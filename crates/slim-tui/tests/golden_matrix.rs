@@ -79,10 +79,14 @@ fn matrix_of_normative_sizes_never_panics_and_keeps_status_visible() {
         for height in [8u16, 12, 24, 40] {
             let frame = render(&state, width, height);
             assert!(
-                frame.contains("SLIM"),
-                "status identity missing at {width}x{height}"
+                !frame.contains("SLIM"),
+                "permanent footer branding at {width}x{height}"
             );
             assert!(frame.contains('›'), "composer prompt missing at {width}x{height}");
+            assert!(
+                frame.contains("ctx") || frame.contains('↑'),
+                "usage metric missing at {width}x{height}"
+            );
             // Regions tile the full height exactly.
             let todo_rows = slim_tui::layout::todo_height(true, 2);
             let regions = plan(width, height, todo_rows, false);
@@ -122,14 +126,16 @@ fn surface_levels_stay_distinguishable_across_color_depths() {
             reduced_motion: false,
         });
         let background = to_terminal_color(depth, theme.background);
+        let surface = to_terminal_color(depth, theme.surface);
         let composer = to_terminal_color(depth, theme.composer_bg);
-        // Spec §21.2: surface levels may collapse at 16 colors/no-color;
-        // truecolor and 256 must keep them apart.
+        // W8: footer/composer flatten onto transcript surface while that
+        // surface remains distinct from the application background.
         if matches!(depth, ColorDepth::TrueColor | ColorDepth::Ansi256) {
             assert_ne!(
                 background, composer,
                 "background vs composer must differ at {depth:?}"
             );
+            assert_eq!(surface, composer, "composer joins surface at {depth:?}");
         }
     }
 }

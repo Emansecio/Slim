@@ -42,7 +42,8 @@ fn build_corpus() -> AppState {
 
 fn percentile(samples: &mut [f64], p: usize) -> f64 {
     samples.sort_by(f64::total_cmp);
-    samples[(samples.len() * p).min(samples.len() - 1) / 100usize.max(1)]
+    let rank = (samples.len() - 1) * p.min(100) / 100;
+    samples[rank]
 }
 
 fn idx_total<'a>(blocks: &'a [Block], width: u16, cache: &'a mut WrapCache) -> u64 {
@@ -56,7 +57,7 @@ fn main() {
 
     // Warm the wrap cache exactly like steady-state usage.
     let mut cache = WrapCache::default();
-    let mut index = HeightIndex::build(&state.blocks, WIDTH, &mut cache);
+    let index = HeightIndex::build(&state.blocks, WIDTH, &mut cache);
     let bottom = index.total_rows.saturating_sub(HEIGHT as u64);
     let _ = index.locate(bottom);
 
@@ -65,7 +66,7 @@ fn main() {
         // Scroll position varies per iteration to exercise different ranges.
         let start = Instant::now();
         let mut cache_i = WrapCache::default();
-        let mut state_view = &state;
+        let state_view = &state;
         let backend = TestBackend::new(WIDTH, HEIGHT);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let row = (idx_total(&state.blocks, WIDTH, &mut cache_i) / 3).saturating_sub((i % 10) as u64);
@@ -103,7 +104,7 @@ fn main() {
             state.apply_event(event);
         }
         let mut cache_p = WrapCache::default();
-        let mut idx = HeightIndex::build(&state.blocks, WIDTH, &mut cache_p);
+        let idx = HeightIndex::build(&state.blocks, WIDTH, &mut cache_p);
         let bottom = idx.total_rows.saturating_sub(HEIGHT as u64);
         let _ = idx.locate(bottom);
         let backend = TestBackend::new(WIDTH, HEIGHT);

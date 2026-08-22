@@ -127,6 +127,7 @@ Legenda: âœ… implementado Â· ðŸŸ¡ parcial Â· âŒ ausente Â· â�
 | # | Severidade | Bug | EvidÃªncia |
 |---|---|---|---|
 | P8 | alta | Shell aguardava o filho antes de drenar stdout/stderr; pipes cheios bloqueavam o processo atÃ© timeout | regressÃ£o `shell_drains_large_stdout_and_stderr_while_child_runs`: RED em 10,26 s; GREEN em 0,76 s com 5 MiB por stream |
+| W8-B1 | alta | `HeightIndex::locate` indexava `entries[0]` quando working/todo tornavam a welcome invisÃ­vel antes de existir transcript | RED em `constrained_working_state_moves_from_activity_to_footer` (`render.rs:151`); boundary `40Ã—8` |
 
 ## 6. Workflow de execuÃ§Ã£o
 
@@ -216,7 +217,7 @@ reducer Ãºnico, render puro, Windows-only.
 | exec | C3 | ContextRail (cwd esq, ctx% Â· k/128k dir) e ActivityRail (spinner â—’â—“â—‘â—” via Action::Tick ~8fps, Ctrl+C stop); reduced motion congela glyph; degradam antes de tudo (Â§14.4) | layout.rs regions context_rail/activity_rail |
 | exec | C2 | HeightIndex prefix sums O(log n) locate; WrapCache bounded (block,width,collapsed)â†’altura; render virtualizado sÃ³ materializa blocos visÃ­veis; agrupamento de tools no Ã­ndice; unicode-width dep | render.rs |
 | exec | C4 | golden_matrix.rs: 7 larguras Ã— 4 alturas, tiling exato das regiÃµes, emergÃªncia 39Ã—7, hierarquia de surfaces por depth (truecolor/256 diferem; 16/no-color colapsam por Â§21.2); to_ansi256 reescrito (cube vs gray, menor distÃ¢ncia) | 4 testes |
-| exec | C6 | bench long_session reescrito: corpus 3.200 blocos, TestBackend draw real, gate p95 â‰¤16ms com exit(1) | release: input_to_frame_p95=2.04ms âœ“ |
+| exec | C6 | bench long_session: corpus 3.200 blocos, TestBackend draw real, gate p95 â‰¤16ms com exit(1); rank corrigido em W8 para a amostra p95 efetiva | release W8: scroll_locate_p95=1,656 ms; input_to_frame_p95=2,384 ms âœ“ |
 | exec | C7 | command palette Ctrl+P (query/filter/Enter submete top match/Esc); markdown-light em assistant: headings heading_accent, code fences code_rail; spinner/reduced motion jÃ¡ em C3 | palette_tests + build |
 | exec | C8 | fault_injection.rs: overflow data lane coalesce sem perder control; renderer panic isolado (safe_block_lines catch_unwind â†’ fallback row); disconnect observÃ¡vel; stale content page nÃ£o fabrica blocos | 5 testes |
 | exec | C9 | proptest: End sempre volta live edge; unseen conta sÃ³ pinned; draft sobrevive a paste oversized + send falho; layout nunca excede viewport em sizes aleatÃ³rios | properties.rs 4 props |
@@ -243,7 +244,9 @@ reducer Ãºnico, render puro, Windows-only.
 | exec | PERF-05 | SSE usa cursor, linhas emprestadas e um drain por chunk; erro malformado continua consumindo a linha; 20k deltas 117,029â†’8,264 ms mediana (14,2Ã—) | commit `129f98c` |
 | exec | PERF-06 | encoder Base64 manual removido em favor de `base64::STANDARD`; -20 linhas lÃ­quidas e fixtures `AAEC` OpenAI/Anthropic idÃªnticas | commit `0609894` |
 | exec | PERF-07 | `read_file_range` troca `read_to_string` por `BufReader`/buffer reutilizado; memÃ³ria O(file)â†’O(max line + page), CRLF/footer/EOF preservados | commit `f266922` |
-| final | PERF-03â€“07 | 45 suÃ­tes / 220 passed / 0 failed / 1 ignored / 0 warnings; refresh `-Test` OK; 25/25 bodies `s4_long` idÃªnticos; processo 1.167â†’1.174 ms (+0,60%, ruÃ­do); binÃ¡rio SHA-256 `902f273eb6a72855f1ad1ced3d5b9e6a9e1c8029ccb0835738f4c2525cd96cbf`, 6.671.872 B | comportamento/wire/schema preservados |
+| final | PERF-03â€“07 | gate/deploy daquele checkpoint verdes; 25/25 bodies `s4_long` idÃªnticos; processo 1.167â†’1.174 ms (+0,60%, ruÃ­do); hash implantado `902f273eb6a72855f1ad1ced3d5b9e6a9e1c8029ccb0835738f4c2525cd96cbf` | contagem atual fica no fim desta tabela |
+| exec | W8 | Footer Grok-style aprovado: ActivityRail imediatamente acima do composer; box rounded completo/insetado em todos os tamanhos suportados; base/topo compartilham `Rect`; `model (effort) Â· mode` no label; atalhos reais + metrics responsivos; `op_divider` vazio removido; nenhum motion novo | +5 testes lÃ­quidos; golden wide/narrow/working/40Ã—8; W8-B1 REDâ†’GREEN; Clippy `slim-tui --all-targets -D warnings` verde; bench release 3.200 blocos: p95 2,384 ms â‰¤16 ms |
+| final | W8 | `refresh-slim.ps1 -Test`: 45 suÃ­tes / 225 passed / 0 failed / 1 ConPTY ignored / 0 warnings; `OK:`; release implantado e smoke aprovado | `C:\Users\User\bin\Slim.exe` SHA-256 `c14b94fa29b665665bbf06aa930b6eb389864c37edc4d23a07079e566c1f9451`, 6.675.456 B |
 
 ---
 
@@ -256,7 +259,7 @@ com o toolchain correto (`stable-x86_64-pc-windows-msvc`, rustc **1.97.1**,
 `RUSTUP_HOME` do scoop persist):
 
 Este bloco registrava uma contagem histÃ³rica anterior. A contagem autoritativa
-atual estÃ¡ no fim do Â§7: 45 suÃ­tes / 220 passed / 0 failed / 1 ignored /
+atual estÃ¡ no fim do Â§7: 45 suÃ­tes / 225 passed / 0 failed / 1 ignored /
 0 warnings. As 45 suÃ­tes incluem os Doc-tests dos trÃªs crates. O Ãºnico
 `#[ignore]` Ã© o gate C5 (`tui_pty.rs`), que segue pendente de console Windows
 fÃ­sico (P0). W1 adicionou 5 testes e W4 adicionou 6 testes unitÃ¡rios de config;

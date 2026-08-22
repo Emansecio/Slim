@@ -53,8 +53,8 @@ pub fn wordmark() -> Vec<String> {
 
     // Each braille cell stacks two adjacent dot rows: grid row `top` maps to
     // the cell's upper dots, `top + 1` to the lower dots (positions 1/2).
-    let mut out = Vec::with_capacity((rows + 1) / 2);
-    for pair in 0..(rows + 1) / 2 {
+    let mut out = Vec::with_capacity(rows.div_ceil(2));
+    for pair in 0..rows.div_ceil(2) {
         let top = pair * 2;
         let bottom = top + 1; // may be past the grid → blank lower half
         let mut line = String::with_capacity(cols / 2);

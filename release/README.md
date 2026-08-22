@@ -46,7 +46,7 @@ secretos das fixtures.
 
 ## Escopo e limitaÃ§Ãµes
 
-O pacote registra 220 passed / 0 failed / 1 ignored em 45 suítes e um E2E do binário real
+O pacote registra 225 passed / 0 failed / 1 ignored em 45 suítes e um E2E do binário real
 contra provider localhost. NÃ£o houve chamada a provider live nem validaÃ§Ã£o
 fÃ­sica completa de terminal, IME, mouse ou clipboard.
 

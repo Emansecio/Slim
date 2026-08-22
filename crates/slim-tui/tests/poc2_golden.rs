@@ -22,11 +22,11 @@ fn approved_surface_sizes_keep_fixed_rows_and_deterministic_status() {
             slim_tui::layout::composer_height(height),
             "size={width}x{height}"
         );
-        assert_eq!(regions.op_divider.height, 1, "size={width}x{height}");
+        assert_eq!(regions.op_divider.height, 0, "size={width}x{height}");
         assert_eq!(regions.operational.height, 1, "size={width}x{height}");
         assert_eq!(
             render(&state, width, height).lines.last(),
-            Some(&"SLIM  Auto · signed out · /login  GPT-5.6 Sol · high · ↑0 ↓0".to_string()),
+            Some(&"signed out · /login  ctx 0% · 0k/128k · ↑0 ↓0".to_string()),
             "size={width}x{height}"
         );
     }

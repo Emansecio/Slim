@@ -85,7 +85,8 @@ pub fn resolve_theme(capabilities: Capabilities) -> Theme {
         accent: (0x78, 0xD9, 0x9B),
         surface: (0x0D, 0x10, 0x14),
         surface_alt: (0x12, 0x16, 0x1B),
-        composer_bg: (0x15, 0x1A, 0x20),
+        // W8: composer/footer share transcript depth; border carries shape.
+        composer_bg: (0x0D, 0x10, 0x14),
         user_prompt_bg: (0x1B, 0x20, 0x26),
         border: (0x2B, 0x31, 0x39),
         border_focus: (0x78, 0xD9, 0x9B),
@@ -149,8 +150,8 @@ fn to_ansi256(rgb: (u8, u8, u8)) -> u8 {
     } else {
         ((r.max(g).max(b)).saturating_sub(8) / 10).min(23)
     };
-    let gray_value = 8 + gray_index as u16 * 10;
-    let gray = 232 + gray_index as u16;
+    let gray_value = 8 + gray_index * 10;
+    let gray = 232 + gray_index;
     let dist = |c: (u16, u16, u16)| {
         let (cr, cg, cb) = c;
         cr.abs_diff(r) + cg.abs_diff(g) + cb.abs_diff(b)

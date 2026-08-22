@@ -23,10 +23,14 @@ pub enum LayoutError {
     InsufficientHeight,
 }
 
-/// Composer box height (§15.3): three rows when the viewport affords it, one
-/// compact row below that (§14.4 degradation order).
+/// Composer box height (§15.3): every supported viewport keeps the approved
+/// three-row silhouette; only the emergency layout below 40x8 collapses it.
 pub fn composer_height(viewport_height: u16) -> u16 {
-    if viewport_height >= 16 { 3 } else { 1 }
+    if viewport_height >= 8 {
+        3
+    } else {
+        1
+    }
 }
 
 /// Todo dock height (§14.3): compact 2 rows, expanded up to 6, 0 when closed.
@@ -35,14 +39,14 @@ pub fn todo_height(expanded: bool, item_count: usize) -> u16 {
         return 0;
     }
     if expanded {
-        (item_count as u16 + 1).min(6).max(2)
+        (item_count as u16 + 1).clamp(2, 6)
     } else {
         2
     }
 }
 
-/// Normal layout (§14.1/§15.3/§21.4). Dividers degrade first, then the
-/// composer box collapses to one row, then the dock shrinks (§14.4).
+/// Normal layout (§14.1/§15.3/§21.4). Activity and Todo degrade before the
+/// approved composer silhouette; its bottom border directly precedes footer.
 pub fn plan_checked(
     width: u16,
     height: u16,
@@ -52,29 +56,22 @@ pub fn plan_checked(
     if width < 40 || height < 8 {
         return Err(LayoutError::TerminalTooSmall);
     }
-    // The activity rail is the only rail and the first non-essential region
-    // to go (§14.4, revised 2026-08-21: the context meter lives in the
-    // operational bar, so there is no top context rail anymore).
-    let mut activity = u16::from(working && height >= 14);
-    let mut composer = composer_height(height);
+    let mut activity = u16::from(working);
+    let composer = composer_height(height);
     let mut todo = todo_rows;
     let mut use_dividers = true;
     let mut todo_div;
-    let mut op_div;
     loop {
         todo_div = u16::from(use_dividers && todo > 0);
-        op_div = u16::from(use_dividers);
-        let fixed = activity + 1 + composer + todo + todo_div + op_div;
+        let fixed = activity + 1 + composer + todo + todo_div;
         if height > fixed {
             break;
         }
-        // Degradation order (§14.4): rail, dividers, composer, dock.
+        // Degradation order (§14.4): rail, Todo divider, Todo; never composer.
         if activity > 0 {
             activity = 0;
         } else if use_dividers {
             use_dividers = false;
-        } else if composer > 1 {
-            composer = 1;
         } else if todo > 1 {
             todo = 1;
         } else if todo > 0 {
@@ -83,19 +80,51 @@ pub fn plan_checked(
             return Err(LayoutError::InsufficientHeight);
         }
     }
-    let scrollback_height = height - activity - 1 - composer - todo - todo_div - op_div;
+    let scrollback_height = height - activity - 1 - composer - todo - todo_div;
     let mut y = 0;
-    let scrollback = Rect { x: 0, y, width, height: scrollback_height };
+    let scrollback = Rect {
+        x: 0,
+        y,
+        width,
+        height: scrollback_height,
+    };
     y += scrollback_height;
-    let todo_rect = Rect { x: 0, y, width, height: todo };
+    let todo_rect = Rect {
+        x: 0,
+        y,
+        width,
+        height: todo,
+    };
     y += todo;
-    let todo_divider = Rect { x: 0, y, width, height: todo_div };
+    let todo_divider = Rect {
+        x: 0,
+        y,
+        width,
+        height: todo_div,
+    };
     y += todo_div;
-    let composer_rect = Rect { x: 0, y, width, height: composer };
+    let activity_rail = Rect {
+        x: 0,
+        y,
+        width,
+        height: activity,
+    };
+    y += activity;
+    let composer_rect = Rect {
+        x: 0,
+        y,
+        width,
+        height: composer,
+    };
     y += composer;
-    let op_divider = Rect { x: 0, y, width, height: op_div };
+    let op_divider = Rect {
+        x: 0,
+        y,
+        width,
+        height: 0,
+    };
     Ok(LayoutRegions {
-        activity_rail: Rect { x: 0, y: 0, width, height: activity },
+        activity_rail,
         scrollback,
         todo: todo_rect,
         todo_divider,
@@ -119,10 +148,15 @@ pub fn plan(width: u16, height: u16, todo_rows: u16, working: bool) -> LayoutReg
     let operational_height = u16::from(height > 0);
     let composer_height = u16::from(height > operational_height);
     let todo_height = u16::from(todo_rows > 0 && height > operational_height + composer_height);
-    let scrollback_height = height
-        .saturating_sub(todo_height + composer_height + operational_height);
+    let scrollback_height =
+        height.saturating_sub(todo_height + composer_height + operational_height);
     LayoutRegions {
-        activity_rail: Rect { x: 0, y: 0, width, height: 0 },
+        activity_rail: Rect {
+            x: 0,
+            y: 0,
+            width,
+            height: 0,
+        },
         scrollback: Rect {
             x: 0,
             y: 0,

@@ -48,7 +48,7 @@ fn fake_session_materializes_deterministic_frame_without_io() {
             "world",
             "todo: 0/0 no active item",
             "composer: ",
-            "SLIM  Read-only · signed out · /login  GPT-5.6 Sol · high · ↑0 ↓0",
+            "signed out · /login  ctx 0% · 0k/128k · ↑0 ↓0",
         ]
     );
 }
@@ -114,11 +114,9 @@ fn signed_out_login_progress_and_success_are_projected_without_history_leaks() {
         authenticated: true,
     });
     assert!(state.login_overlay.is_none());
-    assert!(ViewModel::derive(&state)
-        .lines
-        .last()
-        .unwrap()
-        .contains("Anthropic"));
+    let footer = ViewModel::derive(&state).lines.last().unwrap().clone();
+    assert!(!footer.contains("signed out"));
+    assert!(footer.contains("Shift+Tab:mode"));
 }
 
 #[test]

@@ -51,14 +51,12 @@ proptest! {
         overflow_state(&mut state);
         reduce(&mut state, Action::Scroll(ScrollIntent::Up));
         prop_assert!(state.scroll.pinned);
-        let mut expected = 0u32;
-        for text in deltas {
+        for (index, text) in deltas.into_iter().enumerate() {
             reduce(
                 &mut state,
                 Action::UiEventReceived(UiEvent::UserMessageAdded { text }),
             );
-            expected += 1;
-            prop_assert_eq!(state.scroll.unseen, expected);
+            prop_assert_eq!(state.scroll.unseen, (index + 1) as u32);
         }
         // Live edge resets and stops counting.
         reduce(&mut state, Action::Scroll(ScrollIntent::LiveEdge));

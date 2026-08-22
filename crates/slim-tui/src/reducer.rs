@@ -239,11 +239,9 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             state.revisions.content += 1;
             sync_slash_suggestions(state);
         }
-        KeyCode::Backspace => {
-            if state.composer.remove_last_element().is_some() {
-                state.revisions.content += 1;
-                sync_slash_suggestions(state);
-            }
+        KeyCode::Backspace if state.composer.remove_last_element().is_some() => {
+            state.revisions.content += 1;
+            sync_slash_suggestions(state);
         }
         _ => {}
     }

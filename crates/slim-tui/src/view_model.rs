@@ -1,5 +1,3 @@
-use slim_core::runtime::mode_name;
-
 use crate::app::AppState;
 use crate::block::{BlockKind, BlockLifecycle, FoldState};
 
@@ -74,25 +72,29 @@ impl ViewModel {
     }
 }
 
-/// Operational bar content in normative groups (§15.1): left group carries
-/// identity, Mode and transient state; right group carries model and token
-/// counters. Context/cost appear only once the harness provides real data.
+/// Plain-text mirror of the W8 footer: critical state or real shortcuts on the
+/// left, context/usage on the right. Model/effort/mode live in composer chrome.
 pub fn status_line(state: &AppState) -> String {
-    let mut left = format!("SLIM  {}", mode_name(state.mode));
-    if state.working {
-        left.push_str(" · ◌ working");
+    const CONTEXT_TOKENS: u64 = 128_000;
+    let used = state.input_tokens.saturating_add(state.output_tokens);
+    let pct = (used.saturating_mul(100) / CONTEXT_TOKENS).min(999);
+    let left = if state.working {
+        "Working · Esc/Ctrl+C:cancel".into()
+    } else if state.scroll.pinned {
+        if state.scroll.unseen > 0 {
+            format!("{} new · End latest", state.scroll.unseen)
+        } else {
+            "End latest".into()
+        }
     } else if !state.authenticated {
-        left.push_str(" · signed out · /login");
-    } else if let Some(provider) = state.auth_provider {
-        left.push_str(&format!(" · {}", provider.label()));
-    }
-    let model = crate::api::ModelAlias::parse(&state.model)
-        .map_or_else(|| state.model.clone(), |alias| alias.label().into());
-    let effort = crate::api::ModelAlias::parse(&state.model)
-        .map(|_| format!(" · {}", state.effort.id()))
-        .unwrap_or_default();
+        "signed out · /login".into()
+    } else {
+        "Shift+Tab:mode │ Ctrl+C:exit │ Ctrl+P:commands".into()
+    };
     format!(
-        "{left}  {model}{effort} · ↑{} ↓{}",
-        state.input_tokens, state.output_tokens
+        "{left}  ctx {pct}% · {}k/128k · ↑{} ↓{}",
+        used.saturating_add(500) / 1_000,
+        state.input_tokens,
+        state.output_tokens
     )
 }

@@ -59,17 +59,16 @@ effort = "high"   # low | medium | high (label TUI + reasoning_effort no provide
   config sozinha nÃ£o ativa rede.
 
 
-Os 220 testes passados / 0 failed em 45 suítes, mais 1 ConPTY físico ignorado, comprovam
+Os 225 testes passados / 0 failed em 45 suítes, mais 1 ConPTY físico ignorado, comprovam
 componentes, contratos e caminhos headless/TUI offline; nÃ£o comprovam
 integraÃ§Ã£o completa do produto:
 
 - `cargo test --workspace` e `refresh-slim.ps1 -Test`: exit code `0`, build
   release, deploy e smoke test concluÃ­dos;
-- Clippy focado em `slim-core --all-targets -D warnings`: exit `0`;
+- Clippy focado em `slim-core` e `slim-tui --all-targets -D warnings`: exit `0`;
 - `cargo fmt --all -- --check` tem drift preexistente em arquivos fora do slice;
-  o Clippy workspace para em 6 diagnÃ³sticos preexistentes de `slim-tui`; uma
-  passada `slim-cli --no-deps` expÃµe ainda 20 `let_unit_value` + 1 assert bool;
-- 220 passed / 0 failed / 1 ignored em 45 suítes, incluindo proptest, fault injection,
+  `slim-cli --no-deps` ainda expÃµe 20 `let_unit_value` + 1 assert bool;
+- 225 passed / 0 failed / 1 ignored em 45 suítes, incluindo proptest, fault injection,
   golden matrix via TestBackend e benchmark long-session com gate de budget;
 - E2E do binÃ¡rio real contra fixtures localhost, sem chamada a provider live;
 - nenhuma matriz fÃ­sica completa de terminal, IME, mouse ou clipboard foi
@@ -80,7 +79,7 @@ integraÃ§Ã£o completa do produto:
 | Ãrea | Estado atual |
 |---|---|
 | Headless/provider/tools/auth/compaction/usage/artifacts/anti-loop | `Slim --headless` usa caminhos integrados e exercitados offline; OpenAI-compatible/Anthropic SSE, read/list/search/write/patch/shell e filtragem de capabilities funcionam. |
-| TUI | `Slim` abre a interface normal mesmo deslogado. `/login` abre seletor OAuth nativo para Claude Pro/Max ou ChatGPT Plus/Pro; Anthropic Messages e Codex Responses usam o mesmo agent loop/tools Slim. Reducer Ãºnico normativo (`Action â†’ reduce â†’ Effect`), scrollback virtualizado e navegÃ¡vel (pin/live-edge/unseen), paleta estratificada Â§21.3, ActivityRail com spinner e medidor de contexto na operational bar, composer minimalista (hairline + label discreto), tool blocks tipados agregados, lanes bounded com coalescer no runtime real, command palette Ctrl+P, markdown-light, motion bÃ¡sico com reduced motion, welcome com wordmark braille e pulso ambiente â‰¤2 fps. Fixtures localhost provam OAuth/callback/store, streaming, tool round-trip e cancelamento. PTY E2E fÃ­sico pendente de console real (teste `#[ignore]`). |
+| TUI | `Slim` abre a interface normal mesmo deslogado. `/login` abre seletor OAuth nativo para Claude Pro/Max ou ChatGPT Plus/Pro; Anthropic Messages e Codex Responses usam o mesmo agent loop/tools Slim. Reducer Ãºnico normativo (`Action â†’ reduce â†’ Effect`), scrollback virtualizado e navegÃ¡vel (pin/live-edge/unseen), paleta estratificada Â§21.3, ActivityRail com spinner e medidor de contexto na operational bar, footer Grok-style responsivo (box alinhado + atalhos/metrics), tool blocks tipados agregados, lanes bounded com coalescer no runtime real, command palette Ctrl+P, markdown-light, motion bÃ¡sico com reduced motion, welcome com wordmark braille e pulso ambiente â‰¤2 fps. Fixtures localhost provam OAuth/callback/store, streaming, tool round-trip e cancelamento. PTY E2E fÃ­sico pendente de console real (teste `#[ignore]`). |
 | Cache | Implementado e testado em `HttpProviderClient`, porÃ©m os caminhos normais usam `HttpProviderClient::new`; cache nÃ£o fica ativo no produto normal. |
 | SessÃµes | Writer/recovery/branch e `--session` escrevem JSONL novo; nÃ£o hÃ¡ resume, seleÃ§Ã£o de recovery ou UX de branch/fork na CLI/TUI. |
 | Skills, MCP, subagentes | MÃ³dulos/contratos/testes existem; startup, catÃ¡logo de tools e loop nÃ£o os conectam ao runtime, e nÃ£o hÃ¡ child agents reais. |

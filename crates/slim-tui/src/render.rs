@@ -143,6 +143,9 @@ impl<'a> HeightIndex<'a> {
 
     /// Index of the first entry intersecting `row`, plus rows to skip inside it.
     pub fn locate(&self, row: u64) -> (usize, u64) {
+        if self.entries.is_empty() {
+            return (0, 0);
+        }
         let idx = self
             .entries
             .partition_point(|(prefix, _, _)| *prefix <= row)

@@ -42,8 +42,9 @@ fn layout_keeps_todo_composer_and_operational_rows_bounded() {
     assert_eq!(regions.todo.height, 2);
     assert_eq!(regions.todo_divider.height, 1);
     assert_eq!(regions.composer.height, 3);
-    assert_eq!(regions.op_divider.height, 1);
+    assert_eq!(regions.op_divider.height, 0);
     assert_eq!(regions.operational.height, 1);
+    assert_eq!(regions.operational.y, regions.composer.y + 3);
     assert_eq!(visible_range(100, 98, 10), 98..100);
 }
 
@@ -63,7 +64,7 @@ fn render_uses_same_state_as_m0_view_model() {
     let state = AppState::new();
     assert_eq!(
         render(&state, 80, 24).lines.last(),
-        Some(&"SLIM  Auto · signed out · /login  GPT-5.6 Sol · high · ↑0 ↓0".to_string())
+        Some(&"signed out · /login  ctx 0% · 0k/128k · ↑0 ↓0".to_string())
     );
 }
 
@@ -108,5 +109,7 @@ fn activity_queue_todo_and_composer_are_projected_into_one_frame() {
     assert!(lines
         .iter()
         .any(|line| line == "composer: [Pasted Content 0 10 chars]"));
-    assert!(lines.iter().any(|line| line.contains("SLIM  Auto")));
+    assert!(lines
+        .iter()
+        .any(|line| line.contains("signed out · /login") && line.contains("ctx 0%")));
 }

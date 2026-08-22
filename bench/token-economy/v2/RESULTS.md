@@ -116,7 +116,7 @@ A/B do binário implantado no `s4_long`, N=5:
 - T1 4.239 B, Tn 8.519 B e soma 35.511 B: deltas zero;
 - 25/25 novos requests de compliance verdes;
 - processo mediano 1.167 → 1.174 ms (+7 ms, +0,60%), ruído do `Start-Job`;
-- suíte: 45 suítes / 220 passed / 0 failed / 1 ignored / 0 warnings;
+- suíte atual: 45 suítes / 225 passed / 0 failed / 1 ignored / 0 warnings;
 - binário: 6.589.440 → 6.671.872 B (+82.432 B, +1,25%), trade-off explícito
   da drenagem concorrente/novos caminhos std; payload e pico de contexto não cresceram.
 
@@ -151,10 +151,9 @@ harness, não o Slim implantado; não são prioridade de produto.
 - O benchmark E2E prova não-regressão; ganhos pequenos ficam sob o ruído. Os
   ganhos shell/SSE foram medidos em regressões isoladas de carga.
 - Nenhum provider live foi chamado.
-- `cargo fmt --all -- --check` tem drift preexistente; Clippy workspace para em
-  6 diagnósticos de `slim-tui`, e `slim-cli --no-deps` revela mais 20
-  `let_unit_value` + 1 assert bool, todos preexistentes. Clippy focado em
-  `slim-core --all-targets -D warnings` ficou limpo.
+- `cargo fmt --all -- --check` tem drift preexistente; após W8, Clippy focado
+  em `slim-core` e `slim-tui --all-targets -D warnings` está limpo.
+  `slim-cli --no-deps` ainda revela 20 `let_unit_value` + 1 assert bool.
 
 ## Reprodução
 

@@ -47,7 +47,7 @@ milestone correspondente passou seu gate.
 |---|---|---|---|
 | M0 — contratos/testkit | **Quase completo** | `UiEvent`/`UiCommand` ampliados (Tool* tipados), `AppState` único, reducer como única rota de mutação, effects executados pelo runtime, blocos User/Assistant/Thinking/Tool/System/Error/Activity/QueuedUser, `RevisionSet` de 6 campos, IDs monotônicos, `MemorySurface` + frames determinísticos + proptest | `SurfaceBackend` trait compartilhada, variantes Plan/Compaction/Custom, sequences por stream |
 | M1 — fullscreen Windows | **Fatia ampla; gate físico pendente** | TerminalGuard RAII + UTF-8/VT flags com restore exato, alternate screen/raw mode/paste/cursor oculto, mouse capability-gated, composer boxed 3 rows com cursor por grapheme, ContextRail/ActivityRail, scrollback navegável com pin/live-edge/unseen, paleta §21.3 estratificada em truecolor/256/16/no-color, layout de emergência, golden matrix via TestBackend | PTY/ConPTY E2E físico (teste escrito, `#[ignore]`, requer console real) e validação manual Windows Terminal + alternativo |
-| M2 — integração/performance | **Integração central + pipeline essencial** | bridge tipada com lanes bounded (control 256/data 1024) e fairness 32, coalescer no runtime real, tool blocks tipados com agregação por nome/turno, HeightIndex prefix sums + WrapCache bounded + render virtualizado, cancelamento provider/shell, usage, modos, modelo/effort; bench long-session com gate p95 ≤16 ms (medido: ~2 ms release) | Todo dock end-to-end via eventos reais do harness, ParseCache/LayoutCache dedicados, métricas §26 expostas |
+| M2 — integração/performance | **Integração central + pipeline essencial** | bridge tipada com lanes bounded (control 256/data 1024) e fairness 32, coalescer no runtime real, tool blocks tipados com agregação por nome/turno, HeightIndex prefix sums + WrapCache bounded + render virtualizado, cancelamento provider/shell, usage, modos, modelo/effort; bench long-session com gate p95 ≤16 ms (W8: 2,384 ms release) | Todo dock end-to-end via eventos reais do harness, ParseCache/LayoutCache dedicados, métricas §26 expostas |
 | M3 — experiência completa | **Parcial** | overlays login/modelo/effort integrados, command palette Ctrl+P funcional, markdown-light (headings/code fences), spinner animado com FrameClock por Tick, reduced motion, toasts que reservam rows, fault injection com catch_unwind por bloco | inspectors diff/activity/tree/diagnostics renderizados, clipboard/search, imagens, diff real, matriz golden completa de estados M3 |
 
 #### O que já funciona end-to-end
@@ -68,11 +68,11 @@ milestone correspondente passou seu gate.
 - tela de boas-vindas com wordmark SLIM em dot-matrix braille, pulso ambiente
   de um único glyph a ≤2 fps enquanto ocioso (congelado sob reduced motion,
   fallback ASCII/compacto), status de conexão e um único hint;
-- operational bar única na base: SLIM/modo/estado à esquerda, medidor de
-  contexto (`ctx N% · Nk/128k`) + tokens ↑↓ à direita — sem rail superior
-  (W2, 2026-08-21: substitui a antiga ContextRail) e sem duplicar model/effort,
-  que vivem apenas no label do composer box;
-- verificação atual: workspace verde (45 suítes / 220 passed / 0 failed /
+- footer Grok-style responsivo (W8, 2026-08-22): ActivityRail transitória
+  imediatamente acima do composer; box completo insetado em uma célula em todo
+  tamanho suportado; label `model (effort) · mode`; atalhos reais à esquerda e
+  contexto/tokens à direita, sem ContextRail nem row vazia entre box e footer;
+- verificação atual: workspace verde (45 suítes / 225 passed / 0 failed /
   1 ConPTY físico ignored), incluindo proptest, fault injection e golden
   matrix via TestBackend; re-verificado por `refresh-slim.ps1 -Test` em
   2026-08-22 (rustc 1.97.1), com build/deploy/smoke aprovados (tracker §7);
@@ -1045,25 +1045,25 @@ Transições:
 ### 14.1 Regiões fullscreen
 
 ```text
-├ Context rail: cwd/session ───────────── context/progress ────┤
 │ Scrollback                                      │ Inspector? │
 │                                                 │            │
-├ Activity rail? ─────────────────────────────────┴────────────┤
 ├ Todo dock? ──────────────────────────────────────────────────┤
-╭ Composer: draft ─────────────────── model/mode/effort ──────╮
-╰─────────────────────────────────────────────────────────────╯
-└ Operational bar: shortcuts/status ──────────────────────────┘
+  Activity rail? · working/retry/cancel
+ ╭ Composer: draft ─────────────────── model (effort) · mode ╮
+ ╰────────────────────────────────────────────────────────────╯
+  shortcuts/status ─────────────────────── context/tokens
 ```
 
-`ContextRail` ocupa uma row no topo em altura normal. Mostra cwd/session à
-esquerda e contexto/progresso à direita; uma rail colorida fina indica progresso
-quando houver operação mensurável. Em altura crítica, ela é a primeira região
-não essencial a desaparecer.
+Não existe `ContextRail` no layout atual. Contexto e usage ficam no footer; cwd
+e session pertencem aos fluxos/overlays próprios, sem rail fixa.
 
-`ActivityRail` ocupa zero ou uma row acima do Todo/composer. Só aparece durante
-run, retry, tool longa ou input requerido; mostra spinner, duração e ação de
-cancelamento sem duplicar transcript. A faixa inferior permanece para shortcuts,
-mode/model e estado compacto.
+`ActivityRail` ocupa zero ou uma row imediatamente acima do composer, depois do
+Todo dock. Só aparece durante run/retry/tool longa/input requerido; mostra o
+spinner existente e cancelamento sem duplicar transcript. Se a altura exige
+removê-la, estado crítico migra para o footer como `Working…` com Esc/Ctrl+C.
+Atalhos são contextuais: autenticado ocioso anuncia `Ctrl+C:exit`; durante run,
+`Ctrl+C:cancel`. A borda inferior do composer é o separador: `op_divider`
+reserva zero rows.
 
 ### 14.2 Breakpoints
 
@@ -1102,17 +1102,17 @@ Regras:
 
 ### 14.4 Altura
 
-Prioridade quando a altura diminui:
+Prioridade quando a altura diminui dentro do mínimo suportado (`40×8`):
 
-1. preservar ao menos uma linha funcional de composer;
-2. preservar operational bar mínimo;
-3. reduzir composer boxed de três para uma row compacta;
-4. ocultar ContextRail e incorporar contexto crítico na operational bar;
-5. ocultar ActivityRail e mover estado ativo para a operational bar;
-6. reduzir Todo dock de duas para uma linha;
-7. entregar todo espaço restante ao scrollback;
-8. overlays aplicam scroll interno.
+1. preservar composer boxed de três rows e operational bar mínima;
+2. ocultar ActivityRail e mover estado ativo para a operational bar;
+3. remover divider do Todo;
+4. reduzir Todo dock de duas para uma row, depois ocultá-lo;
+5. entregar todo espaço restante ao scrollback;
+6. overlays aplicam scroll interno.
 
+Largura/altura suportadas abreviam label e atalhos, nunca a silhueta boxed. A row
+compacta sem box existe somente no layout de emergência abaixo de `40×8`.
 Nunca renderizar área negativa ou usar `saturating_sub` para esconder erro de
 layout. O planner valida invariantes e retorna layout de emergência explícito.
 
@@ -1130,37 +1130,28 @@ Para terminal menor que 40×8:
 
 ## 15. Componentes
 
-### 15.1 ContextRail e OperationalBar
+### 15.1 Footer operacional
 
-`ContextRail` usa uma row no topo:
-
-```text
-~/workspace/refactor-auth                          ctx 42% · 9.4k/128k
-```
-
-Quando existe progresso mensurável, a própria row desenha `progress_track` e
-`progress_fill` sem adicionar painel alto. Cwd/session ficam à esquerda;
-contexto, fila ou budget ficam à direita. Não repetir `SLIM` nessa região.
-
-`OperationalBar` usa uma row imediatamente abaixo do composer:
+Não existe ContextRail. O footer usa uma row imediatamente abaixo da borda do
+composer, sem divider/row vazia intermediária:
 
 ```text
-Shift+Tab mode  Ctrl+C cancel  Ctrl+P commands     AUTO · GPT-5.6 Sol · high
+Shift+Tab:mode │ Ctrl+C:cancel │ Ctrl+P:commands  ctx 42% · 9.4k/128k · ↑0 ↓0
 ```
 
-Shortcuts acionáveis ficam à esquerda. Mode, model, effort e estado crítico
-ficam à direita. Durante largura reduzida, remover na ordem: shortcuts não
-acionáveis, effort, model e hints; Mode e error/retry permanecem.
-
-Em largura crítica:
+Shortcuts realmente acionáveis ficam à esquerda; contexto/usage à direita.
+`model (effort) · mode` vive no label inferior do composer. Estado crítico
+(signed-out `/login`, working/cancel, error/retry, pinned/unseen) substitui
+shortcuts antes de qualquer truncamento. Em largura reduzida, usar variantes
+abreviadas medidas em células; nenhum grupo faz wrap ou invade o outro.
 
 ```text
-Ctrl+C cancel                                  AUTO · ◌
+^C stop                                      ctx 42% · ↑0 ↓0
 ```
 
-Nenhuma row faz wrap. `SLIM` aparece no empty state ou no primeiro assistant
-label, não simultaneamente em todas as rails. Ambient idle pode pulsar somente
-um glyph/status em até 2 fps; texto e alinhamento permanecem estáveis.
+`SLIM` aparece no empty state, não como branding permanente no footer. O footer
+idle é estático; somente o spinner operacional existente anima, congelando sob
+reduced motion sem alterar layout.
 
 ### 15.2 ScrollbackView
 
@@ -1225,14 +1216,18 @@ Limites iniciais:
 
 Regras:
 
-- altura normal de três rows: box arredondado completo (`BorderType::Rounded`)
-  com o label embutido no extremo direito da borda inferior (revisão W6,
-  2026-08-21, seguindo a referência visual do Grok Build — decisão do usuário);
-- altura compacta de uma row quando viewport não comporta o box;
-- `composer_bg` diferencia input do transcript sem usar sombra ou gradiente;
+- em toda dimensão suportada (`width ≥ 40`, `height ≥ 8`), box arredondado
+  completo de três rows, insetado em uma célula horizontal (revisão W8,
+  2026-08-22, referência Grok Build aprovada pelo usuário);
+- uma row sem box existe somente no layout de emergência abaixo de `40×8`;
+- composer/footer usam `surface` do transcript, sem faixa pesada, sombra ou
+  gradiente;
 - borda neutra (`border`) em todos os estados; foco sinalizado apenas pelo
   glifo `›` em `accent` (muted quando ocioso) — nenhuma borda muda de cor;
-- model/mode/effort ocupam o label da borda inferior à direita, em `muted`;
+- `model (effort) · mode` ocupa o label inferior direito em `muted`; abrevia por
+  largura sem tocar os cantos;
+- topo, conteúdo e base usam o mesmo `Rect`; `Block::title_bottom` substitui
+  células internas, nunca encurta a base ou desloca `╯`;
 - texto digitado usa viewport horizontal em torno do cursor; não faz wrap;
 - draft multiline continua permitido; a row mostra a linha lógica do cursor e
   um indicador `linha/total` quando houver mais de uma;
@@ -1277,8 +1272,9 @@ Spinner usa sequência estável de glyphs e 8–12 fps em motion normal. Tool co
 progresso conhecido usa `progress_track/progress_fill`; sem progresso conhecido,
 usa spinner e elapsed, nunca barra falsa.
 
-`OperationalBar` mantém shortcuts, Mode, model/effort, Goal curto e unseen count.
-Quando há Goal ativo, mostra `active`, `paused` ou `blocked`, budget restante e
+O footer mantém shortcuts, contexto/usage, estado crítico, Goal curto e unseen
+count. Mode/model/effort vivem no label do composer. Quando há Goal ativo,
+mostra `active`, `paused` ou `blocked`, budget restante e
 `verified`/`unverified`. Goal completo expande in-place no transcript, não vira
 painel permanente.
 
@@ -2066,7 +2062,7 @@ e sair sem corromper terminal.
 > `HeightIndex` prefix sums com locate O(log n), WrapCache bounded e render
 > virtualizado (só blocos visíveis são materializados); bench long-session
 > desenha o pipeline Ratatui final via TestBackend e impõe o budget §27 como
-> exit code (p95 release medido: ~2 ms contra 16 ms). Pendente: Todo dock
+> exit code (p95 release W8: 2,384 ms contra 16 ms). Pendente: Todo dock
 > alimentado por eventos reais do harness, ParseCache/LayoutCache dedicados e
 > métricas §26 exportadas.
 

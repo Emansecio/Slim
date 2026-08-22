@@ -218,56 +218,61 @@ pub fn render_frame(
     cache: &mut WrapCache,
 ) {
     let palette = Palette::of(capabilities);
-    {
-            let area = frame.area();
-            // Stratified surfaces (§1.2/§21.3): background fills everything,
-            // each region paints its own level on top.
-            frame.render_widget(
-                ratatui::widgets::Block::default().style(palette.background),
-                area,
-            );
-            let todo_rows = crate::layout::todo_height(
-                state.todo_dock_open,
-                state.todo_items.len(),
-            );
-            let regions = plan(area.width, area.height, todo_rows, state.working);
+    let area = frame.area();
+    // Stratified surfaces (§1.2/§21.3): background fills everything,
+    // each region paints its own level on top.
+    frame.render_widget(
+        ratatui::widgets::Block::default().style(palette.background),
+        area,
+    );
+    let todo_rows =
+        crate::layout::todo_height(state.todo_dock_open, state.todo_items.len());
+    let regions = plan(area.width, area.height, todo_rows, state.working);
 
-            if regions.activity_rail.height > 0 {
-                render_activity_rail(frame, to_ratatui(regions.activity_rail), state, &palette);
-            }
-            render_scrollback(
-                frame,
-                to_ratatui(regions.scrollback),
-                state,
-                &palette,
-                cache,
-                capabilities,
-            );
+    if regions.activity_rail.height > 0 {
+        render_activity_rail(
+            frame,
+            horizontal_inset(to_ratatui(regions.activity_rail)),
+            state,
+            &palette,
+        );
+    }
+    render_scrollback(
+        frame,
+        to_ratatui(regions.scrollback),
+        state,
+        &palette,
+        cache,
+        capabilities,
+    );
 
-            if regions.todo.height > 0 {
-                render_todo_dock(frame, to_ratatui(regions.todo), state, &palette);
-            }
-            render_divider(frame, to_ratatui(regions.todo_divider), palette.border);
-            render_composer(frame, to_ratatui(regions.composer), state, &palette);
-            if let Some(suggestions) = &state.slash_suggestions {
-                render_slash_popup(frame, to_ratatui(regions.composer), suggestions, &palette);
-            }
-            // W5: the op-bar divider rule is gone — the composer label row and
-            // the surface stratification separate the two regions quietly.
-            render_operational_bar(frame, to_ratatui(regions.operational), state, &palette);
+    if regions.todo.height > 0 {
+        render_todo_dock(frame, to_ratatui(regions.todo), state, &palette);
+    }
+    render_divider(frame, to_ratatui(regions.todo_divider), palette.border);
+    let composer_area = horizontal_inset(to_ratatui(regions.composer));
+    render_composer(frame, composer_area, state, &palette);
+    if let Some(suggestions) = &state.slash_suggestions {
+        render_slash_popup(frame, composer_area, suggestions, &palette);
+    }
+    render_operational_bar(
+        frame,
+        horizontal_inset(to_ratatui(regions.operational)),
+        state,
+        &palette,
+    );
 
-            if let Some(overlay) = &state.model_overlay {
-                render_model_overlay(frame, overlay, &palette);
-            }
-            if let Some(overlay) = &state.effort_overlay {
-                render_effort_overlay(frame, overlay, &palette);
-            }
-            if let Some(overlay) = &state.login_overlay {
-                render_login_overlay(frame, overlay, &palette);
-            }
-            if let Some(query) = &state.palette_query {
-                render_palette(frame, query, &palette);
-            }
+    if let Some(overlay) = &state.model_overlay {
+        render_model_overlay(frame, overlay, &palette);
+    }
+    if let Some(overlay) = &state.effort_overlay {
+        render_effort_overlay(frame, overlay, &palette);
+    }
+    if let Some(overlay) = &state.login_overlay {
+        render_login_overlay(frame, overlay, &palette);
+    }
+    if let Some(query) = &state.palette_query {
+        render_palette(frame, query, &palette);
     }
 }
 
@@ -452,7 +457,7 @@ fn render_activity_rail(
     spans.push(Span::raw("    "));
     spans.push(Span::styled("Ctrl+C stop", palette.muted));
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(palette.surface_alt),
+        Paragraph::new(Line::from(spans)).style(palette.surface),
         area,
     );
 }
@@ -735,10 +740,26 @@ fn render_divider(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, style
     );
 }
 
-/// Composer (§15.3, refined 2026-08-21 W6, Grok-style): full rounded box with
-/// a permanently neutral border, model/effort embedded in the bottom border's
-/// right end; focus lives in the `›` glyph only. One compact row when the
-/// viewport is short.
+fn composer_label(state: &AppState, area_width: u16) -> String {
+    let model = ModelAlias::parse(&state.model)
+        .map_or_else(|| state.model.clone(), |alias| alias.label().into());
+    let effort = state.effort.id();
+    let mode = mode_name(state.mode);
+    let candidates = [
+        format!(" {model} ({effort}) · {mode} "),
+        format!(" ({effort}) · {mode} "),
+        format!(" {mode} "),
+    ];
+    let available = area_width.saturating_sub(2) as usize;
+    candidates
+        .into_iter()
+        .find(|candidate| Span::raw(candidate.as_str()).width() <= available)
+        .unwrap_or_default()
+}
+
+/// Composer (§15.3, refined 2026-08-22 W8): one inset rounded box at every
+/// supported size; focus lives in `›`, and label content abbreviates before it
+/// can disturb either corner. Emergency layout alone collapses to one row.
 fn render_composer(
     frame: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
@@ -760,9 +781,7 @@ fn render_composer(
         palette.muted
     };
     let content_area = if area.height >= 3 {
-        let model = ModelAlias::parse(&state.model)
-            .map_or_else(|| state.model.clone(), |alias| alias.label().into());
-        let label = format!("{model} · {} ", state.effort.id());
+        let label = composer_label(state, area.width);
         let block = RatatuiBlock::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -802,60 +821,110 @@ fn render_composer(
     }
 }
 
-/// Operational bar stays on surface_alt; left group carries identity, mode and
-/// state; right group carries the context meter and token counters (§15.1,
-/// revised 2026-08-21: model/effort live only on the composer label, the
-/// context meter moved here from the old top rail). Pinned scroll shows the
-/// unseen counter with the End hint (§13.3).
+/// Grok-style footer (§15.1/W8): critical status or real shortcuts on the
+/// left, context/usage on the right. Variants are selected by displayed cell
+/// width so neither group wraps or overwrites the other.
 fn render_operational_bar(
     frame: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
     state: &AppState,
     palette: &Palette,
 ) {
-    let mut left = vec![
-        Span::styled("SLIM", palette.accent),
-        Span::styled(format!("  {}", mode_name(state.mode)), palette.text),
-    ];
-    if state.working {
-        left.push(Span::styled(" · ", palette.muted));
-        left.push(Span::styled("◌ working", palette.warning));
-    } else if !state.authenticated {
-        left.push(Span::styled(" · signed out · /login", palette.muted));
+    if area.width == 0 || area.height == 0 {
+        return;
     }
-    if state.scroll.pinned {
-        let unseen = state.scroll.unseen;
-        let hint = if unseen > 0 {
-            format!(" · {unseen} new · End latest")
-        } else {
-            " · End latest".into()
-        };
-        left.push(Span::styled(hint, palette.secondary));
-    }
-    // Context meter + usage (moved from the removed top context rail).
     const CONTEXT_TOKENS: u64 = 128_000;
     let used = state.input_tokens.saturating_add(state.output_tokens);
-    let pct = used.saturating_mul(100) / CONTEXT_TOKENS;
-    let right = vec![
-        Span::styled(
-            format!("ctx {pct}% \u{b7} {}k/128k", (used + 500) / 1_000),
-            palette.muted,
+    let pct = (used.saturating_mul(100) / CONTEXT_TOKENS).min(999);
+    let right_variants = [
+        format!(
+            "ctx {pct}% · {}k/128k · ↑{} ↓{}",
+            used.saturating_add(500) / 1_000,
+            state.input_tokens,
+            state.output_tokens
         ),
-        Span::styled(" · ", palette.muted),
-        Span::styled(
-            format!("\u{2191}{} \u{2193}{}", state.input_tokens, state.output_tokens),
-            palette.muted,
+        format!(
+            "ctx {pct}% · ↑{} ↓{}",
+            state.input_tokens, state.output_tokens
         ),
+        format!("ctx {pct}%"),
     ];
-    let span_width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
-    let pad = (area.width as usize)
-        .saturating_sub(span_width(&left) + span_width(&right))
-        .max(1);
-    let mut spans = left;
-    spans.push(Span::raw(" ".repeat(pad)));
-    spans.extend(right);
+
+    let (left_variants, left_style, preferred_left) = if state.working {
+        (
+            vec![
+                "Working… Esc:cancel · Ctrl+C:cancel".into(),
+                "Working… Esc/^C cancel".into(),
+                "Working… ^C".into(),
+            ],
+            palette.warning,
+            0,
+        )
+    } else if state.scroll.pinned {
+        let unseen = state.scroll.unseen;
+        let full = if unseen > 0 {
+            format!("{unseen} new · End latest")
+        } else {
+            "End latest".into()
+        };
+        let short = if unseen > 0 {
+            format!("{unseen} new · End")
+        } else {
+            "End".into()
+        };
+        (vec![full, short], palette.secondary, 0)
+    } else if !state.authenticated {
+        (
+            vec!["signed out · /login".into(), "/login".into()],
+            palette.muted,
+            0,
+        )
+    } else {
+        (
+            vec![
+                "Shift+Tab:mode │ Ctrl+C:exit │ Ctrl+P:commands".into(),
+                "⇧Tab mode · ^C exit · ^P commands".into(),
+                "⇧Tab mode · ^C exit".into(),
+                "^P · ^C".into(),
+            ],
+            palette.text,
+            2,
+        )
+    };
+
+    let width = |text: &str| Span::raw(text).width();
+    let available = area.width as usize;
+    let Some(minimum_left_variant) = left_variants.last() else {
+        return;
+    };
+    let preferred = left_variants
+        .get(preferred_left)
+        .unwrap_or(minimum_left_variant);
+    let preferred_width = width(preferred);
+    let right = right_variants
+        .iter()
+        .find(|candidate| preferred_width + 1 + width(candidate) <= available)
+        .or_else(|| {
+            let minimum_left = width(minimum_left_variant);
+            right_variants
+                .iter()
+                .find(|candidate| minimum_left + 1 + width(candidate) <= available)
+        })
+        .unwrap_or(&right_variants[2]);
+    let right_width = width(right);
+    let left_budget = available.saturating_sub(right_width + 1);
+    let left = left_variants
+        .iter()
+        .find(|candidate| width(candidate) <= left_budget)
+        .unwrap_or(minimum_left_variant);
+    let pad = available.saturating_sub(width(left) + right_width).max(1);
+    let spans = vec![
+        Span::styled(left.clone(), left_style),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(right.clone(), palette.muted),
+    ];
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(palette.surface_alt),
+        Paragraph::new(Line::from(spans)).style(palette.surface),
         area,
     );
 }
@@ -1031,6 +1100,17 @@ fn to_ratatui(rect: Rect) -> ratatui::layout::Rect {
         y: rect.y,
         width: rect.width,
         height: rect.height,
+    }
+}
+
+fn horizontal_inset(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    if area.width <= 2 {
+        return area;
+    }
+    ratatui::layout::Rect {
+        x: area.x + 1,
+        width: area.width - 2,
+        ..area
     }
 }
 
