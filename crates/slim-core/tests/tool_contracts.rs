@@ -145,6 +145,24 @@ fn read_range_paginates_and_appends_offset_footer_when_truncated() {
 }
 
 #[test]
+fn read_range_matches_lines_semantics_for_crlf_and_past_eof() {
+    let path = temp_path("paged-crlf.txt");
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    fs::write(&path, "alpha\r\nbeta\r\ngamma").expect("write");
+
+    assert_eq!(
+        read_file_range(&path, 2, 1).expect("middle page"),
+        "2: beta\n\n[showing lines 2-2 of 3; pass \"offset\": 3 for the next page]"
+    );
+    assert_eq!(
+        read_file_range(&path, 99, 10).expect("past eof"),
+        ""
+    );
+
+    let _ = fs::remove_dir_all(path.parent().expect("parent"));
+}
+
+#[test]
 fn shell_drains_large_stdout_and_stderr_while_child_runs() {
     const STREAM_BYTES: usize = 5 * 1024 * 1024;
     let result = run_shell_timeout(
