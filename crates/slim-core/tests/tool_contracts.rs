@@ -145,6 +145,21 @@ fn read_range_paginates_and_appends_offset_footer_when_truncated() {
 }
 
 #[test]
+fn shell_drains_large_stdout_and_stderr_while_child_runs() {
+    const STREAM_BYTES: usize = 5 * 1024 * 1024;
+    let result = run_shell_timeout(
+        std::env::temp_dir(),
+        "$chunk = 'x' * 1024; 1..5120 | ForEach-Object { [Console]::Out.Write($chunk); [Console]::Error.Write($chunk) }",
+        Duration::from_secs(10),
+    )
+    .expect("shell");
+
+    assert!(!result.timed_out, "full pipes must not block the child");
+    assert_eq!(result.output.stdout.len(), STREAM_BYTES);
+    assert_eq!(result.output.stderr.len(), STREAM_BYTES);
+}
+
+#[test]
 fn shell_stream_above_cap_is_truncated_with_marker() {
     let result = run_shell_timeout(
         std::env::temp_dir(),

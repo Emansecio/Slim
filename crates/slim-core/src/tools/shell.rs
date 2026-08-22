@@ -1,5 +1,7 @@
+use std::io::Read;
 use std::path::Path;
 use std::process::Output;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::ToolError;
@@ -65,31 +67,62 @@ pub fn run_shell_timeout_cancellable(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(ToolError::from)?;
+    let stdout = child.stdout.take().ok_or_else(|| ToolError::Io {
+        message: "shell stdout pipe is unavailable".into(),
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| ToolError::Io {
+        message: "shell stderr pipe is unavailable".into(),
+    })?;
+    let stdout_reader = std::thread::spawn(move || read_pipe(stdout));
+    let stderr_reader = std::thread::spawn(move || read_pipe(stderr));
+
     let start = Instant::now();
     let mut timed_out = false;
     let mut cancelled = false;
-    loop {
-        if child.try_wait().map_err(ToolError::from)?.is_some() {
-            break;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(ToolError::from)? {
+            break status;
         }
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             cancelled = true;
             terminate_process_tree(&mut child);
-            break;
+            break child.wait().map_err(ToolError::from)?;
         }
         if start.elapsed() >= timeout {
             timed_out = true;
             terminate_process_tree(&mut child);
-            break;
+            break child.wait().map_err(ToolError::from)?;
         }
         std::thread::sleep(Duration::from_millis(5));
-    }
-    let output = child.wait_with_output().map_err(ToolError::from)?;
+    };
+    let output = Output {
+        status,
+        stdout: join_pipe(stdout_reader, "stdout")?,
+        stderr: join_pipe(stderr_reader, "stderr")?,
+    };
     Ok(TimedShellOutput {
         output,
         timed_out,
         cancelled,
     })
+}
+
+fn read_pipe(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn join_pipe(
+    reader: JoinHandle<std::io::Result<Vec<u8>>>,
+    stream: &str,
+) -> Result<Vec<u8>, ToolError> {
+    reader
+        .join()
+        .map_err(|_| ToolError::Io {
+            message: format!("shell {stream} reader panicked"),
+        })?
+        .map_err(ToolError::from)
 }
 
 fn terminate_process_tree(child: &mut std::process::Child) {

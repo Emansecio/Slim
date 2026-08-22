@@ -124,7 +124,9 @@ Legenda: âœ… implementado Â· ðŸŸ¡ parcial Â· âŒ ausente Â· â�
 
 ## 5. Bugs novos descobertos durante execuÃ§Ã£o
 
-(vazio â€” preencher conforme aparecerem)
+| # | Severidade | Bug | EvidÃªncia |
+|---|---|---|---|
+| P8 | alta | Shell aguardava o filho antes de drenar stdout/stderr; pipes cheios bloqueavam o processo atÃ© timeout | regressÃ£o `shell_drains_large_stdout_and_stderr_while_child_runs`: RED em 10,26 s; GREEN em 0,76 s com 5 MiB por stream |
 
 ## 6. Workflow de execuÃ§Ã£o
 
