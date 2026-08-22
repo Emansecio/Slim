@@ -12,12 +12,12 @@ Writes summary_v2.json and prints markdown tables:
   1. Compliance  - model + reasoning effort actually on the wire
   2. Tokens      - per scenario: T1 total, system, tools, Tlast total/history,
                    sum of all request bytes, growth ratio
-  3. Speed       - per scenario: startup_ms median/min, ttfc_ms median/min,
-                   turn gaps, total task time
+  3. Speed       - per scenario: estimated startup_ms/ttfc_ms median/min,
+                   turn gaps, directly measured total task time
 
-Timing definitions (all from server-side meta files, monotonic):
-    startup_ms = arrival of req_1 - process start
-    ttfc_ms    = arrival of req_2 - process start
+Timing definitions:
+    startup_ms = estimate: process total - request span (may include teardown)
+    ttfc_ms    = estimate: startup_ms + gap to req_2
                  (req_2 only happens after the agent wrote the code)
     gap_k_ms   = arrival req_k - arrival req_(k-1)   (agent loop overhead)
 """
@@ -232,7 +232,7 @@ def main(bench):
     speed_summary = {}
     for sc in scenarios:
         print(f"### {sc}\n")
-        print("| agente | startup (mediana/min) | TTFC (mediana/min) | gaps entre turnos | tempo total do processo |")
+        print("| agente | startup estimado (mediana/min) | TTFC estimado (mediana/min) | gaps entre turnos | tempo total do processo |")
         print("|---|---|---|---|---|")
         for agent in sorted(agents):
             rows = []

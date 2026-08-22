@@ -350,6 +350,7 @@ impl Runtime {
         let mut usage = UsageTotals::default();
         let mut seen_tool_outputs: std::collections::HashSet<u64> =
             std::collections::HashSet::new();
+        let mut tools_cache = None;
 
         for turn in 0..config.max_turns {
             turns = turn + 1;
@@ -399,12 +400,15 @@ impl Runtime {
                 }
             }
             let event_start = self.app.events().len();
-            let tools = self.tools.definitions_for_mode(mode);
+            let (tools, tools_bytes) = tools_cache.get_or_insert_with(|| {
+                let tools = self.tools.definitions_for_mode(mode);
+                let tools_bytes = serde_json::to_vec(&tools).map_or(0, |bytes| bytes.len() as u64);
+                (tools, tools_bytes)
+            });
             let snapshot = crate::SessionEvent::new(
                 next_seq,
                 crate::EventKind::ContextSnapshot {
-                    tools_bytes: serde_json::to_vec(&tools)
-                        .map_or(0, |bytes| bytes.len() as u64),
+                    tools_bytes: *tools_bytes,
                     history_bytes: payload_bytes(&messages),
                 },
             );
@@ -415,7 +419,7 @@ impl Runtime {
                 })?;
             next_seq += 1;
             next_seq = self
-                .run_provider_messages_with_tools(client, &messages, &tools, next_seq)
+                .run_provider_messages_with_tools(client, &messages, tools.as_slice(), next_seq)
                 .await?;
             let mut calls = tool_calls_since(&self.app, event_start);
             for event in self.app.events().get(event_start..).unwrap_or_default() {

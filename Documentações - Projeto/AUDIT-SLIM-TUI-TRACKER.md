@@ -231,8 +231,11 @@ reducer Ãºnico, render puro, Windows-only.
 | exec | W7 | Slash autocomplete no composer (ref. Cline/Grok, pedido do usuÃ¡rio): digitar `/` em QUALQUER posiÃ§Ã£o do draft â€” inÃ­cio ou meio de frase â€” abre popup arredondado acima do composer listando `PALETTE_COMMANDS` filtradas por prefixo do token sob ediÃ§Ã£o (Ãºltima palavra); â†‘/â†“ navegam com clamp, **Tab** completa o comando + espaÃ§o no draft sem executar, **Enter** completa e executa imediatamente, `Esc` fecha sem tocar no draft; qualquer outra tecla cai no fluxo normal de ediÃ§Ã£o que re-sincroniza o popup (digitaÃ§Ã£o refiltra, Backspace fecha ao perder o match, paste tambÃ©m dispara); estado novo `AppState.slash_suggestions: Option<SlashSuggestions{query, selected}>`; render `render_slash_popup` (Clear + Rounded + surface_alt) ancorado acima do composer; layout.rs intocado; +8 testes em `slash_tests` (abertura inÃ­cio/meio, texto puro nÃ£o abre, filtro por prefixo, Tab/Enter/Esc, reabertura via ediÃ§Ã£o, paste) | reducer.rs/app.rs/runtime.rs + README |
 
 | final | â€” | cargo test --workspace: 45 suÃ­tes ok, 0 FAILED; build sem warnings | sessÃ£o encerrada |
-| exec | TOK | Economia de tokens nativa (backlog TOK em `analysis_outputs/AUDIT-ECONOMIA-TOKENS.md`): TOK-01 `cache_control` ephemeral na Ãºltima tool do payload Anthropic; TOK-03 dedup de tool output byte-idÃªntico no fio (`[duplicate read result omitted...]`); TOK-04 `read` paginado (`offset` + footer `[showing lines X-Y of Z]`); TOK-05 estimador conservador Ã·3,5 (cÃ³digo denso); TOK-10 cap de 8 KiB por stream de shell; TOK-11 instruÃ§Ã£o do resumo movida para o fim (prefixo cacheÃ¡vel); TOK-12 evento `ContextSnapshot {tools_bytes, history_bytes}` por turno (TUI ignora). +4 testes (208â†’212); mediÃ§Ã£o localhost pÃ³s-deploy: leitura repetida cai de 17.409 B para 68 B no fio | runtime/mod.rs, tools/, provider.rs, compact.rs, events.rs, api.rs |
-| final | â€” | cargo test --workspace: 45 suÃ­tes / 212 passed / 0 failed / 1 ignored (PTY fÃ­sico); refresh-slim.ps1 -Test OK (deploy 20:42); grep 208/189 em docs correntes limpo | sessÃ£o TOK encerrada |
+| exec | TOK | Economia de tokens nativa (backlog TOK em `analysis_outputs/AUDIT-ECONOMIA-TOKENS.md`): TOK-01 `cache_control` ephemeral na Ãºltima tool do payload Anthropic; TOK-03 dedup de tool output byte-idÃªntico no fio (`[duplicate read result omitted...]`); TOK-04 `read` paginado (`offset` + footer `[showing lines X-Y of Z]`); TOK-05 estimador conservador Ã·3,5 (cÃ³digo denso); TOK-10 cap de 8 KiB por stream de shell; TOK-11 instruÃ§Ã£o do resumo movida para o fim (prefixo cacheÃ¡vel); TOK-12 evento `ContextSnapshot {tools_bytes, history_bytes}` por turno (TUI ignora). +4 testes naquele slice; mediÃ§Ã£o localhost pÃ³s-deploy: leitura repetida cai de 17.409 B para 68 B no fio | runtime/mod.rs, tools/, provider.rs, compact.rs, events.rs, api.rs |
+| final | â€” | suÃ­te e deploy verdes no checkpoint TOK; contagem atual supersede este registro histÃ³rico | sessÃ£o TOK encerrada |
+| exec | PERF-01 | microbenchmark `tool_setup` versionado (commit `74f24d2`): 6 tools, 1.418 B internos, 11 Ã— 20.000 iteraÃ§Ãµes; re-mediÃ§Ã£o: 9.305,065 ns setup repetido vs 0,730 ns cacheado (12.746,7Ã— isolado) | harness de mediÃ§Ã£o; sem mudanÃ§a de produto |
+| exec | PERF-02 | `definitions_for_mode(mode)` + serializaÃ§Ã£o de `tools_bytes` calculadas preguiÃ§osamente uma vez por agent loop; economia ~9,3 Âµs por turno adicional; 75/75 payloads `s4_long` byte-idÃªnticos antes/depois; processo mediano 1.168â†’1.170 ms (+0,17%, ruÃ­do do `Start-Job`) | comportamento, APIs, wire e schema preservados; DESIGN Â§1.1 sem mudanÃ§a funcional |
+| final | PERF-02 | `cargo test --workspace`: 45 suÃ­tes / 215 passed / 0 failed / 1 ignored / 0 warnings; Clippy `slim-core --all-targets -D warnings` verde; `refresh-slim.ps1 -Test` imprimiu `OK:`; binÃ¡rio implantado SHA-256 `bc826e987097bb6dd49b680bd28d4e9fb3ce663a2937495a4fe27921a2552847` | fmt/workspace Clippy mantÃªm drift/6 achados preexistentes fora do slice |
 
 ---
 
@@ -244,16 +247,12 @@ Rebuild **limpo** de `target/debug` seguido de `cargo test --workspace`
 com o toolchain correto (`stable-x86_64-pc-windows-msvc`, rustc **1.97.1**,
 `RUSTUP_HOME` do scoop persist):
 
-```text
-cargo test --workspace â†’ 45 suÃ­tes ok / 194 testes / 0 failed / 0 ignored*
-                        / 0 warnings / 0 erros   (*1 ignore: tui_pty ConPTY fÃ­sico)
-```
-
-As 45 suÃ­tes incluem os Doc-tests dos trÃªs crates. O Ãºnico `#[ignore]` Ã© o
-gate C5 (`tui_pty.rs`), que segue pendente de console Windows fÃ­sico (P0).
-Re-contagem apÃ³s o slice W1 (welcome redesenhado): +5 testes (189 â†’ 194).
-Re-contagem apÃ³s o slice W4 (config em camadas `slim.toml`): +6 testes
-unitÃ¡rios de config (194 â†’ 200).
+Este bloco registrava uma contagem histÃ³rica anterior. A contagem autoritativa
+atual estÃ¡ no fim do Â§7: 45 suÃ­tes / 215 passed / 0 failed / 1 ignored /
+0 warnings. As 45 suÃ­tes incluem os Doc-tests dos trÃªs crates. O Ãºnico
+`#[ignore]` Ã© o gate C5 (`tui_pty.rs`), que segue pendente de console Windows
+fÃ­sico (P0). W1 adicionou 5 testes e W4 adicionou 6 testes unitÃ¡rios de config;
+os totais intermediÃ¡rios foram removidos para nÃ£o parecerem estado atual.
 
 ### 8.2 CorreÃ§Ãµes aplicadas nesta verificaÃ§Ã£o
 

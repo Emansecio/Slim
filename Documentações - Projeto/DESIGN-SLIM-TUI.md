@@ -72,10 +72,10 @@ milestone correspondente passou seu gate.
   contexto (`ctx N% · Nk/128k`) + tokens ↑↓ à direita — sem rail superior
   (W2, 2026-08-21: substitui a antiga ContextRail) e sem duplicar model/effort,
   que vivem apenas no label do composer box;
-- verificação focada atual: workspace inteiro verde (45 suítes / 208 testes),
-  incluindo proptest, fault injection e golden matrix via TestBackend;
-  re-verificado em rebuild limpo em 2026-08-21 (rustc 1.97.1) com 0 warnings
-  após limpeza de imports mortos (tracker §8);
+- verificação atual: workspace verde (45 suítes / 215 passed / 0 failed /
+  1 ConPTY físico ignored), incluindo proptest, fault injection e golden
+  matrix via TestBackend; re-verificado por `refresh-slim.ps1 -Test` em
+  2026-08-22 (rustc 1.97.1), com build/deploy/smoke aprovados (tracker §7);
 
 #### O que precisa ser corrigido antes de continuar M3
 

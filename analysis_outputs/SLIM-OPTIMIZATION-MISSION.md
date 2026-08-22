@@ -43,26 +43,32 @@ not a refactor mandate. The current behavior is the contract.
      cap 8 KiB/stream; compaction summary instruction after transcript;
      ContextSnapshot telemetry event.
 
-## Measured baselines (2026-08-22, do not re-derive, extend them)
+## Current measured baselines (revalidated 2026-08-22)
 
-Fixture-driven benchmark at `bench/token-economy/v2/` (capture_server.py +
-run_benchmark.ps1 + analyze.py) measures real wire payloads against a local
-OpenAI-compatible SSE server. Median of 3 runs, model pinned gpt-5.6-luna /
-effort high:
+`bench/token-economy/v2/` measures real wire payloads against a local
+OpenAI-compatible SSE server. The current `s1_read` baseline is median-of-3;
+the PERF-02 `s4_long` before/after arms use 15 runs each. Model and effort were
+pinned to `gpt-5.6-luna` / `high`:
 
 | Metric | Slim | Pi | Pit |
 |---|---|---|---|
-| T1 total (read task) | 5.487 B | 5.941 B | 11.870 B |
-| System prompt | 2.4 KB (compact NATIVE_SYSTEM_PROMPT) | 2.739 B | 4.029 B |
+| T1 total (`s1_read`) | 4.238 B | 5.941 B | 11.870 B |
+| System prompt | 2.435 B | 2.739 B | 4.029 B |
 | Tools block | 1.592 B (6 tools) | 2.900 B (4) | 7.434 B (12) |
-| Sum all requests (s1_read ×2 turns) | 13.852 B | 14.670 B | 26.528 B |
+| Sum all requests (`s1_read`, 2 turns) | 11.354 B | 14.670 B | 26.528 B |
 | Process startup (real, out-of-harness) | ~11 ms | Node init, higher | Node init, higher |
-| Agent loop overhead per turn | ~2 ms | ~11 ms | ~39 ms |
+| Agent loop overhead in the PowerShell harness | ~2 ms/turn | ~11 ms/turn | ~39 ms/turn |
 
-Additional internal measurements:
-- Slim process spawn → first request: ~11 ms direct (the ~1.2 s seen in harness
-  runs was PowerShell `Start-Job` overhead, NOT Slim).
-- History growth is linear and healthy (~350 B/request beyond previous).
+The older Slim values `5.487 B` and `13.852 B` were stale and are superseded by
+the table above. Additional measurements:
+
+- Slim process spawn → first request: ~11 ms direct. The ~1.16 s fixture timing
+  is dominated by PowerShell `Start-Job`, not Slim startup.
+- PERF-01 (`tool_setup`): 6 tools, 1.418 B internal serialized definitions,
+  repeated setup 9.305,065 ns/turn, cached access 0,730 ns/turn, isolated
+  speedup 12.746,7× (11 × 20.000 iterations).
+- PERF-02 preserves all 75/75 `s4_long` request bodies byte-for-byte and saves
+  approximately 9,3 µs per additional agent turn.
 - Est-token estimator: `(chars * 2).div_ceil(7)` (÷3.5 conservative).
 
 Existing audit backlog: `analysis_outputs/AUDIT-ECONOMIA-TOKENS.md` (items
@@ -88,7 +94,28 @@ without new evidence.
    risk behavior. Only propose if you can prove ≥300 B savings with zero
    semantic loss, and validate via A/B (`run_benchmark.ps1 -VariantTag`).
 4. **Startup**: already ~11 ms — treat as solved. Do not spend time here.
-5. **Loop overhead**: 2 ms/turn — treat as solved.
+5. **Scheduler/loop baseline**: ~2 ms/turn in the coarse harness — treat the
+   scheduler as solved, but benchmark the still-duplicated provider payload
+   construction and SSE retention/parsing separately because they scale with
+   payload/event size.
+
+## Verified opportunities after PERF-02 (not implemented)
+
+Static reviews found concrete next candidates. They are hypotheses until their
+own benchmark and must remain separate commits:
+
+| Priority | Candidate | Current evidence | Verdict |
+|---|---|---|---|
+| P0 | Drain shell stdout/stderr while the child runs | pipes are drained only after process exit; large output can deadlock | reproduce and fix as bug |
+| P1 | Build provider request once and skip cache-key work when cache is off | normal clients have `cache: None`, but request construction/canonicalization is repeated | measure, then PERF-03 |
+| P1 | Do not clone/retain provider events when cache is off | every SSE event is cloned despite no cache consumer | measure, separate commit |
+| P1 | Linearize SSE buffer draining | front `String::drain` per line is O(n²) for batched chunks; three reviews agreed | benchmark coalesced chunks |
+| P1 | Exercise TUI beyond 4.096 blocks | WrapCache capacity is 4.096; current benchmark stops at 3.200 and can miss thrash | expand benchmark first |
+| P2 | Replace manual Base64 with the installed crate | image path reimplements padded standard Base64 | measure and simplify |
+| P2 | Stream bounded `read` pages | current implementation loads the entire file | benchmark RSS/latency |
+| P2 | Bound core→TUI retention | upstream channel and AppHandle event vector are unbounded | design required; no adjacent patch |
+
+Details and the full verdict table live in `bench/token-economy/v2/RESULTS.md`.
 
 ## Required method (no exceptions)
 
@@ -120,5 +147,6 @@ without new evidence.
 3. Updated AUDIT-ECONOMIA-TOKENS.md and RESULTS.md.
 4. A short "what I deliberately did NOT touch and why" section.
 
-If any measurement contradicts a baseline above, STOP and report the
-discrepancy before proceeding — the baseline wins until re-verified.
+If a measurement contradicts this document, stop and reconcile it against the
+current source and fresh captures. Once reverified, update this document; stale
+historical numbers never override the current implementation.

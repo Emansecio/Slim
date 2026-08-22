@@ -16,11 +16,14 @@ tools, contexto, skills, MCP e subagentes; headless e TUI apenas compõem o mesm
 JSONL append-only, ACL nativa Windows via `windows-sys`, provider adapters
 tipados, MCP stdio/Streamable HTTP e testes unit/property/golden/PTY.
 
-## Estado de implementação (2026-08-20)
+## Estado de implementação (atualizado em 2026-08-22)
 
-O workspace passou fmt, Clippy com `-D warnings`, testes e build release, todos
-com exit code `0`: são 212 testes em 45 suítes. Isso comprova componentes,
-headless e a bridge TUI central offline, não integração v1 completa.
+O workspace tem 215 passed / 0 failed / 1 ConPTY físico ignored em 45 suítes
+e build/deploy release aprovado por `refresh-slim.ps1 -Test`. Clippy
+focado em `slim-core` está verde. `cargo fmt --all -- --check` e Clippy workspace
+ainda expõem drift/6 diagnósticos preexistentes fora do slice PERF-02. Isso
+comprova componentes, headless e a bridge TUI central offline, não integração
+v1 completa.
 
 Integrado no headless: provider OpenAI-compatible/Anthropic SSE; read/list/search,
 write/patch/shell; filtragem de capabilities; auth nativa com DACL; `--image`
@@ -38,9 +41,9 @@ contexto na operational bar (W2, 2026-08-21: ContextRail superior removida),
 composer boxed de três rows, tool blocks tipados agregados por nome/turno,
 command palette Ctrl+P, markdown-light, UTF-8/VT console flags com restore exato,
 proptest/fault injection/golden matrix via TestBackend e benchmark long-session
-com gate §27 (p95 ~2 ms ≤ 16 ms em release). Estado re-verificado em rebuild
-limpo em 2026-08-21 (rustc 1.97.1): 45 suítes / 212 testes, 0 warnings —
-detalhes e achados de ambiente no tracker §8.
+com gate §27 (p95 ~2 ms ≤ 16 ms em release). Estado re-verificado em
+2026-08-22 (rustc 1.97.1): 45 suítes / 215 passed / 0 failed / 1 ConPTY ignored e
+0 warnings no build — detalhes e achados de ambiente no tracker §§7–8.
 
 Ainda não integrado no caminho normal: cache HTTP usa implementação/testes,
 mas não o construtor normal; CLI/TUI não oferecem resume/recovery selection/branch;
@@ -769,7 +772,7 @@ especificação das tarefas; esta seção registra evidência do worktree atual.
 
 | Área | Estado | Evidência/limite |
 |---|---|---|
-| Tasks 1–9 + tracker TUI | componentes/contratos, headless e fundação TUI M0–M2 implementados em fatias | 189 testes/45 suítes; PTY físico `#[ignore]`; Skills, MCP, subagentes e Todo/Plan/Goal não estão ligados ao loop/catálogo |
+| Tasks 1–9 + tracker TUI | componentes/contratos, headless e fundação TUI M0–M2 implementados em fatias | suíte atual: 215 passed / 0 failed / 1 ignored / 45 suítes; PTY físico `#[ignore]`; Skills, MCP, subagentes e Todo/Plan/Goal não estão ligados ao loop/catálogo |
 | Task 10 | componentes M0/reducer/testes | usados pela aplicação TUI real |
 | Task 11 | lifecycle/input M1 integrado | `--tui` usa composer/fullscreen real e restauração RAII |
 | Task 12 | integração M2 central concluída | `AppHandle` publica SSE incremental para bridge; tools/usage/cancel funcionam; cache HTTP normal inativo |

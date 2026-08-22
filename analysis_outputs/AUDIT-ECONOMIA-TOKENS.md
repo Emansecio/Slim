@@ -9,11 +9,16 @@
 > Selo de confiança: **COMPROVADO** (medido nesta sessão) / **PROVÁVEL**
 > (raciocínio sólido sobre o código) / **ESPECULATIVO** (vale experimentar).
 > Esforço: S (<1 dia) / M (dias) / L (semanas).
+>
+> **Checkpoint atual (2026-08-22):** números históricos abaixo não são baseline
+> do binário atual. A medição v2 e PERF-02 estão em
+> `bench/token-economy/v2/RESULTS.md` e prevalecem quando houver divergência.
 
 ## Status de implementação (slice TOK, 2026-08-21)
 
 Implementados **nativamente como default** (sem flags), comprovados por
-medição localhost pós-deploy e suíte 45/212 verde:
+medição localhost pós-deploy e suíte atual de 45 suítes / 215 passed /
+0 failed / 1 ConPTY físico ignored:
 
 | Item | Estado | Evidência |
 |---|---|---|
@@ -24,47 +29,46 @@ medição localhost pós-deploy e suíte 45/212 verde:
 | TOK-10 | ✅ implementado | cap de 8 KiB por stream stdout/stderr com `[truncated N bytes]` |
 | TOK-11 | ✅ implementado | instrução do resumo movida para DEPOIS do transcript |
 | TOK-12 | ✅ implementado | evento `ContextSnapshot {tools_bytes, history_bytes}` a cada turno (session log; TUI ignora) |
+| TOK-08 | ✅ implementado | `NATIVE_SYSTEM_PROMPT` compacto injetado em todos os adapters; `s1_read` atual mede 2.435 B de system |
 
-Pendentes (próximos slices, exigem telemetria acumulada primeiro):
-TOK-02, TOK-06, TOK-07, TOK-08. Reavaliação: TOK-09 permanece aberto com
-ganho marginal (descrições já ≤ 8 palavras).
+Pendentes: TOK-02 e TOK-06 exigem telemetria real persistida; TOK-07 continua
+especulativo pelo risco de turno extra/capability ausente. TOK-09 permanece
+aberto com ganho marginal (descrições já curtas).
 
-## Benchmark comparativo (Slim x Pi x Pit)
+## Benchmark comparativo atual (Slim x Pi x Pit)
 
-`bench/token-economy/` mede o payload real no fio dos três agentes na mesma
-tarefa contra fixture localhost. Resultado de 2026-08-21: Slim vence nos dois
-turnos (T1 1.747 B vs 5.908/11.732; T2 ~1.156 ~tok vs ~2.174/~3.630) — ver
-`bench/token-economy/RESULTS.md`.
+O benchmark autoritativo é `bench/token-economy/v2/`. No cenário `s1_read`,
+modelo `gpt-5.6-luna` e effort `high`, as medianas atuais são:
 
-## Números-base medidos (resumo)
+| Medição | Slim | Pi | Pit |
+|---|---:|---:|---:|
+| T1 total | 4.238 B | 5.941 B | 11.870 B |
+| System | 2.435 B | 2.739 B | 4.029 B |
+| Tools | 1.592 B (6) | 2.900 B (4) | 7.434 B (12) |
+| Soma dos requests | 11.354 B | 14.670 B | 26.528 B |
 
-| Medição | Valor |
-|---|---|
-| Payload turno 1 (OpenAI-compatível, Auto) | 1.667 B, dos quais tools = 1.552 B |
-| Payload turno 1 (ReadOnly, 3 tools) | 806 B, tools = 692 B |
-| Payload turno 1 (Anthropic, 6 tools direto) | 1.493 B, tools = 1.378 B |
-| Payload turno 2 (com leitura de 500 linhas) | 19.809 B; tool result = **17.341 B (87,5%)**; tools re-enviadas = 1.552 B |
-| System prompt | **0 B** (Anthropic/OpenAI); 33 B no Codex |
-| Prompt caching Anthropic | **inexistente** (sem `cache_control` no payload) |
-| Cache HTTP local no produto | **inativo** (`HttpProviderClient::new` em headless.rs:294,324,343) |
+No `s4_long` (15 runs de Slim), T1 = 4.239 B, Tn = 8.519 B,
+histórico Tn = 4.350 B e soma = 35.511 B. PERF-02 manteve **75/75 bodies
+byte-idênticos** antes/depois. O baseline v1 de 2026-08-21 fica preservado em
+`bench/token-economy/RESULTS.md` apenas como histórico.
 
-Evidências principais: `headless.rs:274–275`, `provider.rs:1688–1710`,
-`codex.rs:88`, `tools/mod.rs:91–97,173–177,247–291`, `tools/read.rs:8–9`,
-`runtime/mod.rs:76–77,352–403,1254–1278`, `budget.rs:17–27`, `compact.rs:3–6`.
+Estado atual relevante:
+
+- system prompt nativo presente nos adapters OpenAI, Anthropic e Codex;
+- prompt caching Anthropic presente na última tool;
+- cache HTTP do produto continua inativo nos construtores normais;
+- tools internas serializadas medem 1.418 B; o wire OpenAI mede 1.592 B após o
+  envelope do adapter.
 
 ---
 
 ## Backlog priorizado (impacto ÷ esforço)
 
-### TOK-01 — Prompt caching Anthropic (`cache_control`)
-- **Selo:** COMPROVADO (hoje = zero caching; grep negativo em `src/`)
-- **Proposta:** injetar `cache_control` marcando o bloco de tools e o início
-  estável das messages no `build_messages_request_with_tools` do
-  `AnthropicAdapter`.
-- **Ganho:** até ~90% de desconto no input dos turnos 2+ (~estimativa,
-  depende do pricing do endpoint). Maior vitória financeira da lista.
-- **Esforço:** S · **Risco:** Baixo (campo opcional; validar que endpoints
-  sem suporte ignoram sem erro 400).
+### TOK-01 — Prompt caching Anthropic (`cache_control`) — ✅ IMPLEMENTADO
+- **Selo:** COMPROVADO no payload capturado e por teste dedicado.
+- **Estado:** a última tool recebe `cache_control: {"type":"ephemeral"}`.
+- **Limite:** economia financeira depende do endpoint/pricing real; o fixture
+  localhost comprova o wire, não desconto de cobrança.
 
 ### TOK-02 — Degradar tool outputs antigos (placeholder após N turnos)
 - **Selo:** PROVÁVEL
@@ -113,14 +117,11 @@ Evidências principais: `headless.rs:274–275`, `provider.rs:1688–1710`,
 - **Ganho:** ~55% do bloco tools/turno.
 - **Esforço:** M · **Risco:** Médio (turno extra se prever errado).
 
-### TOK-08 — System prompt mínimo anti-desperdício
-- **Selo:** ESPECULATIVO
-- **Proposta:** ~150 tokens condicionais ensinando economia ("cite
-  `linha:N-M`; releia trechos em vez de colar; não releia o arquivo todo").
-  Hoje NÃO há system prompt algum (`headless.rs:274–275`; adapters sem campo
-  `system`; só Codex tem 1 linha, `codex.rs:88`).
-- **Ganho:** indireto — ataca o consumidor nº 1 (leituras redundantes).
-- **Esforço:** S · **Risco:** Médio (exige A/B de qualidade).
+### TOK-08 — System prompt nativo compacto — ✅ IMPLEMENTADO
+- **Selo:** COMPROVADO no wire dos três adapters.
+- **Estado:** `NATIVE_SYSTEM_PROMPT` está ativo; `s1_read` mede 2.435 B.
+- **Próximo passo:** nenhum corte adicional sem provar pelo menos 300 B de
+  economia e zero perda semântica em A/B.
 
 ### TOK-09 — Encurtar schemas/descrições das tools
 - **Selo:** COMPROVADO (custo atual medido por tool)
@@ -177,8 +178,7 @@ Evidências principais: `headless.rs:274–275`, `provider.rs:1688–1710`,
 - Providers não expõem essa primitiva. Equivalente simples: TOK-06.
 
 ### TOK-18 — Few-shot examples sob demanda — ❌ DESCARTADO (nada a remover)
-- Não há system prompt nem few-shots hoje (verificado). Se TOK-08 criar um,
-  manter exemplos fora.
+- O system prompt nativo atual não contém few-shots. Manter exemplos fora.
 
 ### TOK-19 — Modo "contexto frio" para tarefas longas — 🔬 EXPERIMENTO FUTURO
 - Iniciar sessão com resumo + só o arquivo-alvo; agente puxa o resto sob
@@ -191,10 +191,22 @@ Evidências principais: `headless.rs:274–275`, `provider.rs:1688–1710`,
 - **Entradas registradas:** 21 (15 do backlog + 6 da seção fora-da-caixa).
 - **Ideias distintas:** **19** (TOK-08 e TOK-15 apareceram duplicadas nas duas
   seções do relatório original; consolidadas aqui).
-- **Status:** 9 acionáveis curtas (TOK-01, 03, 04, 05, 08, 09, 10, 11, 12),
-  3 médias (TOK-02, 06, 07), 2 adiadas (TOK-14, 16), 1 experimento futuro
-  (TOK-19), 4 descartadas com justificativa (TOK-13, 15, 17, 18).
-- **Quick wins <1 dia:** TOK-01, TOK-03, TOK-05, TOK-12.
+- **Implementadas:** TOK-01, 03, 04, 05, 08, 10, 11 e 12.
+- **Aberta marginal:** TOK-09.
+- **Pendentes com evidência insuficiente/risco:** TOK-02, 06 e 07.
+- **Adiadas:** TOK-14 e 16; **experimento futuro:** TOK-19.
+- **Descartadas:** TOK-13, 15, 17 e 18.
+
+## Slices de performance relacionados
+
+| Item | Estado | Evidência |
+|---|---|---|
+| PERF-01 | ✅ benchmark versionado | `tool_setup`: 11 × 20.000 iterações; setup repetido 9.305,065 ns, cacheado 0,730 ns |
+| PERF-02 | ✅ implementado e medido | setup das tools uma vez por agent loop; ~9,3 µs poupados por turno adicional; 75/75 payloads idênticos |
+
+O A/B E2E `s4_long` variou de 1.168 para 1.170 ms de processo mediano
+(+0,17%), ruído esperado num harness dominado por `Start-Job`. Não há claim de
+ganho visível ao usuário.
 
 ## Convenção de uso
 

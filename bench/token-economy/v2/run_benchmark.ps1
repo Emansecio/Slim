@@ -8,18 +8,17 @@
     For each scenario (s1_read, s2_codegen, s3_multistep, s4_long) and each
     run (default 3), runs the SAME scripted task on every agent and records:
 
-      - request bodies   -> captures\<scenario>\<agent>\req_<n>.json
-      - server timings   -> captures\<scenario>\<agent>\req_<n>.meta.json
+      - request bodies   -> captures\<scenario>\run<N>\<agent>\req_<n>.json
+      - server timings   -> captures\<scenario>\run<N>\<agent>\req_<n>.meta.json
       - process timings  -> runs\<scenario>_run<N>_<agent>_timing.json
 
     Model pinned for all agents: gpt-5.6-luna with reasoning effort HIGH.
     Pi/Pit run against isolated agent dirs (.agent-dirs-v2); the user's real
     configuration is never touched.
 
-    NOTE (Slim): the CLI headless path currently does not plumb a reasoning
-    effort option (verified in crates/slim-cli/src/cli.rs). SLIM_EFFORT is
-    exported anyway so the compliance gate records the gap honestly instead
-    of hiding it. See PLAN.md "Pinagem do modelo".
+    Slim headless consumes SLIM_EFFORT/layered config and sends
+    reasoning_effort on the wire. The runner exports SLIM_EFFORT=high and the
+    compliance gate rejects any regression. See PLAN.md "Pinagem do modelo".
 #>
 param(
     [string]$SlimPath = "$env:USERPROFILE\bin\Slim.exe",

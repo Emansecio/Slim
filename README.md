@@ -50,7 +50,7 @@ Chaves reconhecidas hoje (desconhecidas sÃ£o ignoradas):
 ```toml
 model = "gpt-4o-mini"
 endpoint = "https://api.openai.com/v1/chat/completions"
-effort = "high"   # low | medium | high (afeta o label do composer na TUI)
+effort = "high"   # low | medium | high (label TUI + reasoning_effort no provider)
 ```
 
 - Arquivo ausente Ã© normal; **arquivo presente e invÃ¡lido aborta** com erro
@@ -59,12 +59,16 @@ effort = "high"   # low | medium | high (afeta o label do composer na TUI)
   config sozinha nÃ£o ativa rede.
 
 
-Os 212 testes verdes em 45 suítes de teste comprovam componentes, contratos e caminhos
-headless/TUI offline; nÃ£o comprovam integraÃ§Ã£o completa do produto:
+Os 215 testes passados / 0 failed em 45 suítes, mais 1 ConPTY físico ignorado, comprovam
+componentes, contratos e caminhos headless/TUI offline; nÃ£o comprovam
+integraÃ§Ã£o completa do produto:
 
-- `cargo fmt --all -- --check`, Clippy workspace com `-D warnings`, `cargo test
-  --workspace` e `cargo build --workspace --release`: todos exit code `0`;
-- 212 testes offline em 45 suítes, incluindo proptest, fault injection,
+- `cargo test --workspace` e `refresh-slim.ps1 -Test`: exit code `0`, build
+  release, deploy e smoke test concluÃ­dos;
+- Clippy focado em `slim-core --all-targets -D warnings`: exit `0`;
+- `cargo fmt --all -- --check` tem drift preexistente em arquivos fora do slice;
+  o Clippy workspace encontra 6 diagnÃ³sticos preexistentes em `slim-tui`;
+- 215 passed / 0 failed / 1 ignored em 45 suítes, incluindo proptest, fault injection,
   golden matrix via TestBackend e benchmark long-session com gate de budget;
 - E2E do binÃ¡rio real contra fixtures localhost, sem chamada a provider live;
 - nenhuma matriz fÃ­sica completa de terminal, IME, mouse ou clipboard foi

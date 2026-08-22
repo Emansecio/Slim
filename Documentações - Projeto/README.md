@@ -78,12 +78,14 @@ implementado.
 
 ## Evidência e limites
 
-O gate reportado é: `cargo fmt --all -- --check`, Clippy workspace com
-`-D warnings`, `cargo test --workspace` e `cargo build --workspace --release`,
-todos exit `0`, com 212 testes offline em 45 suítes de teste (incluindo proptest,
-fault injection, golden matrix e bench com gate). O E2E inclui o binário
-real contra fixtures localhost. Nenhum provider live foi chamado e não foi
-executada a matriz física completa de terminal, IME, mouse ou clipboard.
+O gate atual é `cargo test --workspace` + `refresh-slim.ps1 -Test`, ambos
+verdes: 215 passed / 0 failed / 1 ConPTY físico ignored em 45 suítes e
+0 warnings no build; release implantado e smoke test aprovado. Clippy focado
+em `slim-core --all-targets -D warnings` também está verde. O workspace ainda
+tem drift de `cargo fmt --check` e 6 diagnósticos Clippy preexistentes em
+`slim-tui`, fora deste slice. O E2E inclui o binário real contra fixtures
+localhost. Nenhum provider live foi chamado e não foi executada a matriz
+física completa de terminal, IME, mouse ou clipboard.
 
 O release contém somente `slim.exe`; o builder usa caminhos relativos ao próprio
 script e metadados ZIP fixos. Verifique-o com `python3 release/build_release.py`

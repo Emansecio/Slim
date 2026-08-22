@@ -1,13 +1,13 @@
 # PLAN — Benchmark v2: economia de tokens + velocidade (Slim x Pi x Pit)
 
-Status: **estrutura preparada, NÃO executada** (decisão do usuário, 2026-08-21).
+Status: **campanha executada em 2026-08-22**; resultados atuais em `RESULTS.md`.
 Modelo fixo para todos os agentes: **gpt-5.6-luna**, thinking **HIGH**.
 
 ## Objetivos
 
-1. Robustez: múltiplos cenários, N repetições, compliance gate, tempos medidos.
-2. Novas dimensões: **velocidade de início** (startup até o 1º request) e
-   **tempo até o primeiro código gerado** (TTFC) e duração total da tarefa.
+1. Robustez: múltiplos cenários, N repetições, compliance gate e tempos locais.
+2. Novas dimensões: estimativas de **velocidade de início** e **tempo até o
+   primeiro código gerado** (TTFC), além da duração total medida do processo.
 
 ## Cenários
 
@@ -28,11 +28,11 @@ Gravados em `captures/<cenario>/run<N>/<agente>/req_<k>.meta.json`
 (epoch ms + monotonic do servidor) e `runs/<cenario>_run<N>_<agente>_timing.json`
 (início/fim do processo, medidos no runner):
 
-- `startup_ms` = chegada do request 1 − início do processo → **latência de início**
-- `ttfc_ms` = chegada do request 2 − início do processo (no s2/s3/s4 o request 2
-  só acontece depois de o agente ter escrito o código no disco) → **tempo até o
-  primeiro código gerado**
-- `total_ms` = fim do processo − início
+- `startup_ms` = **estimativa** do analisador: duração total do processo menos
+  o span entre o primeiro e o último request; pode incluir teardown final
+- `ttfc_ms` = **estimativa** ancorada no mesmo valor, mais o gap até o request 2;
+  em s2/s3/s4 esse request ocorre após o agente escrever o código no disco
+- `total_ms` = fim do processo − início, medição direta do runner
 - `turn_gap_ms` = intervalo entre requests consecutivos (overhead de loop)
 - `sum_bytes_all_requests` = custo total de contexto da tarefa inteira
   (soma dos payloads), não só o último turno
@@ -48,14 +48,9 @@ dele não pode ser comparado até corrigir.
 
 Configuração por agente:
 
-- **Slim**: `--model gpt-5.6-luna`. ⚠️ **PRÉ-REQUISITO (gap verificado no
-  código)**: o caminho headless da CLI constrói `ProviderRunOptions::default()`
-  (`crates/slim-cli/src/cli.rs`) e não consome `effort` do `slim.toml` nem env;
-  só o TUI lê `SLIM_EFFORT` (`crates/slim-cli/src/tui.rs:109`). O adapter já
-  suporta enviar o campo (`slim-core/src/provider.rs:1409`). Patch mínimo
-  sugerido (decidir antes de rodar): aceitar `SLIM_EFFORT` (ou consumir
-  `layered_config.effort`) em `run_cli` e repassar via
-  `ProviderRunOptions::with_reasoning_effort`. Sem isso, o gate marca o Slim.
+- **Slim**: `--model gpt-5.6-luna`; headless consome `SLIM_EFFORT`/config em
+  camadas e repassa `ProviderRunOptions::with_reasoning_effort`. O runner fixa
+  `SLIM_EFFORT=high`; o compliance gate invalida qualquer regressão no wire.
 - **Pi**: `models.json` isolado com modelo `gpt-5.6-luna`,
   `"reasoning": true` + `"thinkingLevelMap": {"high": "high"}`; CLI com
   `--thinking high` (docs/usage.md do Pi).

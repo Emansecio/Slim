@@ -12,8 +12,8 @@
 | pi | _ | _ | _ |
 | pit | _ | _ | _ |
 
-⚠️ Qualquer ❌ invalida a comparação daquele agente. Gap conhecido do Slim:
-headless não plumva effort (ver PLAN.md) — corrigir ANTES de rodar.
+⚠️ Qualquer ❌ invalida a comparação daquele agente. Slim headless consome
+`SLIM_EFFORT`/config em camadas; o gate detecta regressão no wire.
 
 ## 1. Tokens — s1_read (baseline leitura)
 
@@ -31,14 +31,14 @@ _(repetir blocos por cenário: s2_codegen, s3_multistep, s4_long)_
 
 | Cenário | Métrica | Slim | Pi | Pit |
 |---|---|---|---|---|
-| todos | startup_ms (mediana/min) | | | |
-| s2_codegen | TTFC_ms (mediana/min) | | | |
+| todos | startup_ms estimado (mediana/min) | | | |
+| s2_codegen | TTFC_ms estimado (mediana/min) | | | |
 | todos | gap entre turnos | | | |
 | todos | tempo total do processo | | | |
 
-**Definições**: startup = 1º request − início do processo; TTFC = chegada do
-request pós-escrita-do-código − início do processo; gaps = overhead do loop
-entre requests; tempo total = fim − início do processo.
+**Definições**: startup/TTFC são estimativas derivadas de `process_total` e do
+span/gaps dos requests e podem incluir teardown final; gaps vêm do servidor;
+tempo total = fim − início do processo, medido diretamente pelo runner.
 
 ## 3. Leitura dos números
 
