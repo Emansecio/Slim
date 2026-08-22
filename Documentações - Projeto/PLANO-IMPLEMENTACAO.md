@@ -18,10 +18,11 @@ tipados, MCP stdio/Streamable HTTP e testes unit/property/golden/PTY.
 
 ## Estado de implementação (atualizado em 2026-08-22)
 
-O workspace tem 215 passed / 0 failed / 1 ConPTY físico ignored em 45 suítes
+O workspace tem 220 passed / 0 failed / 1 ConPTY físico ignored em 45 suítes
 e build/deploy release aprovado por `refresh-slim.ps1 -Test`. Clippy
-focado em `slim-core` está verde. `cargo fmt --all -- --check` e Clippy workspace
-ainda expõem drift/6 diagnósticos preexistentes fora do slice PERF-02. Isso
+focado em `slim-core` está verde. `cargo fmt --all -- --check` ainda tem drift;
+Clippy para em 6 diagnósticos `slim-tui`, e `slim-cli --no-deps` revela mais 21
+preexistentes fora dos slices de performance. Isso
 comprova componentes, headless e a bridge TUI central offline, não integração
 v1 completa.
 
@@ -42,7 +43,7 @@ composer boxed de três rows, tool blocks tipados agregados por nome/turno,
 command palette Ctrl+P, markdown-light, UTF-8/VT console flags com restore exato,
 proptest/fault injection/golden matrix via TestBackend e benchmark long-session
 com gate §27 (p95 ~2 ms ≤ 16 ms em release). Estado re-verificado em
-2026-08-22 (rustc 1.97.1): 45 suítes / 215 passed / 0 failed / 1 ConPTY ignored e
+2026-08-22 (rustc 1.97.1): 45 suítes / 220 passed / 0 failed / 1 ConPTY ignored e
 0 warnings no build — detalhes e achados de ambiente no tracker §§7–8.
 
 Ainda não integrado no caminho normal: cache HTTP usa implementação/testes,
@@ -772,7 +773,7 @@ especificação das tarefas; esta seção registra evidência do worktree atual.
 
 | Área | Estado | Evidência/limite |
 |---|---|---|
-| Tasks 1–9 + tracker TUI | componentes/contratos, headless e fundação TUI M0–M2 implementados em fatias | suíte atual: 215 passed / 0 failed / 1 ignored / 45 suítes; PTY físico `#[ignore]`; Skills, MCP, subagentes e Todo/Plan/Goal não estão ligados ao loop/catálogo |
+| Tasks 1–9 + tracker TUI | componentes/contratos, headless e fundação TUI M0–M2 implementados em fatias | suíte atual: 220 passed / 0 failed / 1 ignored / 45 suítes; PTY físico `#[ignore]`; Skills, MCP, subagentes e Todo/Plan/Goal não estão ligados ao loop/catálogo |
 | Task 10 | componentes M0/reducer/testes | usados pela aplicação TUI real |
 | Task 11 | lifecycle/input M1 integrado | `--tui` usa composer/fullscreen real e restauração RAII |
 | Task 12 | integração M2 central concluída | `AppHandle` publica SSE incremental para bridge; tools/usage/cancel funcionam; cache HTTP normal inativo |

@@ -59,7 +59,7 @@ effort = "high"   # low | medium | high (label TUI + reasoning_effort no provide
   config sozinha nÃ£o ativa rede.
 
 
-Os 215 testes passados / 0 failed em 45 suítes, mais 1 ConPTY físico ignorado, comprovam
+Os 220 testes passados / 0 failed em 45 suítes, mais 1 ConPTY físico ignorado, comprovam
 componentes, contratos e caminhos headless/TUI offline; nÃ£o comprovam
 integraÃ§Ã£o completa do produto:
 
@@ -67,8 +67,9 @@ integraÃ§Ã£o completa do produto:
   release, deploy e smoke test concluÃ­dos;
 - Clippy focado em `slim-core --all-targets -D warnings`: exit `0`;
 - `cargo fmt --all -- --check` tem drift preexistente em arquivos fora do slice;
-  o Clippy workspace encontra 6 diagnÃ³sticos preexistentes em `slim-tui`;
-- 215 passed / 0 failed / 1 ignored em 45 suítes, incluindo proptest, fault injection,
+  o Clippy workspace para em 6 diagnÃ³sticos preexistentes de `slim-tui`; uma
+  passada `slim-cli --no-deps` expÃµe ainda 20 `let_unit_value` + 1 assert bool;
+- 220 passed / 0 failed / 1 ignored em 45 suítes, incluindo proptest, fault injection,
   golden matrix via TestBackend e benchmark long-session com gate de budget;
 - E2E do binÃ¡rio real contra fixtures localhost, sem chamada a provider live;
 - nenhuma matriz fÃ­sica completa de terminal, IME, mouse ou clipboard foi

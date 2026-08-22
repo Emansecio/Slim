@@ -237,7 +237,13 @@ reducer Ãºnico, render puro, Windows-only.
 | final | â€” | suÃ­te e deploy verdes no checkpoint TOK; contagem atual supersede este registro histÃ³rico | sessÃ£o TOK encerrada |
 | exec | PERF-01 | microbenchmark `tool_setup` versionado (commit `74f24d2`): 6 tools, 1.418 B internos, 11 Ã— 20.000 iteraÃ§Ãµes; re-mediÃ§Ã£o: 9.305,065 ns setup repetido vs 0,730 ns cacheado (12.746,7Ã— isolado) | harness de mediÃ§Ã£o; sem mudanÃ§a de produto |
 | exec | PERF-02 | `definitions_for_mode(mode)` + serializaÃ§Ã£o de `tools_bytes` calculadas preguiÃ§osamente uma vez por agent loop; economia ~9,3 Âµs por turno adicional; 75/75 payloads `s4_long` byte-idÃªnticos antes/depois; processo mediano 1.168â†’1.170 ms (+0,17%, ruÃ­do do `Start-Job`) | comportamento, APIs, wire e schema preservados; DESIGN Â§1.1 sem mudanÃ§a funcional |
-| final | PERF-02 | `cargo test --workspace`: 45 suÃ­tes / 215 passed / 0 failed / 1 ignored / 0 warnings; Clippy `slim-core --all-targets -D warnings` verde; `refresh-slim.ps1 -Test` imprimiu `OK:`; binÃ¡rio implantado SHA-256 `bc826e987097bb6dd49b680bd28d4e9fb3ce663a2937495a4fe27921a2552847` | fmt/workspace Clippy mantÃªm drift/6 achados preexistentes fora do slice |
+| final | PERF-02 | gate e deploy verdes naquele checkpoint; hash implantado `bc826e987097bb6dd49b680bd28d4e9fb3ce663a2937495a4fe27921a2552847`; contagem atual estÃ¡ no fim desta tabela | fmt/workspace Clippy mantinham drift/6 achados preexistentes fora do slice |
+| exec | PERF-03 | Shell passa a drenar stdout/stderr em threads concorrentes enquanto monitora timeout/cancel; regressÃ£o 5 MiB por stream: RED timeout 10,26 s â†’ GREEN 0,76 s; buffers crus/separados e cap de tool preservados | commit `13f582e` |
+| exec | PERF-04 | request provider validado/construÃ­do uma vez; cache key e clones de eventos sÃ³ existem com cache ativo; adapter contador 3â†’1 builds; 18 testes provider HTTP verdes | commit `7086ee9` |
+| exec | PERF-05 | SSE usa cursor, linhas emprestadas e um drain por chunk; erro malformado continua consumindo a linha; 20k deltas 117,029â†’8,264 ms mediana (14,2Ã—) | commit `129f98c` |
+| exec | PERF-06 | encoder Base64 manual removido em favor de `base64::STANDARD`; -20 linhas lÃ­quidas e fixtures `AAEC` OpenAI/Anthropic idÃªnticas | commit `0609894` |
+| exec | PERF-07 | `read_file_range` troca `read_to_string` por `BufReader`/buffer reutilizado; memÃ³ria O(file)â†’O(max line + page), CRLF/footer/EOF preservados | commit `f266922` |
+| final | PERF-03â€“07 | 45 suÃ­tes / 220 passed / 0 failed / 1 ignored / 0 warnings; refresh `-Test` OK; 25/25 bodies `s4_long` idÃªnticos; processo 1.167â†’1.174 ms (+0,60%, ruÃ­do); binÃ¡rio SHA-256 `902f273eb6a72855f1ad1ced3d5b9e6a9e1c8029ccb0835738f4c2525cd96cbf`, 6.671.872 B | comportamento/wire/schema preservados |
 
 ---
 
@@ -250,7 +256,7 @@ com o toolchain correto (`stable-x86_64-pc-windows-msvc`, rustc **1.97.1**,
 `RUSTUP_HOME` do scoop persist):
 
 Este bloco registrava uma contagem histÃ³rica anterior. A contagem autoritativa
-atual estÃ¡ no fim do Â§7: 45 suÃ­tes / 215 passed / 0 failed / 1 ignored /
+atual estÃ¡ no fim do Â§7: 45 suÃ­tes / 220 passed / 0 failed / 1 ignored /
 0 warnings. As 45 suÃ­tes incluem os Doc-tests dos trÃªs crates. O Ãºnico
 `#[ignore]` Ã© o gate C5 (`tui_pty.rs`), que segue pendente de console Windows
 fÃ­sico (P0). W1 adicionou 5 testes e W4 adicionou 6 testes unitÃ¡rios de config;

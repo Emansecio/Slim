@@ -28,7 +28,7 @@
         "high"
       ],
       "ok": true,
-      "requests": 192
+      "requests": 217
     }
   },
   "tokens": {
@@ -282,12 +282,12 @@
         "process_total_median_ms": 3436
       },
       "slim": {
-        "startup_median_ms": 1162,
+        "startup_median_ms": 1163,
         "startup_min_ms": 1145,
-        "ttfc_median_ms": 1164,
+        "ttfc_median_ms": 1168,
         "ttfc_min_ms": 1146,
         "gap_median_ms": 2,
-        "process_total_median_ms": 1170
+        "process_total_median_ms": 1174
       }
     }
   }

@@ -47,8 +47,8 @@ not a refactor mandate. The current behavior is the contract.
 
 `bench/token-economy/v2/` measures real wire payloads against a local
 OpenAI-compatible SSE server. The current `s1_read` baseline is median-of-3;
-the PERF-02 `s4_long` before/after arms use 15 runs each. Model and effort were
-pinned to `gpt-5.6-luna` / `high`:
+the PERF-02 `s4_long` arms use 15 runs each and the PERF-03–07 regression arm
+uses 5 runs. Model and effort were pinned to `gpt-5.6-luna` / `high`:
 
 | Metric | Slim | Pi | Pit |
 |---|---|---|---|
@@ -69,6 +69,9 @@ the table above. Additional measurements:
   speedup 12.746,7× (11 × 20.000 iterations).
 - PERF-02 preserves all 75/75 `s4_long` request bodies byte-for-byte and saves
   approximately 9,3 µs per additional agent turn.
+- PERF-03–07 preserve another 25/25 bodies byte-for-byte; fix shell pipe
+  deadlock, reduce uncached request builds 3→1, accelerate a 20k-line SSE
+  buffer 14,2×, remove the manual Base64 loop, and bound paged-read memory.
 - Est-token estimator: `(chars * 2).div_ceil(7)` (÷3.5 conservative).
 
 Existing audit backlog: `analysis_outputs/AUDIT-ECONOMIA-TOKENS.md` (items
@@ -94,28 +97,24 @@ without new evidence.
    risk behavior. Only propose if you can prove ≥300 B savings with zero
    semantic loss, and validate via A/B (`run_benchmark.ps1 -VariantTag`).
 4. **Startup**: already ~11 ms — treat as solved. Do not spend time here.
-5. **Scheduler/loop baseline**: ~2 ms/turn in the coarse harness — treat the
-   scheduler as solved, but benchmark the still-duplicated provider payload
-   construction and SSE retention/parsing separately because they scale with
-   payload/event size.
+5. **Scheduler/loop baseline**: ~2 ms/turn in the coarse harness. PERF-02–07
+   removed the measured adjacent CPU/I/O waste; do not reopen without a new
+   profile.
 
-## Verified opportunities after PERF-02 (not implemented)
+## Implemented performance wave (PERF-03–07)
 
-Static reviews found concrete next candidates. They are hypotheses until their
-own benchmark and must remain separate commits:
+| Slice | Result | Proof |
+|---|---|---|
+| PERF-03 | shell drains both pipes while running | 10 MiB combined: timeout at 10,26 s → success at 0,76 s |
+| PERF-04 | one request build; no cache work/event clones when cache is off | counting adapter 3→1; cache tests green |
+| PERF-05 | linear SSE cursor/drain | 117,029 ms → 8,264 ms median, 14,2× |
+| PERF-06 | standard Base64 crate | same `AAEC` wire output; 20 net lines removed |
+| PERF-07 | streaming paginated read | O(file) retained memory → O(max line + page), same output |
 
-| Priority | Candidate | Current evidence | Verdict |
-|---|---|---|---|
-| P0 | Drain shell stdout/stderr while the child runs | pipes are drained only after process exit; large output can deadlock | reproduce and fix as bug |
-| P1 | Build provider request once and skip cache-key work when cache is off | normal clients have `cache: None`, but request construction/canonicalization is repeated | measure, then PERF-03 |
-| P1 | Do not clone/retain provider events when cache is off | every SSE event is cloned despite no cache consumer | measure, separate commit |
-| P1 | Linearize SSE buffer draining | front `String::drain` per line is O(n²) for batched chunks; three reviews agreed | benchmark coalesced chunks |
-| P1 | Exercise TUI beyond 4.096 blocks | WrapCache capacity is 4.096; current benchmark stops at 3.200 and can miss thrash | expand benchmark first |
-| P2 | Replace manual Base64 with the installed crate | image path reimplements padded standard Base64 | measure and simplify |
-| P2 | Stream bounded `read` pages | current implementation loads the entire file | benchmark RSS/latency |
-| P2 | Bound core→TUI retention | upstream channel and AppHandle event vector are unbounded | design required; no adjacent patch |
-
-Details and the full verdict table live in `bench/token-economy/v2/RESULTS.md`.
+The deployed A/B preserved 25/25 `s4_long` request bodies. Remaining candidates
+are WrapCache >4.096 blocks, persistence batching, bounded TUI retention, and
+read-only tool parallelism; all require separate behavioral evidence/design.
+Details live in `bench/token-economy/v2/RESULTS.md`.
 
 ## Required method (no exceptions)
 

@@ -11,13 +11,13 @@
 > Esforço: S (<1 dia) / M (dias) / L (semanas).
 >
 > **Checkpoint atual (2026-08-22):** números históricos abaixo não são baseline
-> do binário atual. A medição v2 e PERF-02 estão em
+> do binário atual. A medição v2 e PERF-02–07 estão em
 > `bench/token-economy/v2/RESULTS.md` e prevalecem quando houver divergência.
 
 ## Status de implementação (slice TOK, 2026-08-21)
 
 Implementados **nativamente como default** (sem flags), comprovados por
-medição localhost pós-deploy e suíte atual de 45 suítes / 215 passed /
+medição localhost pós-deploy e suíte atual de 45 suítes / 220 passed /
 0 failed / 1 ConPTY físico ignored:
 
 | Item | Estado | Evidência |
@@ -203,10 +203,16 @@ Estado atual relevante:
 |---|---|---|
 | PERF-01 | ✅ benchmark versionado | `tool_setup`: 11 × 20.000 iterações; setup repetido 9.305,065 ns, cacheado 0,730 ns |
 | PERF-02 | ✅ implementado e medido | setup das tools uma vez por agent loop; ~9,3 µs poupados por turno adicional; 75/75 payloads idênticos |
+| PERF-03 | ✅ bug corrigido | pipes shell concorrentes: 10 MiB timeout 10,26 s → sucesso 0,76 s |
+| PERF-04 | ✅ implementado | request builds 3→1; cache key e clones ausentes quando cache está off |
+| PERF-05 | ✅ implementado e medido | buffer SSE 20k: 117,029 → 8,264 ms (14,2×) |
+| PERF-06 | ✅ simplificado | Base64 manual substituído pela crate instalada; wire `AAEC` idêntico |
+| PERF-07 | ✅ implementado | leitura paginada retém só maior linha + página, não o arquivo inteiro |
 
-O A/B E2E `s4_long` variou de 1.168 para 1.170 ms de processo mediano
-(+0,17%), ruído esperado num harness dominado por `Start-Job`. Não há claim de
-ganho visível ao usuário.
+O A/B E2E PERF-03–07 preservou **25/25 bodies byte-idênticos**. Processo mediano
+variou 1.167→1.174 ms (+0,60%), ruído esperado num harness dominado por
+`Start-Job`. Não há claim de ganho visível no cenário minúsculo; o ganho SSE e
+a correção de pipe aparecem em cargas específicas.
 
 ## Convenção de uso
 

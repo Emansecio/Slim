@@ -72,7 +72,7 @@ milestone correspondente passou seu gate.
   contexto (`ctx N% · Nk/128k`) + tokens ↑↓ à direita — sem rail superior
   (W2, 2026-08-21: substitui a antiga ContextRail) e sem duplicar model/effort,
   que vivem apenas no label do composer box;
-- verificação atual: workspace verde (45 suítes / 215 passed / 0 failed /
+- verificação atual: workspace verde (45 suítes / 220 passed / 0 failed /
   1 ConPTY físico ignored), incluindo proptest, fault injection e golden
   matrix via TestBackend; re-verificado por `refresh-slim.ps1 -Test` em
   2026-08-22 (rustc 1.97.1), com build/deploy/smoke aprovados (tracker §7);

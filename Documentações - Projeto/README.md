@@ -79,11 +79,12 @@ implementado.
 ## Evidência e limites
 
 O gate atual é `cargo test --workspace` + `refresh-slim.ps1 -Test`, ambos
-verdes: 215 passed / 0 failed / 1 ConPTY físico ignored em 45 suítes e
+verdes: 220 passed / 0 failed / 1 ConPTY físico ignored em 45 suítes e
 0 warnings no build; release implantado e smoke test aprovado. Clippy focado
 em `slim-core --all-targets -D warnings` também está verde. O workspace ainda
-tem drift de `cargo fmt --check` e 6 diagnósticos Clippy preexistentes em
-`slim-tui`, fora deste slice. O E2E inclui o binário real contra fixtures
+tem drift de `cargo fmt --check`; Clippy para em 6 diagnósticos preexistentes de
+`slim-tui`, e a passada `slim-cli --no-deps` revela mais 21 preexistentes. O E2E
+inclui o binário real contra fixtures
 localhost. Nenhum provider live foi chamado e não foi executada a matriz
 física completa de terminal, IME, mouse ou clipboard.
 

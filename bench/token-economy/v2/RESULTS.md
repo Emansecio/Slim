@@ -100,28 +100,39 @@ Binário implantado no braço antes: SHA-256
 permanece viva até o fim do loop em vez de ser recriada; isso estende sua vida,
 mas não aumenta o pico já pago durante cada request.
 
-## 4. Próximas oportunidades verificadas estaticamente
+## 4. PERF-03–07 — segunda onda implementada
 
-Nenhuma destas foi implementada ou teve ganho medido. Cada uma exige benchmark
-e commit separado.
+| Slice | Mudança entregue | Evidência antes → depois |
+|---|---|---|
+| PERF-03 | stdout/stderr drenados concorrentemente durante o processo | 5 MiB por stream: timeout/falha em 10,26 s → sucesso em 0,76 s; buffers continuam separados e crus |
+| PERF-04 | request HTTP construído uma vez; cache key/clones só com cache ativo | adapter contador: **3 → 1 builds** no caminho normal; suíte de cache permaneceu verde |
+| PERF-05 | parser SSE por cursor e um único drain por chunk | 20.000 deltas num buffer: **117,029 ms → mediana 8,264 ms (14,2×)** |
+| PERF-06 | encoder Base64 manual substituído pela crate já instalada | -20 linhas líquidas; fixtures OpenAI/Anthropic preservaram `AAEC` |
+| PERF-07 | `read` paginado usa `BufReader` e buffer de linha reutilizado | memória retida: O(tamanho do arquivo) → O(maior linha + página); CRLF/footer/EOF preservados |
 
-| Prioridade | Oportunidade | Evidência atual | Esforço/risco | Veredito |
-|---|---|---|---|---|
-| P0 | Drenar stdout/stderr do shell durante execução | pipes são lidos só após `try_wait()` indicar término; output grande pode bloquear o filho | M / baixo-médio | **Corrigir como bug**, com repro de 10 MiB |
-| P1 | Construir payload provider uma vez | caminho sem cache constrói/serializa request para validação, calcula cache key e constrói novamente | S/M / baixo | **Medir e fazer** |
-| P1 | Não clonar eventos quando cache está desligado | todo delta é clonado e retido embora clientes normais usem `cache: None` | S / baixo | **Medir e fazer** |
-| P1 | Tornar parser SSE linear | `find + to_owned + drain` frontal por linha; três revisões independentes confirmaram O(n²) em chunks agrupados | S/M / baixo-médio | **Medir e fazer** |
-| P1 | Eliminar cliff do WrapCache acima de 4.096 blocos | `HeightIndex` varre todos os blocos; benchmark cobre apenas 3.200 e o LRU pode thrash acima da capacidade | M / médio | **Ampliar benchmark primeiro** |
-| P2 | Usar crate `base64` já instalada | encoder manual escalar no caminho de imagens de até 20 MiB | S / baixo | **Medir e simplificar** |
-| P2 | Paginar `read` sem carregar arquivo inteiro | `read_to_string` aloca todo o arquivo para uma janela limitada | M / baixo | **Medir RSS/latência** |
-| P2 | Batch de persistência JSONL | `--session` chama `sync_data()` por evento após o run | S/M / médio | **Deferir** até fechar contrato de durabilidade |
-| P2 | Limitar fila core→TUI e retenção de eventos | há `mpsc::channel` upstream ilimitado e `AppHandle` mantém o vetor completo | M/L / médio | **Exige design**, não correção adjacente |
-| P3 | Paralelizar tools somente-leitura | runtime executa chamadas serialmente | M / médio-alto | **Deferir**: ordem/eventos/snapshot podem mudar |
+A/B do binário implantado no `s4_long`, N=5:
+
+- **25/25 request bodies byte-idênticos** ao baseline preservado;
+- T1 4.239 B, Tn 8.519 B e soma 35.511 B: deltas zero;
+- 25/25 novos requests de compliance verdes;
+- processo mediano 1.167 → 1.174 ms (+7 ms, +0,60%), ruído do `Start-Job`;
+- suíte: 45 suítes / 220 passed / 0 failed / 1 ignored / 0 warnings;
+- binário: 6.589.440 → 6.671.872 B (+82.432 B, +1,25%), trade-off explícito
+  da drenagem concorrente/novos caminhos std; payload e pico de contexto não cresceram.
+
+## 5. Oportunidades restantes
+
+| Prioridade | Oportunidade | Evidência atual | Veredito |
+|---|---|---|---|
+| P1 | Eliminar cliff do WrapCache acima de 4.096 blocos | benchmark cobre 3.200; ainda não há repro acima da capacidade | ampliar benchmark antes |
+| P2 | Batch de persistência JSONL | `--session` chama `sync_data()` por evento após o run | exige decisão de durabilidade |
+| P2 | Limitar fila core→TUI e retenção de eventos | channel e vetor de eventos são ilimitados | exige design/contrato |
+| P3 | Paralelizar tools somente-leitura | ordem de eventos e snapshots pode mudar | deferido por risco funcional |
 
 O cache do analisador e a remoção do cooldown do runner acelerariam apenas o
 harness, não o Slim implantado; não são prioridade de produto.
 
-## 5. Itens deliberadamente adiados
+## 6. Itens deliberadamente adiados
 
 - **TOK-02/TOK-06:** não há telemetria real persistida para escolher limiares.
   A TUI ainda não persiste sessões; headless só grava com `--session`, e nenhum
@@ -137,11 +148,13 @@ harness, não o Slim implantado; não são prioridade de produto.
 
 - O fixture responde instantaneamente; velocidade mede overhead local e inclui
   aproximadamente 1,16 s de `Start-Job`, não latência/tokens por segundo do modelo.
-- O benchmark E2E prova não-regressão, não o ganho de microssegundos do PERF-02.
+- O benchmark E2E prova não-regressão; ganhos pequenos ficam sob o ruído. Os
+  ganhos shell/SSE foram medidos em regressões isoladas de carga.
 - Nenhum provider live foi chamado.
-- `cargo fmt --all -- --check` tem drift preexistente fora de PERF-02; Clippy
-  workspace encontra exatamente 6 diagnósticos preexistentes em `slim-tui`.
-  O Clippy focado em `slim-core --all-targets -D warnings` ficou limpo.
+- `cargo fmt --all -- --check` tem drift preexistente; Clippy workspace para em
+  6 diagnósticos de `slim-tui`, e `slim-cli --no-deps` revela mais 20
+  `let_unit_value` + 1 assert bool, todos preexistentes. Clippy focado em
+  `slim-core --all-targets -D warnings` ficou limpo.
 
 ## Reprodução
 
