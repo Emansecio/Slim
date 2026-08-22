@@ -1,15 +1,74 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
-use serde_json::json;
+use serde_json::{json, Value};
 use slim_core::provider::{
-    AnthropicAdapter, HttpProviderClient, OpenAiCompatibleAdapter, ProviderCache, ProviderConfig,
-    ProviderContentBlock, ProviderError, ProviderEvent, ProviderMessage,
+    AnthropicAdapter, HttpProviderClient, HttpRequest, OpenAiCompatibleAdapter, ProviderAdapter,
+    ProviderCache, ProviderConfig, ProviderContentBlock, ProviderError, ProviderEvent, ProviderKind,
+    ProviderMessage,
 };
 use slim_core::{EventKind, Runtime};
+
+struct CountingAdapter {
+    inner: OpenAiCompatibleAdapter,
+    builds: Arc<AtomicUsize>,
+}
+
+impl ProviderAdapter for CountingAdapter {
+    fn kind(&self) -> ProviderKind {
+        self.inner.kind()
+    }
+
+    fn model(&self) -> &str {
+        self.inner.model()
+    }
+
+    fn build_request(&self, prompt: &str) -> HttpRequest {
+        self.builds.fetch_add(1, Ordering::Relaxed);
+        self.inner.build_request(prompt)
+    }
+
+    fn build_messages_request_with_tools(
+        &self,
+        messages: &[ProviderMessage],
+        tools: &[Value],
+    ) -> HttpRequest {
+        self.builds.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .build_messages_request_with_tools(messages, tools)
+    }
+
+    fn parse_event(&self, value: &Value) -> Result<Vec<ProviderEvent>, ProviderError> {
+        self.inner.parse_event(value)
+    }
+}
+
+#[test]
+fn uncached_stream_builds_http_request_once() {
+    let (endpoint, server) = spawn_fixture_server(1, FixtureMode::Success);
+    let builds = Arc::new(AtomicUsize::new(0));
+    let adapter = CountingAdapter {
+        inner: OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+            endpoint,
+            "fixture-model",
+            "fixture-key",
+        ))
+        .expect("adapter"),
+        builds: Arc::clone(&builds),
+    };
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(client.send("hello"))
+        .expect("send");
+    server.join().expect("server");
+
+    assert_eq!(builds.load(Ordering::Relaxed), 1);
+}
 
 #[test]
 fn http_client_normalizes_chunked_sse_from_local_fixture_server() {

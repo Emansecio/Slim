@@ -718,25 +718,36 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
     where
         F: FnMut(ProviderEvent),
     {
-        self.adapter
+        let request = self
+            .adapter
             .build_messages_request_with_tools_checked(messages, tools)?;
-        let cache_key = self.adapter.cache_key_with_tools(messages, tools);
-        if let Some(events) = self.cache.as_ref().and_then(|cache| cache.get(&cache_key)) {
+        let cache_key = self
+            .cache
+            .as_ref()
+            .map(|_| self.adapter.cache_key_with_tools(messages, tools));
+        if let Some(events) = self
+            .cache
+            .as_ref()
+            .zip(cache_key.as_deref())
+            .and_then(|(cache, key)| cache.get(key))
+        {
             for event in events {
                 on_event(event);
             }
             return Ok(());
         }
 
-        let mut captured_events = Vec::new();
+        let mut captured_events = self.cache.as_ref().map(|_| Vec::new());
         let mut saw_stopped = false;
         let result = tokio::time::timeout(
             self.timeouts.wall,
-            self.send_inner(messages, tools, &mut |event| {
+            self.send_inner(request, &mut |event| {
                 if matches!(event, ProviderEvent::Stopped { .. }) {
                     saw_stopped = true;
                 }
-                captured_events.push(event.clone());
+                if let Some(events) = &mut captured_events {
+                    events.push(event.clone());
+                }
                 on_event(event);
             }),
         )
@@ -750,9 +761,11 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
                 message: "provider stream ended before completion".into(),
             });
         }
-        if !captured_events.iter().any(is_tool_call_event) {
-            if let Some(cache) = &self.cache {
-                cache.insert(cache_key, captured_events);
+        if let (Some(cache), Some(key), Some(events)) =
+            (&self.cache, cache_key, captured_events)
+        {
+            if !events.iter().any(is_tool_call_event) {
+                cache.insert(key, events);
             }
         }
         Ok(())
@@ -760,16 +773,12 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
 
     async fn send_inner<F>(
         &self,
-        messages: &[ProviderMessage],
-        tools: &[Value],
+        request: HttpRequest,
         on_event: &mut F,
     ) -> Result<bool, ProviderError>
     where
         F: FnMut(ProviderEvent),
     {
-        let request = self
-            .adapter
-            .build_messages_request_with_tools_checked(messages, tools)?;
         let sensitive_values = request
             .headers
             .iter()
