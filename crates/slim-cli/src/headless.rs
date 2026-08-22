@@ -1,8 +1,9 @@
-use serde::Serialize;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::Engine;
+use serde::Serialize;
 use slim_core::provider::{
     AnthropicAdapter, HttpProviderClient, OpenAiCodexAdapter, OpenAiCompatibleAdapter,
     ProviderConfig, ProviderContentBlock, ProviderError, ProviderKind, ProviderPricing,
@@ -543,28 +544,7 @@ fn load_local_image(path: &Path) -> Result<ProviderContentBlock, String> {
 }
 
 fn encode_base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let first = chunk[0];
-        output.push(ALPHABET[(first >> 2) as usize] as char);
-        if chunk.len() == 1 {
-            output.push(ALPHABET[((first & 0x03) << 4) as usize] as char);
-            output.push_str("==");
-        } else {
-            let second = chunk[1];
-            output.push(ALPHABET[((first & 0x03) << 4 | second >> 4) as usize] as char);
-            if chunk.len() == 2 {
-                output.push(ALPHABET[((second & 0x0f) << 2) as usize] as char);
-                output.push('=');
-            } else {
-                let third = chunk[2];
-                output.push(ALPHABET[((second & 0x0f) << 2 | third >> 6) as usize] as char);
-                output.push(ALPHABET[(third & 0x3f) as usize] as char);
-            }
-        }
-    }
-    output
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 fn resolve_context_window_tokens(explicit: Option<u64>) -> Result<u64, ProviderError> {
