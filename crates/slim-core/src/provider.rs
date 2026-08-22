@@ -851,17 +851,25 @@ fn drain_sse<A: ProviderAdapter, F: FnMut(ProviderEvent)>(
     pending: &mut String,
     on_event: &mut F,
 ) -> Result<bool, ProviderError> {
-    let mut saw_done = false;
-    while let Some(index) = pending.find('\n') {
-        let line = pending[..index].trim_end_matches('\r').to_owned();
-        pending.drain(..=index);
-        if parse_sse_line(adapter, &line, on_event)? {
-            pending.clear();
-            saw_done = true;
-            break;
+    let mut consumed = 0;
+    while let Some(relative_end) = pending[consumed..].find('\n') {
+        let line_end = consumed + relative_end;
+        let line = pending[consumed..line_end].trim_end_matches('\r');
+        consumed = line_end + 1;
+        match parse_sse_line(adapter, line, on_event) {
+            Ok(true) => {
+                pending.clear();
+                return Ok(true);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                pending.drain(..consumed);
+                return Err(error);
+            }
         }
     }
-    Ok(saw_done)
+    pending.drain(..consumed);
+    Ok(false)
 }
 
 fn parse_sse_line<A: ProviderAdapter, F: FnMut(ProviderEvent)>(
@@ -1978,5 +1986,57 @@ impl FakeProvider {
 
     pub fn next_error(&self) -> Option<ProviderError> {
         self.error.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    #[test]
+    fn drain_sse_consumes_a_malformed_complete_line_before_erroring() {
+        let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+            "http://127.0.0.1:1",
+            "fixture-model",
+            "fixture-key",
+        ))
+        .expect("adapter");
+        let mut pending = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\ndata: not-json\npartial"
+            .to_owned();
+        let mut events = 0;
+
+        let error = drain_sse(&adapter, &mut pending, &mut |_| events += 1)
+            .expect_err("malformed line");
+
+        assert!(matches!(error, ProviderError::InvalidResponse { .. }));
+        assert_eq!(events, 1);
+        assert_eq!(pending, "partial");
+    }
+
+    #[test]
+    fn drain_sse_handles_many_complete_lines_in_one_buffer() {
+        const DELTAS: usize = 20_000;
+        let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+            "http://127.0.0.1:1",
+            "fixture-model",
+            "fixture-key",
+        ))
+        .expect("adapter");
+        let delta = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n";
+        let mut pending = delta.repeat(DELTAS);
+        pending.push_str(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\ndata: [DONE]\ndata: not-json\n",
+        );
+        let mut events = 0;
+        let started = Instant::now();
+
+        let saw_done = drain_sse(&adapter, &mut pending, &mut |_| events += 1).expect("SSE");
+
+        eprintln!("SSE_BUFFER_ELAPSED_NS={}", started.elapsed().as_nanos());
+        assert!(saw_done);
+        assert!(pending.is_empty());
+        assert_eq!(events, DELTAS + 1);
     }
 }
