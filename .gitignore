@@ -1,0 +1,13 @@
+/target/
+/poc/toolchain/target/
+/poc/toolchain/.cargo-home/
+/poc/search/target/
+/poc/tui/target/
+/bench/token-economy/captures/
+/bench/token-economy/.task/
+/bench/token-economy/.agent-dirs/
+/bench/token-economy/v2/captures/
+/bench/token-economy/v2/runs/
+/bench/token-economy/v2/.task-v2/
+/bench/token-economy/v2/.agent-dirs-v2/
+__pycache__/

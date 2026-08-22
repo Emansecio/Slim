@@ -1,0 +1,100 @@
+{
+  "audit": "DESIGN-SLIM-TUI M0-M3 versus current repository",
+  "overall": "partial_vertical_slice",
+  "product_status": "functional fullscreen chat integration, not TUI v1 complete",
+  "milestones": {
+    "M0": {
+      "status": "partial",
+      "implemented": [
+        "reduced UiEvent/UiCommand API",
+        "basic AppState and reducer",
+        "basic block model and ViewModel",
+        "MemorySurface deterministic frame test"
+      ],
+      "missing": [
+        "full public contracts",
+        "SurfaceBackend trait",
+        "effect runner",
+        "complete state/focus/overlay/scroll/revisions",
+        "full block variants"
+      ]
+    },
+    "M1": {
+      "status": "partial_functional_slice",
+      "implemented": [
+        "fullscreen Ratatui/Crossterm app",
+        "raw mode and alternate screen RAII",
+        "basic composer and bracketed paste",
+        "basic input/layout/theme/operational bar"
+      ],
+      "missing": [
+        "layered visual foundation and boxed composer",
+        "ContextRail and ActivityRail",
+        "real PTY gate",
+        "navigable scrollback",
+        "complete editor/cursor behavior",
+        "Windows console capability lifecycle",
+        "full restore fault matrix"
+      ]
+    },
+    "M2": {
+      "status": "partial_central_bridge_complete",
+      "implemented": [
+        "typed CLI-to-TUI bridge",
+        "incremental SSE projection",
+        "real provider/agent/tools",
+        "usage/mode/model/cancellation"
+      ],
+      "missing": [
+        "runtime-wired coalescing",
+        "bounded priority lanes",
+        "Parse/Wrap/Layout caches",
+        "HeightIndex virtualization",
+        "pin/live-edge scrolling",
+        "typed tool blocks and paging",
+        "real Todo dock integration",
+        "metrics and enforceable performance gate"
+      ]
+    },
+    "M3": {
+      "status": "scaffold",
+      "implemented": [
+        "semantic theme tokens",
+        "basic color/glyph fallback",
+        "login and model overlays",
+        "isolated inspector/palette/image helpers"
+      ],
+      "missing": [
+        "approved layered palette and motion system",
+        "wired inspectors",
+        "command palette integration",
+        "diff/activity/tree/diagnostics views",
+        "search and clipboard",
+        "mouse handling",
+        "reduced motion",
+        "terminal image protocols",
+        "approval/input/goal full flows",
+        "real golden and fault-injection matrix"
+      ]
+    }
+  },
+  "verification": {
+    "static_inspection": "complete",
+    "focused_tests": {
+      "status": "passed",
+      "exit_code": 0,
+      "passed": 35,
+      "failed": 0,
+      "commands": [
+        "cargo.exe test -p slim-tui",
+        "cargo.exe test -p slim-cli --test tui_runtime --test tui_bridge"
+      ]
+    },
+    "heavy_benchmarks": "not_run"
+  },
+  "outputs": [
+    "analysis_outputs/SUMMARY.md",
+    "analysis_outputs/RISKS.md",
+    "analysis_outputs/status.json"
+  ]
+}

@@ -1,0 +1,9 @@
+[package]
+name = "slim-poc-fff-search"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fff-search = "0.10.6-nightly.f4def12"
+
+[workspace]

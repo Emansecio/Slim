@@ -1,0 +1,11 @@
+[package]
+name = "slim-poc-tui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossterm = { version = "0.28", features = ["bracketed-paste"] }
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+slim-tui = { path = "../../crates/slim-tui" }
+
+[workspace]

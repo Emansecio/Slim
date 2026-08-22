@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "crates/slim-core",
+    "crates/slim-tui",
+    "crates/slim-cli",
+]
+resolver = "2"

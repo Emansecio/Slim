@@ -1,0 +1,47 @@
+[package]
+name = "slim-cli"
+version = "0.1.0"
+edition = "2021"
+autobins = false
+
+[dependencies]
+base64 = "0.22"
+directories = "5"
+getrandom = "0.3"
+toml = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+slim-core = { path = "../slim-core" }
+slim-tui = { path = "../slim-tui" }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[[test]]
+name = "smoke_workspace"
+path = "../../tests/smoke_workspace.rs"
+
+[[test]]
+name = "e2e_v1"
+path = "../../tests/e2e_v1.rs"
+
+[[test]]
+name = "e2e_offline"
+path = "../../tests/e2e_offline.rs"
+
+[[bin]]
+name = "slim"
+path = "src/main.rs"
+
+[dev-dependencies]
+portable-pty = "0.9"
