@@ -104,7 +104,7 @@ item 9.
 
 ## Evidência e limites
 
-O gate atual é `cargo test --workspace`, verde: 1087 passed /
+O gate atual é `cargo test --workspace`, verde: 1085 passed /
 0 failed / 1 ignored (ConPTY físico) em 87 suítes e 0 compiler warnings (1 teste
 preexistente quebrado filtrado via `--skip`: `tui_bridge
 ordinary_tui_second_turn_sends_prior_user_and_assistant`, sem implementação em

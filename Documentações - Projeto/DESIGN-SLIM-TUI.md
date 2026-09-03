@@ -344,7 +344,7 @@ milestone correspondente passou seu gate.
 - layout do transcript (2026-08-31): sem inspector docked, a conversa usa toda a
   largura disponível do scrollback; o cap de 144 células permanece somente no
   workspace compartilhado com inspector docked;
-- verificação integral mais recente: workspace verde (87 suítes / 1087 passed /
+- verificação integral mais recente: workspace verde (87 suítes / 1085 passed /
   0 failed / 1 ignored — ConPTY físico / 0 compiler warnings; 1 teste preexistente
   quebrado filtrado via `--skip`, sem implementação em `crates/`), incluindo
   proptest, fault injection, golden matrix e E2E offline do bridge; Grok Slice 2

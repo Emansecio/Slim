@@ -18,7 +18,7 @@ tipados, MCP stdio/Streamable HTTP e testes unit/property/golden/PTY.
 
 ## Estado de implementação (atualizado em 2026-09-03)
 
-O workspace tem 1087 passed / 0 failed / 1 ignored (ConPTY físico) em 87 suítes
+O workspace tem 1085 passed / 0 failed / 1 ignored (ConPTY físico) em 87 suítes
 (1 teste preexistente quebrado filtrado via `--skip`, sem implementação em `crates/`)
 e build/deploy release por via manual equivalente (o `refresh-slim.ps1` aborta sob
 `ErrorActionPreference=Stop` do harness; build release + cópia + smoke `slim --version` verificados).

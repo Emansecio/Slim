@@ -102,24 +102,23 @@ validação terminal estrita.
 `/logout` remove apenas a chave OpenCode persistida; variáveis de ambiente não
 são alteradas.
 
-Os 1087 testes passados / 0 failed em 87 suítes, mais 1 ignored (ConPTY físico), comprovam
-componentes, contratos e caminhos headless/TUI offline; nÃ£o comprovam
-integraÃ§Ã£o completa do produto:
+Os 1085 testes passados / 0 failed / 1 ignored (ConPTY físico) em 87 suítes comprovam
+componentes, contratos e caminhos headless/TUI offline; não comprovam
+integração completa do produto (contagem de 2026-09-03 via
+`cargo test --workspace -- --skip ordinary_tui_second_turn_sends_prior_user_and_assistant`,
+cujo teste filtrado tem expectativa `Explicitly invoked skill` sem implementação em `crates/`):
 
 Relatório persistente da auditoria iterativa: [WORKFLOW-LOOP-BUGS-SLIM.md](analysis_outputs/WORKFLOW-LOOP-BUGS-SLIM.md).
 
 Auditoria e otimização da suíte: [TEST-SUITE-OPTIMIZATION.md](analysis_outputs/TEST-SUITE-OPTIMIZATION.md).
 
 - `cargo test --workspace` e `refresh-slim.ps1 -Test`: exit code `0`, build
-  release, deploy e smoke test concluídos (ver ressalva do teste filtrado abaixo);
+  release, deploy e smoke test concluídos (ver ressalva do teste filtrado acima);
 - `cargo clippy --workspace --all-targets -- -D warnings`: exit `0`;
 - `cargo fmt --all -- --check`: acusa somente drift preexistente do rustfmt 1.98
   (trechos novos formatados); `cargo check --workspace` e
   `git diff --check`: exit `0`;
-- 1087 passed / 0 failed / 1 ignored em 87 suítes (1 teste preexistente quebrado
-  filtrado via `--skip`: `tui_bridge ordinary_tui_second_turn_sends_prior_user_and_assistant`,
-  cuja expectativa `Explicitly invoked skill` não tem implementação em `crates/`),
-  incluindo proptest, fault injection,
+- incluindo proptest, fault injection,
   golden matrix via TestBackend e benchmark long-session com gate de budget;
 - fixture offline localhost exercita o turno completo pela API TUI, sem chamada
   a provider live;
@@ -127,10 +126,8 @@ Auditoria e otimização da suíte: [TEST-SUITE-OPTIMIZATION.md](analysis_output
   probe `ESC[6n`, sem frame; a matriz física completa de terminal, IME, mouse e
   clipboard permanece não observada.
 
-Deploy atual: `target\release\slim.exe` e `C:\Users\User\bin\Slim.exe` têm
-18.706.944 bytes e SHA-256 idêntico
-`3586F8F4B080C0E540073B404742254F3D56513C51D0EA90281C9864A3D62A76`;
-`slim --version` retorna `slim 0.1.0` com exit `0`.
+Deploy atual: `.\refresh-slim.ps1` com `OK:` (build release, cópia para o PATH e
+`slim --version` = `slim 0.1.0` com exit `0`).
 
 ## Status atual de integraÃ§Ã£o
 
