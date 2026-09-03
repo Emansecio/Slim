@@ -70,6 +70,7 @@ impl PendingCall {
 #[derive(Default)]
 pub(super) struct CausalGovernor {
     ledger: ProgressLedger,
+    stop_requested: bool,
 }
 
 #[derive(Default)]
@@ -133,6 +134,18 @@ struct EvidenceRecord {
 }
 
 impl CausalGovernor {
+    /// True once the ledger emitted `WouldStop`: the loop must stop instead of
+    /// spinning (the shadow action becomes a real backstop).
+    pub(super) fn stop_requested(&self) -> bool {
+        self.stop_requested
+    }
+
+    fn note_stop(&mut self, action: CausalShadowAction) {
+        if action == CausalShadowAction::WouldStop {
+            self.stop_requested = true;
+        }
+    }
+
     pub(super) fn observe_before_identified(
         &mut self,
         prepared: &PreparedToolInvocation,
@@ -319,6 +332,7 @@ impl CausalGovernor {
             _ if turn.confidence == CausalConfidence::High => CausalShadowAction::WouldStop,
             _ => CausalShadowAction::WouldWarn,
         };
+        self.note_stop(action);
         vec![GovernorObservation::Anomaly {
             batch_id: turn.last_batch_id,
             call_id: turn.last_call_id,
@@ -495,6 +509,7 @@ impl CausalGovernor {
                 } else {
                     repetition_action(kind, occurrence, pending.confidence)
                 };
+                self.note_stop(action);
                 return vec![GovernorObservation::Anomaly {
                     batch_id: pending.batch_id,
                     call_id: pending.call_id,

@@ -237,6 +237,9 @@ pub enum AgentLoopStop {
     TurnLimit,
     ToolLimit,
     RepeatedFailedTool,
+    /// The causal ledger asked to stop (repeated evidence / stagnant turns):
+    /// continuing would only burn turns without progress.
+    NoProgress,
     Cancelled,
 }
 
@@ -1960,6 +1963,11 @@ impl Runtime {
                 }
             }
             all_results.extend(results);
+            if governor.stop_requested() {
+                stop = AgentLoopStop::NoProgress;
+                self.app.discard_projected_payloads();
+                break;
+            }
             if saw_duplicate_this_turn
                 && budget_steers_used < MAX_BUDGET_STEERS
                 && !self.is_cancelled()
@@ -1977,7 +1985,7 @@ impl Runtime {
 
         if matches!(
             stop,
-            AgentLoopStop::TurnLimit | AgentLoopStop::ToolLimit
+            AgentLoopStop::TurnLimit | AgentLoopStop::ToolLimit | AgentLoopStop::NoProgress
         ) && !self.is_cancelled()
         {
             let finalize_event_start = self.app.events().len();

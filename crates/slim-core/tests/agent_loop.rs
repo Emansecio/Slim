@@ -4332,3 +4332,96 @@ fn duplicate_read_injects_between_turns_steer_once() {
     assert!(conversation_text.contains("done-steer"));
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn repeated_identical_reads_stop_with_no_progress_and_final_answer() {
+    let root = std::env::temp_dir().join(format!("slim-no-progress-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("root");
+    std::fs::write(root.join("a.txt"), "a").expect("a");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        for _ in 0..4 {
+            let mut stream = accept_with_deadline(&listener);
+            let _ = read_http_request(&mut stream);
+            let payload = json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "read-a",
+                            "function": {
+                                "name": "read",
+                                "arguments": json!({"path": "a.txt", "max_lines": 1}).to_string()
+                            }
+                        }]
+                    }
+                }]
+            });
+            let body = format!(
+                "data: {payload}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+            );
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .expect("tool response");
+        }
+
+        let mut final_stream = accept_with_deadline(&listener);
+        let _ = read_http_request(&mut final_stream);
+        let done = "data: {\"choices\":[{\"delta\":{\"content\":\"no-progress-final\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        final_stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{done}",
+                    done.len()
+                )
+                .as_bytes(),
+            )
+            .expect("final response");
+    });
+
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(5)).expect("client");
+    let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let mut runtime = Runtime::new();
+    let result = tokio_runtime
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "read the same file",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig {
+                max_turns: 8,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .expect("loop");
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::NoProgress);
+    assert_eq!(result.turns, 4);
+    assert_eq!(result.tool_results.len(), 4);
+    assert!(result.tool_results.iter().all(|result| result.name == "read"));
+    let conversation_text = runtime
+        .conversation()
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(conversation_text.contains("no-progress-final"));
+    let _ = std::fs::remove_dir_all(root);
+}

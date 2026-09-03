@@ -2627,6 +2627,9 @@ pub(crate) fn format_run_stop_message(
             limits.max_output_tokens
         ),
         "repeated_failed_tool" => "Repeated failed tool blocked.".into(),
+        "no_progress" => {
+            "Stopped: no progress in recent turns. Send a follow-up to continue.".into()
+        }
         other => format!("Run stopped ({other})."),
     }
 }
@@ -2664,6 +2667,7 @@ fn stop_name(stop: AgentLoopStop) -> &'static str {
         AgentLoopStop::TurnLimit => "turn_limit",
         AgentLoopStop::ToolLimit => "tool_limit",
         AgentLoopStop::RepeatedFailedTool => "repeated_failed_tool",
+        AgentLoopStop::NoProgress => "no_progress",
         AgentLoopStop::Cancelled => "cancelled",
     }
 }
@@ -2672,7 +2676,9 @@ fn exit_code_for_stop(stop: AgentLoopStop) -> ExitCode {
     match stop {
         AgentLoopStop::ProviderCompleted => ExitCode::Success,
         AgentLoopStop::ProviderTruncated | AgentLoopStop::ProviderFiltered => ExitCode::Provider,
-        AgentLoopStop::TurnLimit | AgentLoopStop::RepeatedFailedTool => ExitCode::Blocked,
+        AgentLoopStop::TurnLimit | AgentLoopStop::RepeatedFailedTool | AgentLoopStop::NoProgress => {
+            ExitCode::Blocked
+        }
         AgentLoopStop::ToolLimit => ExitCode::Tool,
         AgentLoopStop::Cancelled => ExitCode::Cancelled,
     }
@@ -2800,6 +2806,10 @@ mod stop_message_tests {
         assert_eq!(
             format_run_stop_message("repeated_failed_tool", &[], limits),
             "Repeated failed tool blocked."
+        );
+        assert_eq!(
+            format_run_stop_message("no_progress", &[], limits),
+            "Stopped: no progress in recent turns. Send a follow-up to continue."
         );
         assert_eq!(
             format_run_stop_message("provider_truncated", &[], limits),
