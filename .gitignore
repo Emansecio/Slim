@@ -12,3 +12,11 @@
 /bench/token-economy/v2/.agent-dirs-v2/
 /bench/token-economy/v2/campaigns/
 __pycache__/
+# Runtime local (sessoes, memoria de agentes, logs de crash, rascunhos)
+/.slim/
+/.workbuddy-ai/
+hs_err_pid*.log
+/librust_out.rmeta
+/tmp/
+# Backups locais
+/_backup-*/
