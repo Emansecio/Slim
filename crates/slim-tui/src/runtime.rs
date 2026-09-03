@@ -2058,8 +2058,8 @@ fn render_operational_bar(
         } else if state.working {
             (
                 vec![
-                    "Working… Esc cancel · Ctrl+C cancel".into(),
-                    "Working… Esc/^C cancel".into(),
+                    "Working… Esc stop · Esc×2 force · Ctrl+C cancel".into(),
+                    "Working… Esc stop · Esc×2 force".into(),
                     "Working… ^C".into(),
                 ],
                 Some(palette.warning),

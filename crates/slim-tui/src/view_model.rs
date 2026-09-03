@@ -333,7 +333,7 @@ pub fn status_line(state: &AppState, context_in_session_rail: bool) -> String {
     let left = if state.working && state.activity.is_some() {
         "Shift+Tab mode · Ctrl+C cancel · Ctrl+P commands".into()
     } else if state.working {
-        "Working · Esc/Ctrl+C cancel".into()
+        "Working · Esc stop · Esc×2 force".into()
     } else if state.scroll.is_pinned() {
         if state.scroll.unseen > 0 {
             format!("{} new · End latest", state.scroll.unseen)

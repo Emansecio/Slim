@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use slim_core::provider::{
     clinepass_model, fetch_clinepass_catalog, is_clinepass_model_id, is_command_code_model_id,
@@ -1204,6 +1204,9 @@ struct ActiveLogin {
 enum ActiveEvent {
     Command(Option<UiCommand>),
     Finished(Box<Result<Result<ProviderExecution, ProviderError>, tokio::task::JoinError>>),
+    /// Grace period after the first Esc elapsed while the run still ignores
+    /// the cancellation token: force the abort instead of waiting forever.
+    CancelTimeout,
 }
 
 enum LoginEvent {
@@ -1333,6 +1336,7 @@ fn run_worker(
         }
         let mut active: Option<ActiveRun> = None;
         let mut pending: Option<PendingRun> = None;
+        let mut last_esc_at: Option<Instant> = None;
         let mut login: Option<ActiveLogin> = None;
         let mut next_run_id = 1_u64;
         let content_store = SharedContentStore::default();
@@ -1468,9 +1472,21 @@ fn run_worker(
             if active.is_some() {
                 let wake = {
                     let run = active.as_mut().expect("checked");
-                    tokio::select! {
-                        command = async_rx.recv() => ActiveEvent::Command(command),
-                        result = &mut run.task => ActiveEvent::Finished(Box::new(result)),
+                    match last_esc_at {
+                        Some(armed_at) => {
+                            let grace = ESC_GRACE_PERIOD.saturating_sub(
+                                Instant::now().saturating_duration_since(armed_at),
+                            );
+                            tokio::select! {
+                                command = async_rx.recv() => ActiveEvent::Command(command),
+                                result = &mut run.task => ActiveEvent::Finished(Box::new(result)),
+                                _ = tokio::time::sleep(grace) => ActiveEvent::CancelTimeout,
+                            }
+                        }
+                        None => tokio::select! {
+                            command = async_rx.recv() => ActiveEvent::Command(command),
+                            result = &mut run.task => ActiveEvent::Finished(Box::new(result)),
+                        },
                     }
                 };
                 match wake {
@@ -1479,7 +1495,26 @@ fn run_worker(
                         break;
                     }
                     ActiveEvent::Command(Some(UiCommand::CancelRun)) => {
-                        pending = abort_active(&mut active).await;
+                        let now = Instant::now();
+                        if esc_forces_quit(last_esc_at, now) {
+                            pending =
+                                abort_active_with_grace(&mut active, Duration::ZERO).await;
+                            last_esc_at = None;
+                        } else if let Some(run) = active.as_mut() {
+                            run.cancellation.cancel();
+                            last_esc_at = Some(now);
+                            // Hint only: try_send so a full lane (backpressure)
+                            // can never wedge the cancel path itself.
+                            let _ = sink.try_send(UiEvent::Notification {
+                                message: "Stopping current command… press Esc again to interrupt the agent."
+                                    .into(),
+                            });
+                        }
+                    }
+                    ActiveEvent::CancelTimeout => {
+                        pending =
+                            abort_active_with_grace(&mut active, Duration::ZERO).await;
+                        last_esc_at = None;
                     }
                     ActiveEvent::Command(Some(UiCommand::Shutdown)) => {
                         let _ = abort_active(&mut active).await;
@@ -1522,6 +1557,11 @@ fn run_worker(
                         });
                     }
                     ActiveEvent::Finished(result) => {
+                        // An Esc-armed run that settles on its own still counts
+                        // as user-cancelled, so the terminal reads RunCancelled
+                        // (not RunFailed) via send_cancel_result.
+                        let esc_cancelled = last_esc_at.is_some();
+                        last_esc_at = None;
                         if let Ok(Ok(execution)) = &*result {
                             if let Some(preflight) = execution.resume_preflight.clone() {
                                 startup.resume_path = Some(preflight.path.clone());
@@ -1548,7 +1588,7 @@ fn run_worker(
                                 delivery: VecDeque::new(),
                                 cancellation: run.cancellation,
                                 durable,
-                                cancel_requested: false,
+                                cancel_requested: esc_cancelled,
                                 content_store: run.content_store,
                             });
                         }
@@ -2308,6 +2348,7 @@ fn run_worker(
                         content_store.clone(),
                     ) {
                         Ok(run) => {
+                            last_esc_at = None;
                             startup.options.content_blocks.clear();
                             startup.image_labels.clear();
                             let _ = sink.send(UiEvent::AttachmentsChanged { labels: Vec::new() });
@@ -3013,11 +3054,31 @@ fn start_active_run(
     })
 }
 
+/// Esc escalation window while a run is active (Claude Code / OpenCode parity):
+/// first Esc asks via the cancellation token (graceful, partial work kept), a
+/// second Esc inside the window forces (`task.abort()`, no grace period) for
+/// hung tool calls that ignore the token.
+const ESC_FORCE_WINDOW: Duration = Duration::from_secs(1);
+/// Grace after the first Esc for the run to observe the cancellation token
+/// before the worker forces the abort (also the backstop for the L2 path).
+const ESC_GRACE_PERIOD: Duration = Duration::from_secs(2);
+
+fn esc_forces_quit(last_esc_at: Option<Instant>, now: Instant) -> bool {
+    last_esc_at.is_some_and(|at| now.duration_since(at) <= ESC_FORCE_WINDOW)
+}
+
 async fn abort_active(active: &mut Option<ActiveRun>) -> Option<PendingRun> {
+    abort_active_with_grace(active, ESC_GRACE_PERIOD).await
+}
+
+async fn abort_active_with_grace(
+    active: &mut Option<ActiveRun>,
+    grace: Duration,
+) -> Option<PendingRun> {
     if let Some(mut run) = active.take() {
         let durable = run.durable;
         run.cancellation.cancel();
-        let result = match tokio::time::timeout(Duration::from_secs(2), &mut run.task).await {
+        let result = match tokio::time::timeout(grace, &mut run.task).await {
             Ok(result) => result,
             Err(_) => {
                 run.task.abort();
@@ -3364,9 +3425,10 @@ mod slash_skill_tests {
 mod cancel_tests {
     use super::{
         advance_pending_delivery, associate_projected_run, attach_workspace_to_snapshot,
-        execution_result_events, project_core_event, project_sync_tui_events, send_cancel_result,
-        take_run_id, ContentStore, EventSink, PendingDeliveryStep, PendingRun, WakeSignal,
-        CONTENT_ENTRY_BYTES, CONTENT_PAGE_BYTES, CONTENT_STORE_BYTES, CONTENT_STORE_ENTRIES,
+        esc_forces_quit, execution_result_events, project_core_event, project_sync_tui_events,
+        send_cancel_result, take_run_id, ContentStore, EventSink, PendingDeliveryStep, PendingRun,
+        WakeSignal, CONTENT_ENTRY_BYTES, CONTENT_PAGE_BYTES, CONTENT_STORE_BYTES,
+        CONTENT_STORE_ENTRIES, ESC_FORCE_WINDOW,
     };
     use crate::exit_codes::ExitCode;
     use crate::headless::{ProviderExecution, ProviderHeadlessResult};
@@ -3379,6 +3441,22 @@ mod cancel_tests {
     };
     use std::collections::VecDeque;
     use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn esc_escalates_only_inside_the_force_window() {
+        let now = Instant::now();
+        assert!(!esc_forces_quit(None, now));
+        assert!(esc_forces_quit(Some(now), now));
+        assert!(esc_forces_quit(
+            Some(now),
+            now + ESC_FORCE_WINDOW - Duration::from_millis(1)
+        ));
+        assert!(!esc_forces_quit(
+            Some(now),
+            now + ESC_FORCE_WINDOW + Duration::from_millis(1)
+        ));
+    }
 
     #[test]
     fn content_store_pages_on_utf8_boundaries_at_sixteen_kibibytes() {
