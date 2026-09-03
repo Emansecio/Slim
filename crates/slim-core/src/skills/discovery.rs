@@ -44,6 +44,10 @@ impl DiscoveryResult {
             .filter(|entry| entry.name == name)
             .collect()
     }
+
+    pub fn active_entries(&self) -> &[SkillEntry] {
+        &self.active_entries
+    }
 }
 
 pub fn discover(roots: &[SkillRoot]) -> io::Result<DiscoveryResult> {
@@ -94,7 +98,79 @@ pub fn discover(roots: &[SkillRoot]) -> io::Result<DiscoveryResult> {
     Ok(result)
 }
 
+/// Discovers the native skill roots visible to a Slim run in `cwd`.
+/// Only frontmatter metadata is read; `SKILL.md` bodies remain lazy.
+pub fn discover_workspace(cwd: impl AsRef<Path>) -> io::Result<DiscoveryResult> {
+    let profile = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    discover_workspace_with_profile(cwd.as_ref(), profile.as_deref())
+}
+
+fn discover_workspace_with_profile(
+    cwd: &Path,
+    profile: Option<&Path>,
+) -> io::Result<DiscoveryResult> {
+    let mut roots = vec![
+        SkillRoot::new(cwd.join(".slim").join("skills"), 0),
+        SkillRoot::new(cwd.join(".claude").join("skills"), 1),
+    ];
+    if let Some(profile) = profile {
+        let global = profile.join(".slim").join("skills");
+        if !roots.iter().any(|root| root.path == global) {
+            roots.push(SkillRoot::new(global, 10));
+        }
+    }
+    roots.retain(|root| root.path.is_dir());
+    discover(&roots)
+}
+
 #[allow(dead_code)]
 fn _is_skill_directory(path: &Path) -> bool {
     path.is_dir() && path.join("SKILL.md").is_file()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::discover_workspace_with_profile;
+
+    fn write_skill(root: &Path, name: &str, description: &str) {
+        let skill = root.join(name);
+        std::fs::create_dir_all(&skill).expect("skill directory");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\nbody\n"),
+        )
+        .expect("skill fixture");
+    }
+
+    use std::path::Path;
+
+    #[test]
+    fn workspace_skills_override_global_skills_and_global_only_is_visible() {
+        let root = std::env::temp_dir().join(format!(
+            "slim-workspace-skills-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let workspace = root.join("workspace");
+        let profile = root.join("profile");
+        write_skill(&workspace.join(".slim/skills"), "same", "workspace");
+        write_skill(&profile.join(".slim/skills"), "same", "global");
+        write_skill(&profile.join(".slim/skills"), "global-only", "global");
+
+        let discovery = discover_workspace_with_profile(&workspace, Some(&profile))
+            .expect("workspace discovery");
+
+        assert_eq!(
+            discovery
+                .active("same")
+                .expect("workspace skill")
+                .metadata
+                .description,
+            "workspace"
+        );
+        assert!(discovery.active("global-only").is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

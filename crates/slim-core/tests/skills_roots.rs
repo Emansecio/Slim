@@ -39,9 +39,9 @@ fn more_specific_root_wins_and_shadowing_is_visible() {
     let unique_skill = write_skill(&project, "unique", "unique", "unique body");
 
     let result = discover(&[
-        SkillRoot::new(cli.clone(), 0),
-        SkillRoot::new(project.clone(), 1),
-        SkillRoot::new(global.clone(), 3),
+        SkillRoot::new(cli, 0),
+        SkillRoot::new(project, 1),
+        SkillRoot::new(global, 3),
     ])
     .expect("discover");
     assert_eq!(result.active("same").expect("active").path, cli_skill);
@@ -75,5 +75,35 @@ fn metadata_is_loaded_without_loading_body_and_invalid_skill_is_diagnostic() {
     assert_eq!(result.warnings.len(), 1);
 
     let _ = OperatingMode::Auto;
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn metadata_does_not_decode_the_skill_body() {
+    let root = temp_dir();
+    let skill = root.join("binary-body");
+    fs::create_dir_all(&skill).expect("mkdir");
+    fs::write(
+        skill.join("SKILL.md"),
+        b"---\nname: binary-body\ndescription: valid metadata\n---\n\xff",
+    )
+    .expect("skill");
+
+    let metadata = read_metadata(skill.join("SKILL.md")).expect("metadata");
+
+    assert_eq!(metadata.name, "binary-body");
+    assert_eq!(metadata.description, "valid metadata");
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn skill_body_has_a_bounded_read_budget() {
+    let root = temp_dir();
+    let skill = write_skill(&root, "large-body", "desc", &"x".repeat(1024 * 1024 + 1));
+
+    let error = read_body(skill.join("SKILL.md")).expect_err("oversized body");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("skill file exceeds"));
     fs::remove_dir_all(root).expect("cleanup");
 }

@@ -1,0 +1,30 @@
+Slim Agent UI/TUI/CLI audit — baseline (session 2026-08-25)
+
+Worktree: D:\Slim (git repo). WIP preserved; no reset/checkout/clean/restore/stash/pull/fetch.
+git status --short: 163 lines (modified + untracked). Untracked includes analysis_outputs/, harness docs, new session/runtime modules.
+
+Toolchain:
+  Inherited RUSTC env initially pointed at C:\Users\User\.cargo\bin\rustc.exe (MISSING).
+  Session override: C:\Users\User\scoop\persist\rustup-msvc\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustc.exe
+  rustc 1.97.1 (8bab26f4f 2026-07-14)
+  cargo 1.97.1 (c980f4866 2026-06-30)
+  Get-Command rustc → C:\Users\User\scoop\apps\rustup-msvc\current\.cargo\bin\rustc.exe
+
+Binaries:
+  Get-Command slim → C:\Users\User\bin\Slim.exe
+    LastWriteTime=2026-08-25 17:51:17
+    Size=9799168
+    SHA-256=8AB5BF424E47D6A5B0D4562C8A62EEB1DE209D96AD6858E2BF04F9ADF4AC42F6
+    NOTE: target\release\slim.exe MISSING. PATH copy is NOT proven to match the WIP tree.
+  cargo run (this session) → D:\Slim\target\debug\slim.exe
+    LastWriteTime=2026-08-25 18:30:58
+    Size=16720384
+    SHA-256=6AE3D7C3C3C653B261F678B22E36E887F15E64A75AF72E109EE70D1D0E416F8C
+    This debug binary WAS used for CLI reproductions (stdin, Codex).
+
+Inventory:
+  Workspace members: slim-core, slim-tui, slim-cli
+  Rust source under crates/: 171 files, 59552 lines (non-target)
+  Tracked git files: 184 (git ls-files); many additional untracked WIP files
+
+Docs numbers from DESIGN/README/PLANO (713 tests, SHA 1BCD18…) were NOT reused.

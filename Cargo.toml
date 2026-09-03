@@ -3,5 +3,18 @@ members = [
     "crates/slim-core",
     "crates/slim-tui",
     "crates/slim-cli",
+    "crates/slim-lsp",
 ]
 resolver = "2"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+assigning_clones = "deny"
+bool_to_int_with_if = "deny"
+derive_partial_eq_without_eq = "deny"
+large_enum_variant = "deny"
+manual_string_new = "deny"
+needless_collect = "deny"
+range_plus_one = "deny"
+redundant_clone = "deny"
+single_char_pattern = "deny"

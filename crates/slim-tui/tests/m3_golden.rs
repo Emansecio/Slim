@@ -31,8 +31,7 @@ fn inspectors_toggle_and_capabilities_degrade_safely() {
         mouse: false,
         clipboard: false,
         images: false,
-    reduced_motion: false,
-
+        reduced_motion: false,
     };
     assert_eq!(glyph(caps, '✓', '+'), '+');
     assert_eq!(resolve_theme(caps).foreground, (255, 255, 255));
@@ -56,6 +55,18 @@ fn capability_detection_defaults_to_safe_fallbacks() {
 }
 
 #[test]
+fn focused_composer_uses_the_normative_cyan_border() {
+    let capabilities = Capabilities {
+        color_depth: ColorDepth::TrueColor,
+        mouse: false,
+        clipboard: false,
+        images: false,
+        reduced_motion: false,
+    };
+    assert_eq!(resolve_theme(capabilities).border_focus, (0x4B, 0x78, 0x91));
+}
+
+#[test]
 fn capability_matrix_covers_color_glyph_mouse_clipboard_and_image_fallbacks() {
     for depth in [
         ColorDepth::TrueColor,
@@ -68,8 +79,7 @@ fn capability_matrix_covers_color_glyph_mouse_clipboard_and_image_fallbacks() {
             mouse: true,
             clipboard: true,
             images: true,
-        reduced_motion: false,
-
+            reduced_motion: false,
         };
         let expected_glyph = if depth == ColorDepth::None {
             '+'

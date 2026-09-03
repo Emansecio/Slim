@@ -11,7 +11,9 @@ use tokio::sync::{mpsc, watch};
 use super::browser::BrowserLauncher;
 use super::callback::await_callback;
 use super::pkce::{generate_pkce, generate_state};
-use super::{OAuthCredential, OAuthEndpoints, OAuthError, OAuthProgress};
+use super::{
+    parse_json_response_bounded, OAuthCredential, OAuthEndpoints, OAuthError, OAuthProgress,
+};
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CALLBACK_PORT: u16 = 1455;
@@ -110,10 +112,8 @@ async fn device_login(
             response.status().as_u16()
         )));
     }
-    let value: Value = response
-        .json()
-        .await
-        .map_err(|_| OAuthError::InvalidResponse("Codex device response is invalid".into()))?;
+    let value: Value =
+        parse_json_response_bounded(response, "Codex device response is invalid").await?;
     let device_id = value
         .get("device_auth_id")
         .and_then(Value::as_str)
@@ -158,10 +158,8 @@ async fn device_login(
                 response.status().as_u16()
             )));
         }
-        let value: Value = response
-            .json()
-            .await
-            .map_err(|_| OAuthError::InvalidResponse("Codex device token is invalid".into()))?;
+        let value: Value =
+            parse_json_response_bounded(response, "Codex device token is invalid").await?;
         let code = value
             .get("authorization_code")
             .and_then(Value::as_str)
@@ -236,10 +234,8 @@ async fn parse_token(
             response.status().as_u16()
         )));
     }
-    let token: TokenResponse = response
-        .json()
-        .await
-        .map_err(|_| OAuthError::InvalidResponse("Codex token response is invalid".into()))?;
+    let token: TokenResponse =
+        parse_json_response_bounded(response, "Codex token response is invalid").await?;
     let account_id = account_id(&token.access_token)?;
     Ok(OAuthCredential {
         access: token.access_token,

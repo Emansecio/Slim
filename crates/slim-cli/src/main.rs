@@ -1,5 +1,7 @@
 use std::io::Read;
 
+const MAX_STDIN_BYTES: usize = 8 * 1024 * 1024;
+
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let special = args
@@ -17,7 +19,15 @@ fn main() {
     let needs_stdin = !special && !has_prompt && known_stdin_mode;
     let mut stdin = String::new();
     if needs_stdin {
-        let _ = std::io::stdin().read_to_string(&mut stdin);
+        let mut input = std::io::stdin().take((MAX_STDIN_BYTES + 1) as u64);
+        if let Err(error) = input.read_to_string(&mut stdin) {
+            eprintln!("stdin could not be read: {error}");
+            std::process::exit(slim_cli::ExitCode::InputRequired.as_i32());
+        }
+        if stdin.len() > MAX_STDIN_BYTES {
+            eprintln!("stdin exceeds the {MAX_STDIN_BYTES}-byte safety limit");
+            std::process::exit(slim_cli::ExitCode::InputRequired.as_i32());
+        }
     }
     let output = slim_cli::run_cli(args, &stdin);
     print!("{}", output.stdout);
@@ -36,7 +46,13 @@ fn has_positional_prompt(args: &[String]) -> bool {
         }
         if matches!(
             arg.as_str(),
-            "--provider" | "--model" | "--endpoint" | "--session" | "--image"
+            "--provider"
+                | "--model"
+                | "--endpoint"
+                | "--session"
+                | "--resume"
+                | "--recover"
+                | "--image"
         ) {
             index += 2;
             continue;
@@ -53,8 +69,10 @@ fn known_options_without_prompt(args: &[String]) -> bool {
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--plan" | "--read-only" | "--jsonl" => {}
-            "--prompt" | "--provider" | "--model" | "--endpoint" | "--session" | "--image" => {
+            "--plan" | "--read-only" | "--verbose" | "--jsonl" | "--headless" | "--tui"
+            | "--fake" => {}
+            "--prompt" | "--provider" | "--model" | "--endpoint" | "--session" | "--resume"
+            | "--recover" | "--image" => {
                 if args.get(index + 1).is_none() {
                     return false;
                 }

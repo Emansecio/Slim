@@ -254,10 +254,11 @@ lookup da tool
   → ToolResultMessage
 ```
 
-Um batch sem tools sequenciais executa em paralelo. Um batch todo sequencial é
-serial. Um batch misto é particionado: o subconjunto seguro roda em paralelo e
-o subconjunto sequencial mantém ordem. Resultados voltam ao transcript na ordem
-original das calls, mesmo quando a execução termina fora de ordem.
+**Contrato ativo do Slim v1:** cada resposta do provider define um batch, e
+todas as calls desse batch executam serialmente na ordem recebida. O lifecycle
+de cada call termina antes do `ToolStarted` seguinte. Não existe partição
+paralela/mista nem paralelismo planejado nesta etapa; a ordem do transcript é a
+ordem real de execução.
 
 ## 6. Mapa das 12 áreas
 
@@ -857,11 +858,90 @@ Gates atuais:
 O porte precisa de gates equivalentes em Rust e de uma suíte cross-language que
 alimente os dois binários com os mesmos fixtures.
 
-## 7. LSP em profundidade — pós-v1 planejado
+## 7. LSP — livestream slice 1 implementado
 
-LSP só pode ser implementado depois do gate v1, inicialmente como inteligência
-read-only lazy/shared. Não aquece no boot. Mutations e DAP dependem de evidência
-posterior; DAP não é compromisso do roadmap.
+Slice 1 (v1 pós-gate) implementado em 2026-08-28: crate `slim-lsp`, trait
+`CodeIntelligence` em `slim-core`, tool `code_intel` (6 ações read-only).
+Arquitetura real difere do planejamento original: a tool se chama `code_intel`
+e não `lsp`; o código é organizado em `crates/slim-lsp` com pool de processos
+LSP compartilhado (lease por sessão), codec de posição multi-encoding,
+e resultados compactos com metadados de confiabilidade.
+
+A implementação atual cobre **rust-analyzer** apenas (primeiro vertical slice).
+Descoberta por Cargo.toml + PATH/lookup. Inicialização lazy, processo
+compartilhado por (workspace root, server id, config hash).
+
+### 7.1 Tool `code_intel`
+
+```json
+{
+  "action": "symbol|definition|references|hover|diagnostics|status",
+  "path": "src/main.rs",
+  "line": 12, "column": 3,  // human 1-based
+  "symbol": "execute_tool_call",
+  "query": "search term",
+  "include_info": false,
+  "max_results": 20
+}
+```
+
+Toda resposta traz metadados: `server`, `state`, `completeness`, `document_version`,
+`stale`, `elapsed_ms`. Resultados são limitados e truncados por `max_results` (sem cursor ou offset),
+agrupados por arquivo, e cada linha de referência/símbolo inclui contexto de uma linha.
+
+### 7.2 Arquitetura
+
+```text
+Modelo
+  ↓
+code_intel (tool, 6 ações read-only)
+  ↓
+CodeIntelligence trait (slim-core)
+  ├─ LspProcessPool (processo compartilhado por chave)
+  │  └─ LspServerInstance (handshake, encoding, doc store, diagnostics)
+  └─ fallback textual (busca via ripgrep, não implementado)
+```
+
+### 7.3 Componentes
+
+- `crates/slim-lsp/src/position.rs` — codec UTF-8/16/32 com testes de unicode
+- `crates/slim-lsp/src/transport.rs` — framing Content-Length, JSON-RPC 2.0,
+  timeouts, cancelamento, notificações
+- `crates/slim-lsp/src/document.rs` — DocumentStore (LRU, versões monotônicas)
+- `crates/slim-lsp/src/diagnostics.rs` — DiagnosticsStore bounded por URI
+- `crates/slim-lsp/src/discovery.rs` — descoberta de servidor + root marker
+- `crates/slim-lsp/src/instance.rs` — handshake initialize/initialized,
+  sync de documentos, dreno de notificações (publishDiagnostics, $/progress)
+- `crates/slim-lsp/src/pool.rs` — LspProcessPool com leases, idle shutdown
+  (15 min), circuit breaker com backoff exponencial
+- `crates/slim-lsp/src/manager.rs` — implementação de CodeIntelligence
+- `crates/slim-lsp/src/process.rs` — StdioPair, kill de árvore (taskkill /T /F),
+  stderr ring buffer
+
+### 7.4 Segurança e fail-open
+
+- Nunca instala servidores automaticamente
+- Servidor indisponível → tool retorna `state: unavailable` com mensagem clara
+- Nenhum `request` genérico exposto; todas as operações são tipadas
+- `workspace/applyEdit` respondido com `{"applied": false}`
+- `workspace/executeCommand` desligado
+- Processo mata árvore inteira no teardown
+- Stderr mantido em ring buffer limitado
+
+### 7.5 Próximos slices
+
+- Slice 2: TypeScript + Python; post-write diagnostics;
+  singleflight; métricas
+- Slice 3: implementations, type definition, call hierarchy,
+  rename preview
+- Slice 4: aplicação transacional de rename, code actions seguras
+
+### 7.6 Referência
+
+- [LSP 3.18](https://microsoft.github.io/language-server-protocol/)
+  (lsp-types 0.97/3.17 na implementação atual, com negociação de
+  capabilities; 3.18-specific methods adicionados conforme necessidade)
+- [rust-analyzer](https://rust-analyzer.github.io/)
 
 ### 7.1 Descoberta
 
@@ -1144,7 +1224,7 @@ Rust não resolve sozinho:
 | globals de manager | sessões concorrentes se contaminam | ownership por `AgentSession` |
 | TUI genérica | quebra scrollback, IME e resize | golden ANSI/PTY e renderer diferencial |
 | kill de processo incompleto no Windows | jobs órfãos | Job Objects ou supervisor equivalente |
-| paralelismo sem ordem | transcript não determinístico | execução concorrente, commit de resultados em source order |
+| reordenação de batch | transcript não determinístico | execução serial e lifecycle completo em source order |
 | lock/atomic write diferente | corrupção de sessões e artefatos | testes de crash e concorrência cross-process |
 
 ## 13. Estratégia de migração
@@ -1188,7 +1268,7 @@ Cada fase abaixo é uma vertical slice com gate próprio.
 - implementar o pipeline único de tools;
 - implementar `read`, `edit`, `write`, `apply_patch`, list, search e shell;
 - executar o POC do backend de busca antes de congelar `fff-search` ou `ripgrep`;
-- provar abort, turn budget, batches paralelos/mistos e event ordering;
+- provar abort, turn budget, batches seriais e event ordering;
 - rodar com tools falsas e providers falsos.
 
 ### Fase 3 — sessão, compaction, context economy e CLI headless
@@ -1483,8 +1563,8 @@ Mecanismos úteis:
 - uma conformance suite para Memory, JSONL e SQLite;
 - snapshots remotos autoritativos; progress nunca vira verdade durável;
 - leases shared/exclusive para ownership de sessão remota;
-- tool batch com preflight em source order; somente reads conhecidas executam em
-  paralelo e todos os resultados finais voltam a source order;
+- tool batch com preflight e execução serial em source order; paralelismo de
+  reads permanece apenas referência histórica, sem plano de produto;
 - tool calls de mensagem truncada por output limit nunca executam;
 - paste marker atômico no editor;
 - main screen e alternate screen com componentes compartilhados;
@@ -1511,7 +1591,7 @@ Fontes:
 |---|---|---|
 | P0 | orçamento do prompt base | criar gate inicial de 8 KiB; alterar só com medição de qualidade/cache |
 | P0 | tool-result pipeline | sanitize → mask secrets → cap UTF-8 → marker → handle do integral |
-| P0 | batch determinístico | preflight source-order; execução concorrente; commit source-order |
+| P0 | batch determinístico | preflight e execução serial; lifecycle e commit em source order |
 | P0 | tool truncada | nenhuma tool call de resposta `length`/truncada pode executar |
 | P0 | durable operation state | reducer puro + estado total mínimo para resume/recovery |
 | P0 | backend conformance | Memory e JSONL passam a mesma suíte desde M0 |

@@ -17,7 +17,7 @@
 ## Status de implementação (slice TOK, 2026-08-21)
 
 Implementados **nativamente como default** (sem flags), comprovados por
-medição localhost pós-deploy e suíte atual de 45 suítes / 225 passed /
+medição localhost pós-deploy e suíte atual de 61 suítes / 407 passed /
 0 failed / 1 ConPTY físico ignored:
 
 | Item | Estado | Evidência |

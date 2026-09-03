@@ -12,7 +12,7 @@ pub enum Assurance {
     Unverified,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Goal {
     budget: Option<u64>,
     used: u64,
@@ -38,6 +38,14 @@ impl Goal {
         if self.budget.is_some_and(|budget| self.used >= budget) {
             self.status = GoalStatus::Paused;
         }
+        Ok(())
+    }
+
+    pub fn set_budget(&mut self, budget: Option<u64>) -> Result<(), &'static str> {
+        if self.status != GoalStatus::Active || self.used != 0 {
+            return Err("goal budget must be initialized first");
+        }
+        self.budget = budget;
         Ok(())
     }
 

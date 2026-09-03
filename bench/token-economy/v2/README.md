@@ -42,4 +42,13 @@ Pi e Pit recebem `models.json` isolado com `thinkingLevelMap` e rodam com
 | `RESULTS.template.md` | esqueleto para novas campanhas |
 | `RESULTS.md` | resultados consolidados atuais e PERF-02 |
 
+## Campanha atual — 2026-08-23
+
+A matriz fresca executou 4 cenários × 3 runs × 3 agentes: 36 processos, 78
+requests conformes (`gpt-5.6-luna`/`high`) e 36 arquivos de timing. Somente
+`s1_read` é comparação cross-agent estrita: os braços Pi/Pit atuais não
+expuseram ao discovery uma tool de escrita compatível e encerraram cedo nos
+outros cenários. Resultados e percentuais: `RESULTS.md`; tabela gerada:
+`analysis-current.md`; dados: `summary_v2.json`.
+
 A v1 permanece intocada em `../`.

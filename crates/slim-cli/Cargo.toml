@@ -4,16 +4,20 @@ version = "0.1.0"
 edition = "2021"
 autobins = false
 
+[lints]
+workspace = true
+
 [dependencies]
 base64 = "0.22"
 directories = "5"
 getrandom = "0.3"
 toml = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 slim-core = { path = "../slim-core" }
+slim-lsp = { path = "../slim-lsp" }
 slim-tui = { path = "../slim-tui" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 windows-sys = { version = "0.59", features = [
@@ -22,6 +26,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_System_ProcessStatus",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

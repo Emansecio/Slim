@@ -7,7 +7,7 @@ struct ChildRecord {
     result: Option<ChildResult>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Scheduler {
     max_active: usize,
     max_queue: usize,
@@ -63,6 +63,66 @@ impl Scheduler {
         }
     }
 
+    /// Rebuilds scheduler state from the durable child ledger.  Unlike
+    /// `spawn`, this preserves the recorded lifecycle and depth instead of
+    /// deriving a new status from the current in-memory capacity.
+    pub fn restore<I>(&mut self, children: I) -> Result<(), SpawnResult>
+    where
+        I: IntoIterator<Item = (SpawnRequest, ChildStatus)>,
+    {
+        let mut restored = Self::new(self.max_active, self.max_queue);
+        for (request, status) in children {
+            if request.depth > 1 {
+                return Err(SpawnResult::DepthExceeded);
+            }
+            if restored
+                .children
+                .iter()
+                .any(|child| child.request.id == request.id)
+            {
+                return Err(SpawnResult::Duplicate);
+            }
+            let active = restored
+                .children
+                .iter()
+                .filter(|child| child.status == ChildStatus::Active)
+                .count();
+            let queued = restored
+                .children
+                .iter()
+                .filter(|child| child.status == ChildStatus::Queued)
+                .count();
+            if status == ChildStatus::Active && active >= restored.max_active {
+                return Err(SpawnResult::QueueFull);
+            }
+            if status == ChildStatus::Queued && queued >= restored.max_queue {
+                return Err(SpawnResult::QueueFull);
+            }
+            let result = match status {
+                ChildStatus::Completed | ChildStatus::Cancelled | ChildStatus::Failed => {
+                    Some(ChildResult {
+                        id: request.id.clone(),
+                        status,
+                        session_id: format!("session-{}", request.id),
+                        message: if status == ChildStatus::Cancelled {
+                            "cancelled".into()
+                        } else {
+                            String::new()
+                        },
+                    })
+                }
+                ChildStatus::Queued | ChildStatus::Active => None,
+            };
+            restored.children.push(ChildRecord {
+                request,
+                status,
+                result,
+            });
+        }
+        *self = restored;
+        Ok(())
+    }
+
     pub fn finish(&mut self, id: &str, message: &str) {
         if let Some(child) = self
             .children
@@ -102,6 +162,21 @@ impl Scheduler {
             .iter()
             .find(|child| child.request.id == id)
             .map(|child| child.status)
+    }
+
+    pub fn depth(&self, id: &str) -> Option<u8> {
+        self.children
+            .iter()
+            .find(|child| child.request.id == id)
+            .map(|child| child.request.depth)
+    }
+
+    pub fn queued_ids(&self) -> Vec<String> {
+        self.children
+            .iter()
+            .filter(|child| child.status == ChildStatus::Queued)
+            .map(|child| child.request.id.clone())
+            .collect()
     }
 
     pub fn list(&self) -> Vec<ChildResult> {

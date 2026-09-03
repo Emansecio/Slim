@@ -1,7 +1,10 @@
 # PLAN — Benchmark v2: economia de tokens + velocidade (Slim x Pi x Pit)
 
-Status: **campanha executada em 2026-08-22**; resultados atuais em `RESULTS.md`.
-Modelo fixo para todos os agentes: **gpt-5.6-luna**, thinking **HIGH**.
+Status: **campanha fresca executada em 2026-08-23**; resultados atuais em
+`RESULTS.md`. Modelo fixo para todos os agentes: **gpt-5.6-luna**, thinking
+**HIGH**. O gate de comparabilidade restringe a conclusão cross-agent a
+`s1_read`: Pi/Pit não expuseram uma tool de escrita compatível ao discovery nos
+outros cenários e completaram menos turnos.
 
 ## Objetivos
 

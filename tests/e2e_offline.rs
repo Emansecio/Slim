@@ -12,11 +12,6 @@ use slim_core::provider::ProviderKind;
 use slim_core::session::recover;
 use slim_core::{EventKind, OperatingMode};
 
-#[cfg(windows)]
-use slim_cli::run_cli;
-#[cfg(windows)]
-use std::sync::{Mutex, OnceLock};
-
 const SERVER_DEADLINE: Duration = Duration::from_secs(5);
 const STREAM_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -165,6 +160,8 @@ fn spawn_openai_fixture(
                             "choices": [{
                                 "delta": {
                                     "tool_calls": [{
+                                        "index": 0,
+                                        "id": "offline-read-call",
                                         "function": {
                                             "name": "read",
                                             "arguments": json!({
@@ -221,7 +218,7 @@ fn anthropic_offline_e2e_runs_tool_turn_usage_and_session_without_secret_persist
         .set_nonblocking(true)
         .expect("nonblocking listener");
     let address = listener.local_addr().expect("address");
-    let source_arg = source.to_string_lossy().to_string();
+    let source_arg = "fixture.txt".to_owned();
     let server = thread::spawn(move || {
         let deadline = Instant::now() + SERVER_DEADLINE;
         for turn in 0..2 {
@@ -242,6 +239,7 @@ fn anthropic_offline_e2e_runs_tool_turn_usage_and_session_without_secret_persist
                         }),
                         json!({
                             "type": "content_block_start",
+                            "index": 0,
                             "content_block": {
                                 "type": "tool_use",
                                 "id": "remote-call-1",
@@ -274,6 +272,7 @@ fn anthropic_offline_e2e_runs_tool_turn_usage_and_session_without_secret_persist
                         }),
                         json!({
                             "type": "content_block_delta",
+                            "index": 0,
                             "delta": {"type": "text_delta", "text": "final from anthropic"}
                         }),
                         json!({
@@ -326,23 +325,33 @@ fn anthropic_offline_e2e_runs_tool_turn_usage_and_session_without_secret_persist
     )));
     assert!(recovered.events.iter().any(|event| matches!(
         event.kind,
-        EventKind::Usage {
+        EventKind::UsagePartial {
             input_tokens: 7,
-            output_tokens: 0
+            output_tokens: 0,
+            ..
         }
     )));
     assert!(recovered.events.iter().any(|event| matches!(
         event.kind,
-        EventKind::Usage {
+        EventKind::UsagePartial {
             input_tokens: 9,
-            output_tokens: 0
+            output_tokens: 0,
+            ..
+        }
+    )));
+    assert!(recovered.events.iter().any(|event| matches!(
+        event.kind,
+        EventKind::UsagePartial {
+            input_tokens: 0,
+            output_tokens: 4,
+            ..
         }
     )));
     assert!(recovered.events.iter().any(|event| matches!(
         event.kind,
         EventKind::Usage {
             input_tokens: 0,
-            output_tokens: 4
+            output_tokens: 0
         }
     )));
     assert!(recovered.events.iter().any(|event| matches!(
@@ -367,7 +376,7 @@ fn openai_compatible_offline_e2e_runs_structured_tool_turn_usage_and_session() {
     let address = listener.local_addr().expect("address");
     let server = spawn_openai_fixture(
         listener,
-        source.to_string_lossy().to_string(),
+        "fixture.txt".to_owned(),
         "inspect openai fixture",
         "openai-fixture",
         "fixture-openai-secret",
@@ -477,8 +486,8 @@ fn real_binary_offline_e2e_uses_temp_cwd_and_never_prints_secret() {
     assert!(output.status.success(), "status={:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stdout.contains("stop=provider_completed"));
     assert!(stdout.contains("binary fixture ok"));
+    assert!(!stdout.contains("stop=provider_completed"));
     assert!(!stdout.contains("binary-fixture-secret"));
     assert!(!stderr.contains("binary-fixture-secret"));
     assert!(!temp
@@ -491,55 +500,8 @@ fn real_binary_offline_e2e_uses_temp_cwd_and_never_prints_secret() {
 }
 
 #[cfg(windows)]
-static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-#[cfg(windows)]
-struct EnvGuard {
-    values: Vec<(&'static str, Option<std::ffi::OsString>)>,
-}
-
-#[cfg(windows)]
-impl EnvGuard {
-    fn capture(names: &[&'static str]) -> Self {
-        Self {
-            values: names
-                .iter()
-                .map(|name| (*name, std::env::var_os(name)))
-                .collect(),
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (name, value) in &self.values {
-            if let Some(value) = value {
-                std::env::set_var(name, value);
-            } else {
-                std::env::remove_var(name);
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
 #[test]
 fn cli_offline_auth_json_uses_local_provider_without_secret_output_or_session_persistence() {
-    let _lock = ENV_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("env lock");
-    let _env = EnvGuard::capture(&[
-        "SLIM_AUTH_FILE",
-        "SLIM_API_KEY",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "SLIM_PROVIDER",
-        "SLIM_ENDPOINT",
-        "SLIM_MODEL",
-    ]);
-
     let temp = TempDir::new("cli-auth-e2e");
     let source = temp.path().join("fixture.txt");
     std::fs::write(&source, "offline auth fixture\n").expect("fixture");
@@ -557,7 +519,7 @@ fn cli_offline_auth_json_uses_local_provider_without_secret_output_or_session_pe
     let address = listener.local_addr().expect("address");
     let server = spawn_openai_fixture(
         listener,
-        source.to_string_lossy().to_string(),
+        "fixture.txt".to_owned(),
         "inspect auth fixture",
         "auth-fixture",
         "fixture-auth-secret",
@@ -565,37 +527,40 @@ fn cli_offline_auth_json_uses_local_provider_without_secret_output_or_session_pe
         "final from auth",
     );
 
-    std::env::set_var("SLIM_AUTH_FILE", &auth);
-    std::env::remove_var("SLIM_API_KEY");
-    std::env::remove_var("OPENAI_API_KEY");
-    std::env::remove_var("ANTHROPIC_API_KEY");
     let endpoint = format!("http://{address}");
-    let output_result = run_cli(
-        [
-            "--provider".to_owned(),
-            "openai-compatible".to_owned(),
-            "--endpoint".to_owned(),
-            endpoint,
-            "--model".to_owned(),
-            "auth-fixture".to_owned(),
-            "--session".to_owned(),
-            session.to_str().expect("session path").to_owned(),
-            "--prompt".to_owned(),
-            "inspect auth fixture".to_owned(),
-        ],
-        "",
-    );
-    let server_result = server.join();
-    server_result.expect("server");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_slim"))
+        .current_dir(temp.path())
+        .args([
+            "--headless",
+            "--provider",
+            "openai-compatible",
+            "--endpoint",
+            &endpoint,
+            "--model",
+            "auth-fixture",
+            "--session",
+            session.to_str().expect("session path"),
+            "--prompt",
+            "inspect auth fixture",
+        ])
+        .env("SLIM_AUTH_FILE", &auth)
+        .env_remove("SLIM_API_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("SLIM_PROVIDER")
+        .env_remove("SLIM_ENDPOINT")
+        .env_remove("SLIM_MODEL")
+        .output()
+        .expect("slim binary");
+    server.join().expect("server");
 
-    assert_eq!(output_result.code, ExitCode::Success);
-    assert_eq!(
-        output_result.stdout,
-        "stop=provider_completed\nfinal from auth\n"
-    );
-    assert!(output_result.stderr.is_empty());
-    assert!(!output_result.stdout.contains("fixture-auth-secret"));
-    assert!(!output_result.stderr.contains("fixture-auth-secret"));
+    assert!(output.status.success(), "status={:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stdout, "final from auth\n");
+    assert!(stderr.is_empty());
+    assert!(!stdout.contains("fixture-auth-secret"));
+    assert!(!stderr.contains("fixture-auth-secret"));
     let raw_session = std::fs::read_to_string(&session).expect("session bytes");
     assert!(!raw_session.contains("fixture-auth-secret"));
     temp.cleanup();

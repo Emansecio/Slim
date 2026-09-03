@@ -8,7 +8,9 @@ use tokio::sync::{mpsc, watch};
 use super::browser::BrowserLauncher;
 use super::callback::await_callback;
 use super::pkce::{generate_pkce, generate_state};
-use super::{OAuthCredential, OAuthEndpoints, OAuthError, OAuthProgress};
+use super::{
+    parse_json_response_bounded, OAuthCredential, OAuthEndpoints, OAuthError, OAuthProgress,
+};
 
 const CLIENT_ID: &str = "9d1c250a-e6ae-44d9-88ed-5944d1962f5e";
 const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
@@ -114,10 +116,8 @@ async fn parse_token(
             response.status().as_u16()
         )));
     }
-    let token: TokenResponse = response
-        .json()
-        .await
-        .map_err(|_| OAuthError::InvalidResponse("Anthropic token response is invalid".into()))?;
+    let token: TokenResponse =
+        parse_json_response_bounded(response, "Anthropic token response is invalid").await?;
     if token.access_token.is_empty() {
         return Err(OAuthError::InvalidResponse(
             "Anthropic token response is incomplete".into(),

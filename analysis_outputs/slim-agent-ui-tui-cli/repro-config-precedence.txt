@@ -1,0 +1,23 @@
+Finding: load_layered first-wins with global loaded first, so global beats project.
+
+Documented contract:
+  crates/slim-cli/src/config.rs LayeredConfig: "project wins over global"
+  Config::resolve: cli.or(env).or(project).or(global)
+  tests: resolve_keeps_cli_over_environment_over_project_over_global
+  tests/headless_contract.rs configuration_precedence_is_cli_then_environment_then_project_then_global
+  Tracker W4: cli > env > project > global
+
+Implemented:
+  load_layered() pushes global path first, then ./slim.toml
+  merge_layer only fills None slots (first-wins)
+  Result: global model/endpoint/effort cannot be overridden by project slim.toml
+
+cargo test -p slim-cli --lib merge_fills
+  config::tests::merge_fills_gaps_without_overriding_earlier_layers PASS
+  This test encodes first-wins, which contradicts LayeredConfig's doc comment.
+
+Config::resolve is unit-tested and never called from cli.rs or tui.rs.
+Consumers call load_layered() (cli.rs, tui.rs prepare_tui).
+
+Not reproduced against the auditor's %APPDATA%\slim\slim.toml (would mutate user config).
+The merge order is fully determined by the functions above.

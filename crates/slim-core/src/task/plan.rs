@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Plan {
     nodes: Vec<PlanNode>,
     version: u64,
@@ -8,7 +8,7 @@ pub struct Plan {
     completed: HashSet<String>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct PlanNode {
     id: String,
     dependencies: Vec<String>,

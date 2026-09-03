@@ -1,0 +1,16 @@
+Finding: headless Codex always fails requiring account_id.
+
+Command (offline; adapter constructor fails before HTTP):
+  $env:CODEX_ACCESS_TOKEN = 'dummy-offline-token'
+  cargo run -q -- --headless --provider openai-codex --prompt "hi"
+  EXIT=21
+  stderr: provider error: Codex OAuth account id is required
+
+Code:
+  crates/slim-cli/src/cli.rs account_id: None on every ProviderRequest
+  crates/slim-cli/src/headless.rs OpenAiCodex branch requires request.account_id
+  crates/slim-core/src/provider/codex.rs OpenAiCodexAdapter::new requires OAuth account_id
+  TUI oauth_request fills account_id from OAuthCredential; CLI never calls codex_account_id()
+  auth.rs load_auth_file ignores the oauth blob (returns None when only oauth is stored)
+
+No commercial provider was contacted.

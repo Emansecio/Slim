@@ -10,4 +10,5 @@
 /bench/token-economy/v2/runs/
 /bench/token-economy/v2/.task-v2/
 /bench/token-economy/v2/.agent-dirs-v2/
+/bench/token-economy/v2/campaigns/
 __pycache__/

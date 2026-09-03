@@ -1,0 +1,18 @@
+Finding: binary headless never reads piped stdin.
+
+Command A — piped stdin (current WIP via cargo run → target\debug\slim.exe):
+  "hello from stdin" | cargo run -q -- --headless --read-only
+  EXIT=11
+  stdout/stderr: input_required
+
+Command B — explicit --prompt (control):
+  cargo run -q -- --headless --read-only --prompt "hello from stdin"
+  EXIT=0
+  stdout: success
+
+Library contract (does NOT go through main.rs stdin gate):
+  cargo test -p slim-cli --test cli_contract stdin_is_used_when_prompt_argument_is_absent -- --exact
+  PASS — run_cli(["--read-only"], "hello from stdin") returns Success
+  The test omits --headless, so it never exercises main.rs::known_options_without_prompt.
+
+Cause: crates/slim-cli/src/main.rs known_options_without_prompt treats "--headless" as unknown and returns false, so needs_stdin stays false and stdin is never read.

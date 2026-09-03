@@ -14,7 +14,7 @@ pub struct TodoItem {
     pub status: TodoStatus,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct TodoTracker {
     next_id: u64,
     items: Vec<TodoItem>,

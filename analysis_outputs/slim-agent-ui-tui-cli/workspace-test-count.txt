@@ -1,0 +1,12 @@
+Workspace test count (this session, regex on cargo test --workspace -j 1 --no-fail-fast log):
+
+  suites matching "test result: (ok|FAILED). N passed; N failed; N ignored" = 75
+  passed = 713
+  failed = 0
+  ignored = 1  (deployed_binary_offline_streaming_matrix — ConPTY)
+  failedSuites = 0
+  WORKSPACE_TEST_EXIT=0
+  elapsed_ms ~160957 (compile + run)
+  compiler "warning:" lines in that log: 0
+
+These numbers match older docs by coincidence; they were counted from this session's log, not copied from DESIGN/README.

@@ -1,7 +1,7 @@
 # Plano de implementação do Slim
 
-> **Status de implementação:** checkpoint parcial; definição de v1 ainda não
-> satisfeita. Consulte o [status atual](README.md).
+> **Status de implementação:** checkpoint de integração; definição de v1 ainda
+> não satisfeita. Consulte o [status atual](README.md) e o tracker do Harness v2.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `subagent-driven-development` or `executing-plans` to implement this plan task-by-task.
 
@@ -16,40 +16,52 @@ tools, contexto, skills, MCP e subagentes; headless e TUI apenas compõem o mesm
 JSONL append-only, ACL nativa Windows via `windows-sys`, provider adapters
 tipados, MCP stdio/Streamable HTTP e testes unit/property/golden/PTY.
 
-## Estado de implementação (atualizado em 2026-08-22)
+## Estado de implementação (atualizado em 2026-09-03)
 
-O workspace tem 225 passed / 0 failed / 1 ConPTY físico ignored em 45 suítes
-e build/deploy release aprovado por `refresh-slim.ps1 -Test`. Clippy
-focado em `slim-core` e `slim-tui --all-targets -D warnings` está verde.
-`cargo fmt --all -- --check` ainda tem drift; `slim-cli --no-deps` revela 21
-preexistentes fora deste slice. Isso
-comprova componentes, headless e a bridge TUI central offline, não integração
-v1 completa.
+O workspace tem 1087 passed / 0 failed / 1 ignored (ConPTY físico) em 87 suítes
+(1 teste preexistente quebrado filtrado via `--skip`, sem implementação em `crates/`)
+e build/deploy release por via manual equivalente (o `refresh-slim.ps1` aborta sob
+`ErrorActionPreference=Stop` do harness; build release + cópia + smoke `slim --version` verificados).
+O gate `cargo clippy --workspace --all-targets -- -D warnings` está verde.
+`cargo check --workspace` e `git diff --check` também estão verdes (`cargo fmt --all -- --check`
+acusa somente drift preexistente do rustfmt 1.98; trechos novos estão formatados). O release atual
+tem: `Slim.exe` do target e do PATH têm 18.706.944 bytes e
+SHA-256 idêntico
+`3586F8F4B080C0E540073B404742254F3D56513C51D0EA90281C9864A3D62A76`.
+Isso comprova componentes, headless, bridge TUI e capability bridge offline,
+não integração v1 completa.
 
-Integrado no headless: provider OpenAI-compatible/Anthropic SSE; read/list/search,
+Integrado no headless: providers OpenAI-compatible, Anthropic, Codex subscription
+e OpenCode Go; este último roteia 24 modelos por Chat Completions, Responses ou
+Messages com catálogo bounded/cache/fallback. Também: read/list/search,
 write/patch/shell; filtragem de capabilities; auth nativa com DACL; `--image`
 local; compaction; usage; artifact handles; anti-loop; e gravação JSONL nova via
-`--session`.
+`--session`, preflight/recovery e `--resume` explícitos.
 
-Integrado também na TUI: composer, auth/config, provider SSE incremental, agent
-loop, tools, usage, modos, cancelamento por abort do request e restauração
+Integrado também na TUI: composer, auth/config, provider SSE incremental, login
+OpenCode Go mascarado e `/models` dinâmico, agent loop, tools, usage, modos,
+cancelamento por abort do request e restauração
 fullscreen. Após a execução do tracker de auditoria (AUDIT-SLIM-TUI-TRACKER.md),
 integram-se ainda: reducer único normativo (`Action → reduce → Effect`), lanes
 bounded control/data com fairness e coalescer no runtime real, scrollback
 virtualizado via HeightIndex/WrapCache com pin/live-edge/unseen, paleta §21.3
-estratificada pintada por região, ActivityRail com spinner animado e medidor de
-contexto na operational bar (W2, 2026-08-21: ContextRail superior removida),
-composer boxed de três rows, tool blocks tipados agregados por nome/turno,
+estratificada pintada por região, ActivityRail por fase/tempo, SessionRail conversacional adaptativa e contexto
+único que retorna à operational bar quando a rail degrada (W2/Slice 5),
+composer boxed de três rows, Thinking expansível e tool blocks tipados
+agrupados por batch/correlacionados por call ID,
 command palette Ctrl+P, markdown-light, UTF-8/VT console flags com restore exato,
 proptest/fault injection/golden matrix via TestBackend e benchmark long-session
-com gate §27 (p95 W8 2,384 ms ≤ 16 ms em release). Estado re-verificado em
-2026-08-22 (rustc 1.97.1): 45 suítes / 225 passed / 0 failed / 1 ConPTY ignored e
-0 warnings no build — detalhes e achados de ambiente no tracker §§7–8.
+com gate §27 (p95 input→frame 1,132 ms e scroll 0,794 ms ≤ 16 ms em release). Estado re-verificado em
+2026-08-27 (rustc 1.97.1): 82 suítes / 903 passed / 0 failed / 1 ignored e
+0 compiler warnings — detalhes e achados de ambiente no tracker §§7–8.
+(2026-08-28: cache de corpos da TUI conectado — total 908 passed.)
 
-Ainda não integrado no caminho normal: cache HTTP usa implementação/testes,
-mas não o construtor normal; CLI/TUI não oferecem resume/recovery selection/branch;
-Skills, MCP e subagentes não entram no startup/loop/catálogo; Todo/Plan/Goal não
-são tools vivas e Plan retorna `approval_required` antes de gerar plano via provider.
+Ainda não integrado no caminho normal: `ask_question` no resume durável (N5);
+MCP transporte e child provider-backed. Plan na TUI já roda o loop read-only
+(N4); headless `--plan` continua `approval_required`.
+Todo no loop Auto. Skills Slim via tool `skill` lazy (`%USERPROFILE%/.slim/skills`);
+não entram no schema. Cache HTTP e
+capability bridge estão no run; globais `~/.agents` não são anunciadas.
 PTY/ConPTY E2E físico permanece `#[ignore]` (requer console Windows real) e a
 matriz física de terminais continua não verificada. Release determinístico/
 hash-valid empacota este checkpoint parcial.
@@ -344,24 +356,26 @@ Regras:
 
 Contrato:
 
-- `/compact` manual;
-- auto-compaction pre-send por reserva projetada, somente quando há histórico
-  antigo;
-- threshold 85% geral e 50% para janela de pelo menos 1M;
+- `/compact [instruções]` manual, sem persistir as instruções no transcript;
+- preparação preditiva em background quando a TUI cruza 75% (40% para janela
+  de pelo menos 1M), sem bloquear a resposta normal;
+- aplicação hard pre-send em 85% geral e 50% para janela de pelo menos 1M;
 - estimador heurístico (não tokenizer-exato) e mesmo adapter/modelo produz o
   resumo;
-- original JSONL permanece preservado;
-- o prompt mais recente e pares assistant/tool completos são preservados;
+- JSONL original permanece preservado e recebe checkpoint v2 encadeado;
+- instrução raiz literal, sufixo recente e pares assistant/tool completos são preservados;
 - a janela e a reserva são revalidadas antes e depois da compactação;
 - output integral vive em artifact handle;
-- falhas de resumo ou estouro remanescente são explícitos; não implementar
-  live/proactive/mid-turn ou memória global.
+- resumo preparado é aplicado apenas com fingerprint, provider e modelo
+  compatíveis; falha descarta sem substituir o histórico e entra em cooldown;
+- overflow sem output causal compacta e repete exatamente uma vez; sem
+  mid-turn compaction ou memória global.
 
-- [ ] **Step 1: escrever casos de janela 32k, 128k e 1M**
-- [ ] **Step 2: implementar cálculo de reserva**
-- [ ] **Step 3: implementar resumo e preservação de anchors**
-- [ ] **Step 4: testar overflow e recuperação**
-- [ ] **Step 5: executar**
+- [x] **Step 1: escrever casos de janela ordinária e >=1M**
+- [x] **Step 2: implementar cálculo de reserva e thresholds soft/hard**
+- [x] **Step 3: implementar resumo estruturado, anchors e checkpoint durável**
+- [x] **Step 4: testar background, descarte, overflow e recuperação**
+- [x] **Step 5: executar**
 
   ```powershell
   cargo test -p slim-core context_budget compaction
@@ -650,8 +664,9 @@ Fluxo obrigatório, com provider fake:
 
   Expected: PASS sem API key, rede externa ou terminal interativo, cobrindo
   também TUI real, cache habilitado, resume/branch, Skills, MCP, child agent e
-  Todo/Plan/Goal. O E2E offline existente cobre somente providers, auth e
-  headless/localhost; não é o fluxo completo acima.
+  Todo/Plan/Goal. O E2E offline do Stage10 cobre root→Skill→MCP local selecionado
+  →child→task→reopen sem replay; ainda não é o fluxo completo acima nem registra
+  automaticamente capabilities no provider loop/CLI/TUI.
 
 - [x] **Step 2: executar gates automatizados existentes**
 
@@ -742,19 +757,30 @@ essa lista:
 
 ## 10.1 Trabalho de integração restante (prioridade)
 
+> **Fila curta do ciclo atual (agente completo, harness leve):**
+> [PROXIMAS-ETAPAS-AGENTE.md](PROXIMAS-ETAPAS-AGENTE.md) — **N1–N3 feitos**
+> (OAuth headless, Todo no loop, Skill de projeto, Plan TUI, default Anthropic).
+> Próximo: N5 `ask_question` no resume TUI.
+> Inspectors, caches novos, MCP transporte e child provider-backed estão WONTFIX
+> nesse ciclo. Quando este §10.1 e aquele arquivo divergirem no *próximo* patch,
+> prevalece o arquivo de próximas etapas.
+
 1. **Concluído — TUI central real:** `slim --tui` usa composer, auth/config,
    provider SSE, agent loop, tools, usage e cancelamento; fixtures provam delta
    antes do término, round-trip de tool e fechamento da conexão cancelada.
-2. **P0 — cache:** construir o cliente normal com cache habilitado e provar
-   hit/miss, invalidação e ausência de cache para tool calls.
-3. **P0 — sessões:** expor resume, seleção de recovery e branch/fork na CLI e
-   TUI, preservando JSONL e relações parent/leaf.
-4. **P0 — Skills e MCP:** ligar descoberta/invocação e catálogo MCP ao startup,
-   dispatcher e modos; exercitar tools/resources/prompts reais.
-5. **P0 — subagentes:** ligar scheduler/activity/child-session a chamadas de
-   modelo reais, com cancel/join e resultado estruturado.
-6. **P0 — Todo/Plan/Goal:** registrar as operações como provider tools e fechar
-   fluxo Plan → aprovação → execução, Goal e Todo end-to-end.
+2. **Cache HTTP no caminho normal:** G236 ligou `HttpProviderClient::with_cache`
+   nos braços do run; o item “P0 cache inativo” abaixo é histórico. Não
+   reabrir como fatia de produto.
+3. **Concluído — sessões duráveis:** resume/recovery explícitos headless/TUI,
+   mesmo handle, histórico/redaction e branch v2 validados; UX geral de seleção
+   ou fork pode continuar limitada.
+4. **Parcial — Skills e MCP:** tool `skill` lazy; pasta `%USERPROFILE%/.slim/skills`
+   (override `cwd/.slim/skills`). Sem catálogo no prompt. Sem transporte MCP.
+5. **Parcial — subagentes:** scheduler bounded, parent/child, cancelamento,
+   FIFO e reopen duráveis; falta execução provider-backed/processo externo real.
+6. **Parcial — Todo/Plan/Goal:** tool `todo` no loop Auto e `TodoChanged` no
+   dock TUI. Plan na TUI roda o loop read-only (N4); Plan headless aborta;
+   Goal sem UI.
 7. **P0 — E2E e gates:** executar o fluxo integrado completo, depois repetir
    gates automatizados, matriz física de terminal e o release determinístico.
 
@@ -768,22 +794,22 @@ essa lista:
 
 ## 12. Estado de execução local
 
-Atualizado após a execução local em 2026-08-20. O checklist acima permanece a
+Atualizado após a execução local em 2026-08-24. O checklist acima permanece a
 especificação das tarefas; esta seção registra evidência do worktree atual.
 
 | Área | Estado | Evidência/limite |
 |---|---|---|
-| Tasks 1–9 + tracker TUI | componentes/contratos, headless e fundação TUI M0–M2 implementados em fatias | suíte atual: 225 passed / 0 failed / 1 ignored / 45 suítes; PTY físico `#[ignore]`; Skills, MCP, subagentes e Todo/Plan/Goal não estão ligados ao loop/catálogo |
+| Tasks 1–9 + tracker TUI + Harness v2 Etapas 8–10 | componentes/contratos, headless, TUI e capability bridge no loop (todo + skill lazy) | suíte atual: 1030 passed / 0 failed / 1 ignored / 87 suítes; ConPTY físico `#[ignore]`; MCP/child provider-backed continuam fora |
 | Task 10 | componentes M0/reducer/testes | usados pela aplicação TUI real |
 | Task 11 | lifecycle/input M1 integrado | `--tui` usa composer/fullscreen real e restauração RAII |
-| Task 12 | integração M2 central concluída | `AppHandle` publica SSE incremental para bridge; tools/usage/cancel funcionam; cache HTTP normal inativo |
+| Task 12 | integração M2 central concluída | `AppHandle` publica SSE incremental para bridge; tools/usage/cancel funcionam; cache HTTP e transporte compartilhado ativos |
 | Task 13 | componentes M3/inspectors/fallback/testes | UX base integrada; matriz física completa continua pendente |
 | Task 14 | **não concluída** | E2E offline cobre headless/localhost; fluxo v1 completo ainda não existe |
 | Task 15 | checkpoint determinístico produzido | EXE/ZIP/manifest/checksums hash-valid; não representa v1 completa |
 | Providers/headless | integrado localmente | SSE, tools nativas, modos, auth, multimodal, loop bounded e stops text/JSONL |
 | Context/usage/artifacts | integrado localmente | compaction bounded, Usage, caps e handles; sem alegar cobertura das superfícies não ligadas |
-| Cache | implementação/testes presentes, **inativo no caminho normal** | construtor normal `HttpProviderClient::new` |
-| Sessões | writer e `--session` presentes | sem resume/recovery selection/branch UX |
+| Cache/HTTP | implementação/testes presentes e **ativos no caminho normal** | `with_shared_transport_and_cache`; adapter/auth permanecem por request |
+| Sessões | writer, `--session`, `--resume` e recovery explícitos presentes | branch v2 validado; seleção/fork UX geral continua limitada |
 | POC-0 | verde com nota de ambiente | Rust/MSVC via Developer Command Prompt |
 | POC-1 | parcial comprovado | 100 ciclos e panic em ConPTY |
 | POC-2 | verde no testkit | sete tamanhos normativos |

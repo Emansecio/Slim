@@ -34,6 +34,22 @@ impl McpCatalog {
         self.prompts.push(prompt.into());
     }
 
+    pub fn server_name(&self) -> &str {
+        &self.server
+    }
+
+    pub fn tool_names(&self) -> &[String] {
+        &self.tools
+    }
+
+    pub fn resource_names(&self) -> &[String] {
+        &self.resources
+    }
+
+    pub fn prompt_names(&self) -> &[String] {
+        &self.prompts
+    }
+
     pub fn tools_for_mode(&self, mode: OperatingMode) -> Vec<String> {
         if mode != OperatingMode::Auto {
             return Vec::new();

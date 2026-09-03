@@ -7,7 +7,7 @@ use ratatui::Terminal;
 
 use slim_tui::api::{TodoItemStatus, TodoItemView};
 use slim_tui::app::AppState;
-use slim_tui::layout::plan;
+use slim_tui::layout::plan_with_session_rail;
 use slim_tui::reducer::reduce;
 use slim_tui::render::WrapCache;
 use slim_tui::runtime::render_frame;
@@ -33,8 +33,14 @@ fn state_with_content() -> AppState {
         &mut state,
         slim_tui::reducer::Action::UiEventReceived(slim_tui::api::UiEvent::TodoChanged {
             items: vec![
-                TodoItemView { title: "um".into(), status: TodoItemStatus::Completed },
-                TodoItemView { title: "dois".into(), status: TodoItemStatus::InProgress },
+                TodoItemView {
+                    title: "um".into(),
+                    status: TodoItemStatus::Completed,
+                },
+                TodoItemView {
+                    title: "dois".into(),
+                    status: TodoItemStatus::InProgress,
+                },
             ],
         }),
     );
@@ -79,25 +85,34 @@ fn matrix_of_normative_sizes_never_panics_and_keeps_status_visible() {
         for height in [8u16, 12, 24, 40] {
             let frame = render(&state, width, height);
             assert!(
-                !frame.contains("SLIM"),
-                "permanent footer branding at {width}x{height}"
+                !frame.lines().last().unwrap_or_default().contains("SLIM"),
+                "branding must stay out of the operational footer at {width}x{height}"
             );
-            assert!(frame.contains('›'), "composer prompt missing at {width}x{height}");
             assert!(
-                frame.contains("ctx") || frame.contains('↑'),
-                "usage metric missing at {width}x{height}"
+                frame.contains('>'),
+                "composer prompt missing at {width}x{height}"
+            );
+            assert!(
+                frame.contains("Ctrl") || frame.contains("^C") || frame.contains("/login"),
+                "operational status missing at {width}x{height}"
             );
             // Regions tile the full height exactly.
-            let todo_rows = slim_tui::layout::todo_height(true, 2);
-            let regions = plan(width, height, todo_rows, false);
-            let covered = regions.activity_rail.height
+            let todo_rows = slim_tui::layout::todo_height(true, 2, false);
+            let show_session_rail = width >= 80 && height >= 12;
+            let regions =
+                plan_with_session_rail(width, height, todo_rows, false, show_session_rail);
+            let covered = regions.session_rail.height
+                + regions.activity_rail.height
                 + regions.scrollback.height
                 + regions.todo.height
                 + regions.todo_divider.height
                 + regions.composer.height
                 + regions.op_divider.height
                 + regions.operational.height;
-            assert_eq!(covered, height, "regions must tile height at {width}x{height}");
+            assert_eq!(
+                covered, height,
+                "regions must tile height at {width}x{height}"
+            );
         }
     }
 }
@@ -106,7 +121,7 @@ fn matrix_of_normative_sizes_never_panics_and_keeps_status_visible() {
 fn emergency_size_renders_without_panic_and_keeps_composer() {
     let state = state_with_content();
     let frame = render(&state, 39, 7);
-    assert!(frame.contains('›'), "emergency composer must stay usable");
+    assert!(frame.contains('>'), "emergency composer must stay usable");
 }
 
 #[test]

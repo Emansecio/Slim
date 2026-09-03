@@ -1,72 +1,97 @@
-# AGENTS.md — regras obrigatórias para agentes de código
+# AGENTS.md
 
-> **Leia primeiro: [RULES.md](RULES.md) — protocolo canônico anti-alucinação.**
-> Prevalência: `RULES.md` > este arquivo > README > memória da conversa.
-> Este arquivo resume o que mais mata entregas aqui; RULES.md detalha tudo com
-> os incidentes reais que motivaram cada regra.
+## Propósito
+Completar a tarefa atual com o esquema mínimo suficiente.
+Proibido engenharia excessiva.
+O planejamento pode ser mais robusto, mas a execução deve ser leve.
+Designs que não podem provar ser necessários, por padrão, não fazer.
+Testes que não podem provar ser necessários, por padrão, não adicionar.
 
----
+## Fluxo de Trabalho
+1. Primeiro entender a demanda, depois agir. Não modifique o código primeiro e depois adivinhe a intenção.
+2. Na fase de planejamento, pode-se usar raciocínio mais alto. Na fase de execução, use raciocínio médio-baixo por padrão, ou mude para um modelo mais leve para implementação.
+3. Não mantenha o modo de raciocínio mais alto ativado o tempo todo.
+4. Não inicie múltiplos Agents em paralelo por padrão. Complete uma tarefa em linha única primeiro, depois decida se precisa dividi-la.
+5. Ative apenas as skills necessárias para completar a tarefa. Não instale skills de processos pesados.
+6. Primeiro produza o plano mínimo, depois execute. O plano deve especificar claramente:
+   - Objetivo
+   - Não objetivos
+   - Critérios de aceitação
+   - Escopo não modificado
 
-## 🚨 REGRA ZERO: atualizar o binário implantado antes de encerrar
+## Modos de Falha
+1. Não entender verdadeiramente a intenção, apenas corrigir problemas superficiais.
+2. Algo que poderia ser resolvido com uma limpeza única de causa raiz, mas em vez disso usar patches históricos, camadas de compatibilidade, implementações duplas, cópias e branches para engordar o código.
+3. Projetar excessivamente para casos raros, aumentando o custo de manutenção diária.
+4. Base de julgamento errada, não importa quão completo o raciocínio, a conclusão ainda estará errada.
+5. Em vez de ler o código diretamente para localizar o problema, usar busca ou adivinhação como substituto para a leitura.
+6. Usar "adicionar testes" como desculpa para continuar adicionando abstrações, expandindo o escopo e parecendo completo.
 
-O comando `slim` do terminal aponta para `C:\Users\User\bin\Slim.exe`, uma
-**cópia estática** do `target\release\slim.exe`. Ela **não se atualiza
-sozinha** — código novo sem deploy é, para o usuário, como se não existisse.
+## Limites de Ação
+1. Antes de agir, primeiro reafirme:
+   - O que o usuário realmente quer
+   - Qual é o escopo desta vez
+   - Coisas explicitamente não feitas
+   - Como considerar concluído
+2. Qualquer operação irreversível deve aguardar a confirmação do usuário com a senha antes de executar.
+   - A senha de confirmação é especificada pelo usuário.
+   - Sem senha, senha errada ou outras respostas, recusar a execução em todos os casos.
+3. As seguintes operações não são consideradas irreversíveis por padrão e podem ser executadas:
+   - Rollback do Git, restauração, troca de branch
+   - Mover arquivos para o diretório de backup do repositório atual
+   - Executar testes, visualizar diff, gerar plano, análise somente leitura
+4. Ao descobrir que está fazendo as seguintes coisas, deve parar imediatamente e mudar para um esquema menor:
+   - Adicionar abstração, framework ou camada de configuração, mas a demanda atual não precisa
+   - Projetar antecipadamente para algo que pode ser usado no futuro
+   - Continuar empilhando mais restrições para satisfazer restrições
+   - Modificar muitos arquivos irrelevantes ao mesmo tempo
+   - Criar uma segunda implementação para compatibilizar lógica antiga
+   - Usar a oportunidade para adicionar um sistema completo de testes
 
-**Depois de QUALQUER mudança de código (Rust, testes, Cargo.toml), rode:**
+## Testes
+Os testes servem apenas à aceitação das modificações atuais.
+Os testes não são responsáveis por completar a cobertura histórica, nem por projetar sistemas de testes futuros.
 
-```powershell
-.\refresh-slim.ps1          # build release + copia para o PATH + smoke test
-```
+1. Priorize executar os testes existentes relacionados à modificação atual.
+2. Se os testes existentes puderem provar que a modificação está correta, não adicione novos testes.
+3. Apenas adicione novos testes nas duas situações abaixo:
+   - Desta vez, o comportamento foi alterado, mas os testes existentes não cobrem esse comportamento
+   - O usuário explicitamente requer adicionar testes
+4. Novos testes cobrem no máximo 1 caminho principal da modificação real desta vez, e, se necessário, adicionam 1 caminho de falha crítica.
+5. Proibido expandir o escopo de testes para torná-lo mais completo.
+6. Proibido usar a oportunidade para completar testes de módulos irrelevantes.
+7. Proibido introduzir novos frameworks de teste, ferramentas de teste ou infraestrutura de teste.
+8. Proibido escrever grandes snapshots, matrizes parametrizadas ou suítes end-to-end.
+9. Proibido escrever testes para limites não requeridos pela demanda atual.
+10. Proibido modificar testes primeiro e depois forçar o comportamento do produto a se tornar mais complexo.
+11. Proibido usar "tornar os testes verdes" como razão para continuar adicionando abstrações.
 
-Só declare a tarefa concluída depois que o script imprimir `OK:`. Se a mudança
-for estrutural (não cosmética), prefira `.\refresh-slim.ps1 -Test`, que roda
-`cargo test --workspace` antes do deploy e aborta em caso de falha.
+Antes de adicionar qualquer teste, deve ser capaz de responder:
+- Este teste está validando qual demanda já aceita
+- Se removê-lo, os testes existentes não conseguirão detectar esta regressão
+- Ele é mais complexo que a implementação em si
 
-> **Incidente de referência (2026-08-21, I1 em RULES.md):** o usuário validou
-> visualmente a TUI rodando um `Slim.exe` das 05:45 enquanto o código já tinha
-> os slices do dia. Resultado: screenshots da interface antiga e um ciclo
-> inteiro de "documentação vs realidade" desperdiçado. Não repita isso.
+Se o código de teste for mais longo ou mais complicado que o código de implementação, considere por padrão como engenharia excessiva; delete o teste ou reduza a implementação.
 
-## 🔧 Toolchain — armadilhas conhecidas
+## Divisão de Trabalho do Modelo
+- Esclarecimento de demandas e revisão de esquemas: use modelos mais fortes
+- Escrever código, modificar código, executar testes: use modelos de configuração média-baixa, ou modelos de execução mais leves
+- Ao descobrir que o modelo de execução começa a empilhar arquitetura, adicionar compatibilidade, expandir escopo, adicionar grandes conjuntos de testes: pare imediatamente e reescreva o plano mínimo
 
-- As variáveis de usuário `RUSTC`/`CARGO` apontam para
-  `C:\Users\User\.cargo\bin` (**não existe**). O `refresh-slim.ps1` define
-  `RUSTC` corretamente na sessão; em comandos manuais, use:
+## Verificação Antes da Conclusão
+- Já reafirmou a intenção e os critérios de aceitação
+- O esquema é o esquema mínimo, não o máximo
+- Já marcou os não objetivos
+- Priorizou ler o código relevante, em vez de montar conclusões com busca
+- Modificou apenas o conjunto mínimo de arquivos necessários para completar a tarefa
+- Testes existentes relevantes já foram executados
+- Não adicionou testes para cenários não requeridos
+- Se adicionou testes, apenas bloqueou o comportamento desta vez, e em pouca quantidade
+- Os testes não introduziram novas dependências ou nova estrutura de diretórios
+- Diff pequeno, sem arquivos extras, sem código de depuração residual
+- Não construiu extra para parecer completo
 
-  ```powershell
-  $env:RUSTC = 'C:\Users\User\scoop\persist\rustup-msvc\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustc.exe'
-  ```
-
-- Existem duas instalações rustup: `C:\Users\User\.rustup` (rustc **1.95.0**,
-  velha) e o scoop persist (rustc **1.97.1**, ativa). Compilar com uma e
-  documentar com outra gera E0514 nos Doc-tests. Após trocar de compilador,
-  limpe `target\debug` antes de retestar.
-- Exit code de pipeline PowerShell pode mentir (`2>&1 | Select-String`):
-  confirme com `EXIT=$LASTEXITCODE` sem filtro antes de diagnosticar falha.
-
-## ✅ Definição de pronto
-
-Uma tarefa só está PRONTA quando **todos** os itens valem:
-
-1. `cargo test --workspace` está verde (0 failed, 0 warnings);
-2. `.\refresh-slim.ps1` rodou e imprimiu `OK:` (binário no PATH atualizado);
-3. Documentação de status atualizada na mesma tarefa:
-   - `Documentações - Projeto/AUDIT-SLIM-TUI-TRACKER.md` §7 (log de execução);
-   - `Documentações - Projeto/DESIGN-SLIM-TUI.md` §1.1 (checkpoint), se o
-     comportamento mudou;
-   - números de testes conferidos com grep em **todos** os arquivos que os
-     citam (`README.md`, `Documentações - Projeto/README.md`,
-     `PLANO-IMPLEMENTACAO.md`, `release/README.md`, tracker);
-4. Checklist da seção 4 de `RULES.md` copiado preenchido na resposta final.
-
-## 📚 Documentação viva
-
-- `Documentações - Projeto/AUDIT-SLIM-TUI-TRACKER.md` é tracker vivo: todo
-  slice executado vira linha no §7; bugs novos entram no §5 antes da correção.
-- `Documentações - Projeto/DESIGN-SLIM-TUI.md` §§2–29 são contrato normativo:
-  layout, motion, degradação e cores são decisões fechadas. Mudar
-  comportamento sem revisar a spec primeiro é violação — "modernizar" contra
-  a spec não é melhoria.
-- Auditorias e análises antigas (`analysis_outputs/`, conversas anteriores)
-  descrevem o passado: revalide contra o código antes de usar como base.
+## Regra Geral
+Primeiro confirme a intenção, depois complete a aceitação com modificações mínimas.
+Designs que não podem provar ser necessários, por padrão, não fazer.
+Testes que não podem provar ser necessários, por padrão, não adicionar.

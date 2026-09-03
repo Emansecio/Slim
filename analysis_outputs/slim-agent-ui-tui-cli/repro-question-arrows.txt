@@ -1,0 +1,30 @@
+Finding: live TUI Up/Down scroll instead of moving structured-question selection; Outro... is unreachable.
+
+Expected (DESIGN-SLIM-TUI.md §1.1 and reducer):
+  arrows/numbers navigate options; Outro... is the extra row after options.
+
+Actual live path:
+  slim-tui/src/runtime.rs terminal_action remaps Up/Down/Page/Home/End to Action::Scroll
+  unless login/model/effort/palette/slash overlay is open.
+  pending_interaction() is NOT in that gate.
+
+Reducer still implements Question Up/Down:
+  slim-tui/src/reducer.rs reduce_interaction_key KeyCode::Up|Down → move_question_selection
+  Digit 1-9 select option index < options.len() (Outro is options.len(), not included)
+  Enter on Outro row (selected == options.len()) activates custom answer
+
+Outro reachability:
+  move_question_selection count = options.len() + 1
+  select_question_option rejects index >= options.len()
+  Therefore Outro requires Up/Down, which never arrive as Action::Key in the live terminal.
+
+Tests that pass (bypass the frontier):
+  cargo test -p slim-tui --test interaction_roundtrip
+    question_options_support_selection_and_custom_answer_without_sending_a_prompt PASS
+    uses Action::Key(Down) directly, not terminal_action
+  cargo test -p slim-tui --lib overlay_arrow
+    runtime::tests::overlay_arrow_is_routed_to_reducer_instead_of_scrollback PASS
+    asserts: login overlay → Action::Key; overlay absent → Action::Scroll
+    No pending question is installed in that test.
+
+No ConPTY physical capture in this session (tui_pty.rs is #[ignore]).

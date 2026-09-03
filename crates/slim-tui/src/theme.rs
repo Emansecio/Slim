@@ -33,10 +33,13 @@ pub struct Theme {
     pub border: (u8, u8, u8),
     pub border_focus: (u8, u8, u8),
     pub operational_divider: (u8, u8, u8),
+    pub scrollbar_track: (u8, u8, u8),
+    pub scrollbar_thumb: (u8, u8, u8),
     pub user_accent: (u8, u8, u8),
     pub assistant_accent: (u8, u8, u8),
     pub thinking_accent: (u8, u8, u8),
     pub heading_accent: (u8, u8, u8),
+    pub link_accent: (u8, u8, u8),
     pub tool_accent: (u8, u8, u8),
     pub success: (u8, u8, u8),
     pub warning: (u8, u8, u8),
@@ -67,7 +70,8 @@ pub fn detect_capabilities() -> Capabilities {
             ColorDepth::Ansi16
         },
         mouse: std::env::var_os("SLIM_MOUSE").is_some_and(|value| value == "1"),
-        clipboard: std::env::var_os("SLIM_CLIPBOARD").is_some_and(|value| value == "1"),
+        clipboard: cfg!(windows)
+            || std::env::var_os("SLIM_CLIPBOARD").is_some_and(|value| value == "1"),
         images: std::env::var_os("SLIM_IMAGES").is_some_and(|value| value == "1"),
         reduced_motion: std::env::var_os("SLIM_REDUCED_MOTION").is_some_and(|v| v == "1"),
     }
@@ -82,19 +86,22 @@ pub fn resolve_theme(capabilities: Capabilities) -> Theme {
         foreground: (0xC6, 0xCD, 0xD5),
         muted: (0x74, 0x7B, 0x84),
         secondary_text: (0xA9, 0xB0, 0xB8),
-        accent: (0x78, 0xD9, 0x9B),
+        accent: (0x7D, 0xCF, 0xFF),
         surface: (0x0D, 0x10, 0x14),
         surface_alt: (0x12, 0x16, 0x1B),
         // W8: composer/footer share transcript depth; border carries shape.
         composer_bg: (0x0D, 0x10, 0x14),
         user_prompt_bg: (0x1B, 0x20, 0x26),
         border: (0x2B, 0x31, 0x39),
-        border_focus: (0x78, 0xD9, 0x9B),
+        border_focus: (0x4B, 0x78, 0x91),
         operational_divider: (0x25, 0x2B, 0x33),
+        scrollbar_track: (0x15, 0x1A, 0x20),
+        scrollbar_thumb: (0x4B, 0x55, 0x63),
         user_accent: (0xA9, 0xB0, 0xB8),
         assistant_accent: (0x78, 0xD9, 0x9B),
         thinking_accent: (0x9A, 0xA4, 0xAF),
         heading_accent: (0x82, 0xAF, 0xFF),
+        link_accent: (0x8C, 0xB4, 0xFF),
         tool_accent: (0x7D, 0xCF, 0xFF),
         success: (0x78, 0xD9, 0x9B),
         warning: (0xE6, 0xB4, 0x50),
@@ -114,6 +121,8 @@ pub fn resolve_theme(capabilities: Capabilities) -> Theme {
         theme.foreground = white;
         theme.muted = white;
         theme.secondary_text = white;
+        theme.scrollbar_track = white;
+        theme.scrollbar_thumb = white;
     }
     theme
 }

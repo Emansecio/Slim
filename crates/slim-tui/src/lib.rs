@@ -4,20 +4,23 @@ pub mod api;
 pub mod app;
 pub mod block;
 pub mod cache;
+pub mod clipboard;
 pub mod composer;
 pub mod fullscreen;
 pub mod image;
 pub mod input;
 pub mod inspector;
 pub mod layout;
+mod markdown;
+pub mod picker;
 pub mod reducer;
 pub mod render;
 pub mod runtime;
+mod runtime_wait;
 pub mod terminal;
 pub mod testkit;
 pub mod theme;
 pub mod view_model;
-pub mod welcome;
 
 pub use runtime::run_app;
 

@@ -91,20 +91,30 @@ fn spawn_image_fixture(kind: ProviderKind, image_count: usize) -> (String, threa
         let body = request.split("\r\n\r\n").nth(1).expect("body");
         let body: serde_json::Value = serde_json::from_str(body).expect("json body");
         // OpenAI-compatible: messages[0] is the native Slim system prompt and
-        // the user turn follows. Anthropic carries the system prompt in the
-        // top-level `system` field, so its first message stays the user turn.
+        // the user turn follows. Anthropic carries cacheable system blocks in
+        // the top-level `system` field, so its first message stays the user turn.
         match kind {
             ProviderKind::OpenAiCompatible => {
                 assert_eq!(body["messages"][0]["role"], "system");
-                assert_eq!(body["system"].as_str().is_none(), true);
+                assert!(body["system"].as_str().is_none());
             }
             ProviderKind::Anthropic => {
                 assert_eq!(body["messages"][0]["role"], "user");
-                assert_eq!(body["system"], slim_core::provider::NATIVE_SYSTEM_PROMPT);
+                assert_eq!(
+                    body["system"][0]["text"],
+                    slim_core::provider::NATIVE_SYSTEM_PROMPT
+                );
+                assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+                assert_eq!(body["cache_control"]["type"], "ephemeral");
             }
-            ProviderKind::OpenAiCodex => unreachable!("image fixture does not use Codex"),
+            ProviderKind::OpenAiCodex
+            | ProviderKind::OpenCodeGo
+            | ProviderKind::ClinePass
+            | ProviderKind::CommandCode => {
+                unreachable!("image fixture does not use this provider")
+            }
         }
-        let user_index = if kind == ProviderKind::OpenAiCompatible { 1 } else { 0 };
+        let user_index = usize::from(kind == ProviderKind::OpenAiCompatible);
         let content = &body["messages"][user_index]["content"];
         assert_eq!(
             content.as_array().expect("multimodal content").len(),
@@ -120,7 +130,12 @@ fn spawn_image_fixture(kind: ProviderKind, image_count: usize) -> (String, threa
                 assert_eq!(content[1]["source"]["media_type"], "image/png");
                 assert_eq!(content[1]["source"]["data"], "AAEC");
             }
-            ProviderKind::OpenAiCodex => unreachable!("image fixture does not use Codex"),
+            ProviderKind::OpenAiCodex
+            | ProviderKind::OpenCodeGo
+            | ProviderKind::ClinePass
+            | ProviderKind::CommandCode => {
+                unreachable!("image fixture does not use this provider")
+            }
         }
         stream
             .write_all(
@@ -129,8 +144,10 @@ fn spawn_image_fixture(kind: ProviderKind, image_count: usize) -> (String, threa
             .expect("headers");
         let events = match kind {
             ProviderKind::OpenAiCompatible => b"data: {\"choices\":[{\"delta\":{\"content\":\"image ok\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".as_slice(),
-            ProviderKind::Anthropic => b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"image ok\"}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: [DONE]\n\n".as_slice(),
-            ProviderKind::OpenAiCodex => unreachable!("image fixture does not use Codex"),
+            ProviderKind::Anthropic => b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"image ok\"}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: [DONE]\n\n".as_slice(),
+            ProviderKind::OpenAiCodex | ProviderKind::OpenCodeGo | ProviderKind::ClinePass | ProviderKind::CommandCode => {
+                unreachable!("image fixture does not use this provider")
+            }
         };
         stream.write_all(events).expect("events");
     });
@@ -142,36 +159,36 @@ fn configured_headless_provider_uses_local_sse_without_leaking_key() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let address = listener.local_addr().expect("address");
     let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            // Read until the declared Content-Length is satisfied: the native
-            // system prompt makes the request body larger than a single read.
-            let mut raw = Vec::new();
-            let mut chunk = [0_u8; 64 * 1024];
-            let expected = loop {
-                let size = stream.read(&mut chunk).expect("request");
-                if size == 0 {
-                    panic!("fixture: connection closed before full request");
+        let (mut stream, _) = listener.accept().expect("accept");
+        // Read until the declared Content-Length is satisfied: the native
+        // system prompt makes the request body larger than a single read.
+        let mut raw = Vec::new();
+        let mut chunk = [0_u8; 64 * 1024];
+        let expected = loop {
+            let size = stream.read(&mut chunk).expect("request");
+            if size == 0 {
+                panic!("fixture: connection closed before full request");
+            }
+            raw.extend_from_slice(&chunk[..size]);
+            let text = String::from_utf8_lossy(&raw);
+            if let Some(length) = text
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("Content-Length:")
+                        .or_else(|| line.strip_prefix("content-length:"))
+                })
+                .and_then(|value| value.trim().parse::<usize>().ok())
+            {
+                let header_end = text.find("\r\n\r\n").expect("header terminator") + 4;
+                if raw.len() >= header_end + length {
+                    break (header_end, length);
                 }
-                raw.extend_from_slice(&chunk[..size]);
-                let text = String::from_utf8_lossy(&raw);
-                if let Some(length) = text
-                    .lines()
-                    .find_map(|line| {
-                        line.strip_prefix("Content-Length:")
-                            .or_else(|| line.strip_prefix("content-length:"))
-                    })
-                    .and_then(|value| value.trim().parse::<usize>().ok())
-                {
-                    let header_end = text.find("\r\n\r\n").expect("header terminator") + 4;
-                    if raw.len() >= header_end + length {
-                        break (header_end, length);
-                    }
-                }
-            };
-            let _ = expected;
-            let request = String::from_utf8_lossy(&raw).into_owned();
-            assert!(request.contains("fixture-model"));
-            assert!(request.contains("Bearer fixture-secret"));
+            }
+        };
+        let _ = expected;
+        let request = String::from_utf8_lossy(&raw).into_owned();
+        assert!(request.contains("fixture-model"));
+        assert!(request.contains("Bearer fixture-secret"));
         stream
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
@@ -216,10 +233,7 @@ data: [DONE]
 
     assert_eq!(result.code, ExitCode::Success);
     assert_eq!(result.text, "hello from fixture");
-    assert_eq!(
-        render_provider_text(&result),
-        "stop=provider_completed\nhello from fixture\n"
-    );
+    assert_eq!(render_provider_text(&result), "hello from fixture\n");
     let jsonl = render_provider_jsonl(&result).expect("jsonl");
     assert!(jsonl.contains("hello from fixture"));
     assert!(!jsonl.contains("fixture-secret"));
@@ -232,6 +246,113 @@ data: [DONE]
         .expect("session text")
         .contains("fixture-secret"));
     let _ = std::fs::remove_file(session_path);
+}
+
+#[test]
+fn invalid_session_destination_fails_before_provider_request() {
+    let root = std::env::temp_dir().join(format!(
+        "slim-session-preflight-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let session_path = root.join("session.jsonl");
+    std::fs::create_dir_all(&session_path).expect("directory at session path");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let error = run_provider_headless_with_session(
+        ProviderRequest {
+            prompt: "hello".into(),
+            mode: OperatingMode::Auto,
+            kind: ProviderKind::OpenAiCompatible,
+            endpoint: format!("http://{address}"),
+            model: "fixture-model".into(),
+            api_key: "fixture-secret".into(),
+            account_id: None,
+            timeout: Duration::from_secs(1),
+        },
+        &session_path,
+    )
+    .expect_err("invalid session destination");
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "provider was contacted"
+    );
+    assert!(matches!(
+        error,
+        slim_core::provider::ProviderError::InvalidResponse { message }
+            if message.starts_with("session:")
+    ));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn terminal_provider_failure_preserves_failed_request_ledger_and_session() {
+    let session_path = std::env::temp_dir().join(format!(
+        "slim-provider-failure-{}-{}.jsonl",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let result = run_provider_headless_with_session(
+        ProviderRequest {
+            prompt: "offline failure fixture".into(),
+            mode: OperatingMode::Auto,
+            kind: ProviderKind::OpenAiCompatible,
+            endpoint: "http://127.0.0.1:1".into(),
+            model: "fixture-model".into(),
+            api_key: "fixture-secret".into(),
+            account_id: None,
+            timeout: Duration::from_millis(50),
+        },
+        &session_path,
+    )
+    .expect("terminal provider failure is a headless result");
+
+    assert_eq!(result.code, ExitCode::Provider);
+    assert_eq!(result.stop, "provider_error");
+    assert!(!result.usage_complete);
+    assert!(result.usage.requests[0].failed);
+    let jsonl = render_provider_jsonl(&result).expect("provider JSONL");
+    assert!(jsonl.contains("\"failed\":true"));
+    let recovered = recover(&session_path).expect("failed session");
+    assert!(recovered.events.iter().any(|event| matches!(
+        event.kind,
+        slim_core::EventKind::RequestCompleted { failed: true, .. }
+    )));
+    let _ = std::fs::remove_file(session_path);
+}
+
+#[test]
+fn opencode_go_headless_uses_documented_chat_route() {
+    let (endpoint, server) = spawn_one_turn_fixture(vec![
+        json!({"choices": [{"delta": {"content": "hello from go"}}]}),
+        json!({"usage": {"prompt_tokens": 3, "completion_tokens": 2}}),
+        json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+    ]);
+
+    let result = run_provider_headless_with_options(
+        ProviderRequest {
+            prompt: "hello".into(),
+            mode: OperatingMode::Auto,
+            kind: ProviderKind::OpenCodeGo,
+            endpoint,
+            model: "deepseek-v4-flash".into(),
+            api_key: "go-secret".into(),
+            account_id: None,
+            timeout: Duration::from_secs(2),
+        },
+        ProviderRunOptions::default(),
+    )
+    .expect("OpenCode Go provider");
+    server.join().expect("server");
+
+    assert_eq!(result.text, "hello from go");
 }
 
 #[test]
@@ -275,7 +396,7 @@ fn configured_headless_executes_a_read_tool_call_in_auto_mode() {
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let address = listener.local_addr().expect("address");
-    let path_arg = path.to_string_lossy().replace('\\', "\\\\");
+    let path_arg = "fixture.txt".to_owned();
     let server = thread::spawn(move || {
         for turn in 0..2 {
             let (mut stream, _) = listener.accept().expect("accept");
@@ -293,6 +414,8 @@ fn configured_headless_executes_a_read_tool_call_in_auto_mode() {
                         "choices": [{
                             "delta": {
                                 "tool_calls": [{
+                                    "index": 0,
+                                    "id": "single-read-call",
                                     "function": {
                                         "name": "read",
                                         "arguments": json!({
@@ -318,22 +441,31 @@ fn configured_headless_executes_a_read_tool_call_in_auto_mode() {
         }
     });
 
-    let result = run_provider_headless(ProviderRequest {
-        prompt: "read fixture".into(),
-        mode: OperatingMode::Auto,
-        kind: ProviderKind::OpenAiCompatible,
-        endpoint: format!("http://{address}"),
-        model: "fixture-model".into(),
-        api_key: "fixture-secret".into(),
-        account_id: None,
-        timeout: Duration::from_secs(2),
-    })
+    let result = run_provider_headless_with_options(
+        ProviderRequest {
+            prompt: "read fixture".into(),
+            mode: OperatingMode::Auto,
+            kind: ProviderKind::OpenAiCompatible,
+            endpoint: format!("http://{address}"),
+            model: "fixture-model".into(),
+            api_key: "fixture-secret".into(),
+            account_id: None,
+            timeout: Duration::from_secs(2),
+        },
+        ProviderRunOptions::default()
+            .with_workspace_root(&root)
+            .with_artifact_root(root.join("artifacts")),
+    )
     .expect("provider");
     server.join().expect("server");
 
     assert_eq!(result.code, ExitCode::Success);
     assert!(result.text.contains("tool read:"));
     assert!(result.text.contains("1: tool content"));
+    assert_eq!(result.tool_summary_lines.len(), 1);
+    assert!(result.tool_summary_lines[0].starts_with("✓ read · "));
+    assert!(!result.tool_summary_lines[0].contains(path.to_string_lossy().as_ref()));
+    assert!(!result.tool_summary_lines[0].contains("tool content"));
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -347,7 +479,7 @@ fn configured_headless_runs_a_second_provider_turn_after_tool_result() {
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let address = listener.local_addr().expect("address");
-    let path_arg = path.to_string_lossy().to_string();
+    let path_arg = "fixture.txt".to_owned();
     let server = thread::spawn(move || {
         for turn in 0..2 {
             let (mut stream, _) = listener.accept().expect("accept");
@@ -370,6 +502,8 @@ fn configured_headless_runs_a_second_provider_turn_after_tool_result() {
                     "choices": [{
                         "delta": {
                             "tool_calls": [{
+                                "index": 0,
+                                "id": "multi-turn-read-call",
                                 "function": {
                                     "name": "read",
                                     "arguments": json!({
@@ -436,25 +570,20 @@ fn configured_headless_runs_a_second_provider_turn_after_tool_result() {
 fn bounded_stops_expose_stable_status_and_nonzero_codes() {
     let root = std::env::temp_dir().join(format!("slim-bounded-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("root");
-    let missing = root.join("missing.txt");
     for (options, expected_code, expected_stop, events) in [
         (
             ProviderRunOptions::default().with_max_turns(1),
             ExitCode::Blocked,
             "turn_limit",
-            vec![
-                tool_event(&missing.to_string_lossy(), "turn-1"),
-                finish_tool_event(),
-            ],
+            vec![tool_event("missing.txt", "turn-1"), finish_tool_event()],
         ),
         (
-            ProviderRunOptions::default().with_max_tool_calls(0),
+            ProviderRunOptions::default()
+                .with_max_tool_calls(0)
+                .with_max_read_tool_calls(0),
             ExitCode::Tool,
             "tool_limit",
-            vec![
-                tool_event(&missing.to_string_lossy(), "tool-1"),
-                finish_tool_event(),
-            ],
+            vec![tool_event("missing.txt", "tool-1"), finish_tool_event()],
         ),
     ] {
         let (endpoint, server) = spawn_one_turn_fixture(events);
@@ -487,7 +616,6 @@ fn bounded_stops_expose_stable_status_and_nonzero_codes() {
 fn repeated_failed_tool_stop_is_blocked_and_anti_loop_is_reported() {
     let root = std::env::temp_dir().join(format!("slim-antiloop-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("root");
-    let missing = root.join("missing.txt");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     listener
         .set_nonblocking(true)
@@ -514,7 +642,7 @@ fn repeated_failed_tool_stop_is_blocked_and_anti_loop_is_reported() {
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
                 )
                 .expect("headers");
-            let event = tool_event(&missing.to_string_lossy(), &format!("loop-{turn}"));
+            let event = tool_event("missing.txt", &format!("loop-{turn}"));
             stream
                 .write_all(
                     format!(
@@ -614,6 +742,6 @@ fn local_images_are_repeatable_and_encoded_for_both_provider_shapes() {
         std::env::remove_var("SLIM_API_KEY");
     }
     assert_eq!(output.code, ExitCode::Success);
-    assert!(output.stdout.contains("stop=provider_completed"));
+    assert_eq!(output.stdout, "image ok\n");
     let _ = std::fs::remove_dir_all(root);
 }

@@ -1,30 +1,26 @@
-use std::io::Read;
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Output;
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::ToolError;
+use crate::process::{ProcessOutputBudget, ProcessProgress, ProcessRequest, ProcessRunner};
 use crate::runtime::CancellationToken;
 
+const SHELL_CAPTURE_CAP_BYTES: usize = 8 * 1024 * 1024;
+
 pub fn run_shell(cwd: impl AsRef<Path>, command: &str) -> Result<Output, ToolError> {
-    if command.trim().is_empty() {
-        return Err(ToolError::InvalidInput {
-            message: "shell command cannot be empty".into(),
-        });
-    }
-    let shell = if which("pwsh") { "pwsh" } else { "powershell" };
-    std::process::Command::new(shell)
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            command,
-        ])
-        .current_dir(cwd)
-        .output()
-        .map_err(ToolError::from)
+    let runner = ProcessRunner::default();
+    let result = run_with_runner(
+        &runner,
+        cwd.as_ref(),
+        command,
+        Duration::MAX,
+        None,
+        ProcessOutputBudget::per_stream(usize::MAX),
+        |_| {},
+    )?;
+    Ok(result.output)
 }
 
 #[derive(Debug)]
@@ -32,6 +28,27 @@ pub struct TimedShellOutput {
     pub output: Output,
     pub timed_out: bool,
     pub cancelled: bool,
+    pub stdout_discarded_bytes: usize,
+    pub stderr_discarded_bytes: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ShellProgress {
+    pub elapsed_ms: u64,
+    pub stdout_bytes: usize,
+    pub stderr_bytes: usize,
+    pub last_line: String,
+}
+
+impl From<ProcessProgress> for ShellProgress {
+    fn from(progress: ProcessProgress) -> Self {
+        Self {
+            elapsed_ms: progress.elapsed_ms,
+            stdout_bytes: progress.stdout_bytes,
+            stderr_bytes: progress.stderr_bytes,
+            last_line: progress.last_line,
+        }
+    }
 }
 
 pub fn run_shell_timeout(
@@ -48,98 +65,145 @@ pub fn run_shell_timeout_cancellable(
     timeout: Duration,
     cancellation: Option<&CancellationToken>,
 ) -> Result<TimedShellOutput, ToolError> {
+    run_shell_timeout_cancellable_with_progress(cwd, command, timeout, cancellation, |_| {})
+}
+
+pub fn run_shell_timeout_cancellable_with_progress(
+    cwd: impl AsRef<Path>,
+    command: &str,
+    timeout: Duration,
+    cancellation: Option<&CancellationToken>,
+    on_progress: impl FnMut(ShellProgress),
+) -> Result<TimedShellOutput, ToolError> {
+    run_shell_timeout_cancellable_with_progress_and_runner(
+        &ProcessRunner::default(),
+        cwd,
+        command,
+        timeout,
+        cancellation,
+        on_progress,
+    )
+}
+
+pub(crate) fn run_shell_timeout_cancellable_with_progress_and_runner(
+    runner: &ProcessRunner,
+    cwd: impl AsRef<Path>,
+    command: &str,
+    timeout: Duration,
+    cancellation: Option<&CancellationToken>,
+    mut on_progress: impl FnMut(ShellProgress),
+) -> Result<TimedShellOutput, ToolError> {
+    run_with_runner(
+        runner,
+        cwd.as_ref(),
+        command,
+        timeout,
+        cancellation,
+        ProcessOutputBudget::per_stream(SHELL_CAPTURE_CAP_BYTES),
+        |progress| on_progress(progress.into()),
+    )
+}
+
+fn run_with_runner(
+    runner: &ProcessRunner,
+    cwd: &Path,
+    command: &str,
+    timeout: Duration,
+    cancellation: Option<&CancellationToken>,
+    output_budget: ProcessOutputBudget,
+    on_progress: impl FnMut(ProcessProgress),
+) -> Result<TimedShellOutput, ToolError> {
     if command.trim().is_empty() {
         return Err(ToolError::InvalidInput {
             message: "shell command cannot be empty".into(),
         });
     }
-    let shell = if which("pwsh") { "pwsh" } else { "powershell" };
-    let mut child = std::process::Command::new(shell)
-        .args([
+    let (program, args) = shell_invocation(runner, command)?;
+    let request = ProcessRequest {
+        cwd: cwd.to_path_buf(),
+        program,
+        args,
+        timeout,
+        cancellation: cancellation.cloned(),
+        output_budget,
+    };
+    let result = runner.run_with_progress(request, on_progress)?;
+    Ok(TimedShellOutput {
+        output: result.output,
+        timed_out: result.timed_out,
+        cancelled: result.cancelled,
+        stdout_discarded_bytes: result.stdout_discarded_bytes,
+        stderr_discarded_bytes: result.stderr_discarded_bytes,
+    })
+}
+
+fn shell_invocation(
+    runner: &ProcessRunner,
+    command: &str,
+) -> Result<(PathBuf, Vec<OsString>), ToolError> {
+    #[cfg(windows)]
+    {
+        if !looks_like_powershell(command) {
+            let program = std::env::var_os("COMSPEC")
+                .map(PathBuf::from)
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| PathBuf::from("cmd.exe"));
+            return Ok((
+                program,
+                vec![
+                    OsString::from("/d"),
+                    OsString::from("/s"),
+                    OsString::from("/c"),
+                    OsString::from(command),
+                ],
+            ));
+        }
+    }
+    let program = powershell_program(runner)?;
+    Ok((
+        program,
+        [
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
             "-Command",
             command,
-        ])
-        .current_dir(cwd)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(ToolError::from)?;
-    let stdout = child.stdout.take().ok_or_else(|| ToolError::Io {
-        message: "shell stdout pipe is unavailable".into(),
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| ToolError::Io {
-        message: "shell stderr pipe is unavailable".into(),
-    })?;
-    let stdout_reader = std::thread::spawn(move || read_pipe(stdout));
-    let stderr_reader = std::thread::spawn(move || read_pipe(stderr));
-
-    let start = Instant::now();
-    let mut timed_out = false;
-    let mut cancelled = false;
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(ToolError::from)? {
-            break status;
-        }
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            cancelled = true;
-            terminate_process_tree(&mut child);
-            break child.wait().map_err(ToolError::from)?;
-        }
-        if start.elapsed() >= timeout {
-            timed_out = true;
-            terminate_process_tree(&mut child);
-            break child.wait().map_err(ToolError::from)?;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    let output = Output {
-        status,
-        stdout: join_pipe(stdout_reader, "stdout")?,
-        stderr: join_pipe(stderr_reader, "stderr")?,
-    };
-    Ok(TimedShellOutput {
-        output,
-        timed_out,
-        cancelled,
-    })
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect(),
+    ))
 }
 
-fn read_pipe(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    pipe.read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
-
-fn join_pipe(
-    reader: JoinHandle<std::io::Result<Vec<u8>>>,
-    stream: &str,
-) -> Result<Vec<u8>, ToolError> {
-    reader
-        .join()
-        .map_err(|_| ToolError::Io {
-            message: format!("shell {stream} reader panicked"),
-        })?
-        .map_err(ToolError::from)
-}
-
-fn terminate_process_tree(child: &mut std::process::Child) {
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill.exe")
-            .args(["/PID", &child.id().to_string(), "/T", "/F"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+#[cfg(windows)]
+fn looks_like_powershell(command: &str) -> bool {
+    if command.contains('$') || command.contains("[Console]") || command.contains("::") {
+        return true;
     }
-    let _ = child.kill();
+    let lower = command.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "start-sleep",
+        "write-output",
+        "write-host",
+        "set-content",
+        "get-content",
+        "test-path",
+        "out-null",
+        "foreach-object",
+        "select-object",
+        "where-object",
+        "invoke-expression",
+        " -eq ",
+        " -ne ",
+        " -match ",
+        " -like ",
+        " -not ",
+    ];
+    MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
-fn which(command: &str) -> bool {
-    std::process::Command::new("where.exe")
-        .arg(command)
-        .output()
-        .is_ok_and(|output| output.status.success())
+fn powershell_program(runner: &ProcessRunner) -> Result<PathBuf, ToolError> {
+    runner.resolve_powershell()?.ok_or_else(|| ToolError::Io {
+        message: "neither pwsh nor powershell was found on PATH".into(),
+    })
 }

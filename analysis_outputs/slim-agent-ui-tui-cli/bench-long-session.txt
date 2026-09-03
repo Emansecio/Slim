@@ -1,0 +1,12 @@
+long_session bench (this session, not copied from docs)
+
+  Command: cargo bench -p slim-tui --bench long_session
+  Exit: 0
+  Compile: Finished bench profile in 28.23s
+  Output:
+    SLIM_BODY_CACHE hits=49 misses=1 hit_rate=98.00%
+    blocks=3200 bytes=4968694 rows=40
+    scroll_locate_p95_ms=0.920
+    input_to_frame_p95_ms=1.108
+  Gate in bench source: warm p95 input→frame ≤ 16 ms. Measured 1.108 ms — PASS.
+  Not a bottleneck finding.

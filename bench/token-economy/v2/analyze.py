@@ -1,273 +1,504 @@
-"""Per-agent payload + timing + compliance analysis for benchmark v2.
+﻿"""Strict analysis for one hermetic Slim/Pi/Pit benchmark campaign."""
 
-Usage: python analyze.py [bench_dir]   (default: this file's directory)
-
-Reads:
-    captures/<scenario>/run<N>/<agent>/req_<k>.json      (payloads)
-    captures/<scenario>/run<N>/<agent>/req_<k>.meta.json (server timestamps)
-    runs/<scenario>_run<N>_<agent>_timing.json           (process timings)
-    captures/<scenario>/compliance.jsonl                 (model/effort gate)
-
-Writes summary_v2.json and prints markdown tables:
-  1. Compliance  - model + reasoning effort actually on the wire
-  2. Tokens      - per scenario: T1 total, system, tools, Tlast total/history,
-                   sum of all request bytes, growth ratio
-  3. Speed       - per scenario: estimated startup_ms/ttfc_ms median/min,
-                   turn gaps, directly measured total task time
-
-Timing definitions:
-    startup_ms = estimate: process total - request span (may include teardown)
-    ttfc_ms    = estimate: startup_ms + gap to req_2
-                 (req_2 only happens after the agent wrote the code)
-    gap_k_ms   = arrival req_k - arrival req_(k-1)   (agent loop overhead)
-"""
+import argparse
 import json
 import os
+import re
+import shutil
 import statistics
 import sys
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parent
+EXPECTED_REQUESTS = {"s1_read": 2, "s2_codegen": 2, "s3_multistep": 3, "s4_long": 5}
+POST_WRITE_REQUEST = {"s2_codegen": 1, "s3_multistep": 1, "s4_long": 3}
+REQUEST_RE = re.compile(r"req_(\d+)\.json$")
 
 
-def size(value):
+def encoded_size(value):
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
+def read_json(path):
+    with open(path, encoding="utf-8-sig") as source:
+        return json.load(source)
+
+
 def payload_metrics(path):
-    raw = open(path, "rb").read()
+    raw = path.read_bytes()
     body = json.loads(raw)
     messages = body.get("messages") or []
-    system = sum(
-        size(m.get("content"))
-        for m in messages
-        if m.get("role") in ("system", "developer")
-    )
-    history = sum(size(m) for m in messages if m.get("role") not in ("system", "developer"))
     tools = body.get("tools") or []
     biggest_tool_result = 0
-    for m in messages:
-        if m.get("role") == "tool":
-            content = m.get("content")
-            if isinstance(content, str):
-                biggest_tool_result = max(biggest_tool_result, len(content.encode("utf-8")))
+    for message in messages:
+        if message.get("role") == "tool" and isinstance(message.get("content"), str):
+            biggest_tool_result = max(
+                biggest_tool_result, len(message["content"].encode("utf-8"))
+            )
     return {
         "total_bytes": len(raw),
-        "system_bytes": system,
-        "tools_bytes": size(tools),
+        "system_content_bytes": sum(
+            encoded_size(message.get("content"))
+            for message in messages
+            if message.get("role") in ("system", "developer")
+        ),
+        "tools_schema_bytes": encoded_size(tools),
         "tools_count": len(tools),
-        "history_bytes": history,
-        "messages": len(messages),
+        "history_bytes": sum(
+            encoded_size(message)
+            for message in messages
+            if message.get("role") not in ("system", "developer")
+        ),
         "biggest_tool_result_bytes": biggest_tool_result,
-        "est_tokens_total": len(raw) // 4,
+        "rough_tokens_byte_div4": len(raw) // 4,
     }
 
 
-def load_timing(bench, agent, scenario, run):
-    path = os.path.join(bench, "runs", f"{scenario}_run{run}_{agent}_timing.json")
-    if not os.path.exists(path):
-        return {}
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+def median_int(values):
+    return round(statistics.median(values))
 
 
-def run_dir(bench, scenario, run, agent):
-    return os.path.join(bench, "captures", scenario, f"run{run}", agent)
-
-
-def collect_run(bench, scenario, run, agent):
-    """Return list of {metrics, mono} per request for one run."""
-    d = run_dir(bench, scenario, run, agent)
-    if not os.path.isdir(d):
-        return []
-    entries = []
-    for name in sorted(os.listdir(d)):
-        if name.endswith(".meta.json"):
-            continue
-        if not name.startswith("req_") or not name.endswith(".json"):
-            continue
-        k = int(name[len("req_"):-len(".json")])
-        meta_path = os.path.join(d, f"req_{k}.meta.json")
-        mono = None
-        if os.path.exists(meta_path):
-            with open(meta_path, encoding="utf-8") as f:
-                mono = json.load(f).get("perf_counter")
-        entries.append({"req": k, "metrics": payload_metrics(os.path.join(d, name)), "mono": mono})
-    entries.sort(key=lambda e: e["req"])
-    return entries
-
-
-def timing_rows(bench, scenario, run, agent, entries):
-    t = load_timing(bench, agent, scenario, run)
-    start_epoch = t.get("start_ms")
-    total_ms = t.get("total_ms")
-
-    # Server-side arrival times are perf_counter values from the same process,
-    # so differences between them are valid; anchoring to process start uses
-    # the runner wall clock only when both exist.
-    monos = [e["mono"] for e in entries if e["mono"] is not None]
-    startup_ms = None
-    ttfc_ms = None
-    # Server-side arrivals are perf_counter values from one process, so their
-    # differences are valid. Anchor: assume the last request arrives ~at the
-    # end of the measured process window (runner stops the clock right after
-    # Wait-Job returns). Then:
-    #   startup_ms  = total_ms - span(last - first)
-    #   ttfc_ms     = startup_ms + gap(first -> second)
-    if monos and len(entries) >= 2 and total_ms is not None:
-        span_ms = int((monos[-1] - monos[0]) * 1000)
-        startup_ms = max(total_ms - span_ms, 0)
-        gap01 = int((monos[1] - monos[0]) * 1000)
-        ttfc_ms = max(startup_ms + gap01, 0)
-    gaps = [
-        int((b - a) * 1000)
-        for a, b in zip(monos, monos[1:])
-    ]
-    return {
-        "turns_seen": len(entries),
-        "startup_ms": startup_ms,
-        "ttfc_ms": ttfc_ms,
-        "gap_ms": gaps,
-        "process_total_ms": total_ms,
-    }
+def min_or_none(values):
+    clean = [value for value in values if value is not None]
+    return min(clean) if clean else None
 
 
 def median_or_none(values):
-    clean = [v for v in values if v is not None]
-    return round(statistics.median(clean)) if clean else None
+    clean = [value for value in values if value is not None]
+    return median_int(clean) if clean else None
 
 
-def main(bench):
-    scenarios_root = os.path.join(bench, "captures")
-    runs_root = os.path.join(bench, "runs")
+def agent_tags(manifest):
+    suffix = f"_{manifest['variant_tag']}" if manifest.get("variant_tag") else ""
+    return [f"{agent}{suffix}" for agent in manifest["agents"]]
 
-    # Discover agents/scenarios/runs present on disk.
-    scenarios = sorted(
-        d for d in os.listdir(scenarios_root)
-        if os.path.isdir(os.path.join(scenarios_root, d)) and d.startswith("s")
+
+def collect_entries(arm_dir, errors, arm_name):
+    entries = []
+    for path in arm_dir.glob("req_*.json"):
+        match = REQUEST_RE.fullmatch(path.name)
+        if not match:
+            continue
+        request = int(match.group(1))
+        meta_path = arm_dir / f"req_{request}.meta.json"
+        if not meta_path.exists():
+            errors.append(f"{arm_name}: missing {meta_path.name}")
+            continue
+        entries.append(
+            {
+                "request": request,
+                "payload": payload_metrics(path),
+                "meta": read_json(meta_path),
+            }
+        )
+    entries.sort(key=lambda entry: entry["request"])
+    return entries
+
+
+def compliance_records(arm_dir, errors, arm_name):
+    path = arm_dir / "compliance.jsonl"
+    if not path.exists():
+        errors.append(f"{arm_name}: missing compliance.jsonl")
+        return []
+    records = []
+    with open(path, encoding="utf-8") as source:
+        for line_number, line in enumerate(source, 1):
+            if not line.strip():
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError as error:
+                errors.append(f"{arm_name}: invalid compliance line {line_number}: {error}")
+    return records
+
+
+def arm_payload_row(run, entries):
+    first = entries[0]["payload"]
+    last = entries[-1]["payload"]
+    return {
+        "run": run,
+        "requests": len(entries),
+        "t1_total_bytes": first["total_bytes"],
+        "t1_system_content_bytes": first["system_content_bytes"],
+        "t1_tools_schema_bytes": first["tools_schema_bytes"],
+        "tools_count": first["tools_count"],
+        "tn_total_bytes": last["total_bytes"],
+        "tn_history_bytes": last["history_bytes"],
+        "biggest_tool_result_bytes": max(
+            entry["payload"]["biggest_tool_result_bytes"] for entry in entries
+        ),
+        "sum_all_request_bytes": sum(
+            entry["payload"]["total_bytes"] for entry in entries
+        ),
+        "growth_ratio": round(last["total_bytes"] / first["total_bytes"], 4),
+        "rough_tokens_tn_byte_div4": last["rough_tokens_byte_div4"],
+    }
+
+
+def arm_speed_row(run, scenario, entries, timing, errors, arm_name):
+    start_ms = timing.get("start_ms")
+    end_ms = timing.get("end_ms")
+    total_ms = timing.get("total_ms")
+    arrivals = [entry["meta"].get("epoch_ms") for entry in entries]
+    monotonic = [entry["meta"].get("perf_counter") for entry in entries]
+    if start_ms is None or end_ms is None or total_ms is None:
+        errors.append(f"{arm_name}: incomplete process timing")
+        return None
+    if any(value is None for value in arrivals + monotonic):
+        errors.append(f"{arm_name}: incomplete request timing")
+        return None
+    if arrivals and (arrivals[0] < start_ms - 5 or arrivals[-1] > end_ms + 5):
+        errors.append(f"{arm_name}: request timestamps fall outside process interval")
+    startup_ms = max(arrivals[0] - start_ms, 0)
+    write_index = POST_WRITE_REQUEST.get(scenario)
+    write_complete_ms = (
+        max(arrivals[write_index] - start_ms, 0)
+        if write_index is not None and len(arrivals) > write_index
+        else None
     )
-    agents = set()
-    max_run = 0
-    for sc in scenarios:
-        for d in os.listdir(os.path.join(scenarios_root, sc)):
-            if d.startswith("run"):
-                max_run = max(max_run, int(d[3:]))
-                for sub in os.listdir(os.path.join(scenarios_root, sc, d)):
-                    if os.path.isdir(os.path.join(scenarios_root, sc, d, sub)):
-                        agents.add(sub)
+    gaps = [round((after - before) * 1000) for before, after in zip(monotonic, monotonic[1:])]
+    return {
+        "run": run,
+        "startup_ms": startup_ms,
+        "write_complete_ms": write_complete_ms,
+        "turn_gap_ms": gaps,
+        "process_total_ms": total_ms,
+        "exit_code": timing.get("exit_code"),
+        "timed_out": timing.get("timed_out"),
+    }
 
-    # ---------------- Compliance ----------------
-    print("## Compliance\n")
-    print("| agente | modelo no fio | reasoning_effort | ok? |")
-    print("|---|---|---|---|")
+
+def aggregate_payload(rows):
+    return {
+        "runs": rows,
+        "requests_per_run": sorted({row["requests"] for row in rows}),
+        "t1_total_median_bytes": median_int([row["t1_total_bytes"] for row in rows]),
+        "t1_system_content_median_bytes": median_int(
+            [row["t1_system_content_bytes"] for row in rows]
+        ),
+        "t1_tools_schema_median_bytes": median_int(
+            [row["t1_tools_schema_bytes"] for row in rows]
+        ),
+        "tools_count_median": median_int([row["tools_count"] for row in rows]),
+        "tn_total_median_bytes": median_int([row["tn_total_bytes"] for row in rows]),
+        "tn_history_median_bytes": median_int([row["tn_history_bytes"] for row in rows]),
+        "biggest_tool_result_median_bytes": median_int(
+            [row["biggest_tool_result_bytes"] for row in rows]
+        ),
+        "sum_all_requests_median_bytes": median_int(
+            [row["sum_all_request_bytes"] for row in rows]
+        ),
+        "growth_ratio_median": round(
+            statistics.median(row["growth_ratio"] for row in rows), 2
+        ),
+        "rough_tokens_tn_byte_div4_median": median_int(
+            [row["rough_tokens_tn_byte_div4"] for row in rows]
+        ),
+    }
+
+
+def aggregate_speed(rows):
+    all_gaps = [gap for row in rows for gap in row["turn_gap_ms"]]
+    startups = [row["startup_ms"] for row in rows]
+    writes = [row["write_complete_ms"] for row in rows]
+    totals = [row["process_total_ms"] for row in rows]
+    return {
+        "runs": rows,
+        "startup_median_ms": median_or_none(startups),
+        "startup_min_ms": min_or_none(startups),
+        "write_complete_median_ms": median_or_none(writes),
+        "write_complete_min_ms": min_or_none(writes),
+        "turn_gap_median_ms": median_or_none(all_gaps),
+        "process_total_median_ms": median_or_none(totals),
+        "process_total_min_ms": min_or_none(totals),
+    }
+
+
+def discover_actual_arms(captures):
+    arms = set()
+    if not captures.is_dir():
+        return arms
+    for scenario_dir in captures.iterdir():
+        if not scenario_dir.is_dir():
+            continue
+        for run_dir in scenario_dir.iterdir():
+            if not run_dir.is_dir() or not run_dir.name.startswith("run"):
+                continue
+            try:
+                run = int(run_dir.name[3:])
+            except ValueError:
+                continue
+            for agent_dir in run_dir.iterdir():
+                if agent_dir.is_dir():
+                    arms.add((scenario_dir.name, run, agent_dir.name))
+    return arms
+
+
+def format_value(value, suffix=""):
+    return "—" if value is None else f"{value}{suffix}"
+
+
+def markdown(summary):
+    manifest = summary["manifest"]
+    lines = [
+        f"# Analysis — campaign `{manifest['campaign']}`",
+        "",
+        "## Gate",
+        "",
+        f"**PASS** — {summary['gate']['valid_arms']}/{summary['gate']['expected_arms']} arms; "
+        f"{summary['gate']['compliant_requests']}/{summary['gate']['expected_requests']} compliant requests.",
+        "",
+        "Payload values below are UTF-8 bytes in the captured JSON request. "
+        "`~tokens` remains only bytes ÷ 4 and is not provider billing usage.",
+        "",
+        "## Compliance",
+        "",
+        "| agent | model | effort | requests | ok |",
+        "|---|---|---|---:|---|",
+    ]
+    for agent, row in summary["compliance"].items():
+        lines.append(
+            f"| {agent} | {', '.join(row['models'])} | {', '.join(row['efforts'])} | "
+            f"{row['requests']}/{row['expected_requests']} | {'PASS' if row['ok'] else 'FAIL'} |"
+        )
+    lines.extend(["", "## Payload (medians across runs)", ""])
+    for scenario, agents in summary["payload"].items():
+        lines.extend(
+            [
+                f"### {scenario}",
+                "",
+                "| agent | requests/run | T1 total | T1 system content | T1 tool schemas (n) | "
+                "Tn total | Tn history | sum all requests | growth | ~tokens Tn |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for agent, row in agents.items():
+            lines.append(
+                f"| {agent} | {','.join(map(str, row['requests_per_run']))} | "
+                f"{row['t1_total_median_bytes']} B | {row['t1_system_content_median_bytes']} B | "
+                f"{row['t1_tools_schema_median_bytes']} B ({row['tools_count_median']}) | "
+                f"{row['tn_total_median_bytes']} B | {row['tn_history_median_bytes']} B | "
+                f"{row['sum_all_requests_median_bytes']} B | ×{row['growth_ratio_median']} | "
+                f"~{row['rough_tokens_tn_byte_div4_median']} |"
+            )
+        lines.append("")
+    lines.extend(["## Speed (direct medians/minima)", ""])
+    for scenario, agents in summary["speed"].items():
+        lines.extend(
+            [
+                f"### {scenario}",
+                "",
+                "| agent | startup median/min | post-write request median/min | turn gap median | process median/min |",
+                "|---|---:|---:|---:|---:|",
+            ]
+        )
+        for agent, row in agents.items():
+            lines.append(
+                f"| {agent} | {format_value(row['startup_median_ms'])}/{format_value(row['startup_min_ms'])} ms | "
+                f"{format_value(row['write_complete_median_ms'])}/{format_value(row['write_complete_min_ms'])} ms | "
+                f"{format_value(row['turn_gap_median_ms'], ' ms')} | "
+                f"{format_value(row['process_total_median_ms'])}/{format_value(row['process_total_min_ms'])} ms |"
+            )
+        lines.append("")
+    lines.extend(
+        [
+            "## Definitions",
+            "",
+            "- startup = first request arrival epoch − process start epoch.",
+            "- post-write request = first request sent after the write tool returns − process start epoch.",
+            "- process total is measured around the agent subprocess only; no PowerShell `Start-Job`.",
+            "- all individual run samples are retained in `summary_v2.json` and raw requests in `captures/`.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def analyze(campaign):
+    manifest_path = campaign / "manifest.json"
+    if not manifest_path.exists():
+        raise ValueError(f"missing manifest: {manifest_path}")
+    manifest = read_json(manifest_path)
+    captures = campaign / "captures"
+    runs_dir = campaign / "runs"
+    workspaces = campaign / "workspaces"
+    scenarios = list(manifest["scenarios"])
+    tags = agent_tags(manifest)
+    run_count = int(manifest["runs"])
+    model = manifest["model"]
+    effort = manifest["effort"]
+    expected_arms = {
+        (scenario, run, agent)
+        for scenario in scenarios
+        for run in range(1, run_count + 1)
+        for agent in tags
+    }
+    errors = []
+    actual_arms = discover_actual_arms(captures)
+    for arm in sorted(expected_arms - actual_arms):
+        errors.append(f"missing arm: {arm[0]}/run{arm[1]}/{arm[2]}")
+    for arm in sorted(actual_arms - expected_arms):
+        errors.append(f"unexpected arm: {arm[0]}/run{arm[1]}/{arm[2]}")
+
+    payload_rows = {scenario: {agent: [] for agent in tags} for scenario in scenarios}
+    speed_rows = {scenario: {agent: [] for agent in tags} for scenario in scenarios}
+    compliance_all = {agent: [] for agent in tags}
+    valid_arms = 0
+
+    for scenario, run, agent in sorted(expected_arms):
+        arm_name = f"{scenario}/run{run}/{agent}"
+        arm_dir = captures / scenario / f"run{run}" / agent
+        if not arm_dir.is_dir():
+            continue
+        expected_requests = EXPECTED_REQUESTS.get(scenario)
+        if expected_requests is None:
+            errors.append(f"{arm_name}: unknown expected request count")
+            continue
+        entries = collect_entries(arm_dir, errors, arm_name)
+        sequence = [entry["request"] for entry in entries]
+        if sequence != list(range(expected_requests)):
+            errors.append(
+                f"{arm_name}: request sequence {sequence}, expected {list(range(expected_requests))}"
+            )
+        records = compliance_records(arm_dir, errors, arm_name)
+        compliance_all[agent].extend(records)
+        if len(records) != expected_requests:
+            errors.append(
+                f"{arm_name}: {len(records)} compliance records, expected {expected_requests}"
+            )
+        for record in records:
+            if record.get("model") != model or record.get("reasoning_effort") != effort:
+                errors.append(
+                    f"{arm_name}/req{record.get('req')}: compliance violation "
+                    f"model={record.get('model')!r}, effort={record.get('reasoning_effort')!r}"
+                )
+        timing_path = runs_dir / f"{scenario}_run{run}_{agent}_timing.json"
+        if not timing_path.exists():
+            errors.append(f"{arm_name}: missing process timing")
+            continue
+        timing = read_json(timing_path)
+        if timing.get("timed_out") or timing.get("exit_code") != 0:
+            errors.append(
+                f"{arm_name}: process timed_out={timing.get('timed_out')} "
+                f"exit_code={timing.get('exit_code')}"
+            )
+        if scenario != "s1_read" and not (workspaces / scenario / f"run{run}" / agent / "fizzbuzz.py").is_file():
+            errors.append(f"{arm_name}: fizzbuzz.py was not created")
+        if len(entries) == expected_requests:
+            payload_rows[scenario][agent].append(arm_payload_row(run, entries))
+            speed = arm_speed_row(run, scenario, entries, timing, errors, arm_name)
+            if speed is not None:
+                speed_rows[scenario][agent].append(speed)
+            valid_arms += 1
+
     compliance = {}
-    comp_path = os.path.join(scenarios_root, "compliance.jsonl")
-    # v2 writes per-scenario compliance files; merge all.
-    merged = []
-    for root, _dirs, files in os.walk(scenarios_root):
-        for fn in files:
-            if fn == "compliance.jsonl":
-                p = os.path.join(root, fn)
-                with open(p, encoding="utf-8") as f:
-                    merged.extend(json.loads(line) for line in f if line.strip())
-    by_agent = {}
-    for rec in merged:
-        by_agent.setdefault(rec["agent"], []).append(rec)
-    for agent, recs in sorted(by_agent.items()):
-        models = sorted({str(r["model"]) for r in recs})
-        efforts = sorted({r["reasoning_effort"] for r in recs})
-        ok = all(r["model"] == r["expected_model"] and
-                 r["reasoning_effort"] == r["expected_effort"] for r in recs)
-        compliance[agent] = {"models": models, "efforts": efforts, "ok": ok, "requests": len(recs)}
-        print(f"| {agent} | {', '.join(models)} | {', '.join(efforts)} | "
-              f"{'✅' if ok else '❌ VIOLAÇÃO — não comparar'} |")
+    expected_by_agent = sum(EXPECTED_REQUESTS[scenario] for scenario in scenarios) * run_count
+    for agent, records in compliance_all.items():
+        compliance[agent] = {
+            "models": sorted({str(record.get("model")) for record in records}),
+            "efforts": sorted({str(record.get("reasoning_effort")) for record in records}),
+            "requests": len(records),
+            "expected_requests": expected_by_agent,
+            "ok": len(records) == expected_by_agent
+            and all(
+                record.get("model") == model and record.get("reasoning_effort") == effort
+                for record in records
+            ),
+        }
 
-    # ---------------- Tokens ----------------
-    print("\n## Tokens (medianas entre runs)\n")
-    token_summary = {}
-    for sc in scenarios:
-        print(f"### {sc}\n")
-        header = ("| agente | T1 total | T1 system | T1 tools (n) | Tn total "
-                  "| Tn histórico | maior tool result | soma todos requests | crescimento | ~tokens Tn |")
-        print(header)
-        print("|---|---|---|---|---|---|---|---|---|---|")
-        for agent in sorted(agents):
-            runs_data = []
-            for run in range(1, max_run + 1):
-                entries = collect_run(bench, sc, run, agent)
-                if entries:
-                    runs_data.append(entries)
-            if not runs_data:
-                continue
-            def med(key, pick):
-                vals = []
-                for rd in runs_data:
-                    e = pick(rd)
-                    if e is not None:
-                        vals.append(e[key])
-                return median_or_none(vals) if vals else None
-            t1_total = med("total_bytes", lambda rd: rd[0]["metrics"])
-            t1_sys = med("system_bytes", lambda rd: rd[0]["metrics"])
-            t1_tools = med("tools_bytes", lambda rd: rd[0]["metrics"])
-            tools_n = med("tools_count", lambda rd: rd[0]["metrics"])
-            tn_total = med("total_bytes", lambda rd: rd[-1]["metrics"])
-            tn_hist = med("history_bytes", lambda rd: rd[-1]["metrics"])
-            big_tool = med("biggest_tool_result_bytes", lambda rd: rd[-1]["metrics"])
-            sums = [sum(e["metrics"]["total_bytes"] for e in rd) for rd in runs_data]
-            sum_all = median_or_none(sums)
-            growths = [rd[-1]["metrics"]["total_bytes"] / rd[0]["metrics"]["total_bytes"]
-                       for rd in runs_data]
-            growth = round(statistics.median(growths), 2)
-            est_toks = med("est_tokens_total", lambda rd: rd[-1]["metrics"])
-            token_summary.setdefault(sc, {})[agent] = {
-                "t1_total": t1_total, "t1_system": t1_sys, "t1_tools": t1_tools,
-                "tools_count": tools_n, "tn_total": tn_total, "tn_history": tn_hist,
-                "biggest_tool": big_tool, "sum_all_requests_median": sum_all,
-                "growth_ratio_median": growth, "est_tokens_tn": est_toks,
-            }
-            print(f"| {agent} | {t1_total} B | {t1_sys} B | {t1_tools} B ({tools_n}) "
-                  f"| {tn_total} B | {tn_hist} B | {big_tool} B | {sum_all} B "
-                  f"| x{growth} | ~{est_toks} |")
-        print()
+    for scenario in scenarios:
+        for agent in tags:
+            if len(payload_rows[scenario][agent]) != run_count:
+                errors.append(
+                    f"{scenario}/{agent}: {len(payload_rows[scenario][agent])} valid payload runs, "
+                    f"expected {run_count}"
+                )
+            if len(speed_rows[scenario][agent]) != run_count:
+                errors.append(
+                    f"{scenario}/{agent}: {len(speed_rows[scenario][agent])} valid timing runs, "
+                    f"expected {run_count}"
+                )
 
-    # ---------------- Speed ----------------
-    print("## Velocidade (medianas entre runs)\n")
-    speed_summary = {}
-    for sc in scenarios:
-        print(f"### {sc}\n")
-        print("| agente | startup estimado (mediana/min) | TTFC estimado (mediana/min) | gaps entre turnos | tempo total do processo |")
-        print("|---|---|---|---|---|")
-        for agent in sorted(agents):
-            rows = []
-            for run in range(1, max_run + 1):
-                entries = collect_run(bench, sc, run, agent)
-                if not entries:
-                    continue
-                rows.append(timing_rows(bench, sc, run, agent, entries))
-            if not rows:
-                continue
-            startups = [r["startup_ms"] for r in rows]
-            ttfcs = [r["ttfc_ms"] for r in rows]
-            totals = [r["process_total_ms"] for r in rows]
-            all_gaps = [g for r in rows for g in r["gap_ms"]]
-            speed_summary.setdefault(sc, {})[agent] = {
-                "startup_median_ms": median_or_none(startups),
-                "startup_min_ms": min((v for v in startups if v is not None), default=None),
-                "ttfc_median_ms": median_or_none(ttfcs),
-                "ttfc_min_ms": min((v for v in ttfcs if v is not None), default=None),
-                "gap_median_ms": median_or_none(all_gaps),
-                "process_total_median_ms": median_or_none(totals),
-            }
-            s = speed_summary[sc][agent]
-            print(f"| {agent} | {s['startup_median_ms']} / {s['startup_min_ms']} ms "
-                  f"| {s['ttfc_median_ms']} / {s['ttfc_min_ms']} ms "
-                  f"| {s['gap_median_ms']} ms | {s['process_total_median_ms']} ms |")
-        print()
+    expected_request_total = expected_by_agent * len(tags)
+    compliant_requests = sum(row["requests"] for row in compliance.values() if row["ok"])
+    gate = {
+        "ok": not errors,
+        "expected_arms": len(expected_arms),
+        "valid_arms": valid_arms,
+        "expected_requests": expected_request_total,
+        "compliant_requests": compliant_requests,
+        "errors": errors,
+    }
+    if errors:
+        with open(campaign / "gate_report.json", "w", encoding="utf-8") as output:
+            json.dump(gate, output, indent=2, ensure_ascii=False)
+            output.write("\n")
+        raise ValueError("campaign gate failed:\n- " + "\n- ".join(errors))
 
-    out = os.path.join(bench, "summary_v2.json")
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump({"compliance": compliance, "tokens": token_summary, "speed": speed_summary},
-                  f, indent=2, ensure_ascii=False)
-    print(f"summary: {out}")
+    payload = {
+        scenario: {
+            agent: aggregate_payload(payload_rows[scenario][agent]) for agent in tags
+        }
+        for scenario in scenarios
+    }
+    speed = {
+        scenario: {agent: aggregate_speed(speed_rows[scenario][agent]) for agent in tags}
+        for scenario in scenarios
+    }
+    summary = {
+        "schema_version": 3,
+        "manifest": manifest,
+        "gate": gate,
+        "compliance": compliance,
+        "payload": payload,
+        "speed": speed,
+    }
+    summary_path = campaign / "summary_v2.json"
+    with open(summary_path, "w", encoding="utf-8") as output:
+        json.dump(summary, output, indent=2, ensure_ascii=False)
+        output.write("\n")
+    analysis_path = campaign / "analysis.md"
+    analysis_path.write_text(markdown(summary), encoding="utf-8")
+    return summary_path, analysis_path
+
+
+def latest_campaign():
+    root = BASE / "campaigns"
+    candidates = [path for path in root.iterdir() if path.is_dir() and (path / "manifest.json").exists()] if root.exists() else []
+    if not candidates:
+        raise ValueError("no campaign found; run run_benchmark.ps1 first or pass a campaign path")
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("campaign", nargs="?", type=Path)
+    parser.add_argument(
+        "--publish",
+        action="store_true",
+        help="copy the validated summary/analysis to summary_v2.json and analysis-current.md",
+    )
+    args = parser.parse_args()
+    campaign = (args.campaign or latest_campaign()).resolve()
+    summary_path, analysis_path = analyze(campaign)
+    if args.publish:
+        shutil.copyfile(summary_path, BASE / "summary_v2.json")
+        shutil.copyfile(analysis_path, BASE / "analysis-current.md")
+    rendered = analysis_path.read_text(encoding="utf-8")
+    try:
+        print(rendered)
+    except UnicodeEncodeError:
+        print(rendered.encode(sys.stdout.encoding or "ascii", errors="replace").decode(sys.stdout.encoding or "ascii"))
+    print(f"summary: {summary_path}")
 
 
 if __name__ == "__main__":
-    default_bench = os.path.dirname(os.path.abspath(__file__))
-    main(sys.argv[1] if len(sys.argv) > 1 else default_bench)
+    try:
+        main()
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+        print(f"analysis failed: {error}", file=sys.stderr)
+        raise SystemExit(1)

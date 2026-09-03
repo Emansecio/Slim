@@ -3,9 +3,14 @@ name = "slim-tui"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
 crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
+lru = "0.12.5"
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+pulldown-cmark = { version = "0.13", default-features = false }
 slim-core = { path = "../slim-core" }
 unicode-segmentation = "1"
 unicode-width = "0.2"
@@ -14,7 +19,15 @@ unicode-width = "0.2"
 proptest = "1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+] }
 
 [[bench]]
 name = "long_session"

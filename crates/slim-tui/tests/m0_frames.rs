@@ -3,6 +3,7 @@ use std::sync::Arc;
 use slim_core::OperatingMode;
 use slim_tui::api::{LoginProvider, SessionId, UiEvent};
 use slim_tui::app::AppState;
+use slim_tui::block::{BlockKind, BlockLifecycle, FoldState};
 use slim_tui::reducer::{reduce, Action, Effect};
 use slim_tui::testkit::MemorySurface;
 use slim_tui::view_model::ViewModel;
@@ -42,13 +43,14 @@ fn fake_session_materializes_deterministic_frame_without_io() {
     assert_eq!(
         surface.frames[0].lines,
         vec![
-            "you",
+            "You",
             "> hello",
             "Slim",
             "world",
+            "activity: Responding",
             "todo: 0/0 no active item",
             "composer: ",
-            "signed out · /login  ctx 0% · 0k/128k · ↑0 ↓0",
+            "signed out · /login",
         ]
     );
 }
@@ -68,6 +70,7 @@ fn reducer_emits_commands_and_keeps_errors_visible() {
     reduce(
         &mut state,
         Action::UiEventReceived(UiEvent::FatalError {
+            run_id: None,
             message: "provider failed".into(),
         }),
     );
@@ -107,7 +110,7 @@ fn signed_out_login_progress_and_success_are_projected_without_history_leaks() {
         .as_ref()
         .and_then(|overlay| overlay.auth_url.as_ref())
         .is_some());
-    assert!(state.blocks.is_empty());
+    assert!(state.blocks().is_empty());
 
     state.apply_event(UiEvent::AuthStateChanged {
         provider: Some(LoginProvider::Anthropic),
@@ -116,7 +119,33 @@ fn signed_out_login_progress_and_success_are_projected_without_history_leaks() {
     assert!(state.login_overlay.is_none());
     let footer = ViewModel::derive(&state).lines.last().unwrap().clone();
     assert!(!footer.contains("signed out"));
-    assert!(footer.contains("Shift+Tab:mode"));
+    assert!(footer.contains("Shift+Tab mode"));
+}
+
+#[test]
+fn login_success_dismisses_signed_out_toast_instead_of_joining_it() {
+    let mut state = AppState::new();
+    state.push_notification("No provider connected. Use /login.".into());
+    state.apply_event(UiEvent::AuthStateChanged {
+        provider: Some(LoginProvider::OpenAiCodex),
+        authenticated: true,
+    });
+    state.apply_event(UiEvent::Notification {
+        message: "Connected: OpenAI Codex — ChatGPT Plus/Pro".into(),
+    });
+
+    assert!(
+        state
+            .notifications
+            .iter()
+            .all(|message| !message.contains("No provider connected")),
+        "{:?}",
+        state.notifications
+    );
+    assert_eq!(
+        state.notifications.last().map(|notice| notice.as_str()),
+        Some("Connected: OpenAI Codex — ChatGPT Plus/Pro")
+    );
 }
 
 #[test]
@@ -130,4 +159,18 @@ fn restore_draft_only_replaces_empty_composer() {
         text: "do not overwrite".into(),
     });
     assert_eq!(state.composer.payload(), "retry me");
+}
+
+#[test]
+fn compaction_completed_becomes_collapsed_system_block() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::CompactionCompleted);
+    assert!(state.notifications.is_empty());
+    assert_eq!(state.blocks().len(), 1);
+    assert!(matches!(
+        state.blocks()[0].kind(),
+        BlockKind::System(text) if text == "compaction completed"
+    ));
+    assert_eq!(state.blocks()[0].lifecycle, BlockLifecycle::Complete);
+    assert_eq!(state.blocks()[0].fold, FoldState::Collapsed);
 }

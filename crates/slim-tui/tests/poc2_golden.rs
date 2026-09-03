@@ -26,8 +26,17 @@ fn approved_surface_sizes_keep_fixed_rows_and_deterministic_status() {
         assert_eq!(regions.operational.height, 1, "size={width}x{height}");
         assert_eq!(
             render(&state, width, height).lines.last(),
-            Some(&"signed out · /login  ctx 0% · 0k/128k · ↑0 ↓0".to_string()),
+            Some(&"signed out · /login".to_string()),
             "size={width}x{height}"
         );
     }
+}
+
+#[test]
+fn composer_height_grows_with_content_without_starving_small_viewports() {
+    assert_eq!(slim_tui::layout::composer_height_for_lines(24, 1), 3);
+    assert_eq!(slim_tui::layout::composer_height_for_lines(24, 5), 7);
+    assert_eq!(slim_tui::layout::composer_height_for_lines(24, 9), 7);
+    assert_eq!(slim_tui::layout::composer_height_for_lines(12, 5), 3);
+    assert_eq!(slim_tui::layout::composer_height_for_lines(7, 5), 1);
 }

@@ -6,6 +6,9 @@ use tokio::sync::watch;
 
 use super::OAuthError;
 
+const MAX_CALLBACK_REQUEST_BYTES: usize = 16 * 1024;
+const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub async fn await_callback(
     listener: TcpListener,
     path: &str,
@@ -25,12 +28,14 @@ pub async fn await_callback(
             if !address.ip().is_loopback() {
                 continue;
             }
-            let mut bytes = vec![0_u8; 16 * 1024];
-            let size = stream
-                .read(&mut bytes)
-                .await
-                .map_err(|_| OAuthError::Callback("OAuth callback read failed".into()))?;
-            let request = String::from_utf8_lossy(&bytes[..size]);
+            let Some(bytes) = read_request(&mut stream, &mut cancel).await? else {
+                respond(&mut stream, 400, "Invalid OAuth callback").await;
+                continue;
+            };
+            let Ok(request) = std::str::from_utf8(&bytes) else {
+                respond(&mut stream, 400, "Invalid OAuth callback").await;
+                continue;
+            };
             let target = request
                 .lines()
                 .next()
@@ -73,6 +78,42 @@ pub async fn await_callback(
     tokio::time::timeout(timeout, wait)
         .await
         .map_err(|_| OAuthError::Timeout)?
+}
+
+async fn read_request(
+    stream: &mut tokio::net::TcpStream,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<Option<Vec<u8>>, OAuthError> {
+    let read = async {
+        let mut bytes = Vec::with_capacity(1024);
+        loop {
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Ok(Some(bytes));
+            }
+            if bytes.len() == MAX_CALLBACK_REQUEST_BYTES {
+                return Ok(None);
+            }
+            let mut chunk = [0_u8; 1024];
+            let limit = chunk.len().min(MAX_CALLBACK_REQUEST_BYTES - bytes.len());
+            let size = tokio::select! {
+                result = stream.read(&mut chunk[..limit]) => match result {
+                    Ok(size) => size,
+                    Err(_) => return Ok(None),
+                },
+                changed = cancel.changed() => {
+                    let _ = changed;
+                    return Err(OAuthError::Cancelled);
+                }
+            };
+            if size == 0 {
+                return Ok(None);
+            }
+            bytes.extend_from_slice(&chunk[..size]);
+        }
+    };
+    tokio::time::timeout(CALLBACK_READ_TIMEOUT, read)
+        .await
+        .unwrap_or(Ok(None))
 }
 
 async fn respond(stream: &mut tokio::net::TcpStream, status: u16, message: &str) {

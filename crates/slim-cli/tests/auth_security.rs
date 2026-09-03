@@ -2,7 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use slim_cli::{load_auth_file, redact, resolve_api_key, AuthError};
+use slim_cli::{
+    delete_api_key_file, load_auth_credential, load_auth_file, redact, resolve_api_key,
+    resolve_provider_credential, save_api_key_file, AuthError,
+};
 use slim_core::provider::ProviderKind;
 #[cfg(windows)]
 use std::mem::size_of;
@@ -292,6 +295,43 @@ fn environment_keys_have_priority_over_auth_file() {
 }
 
 #[test]
+fn opencode_key_precedence_is_global_then_provider_then_file() {
+    let _lock = ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("env lock");
+    let _env = EnvGuard::capture(&["SLIM_API_KEY", "OPENCODE_API_KEY", "SLIM_AUTH_FILE"]);
+    let temp = TempDir::new("opencode-priority");
+    let path = auth_file(
+        &temp,
+        r#"{"version":1,"providers":{"opencode-go":{"api_key":"file-key"}}}"#,
+    );
+    std::env::set_var("SLIM_AUTH_FILE", path);
+    std::env::set_var("OPENCODE_API_KEY", "provider-key");
+    std::env::set_var("SLIM_API_KEY", "global-key");
+    assert_eq!(
+        resolve_api_key(ProviderKind::OpenCodeGo)
+            .expect("global key")
+            .as_deref(),
+        Some("global-key")
+    );
+    std::env::remove_var("SLIM_API_KEY");
+    assert_eq!(
+        resolve_api_key(ProviderKind::OpenCodeGo)
+            .expect("provider key")
+            .as_deref(),
+        Some("provider-key")
+    );
+    std::env::remove_var("OPENCODE_API_KEY");
+    assert_eq!(
+        resolve_api_key(ProviderKind::OpenCodeGo)
+            .expect("file key")
+            .as_deref(),
+        Some("file-key")
+    );
+}
+
+#[test]
 fn auth_file_supports_both_providers() {
     let temp = TempDir::new("providers");
     let path = auth_file(
@@ -302,6 +342,165 @@ fn auth_file_supports_both_providers() {
     let anthropic = load_auth_file(&path, ProviderKind::Anthropic).expect("anthropic key");
     assert!(matches!(openai.as_deref(), Some("fixture-openai")));
     assert!(matches!(anthropic.as_deref(), Some("fixture-anthropic")));
+}
+
+#[test]
+fn auth_file_oauth_without_api_key_yields_access_token() {
+    let temp = TempDir::new("oauth-only");
+    let path = auth_file(
+        &temp,
+        r#"{"version":1,"providers":{"openai-codex":{"oauth":{"access":"oauth-access","refresh":"oauth-refresh","expires":1,"account_id":"acct-1"}}}}"#,
+    );
+    assert_eq!(
+        load_auth_file(&path, ProviderKind::OpenAiCodex)
+            .expect("oauth access")
+            .as_deref(),
+        Some("oauth-access")
+    );
+    let credential = load_auth_credential(&path, ProviderKind::OpenAiCodex)
+        .expect("oauth credential")
+        .expect("present");
+    assert_eq!(credential.access, "oauth-access");
+    assert_eq!(credential.account_id.as_deref(), Some("acct-1"));
+    assert!(credential.oauth);
+}
+
+#[test]
+fn auth_file_oauth_wins_over_leftover_api_key() {
+    let temp = TempDir::new("oauth-over-key");
+    let path = auth_file(
+        &temp,
+        r#"{"version":1,"providers":{"openai-codex":{"api_key":"stale-key","oauth":{"access":"oauth-access","refresh":"oauth-refresh","expires":1,"account_id":"acct-1"}}}}"#,
+    );
+    let credential = load_auth_credential(&path, ProviderKind::OpenAiCodex)
+        .expect("credential")
+        .expect("present");
+    assert_eq!(credential.access, "oauth-access");
+    assert_eq!(credential.account_id.as_deref(), Some("acct-1"));
+    assert!(credential.oauth);
+}
+
+#[test]
+fn leftover_auth_lock_file_does_not_block_save() {
+    let temp = TempDir::new("stale-lock");
+    let path = auth_file(
+        &temp,
+        r#"{"version":1,"providers":{"opencode-go":{"api_key":"old"}}}"#,
+    );
+    fs::write(temp.path().join(".auth.lock"), b"stale").expect("stale lock");
+    save_api_key_file(&path, ProviderKind::OpenCodeGo, "fresh-key").expect("save over stale lock");
+    assert_eq!(
+        load_auth_file(&path, ProviderKind::OpenCodeGo)
+            .expect("fresh")
+            .as_deref(),
+        Some("fresh-key")
+    );
+}
+
+#[test]
+fn environment_api_key_wins_over_oauth_file() {
+    let _lock = ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("env lock");
+    let _env = EnvGuard::capture(&["SLIM_API_KEY", "CODEX_ACCESS_TOKEN", "SLIM_AUTH_FILE"]);
+    let temp = TempDir::new("oauth-env-wins");
+    let path = auth_file(
+        &temp,
+        r#"{"version":1,"providers":{"openai-codex":{"oauth":{"access":"oauth-access","refresh":"oauth-refresh","expires":1,"account_id":"acct-1"}}}}"#,
+    );
+    std::env::set_var("SLIM_AUTH_FILE", &path);
+    std::env::set_var("SLIM_API_KEY", "env-wins");
+    std::env::remove_var("CODEX_ACCESS_TOKEN");
+    let credential = resolve_provider_credential(ProviderKind::OpenAiCodex)
+        .expect("env credential")
+        .expect("present");
+    assert_eq!(credential.access, "env-wins");
+    assert!(!credential.oauth);
+}
+
+#[test]
+fn opencode_key_save_is_atomic_and_preserves_sibling_provider() {
+    let temp = TempDir::new("save-opencode");
+    let path = auth_file(
+        &temp,
+        r#"{"version":1,"providers":{"openai-compatible":{"api_key":"fixture-openai"},"anthropic":null}}"#,
+    );
+
+    save_api_key_file(&path, ProviderKind::OpenCodeGo, "fixture-opencode")
+        .expect("save OpenCode key");
+
+    assert_eq!(
+        load_auth_file(&path, ProviderKind::OpenCodeGo)
+            .expect("OpenCode key")
+            .as_deref(),
+        Some("fixture-opencode")
+    );
+    assert_eq!(
+        load_auth_file(&path, ProviderKind::OpenAiCompatible)
+            .expect("sibling key")
+            .as_deref(),
+        Some("fixture-openai")
+    );
+    #[cfg(windows)]
+    assert_native_acl_is_narrow(&path);
+}
+
+#[test]
+fn opencode_logout_deletes_only_its_persisted_key() {
+    let temp = TempDir::new("delete-opencode");
+    let path = auth_file(
+        &temp,
+        r#"{"version":1,"active_provider":"opencode-go","providers":{"openai-compatible":{"api_key":"fixture-openai"},"opencode-go":{"api_key":"fixture-opencode"}}}"#,
+    );
+
+    delete_api_key_file(&path, ProviderKind::OpenCodeGo).expect("delete OpenCode key");
+
+    assert!(load_auth_file(&path, ProviderKind::OpenCodeGo)
+        .expect("OpenCode key")
+        .is_none());
+    assert_eq!(
+        load_auth_file(&path, ProviderKind::OpenAiCompatible)
+            .expect("sibling key")
+            .as_deref(),
+        Some("fixture-openai")
+    );
+}
+
+#[test]
+fn command_code_key_save_is_atomic_and_preserves_sibling_provider() {
+    let temp = TempDir::new("save-command-code");
+    let path = auth_file(
+        &temp,
+        r#"{"version":1,"providers":{"openai-compatible":{"api_key":"fixture-openai"},"anthropic":null}}"#,
+    );
+
+    save_api_key_file(&path, ProviderKind::CommandCode, "fixture-cmd")
+        .expect("save Command Code key");
+
+    assert_eq!(
+        load_auth_file(&path, ProviderKind::CommandCode)
+            .expect("Command Code key")
+            .as_deref(),
+        Some("fixture-cmd")
+    );
+    assert_eq!(
+        load_auth_file(&path, ProviderKind::OpenAiCompatible)
+            .expect("sibling key")
+            .as_deref(),
+        Some("fixture-openai")
+    );
+}
+
+#[test]
+fn api_key_save_rejects_directory_destination_without_deleting_it() {
+    let temp = TempDir::new("save-directory");
+
+    let error = save_api_key_file(temp.path(), ProviderKind::OpenCodeGo, "fixture-opencode")
+        .expect_err("directory destination must fail closed");
+
+    assert_eq!(error, AuthError::InvalidPath);
+    assert!(temp.path().is_dir());
 }
 
 #[test]
@@ -339,6 +538,21 @@ fn missing_auth_file_is_normal() {
     let path = temp.path().join("missing.json");
     let key = load_auth_file(&path, ProviderKind::Anthropic).expect("missing auth file");
     assert!(key.is_none());
+}
+
+#[test]
+fn oversized_auth_file_is_rejected_before_allocation() {
+    let temp = TempDir::new("oversized");
+    let path = temp.path().join("auth.json");
+    fs::File::create(&path)
+        .expect("create")
+        .set_len(1024 * 1024 + 1)
+        .expect("extend");
+
+    let error = load_auth_file(&path, ProviderKind::OpenAiCompatible)
+        .expect_err("oversized auth file must fail");
+
+    assert_eq!(error, AuthError::Read);
 }
 
 #[test]
@@ -406,6 +620,60 @@ fn redaction_masks_every_sensitive_header_in_multiline_input() {
     assert!(!redacted.contains("placeholder-three"));
     assert!(!redacted.contains("placeholder-four"));
     assert_eq!(redacted.matches("[REDACTED]").count(), 4);
+}
+
+#[test]
+fn redaction_masks_sensitive_headers_and_nested_json_values() {
+    let input = serde_json::json!({
+        "authorization": "Bearer json-one",
+        "nested": {
+            "api-key": "json-two",
+            "x-goog-api-key": "json-three",
+            "cookie": "json-four",
+            "set-cookie": "json-five",
+            "proxy-authorization": "json-six",
+            "x-auth-token": "json-seven",
+            "x-amz-security-token": "json-eight"
+        },
+        "safe": "visible"
+    })
+    .to_string();
+    let redacted = redact(&input);
+    for secret in [
+        "json-one",
+        "json-two",
+        "json-three",
+        "json-four",
+        "json-five",
+        "json-six",
+        "json-seven",
+        "json-eight",
+    ] {
+        assert!(!redacted.contains(secret), "leaked {secret}");
+    }
+    assert!(redacted.contains("visible"));
+
+    let headers = concat!(
+        "api-key: header-one\n",
+        "x-goog-api-key: header-two\n",
+        "Cookie: header-three\n",
+        "Set-Cookie: header-four\n",
+        "Proxy-Authorization: header-five\n",
+        "X-Auth-Token: header-six\n",
+        "X-Amz-Security-Token: header-seven"
+    );
+    let redacted = redact(headers);
+    for secret in [
+        "header-one",
+        "header-two",
+        "header-three",
+        "header-four",
+        "header-five",
+        "header-six",
+        "header-seven",
+    ] {
+        assert!(!redacted.contains(secret), "leaked {secret}");
+    }
 }
 
 #[cfg(windows)]

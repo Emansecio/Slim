@@ -1,41 +1,22 @@
-"""Adaptive localhost fixture v2 for cross-agent token+speed benchmarks.
+"""Adaptive localhost fixture for the Slim/Pi/Pit benchmark.
 
-Serves an OpenAI-compatible SSE API on 127.0.0.1:8931 (override with --port).
-Improvements over v1:
-
-- Multi-scenario state machine. POST /reset?scenario=s2_codegen selects the
-  script; the server drives the agent through it by inspecting the agent's own
-  advertised tools each turn (no hardcoded tool names):
-      s1_read      : read -> stop                          (2 turns)
-      s2_codegen   : write fizzbuzz.py (~25 lines) -> stop (2 turns)
-      s3_multistep : write -> read-back -> stop            (3 turns)
-      s4_long      : read -> read -> write -> read -> stop (5 turns)
-  Tool discovery matches by regex on tool name AND required schema keys, so
-  each agent runs its OWN read/write tools.
-- Timing: every request is timestamped (epoch ms + perf_counter) into
-  captures/<scenario>/<tag>/req_<n>.meta.json so startup latency and
-  turn gaps are measurable offline.
-- Compliance gate: records model + reasoning field found per request into
-  compliance.jsonl; analyze.py flags any request whose reasoning effort
-  is not "high".
-
-Endpoints:
-    POST /reset?scenario=<id>  -> restart counters for that scenario
-    POST /*                    -> captured + answered per the scenario script
+The runner starts one fixture process per campaign and resets it before each
+scenario/run/agent arm. Every reset removes that arm's previous artifacts, so a
+short or failed rerun cannot inherit stale requests.
 """
 
+import argparse
 import json
 import os
 import re
+import shutil
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(BASE, "captures")
-os.makedirs(OUT, exist_ok=True)
-
+DEFAULT_OUT = os.path.join(BASE, "campaigns")
 MODEL = "gpt-5.6-luna"
 EXPECTED_EFFORT = "high"
 
@@ -68,38 +49,37 @@ PATH_KEYS = ("path", "file_path", "filePath", "abs_path", "filename")
 LIMIT_KEYS = ("max_lines", "maxLines", "limit", "max_tokens_lines")
 CONTENT_KEYS = ("content", "contents", "text", "file_text", "new_string", "value")
 
-# Scenario scripts: sequence of actions the fixture performs.
-# ("read", file) -> answer with a real tool call to the agent's reader
-# ("write", file)-> answer with a real tool call to the agent's writer
-# ("readback")   -> like read, but the file was written in a previous turn;
-#                   discovery prefers the reader again
-# ("stop",)      -> plain final answer
 SCENARIOS = {
     "s1_read": ["read"],
     "s2_codegen": ["write"],
     "s3_multistep": ["write", "readback"],
-    "s4_long": ["read", "read", "write", "read"],
+    "s4_long": ["read", "read", "write", "readback"],
 }
+EXPECTED_REQUESTS = {name: len(actions) + 1 for name, actions in SCENARIOS.items()}
 
 state_lock = threading.Lock()
-state = {"scenario": "s1_read", "step": 0, "tag": "agent"}
+state = {"scenario": "s1_read", "step": 0, "tag": "agent", "run": "1"}
+OUT = DEFAULT_OUT
 
 
 def _props(tool):
     fn = tool.get("function") or {}
-    params = fn.get("parameters") or tool.get("input_schema") or {}
-    return fn.get("name") or tool.get("name") or "", set((params.get("properties") or {}).keys())
+    params = fn.get("parameters") or tool.get("input_schema") or tool.get("parameters") or {}
+    name = fn.get("name") or tool.get("name") or ""
+    return name, set((params.get("properties") or {}).keys())
 
 
 def _path_key(props):
-    return next((k for k in PATH_KEYS if k in props), None)
+    return next((key for key in PATH_KEYS if key in props), None)
 
 
-def discover_tool(tools, name_re):
-    """Return (tool_name, args) for the agent's own tool matching name_re."""
-    candidates = [_props(t) for t in (tools or [])]
-    for name, props in candidates:
-        if name_re.search(name) and _path_key(props):
+def discover_tool(tools, name_re, required_groups=()):
+    """Return the first matching tool satisfying every required key group."""
+    for tool in tools or []:
+        name, props = _props(tool)
+        if not name_re.search(name) or not _path_key(props):
+            continue
+        if all(any(key in props for key in group) for group in required_groups):
             return name, props
     return None, None
 
@@ -109,25 +89,29 @@ def build_read_call(tools, path):
     if not name:
         return None, None
     args = {_path_key(props): path}
-    limit = next((k for k in LIMIT_KEYS if k in props), None)
+    limit = next((key for key in LIMIT_KEYS if key in props), None)
     if limit:
         args[limit] = 400
     return name, args
 
 
 def build_write_call(tools, path):
-    name, props = discover_tool(tools, WRITE_NAME_RE)
-    if not name:
+    # Pi advertises `edit` before `write`. Consider every compatible schema and
+    # prefer a dedicated writer instead of stopping at the first name match.
+    candidates = []
+    for tool in tools or []:
+        name, props = _props(tool)
+        content_key = next((key for key in CONTENT_KEYS if key in props), None)
+        if WRITE_NAME_RE.search(name) and _path_key(props) and content_key:
+            priority = 0 if name.lower() in ("write", "create") else 1
+            candidates.append((priority, name, props, content_key))
+    if not candidates:
         return None, None
-    pk = _path_key(props)
-    ck = next((k for k in CONTENT_KEYS if k in props), None)
-    if not ck:
-        return None, None
-    return name, {pk: path, ck: FIZZBUZZ_CODE}
+    _, name, props, content_key = min(candidates, key=lambda candidate: candidate[0])
+    return name, {_path_key(props): path, content_key: FIZZBUZZ_CODE}
 
 
 def find_reasoning_effort(body):
-    """Locate the reasoning-effort value wherever the agent put it."""
     if isinstance(body.get("reasoning_effort"), str):
         return body["reasoning_effort"]
     reasoning = body.get("reasoning")
@@ -136,12 +120,26 @@ def find_reasoning_effort(body):
     return "(missing)"
 
 
+def safe_component(value, fallback):
+    value = re.sub(r"[^A-Za-z0-9_.-]", "_", str(value))
+    return value or fallback
+
+
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *args):
+    def log_message(self, *_args):
         pass
 
+    def _json(self, status, payload):
+        raw = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
     def _sse(self, events):
-        payload = "".join(f"data: {json.dumps(e)}\n\n" for e in events)
+        payload = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+        payload += "data: [DONE]\n\n"
         raw = payload.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -149,119 +147,117 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def _reply(self, events):
-        # Timing meta is written in do_POST together with the body.
-        self._sse(events)
-
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Length", "2")
-        self.end_headers()
-        self.wfile.write(b"ok")
+        self._json(200, {"ok": True})
 
     def do_POST(self):
         parsed_path = urlparse(self.path)
-        if parsed_path.path.endswith("/reset"):
-            length = int(self.headers.get("Content-Length", "0"))
-            self.rfile.read(length)
-            qs = parse_qs(parsed_path.query)
-            scenario = (qs.get("scenario") or ["s1_read"])[0]
-            tag = (qs.get("tag") or ["agent"])[0]
-            run = (qs.get("run") or ["1"])[0]
-            if scenario not in SCENARIOS:
-                self.send_response(400)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-                return
-            with state_lock:
-                state.update(scenario=scenario, step=0, tag=tag, run=run)
-            self.send_response(200)
-            self.send_header("Content-Length", "2")
-            self.end_headers()
-            self.wfile.write(b"ok")
-            return
-
         length = int(self.headers.get("Content-Length", "0"))
         body_bytes = self.rfile.read(length)
-        body = json.loads(body_bytes)
+
+        if parsed_path.path.endswith("/reset"):
+            query = parse_qs(parsed_path.query)
+            scenario = (query.get("scenario") or ["s1_read"])[0]
+            if scenario not in SCENARIOS:
+                self._json(400, {"error": "unknown scenario"})
+                return
+            tag = safe_component((query.get("tag") or ["agent"])[0], "agent")
+            run = safe_component((query.get("run") or ["1"])[0], "1")
+            arm_dir = os.path.join(OUT, scenario, f"run{run}", tag)
+            shutil.rmtree(arm_dir, ignore_errors=True)
+            os.makedirs(arm_dir, exist_ok=True)
+            with state_lock:
+                state.update(scenario=scenario, step=0, tag=tag, run=run)
+            self._json(200, {"ok": True, "expected_requests": EXPECTED_REQUESTS[scenario]})
+            return
+
+        try:
+            body = json.loads(body_bytes)
+        except json.JSONDecodeError:
+            self._json(400, {"error": "invalid JSON"})
+            return
 
         with state_lock:
             scenario = state["scenario"]
             step = state["step"]
             state["step"] += 1
-            # Run directory comes from /reset (?run=N) so every run writes to
-            # its own folder — no overwriting between runs.
             tag = state["tag"]
-            run = str(state.get("run", "1"))
-        d = os.path.join(OUT, scenario, f"run{run}", tag)
-        os.makedirs(d, exist_ok=True)
+            run = state["run"]
+
+        arm_dir = os.path.join(OUT, scenario, f"run{run}", tag)
+        os.makedirs(arm_dir, exist_ok=True)
         now_mono = time.perf_counter()
-        with open(os.path.join(d, f"req_{step}.json"), "wb") as f:
-            f.write(body_bytes)
-        with open(os.path.join(d, f"req_{step}.meta.json"), "w", encoding="utf-8") as f:
-            json.dump({"req": step, "epoch_ms": int(time.time() * 1000),
-                       "perf_counter": now_mono}, f)
+        now_epoch_ms = int(time.time() * 1000)
+        with open(os.path.join(arm_dir, f"req_{step}.json"), "wb") as output:
+            output.write(body_bytes)
+        with open(os.path.join(arm_dir, f"req_{step}.meta.json"), "w", encoding="utf-8") as output:
+            json.dump({"req": step, "epoch_ms": now_epoch_ms, "perf_counter": now_mono}, output)
+
+        record = {
+            "scenario": scenario,
+            "run": run,
+            "agent": tag,
+            "req": step,
+            "model": body.get("model"),
+            "reasoning_effort": find_reasoning_effort(body),
+            "expected_model": MODEL,
+            "expected_effort": EXPECTED_EFFORT,
+        }
+        record["ok"] = (
+            record["model"] == record["expected_model"]
+            and record["reasoning_effort"] == record["expected_effort"]
+        )
+        with open(os.path.join(arm_dir, "compliance.jsonl"), "a", encoding="utf-8") as output:
+            output.write(json.dumps(record) + "\n")
+
         script = SCENARIOS[scenario]
         action = script[step] if step < len(script) else "stop"
-
-        # Compliance record (model + reasoning actually on the wire)
-        with state_lock:
-            # Prefer the tag registered at /reset; fall back to the header.
-            tag = state["tag"] or re.sub(
-                r"[^A-Za-z0-9_.-]", "_", self.headers.get("X-Bench-Agent", "agent")
-            )
-        comp = os.path.join(OUT, scenario, "compliance.jsonl")
-        with open(comp, "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "scenario": scenario,
-                "agent": tag,
-                "req": step,
-                "model": body.get("model"),
-                "reasoning_effort": find_reasoning_effort(body),
-                "expected_model": MODEL,
-                "expected_effort": EXPECTED_EFFORT,
-            }) + "\n")
-
         tools = body.get("tools") or []
 
         if action in ("read", "readback"):
-            name, args = build_read_call(tools, TARGET_READ)
+            target = TARGET_WRITE if action == "readback" else TARGET_READ
+            name, args = build_read_call(tools, target)
             if name:
-                events = [
-                    {"choices": [{"delta": {"tool_calls": [
-                        {"index": 0, "id": f"call-bench-{step}", "function": {
-                            "name": name, "arguments": json.dumps(args)}}]}}]},
+                self._sse([
+                    {"choices": [{"delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": f"call-bench-{step}",
+                        "function": {"name": name, "arguments": json.dumps(args)},
+                    }]}}]},
                     {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
-                ]
-                self._reply(events)
+                ])
                 return
 
         if action == "write":
             name, args = build_write_call(tools, TARGET_WRITE)
             if name:
-                events = [
-                    {"choices": [{"delta": {"tool_calls": [
-                        {"index": 0, "id": f"call-bench-{step}", "function": {
-                            "name": name, "arguments": json.dumps(args)}}]}}]},
+                self._sse([
+                    {"choices": [{"delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": f"call-bench-{step}",
+                        "function": {"name": name, "arguments": json.dumps(args)},
+                    }]}}]},
                     {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
-                ]
-                self._reply(events)
+                ])
                 return
 
-        # stop / fallback
-        self._reply([
+        self._sse([
             {"choices": [{"delta": {"content": "bench-done"}}]},
             {"choices": [{"delta": {}, "finish_reason": "stop"}]},
         ])
 
 
 if __name__ == "__main__":
-    import argparse
-
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=8931)
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=8931)
+    parser.add_argument("--out", default=DEFAULT_OUT)
+    args = parser.parse_args()
+    OUT = os.path.abspath(args.out)
+    os.makedirs(OUT, exist_ok=True)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"capture_server v2 listening on 127.0.0.1:{args.port} "
-          f"(model={MODEL}, expected effort={EXPECTED_EFFORT})")
+    print(
+        f"capture_server v3 listening on 127.0.0.1:{args.port} "
+        f"(out={OUT}, model={MODEL}, expected effort={EXPECTED_EFFORT})",
+        flush=True,
+    )
     server.serve_forever()

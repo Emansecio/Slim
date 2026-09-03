@@ -1,7 +1,7 @@
 use std::io::{self, Stdout};
 
 use crossterm::cursor::Hide;
-use crossterm::event::{EnableBracketedPaste, EnableMouseCapture};
+use crossterm::event::EnableBracketedPaste;
 use crossterm::execute;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -20,13 +20,13 @@ impl FullscreenBackend {
     /// hidden until the first focused frame.
     pub fn start(capabilities: Capabilities) -> io::Result<Self> {
         let mut stdout = io::stdout();
-        let guard = TerminalGuard::enter(&mut stdout)?;
+        let mut guard = TerminalGuard::enter(&mut stdout)?;
         if let Err(error) = execute!(stdout, EnableBracketedPaste) {
             drop(guard);
             return Err(error);
         }
         if capabilities.mouse {
-            if let Err(error) = execute!(stdout, EnableMouseCapture) {
+            if let Err(error) = guard.enable_mouse_capture(&mut stdout) {
                 drop(guard);
                 return Err(error);
             }

@@ -1,20 +1,17 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use super::{OAuthCredential, OAuthError, OAuthProvider};
-use crate::auth::{auth_file_path, secure_auth_file};
+use crate::auth::{auth_file_path, create_secure_auth_file, secure_auth_file};
 
 static STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(crate) struct StoreGuard {
-    #[cfg(windows)]
-    _file: File,
+    _lock: crate::auth::AuthStoreLock,
 }
 
 struct TemporaryFile(PathBuf);
@@ -68,6 +65,106 @@ impl OAuthStore {
             .transpose()
     }
 
+    pub fn api_key(&self, provider: &str) -> Result<Option<String>, OAuthError> {
+        validate_api_key_provider(provider)?;
+        self.read_document()?
+            .pointer(&format!("/providers/{provider}/api_key"))
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|key| !key.trim().is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| OAuthError::Store("API key schema is invalid".into()))
+            })
+            .transpose()
+    }
+
+    pub fn save_api_key(&self, provider: &str, key: &str) -> Result<(), OAuthError> {
+        validate_api_key_provider(provider)?;
+        if key.trim().is_empty() {
+            return Err(OAuthError::Store("API key cannot be empty".into()));
+        }
+        let _store_guard = self.lock_exclusive()?;
+        let _guard = STORE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| OAuthError::Store("auth store lock poisoned".into()))?;
+        let mut document = self.read_document()?;
+        document["active_provider"] = Value::String(provider.into());
+        let providers = document
+            .get_mut("providers")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| OAuthError::Store("auth file providers must be an object".into()))?;
+        let entry = providers.entry(provider).or_insert_with(|| json!({}));
+        let entry = entry
+            .as_object_mut()
+            .ok_or_else(|| OAuthError::Store("provider auth entry must be an object".into()))?;
+        entry.insert("api_key".into(), Value::String(key.into()));
+        self.write_document(&document)
+    }
+
+    pub fn activate_api_key(&self, provider: &str) -> Result<Option<String>, OAuthError> {
+        validate_api_key_provider(provider)?;
+        let _store_guard = self.lock_exclusive()?;
+        let _guard = STORE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| OAuthError::Store("auth store lock poisoned".into()))?;
+        let mut document = self.read_document()?;
+        let Some(key) = document
+            .pointer(&format!("/providers/{provider}/api_key"))
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|key| !key.trim().is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| OAuthError::Store("API key schema is invalid".into()))
+            })
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        document["active_provider"] = Value::String(provider.into());
+        self.write_document(&document)?;
+        Ok(Some(key))
+    }
+
+    pub fn remove_api_key(&self, provider: &str) -> Result<(), OAuthError> {
+        validate_api_key_provider(provider)?;
+        let _store_guard = self.lock_exclusive()?;
+        let _guard = STORE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| OAuthError::Store("auth store lock poisoned".into()))?;
+        let mut document = self.read_document()?;
+        if let Some(providers) = document.get_mut("providers").and_then(Value::as_object_mut) {
+            let remove_entry = providers
+                .get_mut(provider)
+                .and_then(Value::as_object_mut)
+                .is_some_and(|entry| {
+                    entry.remove("api_key");
+                    entry.is_empty()
+                });
+            if remove_entry {
+                providers.remove(provider);
+            }
+        }
+        if document.get("active_provider").and_then(Value::as_str) == Some(provider) {
+            document
+                .as_object_mut()
+                .map(|object| object.remove("active_provider"));
+        }
+        self.write_document(&document)
+    }
+
+    pub fn active_provider_key(&self) -> Result<Option<String>, OAuthError> {
+        Ok(self
+            .read_document()?
+            .get("active_provider")
+            .and_then(Value::as_str)
+            .map(str::to_owned))
+    }
+
     pub fn save(
         &self,
         provider: OAuthProvider,
@@ -96,6 +193,7 @@ impl OAuthStore {
         let entry = entry
             .as_object_mut()
             .ok_or_else(|| OAuthError::Store("provider auth entry must be an object".into()))?;
+        entry.remove("api_key");
         entry.insert(
             "oauth".into(),
             serde_json::to_value(credential)
@@ -131,37 +229,15 @@ impl OAuthStore {
         self.write_document(&document)
     }
 
-    #[cfg(windows)]
     pub(crate) fn lock_exclusive(&self) -> Result<StoreGuard, OAuthError> {
-        use std::os::windows::fs::OpenOptionsExt;
-
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| OAuthError::Store("auth file has no parent directory".into()))?;
-        fs::create_dir_all(parent)
-            .map_err(|_| OAuthError::Store("auth directory creation failed".into()))?;
-        let lock_path = parent.join(".auth.lock");
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .share_mode(0)
-                .open(&lock_path)
-            {
-                Ok(file) => return Ok(StoreGuard { _file: file }),
-                Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
-                Err(_) => return Err(OAuthError::Store("auth store lock timed out".into())),
-            }
-        }
-    }
-
-    #[cfg(not(windows))]
-    pub(crate) fn lock_exclusive(&self) -> Result<StoreGuard, OAuthError> {
-        Ok(StoreGuard {})
+        crate::auth::lock_auth_store(&self.path)
+            .map(|lock| StoreGuard { _lock: lock })
+            .map_err(|error| match error {
+                crate::auth::AuthError::Locked => {
+                    OAuthError::Store("auth store lock timed out".into())
+                }
+                other => OAuthError::Store(other.to_string()),
+            })
     }
 
     fn credential_from(
@@ -210,25 +286,23 @@ impl OAuthStore {
         let temporary = parent.join(format!(".auth-{suffix}.tmp"));
         let bytes = serde_json::to_vec_pretty(document)
             .map_err(|_| OAuthError::Store("auth serialization failed".into()))?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|_| OAuthError::Store("auth temporary file creation failed".into()))?;
         let _cleanup = TemporaryFile(temporary.clone());
-        drop(file);
-        secure_auth_file(&temporary).map_err(|error| OAuthError::Store(error.to_string()))?;
-        file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&temporary)
-            .map_err(|_| OAuthError::Store("secured auth temporary file open failed".into()))?;
+        let mut file = create_secure_auth_file(&temporary)
+            .map_err(|error| OAuthError::Store(error.to_string()))?;
         file.write_all(&bytes)
             .and_then(|_| file.sync_all())
             .map_err(|_| OAuthError::Store("auth write failed".into()))?;
         drop(file);
         replace_file(&temporary, &self.path)?;
         Ok(())
+    }
+}
+
+fn validate_api_key_provider(provider: &str) -> Result<(), OAuthError> {
+    if matches!(provider, "opencode-go" | "clinepass" | "command-code") {
+        Ok(())
+    } else {
+        Err(OAuthError::Store("unsupported API-key provider".into()))
     }
 }
 

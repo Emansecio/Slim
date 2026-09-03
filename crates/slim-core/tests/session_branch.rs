@@ -46,3 +46,27 @@ fn branch_keeps_parent_identity_and_rebuildable_caches() {
 
     let _ = fs::remove_dir_all(path.parent().expect("parent"));
 }
+
+#[test]
+fn legacy_branch_rejects_traversal_child_ids_before_creating_a_path() {
+    let path = temp_path("parent-traversal.jsonl");
+    let mut writer = SessionWriter::create(&path, "parent", "D:\\Slim").expect("create");
+    writer
+        .append(&SessionEvent::new(
+            1,
+            EventKind::AssistantTextDelta { text: "one".into() },
+        ))
+        .expect("append");
+    drop(writer);
+
+    assert!(branch(&path, "../escape", 1).is_err());
+    assert!(branch(&path, "", 1).is_err());
+    let escaped = path
+        .parent()
+        .expect("parent")
+        .parent()
+        .expect("temp root")
+        .join("escape.jsonl");
+    assert!(!escaped.exists());
+    let _ = fs::remove_dir_all(path.parent().expect("parent"));
+}

@@ -1,8 +1,10 @@
 # RESULTS — Benchmark v2: Slim x Pi x Pit
 
-> Checkpoint atual: **2026-08-22**. Modelo no fio: `gpt-5.6-luna`;
-> reasoning effort: `high`. O código atual e as capturas atuais prevalecem sobre
-> números históricos. Método: `PLAN.md`, `run_benchmark.ps1` e `analyze.py`.
+> Checkpoint atual: **2026-08-23**. Modelo no fio: `gpt-5.6-luna`;
+> reasoning effort: `high`. Campanha fresca: 4 cenários × 3 runs × 3 agentes
+> (**36 processos**, **78 requests capturados**). O código e as capturas atuais
+> prevalecem sobre números históricos. Método: `PLAN.md`, `run_benchmark.ps1`
+> e `analyze.py`.
 
 ## 0. Compliance gate
 
@@ -12,28 +14,46 @@
 | Pi | `gpt-5.6-luna` | `high` | ✅ |
 | Pit | `gpt-5.6-luna` | `high` | ✅ |
 
-No braço pós-PERF-02, os **75 requests** de Slim (`15 runs × 5 turnos`) foram
-validados separadamente: 75/75 mantiveram modelo e effort esperados.
+Compliance atual: **78/78 requests** mantiveram modelo e effort esperados
+(Slim 36, Pi 21, Pit 21). Cada cenário usou servidor de captura isolado; os
+36 arquivos de timing e pelo menos um payload por run/agente foram validados.
 
 ## 1. Payload disponível
 
-Medianas do `summary_v2.json`. Slim `s1_read` e `s4_long` são capturas atuais;
-`s2_codegen`/`s3_multistep` e braços Pi/Pit não foram rerodados no PERF-02 e
-ficam apenas como referência histórica comparativa:
+Medianas frescas do `summary_v2.json`:
 
 | Cenário | Agente | T1 total | System | Tools | Tn total | Histórico Tn | Soma dos requests |
 |---|---|---:|---:|---:|---:|---:|---:|
 | `s1_read` | Slim | 4.238 B | 2.435 B | 1.592 B (6) | 7.116 B | 2.953 B | 11.354 B |
 | `s1_read` | Pi | 5.941 B | 2.739 B | 2.900 B (4) | 8.729 B | 2.888 B | 14.670 B |
 | `s1_read` | Pit | 11.870 B | 4.029 B | 7.434 B (12) | 14.658 B | 3.023 B | 26.528 B |
-| `s2_codegen` | Slim | 5.488 B | 3.684 B | 1.592 B (6) | 6.242 B | 830 B | 11.730 B |
-| `s3_multistep` | Slim | 5.488 B | 3.684 B | 1.592 B (6) | 9.120 B | 3.706 B | 20.850 B |
+| `s2_codegen` | Slim | 4.239 B | 2.435 B | 1.592 B (6) | 4.993 B | 830 B | 9.232 B |
+| `s2_codegen` | Pi | 5.942 B | 2.739 B | 2.900 B (4) | 5.942 B | 103 B | 5.942 B |
+| `s2_codegen` | Pit | 12.579 B | 4.029 B | 7.434 B (12) | 12.579 B | 946 B | 12.579 B |
+| `s3_multistep` | Slim | 4.239 B | 2.435 B | 1.592 B (6) | 7.871 B | 3.706 B | 17.103 B |
+| `s3_multistep` | Pi | 5.942 B | 2.739 B | 2.900 B (4) | 5.942 B | 103 B | 5.942 B |
+| `s3_multistep` | Pit | 12.579 B | 4.029 B | 7.434 B (12) | 12.579 B | 946 B | 12.579 B |
 | `s4_long` | Slim | 4.239 B | 2.435 B | 1.592 B (6) | 8.519 B | 4.350 B | 35.511 B |
 | `s4_long` | Pi | 5.942 B | 2.739 B | 2.900 B (4) | 11.518 B | 5.675 B | 26.190 B |
 | `s4_long` | Pit | 12.684 B | 4.029 B | 7.434 B (12) | 15.908 B | 4.271 B | 44.064 B |
 
-Os valores antigos de Slim `5.487/5.488 B` em `s1_read` e `13.852 B` na soma
-foram substituídos pelo baseline atual de `4.238 B` e `11.354 B`.
+### Comparação válida entre agentes
+
+Somente `s1_read` completou o mesmo fluxo em todos: **2 requests por run**.
+Nesse cenário, Slim contra Pi reduziu T1 em **28,7%**, payload final em
+**18,5%**, soma da tarefa em **22,6%** e tempo total mediano em **45,2%**
+(1.208 vs 2.204 ms). Contra Pit: **64,3%**, **51,5%**, **57,2%** e **74,5%**
+(1.208 vs 4.733 ms), respectivamente.
+
+### Limite de comparabilidade dos cenários de escrita
+
+Nas capturas atuais, Slim executou `2/3/5` requests em
+`s2_codegen/s3_multistep/s4_long`; Pi e Pit executaram `1/1/3`. O discovery do
+fixture não encontrou uma tool de escrita compatível nos braços Pi/Pit e caiu
+no stop de fallback. Portanto, os números absolutos desses três cenários são
+úteis para auditar payload, mas **não demonstram economia cross-agent**: Slim
+realizou mais etapas. A comparação econômica autoritativa desta campanha é
+`s1_read`.
 
 ## 2. PERF-01 — microbenchmark de setup das tools
 
@@ -116,7 +136,7 @@ A/B do binário implantado no `s4_long`, N=5:
 - T1 4.239 B, Tn 8.519 B e soma 35.511 B: deltas zero;
 - 25/25 novos requests de compliance verdes;
 - processo mediano 1.167 → 1.174 ms (+7 ms, +0,60%), ruído do `Start-Job`;
-- suíte atual: 45 suítes / 225 passed / 0 failed / 1 ignored / 0 warnings;
+- suíte atual: 61 suítes / 407 passed / 0 failed / 1 ignored / 0 warnings;
 - binário: 6.589.440 → 6.671.872 B (+82.432 B, +1,25%), trade-off explícito
   da drenagem concorrente/novos caminhos std; payload e pico de contexto não cresceram.
 

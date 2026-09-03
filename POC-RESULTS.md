@@ -74,8 +74,7 @@ segredos arbitrários não registrados não são alegadamente detectados.
 
 ### Runtime, contexto e headless
 
-- `max_tool_calls` é conferido antes de cada efeito colateral; `ToolStarted`
-  precede a execução e tool output/finished seguem no stream.
+- Budgets separados read-only vs mutating por run (`max_read_tool_calls` / `max_mutating_tool_calls`); esgotamento → `tool_limit` (exit 22). `ToolStarted` precede execução; pares assistant/tool preservados na compactação.
 - O provider/model informado é preservado. Compaction bounded usa o mesmo
   adapter/modelo, preserva o prompt raiz e pares assistant/tool completos, e
   persiste `Usage` tanto dos turnos quanto do resumo.

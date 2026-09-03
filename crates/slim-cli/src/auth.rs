@@ -1,9 +1,15 @@
 use std::fmt;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use slim_core::provider::ProviderKind;
+
+const MAX_AUTH_FILE_BYTES: usize = 1024 * 1024;
 
 /// The only supported auth-file format. Example (keys are placeholders):
 ///
@@ -27,6 +33,8 @@ pub enum AuthError {
     UnsupportedVersion,
     InvalidSchema,
     UnsafePermissions,
+    Write,
+    Locked,
 }
 
 impl fmt::Display for AuthError {
@@ -38,6 +46,8 @@ impl fmt::Display for AuthError {
             Self::UnsupportedVersion => "auth file uses an unsupported schema version",
             Self::InvalidSchema => "auth file has an invalid schema",
             Self::UnsafePermissions => "auth file permissions could not be secured",
+            Self::Write => "auth file could not be written",
+            Self::Locked => "auth file is locked by another Slim process",
         };
         formatter.write_str(message)
     }
@@ -45,7 +55,7 @@ impl fmt::Display for AuthError {
 
 impl std::error::Error for AuthError {}
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AuthDocument {
     version: u32,
@@ -54,7 +64,7 @@ struct AuthDocument {
     providers: AuthProviders,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AuthProviders {
     #[serde(
@@ -62,18 +72,46 @@ struct AuthProviders {
         alias = "openai_compatible",
         alias = "openai"
     )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     openai_compatible: Option<AuthProvider>,
-    #[serde(rename = "openai-codex", default)]
+    #[serde(
+        rename = "openai-codex",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     openai_codex: Option<AuthProvider>,
+    #[serde(
+        rename = "opencode-go",
+        alias = "opencode_go",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    opencode_go: Option<AuthProvider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     anthropic: Option<AuthProvider>,
+    #[serde(
+        rename = "clinepass",
+        alias = "cline-pass",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    clinepass: Option<AuthProvider>,
+    #[serde(
+        rename = "command-code",
+        alias = "commandcode",
+        alias = "command_code",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    command_code: Option<AuthProvider>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AuthProvider {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     api_key: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     oauth: Option<serde_json::Value>,
 }
 
@@ -97,29 +135,73 @@ mod secret_debug_contract {
     };
 }
 
+/// Resolved provider access token plus optional OAuth metadata.
+///
+/// Environment variables and `api_key` in `auth.json` are not OAuth.
+/// TUI `/login` persists `providers.<kind>.oauth`; that path sets `oauth`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderCredential {
+    pub access: String,
+    pub account_id: Option<String>,
+    pub oauth: bool,
+}
+
 /// Resolve a provider key using environment variables first, then auth.json.
 pub fn resolve_api_key(kind: ProviderKind) -> Result<Option<String>, AuthError> {
+    Ok(resolve_provider_credential(kind)?.map(|credential| credential.access))
+}
+
+/// Resolve access, optional account id, and whether the token came from TUI OAuth.
+///
+/// Precedence: `SLIM_API_KEY` / provider env → file `oauth` → file `api_key`.
+pub fn resolve_provider_credential(
+    kind: ProviderKind,
+) -> Result<Option<ProviderCredential>, AuthError> {
     let provider_variable = match kind {
         ProviderKind::OpenAiCompatible => "OPENAI_API_KEY",
         ProviderKind::OpenAiCodex => "CODEX_ACCESS_TOKEN",
         ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
+        ProviderKind::OpenCodeGo => "OPENCODE_API_KEY",
+        ProviderKind::ClinePass => "CLINEPASS_API_KEY",
+        ProviderKind::CommandCode => "COMMANDCODE_API_KEY",
     };
     if let Some(value) = non_empty_environment_value("SLIM_API_KEY") {
-        return Ok(Some(value));
+        return Ok(Some(env_credential(value)));
     }
     if let Some(value) = non_empty_environment_value(provider_variable) {
-        return Ok(Some(value));
+        return Ok(Some(env_credential(value)));
+    }
+    if kind == ProviderKind::CommandCode {
+        if let Some(value) = non_empty_environment_value("CMD_API_KEY") {
+            return Ok(Some(env_credential(value)));
+        }
     }
 
     let Some(path) = auth_file_path()? else {
         return Ok(None);
     };
-    load_auth_file(&path, kind)
+    load_auth_credential(&path, kind)
+}
+
+fn env_credential(access: String) -> ProviderCredential {
+    ProviderCredential {
+        access,
+        account_id: None,
+        oauth: false,
+    }
 }
 
 /// Load one provider key from an existing auth file. This is public so the
 /// offline contract tests can exercise file loading without making requests.
 pub fn load_auth_file(path: &Path, kind: ProviderKind) -> Result<Option<String>, AuthError> {
+    Ok(load_auth_credential(path, kind)?.map(|credential| credential.access))
+}
+
+/// Load `api_key` or TUI `oauth` from an existing auth file.
+pub fn load_auth_credential(
+    path: &Path,
+    kind: ProviderKind,
+) -> Result<Option<ProviderCredential>, AuthError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -147,18 +229,238 @@ pub fn load_auth_file(path: &Path, kind: ProviderKind) -> Result<Option<String>,
         ProviderKind::OpenAiCompatible => document.providers.openai_compatible,
         ProviderKind::OpenAiCodex => document.providers.openai_codex,
         ProviderKind::Anthropic => document.providers.anthropic,
+        ProviderKind::OpenCodeGo => document.providers.opencode_go,
+        ProviderKind::ClinePass => document.providers.clinepass,
+        ProviderKind::CommandCode => document.providers.command_code,
     };
     let Some(provider) = provider else {
         return Ok(None);
     };
+    if let Some(oauth_value) = provider.oauth {
+        let oauth: crate::oauth::OAuthCredential =
+            serde_json::from_value(oauth_value).map_err(|_| AuthError::InvalidSchema)?;
+        if oauth.access.trim().is_empty() {
+            return Err(AuthError::InvalidSchema);
+        }
+        return Ok(Some(ProviderCredential {
+            access: oauth.access,
+            account_id: oauth.account_id,
+            oauth: true,
+        }));
+    }
     let Some(key) = provider.api_key else {
-        let _ = provider.oauth;
         return Ok(None);
     };
     if key.trim().is_empty() {
         return Err(AuthError::InvalidSchema);
     }
-    Ok(Some(key))
+    Ok(Some(ProviderCredential {
+        access: key,
+        account_id: None,
+        oauth: false,
+    }))
+}
+
+static AUTH_TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
+
+/// Atomically persist one provider API key while preserving sibling entries.
+pub fn save_api_key_file(path: &Path, kind: ProviderKind, api_key: &str) -> Result<(), AuthError> {
+    if api_key.trim().is_empty() || api_key.chars().count() > 4_096 {
+        return Err(AuthError::InvalidSchema);
+    }
+    update_auth_file(path, |document| {
+        set_provider(
+            &mut document.providers,
+            kind,
+            Some(AuthProvider {
+                api_key: Some(api_key.to_owned()),
+                oauth: None,
+            }),
+        );
+        document.active_provider = Some(provider_name(kind).to_owned());
+    })
+}
+
+pub fn save_api_key(kind: ProviderKind, api_key: &str) -> Result<(), AuthError> {
+    let path = auth_file_path()?.ok_or(AuthError::InvalidPath)?;
+    save_api_key_file(&path, kind, api_key)
+}
+
+pub fn delete_api_key_file(path: &Path, kind: ProviderKind) -> Result<(), AuthError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    update_auth_file(path, |document| {
+        set_provider(&mut document.providers, kind, None);
+        if document.active_provider.as_deref() == Some(provider_name(kind)) {
+            document.active_provider = None;
+        }
+    })
+}
+
+pub fn delete_api_key(kind: ProviderKind) -> Result<(), AuthError> {
+    let Some(path) = auth_file_path()? else {
+        return Ok(());
+    };
+    delete_api_key_file(&path, kind)
+}
+
+fn provider_name(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::OpenAiCompatible => "openai-compatible",
+        ProviderKind::OpenAiCodex => "openai-codex",
+        ProviderKind::Anthropic => "anthropic",
+        ProviderKind::OpenCodeGo => "opencode-go",
+        ProviderKind::ClinePass => "clinepass",
+        ProviderKind::CommandCode => "command-code",
+    }
+}
+
+fn set_provider(providers: &mut AuthProviders, kind: ProviderKind, provider: Option<AuthProvider>) {
+    match kind {
+        ProviderKind::OpenAiCompatible => providers.openai_compatible = provider,
+        ProviderKind::OpenAiCodex => providers.openai_codex = provider,
+        ProviderKind::Anthropic => providers.anthropic = provider,
+        ProviderKind::OpenCodeGo => providers.opencode_go = provider,
+        ProviderKind::ClinePass => providers.clinepass = provider,
+        ProviderKind::CommandCode => providers.command_code = provider,
+    }
+}
+
+fn update_auth_file(path: &Path, update: impl FnOnce(&mut AuthDocument)) -> Result<(), AuthError> {
+    if fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink() || metadata.is_dir())
+    {
+        return Err(AuthError::InvalidPath);
+    }
+    let parent = path.parent().ok_or(AuthError::InvalidPath)?;
+    fs::create_dir_all(parent).map_err(|_| AuthError::Write)?;
+    if fs::symlink_metadata(parent)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
+    {
+        return Err(AuthError::InvalidPath);
+    }
+
+    let _guard = lock_auth_store(path)?;
+
+    let mut document = if path.exists() {
+        parse_auth_document(&secure_auth_file(path)?)?
+    } else {
+        AuthDocument {
+            version: 1,
+            active_provider: None,
+            providers: AuthProviders::default(),
+        }
+    };
+    if document.version != 1 {
+        return Err(AuthError::UnsupportedVersion);
+    }
+    update(&mut document);
+    let bytes = serde_json::to_vec_pretty(&document).map_err(|_| AuthError::InvalidSchema)?;
+    let temporary = parent.join(format!(
+        ".auth-{}-{}.tmp",
+        std::process::id(),
+        AUTH_TEMP_NONCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file = create_secure_auth_file(&temporary)?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| AuthError::Write)?;
+        drop(file);
+        replace_auth_file(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn parse_auth_document(contents: &[u8]) -> Result<AuthDocument, AuthError> {
+    serde_json::from_slice(contents).map_err(|error| match error.classify() {
+        serde_json::error::Category::Data | serde_json::error::Category::Eof => {
+            AuthError::InvalidSchema
+        }
+        serde_json::error::Category::Syntax => AuthError::MalformedJson,
+        serde_json::error::Category::Io => AuthError::Read,
+    })
+}
+
+pub(crate) struct AuthStoreLock {
+    #[cfg(windows)]
+    _file: File,
+}
+
+pub(crate) fn auth_lock_path(auth_file: &Path) -> Result<PathBuf, AuthError> {
+    Ok(auth_file
+        .parent()
+        .ok_or(AuthError::InvalidPath)?
+        .join(".auth.lock"))
+}
+
+pub(crate) fn lock_auth_store(auth_file: &Path) -> Result<AuthStoreLock, AuthError> {
+    let parent = auth_file.parent().ok_or(AuthError::InvalidPath)?;
+    fs::create_dir_all(parent).map_err(|_| AuthError::Write)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let lock_path = auth_lock_path(auth_file)?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .share_mode(0)
+                .open(&lock_path)
+            {
+                Ok(file) => return Ok(AuthStoreLock { _file: file }),
+                Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+                Err(_) => return Err(AuthError::Locked),
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = parent;
+        Ok(AuthStoreLock {})
+    }
+}
+
+#[cfg(windows)]
+fn replace_auth_file(source: &Path, destination: &Path) -> Result<(), AuthError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect::<Vec<_>>();
+    let success = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if success == 0 {
+        Err(AuthError::Write)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_auth_file(source: &Path, destination: &Path) -> Result<(), AuthError> {
+    fs::rename(source, destination).map_err(|_| AuthError::Write)
 }
 
 fn non_empty_environment_value(name: &str) -> Option<String> {
@@ -193,7 +495,35 @@ pub(crate) fn secure_auth_file(_path: &Path) -> Result<Vec<u8>, AuthError> {
     Err(AuthError::UnsafePermissions)
 }
 
+#[cfg(windows)]
+pub(crate) fn create_secure_auth_file(path: &Path) -> Result<File, AuthError> {
+    native_acl::NativeAuthFile::create_secure(path)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn create_secure_auth_file(_path: &Path) -> Result<File, AuthError> {
+    Err(AuthError::UnsafePermissions)
+}
+
+const SENSITIVE_HEADER_NAMES: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+    "cookie",
+    "set-cookie",
+    "x-auth-token",
+    "x-amz-security-token",
+];
+
 pub fn redact(input: &str) -> String {
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(input) {
+        redact_json_value(&mut value);
+        if let Ok(redacted) = serde_json::to_string(&value) {
+            return redacted;
+        }
+    }
     let mut redacted = String::with_capacity(input.len());
     for line in input.split_inclusive('\n') {
         let (content, newline) = if let Some(content) = line.strip_suffix("\r\n") {
@@ -208,14 +538,36 @@ pub fn redact(input: &str) -> String {
     redacted
 }
 
+fn redact_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (name, value) in object {
+                if SENSITIVE_HEADER_NAMES
+                    .iter()
+                    .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
+                {
+                    *value = serde_json::Value::String("[REDACTED]".into());
+                } else {
+                    redact_json_value(value);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_json_value(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn redact_header_line(line: &str) -> String {
-    let header_names = ["authorization", "x-api-key"];
     let bytes = line.as_bytes();
     let mut search_from = 0;
     let mut matches = Vec::new();
     while search_from < bytes.len() {
         let Some((index, header_len, value_start)) =
-            find_sensitive_header(line, search_from, &header_names)
+            find_sensitive_header(line, search_from, SENSITIVE_HEADER_NAMES)
         else {
             break;
         };
@@ -282,17 +634,37 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
         .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
+#[cfg(all(test, windows))]
+mod secure_creation_tests {
+    use super::*;
+
+    #[test]
+    fn secure_temp_handle_blocks_path_replacement_while_writing() {
+        let root =
+            std::env::temp_dir().join(format!("slim-secure-auth-create-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("auth.tmp");
+        let mut file = create_secure_auth_file(&path).expect("secure create");
+        file.write_all(b"secret").expect("write");
+        assert!(fs::remove_file(&path).is_err());
+        drop(file);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+}
+
 #[cfg(windows)]
 mod native_acl {
-    use super::AuthError;
+    use super::{AuthError, MAX_AUTH_FILE_BYTES};
+    use std::fs::File;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
     use std::path::Path;
     use std::ptr::{null, null_mut};
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, LocalFree, ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, HANDLE,
-        INVALID_HANDLE_VALUE,
+        CloseHandle, GetLastError, LocalFree, ERROR_INSUFFICIENT_BUFFER, GENERIC_READ,
+        GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Security::Authorization::{
         GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo, EXPLICIT_ACCESS_W, SET_ACCESS,
@@ -308,7 +680,7 @@ mod native_acl {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FileAttributeTagInfo, GetFileInformationByHandleEx, GetFileSizeEx,
-        GetFileType, ReadFile, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
+        GetFileType, ReadFile, CREATE_NEW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_SHARE_READ, FILE_TYPE_DISK, OPEN_EXISTING,
     };
@@ -355,6 +727,36 @@ mod native_acl {
     }
 
     impl NativeAuthFile {
+        pub(super) fn create_secure(path: &Path) -> Result<File, AuthError> {
+            let path_wide = wide_path(path)?;
+            let handle = unsafe {
+                CreateFileW(
+                    path_wide.as_ptr(),
+                    GENERIC_READ
+                        | GENERIC_WRITE
+                        | windows_sys::Win32::Storage::FileSystem::WRITE_DAC,
+                    0,
+                    null(),
+                    CREATE_NEW,
+                    FILE_FLAG_OPEN_REPARSE_POINT,
+                    null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+                return Err(AuthError::Write);
+            }
+            let file = Self {
+                handle: NativeHandle(handle),
+            };
+            file.ensure_regular_non_reparse_file()?;
+            let allowed = allowed_sids(file.handle.0)?;
+            install_dacl(file.handle.0, &allowed)?;
+            verify_dacl(file.handle.0, &allowed)?;
+            let handle = file.handle.0;
+            std::mem::forget(file);
+            Ok(unsafe { File::from_raw_handle(handle) })
+        }
+
         pub(super) fn open(path: &Path) -> Result<Self, AuthError> {
             let path_wide = wide_path(path)?;
             let handle = unsafe {
@@ -665,7 +1067,10 @@ mod native_acl {
 
     fn read_contents(handle: HANDLE) -> Result<Vec<u8>, AuthError> {
         let mut size = 0i64;
-        if unsafe { GetFileSizeEx(handle, &mut size) } == 0 || size < 0 {
+        if unsafe { GetFileSizeEx(handle, &mut size) } == 0
+            || size < 0
+            || size as u64 > MAX_AUTH_FILE_BYTES as u64
+        {
             return Err(AuthError::Read);
         }
         let size = usize::try_from(size).map_err(|_| AuthError::Read)?;

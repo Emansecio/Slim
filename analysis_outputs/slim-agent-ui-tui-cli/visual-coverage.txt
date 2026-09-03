@@ -1,0 +1,34 @@
+Visual coverage in this session (TestBackend goldens, not ConPTY).
+
+Ran (all PASS, cargo test -p slim-tui --test …):
+  golden_matrix.rs          4 tests  (sizes 40/80/99/100/139/140/200 × 8/12/24/40; emergency 39×7; color depths)
+  welcome_golden.rs         4 tests  (120×30 truecolor idle; 60×16 ANSI16 connected; 32×10 NO_COLOR ± reduced motion; 24×6/24×5)
+  layout_golden.rs         20 tests
+  markdown_golden.rs       18 tests
+  motion_activity_golden.rs 20 tests
+  multi_tool_golden.rs      4 tests
+  scroll_golden.rs         11 tests
+  thinking_expansion_golden.rs 7 tests
+  tool_details_golden.rs    6 tests
+  interaction_roundtrip.rs  5 tests (reducer-level question/input/approval; not terminal_action)
+
+Requested matrix vs coverage:
+  120×30          welcome idle only (welcome_golden). Not streaming/thinking/tool/question.
+  80×24           golden_matrix nested loop includes 80×24 with user+assistant+todo. Not question/cancel/error.
+  60×16           welcome connected ANSI16 only.
+  32×10           welcome NO_COLOR ± reduced motion.
+  Color on/off    golden_matrix ColorDepth::{TrueColor,Ansi256,Ansi16,None}; welcome NO_COLOR.
+  Motion          motion_activity_golden reduced_motion caret; welcome 32×10 reduced == normal text.
+  Idle            welcome + empty AppState goldens.
+  Streaming       markdown_golden incomplete streaming markdown.
+  Thinking        thinking_expansion_golden + motion_activity_golden.
+  Tool running    tool_details_golden + multi_tool_golden + motion_activity_golden.
+  Tool failed     multi_tool_golden failed/cancelled members.
+  Question open   interaction_roundtrip TestBackend contains options/Outro; arrows not via terminal_action.
+  Cancel/error    motion_activity_golden cancel paths; scroll_golden error block.
+
+NOT run:
+  crates/slim-cli/tests/tui_pty.rs  #[ignore] ConPTY physical matrix 120/80/60/40/32
+  PATH Slim.exe visual session (binary SHA differs from current debug build; target/release missing)
+
+Limitation: no Windows Terminal / conhost screenshot in this session.

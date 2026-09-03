@@ -103,11 +103,17 @@ fn oauth_store_round_trips_active_credential_without_debug_leak() {
         .expect("save");
     assert_eq!(
         store.active().expect("active"),
-        Some((OAuthProvider::OpenAiCodex, credential.clone()))
+        Some((OAuthProvider::OpenAiCodex, credential))
+    );
+    let saved = std::fs::read_to_string(&auth_path).expect("auth text");
+    assert!(saved.contains("access-secret") || saved.contains("oauth"));
+    assert!(
+        !saved.contains("existing-key"),
+        "OAuth save must drop the leftover api_key: {saved}"
     );
     store.remove(OAuthProvider::OpenAiCodex).expect("remove");
     assert_eq!(store.active().expect("active"), None);
-    assert!(std::fs::read_to_string(auth_path)
+    assert!(!std::fs::read_to_string(auth_path)
         .expect("auth text")
         .contains("existing-key"));
     let _ = std::fs::remove_dir_all(root);
@@ -131,6 +137,57 @@ async fn callback_rejects_wrong_state_then_accepts_valid_code() {
     let valid = request(address, "/callback?code=good-code&state=expected").await;
     assert!(valid.contains("200"));
     assert_eq!(task.await.expect("task").expect("callback"), "good-code");
+}
+
+#[tokio::test]
+async fn callback_accepts_http_request_fragmented_across_reads() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let task = tokio::spawn(await_callback(
+        listener,
+        "/callback",
+        "expected",
+        cancel_rx,
+        Duration::from_millis(500),
+    ));
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    stream
+        .write_all(b"GET /callback?code=fragmented")
+        .await
+        .expect("first fragment");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    stream
+        .write_all(b"-code&state=expected HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .expect("second fragment");
+
+    assert_eq!(
+        task.await.expect("task").expect("callback"),
+        "fragmented-code"
+    );
+}
+
+#[tokio::test]
+async fn callback_cancellation_interrupts_an_idle_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let task = tokio::spawn(await_callback(
+        listener,
+        "/callback",
+        "expected",
+        cancel_rx,
+        Duration::from_secs(2),
+    ));
+    let _idle = TcpStream::connect(address).await.expect("connect");
+    cancel_tx.send(true).expect("cancel");
+
+    let result = tokio::time::timeout(Duration::from_millis(200), task)
+        .await
+        .expect("cancellation must not wait for callback read timeout")
+        .expect("task");
+    assert!(matches!(result, Err(OAuthError::Cancelled)));
 }
 
 #[derive(Clone, Copy)]
@@ -163,6 +220,66 @@ impl BrowserLauncher for CallbackBrowser {
         });
         Ok(())
     }
+}
+
+#[test]
+fn api_key_save_and_remove_preserve_sibling_oauth_entries() {
+    let root = std::env::temp_dir().join(format!(
+        "slim-api-key-store-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let path = root.join("auth.json");
+    let store = OAuthStore::at(&path);
+    let credential = OAuthCredential {
+        access: "oauth-access".into(),
+        refresh: "oauth-refresh".into(),
+        expires: u64::MAX,
+        account_id: None,
+    };
+    store
+        .save(OAuthProvider::Anthropic, &credential)
+        .expect("save sibling OAuth");
+
+    store
+        .save_api_key("opencode-go", "go-secret")
+        .expect("save API key");
+    assert_eq!(
+        store.api_key("opencode-go").expect("read key").as_deref(),
+        Some("go-secret")
+    );
+    store.remove_api_key("opencode-go").expect("remove API key");
+    assert!(store
+        .credential(OAuthProvider::Anthropic)
+        .expect("read sibling")
+        .is_some());
+    assert!(store.api_key("opencode-go").expect("removed key").is_none());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn empty_api_key_is_rejected_without_publishing_auth_file() {
+    let root = std::env::temp_dir().join(format!(
+        "slim-empty-api-key-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let path = root.join("auth.json");
+    let store = OAuthStore::at(&path);
+
+    let error = store
+        .save_api_key("opencode-go", "  ")
+        .expect_err("empty key must fail");
+
+    assert!(!path.exists());
+    assert!(!error.to_string().contains("opencode-go"));
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -346,6 +463,56 @@ async fn refreshed_credential_survives_persistence_failure_in_memory() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn anthropic_refresh_rejects_oversized_token_response() {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("refresh bind");
+    let address = listener.local_addr().expect("refresh address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("refresh accept");
+        let mut request = [0_u8; 16 * 1024];
+        let _ = stream.read(&mut request).expect("refresh request");
+        let body = format!(
+            "{{\"access_token\":\"{}\",\"refresh_token\":\"rotated\",\"expires_in\":3600}}",
+            "x".repeat(70 * 1024)
+        );
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .expect("refresh response");
+    });
+    let root = std::env::temp_dir().join(format!("slim-oauth-limit-{}", std::process::id()));
+    let service = OAuthService::new(
+        OAuthEndpoints {
+            anthropic_token: format!("http://{address}"),
+            ..OAuthEndpoints::default()
+        },
+        Arc::new(CallbackBrowser),
+        OAuthStore::at(root.join("auth.json")),
+    )
+    .expect("service");
+
+    let error = service
+        .fresh_credential(
+            OAuthProvider::Anthropic,
+            OAuthCredential {
+                access: "expired".into(),
+                refresh: "refresh".into(),
+                expires: 1,
+                account_id: None,
+            },
+        )
+        .await
+        .expect_err("oversized OAuth response must be rejected");
+    server.join().expect("server");
+    assert!(matches!(error, OAuthError::InvalidResponse(_)));
+    let _ = std::fs::remove_dir_all(root);
+}
+
 fn token_server(body: String) -> (String, thread::JoinHandle<()>) {
     let listener = StdTcpListener::bind("127.0.0.1:0").expect("token bind");
     let address = listener.local_addr().expect("token address");
@@ -375,4 +542,147 @@ async fn request(address: SocketAddr, target: &str) -> String {
     let mut response = String::new();
     stream.read_to_string(&mut response).await.expect("read");
     response
+}
+
+#[tokio::test]
+async fn unexpired_credential_returns_without_waiting_for_refresh() {
+    let root = std::env::temp_dir().join(format!(
+        "slim-refresh-fast-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("root");
+    let store = OAuthStore::at(root.join("auth.json"));
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64;
+    let live = OAuthCredential {
+        access: "live-access".into(),
+        refresh: "live-refresh".into(),
+        expires: now_ms + 2 * 60 * 1000,
+        account_id: None,
+    };
+    store
+        .save(OAuthProvider::Anthropic, &live)
+        .expect("live store");
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("refresh bind");
+    let address = listener.local_addr().expect("refresh address");
+    let _server = thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            thread::sleep(Duration::from_secs(5));
+            drop(stream);
+        }
+    });
+    let endpoints = OAuthEndpoints {
+        anthropic_token: format!("http://{address}"),
+        ..OAuthEndpoints::default()
+    };
+    let service = OAuthService::new(endpoints, Arc::new(CallbackBrowser), store).expect("service");
+    let started = std::time::Instant::now();
+    let fresh = service
+        .fresh_credential(OAuthProvider::Anthropic, live.clone())
+        .await
+        .expect("fresh");
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "unexpired credential must not wait for refresh HTTP"
+    );
+    assert_eq!(fresh.credential.access, "live-access");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_refresh_within_ten_minutes_persists_rotated_token() {
+    let root = std::env::temp_dir().join(format!(
+        "slim-refresh-background-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("root");
+    let store = OAuthStore::at(root.join("auth.json"));
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64;
+    let live = OAuthCredential {
+        access: "live-access".into(),
+        refresh: "live-refresh".into(),
+        expires: now_ms + 2 * 60 * 1000,
+        account_id: None,
+    };
+    store
+        .save(OAuthProvider::Anthropic, &live)
+        .expect("live store");
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("refresh bind");
+    let address = listener.local_addr().expect("refresh address");
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let server_hits = hits.clone();
+    let server = thread::spawn(move || {
+        listener.set_nonblocking(false).expect("blocking accept");
+        let (mut stream, _) = listener.accept().expect("refresh accept");
+        server_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut request = [0_u8; 16 * 1024];
+        let _ = stream.read(&mut request).expect("refresh request");
+        let body = r#"{"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600}"#;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .expect("refresh response");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking extra accept");
+        thread::sleep(Duration::from_millis(150));
+        if listener.accept().is_ok() {
+            server_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    let endpoints = OAuthEndpoints {
+        anthropic_token: format!("http://{address}"),
+        ..OAuthEndpoints::default()
+    };
+    let service =
+        OAuthService::new(endpoints, Arc::new(CallbackBrowser), store.clone()).expect("service");
+    let (first, second) = tokio::join!(
+        service.fresh_credential(OAuthProvider::Anthropic, live.clone()),
+        service.fresh_credential(OAuthProvider::Anthropic, live.clone())
+    );
+    assert_eq!(first.expect("first").credential.access, "live-access");
+    assert_eq!(second.expect("second").credential.access, "live-access");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let stored = store
+            .credential(OAuthProvider::Anthropic)
+            .expect("stored")
+            .expect("credential");
+        if stored.access == "rotated-access" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background refresh must persist the rotated token"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let next = service
+        .fresh_credential(OAuthProvider::Anthropic, live)
+        .await
+        .expect("reread store");
+    assert_eq!(next.credential.access, "rotated-access");
+    let _ = server.join();
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let _ = std::fs::remove_dir_all(root);
 }
