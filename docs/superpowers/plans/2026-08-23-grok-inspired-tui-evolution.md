@@ -2,7 +2,7 @@
 
 **Status:** concluído em 2026-08-23 — cinco slices implementados, revisados, gate final 63 suítes / 566 passed, deploy `OK:` e limpeza de 22.515 artefatos / 12,4 GiB. Tracker vivo contém desvios e hardening G1–G190.
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps usam checkbox (`- [x]`) como registro de execução.
+> **Retomada deste plano:** revalide as pendências no código e execute somente o escopo autorizado, conforme o `AGENTS.md` vigente. Skills e delegação são escolhidas por necessidade; receitas e resultados da execução original não são obrigações gerais.
 
 **Goal:** Implementar cinco evoluções sequenciais da TUI Slim — hierarquia Markdown, motion/activity, usage vivo, page-fill scroll/scrollbar e SessionRail — com TDD, revisão independente e gate verde entre slices.
 

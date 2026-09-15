@@ -89,6 +89,13 @@ pub struct CodeIntelPositionQuery {
     /// Optional symbol name for error messages and result headers.
     pub symbol: Option<String>,
     pub max_results: usize,
+    /// 0-based index of the first in-scope result to return (references
+    /// paging); 0 is the first page.
+    pub offset: usize,
+    /// Continuation token emitted as `revision` by a previous page. When set,
+    /// the call is rejected if the workspace revision or the server generation
+    /// changed — pages never mix different states.
+    pub revision: Option<u64>,
     /// Cooperative cancellation inherited from the active agent run.
     pub cancellation: Option<CancellationToken>,
 }
@@ -99,8 +106,16 @@ pub struct CodeIntelSymbolQuery {
     pub workspace: PathBuf,
     /// When set, restricts to document symbols; otherwise workspace symbols.
     pub path: Option<PathBuf>,
+    /// Workspace query sent to LSP; with path, ranks matching document
+    /// symbols first before the page window.
     pub query: Option<String>,
     pub max_results: usize,
+    /// 0-based index of the first result to return (paging); 0 is the
+    /// first page.
+    pub offset: usize,
+    /// Continuation token emitted as `revision` by a previous page; rejected
+    /// when the workspace revision or server generation changed.
+    pub revision: Option<u64>,
     /// Cooperative cancellation inherited from the active agent run.
     pub cancellation: Option<CancellationToken>,
 }
@@ -116,9 +131,60 @@ pub struct CodeIntelDiagnosticsQuery {
     pub cancellation: Option<CancellationToken>,
 }
 
+/// A resolved patch position, before this individual edit is applied.
+/// The LSP backend converts the physical-line prefix with its PositionCodec.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodeIntelEditPosition {
+    pub line: u32,
+    pub prefix: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodeIntelTextEdit {
+    pub start: CodeIntelEditPosition,
+    pub end: CodeIntelEditPosition,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodeIntelPatch {
+    pub before_digest: String,
+    /// Ordered edits: each range addresses the result of the preceding edit.
+    pub edits: Vec<CodeIntelTextEdit>,
+}
+
+impl CodeIntelPatch {
+    pub fn new(before: &str, edits: Vec<CodeIntelTextEdit>) -> Self {
+        Self {
+            before_digest: crate::tools::digest_bytes(
+                b"slim-written-content-v1",
+                before.as_bytes(),
+            ),
+            edits,
+        }
+    }
+
+    pub fn matches_before(&self, text: &str) -> bool {
+        self.before_digest
+            == crate::tools::digest_bytes(b"slim-written-content-v1", text.as_bytes())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodeIntelFileUpdate {
+    pub text: String,
+    pub patch: Option<CodeIntelPatch>,
+}
+
 /// Semantic code intelligence facade (phase 1: read-only).
 #[async_trait]
 pub trait CodeIntelligence: Send + Sync {
+    /// Whether this backend can serve the workspace. Must not start a server.
+    /// Backends without a discovery restriction remain advertised.
+    fn supports_workspace(&self, _workspace: &Path) -> bool {
+        true
+    }
+
     /// Server availability and health for a workspace.
     async fn status(&self, workspace: &Path) -> CodeIntelOutcome;
 
@@ -141,4 +207,14 @@ pub trait CodeIntelligence: Send + Sync {
     /// (didChange/didSave). Implementations remain fail-open, but completion
     /// must mean later semantic queries observe this notification sequence.
     async fn notify_file_changed(&self, workspace: &Path, path: &Path, text: Option<String>);
+
+    async fn notify_file_updated(
+        &self,
+        workspace: &Path,
+        path: &Path,
+        update: CodeIntelFileUpdate,
+    ) {
+        self.notify_file_changed(workspace, path, Some(update.text))
+            .await;
+    }
 }

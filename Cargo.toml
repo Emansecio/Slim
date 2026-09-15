@@ -18,3 +18,9 @@ needless_collect = "deny"
 range_plus_one = "deny"
 redundant_clone = "deny"
 single_char_pattern = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

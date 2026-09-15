@@ -112,8 +112,7 @@ pub(crate) fn invoke_script_with_limits_and_runner(
     {
         return Err(SkillInvocationError::Cancelled);
     }
-    let (path, canonical_dir) =
-        resolve_script_path_with_dir(request.skill_dir, request.script)?;
+    let (path, canonical_dir) = resolve_script_path_with_dir(request.skill_dir, request.script)?;
     let program = runner
         .resolve_powershell()
         .map_err(|error| SkillInvocationError::Io(error.to_string()))?

@@ -25,6 +25,8 @@ fn fixture_records() -> Vec<DurableRecord> {
                 parent_entry_id: None,
                 operation_id: "op-1".into(),
                 tool_call_id: None,
+                tool_calls: Vec::new(),
+                content_blocks: Vec::new(),
             },
         },
         DurableRecord::Operation {
@@ -474,6 +476,8 @@ fn terminal_requires_started_and_no_open_attempt() {
                 parent_entry_id: None,
                 operation_id: "op-1".into(),
                 tool_call_id: None,
+                tool_calls: Vec::new(),
+                content_blocks: Vec::new(),
             },
         },
         DurableRecord::Operation {

@@ -218,6 +218,21 @@ impl DurableRepo for JsonlRepo {
     }
 
     fn append_batch(&mut self, records: Vec<DurableRecord>) -> io::Result<()> {
+        self.append_records(records, true)
+    }
+}
+
+impl JsonlRepo {
+    /// Appends a record without forcing a data sync. The bytes are written and
+    /// visible to readers on this handle, and the next synced append flushes
+    /// them to storage. Intended for observability-only records where losing a
+    /// trailing line on crash is acceptable; torn-tail recovery bounds a
+    /// partially flushed tail.
+    pub(crate) fn append_unsynced(&mut self, record: DurableRecord) -> io::Result<()> {
+        self.append_records(vec![record], false)
+    }
+
+    fn append_records(&mut self, records: Vec<DurableRecord>, sync: bool) -> io::Result<()> {
         if self.poisoned {
             return Err(io::Error::other("durable session repository is poisoned"));
         }
@@ -251,7 +266,13 @@ impl DurableRepo for JsonlRepo {
         let write_result = encoded_records
             .iter()
             .try_for_each(|encoded| write_line(&mut self.file, encoded))
-            .and_then(|_| sync_append_data(&self.file));
+            .and_then(|_| {
+                if sync {
+                    sync_append_data(&self.file)
+                } else {
+                    Ok(())
+                }
+            });
         if let Err(error) = write_result {
             self.poisoned = true;
             return Err(error);

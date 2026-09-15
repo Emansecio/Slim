@@ -85,16 +85,30 @@ fn openai_compatible_request_and_stream_events_are_normalized() {
         .expect("events");
     assert!(events.contains(&ProviderEvent::TextDelta("hi".into())));
     assert!(events.contains(&ProviderEvent::ReasoningDelta("think".into())));
+    let reasoning_at = events
+        .iter()
+        .position(|event| matches!(event, ProviderEvent::ReasoningDelta(_)))
+        .expect("reasoning");
+    let text_at = events
+        .iter()
+        .position(|event| matches!(event, ProviderEvent::TextDelta(_)))
+        .expect("text");
+    assert!(
+        reasoning_at < text_at,
+        "reasoning must precede visible text in the same chunk"
+    );
     assert!(events.contains(&ProviderEvent::ToolCallDelta {
         index: Some(0),
         id: Some("call-a".into()),
         name: Some("read".into()),
         arguments: "{}".into(),
     }));
-    assert!(events.contains(&ProviderEvent::ToolCall {
-        name: "read".into(),
-        arguments: "{}".into()
-    }));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::ToolCall { .. })),
+        "identified OpenAI deltas must not emit an identityless mirror"
+    );
     assert!(events.contains(&ProviderEvent::Stopped {
         reason: "tool_calls".into()
     }));
@@ -136,7 +150,7 @@ fn codex_sends_selected_reasoning_effort() {
     let adapter = OpenAiCodexAdapter::new(
         ProviderConfig::openai_codex(
             "https://chatgpt.com/backend-api",
-            "gpt-5.6-terra",
+            "terra",
             "oauth-token",
             "account-id",
         )
@@ -147,6 +161,117 @@ fn codex_sends_selected_reasoning_effort() {
         serde_json::from_str(&adapter.build_request("hello").body).expect("request json");
     assert_eq!(body["reasoning"]["effort"], "max");
     assert_eq!(body["reasoning"]["summary"], "auto");
+    assert_eq!(body["model"], "gpt-5.6-terra");
+}
+
+#[test]
+fn anthropic_sends_effort_without_enabling_thinking() {
+    let adapter = AnthropicAdapter::new(
+        ProviderConfig::anthropic(
+            "https://api.anthropic.com/v1/messages",
+            "claude-sonnet-4-6",
+            "fixture",
+        )
+        .with_reasoning_effort("medium"),
+    )
+    .expect("adapter");
+    let body: serde_json::Value =
+        serde_json::from_str(&adapter.build_request("hello").body).unwrap();
+    assert_eq!(body["output_config"]["effort"], "medium");
+    assert!(body.get("thinking").is_none());
+}
+
+#[test]
+fn astra_preserves_reasoning_and_tools_in_normal_and_fast_requests() {
+    for effort in ["low", "medium", "high", "xhigh", "max"] {
+        let mut adapter = OpenAiCodexAdapter::new(
+            ProviderConfig::openai_codex(
+                "https://chatgpt.com/backend-api",
+                "astra",
+                "fixture-token",
+                "fixture-account",
+            )
+            .with_reasoning_effort(effort),
+        )
+        .expect("Astra");
+        let messages = [
+            ProviderMessage::user("read file.txt"),
+            ProviderMessage::assistant(
+                "",
+                vec![ProviderToolCall {
+                    id: "read-1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"file.txt"}"#.into(),
+                }],
+            ),
+            ProviderMessage::tool("read", "read-1", "1: evidence"),
+        ];
+        let tools = [json!({
+            "name": "read",
+            "description": "Read a workspace file",
+            "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}
+        })];
+        for fast in [true, false] {
+            adapter = adapter.with_fast_mode(fast);
+            let prepared = adapter
+                .prepare_messages_request_with_tools_checked(&messages, &tools)
+                .expect("prepared");
+            let body: serde_json::Value = serde_json::from_slice(prepared.body()).expect("body");
+            assert_eq!(body["model"], "gpt-6-astra");
+            assert_eq!(
+                body["reasoning"],
+                json!({"effort": effort, "summary": "auto"})
+            );
+            assert_eq!(body.get("service_tier"), fast.then_some(&json!("priority")));
+            assert_eq!(body["store"], false);
+            assert_eq!(body["tools"][0]["name"], "read");
+            assert_eq!(body["input"][2]["arguments"], r#"{"path":"file.txt"}"#);
+            assert_eq!(body["input"][3]["call_id"], "read-1");
+            assert_eq!(body["input"][3]["output"], "1: evidence");
+            assert!(body.get("temperature").is_none());
+            assert!(body.get("top_p").is_none());
+        }
+    }
+    for effort in ["none", "minimal", "ultra", "invalid"] {
+        assert!(
+            OpenAiCodexAdapter::new(
+                ProviderConfig::openai_codex(
+                    "https://chatgpt.com/backend-api",
+                    "gpt-6-astra",
+                    "fixture-token",
+                    "fixture-account"
+                )
+                .with_reasoning_effort(effort)
+            )
+            .is_err(),
+            "unsupported Astra effort must fail before sending: {effort}"
+        );
+    }
+}
+
+#[test]
+fn official_openai_chat_uses_native_output_and_usage_controls() {
+    let adapter = OpenAiCompatibleAdapter::new(
+        ProviderConfig::openai(
+            "https://api.openai.com/v1/chat/completions",
+            "gpt-5.6-sol",
+            "fixture",
+        )
+        .with_max_output_tokens(123),
+    )
+    .expect("adapter");
+    let body: serde_json::Value =
+        serde_json::from_str(&adapter.build_request("hello").body).unwrap();
+    assert_eq!(body["max_completion_tokens"], 123);
+    assert_eq!(body["verbosity"], "low");
+    assert!(body.get("max_tokens").is_none());
+    assert_eq!(body["stream_options"]["include_usage"], true);
+    assert_eq!(
+        adapter.build_request("hello").body,
+        adapter
+            .build_messages_request(&[ProviderMessage::user("hello")])
+            .body
+    );
 }
 
 #[test]
@@ -355,12 +480,13 @@ fn anthropic_sends_native_system_as_cacheable_top_level_blocks() {
             .body,
     )
     .expect("compaction body");
+    // The compaction transcript can never be read back under a different
+    // system prompt: cache markers would only bill an ephemeral write.
     assert_eq!(
-        compact["system"][0]["text"],
-        slim_core::context::COMPACTION_SYSTEM_PROMPT
+        compact["system"].as_str(),
+        Some(slim_core::context::COMPACTION_SYSTEM_PROMPT)
     );
-    assert_eq!(compact["system"][0]["cache_control"]["type"], "ephemeral");
-    assert_eq!(compact["cache_control"]["type"], "ephemeral");
+    assert!(compact.get("cache_control").is_none());
 
     let none = AnthropicAdapter::new(
         ProviderConfig::anthropic(
@@ -806,10 +932,71 @@ fn openai_accepts_tool_call_arguments_as_json_object() {
             ]}}]
         }))
         .expect("object arguments are serialized");
-    assert!(events.contains(&ProviderEvent::ToolCall {
-        name: "read".into(),
+    assert!(events.contains(&ProviderEvent::ToolCallDelta {
+        index: Some(0),
+        id: Some("call-x".into()),
+        name: Some("read".into()),
         arguments: r#"{"path":"file.txt"}"#.into(),
     }));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::ToolCall { .. })),
+        "identified OpenAI deltas must not emit an identityless mirror"
+    );
+}
+
+#[test]
+fn openai_identityless_tool_delta_retains_legacy_event() {
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        "https://example.invalid/v1/chat/completions",
+        "model-a",
+        "secret-a",
+    ))
+    .expect("adapter");
+    let cases = [
+        (
+            "identityless",
+            json!({"function": {"name": "read", "arguments": "{}"}}),
+            None,
+            None,
+            true,
+        ),
+        (
+            "index-only",
+            json!({"index": 0, "function": {"name": "read", "arguments": "{}"}}),
+            Some(0),
+            None,
+            false,
+        ),
+        (
+            "id-only",
+            json!({"id": "call-id-only", "function": {"name": "read", "arguments": "{}"}}),
+            None,
+            Some("call-id-only"),
+            false,
+        ),
+    ];
+    for (label, call, index, id, emits_legacy) in cases {
+        let events = adapter
+            .parse_event(&json!({
+                "choices": [{"delta": {"tool_calls": [call]}}]
+            }))
+            .expect(label);
+        assert!(events.contains(&ProviderEvent::ToolCallDelta {
+            index,
+            id: id.map(str::to_owned),
+            name: Some("read".into()),
+            arguments: "{}".into(),
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::ToolCall { .. })),
+            emits_legacy,
+            "legacy mirror policy for {label}"
+        );
+    }
 }
 
 #[test]
@@ -837,6 +1024,74 @@ fn openai_accepts_null_tool_call_arguments_as_empty_stream_fragment() {
             arguments: String::new(),
         }]
     );
+}
+
+#[test]
+fn openai_preserves_whitespace_content_and_skips_empty_tool_names() {
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        "https://example.invalid/v1/chat/completions",
+        "model-a",
+        "secret-a",
+    ))
+    .expect("adapter");
+    let events = adapter
+        .parse_event(&json!({
+            "choices": [{"delta": {
+                "content": "  \n ",
+                "reasoning_content": "think",
+                "tool_calls": [
+                    {"index": 0, "id": "call-x", "type": "function",
+                     "function": {"name": "", "arguments": {"path": "a"}}}
+                ]
+            }}]
+        }))
+        .expect("whitespace content is a text delta");
+    assert!(events.contains(&ProviderEvent::TextDelta("  \n ".into())));
+    assert!(events.contains(&ProviderEvent::ReasoningDelta("think".into())));
+    assert!(events.contains(&ProviderEvent::ToolCallDelta {
+        index: Some(0),
+        id: Some("call-x".into()),
+        name: None,
+        arguments: r#"{"path":"a"}"#.into(),
+    }));
+}
+
+#[test]
+fn openai_treats_null_type_as_function_and_skips_null_tool_entries() {
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        "https://example.invalid/v1/chat/completions",
+        "model-a",
+        "secret-a",
+    ))
+    .expect("adapter");
+    let events = adapter
+        .parse_event(&json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call-a", "type": "function",
+                 "function": {"name": "read", "arguments": ""}},
+                null,
+                {"index": 0, "id": null, "type": null,
+                 "function": {"name": null, "arguments": "{\"path\":\"a.txt\"}"}}
+            ]}}]
+        }))
+        .expect("null type continues the identified call");
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        ProviderEvent::ToolCallDelta { index: None, id: None, name: None, arguments }
+            if arguments.is_empty()
+    )),);
+    assert!(events.contains(&ProviderEvent::ToolCallDelta {
+        index: Some(0),
+        id: Some("call-a".into()),
+        name: Some("read".into()),
+        arguments: String::new(),
+    }));
+    assert!(events.contains(&ProviderEvent::ToolCallDelta {
+        index: Some(0),
+        id: None,
+        name: None,
+        arguments: r#"{"path":"a.txt"}"#.into(),
+    }));
 }
 
 #[test]

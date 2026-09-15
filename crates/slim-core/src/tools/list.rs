@@ -35,14 +35,65 @@ struct ListSnapshot {
     last_used: Instant,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ListPage {
     pub entries: Vec<PathBuf>,
     pub first: usize,
     pub total: usize,
     pub next_cursor: Option<String>,
+    snapshot_id: String,
     pub(crate) dependency: DependencyObservation,
     pub(crate) bytes_read: u64,
+}
+
+impl ListPage {
+    pub(crate) fn present(&self, max_bytes: usize, display_root: &Path) -> super::ToolPresentation {
+        let render = |count: usize| {
+            let mut text = self.entries[..count]
+                .iter()
+                .map(|entry| {
+                    super::search::display_path(display_root, entry)
+                        .display()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let next = self.first.saturating_add(count);
+            if next <= self.total {
+                text.push_str(&format!("\n\n[showing entries {}-{} of {}; pass \"cursor\": \"{}:{next:x}\" for the next page]", self.first, next.saturating_sub(1), self.total, self.snapshot_id));
+            }
+            text
+        };
+        let full = render(self.entries.len());
+        if full.len() <= max_bytes {
+            return super::ToolPresentation {
+                text: full,
+                delivered_records: self.entries.len(),
+                complete: true,
+                oversized_record: false,
+            };
+        }
+        let mut low = 0;
+        let mut high = self.entries.len();
+        while low < high {
+            let count = low + (high - low).div_ceil(2);
+            if render(count).len() <= max_bytes {
+                low = count;
+            } else {
+                high = count - 1;
+            }
+        }
+        let mut text = render(low);
+        if low == 0 {
+            text.insert_str(0, "[entry and continuation exceed presentation budget; no entry delivered; narrow the path or use the continuation]");
+        }
+        super::ToolPresentation {
+            text,
+            delivered_records: low,
+            complete: false,
+            oversized_record: low == 0,
+        }
+    }
 }
 
 struct DirectoryScan {
@@ -193,11 +244,7 @@ impl ListService {
         let snapshot = cache.snapshots.get_mut(&id)?;
         snapshot.last_used = now;
         snapshot.expires_at = now + LIST_SNAPSHOT_TTL;
-        Some((
-            id,
-            Arc::clone(&snapshot.entries),
-            snapshot.stamp.clone(),
-        ))
+        Some((id, Arc::clone(&snapshot.entries), snapshot.stamp.clone()))
     }
 }
 
@@ -225,6 +272,7 @@ fn build_page(
         first: first_index.saturating_add(1),
         total: entries.len(),
         next_cursor,
+        snapshot_id: id.to_owned(),
         dependency: DependencyObservation {
             path: path.to_path_buf(),
             stamp,
@@ -364,6 +412,37 @@ fn evict_old_snapshots(cache: &mut ListSnapshotCache) {
 #[cfg(test)]
 mod tests {
     use super::{directory_entry_safety_limit_message, parse_cursor};
+
+    #[test]
+    fn presentation_keeps_final_snapshot_cursor_and_complete_paths() {
+        let entries = (0..30)
+            .map(|n| std::path::PathBuf::from(format!("folder/{n:03}-{}.txt", "á".repeat(40))))
+            .collect::<Vec<_>>();
+        let page = super::build_page(
+            "list-test",
+            &entries,
+            8,
+            500,
+            std::path::Path::new("folder"),
+            super::FastStamp::observed_directory(30, "fixture".into()),
+            0,
+        );
+        assert!(page.next_cursor.is_none());
+        let result = page.present(400, std::path::Path::new("folder"));
+        assert!(result.delivered_records > 0 && result.delivered_records < page.entries.len());
+        assert!(result.text.len() <= 400);
+        let next = page.first + result.delivered_records;
+        assert!(result.text.contains(&format!("list-test:{next:x}")));
+        for entry in &page.entries[..result.delivered_records] {
+            assert!(result
+                .text
+                .contains(&entry.file_name().unwrap().to_string_lossy().to_string()));
+        }
+        let empty = page.present(1, std::path::Path::new("folder"));
+        assert_eq!(empty.delivered_records, 0);
+        assert!(empty.text.contains("list-test:8"));
+        assert!(empty.oversized_record);
+    }
 
     #[test]
     fn safety_limit_copy_names_the_cap_and_narrower_path() {

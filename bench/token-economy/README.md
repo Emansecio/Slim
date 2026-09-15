@@ -1,5 +1,9 @@
 # Benchmarks de economia de tokens — Slim x Pi x Pit
 
+Benchmark **real via Codex**, uma tarefa curta com GPT‑5.6 Luna em 05/09/2026:
+[Pi × Slim: resultado, auditoria por chamada e oportunidades de correção](../luna-live/README.md).
+O método de captura simulada abaixo é uma campanha diferente.
+
 Harness que mede o payload **real no fio** de três coding agents executando a
 **mesma tarefa** contra um endpoint localhost de captura:
 

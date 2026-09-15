@@ -178,6 +178,7 @@ fn fake_v1_flow_covers_headless_core_and_tui_contracts() {
         Action::UiEventReceived(UiEvent::SessionSnapshot {
             session_id: SessionId(Arc::from("e2e")),
             cwd: "D:\\Slim".into(),
+            skill_names: Vec::new(),
         }),
     );
     for event in handle.drain_events() {

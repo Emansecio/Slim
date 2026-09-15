@@ -41,4 +41,7 @@ fn shell_summary_keeps_the_effective_timeout_visible() {
     assert!(summary.starts_with("command="), "{summary}");
     assert!(summary.ends_with("limit 120s"), "{summary}");
     assert!(summary.chars().count() <= 48, "{summary}");
+    let direct =
+        summarize_tool_arguments_for("shell", r#"{"command":"python","args":["check.py"]}"#);
+    assert_eq!(direct, "program=python \"check.py\" · limit 30s");
 }

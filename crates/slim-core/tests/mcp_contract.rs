@@ -1,18 +1,25 @@
-use slim_core::mcp::{authorize_http, canonical_name, JsonLineFramer, McpCatalog, McpLifecycle};
+use slim_core::mcp::{canonical_name, FramedLine, JsonLineFramer, McpCatalog};
 use slim_core::OperatingMode;
 
 #[test]
 fn fragmented_stdio_frames_reassemble_without_loss() {
     let mut framer = JsonLineFramer::default();
-    assert!(framer
-        .push(br#"{"jsonrpc":"2.0","id":1"#)
-        .expect("push")
-        .is_empty());
-    let messages = framer
-        .push(b", \"result\": {\"ok\": true}}\n")
-        .expect("push");
-    assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0]["result"]["ok"], true);
+    assert!(framer.push(br#"{"jsonrpc":"2.0","id":1"#).is_empty());
+    let lines = framer.push(b", \"result\": {\"ok\": true}}\n");
+    assert_eq!(lines.len(), 1);
+    let FramedLine::Message(message) = &lines[0] else {
+        panic!("expected message, got {lines:?}");
+    };
+    assert_eq!(message["result"]["ok"], true);
+}
+
+#[test]
+fn non_json_stdout_lines_become_noise_not_fatal() {
+    let mut framer = JsonLineFramer::default();
+    let lines = framer.push(b"server log line\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+    assert_eq!(lines.len(), 2);
+    assert!(matches!(&lines[0], FramedLine::Noise(noise) if noise == "server log line"));
+    assert!(matches!(&lines[1], FramedLine::Message(_)));
 }
 
 #[test]
@@ -40,15 +47,4 @@ fn catalog_namespaces_tools_and_requires_explicit_resource_selection() {
     assert!(catalog
         .call_tool(OperatingMode::Plan, "read", "{}")
         .is_err());
-}
-
-#[test]
-fn static_http_auth_and_idempotent_lifecycle_are_deterministic() {
-    assert!(authorize_http("Bearer token", "token"));
-    assert!(!authorize_http("Bearer other", "token"));
-    let mut lifecycle = McpLifecycle::new();
-    assert!(lifecycle.is_running());
-    lifecycle.cancel();
-    lifecycle.cancel();
-    assert!(!lifecycle.is_running());
 }

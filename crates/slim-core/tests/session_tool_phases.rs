@@ -18,6 +18,8 @@ fn records() -> Vec<DurableRecord> {
                 parent_entry_id: None,
                 operation_id: "op-1".into(),
                 tool_call_id: None,
+                tool_calls: Vec::new(),
+                content_blocks: Vec::new(),
             },
         },
         DurableRecord::Operation {
@@ -130,6 +132,8 @@ fn many_operations_can_complete_without_leaking_open_tool_calls() {
                 parent_entry_id: None,
                 operation_id: operation_id.clone(),
                 tool_call_id: None,
+                tool_calls: Vec::new(),
+                content_blocks: Vec::new(),
             },
         });
         seq += 1;

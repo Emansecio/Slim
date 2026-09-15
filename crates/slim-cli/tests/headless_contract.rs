@@ -1,7 +1,7 @@
 use slim_cli::{
     redact, render_jsonl, render_provider_jsonl, render_provider_text,
     render_provider_verbose_text, render_text, run_fake_headless, Config, ExitCode,
-    HeadlessRequest, OutputFormat, ProviderHeadlessResult,
+    HeadlessRequest, OutputFormat, ProviderHeadlessResult, ToolProcessFact,
 };
 use slim_core::provider::ProviderKind;
 use slim_core::runtime::CancellationToken;
@@ -44,6 +44,7 @@ fn provider_jsonl_preserves_usage_completeness_and_overflow() {
         text: "partial".into(),
         input_tokens: Some(u64::MAX),
         output_tokens: Some(3),
+        stop_message: None,
         stop_reason: Some("cancelled".into()),
         stop: "cancelled".into(),
         cost_micros: None,
@@ -59,6 +60,20 @@ fn provider_jsonl_preserves_usage_completeness_and_overflow() {
         costs: Default::default(),
         validation_source: None,
         tool_summary_lines: Vec::new(),
+        tool_process_facts: vec![ToolProcessFact {
+            batch_id: "batch".into(),
+            call_id: "call".into(),
+            name: "shell".into(),
+            process: slim_core::process::ProcessExecutionFacts {
+                exit_code: Some(0),
+                timed_out: false,
+                cancelled: false,
+                stdout_bytes: 5,
+                stderr_bytes: 0,
+                stdout_discarded_bytes: 2,
+                stderr_discarded_bytes: 0,
+            },
+        }],
     };
     let value: serde_json::Value = serde_json::from_str(
         render_provider_jsonl(&result)
@@ -71,6 +86,8 @@ fn provider_jsonl_preserves_usage_completeness_and_overflow() {
     assert_eq!(value["input_tokens"], u64::MAX);
     assert_eq!(value["usage"]["compaction_tokens_saved_estimated"], true);
     assert!(value.get("cache_hit_ratio").is_none());
+    assert_eq!(value["tool_process_facts"][0]["name"], "shell");
+    assert_eq!(value["tool_process_facts"][0]["process"]["exit_code"], 0);
     assert!(render_provider_verbose_text(&result).contains("estimation_error=?"));
     assert_eq!(render_provider_text(&result), "partial\n");
 }
@@ -84,6 +101,7 @@ fn verbose_provider_text_prepends_only_redacted_tool_summaries() {
         text: "done".into(),
         input_tokens: Some(4),
         output_tokens: Some(2),
+        stop_message: None,
         stop_reason: Some("stop".into()),
         stop: "provider_completed".into(),
         cost_micros: None,
@@ -99,6 +117,7 @@ fn verbose_provider_text_prepends_only_redacted_tool_summaries() {
         costs: Default::default(),
         validation_source: Some("derived_runtime".into()),
         tool_summary_lines: vec!["✓ 2 tools · read, shell · 12ms".into()],
+        tool_process_facts: Vec::new(),
     };
 
     assert_eq!(

@@ -1,26 +1,84 @@
 # Slim
 
-> **âš ï¸ Agentes de cÃ³digo:** leiam [RULES.md](RULES.md) e [AGENTS.md](AGENTS.md)
-> **antes de qualquer tarefa**. Regra Zero: toda mudanÃ§a de cÃ³digo termina com
-> `.\refresh-slim.ps1` imprimindo `OK:` â€” o `slim` do PATH Ã© uma cÃ³pia estÃ¡tica
-> e nÃ£o acompanha o cÃ³digo sozinho. Proibido afirmar "feito/testado" sem
-> evidÃªncia executada na sessÃ£o.
+**Checkout — seleção textual e confirmação de cópia, 14/09/2026:** o arrasto
+fica no conteúdo da conversa ou do inspetor, sem alcançar os controles e sem
+pintar espaços vazios à direita. Clique direito copia a seleção atual; `Copiado`
+aparece discretamente após sucesso do clipboard. [Validação e limites](Documentações%20-%20Projeto/AUDIT-SLIM-TUI-TRACKER.md).
+Deploy local concluído às 21:05; [identidade do executável](release/README.md).
+
+**Checkout — polimento adicional da TUI, 14/09/2026:** navegação por mouse no
+inspetor, reutilização das métricas de scroll, agendamento sem frame duplicado
+e indicador Thinking separado das linhas estáveis. Menus têm seleção com fundo
+distinto; espera pelo provider e raciocínio são estados diferentes, sem repetir
+Thinking na barra quando seu cabeçalho está visível. Deploy local concluído em
+14/09 às 20:29; veja a [validação](Documentações%20-%20Projeto/AUDIT-SLIM-TUI-TRACKER.md)
+e a [identidade do executável instalado](release/README.md).
+
+**Checkout — 14/09/2026, revisão da TUI:** fundo preto com superfícies neutras,
+editor com quebra visual sem alterar o prompt, rodapé compacto que preserva
+cancelamento e novas mensagens, navegação visível em menus e rolagem própria
+dos inspetores. A busca prioriza a consulta; o TODO não duplica o indicador
+animado de atividade. Confirmações recebem realce breve, respeitando movimento
+reduzido. Veja o [contrato visual](Documentações%20-%20Projeto/DESIGN-SLIM-TUI.md)
+e o [registro de validação](Documentações%20-%20Projeto/AUDIT-SLIM-TUI-TRACKER.md).
+Esta revisão foi implantada localmente em 14/09/2026 às 19:41; identidade e
+smoke do executável estão no [registro de deploy](release/README.md).
+
+**Checkout — 12/09/2026, agrupamento da TUI:** trechos do assistente entre
+mensagens do usuário compartilham um único cabeçalho `Slim`. Textos e atividades
+mantêm sua ordem, com indicação de interrupção/falha no grupo. Rascunhos e
+mensagens enfileiradas não iniciam outra resposta visual. Veja o
+[contrato visual](Documentações%20-%20Projeto/DESIGN-SLIM-TUI.md) e o
+[registro de validação](Documentações%20-%20Projeto/AUDIT-SLIM-TUI-TRACKER.md).
+Esta mudança está apenas no checkout, sem novo deploy.
+
+**Checkout — 12/09/2026:** revisão dos contratos de ferramentas da auditoria
+unificada, descrita em [Admissão e resultados nativos](#admissão-e-resultados-nativos).
+Esta mudança está apenas no checkout; a identificação do executável instalado
+abaixo pertence ao deploy anterior.
+
+**Checkout — 10/09/2026:** TUI com coluna de leitura de até 100 células, paleta
+quente, footer responsivo, pulso discreto de atividade e respostas identificadas
+por `Slim`, com faixa do usuário mais suave. Pensamento tem pulso contextual
+e indicação de detalhes recolhidos/expandidos. Veja o
+[contrato visual](Documentações%20-%20Projeto/DESIGN-SLIM-TUI.md) e a
+[validação atual e seus limites](Documentações%20-%20Projeto/AUDIT-SLIM-TUI-TRACKER.md).
+Esta revisão também está no `Slim.exe` do PATH, atualizado em 10/09/2026 às
+16:39:46. [Identidade do build e smoke do deploy](release/README.md).
+
+> **⚠️ Agentes de código:** leiam [RULES.md](RULES.md) e [AGENTS.md](AGENTS.md)
+> **antes de qualquer tarefa**. Regra Zero: toda mudança de código termina com
+> `.\refresh-slim.ps1` imprimindo `OK:` — o `slim` do PATH é uma cópia estática
+> e não acompanha o código sozinho. Proibido afirmar "feito/testado" sem
+> evidência executada na sessão.
 
 Harness de coding agent em Rust para Windows x64/MSVC (`0.1.0`). **Status de
-implementaÃ§Ã£o: checkpoint de integraÃ§Ã£o parcial, nÃ£o v1 concluÃ­da.** Headless e
+implementação: checkpoint de integração parcial, não v1 concluída.** Headless e
 TUI fullscreen usam provider, agent loop e tools reais; a TUI recebe streaming,
-usage e cancelamento por channels tipados, sem executar domÃ­nio.
+usage e cancelamento por channels tipados, sem executar domínio.
 
-## Build e deploy do binÃ¡rio (`slim` no PATH)
+## Build e deploy do binário (`slim` no PATH)
 
 O comando `slim` do terminal aponta para `C:\Users\User\bin\Slim.exe`, uma
-**cÃ³pia estÃ¡tica** â€” ela **nÃ£o** acompanha o cÃ³digo automaticamente. Depois de
-qualquer mudanÃ§a, rode:
+**cópia estática** — ela **não** acompanha o código automaticamente. Depois de
+qualquer mudança, rode:
 
 ```powershell
 .\refresh-slim.ps1          # build release + copia para o PATH + smoke test
 .\refresh-slim.ps1 -Test    # idem, rodando cargo test --workspace antes
 ```
+
+O checkout limita o Cargo a um job em `.cargo/config.toml` para reduzir picos
+de commit dos compiladores/linkers. Isso não limita as threads dos testes nem
+garante memória suficiente para um processo isolado. Em um host pressionado,
+use alvos focados e, se necessário, reduza os símbolos apenas no comando:
+
+```powershell
+cargo test -p slim-core --test native_tool_recovery --offline --config=profile.dev.debug=0 --config=profile.test.debug=0
+```
+
+O trade-off é menor informação para depuração nessa compilação; os perfis
+permanentes e o build release não foram alterados.
 
 Deploy manual equivalente:
 
@@ -29,23 +87,23 @@ cargo build --release -p slim-cli
 Copy-Item target\release\slim.exe C:\Users\User\bin\Slim.exe -Force
 ```
 
-**Agentes de cÃ³digo devem rodar `.\refresh-slim.ps1` antes de encerrar
-qualquer tarefa que altere cÃ³digo** â€” ver [AGENTS.md](AGENTS.md). O script
-tambÃ©m corrige o `RUSTC` da sessÃ£o (as variÃ¡veis de usuÃ¡rio `RUSTC`/`CARGO`
-apontam para um caminho inexistente; detalhes no tracker TUI Â§8.3).
+**Agentes de código devem rodar `.\refresh-slim.ps1` antes de encerrar
+qualquer tarefa que altere código** — ver [AGENTS.md](AGENTS.md). O script
+também corrige o `RUSTC` da sessão (as variáveis de usuário `RUSTC`/`CARGO`
+apontam para um caminho inexistente; detalhes no tracker TUI §8.3).
 
-## ConfiguraÃ§Ã£o (`slim.toml`)
+## Configuração (`slim.toml`)
 
-O Slim lÃª defaults de dois arquivos TOML, mesclados nessa precedÃªncia:
+O Slim lê defaults de dois arquivos TOML, mesclados nessa precedência:
 
-**flag CLI > variÃ¡vel de ambiente > projeto > global > default interno**
+**flag CLI > variável de ambiente > projeto > global > default interno**
 
 | Camada | Caminho |
 |---|---|
-| Projeto | `./slim.toml` (diretÃ³rio de trabalho) |
+| Projeto | `./slim.toml` (diretório de trabalho) |
 | Global | `%APPDATA%\slim\slim.toml` no Windows |
 
-Chaves reconhecidas hoje (desconhecidas sÃ£o ignoradas):
+Chaves reconhecidas hoje (desconhecidas são ignoradas):
 
 ```toml
 model = "gpt-4o-mini"
@@ -66,15 +124,224 @@ summary_max_bytes = 65536
 manual_instructions_max_bytes = 4096
 ```
 
-- Arquivo ausente Ã© normal; **arquivo presente e invÃ¡lido aborta** com erro
-  nomeando o caminho â€” sem silenciar configuraÃ§Ã£o quebrada.
-- As camadas sÃ³ entram em jogo quando o modo provider estÃ¡ ativo (flag ou env);
-  config sozinha nÃ£o ativa rede.
+Se uma resposta atingir o limite de saída, o runtime tenta continuar automaticamente
+até duas vezes por execução, preservando respostas a perguntas e resultados já
+concluídos. Chamadas de ferramentas cortadas não são executadas. Nessas tentativas,
+`max_output_tokens` é o orçamento inicial: o limite enviado pode crescer até 4×
+por recuperação, respeitando o teto conhecido do modelo e metade da janela de
+contexto (sem metadados, o teto de crescimento é 32.768 tokens). Providers que
+omitem o limite continuam omitindo-o. O esforço de raciocínio não muda. As
+recuperações contam no limite de turnos; se não bastarem, o Slim informa a
+interrupção e orienta ajustar o orçamento ou reduzir o próximo passo.
+Se o provider rejeitar o aumento por erro no parâmetro de saída, a recuperação
+restante volta ao orçamento original, com aviso explícito.
+
+- Arquivo ausente é normal; **arquivo presente e inválido aborta** com erro
+  nomeando o caminho — sem silenciar configuração quebrada.
+- As camadas só entram em jogo quando o modo provider está ativo (flag ou env);
+  config sozinha não ativa rede.
 
 Tuning de velocidade (env vence o TOML): SLIM_MAX_TURNS, SLIM_MAX_MUTATING_TOOL_CALLS,
 SLIM_MAX_READ_TOOL_CALLS, SLIM_MAX_OUTPUT_TOKENS, SLIM_TIMEOUT_SECS, SLIM_MAX_RESULT_BYTES.
-Defaults: turns 128, mutating 32/turno, read 96/turno, output 4096, timeout 120s, result 16 KiB.
+Defaults: turns 128, mutating 32/turno, read 96/turno, output pelo catálogo do modelo (4096 se desconhecido; reserva limitada à metade da janela), timeout 120s, result 16 KiB (read completo até 64 KiB).
 Reduzir timeout_secs da fail-fast em rede lenta; reduzir max_turns/max_*_tool_calls encurta turnos longos.
+
+## Admissão e resultados nativos
+
+Revisão de 12/09/2026:
+
+- `shell` com `args` ausente ou `null` executa um script PowerShell. Com um array
+  em `args`, executa o programa
+  indicado; não interpreta o script automaticamente com um parser POSIX.
+  Exemplo direto: `{"command":"git","args":["status","--short"]}`.
+  Batch (`.bat`/`.cmd`) mantém as regras de argumentos do seu interpretador.
+  `timeout_ms` aceita inteiros entre 1 e 120.000; fora da faixa a chamada falha
+  na admissão, antes de executar.
+- `read.lines` é alias de `max_lines`, com a mesma faixa de 1 a 4.096.
+  Valores iguais nas duas chaves são aceitos; conflito, tipo inválido e campos
+  desconhecidos são rejeitados. Exemplo: `{"path":"README.md","offset":10,"lines":12}`.
+  Sem limite explícito, a primeira página pode ler até 4.096 linhas dentro do
+  orçamento de bytes; páginas posteriores usam 200. Leitura parcial continua
+  sem fornecer o recibo completo necessário para overwrite sem `expected`.
+- As formas nativas de patch `edits` e `expected`/`replacement` continuam aceitas,
+  de modo exclusivo. Campos desconhecidos também são rejeitados em cada edit.
+  Esta validação nativa não é aplicada ao payload de ferramentas externas/MCP.
+- Valores efetivamente admitidos determinam a identidade da chamada. Aliases,
+  cursores normalizados e limites de apresentação não criam identidades
+  diferentes para a mesma operação efetiva. Argumentos originais continuam
+  correlacionados à chamada, sujeitos à redação de segredos configurada.
+- `search.context_lines` aceita inteiro não negativo e aplica no máximo três
+  linhas de contexto. Um pedido maior recebe nota com os valores solicitado e
+  aplicado, preservada na prévia do modelo. Esta regra é de apresentação;
+  não reduz silenciosamente limites de edição ou de execução.
+- Fatos de processo (`ToolProcessFinished`, `tool.process.v1`) preservam código
+  de saída, timeout, cancelamento, bytes observados e descartados. Código zero
+  descreve o processo; não certifica todas as operações do script nem a tarefa.
+  Ausência de diagnóstico estruturado continua sem classificação automática.
+- A ferramenta shell retém até 8 KiB por stream para a prévia, mantendo início,
+  fim e contagem de descarte, com drenagem, progresso e cancelamento. APIs públicas
+  de captura bruta preservam seus orçamentos anteriores. O artefato desse caminho
+  contém a saída apresentada, não recupera bytes já descartados na captura.
+  A indicação operacional de símbolos usa `code_intel action=symbol`.
+
+Integridade de ferramentas e streaming (13/09/2026):
+
+- Sobrescritas e patches preservam a versão deslocada quando ela difere da
+  observada ou não pode ser verificada. O resultado informa o caminho de
+  recuperação. Falhas de publicação preservam os arquivos recuperáveis,
+  informam estado incerto e invalidam evidências anteriores; não há rollback
+  nem repetição automática. No Windows, a publicação usa `ReplaceFileW` com
+  backup. As pré-condições são de melhor esforço diante de escritores externos,
+  sem garantia de comparação-e-troca. Fora do Windows, preservar a versão
+  deslocada pode deixar um intervalo sem o pathname entre as duas operações;
+  a publicação seguinte não sobrescreve uma terceira edição.
+- Falhas na coleta de lotes cancelam e aguardam o trabalho nativo iniciado.
+  Se o diário falhar, os resultados coletados continuam no histórico em memória;
+  persistência incompleta permanece um erro, sem promessa de ausência de efeitos.
+- A recuperação de `write`/`patch` respeita fronteiras UTF-8. O texto canônico
+  e o adaptador Chat preservam whitespace recebido em chunks separados,
+  incluindo conteúdo de raciocínio. SSE agrega campos `data`
+  por evento, com limite de 1 MiB também para o payload agregado.
+- Após exclusão externa de um arquivo lido, `write` com `expected` omitido ou
+  `null` descarta a observação antiga e pode recriar o arquivo sem sobrescrever
+  um arquivo que apareça durante a criação. `expected` explícito continua
+  exigindo um arquivo existente.
+- Chamadas contendo material sensível registrado são rejeitadas antes da
+  execução, sem substituir caminhos, IDs ou argumentos por `[REDACTED]`.
+  A TUI sem persistência também conserva o histórico parcial de turnos com erro.
+
+Robustez de admissão para chamadas malformadas (14/09/2026):
+
+- `shell`: `command` contendo um payload JSON de ferramenta é rejeitado na
+  admissão com mensagem dirigida. No script form, trechos associados a bash
+  (heredoc `<<`, `head -`, `tail -`, `ls -`, `export`, `which`, `chmod`,
+  `sed -i`, `awk`, `xargs`, `/dev/null`, `source`) geram nota de admissão na
+  saída da chamada; no program form, um `command` de várias palavras junto de
+  `args` também gera nota; eval inline (`python -c`, `node -e`, etc.) em scripts
+  com quebras de linha gera nota sobre possível risco de quoting. Essas notas
+  são heurísticas: strings literais, invocações explícitas de bash e eval
+  multilinha podem ser válidos; comandos bem-sucedidos não exigem reescrita.
+  O channel stanza do modo Auto informa que o shell é PowerShell, não bash.
+  Exit não-zero com stderr vazio recebe nota para interpretar o código e a
+  saída conforme o contrato do comando: alguns utilitários usam códigos
+  específicos para "sem match"/"diffs existem", mas stderr vazio não implica
+  sucesso nem altera o estado de falha da chamada.
+- `todo`: uma entrada sem `id` cujo título casa exatamente um item existente é
+  aplicada como atualização de status desse item, não como duplicata; sem
+  casamento único, a entrada continua sendo adição.
+- `patch` sem casamento exato sinaliza `expected` corrompido (U+FFFD) ou com
+  texto não-ASCII e instrui cópia verbatim da leitura.
+- OpenAI-compatible: deltas identificados não geram uma cópia legada sem
+  identidade; chamadas paralelas com IDs distintos conservam sua identidade
+  mesmo quando têm nome e argumentos iguais.
+
+Validação local de 12/09/2026: `cargo test --workspace --offline --no-fail-fast`
+concluiu com **1.521 aprovados, 33 ignorados e zero falhas** (incluídos os quatro
+alvos de Doc-tests, todos sem casos). Esse total não inclui a fixture manual
+abaixo. `cargo clippy --workspace --all-targets --offline -- -D warnings`
+concluiu com exit 0, sem avisos, após corrigir as falhas de integração. `rustfmt --check`
+nos arquivos Rust alterados e `git diff --check` também passaram. A revisão
+independente confirmou os ajustes de identidade da evidência e dos avisos em lote.
+
+A fixture offline `capture_budget_retained_allocation`, executada separadamente
+com `--ignored --nocapture --test-threads=1`, produziu 9 MiB em cada stream e
+conferiu bytes de início/fim e descartes. A soma das capacidades dos buffers
+finais foi 16.384 bytes no orçamento nativo e 16.777.216 no bruto. Nessa amostra,
+o runner levou 1.663,919 ms e 1.675,741 ms, respectivamente; o intervalo de
+finalização `wait_complete → handles_closed` levou 0,186 ms e 0,121 ms.
+São capacidades retidas finais e uma amostra de tempo, não pico de memória/RSS
+nem comprovação de ganho global de velocidade ou tokens. Não houve validação
+com provider comercial, LSP externo ou console físico. Deploy não aplicável:
+mudança somente no checkout.
+
+## MCP (`[mcp.servers]`)
+
+**Onde configurar** — MCPs não são "instalados" como pacote; são declarados em
+TOML em uma destas camadas (o projeto vence o global, campo a campo):
+
+| Escopo | Arquivo |
+|---|---|
+| Projeto (só este workspace) | `./slim.toml` na raiz do projeto |
+| Global (todas as sessões) | `%APPDATA%\slim\config\slim.toml` (ou `SLIM_CONFIG_FILE`) |
+
+`/mcp add` escreve no `slim.toml` do projeto por padrão; `--global` escreve no
+arquivo global. `/mcp remove` remove de onde o servidor estiver definido.
+`env`/`headers` (segredos) só entram editando o TOML — nunca via `/mcp add`,
+para não vazarem no transcript.
+
+A identificação de credenciais usa nomes como `Authorization`, `Cookie`,
+`API_KEY` e componentes `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL`
+ou `SIGNATURE`, sem distinção de caixa. Use esses nomes para material sensível;
+valores ordinários de configuração, como `NODE_ENV=production` e flags `1` ou
+`true`, não são tratados como credenciais apenas pelo conteúdo.
+
+Servidores MCP (stdio ou HTTP streamable, protocolo `2025-11-25`) em qualquer
+camada do `slim.toml`; o projeto vence o global e `env`/`headers` mesclam por chave:
+
+```toml
+[mcp.servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+env = { }
+enabled = true
+timeout_ms = 30000        # 1_000–600_000
+
+[mcp.servers.remote]
+url = "https://mcp.example.com/mcp"
+headers = { Authorization = "Bearer …" }
+```
+
+`command` e `url` são mutuamente exclusivos; `name` aceita `[A-Za-z0-9_-]{1,64}`.
+Construir o manager não spawna processo nem abre socket: a conexão só nasce no
+primeiro uso real (lazy). O agente recebe uma única meta-tool `mcp` em modo Auto
+— `{list:true}` lista servidores sem conectar, `{server,list:true}` lista tools,
+`{server,tool,describe:true}` expõe o schema, `{server,tool,arguments:{…}}`
+chama. Zero catálogo injetado no prompt; `mcp` conta no bucket mutating e é
+serial barrier. Valores de `env`/`headers` entram na redaction do runtime.
+
+Na TUI, `/mcp` abre o overlay: nome · transporte · alvo · status (`●` pronto,
+`◌` conectando/desconectado, `✕` falha, `○` desabilitado). Teclas: `Enter`
+testa, `r` reconecta, `x` desconecta, `d`/`Delete` remove com confirmação,
+`R` recarrega config, `Esc` fecha. O polling de 1 s só roda com o overlay
+aberto. Comandos: `/mcp add <nome> <comando> [args…] [--global]`,
+`/mcp add <nome> --url <url> [--global]`, `/mcp remove|rm <nome>`,
+`/mcp reconnect|disconnect <nome>`, `/mcp reload`. Gestão durante run ativo é
+recusada ("a run is already active"). Fora da v1: resources/prompts, OAuth,
+revisão `2026-07-28`.
+
+## Command Code — DeepSeek V4.1 Flash
+
+O provider nativo `command-code` usa a [Provider API](https://commandcode.ai/docs/provider).
+O [plano GOAT](https://commandcode.ai/docs/plans/goat) inclui acesso à API e ao
+**DeepSeek V4.1 Flash**, confirmado em 2026-09-10 no catálogo público
+`https://api.commandcode.ai/provider/v1/models`.
+
+Na TUI:
+1. `/login command-code` — cadastre sua chave do Command Code Studio no campo mascarado.
+2. `/models` — selecione **DeepSeek V4.1 Flash** no grupo **Command Code**.
+   Também aceita `/model deepseek/deepseek-v4.1-flash` após conectar esse provider.
+
+```powershell
+slim --headless --provider command-code --model deepseek/deepseek-v4.1-flash --prompt "hello"
+```
+
+O ID exato e padrão desse provider é `deepseek/deepseek-v4.1-flash`, com contexto
+catalogado de 1.000.000 tokens e rota `/provider/v1/chat/completions`.
+Não é o ID `deepseek-flash` do OpenCode Go. Modelos anteriores são preservados.
+Não precisa instalar o CLI Command Code para usar essa integração.
+
+Credencial: `SLIM_API_KEY` > `COMMANDCODE_API_KEY` > `CMD_API_KEY` > chave salva
+pelo Slim. Uso consome créditos do seu plano; autenticação e assinatura continuam
+sob responsabilidade do Command Code. Nunca coloque chave em `slim.toml`.
+`/models` atualiza catálogo em background e salva
+`%USERPROFILE%\.slim\command-code-models.json`; IDs oficiais com `:free` também
+são aceitos pelo parser, sem invalidar a lista inteira. Sem cache, o catálogo
+embutido espelha o snapshot live; configurações de modelo já salvas não são
+sobrescritas.
+
+`SLIM_CMD_ZDR=1` (ou `CMD_ZDR=1`) envia `x-cmd-zdr: 1` em toda requisição,
+optando pela rotação zero-data-retention documentada — upstreams sem
+capacidade ZDR respondem 422 em vez de degradar para retenção.
 
 ## OpenCode Go
 
@@ -83,8 +350,15 @@ O provider `opencode-go` usa chave em `SLIM_API_KEY`, depois
 
 ```powershell
 $env:OPENCODE_API_KEY = "..."
-slim --headless --provider opencode-go --model deepseek-v4-flash --prompt "hello"
+slim --headless --provider opencode-go --model deepseek-flash --prompt "hello"
 ```
+
+**DeepSeek V4.1 Flash:** no OpenCode Go, o ID oficial é `deepseek-flash`
+([endpoints](https://opencode.ai/docs/go/#endpoints), verificado em 2026-09-10).
+Na TUI, selecione **DeepSeek V4.1 Flash** em `/models`; `deepseek-v4-flash`
+continua sendo a entrada V4 anterior. O alias `deepseek-v4.1-flash` também é aceito.
+Se o executável instalado for anterior ao suporte, atualizar só o catálogo não
+basta: instale o build atual com `refresh-slim.ps1` e reabra o Slim.
 
 Na TUI, `/login` oferece **OpenCode Go** com campo mascarado e persistência
 atômica; ao reiniciar, o provider API-key ativo é restaurado automaticamente.
@@ -93,7 +367,7 @@ autenticação inválido produz erro explícito em vez de aparentar logout.
 `/models` abre imediatamente e atualiza em background o catálogo
 público `https://opencode.ai/zen/go/v1/models`. O último catálogo válido fica
 em `%USERPROFILE%\.slim\opencode-go-models.json`; offline, Slim usa cache ou
-registro embutido. Somente os 24 modelos documentados são aceitos. Cada modelo
+registro embutido. Somente os 25 modelos documentados são aceitos. Cada modelo
 seleciona protocolo, contexto, reasoning e suporte a imagem por metadado
 explícito, sem heurística: Chat Completions, Responses ou Anthropic Messages.
 No wire Chat Completions, snapshots cumulativos de `usage` do OpenCode Go são
@@ -101,6 +375,25 @@ consolidados em um único total conservador; providers irmãos continuam com
 validação terminal estrita.
 `/logout` remove apenas a chave OpenCode persistida; variáveis de ambiente não
 são alteradas.
+
+## OpenCode Zen (free tier)
+
+O provider `opencode-zen` (alias `zen`) usa o gateway principal
+`https://opencode.ai/zen/v1`, restrito aos modelos gratuitos. Sem chave, o
+tier free responde ao bearer `public` com o header `x-opencode-session`
+obrigatório; `OPENCODE_API_KEY`, `SLIM_API_KEY` ou `/login zen` sobrescrevem
+com uma chave de conta Zen. Exemplo headless:
+
+```powershell
+slim --headless --provider zen --model big-pickle --prompt "hello"
+```
+
+`/models` lista o grupo **OpenCode Zen** separado do Go e atualiza em
+background o catálogo `https://opencode.ai/zen/v1/models`, intersectado com
+os IDs free verificados localmente; o último válido fica em
+`%USERPROFILE%\.slim\opencode-zen-models.json`, com o registro embutido como
+fallback. O tier free é limitado pelo próprio gateway (rate limit por
+sessão).
 
 Os 1085 testes passados / 0 failed / 1 ignored (ConPTY físico) em 87 suítes comprovam
 componentes, contratos e caminhos headless/TUI offline; não comprovam
@@ -129,67 +422,83 @@ Auditoria e otimização da suíte: [TEST-SUITE-OPTIMIZATION.md](analysis_output
 Deploy atual: `.\refresh-slim.ps1` com `OK:` (build release, cópia para o PATH e
 `slim --version` = `slim 0.1.0` com exit `0`).
 
-## Status atual de integraÃ§Ã£o
+## Status atual de integração
 
-| Ãrea | Estado atual |
+| Área | Estado atual |
 |---|---|
 | Headless/provider/tools/auth/compaction/usage/artifacts/anti-loop | `Slim --headless` usa caminhos integrados e exercitados offline; OpenAI-compatible/Anthropic SSE, read/list/search/write/patch/shell e filtragem de capabilities funcionam. |
-| TUI | `Slim` abre a interface normal mesmo deslogado. `/login` abre seletor OAuth nativo para Claude Pro/Max ou ChatGPT Plus/Pro; Anthropic Messages e Codex Responses usam o mesmo agent loop/tools Slim. Reducer Ãºnico normativo (`Action â†’ reduce â†’ Effect`), scrollback virtualizado e navegÃ¡vel (pin/live-edge/unseen), paleta estratificada Â§21.3, ActivityRail por fase/tempo, SessionRail conversacional adaptativa com contexto único e footer Grok-style responsivo (box alinhado + atalhos/metrics), tool blocks tipados agregados, lanes bounded com coalescer no runtime real, command palette Ctrl+P, markdown-light, motion bÃ¡sico com reduced motion e welcome estática com nome, conexão e próxima ação. Fixtures localhost provam OAuth/callback/store, streaming, tool round-trip e cancelamento. PTY E2E fÃ­sico pendente de console real (teste `#[ignore]`). |
+| TUI | `Slim` abre a interface normal mesmo deslogado. `/login` abre seletor OAuth nativo para Claude Pro/Max ou ChatGPT Plus/Pro; Anthropic Messages e Codex Responses usam o mesmo agent loop/tools Slim. Reducer único normativo (`Action → reduce → Effect`), scrollback virtualizado e navegável (pin/live-edge/unseen), paleta estratificada §21.3, ActivityRail por fase/tempo, SessionRail conversacional adaptativa com contexto único e footer Grok-style responsivo (box alinhado + atalhos/metrics), tool blocks tipados agregados, lanes bounded com coalescer no runtime real, command palette Ctrl+P, markdown-light, motion básico com reduced motion e welcome estática com nome, conexão e próxima ação. Fixtures localhost provam OAuth/callback/store, streaming, tool round-trip e cancelamento. PTY E2E físico pendente de console real (teste `#[ignore]`). |
 | Cache/HTTP | Replay local de respostas (`ProviderCache`) desligado no produto; transporte HTTP compartilhado reaproveita conexões, enquanto adapters e autenticação continuam isolados por request. |
-| SessÃµes | Writer/recovery/branch e `--session` escrevem JSONL novo; `--resume`/recovery explÃ­citos existem headless e TUI; UX geral de seleÃ§Ã£o/fork continua limitada. |
-| Skills, MCP, subagentes | Tool `skill` lazy (`list` / `name`); pasta `%USERPROFILE%/.slim/skills` (cwd `.slim/skills` vence). Sem injeção de catálogo. Sem MCP/child. |
+| Sessões | Writer/recovery/branch e `--session` escrevem JSONL novo; `--resume`/recovery explícitos existem headless e TUI; UX geral de seleção/fork continua limitada. |
+| Skills, MCP, subagentes | Tool `skill` lazy (`list` / `name`); pasta `%USERPROFILE%/.slim/skills` (cwd `.slim/skills` vence). Sem injeção de catálogo. MCP stdio/HTTP lazy via meta-tool `mcp` + overlay `/mcp` (ver seção MCP). Sem child. |
 | Todo/Plan/Goal | Tool `todo` no loop Auto; `TodoChanged` abre o dock TUI. Plan/Goal sem UI; Plan headless continua abortando (N4). |
-| Release | DeterminÃ­stico e hash-valid; empacota este checkpoint parcial, nÃ£o uma v1 completa. |
+| Release | Determinístico e hash-valid; empacota este checkpoint parcial, não uma v1 completa. |
 
-O restante desta pÃ¡gina descreve contratos realmente integrados. Para o plano de
-integraÃ§Ã£o pendente, consulte o [Ã­ndice canÃ´nico](Documenta%C3%A7%C3%B5es%20-%20Projeto/README.md)
+O restante desta página descreve contratos realmente integrados. Para o plano de
+integração pendente, consulte o [índice canônico](Documenta%C3%A7%C3%B5es%20-%20Projeto/README.md)
 e o [plano](Documenta%C3%A7%C3%B5es%20-%20Projeto/PLANO-IMPLEMENTACAO.md). A fila
-curta do ciclo atual (agente completo, harness leve) estÃ¡ em
-[prÃ³ximas etapas](Documenta%C3%A7%C3%B5es%20-%20Projeto/PROXIMAS-ETAPAS-AGENTE.md).
+curta do ciclo atual (agente completo, harness leve) está em
+[próximas etapas](Documenta%C3%A7%C3%B5es%20-%20Projeto/PROXIMAS-ETAPAS-AGENTE.md).
 
 ## Contratos implementados no headless
 
-No Windows, `auth.json` Ã© somente leitura e fail-closed. O arquivo Ã© aberto por
+No Windows, `auth.json` é somente leitura e fail-closed. O arquivo é aberto por
 handle `windows-sys` e recebe DACL protegida com allowlist exata do owner atual,
-usuÃ¡rio atual, `SYSTEM` e `Administrators`; o teste tambÃ©m cobre caminho Unicode.
-Symlink, diretÃ³rio, reparse point, ACL divergente, JSON/schema invÃ¡lido ou
-versÃ£o diferente falham. No headless, arquivo ausente nÃ£o Ã© criado. A TUI pode
+usuário atual, `SYSTEM` e `Administrators`; o teste também cobre caminho Unicode.
+Symlink, diretório, reparse point, ACL divergente, JSON/schema inválido ou
+versão diferente falham. No headless, arquivo ausente não é criado. A TUI pode
 escrever credenciais OAuth tipadas e a chave OpenCode Go no mesmo arquivo por
-temp exclusivo, lock, ACL e replace atÃ´mico, preservando providers irmãos. NÃ£o hÃ¡ detecÃ§Ã£o mÃ¡gica de segredos desconhecidos.
+temp exclusivo, lock, ACL e replace atômico, preservando providers irmãos. Não há detecção mágica de segredos desconhecidos.
 
-O cliente HTTP nÃ£o segue redirects. O cache Ã© bounded, em memÃ³ria e por
-processo, e estÃ¡ ativo no caminho normal. O transporte Reqwest Ã© compartilhado
-para reaproveitar conexÃµes; seu namespace inclui provider, identidade do endpoint e modelo exato,
-alÃ©m de mensagens/tools e conteÃºdo multimodal canonicalizados. Headers e chaves
-ficam fora da chave. Respostas com tool call nunca sÃ£o cacheadas. SSE exige
-evento terminal; bytes/eventos apÃ³s a terminaÃ§Ã£o ou stream sem terminaÃ§Ã£o sÃ£o
+O cliente HTTP não segue redirects. O cache é bounded, em memória e por
+processo, e está ativo no caminho normal. O transporte Reqwest é compartilhado
+para reaproveitar conexões; seu namespace inclui provider, identidade do endpoint e modelo exato,
+além de mensagens/tools e conteúdo multimodal canonicalizados. Headers e chaves
+ficam fora da chave. Respostas com tool call nunca são cacheadas. SSE exige
+evento terminal; bytes/eventos após a terminação ou stream sem terminação são
 rejeitados. Os adapters preservam, quando fornecidos, os IDs/index/name de tool
 deltas OpenAI e os IDs de `content_block` Anthropic; somente chamadas legadas
-sem ID recebem identificador interno. JSON de tool malformado ou incompleto Ã©
+sem ID recebem identificador interno. JSON de tool malformado ou incompleto é
 rejeitado.
 
 O runtime aplica budgets separados read-only vs mutating por run (`max_read_tool_calls` default 96, `max_mutating_tool_calls` default 32; env `SLIM_MAX_READ_TOOL_CALLS` / `SLIM_MAX_MUTATING_TOOL_CALLS` e chaves `slim.toml`); esgotamento → `tool_limit` (exit 22). O teto de turns por run é 128 (`SLIM_MAX_TURNS` / `max_turns` em `slim.toml`, cap 1024); esgotamento → `turn_limit` (exit 12) com mensagem `Turn limit reached (N/N)`. A tool `search` respeita `.gitignore`, ignora árvores de build, cap default 200 hits e paginação `offset`/`max_hits`. Emite `ToolStarted`, mantém pares assistant/tool e o prompt raiz através da
 compactação no mesmo adapter/modelo. O threshold soft prepara o checkpoint em
 background; o hard, `/compact` e uma única recuperação de overflow aplicam o
-resumo somente após validação. A seleção preserva grupos assistant/tool, o
+resumo somente após validação. A última instrução de usuário é preservada
+separadamente do sufixo recente, inclusive na retomada de checkpoints; trabalho
+encerrado posterior à instrução pode ser resumido. A seleção preserva grupos assistant/tool, o
 checkpoint durável usa fingerprint do prefixo, e usage/duração do resumo são
-contabilizados mesmo quando uma preparação inválida é descartada. Cada valor de API key fornecido Ã© redigido exatamente antes
-de tool output, follow-up ao provider, renderizaÃ§Ã£o e sessÃ£o; isso nÃ£o promete
-encontrar qualquer segredo arbitrÃ¡rio que nÃ£o tenha sido registrado.
+contabilizados mesmo quando uma preparação inválida é descartada. Cada valor de API key fornecido é redigido exatamente antes
+de tool output, follow-up ao provider, renderização e sessão; isso não promete
+encontrar qualquer segredo arbitrário que não tenha sido registrado.
+
+Após uma escrita ou patch, o escalonador reavalia as consultas cujas dependências
+foram concluídas e usa a concorrência existente, mantendo as barreiras e a
+sincronização LSP. A busca multipadrão reserva espaço para padrões ainda não
+atendidos, distingue ausência de varredura incompleta e limita a varredura
+agregada a 4096 arquivos e aproximadamente 64 MiB (uma leitura de linha pode
+cruzar o limite antes da interrupção).
 
 `--image PATH` aceita repetidamente PNG, JPEG/JPG, GIF e WebP; cada entrada deve
-ser arquivo regular nÃ£o-symlink, nÃ£o vazio e ter no mÃ¡ximo 20 MiB. O conteÃºdo Ã©
+ser arquivo regular não-symlink, não vazio e ter no máximo 20 MiB. O conteúdo é
 enviado como base64 estrito, sem I/O remoto. `SLIM_CONTEXT_WINDOW_TOKENS` e
 `SLIM_MAX_OUTPUT_TOKENS` aceitam inteiros positivos e controlam janela/reserva
-de contexto e, quando suportado pelo wire, o teto de saÃ­da do provider (padrÃ£o:
+de contexto e, quando suportado pelo wire, o teto de saída do provider (padrão:
 4096 tokens). No contrato Codex subscription, o valor permanece reserva local e
-`max_output_tokens` nÃ£o Ã© serializado. O resultado de tool tambÃ©m tem cap
-bounded de 64 KiB, com artifact handle quando
-aplicÃ¡vel.
+`max_output_tokens` não é serializado. A apresentação dos resultados usa um
+orçamento agregado calculado com o request serializado, a estimativa conservadora
+do preflight, os schemas, o histórico e a reserva de saída. Leituras completas
+de até 64 KiB continuam possíveis quando cabem. Páginas menores preservam
+registros inteiros e calculam a continuação pelo conteúdo entregue; registros
+grandes demais recebem um aviso explícito. Resultados completos são mantidos
+separadamente, com artefato quando o armazenamento está configurado.
+O diário mantém o resultado bruto e a projeção vinculada à sua entrada; resume
+e branches aplicam essa projeção antes de verificar checkpoints. A projeção
+segue a gravação de fatos do diário e é sincronizada pelo próximo append durável.
 
-No headless, text e JSONL expÃµem `stop`: `provider_completed` (exit `0`),
+No headless, text e JSONL expõem `stop`: `provider_completed` (exit `0`),
 `turn_limit` e `repeated_failed_tool` (exit `12`) ou `tool_limit` (exit `22`).
-O provider/model/IDs informados sÃ£o preservados; nÃ£o hÃ¡ troca silenciosa de
+O provider/model/IDs informados são preservados; não há troca silenciosa de
 provider.
 
 `--verbose` (somente com saída text) acrescenta a timeline humana de tools e o
@@ -222,24 +531,24 @@ como economia comportamental do agente.
 
 ## Comece aqui
 
-O Ã­ndice canÃ´nico estÃ¡ em
-[DocumentaÃ§Ãµes - Projeto/README.md](Documenta%C3%A7%C3%B5es%20-%20Projeto/README.md).
+O índice canônico está em
+[Documentações - Projeto/README.md](Documenta%C3%A7%C3%B5es%20-%20Projeto/README.md).
 
-As decisÃµes normativas estÃ£o em
+As decisões normativas estão em
 [DECISOES-GRILL-PRE-IMPLEMENTACAO.md](Documenta%C3%A7%C3%B5es%20-%20Projeto/DECISOES-GRILL-PRE-IMPLEMENTACAO.md)
-e o plano/evidÃªncia final em
+e o plano/evidência final em
 [PLANO-IMPLEMENTACAO.md](Documenta%C3%A7%C3%B5es%20-%20Projeto/PLANO-IMPLEMENTACAO.md) e
 [POC-RESULTS.md](POC-RESULTS.md).
 
-## Provider headless e autenticaÃ§Ã£o local
+## Provider headless e autenticação local
 
-Sem configuraÃ§Ã£o, o CLI usa o provider fake dos testes. A rota HTTP local
-suporta `openai-compatible` e `anthropic`; a validaÃ§Ã£o registrada usa somente
+Sem configuração, o CLI usa o provider fake dos testes. A rota HTTP local
+suporta `openai-compatible` e `anthropic`; a validação registrada usa somente
 fixtures localhost, sem credencial real ou rede externa.
 
-As chaves sÃ£o resolvidas nesta ordem: `SLIM_API_KEY`, variÃ¡vel especÃ­fica do
+As chaves são resolvidas nesta ordem: `SLIM_API_KEY`, variável específica do
 provider (`OPENAI_API_KEY` ou `ANTHROPIC_API_KEY`), `SLIM_AUTH_FILE` e
-`%USERPROFILE%\\.slim\\auth.json`. O formato aceito Ã©:
+`%USERPROFILE%\\.slim\\auth.json`. O formato aceito é:
 
 ```json
 {
@@ -251,29 +560,33 @@ provider (`OPENAI_API_KEY` ou `ANTHROPIC_API_KEY`), `SLIM_AUTH_FILE` e
 }
 ```
 
-O headless nÃ£o grava `auth.json`. A TUI grava somente credenciais obtidas por
+O headless não grava `auth.json`. A TUI grava somente credenciais obtidas por
 `/login`, preservando entradas API-key existentes. O provider ativo salvo é
 restaurado no próximo startup; variáveis de ambiente continuam tendo
 precedência e evitam a leitura de um auth file inferior. Access/refresh/code nunca
-entram em events ou sessÃµes. `--session PATH` opta por persistir os eventos
-JSONL do turno headless; sem essa flag nÃ£o hÃ¡ sessÃ£o headless.
+entram em events ou sessões. `--session PATH` opta por persistir os eventos
+JSONL do turno headless; sem essa flag não há sessão headless.
 
 ## TUI e OAuth nativo
 
 `Slim` sempre abre a tela normal com composer. Sem credencial, status mostra
-`signed out Â· type /login`; prompt comum Ã© preservado e recebe aviso local.
+`signed out · type /login`; prompt comum é preservado e recebe aviso local.
 
 - `/login`: seletor Anthropic Claude Pro/Max ou OpenAI Codex ChatGPT Plus/Pro;
-- autocomplete: digitar `/` em qualquer posiÃ§Ã£o do prompt (inÃ­cio ou meio de
-  frase) abre as opÃ§Ãµes; â†‘/â†“ navegam, **Tab** completa no draft, **Enter**
+- autocomplete: digitar `/` em qualquer posição do prompt (início ou meio de
+  frase) abre as opções; ↑/↓ navegam, **Tab** completa no draft, **Enter**
   completa e executa, `Esc` fecha;
 - `/login anthropic` e `/login codex`: atalhos diretos;
 - `/logout`: remove credencial OAuth ativa;
 - `/model`: seletor GPT-5.6 Sol/Terra/Luna para Codex;
 - `/model sol`, `/model terra`, `/model luna`: aliases diretos;
+- `Ctrl+V`/`Shift+Insert` e o paste do botão direito: com imagem no clipboard,
+  o composer recebe um chip `image · clipboard-N.png` (PNG temporário anexado
+  ao próximo prompt); sem imagem, cola texto como antes. `/image PATH` continua
+  anexando arquivos locais;
 - `Esc`: cancela seletor/login em andamento.
 
-OAuth usa PKCE S256, callback restrito a loopback, validaÃ§Ã£o de `state`, refresh
+OAuth usa PKCE S256, callback restrito a loopback, validação de `state`, refresh
 e browser via `ShellExecuteW` sem shell. Codex usa SSE Responses; WebSocket fica
-fora deste checkpoint. Testes sÃ£o localhost/offline: nenhum login real foi
-executado, e polÃ­tica de limites/cobranÃ§a pertence aos providers.
+fora deste checkpoint. Testes são localhost/offline: nenhum login real foi
+executado, e política de limites/cobrança pertence aos providers.

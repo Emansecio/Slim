@@ -1,6 +1,6 @@
 # Streaming, Thinking and Tools TUI Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use `executing-plans` and `tdd`. Complete one slice at a time, run its focused RED/GREEN gates, review the complete diff for that slice, and do not begin the next slice while a regression remains.
+> **Retomada deste plano:** revalide as pendências no código e execute somente o escopo autorizado, conforme o `AGENTS.md` vigente. Skills e delegação são escolhidas por necessidade; receitas e resultados da execução original não são obrigações gerais.
 
 **Goal:** Make the deployed Slim TUI present reasoning, tool execution, multi-tool runs, interaction requests, streaming cadence, and ConPTY evidence as one causally correct, inspectable timeline.
 

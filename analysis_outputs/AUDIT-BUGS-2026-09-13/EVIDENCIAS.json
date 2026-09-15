@@ -1,0 +1,176 @@
+{
+  "audit_date": "2026-09-13",
+  "scope": "Bugs in current source; isolated native tools and loopback provider",
+  "production_edits_performed": false,
+  "live_model_requests": 0,
+  "source_state": {
+    "head": "972b46e4e445de05b4021554b277710f3cfe9243",
+    "working_tree_already_modified_at_audit_start": true,
+    "hash_capture": "end_of_audit; not a before/after baseline",
+    "sha256": {
+      "crates/slim-core/src/tools/write.rs": "769e1d0065522a4736fee4c9c225518464b23dfb9fa3be4199fc2eb3ec70a2d9",
+      "crates/slim-core/src/tools/patch.rs": "decdab8ac05a85f550027c95395d418fd5768342a7f0a99b9fdd2bdc9d623eae",
+      "crates/slim-core/src/tools/read.rs": "77d2c09ba336eca7ef2640e9e19354f8be30f333ff95474ed25339cacc2a6c04",
+      "crates/slim-core/src/tools/mod.rs": "8bde60676829b645c0cf1b1e55358a179a2add42e582df5311165732eb4dd146",
+      "crates/slim-core/src/tools/execution.rs": "60d2c886d9c9cecc6542af8cb8b3477e52e1bdf56b01b8459e82083bdf8e20a0",
+      "crates/slim-core/src/runtime/mod.rs": "db84577a776c0d2bb178adb229d81b6355b1274e7101a6f738f467424a95ca7d",
+      "crates/slim-core/src/runtime/loop_guard.rs": "0f4d680e38869c67d9ffb513b6b9e9763d5e7159f38c90e19d2ea78e0cf25bcb",
+      "crates/slim-core/src/provider.rs": "7d0fd4a37400187931c3b44372546a16121d8ba7ac1e3258fc8602db465fe600",
+      "crates/slim-core/src/mcp/spec.rs": "48af77183bd73779b348c51069f7bf85f5b8f9e6a7ea42f03d152982e6850c2e",
+      "crates/slim-core/src/mcp/manager.rs": "7d4db170991c37a4b531f936ebc7943b12e0cf7e2d7f5a77e7e0b873d4b7b032",
+      "crates/slim-core/src/session/manual_journal.rs": "9576daa1fd79a72c80e7327e34116e618aeeb8067d61156d80b265a68882605f",
+      "crates/slim-cli/src/headless.rs": "88a077b597b7d904f776701abcc173ffff336934f261a26b1b0b1e3f21c554ea",
+      "crates/slim-cli/src/mcp.rs": "63b561eddc5ed6ff2608c2495c1aa96ad1e6bbcbc5a95eabe349792528400cf0",
+      "crates/slim-cli/src/tui.rs": "0c0f23783b821ab3500862f2746095d625993f27d760dd21e8c4179355c93089"
+    },
+    "probe_registry_dependencies_not_in_project_lock": []
+  },
+  "unit_tests": {
+    "command": "cargo test -p slim-core --lib --offline",
+    "passed": 195,
+    "failed": 0,
+    "ignored": 11,
+    "exit_code": 0,
+    "workspace_suite_executed": false
+  },
+  "probe": {
+    "command": "cargo run --offline --manifest-path analysis_outputs/AUDIT-BUGS-2026-09-13/probe/Cargo.toml --target-dir target",
+    "profile": "dev",
+    "exit_code": 0,
+    "assertions_characterize_defects_not_correctness": true,
+    "results": {
+      "agent_loop": {
+        "empty_completion": {
+          "error": "InvalidResponse { message: \"provider completed without assistant text or tool calls\" }"
+        },
+        "mcp_environment_redaction": {
+          "numeric_read": {
+            "mcp_calls_performed": 0,
+            "mcp_server_enabled": false,
+            "provider_requests": 1,
+            "registered_synthetic_values": [
+              "1"
+            ],
+            "requested_write_contents": null,
+            "result": {
+              "error": "MalformedToolCall"
+            },
+            "written_contents": null
+          },
+          "write_content": {
+            "mcp_calls_performed": 0,
+            "mcp_server_enabled": false,
+            "provider_requests": 2,
+            "registered_synthetic_values": [
+              "1"
+            ],
+            "requested_write_contents": "version = 1\n",
+            "result": {
+              "stop": "ProviderCompleted",
+              "tool_results": [
+                {
+                  "name": "write",
+                  "output": "written new.txt; bytes=2[REDACTED]; sha256=[REDACTED]f[REDACTED]ae97c8a2e; exists=true; do not re-read",
+                  "success": true
+                }
+              ]
+            },
+            "written_contents": "version = [REDACTED]\n"
+          }
+        },
+        "recreate_after_read": {
+          "file_exists": false,
+          "file_unchanged": false,
+          "provider_requests": 4,
+          "stop": "RepeatedFailedTool",
+          "tool_results": [
+            {
+              "name": "read",
+              "output": "initial read succeeded",
+              "success": true
+            },
+            {
+              "name": "write",
+              "output": "\\\\?\\D:\\Slim\\analysis_outputs\\AUDIT-BUGS-2026-09-13\\probe\\fixtures\\42776\\loop-recreate\\source.txt: file does not exist; expected checks an EXISTING file (even when empty). To create it, retry write with the same path/content and omit expected or set it to null. No file was written.",
+              "success": false
+            },
+            {
+              "name": "write",
+              "output": "\\\\?\\D:\\Slim\\analysis_outputs\\AUDIT-BUGS-2026-09-13\\probe\\fixtures\\42776\\loop-recreate\\source.txt: file does not exist; expected checks an EXISTING file (even when empty). To create it, retry write with the same path/content and omit expected or set it to null. No file was written.",
+              "success": false
+            }
+          ],
+          "turns": 3
+        },
+        "unicode_recovery": {
+          "file_exists": true,
+          "file_unchanged": true,
+          "provider_requests": 3,
+          "stop": "RepeatedFailedTool",
+          "tool_results": [
+            {
+              "name": "write",
+              "output": "native tool task failed: task 32 panicked with message \"end byte index 8192 is not a char boundary; it is inside 'é' (bytes 8191..8193 of string)\"",
+              "success": false
+            },
+            {
+              "name": "write",
+              "output": "native tool task failed: task 36 panicked with message \"end byte index 8192 is not a char boundary; it is inside 'é' (bytes 8191..8193 of string)\"",
+              "success": false
+            }
+          ],
+          "turns": 2
+        }
+      },
+      "concurrent_editor_save": {
+        "external_change_preserved": false,
+        "external_replacement_performed": true,
+        "final_contents": "agent version\n",
+        "replacement_error": null,
+        "write_output": "written source.txt; bytes=14; sha256=d0fb94aa7194; exists=true; do not re-read",
+        "write_success": true
+      },
+      "fixture_root": "D:\\Slim\\analysis_outputs\\AUDIT-BUGS-2026-09-13\\probe\\fixtures\\42776",
+      "method": "Native ToolRegistry from current path dependency; isolated local files only.",
+      "read_delete_recreate": {
+        "attempts": [
+          {
+            "arguments": {
+              "content": "recreated",
+              "path": "source.txt"
+            },
+            "output": "\\\\?\\D:\\Slim\\analysis_outputs\\AUDIT-BUGS-2026-09-13\\probe\\fixtures\\42776\\recreate-after-read\\source.txt: file does not exist; expected checks an EXISTING file (even when empty). To create it, retry write with the same path/content and omit expected or set it to null. No file was written.",
+            "success": false
+          },
+          {
+            "arguments": {
+              "content": "recreated",
+              "expected": null,
+              "path": "source.txt"
+            },
+            "output": "\\\\?\\D:\\Slim\\analysis_outputs\\AUDIT-BUGS-2026-09-13\\probe\\fixtures\\42776\\recreate-after-read\\source.txt: file does not exist; expected checks an EXISTING file (even when empty). To create it, retry write with the same path/content and omit expected or set it to null. No file was written.",
+            "success": false
+          }
+        ],
+        "final_contents": "recreated",
+        "fresh_registry_success": true
+      },
+      "unicode_error_recovery": {
+        "file_bytes": 103193,
+        "file_unchanged": true,
+        "outcomes": [
+          {
+            "message": "end byte index 8192 is not a char boundary; it is inside 'é' (bytes 8191..8193 of string)",
+            "panicked": true,
+            "tool": "write"
+          },
+          {
+            "message": "end byte index 8192 is not a char boundary; it is inside 'é' (bytes 8191..8193 of string)",
+            "panicked": true,
+            "tool": "patch"
+          }
+        ]
+      }
+    }
+  }
+}

@@ -68,6 +68,8 @@ fn durable_header_and_record_kinds_have_stable_json_envelopes() {
                 parent_entry_id: None,
                 operation_id: "op-1".into(),
                 tool_call_id: None,
+                tool_calls: Vec::new(),
+                content_blocks: Vec::new(),
             },
         },
         DurableRecord::Entry {
@@ -79,6 +81,8 @@ fn durable_header_and_record_kinds_have_stable_json_envelopes() {
                 parent_entry_id: Some("entry-1".into()),
                 operation_id: "op-1".into(),
                 tool_call_id: Some("call-1".into()),
+                tool_calls: Vec::new(),
+                content_blocks: Vec::new(),
             },
         },
         DurableRecord::Operation {

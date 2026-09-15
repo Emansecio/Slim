@@ -1,0 +1,2147 @@
+{
+  "experiment": "discovery-prelude-prototype-1",
+  "status": "complete",
+  "runs": 48,
+  "pairs": 24,
+  "passed": 48,
+  "comparison": "Installed Slim vs same Slim with experimental workspace path context; not Pi; runtime unchanged.",
+  "summaries": [
+    {
+      "model": "deepseek-v4-flash",
+      "totals": {
+        "baseline": {
+          "total_tokens": 215437,
+          "input": 195089,
+          "output": 20348,
+          "model_calls": 64,
+          "tool_calls": 86,
+          "discovery_turns": 25,
+          "root_lists": 10
+        },
+        "snapshot": {
+          "total_tokens": 202648,
+          "input": 181752,
+          "output": 20896,
+          "model_calls": 54,
+          "tool_calls": 77,
+          "discovery_turns": 15,
+          "root_lists": 2
+        }
+      },
+      "delta_percent": -5.936306205526442,
+      "median_pair_delta": -2.6283098131482054,
+      "wins": 8,
+      "pairs": 12,
+      "scenarios": [
+        {
+          "scenario": "config_migration",
+          "baseline": 35876,
+          "snapshot": 33879,
+          "delta_percent": -5.5663953618017565
+        },
+        {
+          "scenario": "js_pagination",
+          "baseline": 29558,
+          "snapshot": 29222,
+          "delta_percent": -1.1367480885039583
+        },
+        {
+          "scenario": "json_cli",
+          "baseline": 39975,
+          "snapshot": 42539,
+          "delta_percent": 6.414008755472178
+        },
+        {
+          "scenario": "ledger_audit",
+          "baseline": 42732,
+          "snapshot": 44437,
+          "delta_percent": 3.9899840868669934
+        },
+        {
+          "scenario": "merge_ranges",
+          "baseline": 38376,
+          "snapshot": 28589,
+          "delta_percent": -25.50291849072337
+        },
+        {
+          "scenario": "repair_catalog",
+          "baseline": 28920,
+          "snapshot": 23982,
+          "delta_percent": -17.074688796680494
+        }
+      ]
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "totals": {
+        "baseline": {
+          "total_tokens": 163812,
+          "input": 151575,
+          "output": 12237,
+          "model_calls": 71,
+          "tool_calls": 95,
+          "discovery_turns": 25,
+          "root_lists": 13
+        },
+        "snapshot": {
+          "total_tokens": 147351,
+          "input": 135792,
+          "output": 11559,
+          "model_calls": 60,
+          "tool_calls": 85,
+          "discovery_turns": 15,
+          "root_lists": 5
+        }
+      },
+      "delta_percent": -10.048714379898904,
+      "median_pair_delta": -8.58242800908796,
+      "wins": 9,
+      "pairs": 12,
+      "scenarios": [
+        {
+          "scenario": "config_migration",
+          "baseline": 47733,
+          "snapshot": 40740,
+          "delta_percent": -14.650241970963485
+        },
+        {
+          "scenario": "js_pagination",
+          "baseline": 18483,
+          "snapshot": 17974,
+          "delta_percent": -2.7538819455716013
+        },
+        {
+          "scenario": "json_cli",
+          "baseline": 27706,
+          "snapshot": 26744,
+          "delta_percent": -3.472172092687509
+        },
+        {
+          "scenario": "ledger_audit",
+          "baseline": 33014,
+          "snapshot": 30757,
+          "delta_percent": -6.836493608772032
+        },
+        {
+          "scenario": "merge_ranges",
+          "baseline": 18922,
+          "snapshot": 16340,
+          "delta_percent": -13.645492019871053
+        },
+        {
+          "scenario": "repair_catalog",
+          "baseline": 17954,
+          "snapshot": 14796,
+          "delta_percent": -17.589395120864427
+        }
+      ]
+    }
+  ],
+  "pair_results": [
+    {
+      "model": "gpt-5.6-luna",
+      "round": 1,
+      "scenario": "merge_ranges",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131258Z",
+        "variant": "baseline",
+        "round": 1,
+        "scenario": "merge_ranges",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 8746,
+        "input": 7772,
+        "output": 974,
+        "model_calls": 4,
+        "tool_calls": 6,
+        "discovery_turns": 1,
+        "root_lists": 1,
+        "first_tools": [
+          "read",
+          "read",
+          "read",
+          "list"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "read",
+            "list"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131325Z",
+        "variant": "snapshot",
+        "round": 1,
+        "scenario": "merge_ranges",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 7946,
+        "input": 7211,
+        "output": 735,
+        "model_calls": 4,
+        "tool_calls": 5,
+        "discovery_turns": 1,
+        "root_lists": 1,
+        "first_tools": [
+          "read",
+          "read",
+          "list"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "list"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": -9.147038646238281,
+      "added_context_bytes": 204
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "round": 1,
+      "scenario": "repair_catalog",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131404Z-repair_catalog",
+        "variant": "baseline",
+        "round": 1,
+        "scenario": "repair_catalog",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 9052,
+        "input": 8452,
+        "output": 600,
+        "model_calls": 5,
+        "tool_calls": 7,
+        "discovery_turns": 2,
+        "root_lists": 1,
+        "first_tools": [
+          "list",
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "list",
+            "read",
+            "read"
+          ],
+          [
+            "read",
+            "read"
+          ],
+          [
+            "patch"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131346Z-repair_catalog",
+        "variant": "snapshot",
+        "round": 1,
+        "scenario": "repair_catalog",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 7408,
+        "input": 6892,
+        "output": 516,
+        "model_calls": 4,
+        "tool_calls": 6,
+        "discovery_turns": 1,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read",
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "patch"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": -18.161732213875382,
+      "added_context_bytes": 235
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "round": 1,
+      "scenario": "json_cli",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131423Z-json_cli",
+        "variant": "baseline",
+        "round": 1,
+        "scenario": "json_cli",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 14134,
+        "input": 12285,
+        "output": 1849,
+        "model_calls": 6,
+        "tool_calls": 7,
+        "discovery_turns": 3,
+        "root_lists": 1,
+        "first_tools": [
+          "list"
+        ],
+        "turns": [
+          [
+            "list"
+          ],
+          [
+            "read",
+            "read",
+            "list"
+          ],
+          [
+            "read"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131510Z-json_cli",
+        "variant": "snapshot",
+        "round": 1,
+        "scenario": "json_cli",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 13091,
+        "input": 11232,
+        "output": 1859,
+        "model_calls": 5,
+        "tool_calls": 6,
+        "discovery_turns": 2,
+        "root_lists": 1,
+        "first_tools": [
+          "read",
+          "read",
+          "list"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "list"
+          ],
+          [
+            "read"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": -7.379368897693506,
+      "added_context_bytes": 242
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "round": 1,
+      "scenario": "js_pagination",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131614Z-js_pagination",
+        "variant": "baseline",
+        "round": 1,
+        "scenario": "js_pagination",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 9307,
+        "input": 8648,
+        "output": 659,
+        "model_calls": 5,
+        "tool_calls": 7,
+        "discovery_turns": 2,
+        "root_lists": 1,
+        "first_tools": [
+          "list"
+        ],
+        "turns": [
+          [
+            "list"
+          ],
+          [
+            "read",
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "patch"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131554Z-js_pagination",
+        "variant": "snapshot",
+        "round": 1,
+        "scenario": "js_pagination",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 9817,
+        "input": 9256,
+        "output": 561,
+        "model_calls": 5,
+        "tool_calls": 7,
+        "discovery_turns": 2,
+        "root_lists": 1,
+        "first_tools": [
+          "read",
+          "read",
+          "list"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "list"
+          ],
+          [
+            "read",
+            "read"
+          ],
+          [
+            "patch"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": 5.479746427420218,
+      "added_context_bytes": 232
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "round": 1,
+      "scenario": "ledger_audit",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131637Z-ledger_audit",
+        "variant": "baseline",
+        "round": 1,
+        "scenario": "ledger_audit",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 16401,
+        "input": 15655,
+        "output": 746,
+        "model_calls": 6,
+        "tool_calls": 7,
+        "discovery_turns": 2,
+        "root_lists": 1,
+        "first_tools": [
+          "list"
+        ],
+        "turns": [
+          [
+            "list"
+          ],
+          [
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "shell"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131702Z-ledger_audit",
+        "variant": "snapshot",
+        "round": 1,
+        "scenario": "ledger_audit",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 15476,
+        "input": 14688,
+        "output": 788,
+        "model_calls": 5,
+        "tool_calls": 6,
+        "discovery_turns": 1,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "shell"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": -5.639900006097188,
+      "added_context_bytes": 218
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "round": 1,
+      "scenario": "config_migration",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131757Z-config_migration",
+        "variant": "baseline",
+        "round": 1,
+        "scenario": "config_migration",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 12712,
+        "input": 11912,
+        "output": 800,
+        "model_calls": 6,
+        "tool_calls": 11,
+        "discovery_turns": 2,
+        "root_lists": 1,
+        "first_tools": [
+          "list",
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "list",
+            "read",
+            "read"
+          ],
+          [
+            "list",
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "patch",
+            "patch"
+          ],
+          [
+            "shell"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131725Z-config_migration",
+        "variant": "snapshot",
+        "round": 1,
+        "scenario": "config_migration",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 21535,
+        "input": 20445,
+        "output": 1090,
+        "model_calls": 8,
+        "tool_calls": 14,
+        "discovery_turns": 1,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read",
+          "read",
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "patch",
+            "patch"
+          ],
+          [
+            "shell"
+          ],
+          [
+            "shell"
+          ],
+          [
+            "read",
+            "read"
+          ],
+          [
+            "patch",
+            "patch"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": 69.40685966016362,
+      "added_context_bytes": 291
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "round": 2,
+      "scenario": "merge_ranges",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131844Z",
+        "variant": "baseline",
+        "round": 2,
+        "scenario": "merge_ranges",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 10176,
+        "input": 9002,
+        "output": 1174,
+        "model_calls": 5,
+        "tool_calls": 5,
+        "discovery_turns": 2,
+        "root_lists": 1,
+        "first_tools": [
+          "list"
+        ],
+        "turns": [
+          [
+            "list"
+          ],
+          [
+            "read",
+            "read"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131822Z",
+        "variant": "snapshot",
+        "round": 2,
+        "scenario": "merge_ranges",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 8394,
+        "input": 7522,
+        "output": 872,
+        "model_calls": 4,
+        "tool_calls": 5,
+        "discovery_turns": 1,
+        "root_lists": 1,
+        "first_tools": [
+          "read",
+          "read",
+          "list"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "list"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": -17.51179245283019,
+      "added_context_bytes": 204
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "round": 2,
+      "scenario": "repair_catalog",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131918Z-repair_catalog",
+        "variant": "baseline",
+        "round": 2,
+        "scenario": "repair_catalog",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 8902,
+        "input": 8306,
+        "output": 596,
+        "model_calls": 5,
+        "tool_calls": 8,
+        "discovery_turns": 2,
+        "root_lists": 2,
+        "first_tools": [
+          "list",
+          "read",
+          "list"
+        ],
+        "turns": [
+          [
+            "list",
+            "read",
+            "list"
+          ],
+          [
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "patch"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131936Z-repair_catalog",
+        "variant": "snapshot",
+        "round": 2,
+        "scenario": "repair_catalog",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 7388,
+        "input": 6878,
+        "output": 510,
+        "model_calls": 4,
+        "tool_calls": 6,
+        "discovery_turns": 1,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read",
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "patch"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": -17.007414064255222,
+      "added_context_bytes": 235
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "round": 2,
+      "scenario": "json_cli",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-132044Z-json_cli",
+        "variant": "baseline",
+        "round": 2,
+        "scenario": "json_cli",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 13572,
+        "input": 11345,
+        "output": 2227,
+        "model_calls": 5,
+        "tool_calls": 7,
+        "discovery_turns": 2,
+        "root_lists": 1,
+        "first_tools": [
+          "list",
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "list",
+            "read",
+            "read"
+          ],
+          [
+            "list",
+            "read"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131956Z-json_cli",
+        "variant": "snapshot",
+        "round": 2,
+        "scenario": "json_cli",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 13653,
+        "input": 11547,
+        "output": 2106,
+        "model_calls": 5,
+        "tool_calls": 6,
+        "discovery_turns": 2,
+        "root_lists": 1,
+        "first_tools": [
+          "read",
+          "read",
+          "list"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "list"
+          ],
+          [
+            "read"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": 0.5968169761273234,
+      "added_context_bytes": 242
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "round": 2,
+      "scenario": "js_pagination",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-132142Z-js_pagination",
+        "variant": "baseline",
+        "round": 2,
+        "scenario": "js_pagination",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 9176,
+        "input": 8552,
+        "output": 624,
+        "model_calls": 5,
+        "tool_calls": 7,
+        "discovery_turns": 2,
+        "root_lists": 1,
+        "first_tools": [
+          "list"
+        ],
+        "turns": [
+          [
+            "list"
+          ],
+          [
+            "read",
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "patch"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-132210Z-js_pagination",
+        "variant": "snapshot",
+        "round": 2,
+        "scenario": "js_pagination",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 8157,
+        "input": 7528,
+        "output": 629,
+        "model_calls": 4,
+        "tool_calls": 6,
+        "discovery_turns": 1,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read",
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "patch"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": -11.1050566695728,
+      "added_context_bytes": 232
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "round": 2,
+      "scenario": "ledger_audit",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-132258Z-ledger_audit",
+        "variant": "baseline",
+        "round": 2,
+        "scenario": "ledger_audit",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 16613,
+        "input": 15789,
+        "output": 824,
+        "model_calls": 6,
+        "tool_calls": 7,
+        "discovery_turns": 2,
+        "root_lists": 1,
+        "first_tools": [
+          "list"
+        ],
+        "turns": [
+          [
+            "list"
+          ],
+          [
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "shell"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-132228Z-ledger_audit",
+        "variant": "snapshot",
+        "round": 2,
+        "scenario": "ledger_audit",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 15281,
+        "input": 14575,
+        "output": 706,
+        "model_calls": 5,
+        "tool_calls": 6,
+        "discovery_turns": 1,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "shell"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": -8.01781737193764,
+      "added_context_bytes": 218
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "round": 2,
+      "scenario": "config_migration",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-132342Z-config_migration",
+        "variant": "baseline",
+        "round": 2,
+        "scenario": "config_migration",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 35021,
+        "input": 33857,
+        "output": 1164,
+        "model_calls": 13,
+        "tool_calls": 16,
+        "discovery_turns": 3,
+        "root_lists": 1,
+        "first_tools": [
+          "list"
+        ],
+        "turns": [
+          [
+            "list"
+          ],
+          [
+            "read",
+            "list",
+            "read"
+          ],
+          [
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "patch"
+          ],
+          [
+            "patch"
+          ],
+          [
+            "shell"
+          ],
+          [
+            "read"
+          ],
+          [
+            "patch"
+          ],
+          [
+            "shell"
+          ],
+          [
+            "read"
+          ],
+          [
+            "patch"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-132427Z-config_migration",
+        "variant": "snapshot",
+        "round": 2,
+        "scenario": "config_migration",
+        "model": "gpt-5.6-luna",
+        "total_tokens": 19205,
+        "input": 18018,
+        "output": 1187,
+        "model_calls": 7,
+        "tool_calls": 12,
+        "discovery_turns": 1,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read",
+          "read",
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "patch",
+            "patch"
+          ],
+          [
+            "shell"
+          ],
+          [
+            "read",
+            "read"
+          ],
+          [
+            "patch"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": -45.161474543845124,
+      "added_context_bytes": 291
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "round": 1,
+      "scenario": "merge_ranges",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131258Z-opencode-go",
+        "variant": "baseline",
+        "round": 1,
+        "scenario": "merge_ranges",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 17662,
+        "input": 15449,
+        "output": 2213,
+        "model_calls": 5,
+        "tool_calls": 6,
+        "discovery_turns": 2,
+        "root_lists": 2,
+        "first_tools": [
+          "read",
+          "list"
+        ],
+        "turns": [
+          [
+            "read",
+            "list"
+          ],
+          [
+            "read",
+            "list"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131325Z-opencode-go",
+        "variant": "snapshot",
+        "round": 1,
+        "scenario": "merge_ranges",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 15295,
+        "input": 13025,
+        "output": 2270,
+        "model_calls": 4,
+        "tool_calls": 5,
+        "discovery_turns": 1,
+        "root_lists": 1,
+        "first_tools": [
+          "read",
+          "read",
+          "list"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "list"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": -13.401653266900693,
+      "added_context_bytes": 204
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "round": 1,
+      "scenario": "repair_catalog",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131451Z-opencode-go-repair_catalog",
+        "variant": "baseline",
+        "round": 1,
+        "scenario": "repair_catalog",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 14862,
+        "input": 13629,
+        "output": 1233,
+        "model_calls": 5,
+        "tool_calls": 6,
+        "discovery_turns": 2,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "read",
+            "read"
+          ],
+          [
+            "read",
+            "read"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131434Z-opencode-go-repair_catalog",
+        "variant": "snapshot",
+        "round": 1,
+        "scenario": "repair_catalog",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 10967,
+        "input": 10307,
+        "output": 660,
+        "model_calls": 4,
+        "tool_calls": 6,
+        "discovery_turns": 1,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read",
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": -26.207778226349077,
+      "added_context_bytes": 235
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "round": 1,
+      "scenario": "json_cli",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131512Z-opencode-go-json_cli",
+        "variant": "baseline",
+        "round": 1,
+        "scenario": "json_cli",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 17099,
+        "input": 15326,
+        "output": 1773,
+        "model_calls": 5,
+        "tool_calls": 6,
+        "discovery_turns": 2,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "read",
+            "read"
+          ],
+          [
+            "read",
+            "list"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131536Z-opencode-go-json_cli",
+        "variant": "snapshot",
+        "round": 1,
+        "scenario": "json_cli",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 19652,
+        "input": 17138,
+        "output": 2514,
+        "model_calls": 5,
+        "tool_calls": 6,
+        "discovery_turns": 2,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read",
+          "list"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "list"
+          ],
+          [
+            "read"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": 14.930697701619987,
+      "added_context_bytes": 242
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "round": 1,
+      "scenario": "js_pagination",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131623Z-opencode-go-js_pagination",
+        "variant": "baseline",
+        "round": 1,
+        "scenario": "js_pagination",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 14256,
+        "input": 13289,
+        "output": 967,
+        "model_calls": 5,
+        "tool_calls": 7,
+        "discovery_turns": 2,
+        "root_lists": 1,
+        "first_tools": [
+          "read",
+          "list"
+        ],
+        "turns": [
+          [
+            "read",
+            "list"
+          ],
+          [
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131605Z-opencode-go-js_pagination",
+        "variant": "snapshot",
+        "round": 1,
+        "scenario": "js_pagination",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 14221,
+        "input": 12646,
+        "output": 1575,
+        "model_calls": 4,
+        "tool_calls": 6,
+        "discovery_turns": 1,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read",
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "patch"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": -0.24551066217732842,
+      "added_context_bytes": 232
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "round": 1,
+      "scenario": "ledger_audit",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131643Z-opencode-go-ledger_audit",
+        "variant": "baseline",
+        "round": 1,
+        "scenario": "ledger_audit",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 18899,
+        "input": 17746,
+        "output": 1153,
+        "model_calls": 5,
+        "tool_calls": 8,
+        "discovery_turns": 0,
+        "root_lists": 1,
+        "first_tools": [
+          "list",
+          "shell"
+        ],
+        "turns": [
+          [
+            "list",
+            "shell"
+          ],
+          [
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "shell"
+          ],
+          [
+            "shell",
+            "read"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131703Z-opencode-go-ledger_audit",
+        "variant": "snapshot",
+        "round": 1,
+        "scenario": "ledger_audit",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 21388,
+        "input": 18690,
+        "output": 2698,
+        "model_calls": 4,
+        "tool_calls": 5,
+        "discovery_turns": 1,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "shell"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": 13.170008995184922,
+      "added_context_bytes": 218
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "round": 1,
+      "scenario": "config_migration",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131804Z-opencode-go-config_migration",
+        "variant": "baseline",
+        "round": 1,
+        "scenario": "config_migration",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 18514,
+        "input": 16939,
+        "output": 1575,
+        "model_calls": 6,
+        "tool_calls": 10,
+        "discovery_turns": 3,
+        "root_lists": 1,
+        "first_tools": [
+          "read",
+          "list"
+        ],
+        "turns": [
+          [
+            "read",
+            "list"
+          ],
+          [
+            "list",
+            "read"
+          ],
+          [
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "write",
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131751Z-opencode-go-config_migration",
+        "variant": "snapshot",
+        "round": 1,
+        "scenario": "config_migration",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 13890,
+        "input": 12466,
+        "output": 1424,
+        "model_calls": 4,
+        "tool_calls": 8,
+        "discovery_turns": 1,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read",
+          "read",
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "write",
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": -24.975694069352926,
+      "added_context_bytes": 291
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "round": 2,
+      "scenario": "merge_ranges",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131849Z-opencode-go",
+        "variant": "baseline",
+        "round": 2,
+        "scenario": "merge_ranges",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 20714,
+        "input": 18593,
+        "output": 2121,
+        "model_calls": 6,
+        "tool_calls": 6,
+        "discovery_turns": 2,
+        "root_lists": 1,
+        "first_tools": [
+          "read",
+          "list"
+        ],
+        "turns": [
+          [
+            "read",
+            "list"
+          ],
+          [
+            "read"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131829Z-opencode-go",
+        "variant": "snapshot",
+        "round": 2,
+        "scenario": "merge_ranges",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 13294,
+        "input": 11806,
+        "output": 1488,
+        "model_calls": 4,
+        "tool_calls": 5,
+        "discovery_turns": 1,
+        "root_lists": 1,
+        "first_tools": [
+          "read",
+          "read",
+          "list"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "list"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": -35.821183740465386,
+      "added_context_bytes": 204
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "round": 2,
+      "scenario": "repair_catalog",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131913Z-opencode-go-repair_catalog",
+        "variant": "baseline",
+        "round": 2,
+        "scenario": "repair_catalog",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 14058,
+        "input": 13065,
+        "output": 993,
+        "model_calls": 5,
+        "tool_calls": 6,
+        "discovery_turns": 2,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "read",
+            "read"
+          ],
+          [
+            "read",
+            "read"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131926Z-opencode-go-repair_catalog",
+        "variant": "snapshot",
+        "round": 2,
+        "scenario": "repair_catalog",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 13015,
+        "input": 11646,
+        "output": 1369,
+        "model_calls": 4,
+        "tool_calls": 6,
+        "discovery_turns": 1,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read",
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": -7.4192630530658725,
+      "added_context_bytes": 235
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "round": 2,
+      "scenario": "json_cli",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-132008Z-opencode-go-json_cli",
+        "variant": "baseline",
+        "round": 2,
+        "scenario": "json_cli",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 22876,
+        "input": 19906,
+        "output": 2970,
+        "model_calls": 6,
+        "tool_calls": 7,
+        "discovery_turns": 3,
+        "root_lists": 1,
+        "first_tools": [
+          "read",
+          "list"
+        ],
+        "turns": [
+          [
+            "read",
+            "list"
+          ],
+          [
+            "read",
+            "list"
+          ],
+          [
+            "read"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-131942Z-opencode-go-json_cli",
+        "variant": "snapshot",
+        "round": 2,
+        "scenario": "json_cli",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 22887,
+        "input": 20602,
+        "output": 2285,
+        "model_calls": 6,
+        "tool_calls": 7,
+        "discovery_turns": 2,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read",
+          "list"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "list"
+          ],
+          [
+            "read"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": 0.04808532960307588,
+      "added_context_bytes": 242
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "round": 2,
+      "scenario": "js_pagination",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-132101Z-opencode-go-js_pagination",
+        "variant": "baseline",
+        "round": 2,
+        "scenario": "js_pagination",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 15302,
+        "input": 13981,
+        "output": 1321,
+        "model_calls": 5,
+        "tool_calls": 7,
+        "discovery_turns": 2,
+        "root_lists": 1,
+        "first_tools": [
+          "read",
+          "list"
+        ],
+        "turns": [
+          [
+            "read",
+            "list"
+          ],
+          [
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-132121Z-opencode-go-js_pagination",
+        "variant": "snapshot",
+        "round": 2,
+        "scenario": "js_pagination",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 15001,
+        "input": 13141,
+        "output": 1860,
+        "model_calls": 4,
+        "tool_calls": 6,
+        "discovery_turns": 1,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read",
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": -1.967063129002744,
+      "added_context_bytes": 232
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "round": 2,
+      "scenario": "ledger_audit",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-132218Z-opencode-go-ledger_audit",
+        "variant": "baseline",
+        "round": 2,
+        "scenario": "ledger_audit",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 23833,
+        "input": 20972,
+        "output": 2861,
+        "model_calls": 5,
+        "tool_calls": 7,
+        "discovery_turns": 2,
+        "root_lists": 1,
+        "first_tools": [
+          "list",
+          "read"
+        ],
+        "turns": [
+          [
+            "list",
+            "read"
+          ],
+          [
+            "read",
+            "read"
+          ],
+          [
+            "shell"
+          ],
+          [
+            "read",
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-132153Z-opencode-go-ledger_audit",
+        "variant": "snapshot",
+        "round": 2,
+        "scenario": "ledger_audit",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 23049,
+        "input": 21563,
+        "output": 1486,
+        "model_calls": 5,
+        "tool_calls": 6,
+        "discovery_turns": 1,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read",
+          "read"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "shell"
+          ],
+          [
+            "shell"
+          ],
+          [
+            "read"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": -3.2895564972936664,
+      "added_context_bytes": 218
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "round": 2,
+      "scenario": "config_migration",
+      "baseline": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-132305Z-opencode-go-config_migration",
+        "variant": "baseline",
+        "round": 2,
+        "scenario": "config_migration",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 17362,
+        "input": 16194,
+        "output": 1168,
+        "model_calls": 6,
+        "tool_calls": 10,
+        "discovery_turns": 3,
+        "root_lists": 1,
+        "first_tools": [
+          "read",
+          "list"
+        ],
+        "turns": [
+          [
+            "read",
+            "list"
+          ],
+          [
+            "list",
+            "read"
+          ],
+          [
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "write",
+            "write"
+          ],
+          [
+            "shell"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "snapshot": {
+        "campaign": "D:\\Slim\\bench\\luna-live\\20260905-132319Z-opencode-go-config_migration",
+        "variant": "snapshot",
+        "round": 2,
+        "scenario": "config_migration",
+        "model": "deepseek-v4-flash",
+        "total_tokens": 19989,
+        "input": 18722,
+        "output": 1267,
+        "model_calls": 6,
+        "tool_calls": 11,
+        "discovery_turns": 2,
+        "root_lists": 0,
+        "first_tools": [
+          "read",
+          "read",
+          "list"
+        ],
+        "turns": [
+          [
+            "read",
+            "read",
+            "list"
+          ],
+          [
+            "read",
+            "read",
+            "read"
+          ],
+          [
+            "patch",
+            "patch"
+          ],
+          [
+            "shell"
+          ],
+          [
+            "read",
+            "read"
+          ],
+          []
+        ],
+        "passed": true
+      },
+      "delta_percent": 15.130745305840332,
+      "added_context_bytes": 291
+    }
+  ]
+}

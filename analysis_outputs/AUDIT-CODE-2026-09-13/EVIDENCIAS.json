@@ -1,0 +1,78 @@
+{
+  "batch_context_overflow": {
+    "actual_reads": 4,
+    "allowed_reads": 96,
+    "bytes_per_file": 50007,
+    "configured_result_bytes": 16384,
+    "error": "InvalidResponse { message: \"context window still exceeded after compaction\" }",
+    "provider_requests": 1,
+    "reserve_tokens": 4096,
+    "window_tokens": 32000
+  },
+  "compaction_latest_user_pin": {
+    "first_kept_index": 2,
+    "keep_recent_config": 20000,
+    "kept_messages": 31,
+    "live_tool_continuation": false,
+    "reasoning_state": false,
+    "selected_recent_tokens": 34568
+  },
+  "complete_read": {
+    "backend_bytes": 110000,
+    "file_bytes": 110000,
+    "forbids_offset": true,
+    "has_artifact": true,
+    "middle_seen_by_backend": true,
+    "middle_seen_by_model": false,
+    "model_bytes": 16827
+  },
+  "fixture_root": "D:\\Slim\\analysis_outputs\\AUDIT-CODE-2026-09-13\\probe\\fixtures\\26728",
+  "method": "Current slim-core path dependency, native tools, loopback provider; semantic facade simulated only for concurrency.",
+  "multipattern_starvation": {
+    "batch_has_rare": false,
+    "common_rows": 600,
+    "general_cap_notice": true,
+    "rare_line": 601,
+    "single_query_has_rare": true
+  },
+  "scheduler_after_mutation": {
+    "peak_after_completed_write": 1,
+    "peak_without_mutation": 3,
+    "queries": 3,
+    "real_lsp_speedup_measured": false,
+    "simulated_work_ms": 20
+  },
+  "search_pagination": {
+    "backend_first_bytes": 104476,
+    "claims_1_to_200": true,
+    "has_artifact": true,
+    "middle_100_missing": true,
+    "model_first_bytes": 16744,
+    "model_second_bytes": 15762,
+    "second_starts_201": true,
+    "source_rows": 230,
+    "visible_rows_two_pages": 61
+  },
+  "source_state": {
+    "head": "972b46e4e445de05b4021554b277710f3cfe9243",
+    "hashes_sha256": {
+      "crates/slim-core/src/runtime/mod.rs": "db84577a776c0d2bb178adb229d81b6355b1274e7101a6f738f467424a95ca7d",
+      "crates/slim-core/src/context/compact.rs": "690e6b5787179228cbef4247e9c41c8d6058770b01da174d7a34ba4c34f16a63",
+      "crates/slim-core/src/tools/read.rs": "77d2c09ba336eca7ef2640e9e19354f8be30f333ff95474ed25339cacc2a6c04",
+      "crates/slim-core/src/tools/search.rs": "803a234087d136f5dc5cfeeb3199752ddd2496a6d8213be62314550e0cbdd109",
+      "crates/slim-core/src/tools/mod.rs": "8bde60676829b645c0cf1b1e55358a179a2add42e582df5311165732eb4dd146",
+      "crates/slim-core/src/context/artifacts.rs": "bf6a1a2f1c8133f0a6d559be60d9981e51791fc95409ff689b2f7a157a6aceee",
+      "crates/slim-core/src/session/manual_journal.rs": "9576daa1fd79a72c80e7327e34116e618aeeb8067d61156d80b265a68882605f",
+      "crates/slim-cli/src/headless.rs": "88a077b597b7d904f776701abcc173ffff336934f261a26b1b0b1e3f21c554ea",
+      "crates/slim-tui/src/render.rs": "04867801486c3afd3ae573f5a6e61e35e4dcf3db6da7ab02eac3b7ff235a9ad4",
+      "crates/slim-lsp/src/manager.rs": "7c0000d3e884728539167a42908d402b875a68f01f5770bd455a1abb9d534c40"
+    }
+  },
+  "probe_dependencies_not_in_project_lock": [],
+  "unit_tests": {
+    "command": "cargo test -p slim-core --lib --offline",
+    "passed": 195,
+    "failed": 0,
+    "ignored": 11
+  }
+}

@@ -1,12 +1,16 @@
 mod catalog;
 mod http;
-mod lifecycle;
+mod manager;
+mod spec;
 mod stdio;
 
 pub use catalog::McpCatalog;
-pub use http::authorize_http;
-pub use lifecycle::McpLifecycle;
-pub use stdio::JsonLineFramer;
+pub use manager::McpManager;
+pub use spec::{
+    McpConnection, McpError, McpServerInfo, McpServerSpec, McpServerStatus, McpToolSummary,
+    McpTransport, MCP_PROTOCOL_VERSION,
+};
+pub use stdio::{FramedLine, JsonLineFramer};
 
 pub fn canonical_name(server: &str, tool: &str) -> String {
     format!("mcp.{server}.{tool}")

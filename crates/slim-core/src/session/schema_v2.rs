@@ -127,6 +127,10 @@ pub struct DurableEntry {
     pub parent_entry_id: Option<String>,
     pub operation_id: String,
     pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<crate::provider::ProviderToolCall>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content_blocks: Vec<crate::provider::ProviderContentBlock>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

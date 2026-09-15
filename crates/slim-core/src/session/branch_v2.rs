@@ -12,7 +12,6 @@ use crate::context::{
     estimate_provider_message_tokens, select_compaction_history, CompactionPolicy,
     CompactionReason,
 };
-use crate::provider::ProviderMessage;
 
 /// Metadata returned by the richer branch API. The path-returning
 /// `branch_v2` is kept symmetrical with the existing v1 helper; callers that
@@ -155,27 +154,19 @@ where
 {
     let branch = create_durable_branch(path, child_id, cutoff_seq)?;
     let report = preflight_session(&branch.path)?;
-    let mut messages = Vec::new();
-    let mut entry_ids = Vec::new();
-    for record in &report.records {
-        let DurableRecord::Entry { entry, .. } = record else {
-            continue;
-        };
-        if entry.tool_call_id.is_some() {
-            continue;
-        }
-        let message = match entry.role {
-            super::schema_v2::DurableEntryRole::User => {
-                ProviderMessage::user(entry.content.clone())
-            }
-            super::schema_v2::DurableEntryRole::Assistant => {
-                ProviderMessage::assistant(entry.content.clone(), Vec::new())
-            }
-            super::schema_v2::DurableEntryRole::Tool => continue,
-        };
-        messages.push(message);
-        entry_ids.push(entry.entry_id.clone());
-    }
+    let entries: Vec<_> = report
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            DurableRecord::Entry { entry, .. } => Some(entry),
+            _ => None,
+        })
+        .collect();
+    let Ok(messages) = super::provider_messages_from_records(report.records.iter()) else {
+        // A cutoff inside a tool batch is not a complete conversation to summarize.
+        return Ok(branch);
+    };
+    let entry_ids: Vec<_> = entries.iter().map(|entry| entry.entry_id.clone()).collect();
     let mut policy = CompactionPolicy::default();
     policy.keep_recent_tokens = policy.keep_recent_for_window(32_000);
     let Ok(selection) = select_compaction_history(&messages, &policy) else {
@@ -188,8 +179,9 @@ where
             None
         }
     });
+    let summarized = selection.summarized_for_prompt();
     let prompt = build_summary_prompt_with_checkpoint(
-        &selection.summarized,
+        &summarized,
         previous.map(|checkpoint| checkpoint.summary.as_str()),
     );
     let started = std::time::Instant::now();

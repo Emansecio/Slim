@@ -408,6 +408,7 @@ fn typed_task_mutations_are_revisioned_idempotent_and_restorable() {
         entity_id: "todo".into(),
         revision: 1,
         mutation: TaskMutation::TodoAdd {
+            status: None,
             title: "offline task".into(),
         },
     };
@@ -429,6 +430,7 @@ fn typed_task_mutations_are_revisioned_idempotent_and_restorable() {
                 entity_id: "todo".into(),
                 revision: 3,
                 mutation: TaskMutation::TodoSetStatus {
+                    id: None,
                     status: TaskTodoStatus::Completed,
                 },
             },
@@ -610,7 +612,10 @@ fn child_and_task_mutations_require_policy_and_child_depth_is_derived() {
                 idempotency_key: "unauthorized-task".into(),
                 entity_id: "todo".into(),
                 revision: 1,
-                mutation: TaskMutation::TodoAdd { title: "x".into() },
+                mutation: TaskMutation::TodoAdd {
+                    title: "x".into(),
+                    status: None
+                },
             },
             OperatingMode::Plan,
             AuthorizationGrant::None,
@@ -624,6 +629,7 @@ fn child_and_task_mutations_require_policy_and_child_depth_is_derived() {
                 entity_id: "todo".into(),
                 revision: 1,
                 mutation: TaskMutation::TodoAdd {
+                    status: None,
                     title: "x".repeat(5 * 1024),
                 },
             },
@@ -1029,6 +1035,7 @@ fn task_projection_enforces_todo_plan_and_goal_invariants() {
         entity_id: entity.into(),
         revision: 1,
         mutation: TaskMutation::TodoAdd {
+            status: None,
             title: "todo".into(),
         },
     };
@@ -1046,6 +1053,7 @@ fn task_projection_enforces_todo_plan_and_goal_invariants() {
                 entity_id: "todo-a".into(),
                 revision: 2,
                 mutation: TaskMutation::TodoSetStatus {
+                    id: None,
                     status: TaskTodoStatus::InProgress,
                 },
             },
@@ -1067,6 +1075,7 @@ fn task_projection_enforces_todo_plan_and_goal_invariants() {
                 entity_id: "todo-b".into(),
                 revision: 2,
                 mutation: TaskMutation::TodoSetStatus {
+                    id: None,
                     status: TaskTodoStatus::InProgress,
                 },
             },
@@ -1306,6 +1315,7 @@ fn restore_reauthorizes_task_and_child_facts() {
         entity_id: "todo".into(),
         revision: 1,
         mutation: TaskMutation::TodoAdd {
+            status: None,
             title: "task".into(),
         },
     };

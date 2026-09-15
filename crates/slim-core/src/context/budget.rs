@@ -1,3 +1,5 @@
+use super::compact::CompactionPolicy;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContextBudget {
     pub window_tokens: u64,
@@ -15,15 +17,15 @@ impl ContextBudget {
     }
 
     pub fn threshold_tokens(self) -> u64 {
-        if self.window_tokens >= 1_000_000 {
-            self.window_tokens / 2
-        } else {
-            self.window_tokens.saturating_mul(85) / 100
-        }
+        CompactionPolicy::default().hard_threshold_tokens(self.window_tokens)
     }
 
     pub fn should_compact(self) -> bool {
-        self.used_tokens.saturating_add(self.reserve_tokens) >= self.threshold_tokens()
+        CompactionPolicy::default().is_over_hard(
+            self.used_tokens,
+            self.window_tokens,
+            self.reserve_tokens,
+        )
     }
 
     pub fn can_fit(self, additional_tokens: u64) -> bool {

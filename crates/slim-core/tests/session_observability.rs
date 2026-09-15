@@ -23,6 +23,8 @@ fn entry(seq: u64, content: &str) -> DurableRecord {
             parent_entry_id: None,
             operation_id: format!("op-{seq}"),
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            content_blocks: Vec::new(),
         },
     }
 }
@@ -245,6 +247,8 @@ fn caller_controlled_ids_are_replaced_when_oversized() {
             parent_entry_id: None,
             operation_id: secret_id.clone(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            content_blocks: Vec::new(),
         },
     };
     let projection = DurableAppendProjection::from_record(&record);

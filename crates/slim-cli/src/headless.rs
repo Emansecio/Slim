@@ -5,21 +5,22 @@ use std::time::Duration;
 
 use base64::Engine;
 use serde::Serialize;
-use slim_core::context::CompactionHandle;
+use slim_core::context::{latest_user_instruction_before_boundary, CompactionHandle};
 use slim_core::provider::{
-    clinepass_model, codex_model, command_code_model, open_code_model,
-    resolve_codex_context_window, AnthropicAdapter, ClinePassAdapter, CommandCodeAdapter,
-    HttpProviderClient, OpenAiCodexAdapter, OpenAiCompatibleAdapter, OpenCodeGoAdapter,
+    clinepass_model, codex_model, command_code_model, history_response_cache_scope,
+    open_code_model, resolve_codex_context_window, xai_model, zen_model, AnthropicAdapter,
+    ClinePassAdapter, CommandCodeAdapter, HttpProviderClient, OpenAiCodexAdapter,
+    OpenAiCompatibleAdapter, OpenCodeGoAdapter, OpenCodeZenAdapter, ProviderAdapter,
     ProviderConfig, ProviderContentBlock, ProviderError, ProviderKind, ProviderPricing,
-    ProviderTimeouts, DEFAULT_MAX_OUTPUT_TOKENS,
+    ProviderTimeouts, XaiAdapter, DEFAULT_MAX_OUTPUT_TOKENS,
 };
 use slim_core::runtime::{
     tool_call_is_read_only, AgentLoopConfig, AgentLoopStop, CancellationToken,
 };
 use slim_core::session::{
-    open_resume_v2, preflight_session, DurableErrorClass, DurableOutcome, DurableRepo,
-    ManualExecutor, ManualRunSpec, ProviderResponse, SessionFormat, SessionPreflight,
-    SessionWriter,
+    preflight_session, provider_messages_from_entries, provider_messages_from_records,
+    DurableEntry, DurableErrorClass, DurableOutcome, DurableRepo, DurableSessionHeader, JsonlRepo,
+    ManualRunJournal, ManualRunSpec, ProviderResponse, SessionFormat, SessionPreflight,
 };
 use slim_core::tools::ToolRegistry;
 use slim_core::{
@@ -28,6 +29,7 @@ use slim_core::{
 };
 
 use crate::codex_catalog::{should_fetch_live_codex_catalog, CodexCatalog};
+use crate::command_code_catalog::CommandCodeCatalog;
 use crate::exit_codes::ExitCode;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -80,10 +82,6 @@ impl CodeIntelligenceHandle {
         &self.0
     }
 
-    pub(crate) fn warm_workspace(&self, workspace: std::path::PathBuf) {
-        self.0.warm_workspace(workspace);
-    }
-
     pub(crate) async fn shutdown(&self) {
         self.0.shutdown().await;
     }
@@ -105,6 +103,38 @@ impl PartialEq for CodeIntelligenceHandle {
 }
 
 impl Eq for CodeIntelligenceHandle {}
+
+/// Cloneable identity for the application-scoped MCP manager. Equality is
+/// pointer identity so ProviderRunOptions remains deterministic in tests.
+#[derive(Clone)]
+pub struct McpHandle(Arc<slim_core::mcp::McpManager>);
+
+impl McpHandle {
+    pub fn new(manager: Arc<slim_core::mcp::McpManager>) -> Self {
+        Self(manager)
+    }
+
+    pub fn manager(&self) -> &Arc<slim_core::mcp::McpManager> {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for McpHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpHandle")
+            .field("manager", &"application-scoped")
+            .finish()
+    }
+}
+
+impl PartialEq for McpHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for McpHandle {}
 
 /// Cloneable registry retained by one interactive host across per-turn runtimes.
 #[derive(Clone)]
@@ -139,22 +169,29 @@ impl Eq for SharedToolRegistry {}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProviderRunOptions {
+    /// Stable conversation identity for provider routing, shared across turns.
+    pub provider_session_id: Option<String>,
     pub content_blocks: Vec<ProviderContentBlock>,
     pub history: Vec<ProviderMessage>,
+    pub task_facts: Vec<slim_core::session::DurableFact>,
     pub workspace_root: Option<PathBuf>,
     pub artifact_root: Option<PathBuf>,
     pub context_window_tokens: Option<u64>,
     pub max_output_tokens: Option<u32>,
     pub reasoning_effort: Option<String>,
+    pub codex_fast: bool,
     pub max_turns: Option<usize>,
     /// Mutating-tool budget (write/patch/shell/todo/skill/ask_question).
     pub max_tool_calls: Option<usize>,
     pub max_read_tool_calls: Option<usize>,
+    pub max_total_tool_calls: Option<usize>,
     pub max_result_bytes: Option<usize>,
     pub cancellation: Option<CancellationToken>,
     pub compaction: Option<CompactionHandle>,
     /// Shared for the whole host application; cloned into per-turn runtimes.
     pub code_intelligence: Option<CodeIntelligenceHandle>,
+    /// Application-scoped MCP manager; connections stay lazy per server.
+    pub mcp: Option<McpHandle>,
     /// Native tool snapshots retained for the lifetime of an interactive host.
     pub tool_registry: Option<SharedToolRegistry>,
     /// TUI Plan runs the read-only agent loop. Headless Plan stays abort-only.
@@ -219,6 +256,11 @@ impl ProviderRunOptions {
         self
     }
 
+    pub fn with_max_total_tool_calls(mut self, calls: usize) -> Self {
+        self.max_total_tool_calls = Some(calls);
+        self
+    }
+
     pub fn with_max_result_bytes(mut self, bytes: usize) -> Self {
         self.max_result_bytes = Some(bytes);
         self
@@ -256,6 +298,8 @@ pub struct ProviderHeadlessResult {
     pub output_tokens: Option<u64>,
     pub stop_reason: Option<String>,
     pub stop: String,
+    /// Local stop evidence, independent of whether the model produced a final answer.
+    pub stop_message: Option<String>,
     pub cost_micros: Option<u64>,
     pub usage_complete: bool,
     pub usage_overflowed: bool,
@@ -263,6 +307,17 @@ pub struct ProviderHeadlessResult {
     pub costs: UsageCostSummary,
     pub validation_source: Option<String>,
     pub tool_summary_lines: Vec<String>,
+    /// Typed process observations emitted by native tool executions. These
+    /// remain separate from the legacy tool result/success fields.
+    pub tool_process_facts: Vec<ToolProcessFact>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ToolProcessFact {
+    pub batch_id: String,
+    pub call_id: String,
+    pub name: String,
+    pub process: slim_core::process::ProcessExecutionFacts,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -277,12 +332,11 @@ pub struct UsageCostSummary {
 pub(crate) struct ProviderExecution {
     pub result: ProviderHeadlessResult,
     pub history: Option<Vec<ProviderMessage>>,
+    pub turn_transcript: Vec<ProviderMessage>,
+    pub task_facts: Vec<slim_core::session::DurableFact>,
     pub events: Vec<SessionEvent>,
     pub tool_results: Vec<slim_core::tools::ToolResult>,
-    pub max_mutating_tool_calls: usize,
-    pub max_read_tool_calls: usize,
-    pub max_turns: usize,
-    pub max_output_tokens: u32,
+    pub limits: ToolLoopLimits,
     pub resume_preflight: Option<SessionPreflight>,
 }
 
@@ -290,6 +344,7 @@ pub(crate) struct ProviderExecution {
 pub(crate) struct ToolLoopLimits {
     pub max_mutating_tool_calls: usize,
     pub max_read_tool_calls: usize,
+    pub max_total_tool_calls: usize,
     pub max_turns: usize,
     pub max_output_tokens: u32,
 }
@@ -440,18 +495,53 @@ async fn run_provider_resume_with_preflight_events_inner(
         return Ok(empty_provider_execution(input_required_result(&request)));
     }
     if request.mode == OperatingMode::Plan && !options.allow_plan_loop {
-        return execute_provider_turn_with_skill_async(request, None, options, skill_instructions)
-            .await;
+        return execute_provider_turn_with_local_lsp(
+            request,
+            false,
+            options,
+            skill_instructions,
+            None,
+            None,
+        )
+        .await;
     }
 
     let DurableProviderHistory {
         messages: history,
         parent_entry_id,
-        mut entry_ids,
-        applied_checkpoint_id,
+        entry_ids: _,
+        applied_checkpoint_id: _,
     } = durable_provider_history(&preflight)?;
-    let (mut repo, _plan) =
-        open_resume_v2(&preflight).map_err(|error| resume_error(error.to_string()))?;
+    let workspace = PathBuf::from(
+        &preflight
+            .header
+            .as_ref()
+            .ok_or_else(|| resume_error("missing session header"))?
+            .cwd,
+    );
+    let workspace = std::fs::canonicalize(workspace)
+        .map_err(|error| resume_error(format!("session workspace: {error}")))?;
+    if let Some(requested) = options.workspace_root.as_ref() {
+        let requested = std::fs::canonicalize(requested)
+            .map_err(|error| resume_error(format!("workspace: {error}")))?;
+        if requested != workspace {
+            return Err(resume_error(
+                "requested workspace differs from the session workspace",
+            ));
+        }
+    }
+    // The journal drives its own records; building the full ResumePlan
+    // (reducer + attempt/tool/queue ledgers) here would be discarded work on
+    // every prompt. ensure_resume_preflight already covered the same gates.
+    let repo = JsonlRepo::open_no_repair_expected(
+        &preflight.path,
+        preflight
+            .header
+            .as_ref()
+            .ok_or_else(|| resume_error("missing durable session header"))?,
+        &preflight.records,
+    )
+    .map_err(|error| resume_error(error.to_string()))?;
     let first_seq = repo
         .next_seq()
         .map_err(|error| resume_error(error.to_string()))?;
@@ -459,10 +549,17 @@ async fn run_provider_resume_with_preflight_events_inner(
     let input_entry_id = format!("{operation_id}-input");
     let assistant_entry_id = format!("{operation_id}-assistant");
     let attempt_id = format!("{operation_id}-attempt");
-    let redacted_prompt = redact_secret(&request.prompt, &request.api_key);
-    let mut persisted_messages = history.clone();
-    persisted_messages.push(ProviderMessage::user(redacted_prompt.clone()));
-    entry_ids.push(Some(input_entry_id.clone()));
+    let mut options = options;
+    options.provider_session_id = Some(repo.header().id.clone());
+    options.workspace_root = Some(workspace);
+    // Attach before the first redaction so MCP env/header values are
+    // scrubbed from the journal too.
+    let local_mcp = attach_local_mcp(&mut options);
+    let input_message = redact_durable_message(
+        ProviderMessage::user(&request.prompt).with_content_blocks(options.content_blocks.clone()),
+        &durable_secrets(&request, &options),
+    );
+    let redacted_prompt = input_message.content.clone();
     let mut spec = ManualRunSpec::new(
         operation_id.clone(),
         attempt_id,
@@ -474,36 +571,59 @@ async fn run_provider_resume_with_preflight_events_inner(
     if let Some(parent_entry_id) = parent_entry_id {
         spec = spec.with_parent_entry_id(parent_entry_id);
     }
-    let mut options = options;
-    options.history = history;
-    let compaction_generation = options
-        .compaction
-        .as_ref()
-        .map(slim_core::context::CompactionHandle::generation)
-        .unwrap_or(0);
+    spec.input_content_blocks = input_message.content_blocks;
+    // Same-process TUI continuation keeps the live conversation when it is
+    // the durable prefix plus adapter-scoped reasoning. Cold resume leaves
+    // options.history empty and uses the JSONL reconstruction.
+    if !keep_live_history(&options.history, &history) {
+        options.history = history;
+    }
+    options.task_facts = session_task_facts(&preflight);
     let compaction_handle = options.compaction.clone();
+    let journal = std::sync::Arc::new(std::sync::Mutex::new(
+        ManualRunJournal::start(repo, spec).map_err(|error| resume_error(error.to_string()))?,
+    ));
     let mut executor = DurableProviderExecutor::new(
         request,
         options,
         skill_instructions,
         event_sender,
         interaction_route,
+        journal.clone(),
     );
-    let drive_result =
-        slim_core::session::drive_manual_async(&mut repo, spec, classify_provider_error, || {
-            executor.execute_async()
-        })
-        .await;
+    let drive_result = match executor.execute_async().await {
+        Ok(response) => journal
+            .lock()
+            .map_err(|_| resume_error("durable run lock poisoned"))?
+            .finish(response)
+            .map_err(slim_core::session::ManualDriveError::Persist),
+        Err(error) => {
+            journal
+                .lock()
+                .map_err(|_| resume_error("durable run lock poisoned"))?
+                .fail_attempt(classify_provider_error(&error))
+                .map_err(|error| resume_error(error.to_string()))?;
+            Err(slim_core::session::ManualDriveError::Execute(error))
+        }
+    };
+    if let Some(manager) = local_mcp {
+        manager.disconnect_all().await;
+    }
+    let mut journal_guard = journal
+        .lock()
+        .map_err(|_| resume_error("durable run lock poisoned"))?;
+    let repo = journal_guard.repo_mut();
     match drive_result {
         Ok(()) => {
-            if let Some(commit) = compaction_handle
+            for commit in compaction_handle
                 .as_ref()
-                .filter(|handle| handle.generation() > compaction_generation)
-                .and_then(slim_core::context::CompactionHandle::last_commit)
+                .map(slim_core::context::CompactionHandle::take_commits)
+                .unwrap_or_default()
             {
+                let persisted = durable_provider_history(&SessionPreflight::from_open_repo(repo))?;
                 if let Some(first_kept_entry_id) = durable_checkpoint_anchor(
-                    &persisted_messages,
-                    &entry_ids,
+                    &persisted.messages,
+                    &persisted.entry_ids,
                     commit.first_kept_index,
                     &commit.prefix_fingerprint,
                 ) {
@@ -517,7 +637,7 @@ async fn run_provider_resume_with_preflight_events_inner(
                             summary: commit.summary,
                             first_kept_entry_id,
                             prefix_fingerprint: commit.prefix_fingerprint,
-                            previous_checkpoint_id: applied_checkpoint_id,
+                            previous_checkpoint_id: persisted.applied_checkpoint_id,
                             tokens_before: commit.tokens_before,
                             tokens_after: commit.tokens_after,
                             input_tokens: Some(commit.input_tokens),
@@ -534,7 +654,7 @@ async fn run_provider_resume_with_preflight_events_inner(
             let mut execution = executor
                 .execution
                 .ok_or_else(|| resume_error("durable provider execution produced no result"))?;
-            execution.resume_preflight = Some(SessionPreflight::from_open_repo(&repo));
+            execution.resume_preflight = Some(SessionPreflight::from_open_repo(repo));
             Ok(execution)
         }
         Err(slim_core::session::ManualDriveError::Execute(error)) => {
@@ -567,6 +687,7 @@ fn durable_checkpoint_anchor(
 ) -> Option<String> {
     if messages.len() != entry_ids.len()
         || first_kept_index >= messages.len()
+        || messages[first_kept_index].role == "tool"
         || slim_core::context::compaction_prefix_fingerprint(&messages[..first_kept_index])
             != prefix_fingerprint
     {
@@ -610,11 +731,26 @@ pub(crate) fn ensure_resume_preflight(preflight: &SessionPreflight) -> Result<()
         || preflight.summary.suspended_count() > 0
     {
         return Err(
-            "resume requires an explicit decision for existing pending, claimed, or suspended durable work"
+            "resume requires an explicit decision for existing pending, claimed, or suspended durable work; inspect prior effects, then use Slim --headless --recover PATH --abandon-pending to abandon without replay"
                 .into(),
         );
     }
     Ok(())
+}
+
+pub(crate) fn session_task_facts(
+    preflight: &SessionPreflight,
+) -> Vec<slim_core::session::DurableFact> {
+    preflight
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            slim_core::session::DurableRecord::Fact { fact, .. } if fact.namespace == "task.v1" => {
+                Some(fact.clone())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 struct DurableProviderHistory {
@@ -630,34 +766,18 @@ fn durable_provider_history(
     let mut history = Vec::new();
     let mut entry_ids = Vec::new();
     let mut parent_entry_id = None;
-    for record in &preflight.records {
-        let slim_core::session::DurableRecord::Entry { entry, .. } = record else {
-            continue;
-        };
-        if entry.tool_call_id.is_some() {
-            return Err(resume_error(
-                "resume cannot reconstruct durable tool-call metadata safely",
-            ));
-        }
+    let entries: Vec<_> = preflight
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            slim_core::session::DurableRecord::Entry { entry, .. } => Some(entry),
+            _ => None,
+        })
+        .collect();
+    history.extend(provider_messages_from_records(preflight.records.iter()).map_err(resume_error)?);
+    for entry in entries {
         parent_entry_id = Some(entry.entry_id.clone());
-        match entry.role {
-            slim_core::session::DurableEntryRole::User => {
-                history.push(ProviderMessage::user(entry.content.clone()));
-                entry_ids.push(Some(entry.entry_id.clone()));
-            }
-            slim_core::session::DurableEntryRole::Assistant => {
-                history.push(ProviderMessage::assistant(
-                    entry.content.clone(),
-                    Vec::new(),
-                ));
-                entry_ids.push(Some(entry.entry_id.clone()));
-            }
-            slim_core::session::DurableEntryRole::Tool => {
-                return Err(resume_error(
-                    "resume cannot reconstruct durable tool-role history safely",
-                ))
-            }
-        }
+        entry_ids.push(Some(entry.entry_id.clone()));
     }
     let mut applied_checkpoint_id: Option<String> = None;
     for checkpoint in preflight.records.iter().filter_map(|record| {
@@ -677,6 +797,7 @@ fn durable_provider_history(
         };
         let prefix = slim_core::context::compaction_prefix_fingerprint(&history[..anchor_index]);
         if prefix != checkpoint.prefix_fingerprint
+            || history[anchor_index].role == "tool"
             || checkpoint.summary.trim().is_empty()
             || checkpoint.summary.len() > slim_core::session::MAX_COMPACTION_SUMMARY_BYTES
         {
@@ -697,6 +818,12 @@ fn durable_provider_history(
             )),
         ];
         let mut restored_ids = vec![entry_ids[root_index].clone(), None];
+        if let Some((pinned_index, pinned)) =
+            latest_user_instruction_before_boundary(&history, anchor_index)
+        {
+            restored.push(pinned);
+            restored_ids.push(entry_ids[pinned_index].clone());
+        }
         restored.extend(history[anchor_index..].iter().cloned());
         restored_ids.extend(entry_ids[anchor_index..].iter().cloned());
         history = restored;
@@ -717,13 +844,76 @@ pub(crate) fn resume_messages_from_preflight(
     durable_provider_history(preflight).map(|history| history.messages)
 }
 
-fn redact_secret(input: &str, secret: &str) -> String {
-    let redacted = crate::redact(input);
-    if secret.is_empty() {
-        redacted
-    } else {
-        redacted.replace(secret, "[REDACTED]")
+fn redact_secret(input: &str, secrets: &[String]) -> String {
+    let mut redacted = crate::redact(input);
+    for secret in secrets {
+        if !secret.is_empty() {
+            redacted = redacted.replace(secret, "[REDACTED]");
+        }
     }
+    redacted
+}
+
+/// API key + every configured MCP env/header value: the set scrubbed from
+/// anything persisted to the durable journal.
+fn durable_secrets(request: &ProviderRequest, options: &ProviderRunOptions) -> Vec<String> {
+    let mut secrets = vec![request.api_key.clone()];
+    if let Some(mcp) = options.mcp.as_ref() {
+        secrets.extend(mcp.manager().sensitive_values());
+    }
+    secrets
+}
+
+fn durable_visible_eq(left: &ProviderMessage, right: &ProviderMessage) -> bool {
+    left.role == right.role
+        && slim_core::without_workspace_snapshot(&left.content)
+            == slim_core::without_workspace_snapshot(&right.content)
+        && left.name == right.name
+        && left.tool_call_id == right.tool_call_id
+        && left.tool_calls == right.tool_calls
+        && left.content_blocks == right.content_blocks
+}
+
+fn keep_live_history(live: &[ProviderMessage], durable: &[ProviderMessage]) -> bool {
+    !live.is_empty()
+        && live.len() == durable.len()
+        && live
+            .iter()
+            .zip(durable)
+            .all(|(left, right)| durable_visible_eq(left, right))
+}
+
+fn bind_history_scope<A>(
+    adapter: A,
+    model: &str,
+    history: &[ProviderMessage],
+    bind: impl FnOnce(A, u64) -> A,
+) -> A {
+    match history_response_cache_scope(history, model) {
+        Some(scope) => bind(adapter, scope),
+        None => adapter,
+    }
+}
+
+fn redact_durable_message(mut message: ProviderMessage, secrets: &[String]) -> ProviderMessage {
+    message.content = redact_secret(&message.content, secrets);
+    message.name = message.name.map(|name| redact_secret(&name, secrets));
+    message.tool_call_id = message.tool_call_id.map(|id| redact_secret(&id, secrets));
+    for call in &mut message.tool_calls {
+        call.id = redact_secret(&call.id, secrets);
+        call.name = redact_secret(&call.name, secrets);
+        call.arguments = redact_secret(&call.arguments, secrets);
+    }
+    for block in &mut message.content_blocks {
+        match block {
+            ProviderContentBlock::Text(text) => *text = redact_secret(text, secrets),
+            ProviderContentBlock::Unsupported { kind } => *kind = redact_secret(kind, secrets),
+            _ => {}
+        }
+    }
+    message.responses_reasoning.clear();
+    message.chat_reasoning = None;
+    message
 }
 
 fn resume_error(message: impl Into<String>) -> ProviderError {
@@ -749,6 +939,8 @@ fn input_required_result(request: &ProviderRequest) -> ProviderHeadlessResult {
         costs: UsageCostSummary::default(),
         validation_source: None,
         tool_summary_lines: Vec::new(),
+        tool_process_facts: Vec::new(),
+        stop_message: None,
     }
 }
 
@@ -759,6 +951,7 @@ struct DurableProviderExecutor {
     event_sender: Option<SessionEventSender>,
     interaction_route: Option<InteractionRoute>,
     execution: Option<ProviderExecution>,
+    journal: std::sync::Arc<std::sync::Mutex<ManualRunJournal>>,
 }
 
 impl DurableProviderExecutor {
@@ -768,6 +961,7 @@ impl DurableProviderExecutor {
         skill_instructions: Option<SkillInstructions>,
         event_sender: Option<SessionEventSender>,
         interaction_route: Option<InteractionRoute>,
+        journal: std::sync::Arc<std::sync::Mutex<ManualRunJournal>>,
     ) -> Self {
         Self {
             request,
@@ -776,21 +970,17 @@ impl DurableProviderExecutor {
             event_sender,
             interaction_route,
             execution: None,
+            journal,
         }
     }
 }
 
 impl DurableProviderExecutor {
     async fn execute_async(&mut self) -> Result<ProviderResponse, ProviderError> {
-        let mut options = self.options.clone();
-        if self.interaction_route.is_none() {
-            // Headless durable resume has no interactive decision surface and
-            // keeps the existing fail-closed tool contract.
-            options.max_tool_calls = Some(0);
-            options.max_read_tool_calls = Some(0);
-        }
-        let execution = execute_provider_turn_with_events_and_interaction_async(
+        let options = self.options.clone();
+        let mut execution = execute_provider_turn_with_local_lsp(
             self.request.clone(),
+            TranscriptCapture::Durable(self.journal.clone()),
             options,
             self.skill_instructions.clone(),
             self.event_sender.clone(),
@@ -809,39 +999,88 @@ impl DurableProviderExecutor {
                 output_tokens,
             }),
         };
-        let outcome = match execution.result.code {
-            ExitCode::Success => slim_core::session::DurableOutcome::Success,
-            ExitCode::Cancelled => slim_core::session::DurableOutcome::Cancelled,
-            _ => slim_core::session::DurableOutcome::Failed,
+        let mut pending_tools = std::collections::BTreeSet::new();
+        for event in &execution.events {
+            match &event.kind {
+                EventKind::ToolStarted {
+                    batch_id, call_id, ..
+                } => {
+                    pending_tools.insert((batch_id, call_id));
+                }
+                EventKind::ToolFinished {
+                    batch_id, call_id, ..
+                } => {
+                    pending_tools.remove(&(batch_id, call_id));
+                }
+                _ => {}
+            }
+        }
+        let outcome = if !pending_tools.is_empty() {
+            DurableOutcome::Unknown
+        } else {
+            match execution.result.code {
+                ExitCode::Success => slim_core::session::DurableOutcome::Success,
+                ExitCode::Cancelled => slim_core::session::DurableOutcome::Cancelled,
+                _ => slim_core::session::DurableOutcome::Failed,
+            }
         };
-        let response =
+        let mut response =
             ProviderResponse::with_outcome(execution.result.text.clone(), usage, outcome);
+        response.transcript = std::mem::take(&mut execution.turn_transcript);
+        response.task_facts = execution
+            .task_facts
+            .iter()
+            .skip(self.options.task_facts.len())
+            .cloned()
+            .collect();
+        if execution.result.stop == "provider_error" {
+            // The durable writer prefers a nonempty transcript over content.
+            // Keep this explicitly labelled runtime failure after completed tools.
+            response.transcript.push(ProviderMessage::assistant(
+                format!(
+                    "[Run failed]\n{}",
+                    execution
+                        .result
+                        .stop_message
+                        .as_deref()
+                        .unwrap_or(&execution.result.text)
+                ),
+                Vec::new(),
+            ));
+        }
+        if execution.result.stop != "provider_error" {
+            if let Some(message) = &execution.result.stop_message {
+                response.transcript.push(ProviderMessage::assistant(
+                    format!("{}\n{message}", run_notice_label(&execution.result)),
+                    Vec::new(),
+                ));
+            }
+        }
+        // These terminal explanations are added by the CLI after the runtime's
+        // incrementally persisted conversation.
+        if let Some(message) = response.transcript.last().filter(|_| {
+            execution.result.stop == "provider_error" || execution.result.stop_message.is_some()
+        }) {
+            self.journal
+                .lock()
+                .map_err(|_| resume_error("durable run lock poisoned"))?
+                .record_message(message.clone())
+                .map_err(|error| resume_error(error.to_string()))?;
+        }
         self.execution = Some(execution);
         Ok(response)
     }
 }
 
-impl ManualExecutor for DurableProviderExecutor {
-    type Error = ProviderError;
-
-    fn execute(
-        &mut self,
-        _effect: &slim_core::session::Effect,
-    ) -> Result<ProviderResponse, Self::Error> {
-        block_on_provider(self.execute_async())
-    }
-
-    fn classify_error(&self, error: &Self::Error) -> DurableErrorClass {
-        classify_provider_error(error)
-    }
-}
-
 fn classify_provider_error(error: &ProviderError) -> DurableErrorClass {
     match error {
-        ProviderError::Transport { safe_to_retry } => DurableErrorClass::Transport {
+        ProviderError::Transport { safe_to_retry, .. } => DurableErrorClass::Transport {
             safe_to_retry: *safe_to_retry,
         },
-        ProviderError::Remote { .. } => DurableErrorClass::Remote,
+        ProviderError::Api { .. }
+        | ProviderError::TransientRemote { .. }
+        | ProviderError::Remote { .. }
+        | ProviderError::Http { .. } => DurableErrorClass::Remote,
         ProviderError::InvalidResponse { .. } | ProviderError::MalformedToolCall => {
             DurableErrorClass::Invalid
         }
@@ -860,58 +1099,102 @@ fn run_provider_headless_inner(
 pub(crate) fn execute_provider_turn(
     request: ProviderRequest,
     session_path: Option<&Path>,
-    options: ProviderRunOptions,
+    mut options: ProviderRunOptions,
 ) -> Result<ProviderExecution, ProviderError> {
-    execute_provider_turn_with_skill(request, session_path, options, None)
-}
-
-fn execute_provider_turn_with_skill(
-    request: ProviderRequest,
-    session_path: Option<&Path>,
-    options: ProviderRunOptions,
-    skill_instructions: Option<SkillInstructions>,
-) -> Result<ProviderExecution, ProviderError> {
-    block_on_provider(execute_provider_turn_with_skill_async(
-        request,
-        session_path.map(Path::to_path_buf),
-        options,
-        skill_instructions,
+    if request.prompt.trim().is_empty() {
+        return Ok(empty_provider_execution(input_required_result(&request)));
+    }
+    if let Some(path) = session_path {
+        let workspace = options
+            .workspace_root
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(std::env::current_dir)
+            .and_then(std::fs::canonicalize)
+            .map_err(|error| resume_error(format!("workspace: {error}")))?;
+        let cwd = workspace
+            .to_str()
+            .ok_or_else(|| resume_error("workspace path is not valid Unicode"))?;
+        let id = format!("slim-{}-{}", std::process::id(), next_session_suffix());
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| resume_error("system clock is before the Unix epoch"))?
+            .as_nanos()
+            .to_string();
+        let mut repo = JsonlRepo::create(
+            path,
+            DurableSessionHeader::new(&id, timestamp, cwd, None, None),
+        )
+        .map_err(|error| ProviderError::InvalidResponse {
+            message: format!("session: {error}; use --resume for an existing session"),
+        })?;
+        let mut parent = None;
+        let mut entries = Vec::new();
+        for (index, message) in std::mem::take(&mut options.history).into_iter().enumerate() {
+            let message = redact_durable_message(message, &durable_secrets(&request, &options));
+            let entry_id = format!("{id}-history-{index}");
+            entries.push(
+                DurableEntry::from_provider_message(
+                    entry_id.clone(),
+                    parent,
+                    format!("{id}-history"),
+                    message,
+                )
+                .map_err(resume_error)?,
+            );
+            parent = Some(entry_id);
+        }
+        provider_messages_from_entries(&entries).map_err(resume_error)?;
+        repo.append_batch(
+            entries
+                .into_iter()
+                .enumerate()
+                .map(|(index, entry)| slim_core::session::DurableRecord::Entry {
+                    seq: index as u64,
+                    entry,
+                })
+                .collect(),
+        )
+        .map_err(|error| resume_error(error.to_string()))?;
+        let preflight = SessionPreflight::from_open_repo(&repo);
+        drop(repo);
+        options.workspace_root = Some(workspace);
+        return run_provider_resume_with_preflight_events(request, preflight, options, None);
+    }
+    block_on_provider(execute_provider_turn_with_local_lsp(
+        request, false, options, None, None, None,
     ))
 }
 
-async fn execute_provider_turn_with_skill_async(
-    request: ProviderRequest,
-    session_path: Option<PathBuf>,
-    mut options: ProviderRunOptions,
-    skill_instructions: Option<SkillInstructions>,
-) -> Result<ProviderExecution, ProviderError> {
-    let local_code_intelligence = attach_local_code_intelligence(&mut options);
-    let result = execute_provider_turn_async(
-        request,
-        session_path,
-        options,
-        skill_instructions,
-        None,
-        None,
-    )
-    .await;
-    if let Some(manager) = local_code_intelligence {
-        manager.shutdown().await;
-    }
-    result
+pub(crate) enum TranscriptCapture {
+    None,
+    Memory,
+    Durable(std::sync::Arc<std::sync::Mutex<ManualRunJournal>>),
 }
 
-async fn execute_provider_turn_with_events_and_interaction_async(
+impl From<bool> for TranscriptCapture {
+    fn from(capture: bool) -> Self {
+        if capture {
+            Self::Memory
+        } else {
+            Self::None
+        }
+    }
+}
+
+async fn execute_provider_turn_with_local_lsp(
     request: ProviderRequest,
+    capture_transcript: impl Into<TranscriptCapture>,
     mut options: ProviderRunOptions,
     skill_instructions: Option<SkillInstructions>,
     event_sender: Option<SessionEventSender>,
     interaction_route: Option<InteractionRoute>,
 ) -> Result<ProviderExecution, ProviderError> {
     let local_code_intelligence = attach_local_code_intelligence(&mut options);
+    let local_mcp = attach_local_mcp(&mut options);
     let result = execute_provider_turn_async(
         request,
-        None,
+        capture_transcript,
         options,
         skill_instructions,
         event_sender,
@@ -920,6 +1203,9 @@ async fn execute_provider_turn_with_events_and_interaction_async(
     .await;
     if let Some(manager) = local_code_intelligence {
         manager.shutdown().await;
+    }
+    if let Some(manager) = local_mcp {
+        manager.disconnect_all().await;
     }
     result
 }
@@ -939,15 +1225,16 @@ fn shared_provider_runtime() -> Result<&'static tokio::runtime::Runtime, Provide
     if let Some(runtime) = PROVIDER_RUNTIME.get() {
         return Ok(runtime);
     }
-    let runtime = tokio::runtime::Runtime::new().map_err(|error| {
-        ProviderError::InvalidResponse {
+    let runtime =
+        tokio::runtime::Runtime::new().map_err(|error| ProviderError::InvalidResponse {
             message: format!("runtime: {error}"),
-        }
-    })?;
+        })?;
     let _ = PROVIDER_RUNTIME.set(runtime);
-    PROVIDER_RUNTIME.get().ok_or_else(|| ProviderError::InvalidResponse {
-        message: "runtime: shared provider runtime unavailable".into(),
-    })
+    PROVIDER_RUNTIME
+        .get()
+        .ok_or_else(|| ProviderError::InvalidResponse {
+            message: "runtime: shared provider runtime unavailable".into(),
+        })
 }
 
 fn attach_local_code_intelligence(
@@ -964,56 +1251,30 @@ fn attach_local_code_intelligence(
     Some(handle)
 }
 
-/// Headless-only stderr telemetry. A live TUI projection (`event_sender`)
-/// must not print here: the composer holds the cursor, and Windows raw mode
-/// paints/injects the line into the input box.
-#[cfg(test)]
-fn provider_cache_report_line(
-    stats: &slim_core::provider::ProviderCacheStats,
-    interactive_surface: bool,
-) -> Option<String> {
-    if interactive_surface || (stats.hits == 0 && stats.misses == 0) {
+fn attach_local_mcp(options: &mut ProviderRunOptions) -> Option<Arc<slim_core::mcp::McpManager>> {
+    if options.mcp.is_some() {
         return None;
     }
-    let total = stats.hits.saturating_add(stats.misses);
-    Some(format!(
-        "SLIM_PROVIDER_CACHE hits={} misses={} hit_rate={:.2}% evictions={} \
-         entries={} retained_bytes={}",
-        stats.hits,
-        stats.misses,
-        stats.hits as f64 * 100.0 / total as f64,
-        stats.evictions,
-        stats.entries,
-        stats.retained_bytes,
-    ))
+    let layered = crate::config::load_layered().ok()?;
+    let cwd = options
+        .workspace_root
+        .clone()
+        .or_else(|| std::env::current_dir().ok())?;
+    let manager = crate::mcp::build_mcp_manager(&layered.mcp, &cwd)?;
+    options.mcp = Some(McpHandle::new(Arc::clone(&manager)));
+    Some(manager)
 }
 
 pub(crate) async fn execute_provider_turn_async(
     request: ProviderRequest,
-    session_path: Option<PathBuf>,
+    capture_transcript: impl Into<TranscriptCapture>,
     options: ProviderRunOptions,
     skill_instructions: Option<SkillInstructions>,
     event_sender: Option<SessionEventSender>,
     interaction_route: Option<slim_core::InteractionRoute>,
 ) -> Result<ProviderExecution, ProviderError> {
     if request.prompt.trim().is_empty() {
-        return Ok(empty_provider_execution(ProviderHeadlessResult {
-            code: ExitCode::InputRequired,
-            provider: request.kind,
-            model: request.model,
-            text: "input_required".into(),
-            input_tokens: None,
-            output_tokens: None,
-            stop_reason: None,
-            stop: "input_required".into(),
-            cost_micros: None,
-            usage_complete: false,
-            usage_overflowed: false,
-            usage: UsageTotals::default(),
-            costs: UsageCostSummary::default(),
-            validation_source: None,
-            tool_summary_lines: Vec::new(),
-        }));
+        return Ok(empty_provider_execution(input_required_result(&request)));
     }
     let skill_user_prefix = skill_instructions
         .as_ref()
@@ -1036,18 +1297,27 @@ pub(crate) async fn execute_provider_turn_async(
             costs: UsageCostSummary::default(),
             validation_source: None,
             tool_summary_lines: Vec::new(),
+            tool_process_facts: Vec::new(),
+            stop_message: None,
         }));
     }
 
-    let open_code_spec = if request.kind == ProviderKind::OpenCodeGo {
-        Some(
-            open_code_model(&request.model).ok_or_else(|| ProviderError::InvalidResponse {
-                message: format!("unsupported OpenCode Go model: {}", request.model),
-            })?,
-        )
-    } else {
-        None
-    };
+    let open_code_spec =
+        match request.kind {
+            ProviderKind::OpenCodeGo => Some(open_code_model(&request.model).ok_or_else(|| {
+                ProviderError::InvalidResponse {
+                    message: format!("unsupported OpenCode Go model: {}", request.model),
+                }
+            })?),
+            ProviderKind::OpenCodeZen => {
+                Some(
+                    zen_model(&request.model).ok_or_else(|| ProviderError::InvalidResponse {
+                        message: format!("unsupported OpenCode Zen model: {}", request.model),
+                    })?,
+                )
+            }
+            _ => None,
+        };
     let catalog_override_absent = options.context_window_tokens.is_none()
         && std::env::var_os("SLIM_CONTEXT_WINDOW_TOKENS").is_none();
     let live_codex = if request.kind == ProviderKind::OpenAiCodex
@@ -1068,6 +1338,15 @@ pub(crate) async fn execute_provider_turn_async(
     } else {
         None
     };
+    // Headless runs keep the Command Code cache warm for the next
+    // invocation; the lookup itself only reads the on-disk snapshot.
+    if request.kind == ProviderKind::CommandCode && catalog_override_absent {
+        if let Ok(catalog) = CommandCodeCatalog::production() {
+            tokio::spawn(async move {
+                let _ = catalog.refresh().await;
+            });
+        }
+    }
     let context_window_tokens = if catalog_override_absent {
         if let Some(model) = open_code_spec {
             model
@@ -1092,25 +1371,12 @@ pub(crate) async fn execute_provider_turn_async(
                 .is_some_and(|limit| max_output_tokens > limit)
         {
             return Err(ProviderError::InvalidResponse {
-                message: "OpenCode Go context or output limit exceeds model metadata".into(),
-            });
-        }
-        if reasoning_effort
-            .as_deref()
-            .is_some_and(|effort| !model.reasoning_levels.contains(&effort))
-        {
-            return Err(ProviderError::InvalidResponse {
-                message: "unsupported OpenCode Go reasoning effort".into(),
-            });
-        }
-        if options
-            .content_blocks
-            .iter()
-            .any(|block| matches!(block, ProviderContentBlock::Image { .. }))
-            && !model.accepts_images
-        {
-            return Err(ProviderError::InvalidResponse {
-                message: format!("OpenCode Go model {} does not accept images", model.id),
+                message: if request.kind == ProviderKind::OpenCodeZen {
+                    "OpenCode Zen context or output limit exceeds model metadata"
+                } else {
+                    "OpenCode Go context or output limit exceeds model metadata"
+                }
+                .into(),
             });
         }
     }
@@ -1127,21 +1393,9 @@ pub(crate) async fn execute_provider_turn_async(
                 message: format!("current directory: {error}"),
             })?,
         );
-    let mut session_writer = if let Some(path) = session_path.as_ref() {
-        let cwd_text = cwd.display().to_string();
-        let session_id = format!("slim-{}-{}", std::process::id(), next_session_suffix());
-        Some(
-            SessionWriter::create(path, &session_id, &cwd_text).map_err(|error| {
-                ProviderError::InvalidResponse {
-                    message: format!("session: {error}"),
-                }
-            })?,
-        )
-    } else {
-        None
-    };
     let max_mutating_tool_calls = resolve_max_mutating_tool_calls(&options)?;
     let max_read_tool_calls = resolve_max_read_tool_calls(&options)?;
+    let max_total_tool_calls = resolve_max_total_tool_calls(&options)?;
     let max_turns = resolve_max_turns(&options)?;
     let max_result_bytes = resolve_max_result_bytes(options.max_result_bytes)?;
     let artifact_root = options
@@ -1152,6 +1406,14 @@ pub(crate) async fn execute_provider_turn_async(
             message: format!("artifact store: {error}"),
         }
     })?;
+    match capture_transcript.into() {
+        TranscriptCapture::None => {}
+        TranscriptCapture::Memory => runtime.capture_turn_transcript(),
+        TranscriptCapture::Durable(journal) => {
+            runtime.capture_turn_transcript();
+            runtime.app.set_run_journal(journal);
+        }
+    }
     if let Some(tools) = options.tool_registry.as_ref() {
         runtime.set_tool_registry(tools.registry());
     }
@@ -1173,10 +1435,16 @@ pub(crate) async fn execute_provider_turn_async(
         runtime.set_background_compaction_enabled(true);
     }
     runtime.register_sensitive_value(&request.api_key);
+    runtime.restore_task_facts(&options.task_facts, &cwd)?;
     // Per-turn Runtime, application-scoped language-server pool.
     if let Some(code_intelligence) = options.code_intelligence.as_ref() {
         runtime.set_code_intelligence(code_intelligence.manager().clone());
-        code_intelligence.warm_workspace(cwd.clone());
+    }
+    if let Some(mcp) = options.mcp.as_ref() {
+        for value in mcp.manager().sensitive_values() {
+            runtime.register_sensitive_value(value);
+        }
+        runtime.set_mcp_manager(Some(mcp.manager().clone()));
     }
     let provider_timeouts = ProviderTimeouts::production(request.timeout);
     let mut loop_config = AgentLoopConfig {
@@ -1187,10 +1455,12 @@ pub(crate) async fn execute_provider_turn_async(
     loop_config.max_turns = max_turns;
     loop_config.max_mutating_tool_calls = max_mutating_tool_calls;
     loop_config.max_read_tool_calls = max_read_tool_calls;
+    loop_config.max_total_tool_calls = max_total_tool_calls;
     loop_config.max_result_bytes = max_result_bytes;
     let tool_limits = ToolLoopLimits {
         max_mutating_tool_calls: loop_config.max_mutating_tool_calls,
         max_read_tool_calls: loop_config.max_read_tool_calls,
+        max_total_tool_calls: loop_config.max_total_tool_calls,
         max_turns: loop_config.max_turns,
         max_output_tokens,
     };
@@ -1200,7 +1470,7 @@ pub(crate) async fn execute_provider_turn_async(
     };
     let initial_message =
         ProviderMessage::user(user_text).with_content_blocks(options.content_blocks);
-    let mut initial_messages = options.history.clone();
+    let mut initial_messages = options.history;
     initial_messages.push(initial_message);
     let loop_result = match provider {
         ProviderKind::OpenAiCompatible => {
@@ -1211,6 +1481,13 @@ pub(crate) async fn execute_provider_turn_async(
                 config = config.with_reasoning_effort(effort);
             }
             let adapter = OpenAiCompatibleAdapter::new(config)?;
+            let model = adapter.model().to_owned();
+            let adapter = bind_history_scope(
+                adapter,
+                &model,
+                &initial_messages,
+                OpenAiCompatibleAdapter::with_response_cache_scope_id,
+            );
             let client = HttpProviderClient::with_shared_transport(adapter, provider_timeouts)?;
             runtime
                 .run_agent_loop_with_messages(
@@ -1241,7 +1518,14 @@ pub(crate) async fn execute_provider_turn_async(
             if let Some(effort) = reasoning_effort.as_deref() {
                 config = config.with_reasoning_effort(effort);
             }
-            let adapter = OpenAiCodexAdapter::new(config)?;
+            let adapter = OpenAiCodexAdapter::new(config)?.with_fast_mode(options.codex_fast);
+            let model = adapter.model().to_owned();
+            let adapter = bind_history_scope(
+                adapter,
+                &model,
+                &initial_messages,
+                OpenAiCodexAdapter::with_response_cache_scope_id,
+            );
             let client = HttpProviderClient::with_shared_transport(adapter, provider_timeouts)?;
             runtime
                 .run_agent_loop_with_messages(
@@ -1255,12 +1539,22 @@ pub(crate) async fn execute_provider_turn_async(
                 .await
         }
         ProviderKind::Anthropic => {
-            let config = if request.account_id.is_some() {
+            let mut config = if request.account_id.is_some() {
                 ProviderConfig::anthropic_oauth(request.endpoint, request.model, api_key.clone())
             } else {
                 ProviderConfig::anthropic(request.endpoint, request.model, api_key.clone())
             };
+            if let Some(effort) = reasoning_effort.as_deref() {
+                config = config.with_reasoning_effort(effort);
+            }
             let adapter = AnthropicAdapter::new(config.with_max_output_tokens(max_output_tokens))?;
+            let model = adapter.model().to_owned();
+            let adapter = bind_history_scope(
+                adapter,
+                &model,
+                &initial_messages,
+                AnthropicAdapter::with_response_cache_scope_id,
+            );
             let client = HttpProviderClient::with_shared_transport(adapter, provider_timeouts)?;
             runtime
                 .run_agent_loop_with_messages(
@@ -1281,6 +1575,50 @@ pub(crate) async fn execute_provider_turn_async(
                 reasoning_effort.as_deref(),
             )?
             .with_max_output_tokens(max_output_tokens);
+            let adapter = match options.provider_session_id.as_deref() {
+                Some(id) => adapter.with_session_id(id),
+                None => adapter,
+            };
+            adapter.validate_messages(&initial_messages)?;
+            let model = adapter.model().to_owned();
+            let adapter = bind_history_scope(
+                adapter,
+                &model,
+                &initial_messages,
+                OpenCodeGoAdapter::with_response_cache_scope_id,
+            );
+            let client = HttpProviderClient::with_shared_transport(adapter, provider_timeouts)?;
+            runtime
+                .run_agent_loop_with_messages(
+                    &client,
+                    &initial_messages,
+                    request.mode,
+                    &cwd,
+                    1,
+                    loop_config,
+                )
+                .await
+        }
+        ProviderKind::OpenCodeZen => {
+            let adapter = OpenCodeZenAdapter::new(
+                &request.endpoint,
+                &request.model,
+                &api_key,
+                reasoning_effort.as_deref(),
+            )?
+            .with_max_output_tokens(max_output_tokens);
+            let adapter = match options.provider_session_id.as_deref() {
+                Some(id) => adapter.with_session_id(id),
+                None => adapter,
+            };
+            adapter.validate_messages(&initial_messages)?;
+            let model = adapter.model().to_owned();
+            let adapter = bind_history_scope(
+                adapter,
+                &model,
+                &initial_messages,
+                OpenCodeZenAdapter::with_response_cache_scope_id,
+            );
             let client = HttpProviderClient::with_shared_transport(adapter, provider_timeouts)?;
             runtime
                 .run_agent_loop_with_messages(
@@ -1299,7 +1637,15 @@ pub(crate) async fn execute_provider_turn_async(
                 &request.model,
                 &api_key,
                 reasoning_effort.as_deref(),
-            )?;
+            )?
+            .with_max_output_tokens(max_output_tokens);
+            let model = adapter.model().to_owned();
+            let adapter = bind_history_scope(
+                adapter,
+                &model,
+                &initial_messages,
+                ClinePassAdapter::with_response_cache_scope_id,
+            );
             let client = HttpProviderClient::with_shared_transport(adapter, provider_timeouts)?;
             runtime
                 .run_agent_loop_with_messages(
@@ -1318,7 +1664,43 @@ pub(crate) async fn execute_provider_turn_async(
                 &request.model,
                 &api_key,
                 reasoning_effort.as_deref(),
-            )?;
+            )?
+            .with_max_output_tokens(max_output_tokens)
+            .with_zero_data_retention(command_code_zero_data_retention());
+            let model = adapter.model().to_owned();
+            let adapter = bind_history_scope(
+                adapter,
+                &model,
+                &initial_messages,
+                CommandCodeAdapter::with_response_cache_scope_id,
+            );
+            let client = HttpProviderClient::with_shared_transport(adapter, provider_timeouts)?;
+            runtime
+                .run_agent_loop_with_messages(
+                    &client,
+                    &initial_messages,
+                    request.mode,
+                    &cwd,
+                    1,
+                    loop_config,
+                )
+                .await
+        }
+        ProviderKind::Xai => {
+            let adapter = XaiAdapter::new(
+                &request.endpoint,
+                &request.model,
+                &api_key,
+                reasoning_effort.as_deref(),
+            )?
+            .with_max_output_tokens(max_output_tokens);
+            let model = adapter.model().to_owned();
+            let adapter = bind_history_scope(
+                adapter,
+                &model,
+                &initial_messages,
+                XaiAdapter::with_response_cache_scope_id,
+            );
             let client = HttpProviderClient::with_shared_transport(adapter, provider_timeouts)?;
             runtime
                 .run_agent_loop_with_messages(
@@ -1335,13 +1717,6 @@ pub(crate) async fn execute_provider_turn_async(
     .map_err(|error| redact_provider_error(error, &api_key));
 
     let events = runtime.app.drain_events();
-    if let Some(writer) = session_writer.as_mut() {
-        writer
-            .append_batch(&events)
-            .map_err(|error| ProviderError::InvalidResponse {
-                message: format!("session: {error}"),
-            })?;
-    }
 
     let mut text = String::new();
     let mut tool_text = Vec::new();
@@ -1359,6 +1734,8 @@ pub(crate) async fn execute_provider_turn_async(
     if text.is_empty() {
         text = tool_text.join("\n");
     }
+    let has_partial_output = !text.trim().is_empty();
+    let mut provider_failure = None;
     let (validated_completion, stop, code, tool_results) = match loop_result {
         Ok(loop_result) => (
             derive_validated_completion(loop_result.stop, &events),
@@ -1368,17 +1745,54 @@ pub(crate) async fn execute_provider_turn_async(
         ),
         Err(error) => {
             let (code, stop, message) = provider_failure_details(error);
-            text = message;
+            if !has_partial_output {
+                text.clone_from(&message);
+            }
+            provider_failure = Some(message);
             (false, stop.to_owned(), code, Vec::new())
         }
     };
+    let stop_message = if !matches!(code, ExitCode::Success | ExitCode::Cancelled) {
+        let cause = if stop == "provider_error" {
+            let failure = provider_failure.as_deref().unwrap_or(&text);
+            if events.iter().rev().find_map(|event| match event.kind {
+                EventKind::ContextSnapshot { request_kind, .. } => Some(request_kind),
+                _ => None,
+            }) == Some(slim_core::RequestKind::Compaction)
+            {
+                format!("Foreground compaction failed: {failure}")
+            } else {
+                failure.to_owned()
+            }
+        } else {
+            format_run_stop_message(&stop, &tool_results, tool_limits)
+        };
+        Some(stopped_context(cause, &runtime, &events))
+    } else if code == ExitCode::Success {
+        pending_task_summary(&runtime)
+    } else {
+        None
+    };
+    if stop == "provider_error" && !has_partial_output {
+        if let Some(message) = &stop_message {
+            text.clone_from(message);
+        }
+    }
     let usage = UsageTotals::from_events(&events, validated_completion);
     let (input_tokens, output_tokens) = legacy_provider_usage(&usage);
     let costs = cost_summary_for_usage(&usage, resolve_pricing());
     let cost_micros = costs.total_micros;
     text = runtime.redact_sensitive(&text);
-    let history = runtime.conversation().to_vec();
+    let mut history = runtime.conversation().to_vec();
+    if let Some(prefix) = skill_user_prefix.as_deref() {
+        for msg in &mut history {
+            if msg.role == "user" && msg.content.starts_with(prefix) {
+                msg.content = msg.content[prefix.len()..].to_string();
+            }
+        }
+    }
     let tool_summary_lines = summarize_tool_events(&events);
+    let tool_process_facts = collect_tool_process_facts(&events);
     Ok(ProviderExecution {
         result: ProviderHeadlessResult {
             code,
@@ -1396,14 +1810,15 @@ pub(crate) async fn execute_provider_turn_async(
             costs,
             validation_source: validated_completion.then(|| "derived_runtime".into()),
             tool_summary_lines,
+            tool_process_facts,
+            stop_message,
         },
         history: Some(history),
+        turn_transcript: runtime.take_turn_transcript(),
+        task_facts: runtime.task_facts(),
         events,
         tool_results,
-        max_mutating_tool_calls: tool_limits.max_mutating_tool_calls,
-        max_read_tool_calls: tool_limits.max_read_tool_calls,
-        max_turns: tool_limits.max_turns,
-        max_output_tokens: tool_limits.max_output_tokens,
+        limits: tool_limits,
         resume_preflight: None,
     })
 }
@@ -1556,19 +1971,43 @@ fn legacy_provider_usage(usage: &UsageTotals) -> (Option<u64>, Option<u64>) {
     (input, output)
 }
 
-fn summarize_tool_events(events: &[SessionEvent]) -> Vec<String> {
-    struct FinishedTool {
-        batch_id: String,
-        name: String,
-        success: bool,
-        duration_ms: u64,
-        reason: String,
-    }
+fn collect_tool_process_facts(events: &[SessionEvent]) -> Vec<ToolProcessFact> {
+    events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ToolProcessFinished {
+                batch_id,
+                call_id,
+                name,
+                process,
+            } => Some(ToolProcessFact {
+                batch_id: batch_id.clone(),
+                call_id: call_id.clone(),
+                name: name.clone(),
+                process: process.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
 
+struct FinishedToolSummary {
+    batch_id: String,
+    name: String,
+    success: bool,
+    duration_ms: u64,
+    reason: String,
+    process: Option<slim_core::process::ProcessExecutionFacts>,
+}
+
+fn summarize_tool_events(events: &[SessionEvent]) -> Vec<String> {
     // Last output/preview per call, so `✕` rows carry the same short reason
     // the TUI projects for a failed tool. Success rows never carry output
     // text (spec §15.1); empty call ids are never correlated.
     let mut reasons = std::collections::HashMap::<&str, &str>::new();
+    let mut processes =
+        std::collections::HashMap::<(&str, &str), &slim_core::process::ProcessExecutionFacts>::new(
+        );
     for event in events {
         match &event.kind {
             EventKind::ToolOutput {
@@ -1580,6 +2019,14 @@ fn summarize_tool_events(events: &[SessionEvent]) -> Vec<String> {
                 call_id, preview, ..
             } if !call_id.is_empty() => {
                 reasons.insert(call_id.as_str(), preview.as_str());
+            }
+            EventKind::ToolProcessFinished {
+                batch_id,
+                call_id,
+                process,
+                ..
+            } if !batch_id.is_empty() && !call_id.is_empty() => {
+                processes.insert((batch_id.as_str(), call_id.as_str()), process);
             }
             _ => {}
         }
@@ -1604,12 +2051,15 @@ fn summarize_tool_events(events: &[SessionEvent]) -> Vec<String> {
                         .map(|text| short_failure_reason(text))
                         .unwrap_or_default()
                 };
-                Some(FinishedTool {
+                Some(FinishedToolSummary {
                     batch_id: batch_id.clone(),
                     name: sanitize_timeline_name(name),
                     success: *success,
                     duration_ms: *duration_ms,
                     reason,
+                    process: processes
+                        .get(&(batch_id.as_str(), call_id.as_str()))
+                        .map(|process| (*process).clone()),
                 })
             }
             _ => None,
@@ -1633,9 +2083,10 @@ fn summarize_tool_events(events: &[SessionEvent]) -> Vec<String> {
                     total.saturating_add(member.duration_ms)
                 });
                 lines.push(format!(
-                    "✓ {} tools · {} · {duration_ms}ms",
+                    "✓ {} tools · {}{} · {duration_ms}ms",
                     members.len(),
-                    summarize_timeline_names(members.iter().map(|member| member.name.as_str()))
+                    summarize_timeline_names(members.iter().map(|member| member.name.as_str())),
+                    process_timeline_suffix(members),
                 ));
                 index = end;
                 continue;
@@ -1649,12 +2100,49 @@ fn summarize_tool_events(events: &[SessionEvent]) -> Vec<String> {
             format!(" · {}", tool.reason)
         };
         lines.push(format!(
-            "{status} {}{failure}{reason} · {}ms",
-            tool.name, tool.duration_ms
+            "{status} {}{failure}{reason}{} · {}ms",
+            tool.name,
+            process_timeline_suffix(std::slice::from_ref(tool)),
+            tool.duration_ms,
         ));
         index += 1;
     }
     lines
+}
+
+fn process_timeline_suffix(tools: &[FinishedToolSummary]) -> String {
+    let statuses = tools
+        .iter()
+        .filter_map(|tool| tool.process.as_ref())
+        .map(process_status_text)
+        .collect::<Vec<_>>();
+    if statuses.is_empty() {
+        String::new()
+    } else {
+        format!(" · process: {}", statuses.join("; "))
+    }
+}
+
+fn process_status_text(process: &slim_core::process::ProcessExecutionFacts) -> String {
+    let mut parts = vec![format!(
+        "exit {}",
+        process
+            .exit_code
+            .map_or_else(|| "n/a".to_owned(), |code| code.to_string())
+    )];
+    if process.timed_out {
+        parts.push("timed out".into());
+    }
+    if process.cancelled {
+        parts.push("cancelled".into());
+    }
+    let discarded = process
+        .stdout_discarded_bytes
+        .saturating_add(process.stderr_discarded_bytes);
+    if discarded > 0 {
+        parts.push(format!("discarded {discarded} B"));
+    }
+    parts.join(" · ")
 }
 
 /// First redacted line of a tool output/preview for `✕` timeline rows.
@@ -1850,6 +2338,54 @@ mod tool_timeline_tests {
             summarize_tool_events(&events),
             ["✕ shell · failed · exit 1: file not found · 3ms"]
         );
+    }
+
+    #[test]
+    fn process_facts_add_bounded_status_to_timeline_without_output_text() {
+        let events = vec![
+            SessionEvent::new(
+                1,
+                EventKind::ToolOutput {
+                    batch_id: "a".into(),
+                    call_id: "call-1".into(),
+                    name: "shell".into(),
+                    output: "secret output".into(),
+                },
+            ),
+            SessionEvent::new(
+                2,
+                EventKind::ToolProcessFinished {
+                    batch_id: "a".into(),
+                    call_id: "call-1".into(),
+                    name: "shell".into(),
+                    process: slim_core::process::ProcessExecutionFacts {
+                        exit_code: Some(3),
+                        timed_out: false,
+                        cancelled: true,
+                        stdout_bytes: 4,
+                        stderr_bytes: 2,
+                        stdout_discarded_bytes: 1,
+                        stderr_discarded_bytes: 2,
+                    },
+                },
+            ),
+            SessionEvent::new(
+                3,
+                EventKind::ToolFinished {
+                    batch_id: "a".into(),
+                    call_id: "call-1".into(),
+                    name: "shell".into(),
+                    success: false,
+                    duration_ms: 4,
+                },
+            ),
+        ];
+        let timeline = summarize_tool_events(&events).join("\n");
+        assert_eq!(
+            timeline,
+            "✕ shell · failed · secret output · process: exit 3 · cancelled · discarded 3 B · 4ms"
+        );
+        assert!(!timeline.contains("stdout"));
     }
 }
 
@@ -2186,6 +2722,8 @@ struct ProviderJsonlResult<'a> {
     stop_reason: Option<&'a str>,
     stop: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    stop_message: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     cost_micros: Option<u64>,
     usage_complete: bool,
     usage_overflowed: bool,
@@ -2196,6 +2734,12 @@ struct ProviderJsonlResult<'a> {
     cache_hit_ratio: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     validation_source: Option<&'a str>,
+    #[serde(skip_serializing_if = "slice_is_empty")]
+    tool_process_facts: &'a [ToolProcessFact],
+}
+
+fn slice_is_empty<T>(slice: &[T]) -> bool {
+    slice.is_empty()
 }
 
 #[derive(Serialize)]
@@ -2206,7 +2750,24 @@ struct ProviderUsageJson<'a> {
 }
 
 pub fn render_provider_text(result: &ProviderHeadlessResult) -> String {
-    format!("{}\n", result.text)
+    let label = run_notice_label(result);
+    match result
+        .stop_message
+        .as_deref()
+        .filter(|message| *message != result.text)
+    {
+        Some(message) if result.text.trim().is_empty() => format!("{label}\n{message}\n"),
+        Some(message) => format!("{}\n\n{label}\n{message}\n", result.text),
+        None => format!("{}\n", result.text),
+    }
+}
+
+fn run_notice_label(result: &ProviderHeadlessResult) -> &'static str {
+    if result.code == ExitCode::Success {
+        "[Run ended]"
+    } else {
+        "[Run stopped]"
+    }
 }
 
 fn provider_telemetry(result: &ProviderHeadlessResult) -> String {
@@ -2294,8 +2855,10 @@ pub fn render_provider_jsonl(result: &ProviderHeadlessResult) -> Result<String, 
         ProviderKind::OpenAiCodex => "openai-codex",
         ProviderKind::Anthropic => "anthropic",
         ProviderKind::OpenCodeGo => "opencode-go",
+        ProviderKind::OpenCodeZen => "opencode-zen",
         ProviderKind::ClinePass => "clinepass",
         ProviderKind::CommandCode => "command-code",
+        ProviderKind::Xai => "xai",
     };
     let kind = match result.code {
         ExitCode::Success => "assistant",
@@ -2313,6 +2876,7 @@ pub fn render_provider_jsonl(result: &ProviderHeadlessResult) -> Result<String, 
         output_tokens: result.output_tokens,
         stop_reason: result.stop_reason.as_deref(),
         stop: &result.stop,
+        stop_message: result.stop_message.as_deref(),
         cost_micros: result.cost_micros,
         usage_complete: result.usage_complete,
         usage_overflowed: result.usage_overflowed,
@@ -2324,6 +2888,7 @@ pub fn render_provider_jsonl(result: &ProviderHeadlessResult) -> Result<String, 
         costs: &result.costs,
         cache_hit_ratio: cache_hit_ratio(&result.usage),
         validation_source: result.validation_source.as_deref(),
+        tool_process_facts: &result.tool_process_facts,
     })?;
     Ok(format!("{line}\n"))
 }
@@ -2398,6 +2963,23 @@ fn resolve_context_window_tokens(explicit: Option<u64>) -> Result<u64, ProviderE
     )
 }
 
+/// Resolves a Command Code model's context window from the catalog's disk
+/// cache first (so live-only models get their real `context_length`), then
+/// the static fallback registry. Never performs network I/O.
+fn command_code_context_window(model: &str) -> Option<u64> {
+    let cached = CommandCodeCatalog::production()
+        .ok()
+        .map(|catalog| catalog.load_or_fallback())
+        .and_then(|snapshot| {
+            snapshot
+                .models
+                .iter()
+                .find(|entry| entry.id == model)
+                .map(|entry| entry.context_window)
+        });
+    cached.or_else(|| command_code_model(model).map(|model| model.context_window))
+}
+
 fn known_model_context_window(
     kind: ProviderKind,
     model: &str,
@@ -2406,9 +2988,12 @@ fn known_model_context_window(
     match kind {
         ProviderKind::OpenAiCodex => Some(resolve_codex_context_window(model, live_codex)),
         ProviderKind::ClinePass => clinepass_model(model).map(|model| model.context_window),
-        ProviderKind::CommandCode => command_code_model(model).map(|model| model.context_window),
+        ProviderKind::CommandCode => command_code_context_window(model),
+        ProviderKind::Xai => xai_model(model).map(|model| model.context_window),
         ProviderKind::Anthropic => command_code_model(model).map(|model| model.context_window),
-        ProviderKind::OpenAiCompatible | ProviderKind::OpenCodeGo => None,
+        ProviderKind::OpenAiCompatible | ProviderKind::OpenCodeGo | ProviderKind::OpenCodeZen => {
+            None
+        }
     }
 }
 
@@ -2429,7 +3014,7 @@ pub(crate) fn resolve_max_output_tokens(
             .map_err(|message| ProviderError::InvalidResponse { message })?;
         match value {
             Some(value) => (value, true),
-            None => return Ok(DEFAULT_MAX_OUTPUT_TOKENS),
+            None => return Ok(catalog_default_max_output_tokens(kind, model)),
         }
     };
 
@@ -2437,10 +3022,14 @@ pub(crate) fn resolve_max_output_tokens(
         && known_model_max_output_tokens(kind, model).is_some_and(|limit| value > limit as u64)
     {
         return Err(ProviderError::InvalidResponse {
-            message: if kind == ProviderKind::OpenCodeGo {
-                "OpenCode Go context or output limit exceeds model metadata"
-            } else {
-                "max output tokens exceeds model metadata"
+            message: match kind {
+                ProviderKind::OpenCodeGo => {
+                    "OpenCode Go context or output limit exceeds model metadata"
+                }
+                ProviderKind::OpenCodeZen => {
+                    "OpenCode Zen context or output limit exceeds model metadata"
+                }
+                _ => "max output tokens exceeds model metadata",
             }
             .into(),
         });
@@ -2450,6 +3039,28 @@ pub(crate) fn resolve_max_output_tokens(
     })
 }
 
+fn catalog_default_max_output_tokens(kind: ProviderKind, model: &str) -> u32 {
+    let Some(catalog) = known_model_max_output_tokens(kind, model) else {
+        return DEFAULT_MAX_OUTPUT_TOKENS;
+    };
+    let window = match kind {
+        ProviderKind::OpenCodeGo => open_code_model(model)
+            .and_then(|model| model.context_window)
+            .unwrap_or(AgentLoopConfig::default().context_window_tokens),
+        ProviderKind::OpenCodeZen => zen_model(model)
+            .and_then(|model| model.context_window)
+            .unwrap_or(AgentLoopConfig::default().context_window_tokens),
+        _ => known_model_context_window(kind, model, None)
+            .unwrap_or(AgentLoopConfig::default().context_window_tokens),
+    };
+    let usable = window
+        .saturating_sub(8_192)
+        .min(window / 2)
+        .min(u64::from(u32::MAX));
+    let usable = u32::try_from(usable).unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+    catalog.min(usable.max(DEFAULT_MAX_OUTPUT_TOKENS.min(catalog)))
+}
+
 fn known_model_max_output_tokens(kind: ProviderKind, model: &str) -> Option<u32> {
     match kind {
         ProviderKind::OpenAiCodex => codex_model(model).map(|model| model.max_output_tokens),
@@ -2457,6 +3068,8 @@ fn known_model_max_output_tokens(kind: ProviderKind, model: &str) -> Option<u32>
         ProviderKind::OpenCodeGo => {
             open_code_model(model).and_then(|model| model.max_output_tokens)
         }
+        ProviderKind::OpenCodeZen => zen_model(model).and_then(|model| model.max_output_tokens),
+        ProviderKind::Xai => xai_model(model).map(|model| model.max_output_tokens),
         ProviderKind::Anthropic | ProviderKind::CommandCode | ProviderKind::OpenAiCompatible => {
             None
         }
@@ -2509,6 +3122,7 @@ fn parse_positive_env_usize(name: &str) -> Result<Option<usize>, String> {
 
 const MAX_MUTATING_TOOL_CALLS_HARD_CAP: usize = 256;
 const MAX_READ_TOOL_CALLS_HARD_CAP: usize = 512;
+const MAX_TOTAL_TOOL_CALLS_HARD_CAP: usize = 2048;
 const MAX_TURNS_HARD_CAP: usize = 1024;
 
 fn clamp_mutating_tool_calls(value: usize) -> usize {
@@ -2517,6 +3131,10 @@ fn clamp_mutating_tool_calls(value: usize) -> usize {
 
 fn clamp_read_tool_calls(value: usize) -> usize {
     value.min(MAX_READ_TOOL_CALLS_HARD_CAP)
+}
+
+fn clamp_total_tool_calls(value: usize) -> usize {
+    value.min(MAX_TOTAL_TOOL_CALLS_HARD_CAP)
 }
 
 fn clamp_max_turns(value: usize) -> usize {
@@ -2553,6 +3171,21 @@ pub(crate) fn resolve_max_read_tool_calls(
         })
 }
 
+pub(crate) fn resolve_max_total_tool_calls(
+    options: &ProviderRunOptions,
+) -> Result<usize, ProviderError> {
+    if let Some(value) = options.max_total_tool_calls {
+        return Ok(clamp_total_tool_calls(value));
+    }
+    parse_positive_env_usize("SLIM_MAX_TOTAL_TOOL_CALLS")
+        .map_err(|message| ProviderError::InvalidResponse { message })
+        .map(|value| {
+            value
+                .map(clamp_total_tool_calls)
+                .unwrap_or(AgentLoopConfig::DEFAULT_MAX_TOTAL_TOOL_CALLS)
+        })
+}
+
 pub(crate) fn resolve_max_turns(options: &ProviderRunOptions) -> Result<usize, ProviderError> {
     if let Some(value) = options.max_turns {
         return Ok(clamp_max_turns(value));
@@ -2579,18 +3212,147 @@ fn parse_positive_env_u64(name: &str) -> Result<Option<u64>, String> {
     Ok(Some(parsed))
 }
 
+/// `SLIM_CMD_ZDR`/`CMD_ZDR` opt into Command Code zero-data retention
+/// (`x-cmd-zdr: 1`). Accepts 1/true/yes/on; anything else counts as unset so
+/// a typo cannot silently widen retention — the header is only sent when the
+/// value is explicitly affirmative.
+fn command_code_zero_data_retention() -> bool {
+    ["SLIM_CMD_ZDR", "CMD_ZDR"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .any(|value| {
+            matches!(
+                value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
 fn empty_provider_execution(result: ProviderHeadlessResult) -> ProviderExecution {
     ProviderExecution {
         result,
         history: None,
+        turn_transcript: Vec::new(),
+        task_facts: Vec::new(),
         events: Vec::new(),
         tool_results: Vec::new(),
-        max_mutating_tool_calls: AgentLoopConfig::DEFAULT_MAX_MUTATING_TOOL_CALLS,
-        max_read_tool_calls: AgentLoopConfig::DEFAULT_MAX_READ_TOOL_CALLS,
-        max_turns: AgentLoopConfig::DEFAULT_MAX_TURNS,
-        max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+        limits: ToolLoopLimits {
+            max_mutating_tool_calls: AgentLoopConfig::DEFAULT_MAX_MUTATING_TOOL_CALLS,
+            max_read_tool_calls: AgentLoopConfig::DEFAULT_MAX_READ_TOOL_CALLS,
+            max_total_tool_calls: AgentLoopConfig::DEFAULT_MAX_TOTAL_TOOL_CALLS,
+            max_turns: AgentLoopConfig::DEFAULT_MAX_TURNS,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+        },
         resume_preflight: None,
     }
+}
+
+fn pending_task_summary(runtime: &Runtime) -> Option<String> {
+    let pending = runtime
+        .todo_items()
+        .into_iter()
+        .filter(|item| matches!(item.status.as_str(), "pending" | "in_progress" | "blocked"))
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        None
+    } else {
+        let mut message = String::from("Pending tasks:");
+        for item in pending.iter().take(8) {
+            message.push_str(&format!(
+                "\n- [{}] {}",
+                item.status,
+                runtime
+                    .redact_sensitive(&item.title)
+                    .chars()
+                    .take(160)
+                    .collect::<String>()
+            ));
+        }
+        if pending.len() > 8 {
+            message.push_str(&format!("\n- {} more saved tasks", pending.len() - 8));
+        }
+        Some(message)
+    }
+}
+
+fn stopped_context(mut message: String, runtime: &Runtime, events: &[SessionEvent]) -> String {
+    if let Some(error) = runtime.finalization_error() {
+        message.push_str(&format!(
+            "\nFinal response failed: {}",
+            provider_failure_details(error.clone()).2
+        ));
+    }
+    message.push_str("\nTask remains pending verification; this run did not confirm completion.");
+    if let Some(pending) = pending_task_summary(runtime) {
+        message.push('\n');
+        message.push_str(&pending);
+    }
+    let mut unconfirmed = std::collections::BTreeMap::new();
+    for event in events {
+        match &event.kind {
+            EventKind::ToolStarted {
+                batch_id,
+                call_id,
+                name,
+                ..
+            } => {
+                unconfirmed.insert((batch_id, call_id), name);
+            }
+            EventKind::ToolFinished {
+                batch_id, call_id, ..
+            } => {
+                unconfirmed.remove(&(batch_id, call_id));
+            }
+            _ => {}
+        }
+    }
+    if !unconfirmed.is_empty() {
+        let names = unconfirmed
+            .values()
+            .take(8)
+            .map(|name| {
+                runtime
+                    .redact_sensitive(name)
+                    .chars()
+                    .take(64)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        message.push_str(&format!("\nTool execution remains unconfirmed: {names}. Check effects before repeating these operations."));
+    }
+    if let Some((batch_id, call_id, name, false)) =
+        events.iter().rev().find_map(|event| match &event.kind {
+            EventKind::ToolFinished {
+                batch_id,
+                call_id,
+                name,
+                success,
+                ..
+            } => Some((batch_id, call_id, name, *success)),
+            _ => None,
+        })
+    {
+        if let Some(output) = events.iter().rev().find_map(|event| match &event.kind {
+            EventKind::ToolOutput {
+                batch_id: batch,
+                call_id: call,
+                output,
+                ..
+            } if batch == batch_id && call == call_id => Some(output),
+            _ => None,
+        }) {
+            message.push_str(&format!(
+                "\nLast tool failure ({name}): {}",
+                runtime
+                    .redact_sensitive(output)
+                    .chars()
+                    .take(512)
+                    .collect::<String>()
+            ));
+        }
+    }
+    runtime.redact_sensitive(&message)
 }
 
 pub(crate) fn format_run_stop_message(
@@ -2600,13 +3362,26 @@ pub(crate) fn format_run_stop_message(
 ) -> String {
     match stop {
         "tool_limit" if limits.max_read_tool_calls == 0 && limits.max_mutating_tool_calls == 0 => {
-            "Durable resume cannot execute tools yet. Start a new run to continue with tools."
+            "Configured tool budgets are zero. Increase the tool limits to continue with tools."
                 .into()
         }
         "tool_limit" => {
             let (read_used, mutating_used) = count_tool_results_by_bucket(tool_results);
+            let total_used = read_used + mutating_used;
             let breakdown = summarize_tool_results(tool_results);
-            if breakdown.is_empty() {
+            if total_used >= limits.max_total_tool_calls {
+                if breakdown.is_empty() {
+                    format!(
+                        "Total tool budget exhausted ({total_used}/{}). Send a follow-up to continue.",
+                        limits.max_total_tool_calls
+                    )
+                } else {
+                    format!(
+                        "Total tool budget exhausted ({total_used}/{}): {breakdown}. Send a follow-up to continue.",
+                        limits.max_total_tool_calls
+                    )
+                }
+            } else if breakdown.is_empty() {
                 format!(
                     "Tool budget exhausted (read {read_used}/{}, mutating {mutating_used}/{}). Send a follow-up to continue.",
                     limits.max_read_tool_calls, limits.max_mutating_tool_calls
@@ -2623,10 +3398,11 @@ pub(crate) fn format_run_stop_message(
             n = limits.max_turns
         ),
         "provider_truncated" => format!(
-            "Output truncated (max_output_tokens={}). Send a follow-up to continue.",
+            "Output truncated (initial max_output_tokens={}). Automatic recovery is bounded by retry, turn, model and context limits. Progress is preserved. Increase max_output_tokens within the model limit or request a smaller next step before continuing.",
             limits.max_output_tokens
         ),
         "repeated_failed_tool" => "Repeated failed tool blocked.".into(),
+        "provider_filtered" => "Provider response was filtered before completion.".into(),
         "no_progress" => {
             "Stopped: no progress in recent turns. Send a follow-up to continue.".into()
         }
@@ -2676,9 +3452,9 @@ fn exit_code_for_stop(stop: AgentLoopStop) -> ExitCode {
     match stop {
         AgentLoopStop::ProviderCompleted => ExitCode::Success,
         AgentLoopStop::ProviderTruncated | AgentLoopStop::ProviderFiltered => ExitCode::Provider,
-        AgentLoopStop::TurnLimit | AgentLoopStop::RepeatedFailedTool | AgentLoopStop::NoProgress => {
-            ExitCode::Blocked
-        }
+        AgentLoopStop::TurnLimit
+        | AgentLoopStop::RepeatedFailedTool
+        | AgentLoopStop::NoProgress => ExitCode::Blocked,
         AgentLoopStop::ToolLimit => ExitCode::Tool,
         AgentLoopStop::Cancelled => ExitCode::Cancelled,
     }
@@ -2691,17 +3467,21 @@ fn provider_failure_details(error: ProviderError) -> (ExitCode, &'static str, St
             "cancelled",
             "provider request cancelled".into(),
         ),
-        ProviderError::Transport { .. } => (
+        ProviderError::Transport { message, .. } => (
             ExitCode::Provider,
             "provider_error",
-            "provider transport failed".into(),
+            format!("provider transport failed: {message}"),
         ),
         ProviderError::MalformedToolCall => (
             ExitCode::Provider,
             "provider_error",
             "provider returned a malformed tool call".into(),
         ),
-        ProviderError::Remote { message } | ProviderError::InvalidResponse { message } => (
+        ProviderError::TransientRemote { message }
+        | ProviderError::Remote { message }
+        | ProviderError::Api { message, .. }
+        | ProviderError::Http { message, .. }
+        | ProviderError::InvalidResponse { message } => (
             ExitCode::Provider,
             "provider_error",
             format!("provider error: {}", crate::redact(&message)),
@@ -2718,7 +3498,47 @@ fn redact_provider_error(error: ProviderError, secret: &str) -> ProviderError {
         }
     };
     match error {
+        ProviderError::Api {
+            mut metadata,
+            message,
+        } => {
+            for value in [
+                &mut metadata.code,
+                &mut metadata.error_type,
+                &mut metadata.detail_code,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !secret.is_empty() {
+                    *value = value.replace(secret, "[REDACTED]");
+                }
+            }
+            ProviderError::Api {
+                metadata,
+                message: redact(message),
+            }
+        }
+        ProviderError::Transport {
+            safe_to_retry,
+            message,
+        } => ProviderError::Transport {
+            safe_to_retry,
+            message: redact(message),
+        },
         ProviderError::Remote { message } => ProviderError::Remote {
+            message: redact(message),
+        },
+        ProviderError::TransientRemote { message } => ProviderError::TransientRemote {
+            message: redact(message),
+        },
+        ProviderError::Http {
+            status,
+            retry_after,
+            message,
+        } => ProviderError::Http {
+            status,
+            retry_after,
             message: redact(message),
         },
         ProviderError::InvalidResponse { message } => ProviderError::InvalidResponse {
@@ -2781,6 +3601,7 @@ mod stop_message_tests {
             ToolLoopLimits {
                 max_mutating_tool_calls: 32,
                 max_read_tool_calls: 96,
+                max_total_tool_calls: 256,
                 max_turns: 128,
                 max_output_tokens: 4096,
             },
@@ -2796,6 +3617,7 @@ mod stop_message_tests {
         let limits = ToolLoopLimits {
             max_mutating_tool_calls: 32,
             max_read_tool_calls: 96,
+            max_total_tool_calls: 256,
             max_turns: 128,
             max_output_tokens: 4096,
         };
@@ -2813,7 +3635,7 @@ mod stop_message_tests {
         );
         assert_eq!(
             format_run_stop_message("provider_truncated", &[], limits),
-            "Output truncated (max_output_tokens=4096). Send a follow-up to continue."
+            "Output truncated (initial max_output_tokens=4096). Automatic recovery is bounded by retry, turn, model and context limits. Progress is preserved. Increase max_output_tokens within the model limit or request a smaller next step before continuing."
         );
         assert_eq!(
             format_run_stop_message(
@@ -2822,11 +3644,12 @@ mod stop_message_tests {
                 ToolLoopLimits {
                     max_mutating_tool_calls: 0,
                     max_read_tool_calls: 0,
+                    max_total_tool_calls: 0,
                     max_turns: 128,
                     max_output_tokens: 4096,
                 },
             ),
-            "Durable resume cannot execute tools yet. Start a new run to continue with tools."
+            "Configured tool budgets are zero. Increase the tool limits to continue with tools."
         );
     }
 }
@@ -2834,9 +3657,10 @@ mod stop_message_tests {
 #[cfg(test)]
 mod resolve_budget_tests {
     use super::{
-        execute_provider_turn, resolve_max_mutating_tool_calls, resolve_max_output_tokens,
-        resolve_max_read_tool_calls, resolve_max_result_bytes, resolve_max_turns,
-        resolve_timeout_secs, ProviderRequest, ProviderRunOptions, DEFAULT_PROVIDER_TIMEOUT_SECS,
+        command_code_context_window, command_code_zero_data_retention, execute_provider_turn,
+        resolve_max_mutating_tool_calls, resolve_max_output_tokens, resolve_max_read_tool_calls,
+        resolve_max_result_bytes, resolve_max_turns, resolve_timeout_secs, ProviderRequest,
+        ProviderRunOptions, DEFAULT_PROVIDER_TIMEOUT_SECS,
     };
     use slim_core::runtime::AgentLoopConfig;
     use std::sync::{Mutex, OnceLock};
@@ -2968,7 +3792,7 @@ mod resolve_budget_tests {
     }
 
     #[test]
-    fn default_max_output_is_operational_default_without_env_or_options() {
+    fn default_max_output_uses_catalog_when_the_window_is_known() {
         with_env(&[("SLIM_MAX_OUTPUT_TOKENS", None)], || {
             let tokens = resolve_max_output_tokens(
                 None,
@@ -2976,7 +3800,16 @@ mod resolve_budget_tests {
                 "gpt-5.6-sol",
             )
             .expect("default output cap");
-            assert_eq!(tokens, slim_core::provider::DEFAULT_MAX_OUTPUT_TOKENS);
+            assert_eq!(tokens, 128_000);
+            assert_eq!(
+                resolve_max_output_tokens(
+                    None,
+                    slim_core::provider::ProviderKind::Xai,
+                    "grok-4.3",
+                )
+                .expect("xai"),
+                30_000
+            );
         });
     }
 
@@ -3069,6 +3902,79 @@ mod resolve_budget_tests {
     }
 
     #[test]
+    fn command_code_context_window_uses_cached_live_only_models() {
+        let cache = std::env::temp_dir().join(format!(
+            "slim-cmd-models-{}-cached.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &cache,
+            br#"{"version":1,"models":[
+                {"id":"live-only/model","name":"Live Only","context_window":777000},
+                {"id":"claude-sonnet-5","name":"Claude Sonnet 5","context_window":111111}
+            ]}"#,
+        )
+        .expect("cache");
+        let cache_str = cache.to_string_lossy().into_owned();
+        with_env(
+            &[("SLIM_COMMANDCODE_MODELS_FILE", Some(&cache_str))],
+            || {
+                // A model absent from the static registry resolves through the
+                // cached live snapshot.
+                assert_eq!(
+                    command_code_context_window("live-only/model"),
+                    Some(777_000)
+                );
+                // The cache wins over the static registry for shared ids.
+                assert_eq!(
+                    command_code_context_window("claude-sonnet-5"),
+                    Some(111_111)
+                );
+            },
+        );
+        let _ = std::fs::remove_file(&cache);
+    }
+
+    #[test]
+    fn command_code_context_window_falls_back_to_static_registry() {
+        let missing = std::env::temp_dir().join(format!(
+            "slim-cmd-models-{}-missing.json",
+            std::process::id()
+        ));
+        let missing_str = missing.to_string_lossy().into_owned();
+        with_env(
+            &[("SLIM_COMMANDCODE_MODELS_FILE", Some(&missing_str))],
+            || {
+                assert_eq!(
+                    command_code_context_window("deepseek/deepseek-v4.1-flash"),
+                    Some(1_000_000)
+                );
+                assert_eq!(command_code_context_window("totally/unknown"), None);
+            },
+        );
+    }
+
+    #[test]
+    fn command_code_zdr_requires_explicit_affirmative() {
+        with_env(&[("SLIM_CMD_ZDR", None), ("CMD_ZDR", None)], || {
+            assert!(!command_code_zero_data_retention());
+        });
+        for value in ["1", "true", "TRUE", " yes ", "on"] {
+            with_env(&[("SLIM_CMD_ZDR", Some(value)), ("CMD_ZDR", None)], || {
+                assert!(command_code_zero_data_retention(), "value {value}")
+            });
+        }
+        for value in ["0", "false", "no", "yess", ""] {
+            with_env(&[("SLIM_CMD_ZDR", Some(value)), ("CMD_ZDR", None)], || {
+                assert!(!command_code_zero_data_retention(), "value {value}")
+            });
+        }
+        with_env(&[("SLIM_CMD_ZDR", None), ("CMD_ZDR", Some("1"))], || {
+            assert!(command_code_zero_data_retention());
+        });
+    }
+
+    #[test]
     fn max_result_bytes_zero_is_rejected_and_hard_cap_is_one_mib() {
         with_env(&[("SLIM_MAX_RESULT_BYTES", None)], || {
             let error = resolve_max_result_bytes(Some(0)).expect_err("zero");
@@ -3153,39 +4059,6 @@ mod plan_loop_tests {
 }
 
 #[cfg(test)]
-mod cache_report_tests {
-    use super::provider_cache_report_line;
-    use slim_core::provider::ProviderCacheStats;
-
-    #[test]
-    fn interactive_surface_never_emits_cache_line() {
-        let stats = ProviderCacheStats {
-            hits: 0,
-            misses: 1,
-            evictions: 0,
-            entries: 1,
-            retained_bytes: 32,
-        };
-        assert_eq!(provider_cache_report_line(&stats, true), None);
-    }
-
-    #[test]
-    fn headless_run_emits_cache_line_after_a_miss() {
-        let stats = ProviderCacheStats {
-            hits: 0,
-            misses: 1,
-            evictions: 0,
-            entries: 1,
-            retained_bytes: 32,
-        };
-        let line = provider_cache_report_line(&stats, false).expect("headless report");
-        assert!(line.starts_with("SLIM_PROVIDER_CACHE "));
-        assert!(line.contains("misses=1"));
-        assert!(!line.contains('\n'));
-    }
-}
-
-#[cfg(test)]
 mod compaction_resume_tests {
     use super::{durable_provider_history, DurableProviderHistory};
     use slim_core::context::{compaction_prefix_fingerprint, CompactionReason};
@@ -3194,6 +4067,87 @@ mod compaction_resume_tests {
         DurableRepo, DurableSessionHeader, JsonlRepo,
     };
     use slim_core::ProviderMessage;
+
+    #[test]
+    fn checkpoint_cannot_separate_a_tool_result_from_its_call() {
+        let path = fixture_path("tool-boundary");
+        let mut repo = JsonlRepo::create(
+            &path,
+            DurableSessionHeader::new("session", "now", "D:\\Slim", None, None),
+        )
+        .unwrap();
+        let messages = vec![
+            ProviderMessage::user("inspect"),
+            ProviderMessage::assistant(
+                "",
+                vec![slim_core::provider::ProviderToolCall {
+                    id: "read-1".into(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            ProviderMessage::tool("read", "read-1", "contents"),
+            ProviderMessage::assistant("done", vec![]),
+        ];
+        for (index, message) in messages.iter().cloned().enumerate() {
+            repo.append(DurableRecord::Entry {
+                seq: index as u64,
+                entry: DurableEntry::from_provider_message(
+                    index.to_string(),
+                    index.checked_sub(1).map(|i| i.to_string()),
+                    "op".into(),
+                    message,
+                )
+                .unwrap(),
+            })
+            .unwrap();
+        }
+        repo.append(DurableRecord::Compaction {
+            seq: 4,
+            checkpoint: CompactionCheckpoint {
+                checkpoint_id: "unsafe".into(),
+                summary: "summary".into(),
+                first_kept_entry_id: "2".into(),
+                prefix_fingerprint: compaction_prefix_fingerprint(&messages[..2]),
+                previous_checkpoint_id: None,
+                tokens_before: 100,
+                tokens_after: 10,
+                input_tokens: None,
+                output_tokens: None,
+                duration_ms: 0,
+                reason: CompactionReason::HardThreshold,
+                read_files: vec![],
+                modified_files: vec![],
+            },
+        })
+        .unwrap();
+        let restored =
+            durable_provider_history(&super::SessionPreflight::from_open_repo(&repo)).unwrap();
+        assert_eq!(restored.messages, messages);
+        assert_eq!(restored.applied_checkpoint_id, None);
+        let ids = (0..4).map(|i| Some(i.to_string())).collect::<Vec<_>>();
+        assert_eq!(
+            super::durable_checkpoint_anchor(
+                &messages,
+                &ids,
+                2,
+                &compaction_prefix_fingerprint(&messages[..2])
+            ),
+            None
+        );
+        assert_eq!(
+            super::durable_checkpoint_anchor(
+                &messages,
+                &ids,
+                3,
+                &compaction_prefix_fingerprint(&messages[..3])
+            ),
+            Some("3".into())
+        );
+        drop(repo);
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(path.with_extension("jsonl.lock"));
+    }
 
     fn fixture_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -3240,6 +4194,8 @@ mod compaction_resume_tests {
                         parent_entry_id: parent.map(str::to_owned),
                         operation_id: format!("op-{id}"),
                         tool_call_id: None,
+                        tool_calls: Vec::new(),
+                        content_blocks: Vec::new(),
                     },
                 })
                 .expect("append entry");
@@ -3280,6 +4236,8 @@ mod compaction_resume_tests {
                     parent_entry_id: Some("kept".into()),
                     operation_id: "op-kept-2".into(),
                     tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    content_blocks: Vec::new(),
                 },
             })
             .expect("append second kept entry");
@@ -3339,11 +4297,20 @@ mod compaction_resume_tests {
             } = durable_provider_history(&preflight).expect("history");
             assert_eq!(parent.as_deref(), Some("kept-2"));
             if fingerprint_matches {
-                assert_eq!(history.len(), 3);
+                assert_eq!(history.len(), 4);
                 assert_eq!(history[0].content, "root instruction");
                 assert!(history[1].content.contains("Second"));
-                assert_eq!(history[2].content, "recent answer");
-                assert_eq!(ids, vec![Some("root".into()), None, Some("kept-2".into())]);
+                assert_eq!(history[2].content, "recent question");
+                assert_eq!(history[3].content, "recent answer");
+                assert_eq!(
+                    ids,
+                    vec![
+                        Some("root".into()),
+                        None,
+                        Some("kept".into()),
+                        Some("kept-2".into())
+                    ]
+                );
                 assert_eq!(applied_checkpoint_id.as_deref(), Some("compact-2"));
             } else {
                 assert_eq!(history.len(), 4);
@@ -3419,5 +4386,309 @@ mod resume_preflight_transport_tests {
         ));
 
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod live_history_resume_tests {
+    use super::{
+        keep_live_history, run_provider_resume_with_preflight_events, ProviderRequest,
+        ProviderRunOptions,
+    };
+    use slim_core::provider::ProviderKind;
+    use slim_core::session::{
+        preflight_session, DurableEntry, DurableEntryRole, DurableRecord, DurableRepo,
+        DurableSessionHeader, JsonlRepo,
+    };
+    use slim_core::{OperatingMode, ProviderMessage};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    fn temp_session(label: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "slim-live-history-{label}-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("workspace");
+        dir.join("session.jsonl")
+    }
+
+    fn create_empty_v2(path: &Path) {
+        let cwd = path.parent().expect("parent").to_str().expect("unicode");
+        drop(
+            JsonlRepo::create(
+                path,
+                DurableSessionHeader::new("live-history", "now", cwd, None, None),
+            )
+            .expect("empty v2"),
+        );
+    }
+
+    fn create_v2_with_visible_history(path: &Path) {
+        let cwd = path.parent().expect("parent").to_str().expect("unicode");
+        let mut repo = JsonlRepo::create(
+            path,
+            DurableSessionHeader::new("visible", "now", cwd, None, None),
+        )
+        .expect("v2");
+        repo.append(DurableRecord::Entry {
+            seq: 0,
+            entry: DurableEntry {
+                entry_id: "user-1".into(),
+                role: DurableEntryRole::User,
+                content: "seed question".into(),
+                parent_entry_id: None,
+                operation_id: "seed".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+                content_blocks: Vec::new(),
+            },
+        })
+        .expect("user");
+        repo.append(DurableRecord::Entry {
+            seq: 1,
+            entry: DurableEntry {
+                entry_id: "asst-1".into(),
+                role: DurableEntryRole::Assistant,
+                content: "seed answer".into(),
+                parent_entry_id: Some("user-1".into()),
+                operation_id: "seed".into(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+                content_blocks: Vec::new(),
+            },
+        })
+        .expect("assistant");
+    }
+
+    fn request(endpoint: String, prompt: &str) -> ProviderRequest {
+        ProviderRequest {
+            prompt: prompt.into(),
+            mode: OperatingMode::Auto,
+            kind: ProviderKind::OpenAiCompatible,
+            endpoint,
+            model: "deepseek-v4-flash".into(),
+            api_key: "fixture-secret".into(),
+            account_id: None,
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn read_http_body(stream: &mut std::net::TcpStream) -> String {
+        stream.set_nonblocking(false).expect("blocking");
+        let mut raw = Vec::new();
+        let mut chunk = [0_u8; 16 * 1024];
+        loop {
+            let size = stream.read(&mut chunk).expect("request");
+            assert!(size > 0, "request closed before body");
+            raw.extend_from_slice(&chunk[..size]);
+            let text = String::from_utf8_lossy(&raw);
+            let Some(header_end) = text.find("\r\n\r\n").map(|index| index + 4) else {
+                continue;
+            };
+            let Some(content_length) = text.lines().find_map(|line| {
+                line.strip_prefix("Content-Length:")
+                    .or_else(|| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            }) else {
+                continue;
+            };
+            if raw.len() >= header_end + content_length {
+                return String::from_utf8_lossy(&raw[header_end..header_end + content_length])
+                    .into_owned();
+            }
+        }
+    }
+
+    fn write_sse(stream: &mut std::net::TcpStream, payload: &[u8]) {
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .expect("headers");
+        stream.write_all(payload).expect("events");
+    }
+
+    fn spawn_turns(
+        payloads: Vec<&'static [u8]>,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let address = listener.local_addr().expect("address");
+        let captured = Arc::clone(&bodies);
+        let server = thread::spawn(move || {
+            for payload in payloads {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(pair) => break pair,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "fixture accept timed out");
+                            thread::yield_now();
+                        }
+                        Err(error) => panic!("fixture accept: {error}"),
+                    }
+                };
+                let body = read_http_body(&mut stream);
+                captured.lock().expect("bodies").push(body);
+                write_sse(&mut stream, payload);
+            }
+        });
+        (format!("http://{address}"), bodies, server)
+    }
+
+    #[test]
+    fn keep_live_history_requires_visible_identity() {
+        let durable = vec![
+            ProviderMessage::user("a"),
+            ProviderMessage::assistant("b", vec![]),
+        ];
+        assert!(keep_live_history(&durable, &durable));
+        assert!(!keep_live_history(&[], &durable));
+        assert!(!keep_live_history(
+            &[
+                ProviderMessage::user("z"),
+                ProviderMessage::assistant("b", vec![])
+            ],
+            &durable
+        ));
+        assert!(!keep_live_history(&[ProviderMessage::user("a")], &durable));
+        let snapshot = format!(
+            "a{} (partial):\nfile.txt\n",
+            "\n\nWorkspace paths observed before this turn"
+        );
+        assert!(keep_live_history(
+            &[
+                ProviderMessage::user(snapshot),
+                ProviderMessage::assistant("b", vec![]),
+            ],
+            &durable
+        ));
+        let channel = "a\n\nHarness channel: Auto, unattended.".to_string();
+        assert!(keep_live_history(
+            &[
+                ProviderMessage::user(channel),
+                ProviderMessage::assistant("b", vec![]),
+            ],
+            &durable
+        ));
+    }
+
+    #[test]
+    fn mismatched_live_history_is_replaced_by_durable_prefix() {
+        let path = temp_session("mismatch");
+        create_v2_with_visible_history(&path);
+        let (endpoint, bodies, server) = spawn_turns(vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        ]);
+        let preflight = preflight_session(&path).expect("preflight");
+        let options = ProviderRunOptions::default()
+            .with_workspace_root(path.parent().expect("parent"))
+            .with_history(vec![
+                ProviderMessage::user("stale live question"),
+                ProviderMessage::assistant("stale live answer", vec![]),
+            ]);
+        let execution = run_provider_resume_with_preflight_events(
+            request(endpoint, "continue"),
+            preflight,
+            options,
+            None,
+        )
+        .expect("resume");
+        server.join().expect("server");
+        assert_eq!(execution.result.code, super::ExitCode::Success);
+        let body = bodies.lock().expect("bodies")[0].clone();
+        assert!(body.contains("seed question"), "{body}");
+        assert!(body.contains("seed answer"), "{body}");
+        assert!(!body.contains("stale live question"), "{body}");
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    #[test]
+    fn same_process_resume_resends_chat_reasoning() {
+        let path = temp_session("thought");
+        create_empty_v2(&path);
+        let first = b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hold this thought\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"first answer\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let second = b"data: {\"choices\":[{\"delta\":{\"content\":\"second answer\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let (endpoint, bodies, server) = spawn_turns(vec![first, second]);
+        let workspace = path.parent().expect("parent").to_path_buf();
+        let first_options = ProviderRunOptions::default()
+            .with_workspace_root(&workspace)
+            .with_reasoning_effort("high");
+        let first_execution = run_provider_resume_with_preflight_events(
+            request(endpoint.clone(), "first prompt"),
+            preflight_session(&path).expect("first preflight"),
+            first_options,
+            None,
+        )
+        .expect("first resume");
+        assert_eq!(first_execution.result.code, super::ExitCode::Success);
+        assert_eq!(first_execution.result.text, "first answer");
+        let history = first_execution.history.expect("live history");
+        assert!(
+            history.iter().any(|message| {
+                message.response_cache_scope_id().is_some()
+                    && message.role == "assistant"
+                    && message.content == "first answer"
+            }),
+            "first turn must retain chat reasoning: {history:?}"
+        );
+
+        let second_options = ProviderRunOptions::default()
+            .with_workspace_root(&workspace)
+            .with_reasoning_effort("high")
+            .with_history(history);
+        let second_execution = run_provider_resume_with_preflight_events(
+            request(endpoint, "second prompt"),
+            first_execution.resume_preflight.expect("updated preflight"),
+            second_options,
+            None,
+        )
+        .expect("second resume");
+        server.join().expect("server");
+        assert_eq!(second_execution.result.code, super::ExitCode::Success);
+        assert_eq!(second_execution.result.text, "second answer");
+        let captured = bodies.lock().expect("bodies");
+        assert_eq!(captured.len(), 2, "{captured:?}");
+        assert!(
+            captured[1].contains("hold this thought"),
+            "second request must resend live thought: {}",
+            captured[1]
+        );
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn cold_resume_does_not_invent_reasoning() {
+        let path = temp_session("cold");
+        create_v2_with_visible_history(&path);
+        let (endpoint, bodies, server) = spawn_turns(vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        ]);
+        let options = ProviderRunOptions::default()
+            .with_workspace_root(path.parent().expect("parent"))
+            .with_reasoning_effort("high");
+        let execution = run_provider_resume_with_preflight_events(
+            request(endpoint, "continue"),
+            preflight_session(&path).expect("preflight"),
+            options,
+            None,
+        )
+        .expect("cold resume");
+        server.join().expect("server");
+        assert_eq!(execution.result.code, super::ExitCode::Success);
+        let body = bodies.lock().expect("bodies")[0].clone();
+        assert!(body.contains("seed question"), "{body}");
+        assert!(!body.contains("hold this thought"), "{body}");
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
     }
 }

@@ -18,6 +18,8 @@ fn records() -> Vec<DurableRecord> {
                 parent_entry_id: None,
                 operation_id: "op-1".into(),
                 tool_call_id: None,
+                tool_calls: Vec::new(),
+                content_blocks: Vec::new(),
             },
         },
         DurableRecord::Entry {
@@ -29,6 +31,8 @@ fn records() -> Vec<DurableRecord> {
                 parent_entry_id: Some("entry-root".into()),
                 operation_id: "op-1".into(),
                 tool_call_id: Some("call-1".into()),
+                tool_calls: Vec::new(),
+                content_blocks: Vec::new(),
             },
         },
         DurableRecord::Operation {
@@ -291,6 +295,8 @@ fn duplicate_entry_id_is_rejected_without_mutating_state() {
             parent_entry_id: None,
             operation_id: "op-1".into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            content_blocks: Vec::new(),
         },
     };
 
@@ -350,6 +356,8 @@ fn empty_required_ids_are_rejected_without_mutation() {
                 parent_entry_id: None,
                 operation_id: "op-1".into(),
                 tool_call_id: None,
+                tool_calls: Vec::new(),
+                content_blocks: Vec::new(),
             },
         },
         "entry.entry_id",
@@ -400,6 +408,8 @@ fn empty_required_ids_are_rejected_without_mutation() {
                 parent_entry_id: Some(String::new()),
                 operation_id: "op-1".into(),
                 tool_call_id: None,
+                tool_calls: Vec::new(),
+                content_blocks: Vec::new(),
             },
         },
         "entry.parent_entry_id",
@@ -466,6 +476,8 @@ fn missing_parent_is_rejected_without_mutation() {
             parent_entry_id: Some("entry-missing".into()),
             operation_id: "op-1".into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            content_blocks: Vec::new(),
         },
     };
     let error = reduce(&mut state, record).expect_err("missing parent");
@@ -511,6 +523,8 @@ fn started_operation_requires_existing_matching_input_entry() {
             parent_entry_id: None,
             operation_id: "op-entry".into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            content_blocks: Vec::new(),
         },
     };
     reduce(&mut state, entry).expect("input entry");

@@ -3,6 +3,10 @@
 > **Status de implementação:** evidência de componentes e do caminho headless
 > em um checkpoint de integração parcial. Este arquivo não é prova de v1
 > completa. Atualizado em 2026-08-21.
+>
+> **Contagens de teste abaixo são históricas desta data.** Para validação atual,
+> use `.\refresh-slim.ps1 -Test` e registre a saída uma vez — ver
+> [RULES.md](RULES.md) §R2 e §R11.
 
 > A TUI do binário abre normalmente sem credencial; `/login` oferece OAuth nativo
 > Anthropic Claude Pro/Max e OpenAI Codex ChatGPT Plus/Pro. Composer, auth/config,

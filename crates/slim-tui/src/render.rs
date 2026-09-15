@@ -1,12 +1,17 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::api::UiEvent;
-use crate::app::{AppState, FollowMode, ScrollAnchor};
+use crate::api::{BlockId, UiEvent};
+use crate::app::{AppState, FollowMode, ModelOverlay, ModelRow, ScrollAnchor};
 use crate::block::{Block, BlockKind};
 use crate::cache::{BoundedCache, WeightedCache};
+use crate::composer::{Composer, DisplaySnapshot};
+use crate::inspector::{InspectorKind, SearchFilter};
 use crate::layout;
+use crate::markdown::LogicalLine;
 use crate::view_model::{Frame, ViewModel};
+use ratatui::style::Style;
 use ratatui::text::Line as RatatuiLine;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -88,7 +93,9 @@ impl EventCoalescer {
                 if current_batch == batch_id && current_call == call_id {
                     current_name.clone_from(name);
                     current_preview.clone_from(preview);
-                    current_handle.clone_from(content_handle);
+                    if content_handle.is_some() {
+                        current_handle.clone_from(content_handle);
+                    }
                     return Vec::new();
                 }
             }
@@ -179,7 +186,8 @@ mod coalescer_tests {
     use std::time::Duration;
 
     use super::{thinking_preview_tail, EventCoalescer, THINKING_PREVIEW_GRAPHEMES};
-    use crate::api::UiEvent;
+    use crate::api::{ContentHandle, ToolBatchId, ToolCallId, UiEvent};
+    use slim_core::{EventKind, SessionEvent};
 
     #[test]
     fn fake_monotonic_clock_reaches_window_without_sleeping() {
@@ -252,6 +260,74 @@ mod coalescer_tests {
                 if call_id.0.as_ref() == "two" && preview == "other"
         ));
     }
+
+    #[test]
+    fn tool_progress_coalescing_preserves_handle_and_replaces_new_one() {
+        let batch_id = ToolBatchId("batch-1".into());
+        let call_id = ToolCallId("call-1".into());
+        let output_handle = ContentHandle("output-handle".into());
+        let progress =
+            |preview: &str, content_handle: Option<ContentHandle>| UiEvent::ToolProgress {
+                batch_id: batch_id.clone(),
+                call_id: call_id.clone(),
+                name: "shell".into(),
+                preview: preview.into(),
+                content_handle,
+            };
+        let process_finished = UiEvent::from_core(SessionEvent::new(
+            2,
+            EventKind::ToolProcessFinished {
+                batch_id: "batch-1".into(),
+                call_id: "call-1".into(),
+                name: "shell".into(),
+                process: slim_core::process::ProcessExecutionFacts {
+                    exit_code: Some(7),
+                    timed_out: true,
+                    cancelled: false,
+                    stdout_bytes: 12,
+                    stderr_bytes: 8,
+                    stdout_discarded_bytes: 3,
+                    stderr_discarded_bytes: 4,
+                },
+            },
+        ))
+        .expect("process-finished projection");
+        assert!(matches!(
+            &process_finished,
+            UiEvent::ToolProgress {
+                batch_id: projected_batch,
+                call_id: projected_call,
+                content_handle: None,
+                preview,
+                ..
+            } if projected_batch == &batch_id
+                && projected_call == &call_id
+                && preview == "exit 7 · timed out · discarded 7 B"
+        ));
+
+        let mut coalescer = EventCoalescer::new(16, Duration::from_millis(16));
+        coalescer.push_data(progress("full output", Some(output_handle.clone())));
+        coalescer.push_data(process_finished);
+        assert_eq!(
+            coalescer.flush(),
+            vec![progress(
+                "exit 7 · timed out · discarded 7 B",
+                Some(output_handle),
+            )]
+        );
+
+        let old_handle = ContentHandle("old-handle".into());
+        let replacement_handle = ContentHandle("replacement-handle".into());
+        coalescer.push_data(progress("replacement", Some(old_handle)));
+        coalescer.push_data(progress(
+            "latest replacement",
+            Some(replacement_handle.clone()),
+        ));
+        assert_eq!(
+            coalescer.flush(),
+            vec![progress("latest replacement", Some(replacement_handle))]
+        );
+    }
 }
 
 pub fn render(state: &AppState, width: u16, height: u16) -> Frame {
@@ -267,7 +343,10 @@ pub fn render(state: &AppState, width: u16, height: u16) -> Frame {
                 .any(|item| item.status == crate::api::TodoItemStatus::InProgress),
         ),
         state.working || state.activity.is_some(),
-        !state.blocks().is_empty() && width >= 80 && height >= 12,
+        !state.blocks().is_empty()
+            && !crate::view_model::is_trivial_cwd(&state.cwd)
+            && width >= 80
+            && height >= 12,
     );
     ViewModel::derive_with_session_rail(state, regions.session_rail.height > 0, width)
 }
@@ -278,26 +357,50 @@ pub fn wrapped_row_count(text: &str, width: usize) -> usize {
     crate::markdown::plain_row_count(text, width.min(u16::MAX as usize) as u16)
 }
 
-fn block_height(block: &Block, width: u16) -> usize {
+/// Cells before the user prompt text on each band row (`"  You  "`).
+pub(crate) const USER_PROMPT_PREFIX_COLS: u16 = 7;
+
+pub(crate) fn user_prompt_text_width(width: u16) -> u16 {
+    width.saturating_sub(USER_PROMPT_PREFIX_COLS).max(1)
+}
+
+/// Align reasoning text beneath the header after its marker and disclosure glyph.
+pub(crate) fn thinking_body_width(width: u16) -> u16 {
+    width.saturating_sub(4).max(1)
+}
+
+fn block_height(block: &Block, width: u16, cache: &mut WrapCache) -> usize {
     let body_width = width.saturating_sub(2).max(1) as usize; // rail/padding column
     let content_rows = match block.kind() {
-        BlockKind::User(text) => 1 + wrapped_row_count(text, body_width) + 1,
+        BlockKind::User(text) => {
+            wrapped_row_count(text, user_prompt_text_width(width) as usize) + 1
+        }
         BlockKind::Assistant(text) => {
             let text_width = if body_width > 1 {
                 body_width - 1 // reserved streaming-caret cell, stable after completion
             } else {
                 body_width
             };
-            1 + crate::markdown::markdown_row_count(text, text_width as u16)
+            // The measured projection is shared with the render pass, so the
+            // streaming body is parsed once per generation instead of twice.
+            2 + cache.markdown_rows(block, text, text_width as u16)
         }
         BlockKind::Thinking(text) => match block.fold {
-            crate::block::FoldState::Expanded => 1 + wrapped_row_count(text, body_width),
+            crate::block::FoldState::Expanded => {
+                1 + cache.cached_body_rows(
+                    block,
+                    BodyKind::Thinking,
+                    width,
+                    block.lifecycle != crate::block::BlockLifecycle::Streaming,
+                    || wrapped_row_count(text, thinking_body_width(width) as usize),
+                )
+            }
             _ if block.lifecycle == crate::block::BlockLifecycle::Streaming => {
                 let (preview, _) = thinking_preview_tail(text);
                 let rows = if preview.is_empty() {
                     0
                 } else {
-                    crate::markdown::plain_row_count(preview, width.saturating_sub(4).max(1)).min(2)
+                    crate::markdown::plain_row_count(preview, thinking_body_width(width)).min(2)
                 };
                 1 + rows
             }
@@ -310,13 +413,38 @@ fn block_height(block: &Block, width: u16) -> usize {
             if block.fold == crate::block::FoldState::Expanded
                 && !state.materialized_output.is_empty()
             {
-                1 + wrapped_row_count(&state.materialized_output, body_width)
+                1 + cache.cached_body_rows(
+                    block,
+                    BodyKind::ToolOutput,
+                    width,
+                    block.lifecycle != crate::block::BlockLifecycle::Streaming,
+                    || {
+                        wrapped_row_count(
+                            &state.materialized_output,
+                            width.saturating_sub(4).max(1) as usize,
+                        )
+                    },
+                )
             } else {
                 1
             }
         }
         BlockKind::InteractionRequest(state) => {
-            crate::markdown::plain_row_count(&state.display_text(), width.saturating_sub(4).max(1))
+            if state.acknowledgement.is_none() {
+                0
+            } else if matches!(
+                state.kind,
+                crate::block::InteractionRequestKind::Question { .. }
+            ) {
+                state
+                    .layout_lines(width.saturating_sub(2).max(8) as usize)
+                    .len()
+            } else {
+                crate::markdown::plain_row_count(
+                    &state.display_text(),
+                    width.saturating_sub(4).max(1),
+                )
+            }
         }
         BlockKind::System(_) | BlockKind::Activity(_) => 1,
         BlockKind::Error(text) | BlockKind::QueuedUser(text) => {
@@ -351,12 +479,11 @@ fn grouped_member_rows(leader: &Block, member_count: usize) -> u64 {
     }
 }
 
-fn push_grouped_tool_entry<'a>(
-    entries: &mut Vec<(u64, &'a Block, &'a [Block])>,
+fn record_grouped_member_rows(
     block_rows: &mut HashMap<crate::api::BlockId, (u64, u64)>,
     prefix: u64,
-    leader: &'a Block,
-    members: &'a [Block],
+    leader: &Block,
+    members: &[Block],
     rows: u64,
     member_is_tool: impl Fn(&Block) -> bool,
 ) -> u64 {
@@ -379,22 +506,47 @@ fn push_grouped_tool_entry<'a>(
             .entry(member.id.clone())
             .or_insert((member_prefix, member_rows));
     }
-    entries.push((prefix, leader, members));
     prefix.saturating_add(rows)
 }
 
 pub struct HeightIndex<'a> {
-    /// (prefix_rows_before, leader, members) — consecutive successful tools
-    /// from one provider batch are grouped for presentation only (§11.4.1).
-    pub entries: Vec<(u64, &'a Block, &'a [Block])>,
+    /// The block slice spans resolve against.
+    blocks: &'a [Block],
+    /// Shareable, borrow-free index content: (prefix, leader index, member
+    /// span start..end) plus the per-block row map. A cached `Arc` is reused
+    /// as-is while (content, fold, width) are unchanged — no O(n) rebuild.
+    memo: Arc<HeightIndexMemo>,
     pub total_rows: u64,
+}
+
+/// Borrow-free, immutable index content shared between the built index and
+/// the `WrapCache::height_indexes` memo table. Spans are resolved against the
+/// block slice on demand via [`HeightIndex::entry`].
+pub(crate) struct HeightIndexMemo {
+    spans: Vec<(u64, usize, usize, usize)>,
     block_rows: HashMap<crate::api::BlockId, (u64, u64)>,
+    total_rows: u64,
 }
 
 impl<'a> HeightIndex<'a> {
+    /// (prefix_rows_before, leader, members) — consecutive successful tools
+    /// from one provider batch are grouped for presentation only (§11.4.1).
+    pub fn entry(&self, index: usize) -> (u64, &'a Block, &'a [Block]) {
+        let &(prefix, leader, start, end) = &self.memo.spans[index];
+        (prefix, &self.blocks[leader], &self.blocks[start..end])
+    }
+
+    pub fn len(&self) -> usize {
+        self.memo.spans.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.memo.spans.is_empty()
+    }
+
     pub fn build(blocks: &'a [Block], width: u16, cache: &mut WrapCache) -> Self {
-        let mut entries = Vec::with_capacity(blocks.len());
         let mut block_rows = HashMap::with_capacity(blocks.len());
+        let mut spans = Vec::with_capacity(blocks.len());
         let mut pending_heights = Vec::new();
         let mut prefix = 0u64;
         let mut index = 0usize;
@@ -407,8 +559,8 @@ impl<'a> HeightIndex<'a> {
                     let tool_count = crate::block::complete_tool_count(blocks, start, end);
                     if tool_count > 1 && start == index {
                         let rows = grouped_member_rows(block, tool_count);
-                        prefix = push_grouped_tool_entry(
-                            &mut entries,
+                        let entry_prefix = prefix;
+                        prefix = record_grouped_member_rows(
                             &mut block_rows,
                             prefix,
                             block,
@@ -416,6 +568,7 @@ impl<'a> HeightIndex<'a> {
                             rows,
                             crate::block::is_complete_tool,
                         );
+                        spans.push((entry_prefix, start, start, end));
                         index = end;
                         continue;
                     }
@@ -428,8 +581,8 @@ impl<'a> HeightIndex<'a> {
                     let tool_count = end.saturating_sub(start);
                     if tool_count > 1 && start == index {
                         let rows = grouped_member_rows(block, tool_count);
-                        prefix = push_grouped_tool_entry(
-                            &mut entries,
+                        let entry_prefix = prefix;
+                        prefix = record_grouped_member_rows(
                             &mut block_rows,
                             prefix,
                             block,
@@ -437,6 +590,7 @@ impl<'a> HeightIndex<'a> {
                             rows,
                             crate::block::is_failed_tool,
                         );
+                        spans.push((entry_prefix, start, start, end));
                         index = end;
                         continue;
                     }
@@ -450,23 +604,23 @@ impl<'a> HeightIndex<'a> {
                     if count > 1 && start == index {
                         let members = &blocks[start..end];
                         let rows = if block.fold == crate::block::FoldState::Expanded {
-                            let body_width = width.saturating_sub(2).max(1) as usize;
                             1u64.saturating_add(
                                 members
                                     .iter()
-                                    .map(|member| match member.kind() {
-                                        BlockKind::Thinking(text) => {
-                                            wrapped_row_count(text, body_width).max(1) as u64
-                                        }
-                                        _ => 1,
+                                    .map(|member| {
+                                        cache.thinking_body_height(
+                                            member,
+                                            width,
+                                            &mut pending_heights,
+                                        ) as u64
                                     })
                                     .sum(),
                             )
                         } else {
                             1
                         };
-                        prefix = push_grouped_tool_entry(
-                            &mut entries,
+                        let entry_prefix = prefix;
+                        prefix = record_grouped_member_rows(
                             &mut block_rows,
                             prefix,
                             block,
@@ -474,6 +628,7 @@ impl<'a> HeightIndex<'a> {
                             rows,
                             crate::block::is_complete_thinking,
                         );
+                        spans.push((entry_prefix, start, start, end));
                         index = end;
                         continue;
                     }
@@ -483,13 +638,14 @@ impl<'a> HeightIndex<'a> {
                 block.cache_identity(),
                 block.content_generation(),
                 width,
-                block.fold == crate::block::FoldState::Collapsed,
+                u8::from(block.fold == crate::block::FoldState::Collapsed),
+                block.lifecycle_tag(),
             );
             let height = if let Some(height) = cache.heights.get(&key).copied() {
                 height
             } else {
                 cache.height_misses = cache.height_misses.saturating_add(1);
-                let height = block_height(block, width);
+                let height = block_height(block, width, cache);
                 pending_heights.push((key, height));
                 height
             };
@@ -499,39 +655,44 @@ impl<'a> HeightIndex<'a> {
                 prefix.saturating_add(boundary_rows),
                 rows.saturating_sub(boundary_rows).max(1),
             ));
-            entries.push((prefix, block, &blocks[index..=index]));
+            spans.push((prefix, index, index, index + 1));
             prefix = prefix.saturating_add(rows);
             index += 1;
         }
         // Defer inserts until the scan ends. Eager FIFO insertion can evict
         // the very next key and cascade into an all-miss frame at capacity+1.
-        for (key, height) in pending_heights {
-            cache.heights.insert(key, height);
-        }
+        cache.remember_heights(pending_heights);
         Self {
-            entries,
+            blocks,
             total_rows: prefix,
-            block_rows,
+            memo: Arc::new(HeightIndexMemo {
+                spans,
+                block_rows,
+                total_rows: prefix,
+            }),
         }
     }
 
     pub fn prefix_for_block(&self, id: &crate::api::BlockId) -> Option<u64> {
-        self.block_rows.get(id).map(|(prefix, _)| *prefix)
+        self.memo.block_rows.get(id).map(|(prefix, _)| *prefix)
     }
 
     pub fn row_for_anchor(&self, anchor: &ScrollAnchor) -> Option<u64> {
-        self.block_rows.get(&anchor.block_id).map(|(prefix, rows)| {
-            prefix.saturating_add(anchor.row_offset.min(rows.saturating_sub(1)))
-        })
+        self.memo
+            .block_rows
+            .get(&anchor.block_id)
+            .map(|(prefix, rows)| {
+                prefix.saturating_add(anchor.row_offset.min(rows.saturating_sub(1)))
+            })
     }
 
     pub fn anchor_for_row(&self, row: u64) -> Option<ScrollAnchor> {
-        if self.entries.is_empty() || row >= self.total_rows {
+        if self.memo.spans.is_empty() || row >= self.total_rows {
             return None;
         }
         let (index, row_offset) = self.locate(row);
         Some(ScrollAnchor {
-            block_id: self.entries[index].1.id.clone(),
+            block_id: self.entry(index).1.id.clone(),
             row_offset,
         })
     }
@@ -562,23 +723,7 @@ impl<'a> HeightIndex<'a> {
         let page_down = scroll_start.saturating_add(page).min(bottom_start);
         let viewport_end = viewport_start.saturating_add(viewport_rows);
         let last_visible_foldable_anchor = has_visible_viewport
-            .then(|| {
-                self.entries
-                    .iter()
-                    .rev()
-                    .find_map(|(prefix, block, members)| {
-                        let rows = self.block_rows.get(&block.id)?.1;
-                        let foldable_tool = matches!(block.kind(), BlockKind::Tool(state)
-                        if members.len() > 1 || state.content_handle.is_some());
-                        (*prefix < viewport_end
-                            && prefix.saturating_add(rows) > viewport_start
-                            && (matches!(block.kind(), BlockKind::Thinking(_)) || foldable_tool))
-                            .then(|| ScrollAnchor {
-                                block_id: block.id.clone(),
-                                row_offset: 0,
-                            })
-                    })
-            })
+            .then(|| self.last_visible_foldable_anchor(viewport_start, viewport_end))
             .flatten();
         ScrollMetrics {
             viewport_start,
@@ -596,16 +741,49 @@ impl<'a> HeightIndex<'a> {
 
     /// Index of the first entry intersecting `row`, plus rows to skip inside it.
     pub fn locate(&self, row: u64) -> (usize, u64) {
-        if self.entries.is_empty() {
+        if self.memo.spans.is_empty() {
             return (0, 0);
         }
         let idx = self
-            .entries
-            .partition_point(|(prefix, _, _)| *prefix <= row)
+            .memo
+            .spans
+            .partition_point(|(prefix, _, _, _)| *prefix <= row)
             .saturating_sub(1)
-            .min(self.entries.len().saturating_sub(1));
-        let skipped = row.saturating_sub(self.entries[idx].0);
+            .min(self.memo.spans.len().saturating_sub(1));
+        let skipped = row.saturating_sub(self.memo.spans[idx].0);
         (idx, skipped)
+    }
+
+    fn last_visible_foldable_anchor(
+        &self,
+        viewport_start: u64,
+        viewport_end: u64,
+    ) -> Option<ScrollAnchor> {
+        let mut index = self
+            .memo
+            .spans
+            .partition_point(|(prefix, _, _, _)| *prefix < viewport_end);
+        while index > 0 {
+            index -= 1;
+            let (prefix, leader, start, end) = self.memo.spans[index];
+            let block = &self.blocks[leader];
+            let members = &self.blocks[start..end];
+            let Some(&(_, rows)) = self.memo.block_rows.get(&block.id) else {
+                continue;
+            };
+            if prefix.saturating_add(rows) <= viewport_start {
+                break;
+            }
+            let foldable_tool = matches!(block.kind(), BlockKind::Tool(state)
+                if members.len() > 1 || state.content_handle.is_some());
+            if matches!(block.kind(), BlockKind::Thinking(_)) || foldable_tool {
+                return Some(ScrollAnchor {
+                    block_id: block.id.clone(),
+                    row_offset: 0,
+                });
+            }
+        }
+        None
     }
 }
 
@@ -636,23 +814,487 @@ impl BodyKind {
     }
 }
 
+/// The inspector rows are styled at paint time, while keyboard navigation only
+/// needs their palette-independent row count. Keep the palette in the single
+/// inspector memo key so a NoColor measurement can never poison a later paint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct InspectorPaletteKey([Style; 7]);
+
+impl InspectorPaletteKey {
+    pub(crate) fn new(styles: [Style; 7]) -> Self {
+        Self(styles)
+    }
+}
+
+type InspectorMemoBaseKey = (Option<InspectorKind>, u64, u64, u64, u16);
+type InspectorMemoKey = (InspectorMemoBaseKey, InspectorPaletteKey);
+
+fn inspector_memo_base_key(
+    state: &AppState,
+    kind: Option<InspectorKind>,
+    width: u16,
+) -> InspectorMemoBaseKey {
+    (
+        kind,
+        state.revisions.content,
+        state.revisions.status,
+        state.clock.elapsed_ms / 1_000,
+        width,
+    )
+}
+
 /// Bounded caches for the render pipeline (§12.3/§12.4): heights keyed by
-/// block generation, width and fold state. Eviction only drops derivations.
+/// block generation, width and layout kind (folded/full/grouped body).
+/// Eviction only drops derivations.
 pub struct WrapCache {
-    heights: BoundedCache<(u64, u64, u16, bool), usize>,
+    /// Content hit regions from the last painted frame: transcript, inspector.
+    pub(crate) selection_regions: [Option<ratatui::layout::Rect>; 2],
+    heights: BoundedCache<HeightKey, usize>,
     height_misses: u64,
     /// Wrapped body lines keyed by (identity, generation, width, body kind).
     /// Byte-weighted so a few large bodies cannot exhaust memory. Stable blocks
     /// are re-wrapped every frame today; this makes them render from the last
     /// wrap until their content changes.
     bodies: WeightedCache<(u64, u64, u16, u8), Vec<RatatuiLine<'static>>>,
+    /// Bodies that bypass the LRU (streaming or oversized): a few most-recent
+    /// derivations kept so height measurement and paint share one wrap per
+    /// content generation instead of re-wrapping every frame.
+    scratch_bodies: Vec<(BodyKey, Arc<Vec<RatatuiLine<'static>>>)>,
+    /// Shared markdown projections keyed by (identity, generation, body width):
+    /// one pulldown-cmark parse feeds both row counting and body rendering.
+    #[allow(clippy::type_complexity)]
+    projections: Vec<((u64, u64, u16), Arc<Vec<LogicalLine>>)>,
+    /// Built height indexes keyed by (content rev, fold rev, width): scroll
+    /// gestures and churn-free frames re-render without an O(n) rebuild.
+    height_indexes: HashMap<(u64, u64, u16), Arc<HeightIndexMemo>>,
+    /// Transcript search results keyed by (query, filter, content rev).
+    #[allow(clippy::type_complexity)]
+    search_memo: Option<((String, SearchFilter, u64), Arc<[usize]>)>,
+    /// Foldable selected-block probe keyed by (content, fold, scroll mode).
+    selected_memo: Option<((u64, u64, FollowMode), Option<BlockId>)>,
+    /// Last collapsed tool-group leader keyed by (content, fold).
+    tool_leader_memo: Option<((u64, u64), Option<BlockId>)>,
+    /// Composer display snapshot keyed by (composer revision, width).
+    composer_memo: Option<((u64, u16), DisplaySnapshot)>,
+    /// Slash completion matches keyed by (query, skill list revision).
+    #[allow(clippy::type_complexity)]
+    slash_memo: Option<((String, u64), Arc<Vec<String>>)>,
+    /// Model overlay flattened rows keyed by (filter, collapsed, catalog rev).
+    #[allow(clippy::type_complexity)]
+    model_rows_memo: Option<((String, [bool; 5], u64), Arc<Vec<ModelRow>>)>,
+    /// Inspector panel lines keyed by (kind, content, status, second, width,
+    /// palette). The row count is retained independently of the palette so a
+    /// keyboard-only probe can reuse it without rebuilding styled lines.
+    #[allow(clippy::type_complexity)]
+    inspector_memo: Option<(InspectorMemoKey, Arc<Vec<RatatuiLine<'static>>>)>,
+    /// Command palette matches keyed by the query — the open palette no
+    /// longer re-filters the static command list per frame.
+    palette_memo: Option<(String, Arc<Vec<&'static str>>)>,
+    streaming_blocks_memo: Option<(u64, bool)>,
+    /// Fully-rendered block lines (header + body + boundary) keyed by
+    /// [`BlockLinesKey`]. Stable blocks paint into the frame buffer by
+    /// reference; only changed or animated blocks re-materialize.
+    block_line_memos: WeightedCache<BlockLinesKey, Arc<Vec<RatatuiLine<'static>>>>,
+    /// Footer/status rows keyed by their explicit inputs — the candidate
+    /// strings are built once per state change, not per frame.
+    footer_memo: Option<(FooterKey, Arc<Vec<String>>)>,
     body_hits: u64,
     body_misses: u64,
     body_bypasses: u64,
     body_oversized_skips: u64,
 }
 
+// (identity, content generation, width, layout tag, lifecycle). Lifecycle is
+// assigned directly without `touch_content`, so it cannot ride on the
+// generation counter — a collapsed thinking block leaving `Streaming` must
+// miss the cached preview height.
+type HeightKey = (u64, u64, u16, u8, u8);
+type BodyKey = (u64, u64, u16, u8);
+/// (leader identity, member-state fold, flags, width) — see
+/// [`WrapCache::get_block_lines`]. Animation is painted as a one-cell patch
+/// after a cache hit, so the clock never invalidates stable block lines.
+type BlockLinesKey = (u64, u64, u8, u16);
+
+/// Footer inputs that decide the rendered rows. Values, not just revisions,
+/// so the memo can never go stale when a field changes without a revision
+/// bump (lifecycle/fold-style direct writes exist elsewhere in the state).
+#[derive(Clone, Eq, PartialEq)]
+struct FooterKey {
+    working: bool,
+    mode: slim_core::OperatingMode,
+    pinned: bool,
+    unseen: u32,
+    authenticated: bool,
+    activity: Option<crate::app::ActivityPhase>,
+    context_tokens: u64,
+    context_window_tokens: u64,
+    content_rev: u64,
+    status_rev: u64,
+    width: u16,
+    rows: u16,
+    activity_visible: bool,
+}
+
+const SCRATCH_BODY_SLOTS: usize = 4;
+const SCRATCH_PROJECTION_SLOTS: usize = 4;
+const MAX_HEIGHT_INDEX_MEMOS: usize = 4;
+const MAX_BLOCK_LINE_MEMOS: usize = 256;
+const MAX_BLOCK_LINE_MEMO_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CACHED_BLOCK_LINES_BYTES: usize = 256 * 1024;
+
+/// Single-slot memo: recomputes only when `key` changes. Every consumer is a
+/// pure derivation of state, so a kept value can never be semantically stale.
+fn memoized<K: PartialEq, V>(slot: &mut Option<(K, V)>, key: K, produce: impl FnOnce() -> V) -> &V {
+    if slot.as_ref().is_none_or(|(stored, _)| *stored != key) {
+        *slot = Some((key, produce()));
+    }
+    &slot.as_ref().expect("memo slot populated").1
+}
+
 impl WrapCache {
+    /// Height index for the current frame: shares the memoized index content
+    /// when (content, fold, width) are unchanged, built and memoized otherwise.
+    pub(crate) fn height_index<'a>(
+        &mut self,
+        blocks: &'a [Block],
+        content_rev: u64,
+        fold_rev: u64,
+        width: u16,
+    ) -> HeightIndex<'a> {
+        let key = (content_rev, fold_rev, width);
+        if let Some(memo) = self.height_indexes.get(&key) {
+            return HeightIndex {
+                blocks,
+                memo: Arc::clone(memo),
+                total_rows: memo.total_rows,
+            };
+        }
+        let index = HeightIndex::build(blocks, width, self);
+        self.height_indexes
+            .retain(|(c, f, _), _| *c == content_rev && *f == fold_rev);
+        if self.height_indexes.len() >= MAX_HEIGHT_INDEX_MEMOS {
+            self.height_indexes.clear();
+        }
+        self.height_indexes.insert(key, Arc::clone(&index.memo));
+        index
+    }
+
+    pub(crate) fn has_streaming_block(&mut self, blocks: &[Block], content_rev: u64) -> bool {
+        *memoized(&mut self.streaming_blocks_memo, content_rev, || {
+            blocks
+                .iter()
+                .any(|block| block.lifecycle == crate::block::BlockLifecycle::Streaming)
+        })
+    }
+
+    /// Markdown row count sharing the parse with the render pass: the
+    /// projection produced here is reused by `wrapped_body` callers within
+    /// the same content generation (the streaming tail's hot path).
+    pub(crate) fn markdown_rows(&mut self, block: &Block, text: &str, width: u16) -> usize {
+        let projection = self.markdown_projection(block, text, width);
+        crate::markdown::projected_row_count(&projection, width)
+    }
+
+    /// The shared parse result for a markdown body, deduplicated across the
+    /// height probe and the render pass for the same (block, generation,
+    /// width).
+    pub(crate) fn markdown_projection(
+        &mut self,
+        block: &Block,
+        text: &str,
+        width: u16,
+    ) -> Arc<Vec<LogicalLine>> {
+        let key = (block.cache_identity(), block.content_generation(), width);
+        if let Some((_, projection)) = self.projections.iter().find(|(stored, _)| *stored == key) {
+            return projection.clone();
+        }
+        let projection = Arc::new(crate::markdown::project_markdown(text, width));
+        if self.projections.len() >= SCRATCH_PROJECTION_SLOTS {
+            self.projections.remove(0);
+        }
+        self.projections.push((key, projection.clone()));
+        projection
+    }
+
+    /// Row count reusing whichever body store applies: a hit returns the
+    /// stored line count, a miss falls back to `count` — never produces a
+    /// body just to measure it.
+    pub(crate) fn cached_body_rows(
+        &mut self,
+        block: &Block,
+        kind: BodyKind,
+        width: u16,
+        cacheable: bool,
+        count: impl FnOnce() -> usize,
+    ) -> usize {
+        let key = (
+            block.cache_identity(),
+            block.content_generation(),
+            width,
+            kind.tag(),
+        );
+        if cacheable {
+            if let Some(body) = self.bodies.get(&key) {
+                return body.len();
+            }
+        } else if let Some((_, body)) = self
+            .scratch_bodies
+            .iter()
+            .find(|(stored, _)| *stored == key)
+        {
+            return body.len();
+        }
+        count()
+    }
+
+    /// Transcript search results, recomputed only when the query, filter or
+    /// block set changes — the open search bar no longer rescans every frame.
+    pub(crate) fn search_matches(
+        &mut self,
+        blocks: &[Block],
+        query: &str,
+        filter: SearchFilter,
+        content_rev: u64,
+    ) -> Arc<[usize]> {
+        memoized(
+            &mut self.search_memo,
+            (query.to_owned(), filter, content_rev),
+            || crate::inspector::search_match_indices_filtered(blocks, query, filter).into(),
+        )
+        .clone()
+    }
+
+    /// Foldable block under the stable scroll anchor; the O(n) probe is
+    /// skipped while (content, fold, scroll mode) are unchanged.
+    pub(crate) fn selected_block(&mut self, state: &AppState) -> Option<BlockId> {
+        memoized(
+            &mut self.selected_memo,
+            (
+                state.revisions.content,
+                state.revisions.fold,
+                state.scroll.mode.clone(),
+            ),
+            || state.selected_block_id().cloned(),
+        )
+        .clone()
+    }
+
+    /// The most recent collapsed tool-group leader while a run is active;
+    /// memoized over (content, fold) so working frames stop rescanning.
+    pub(crate) fn tool_group_leader(
+        &mut self,
+        blocks: &[Block],
+        content_rev: u64,
+        fold_rev: u64,
+    ) -> Option<BlockId> {
+        memoized(&mut self.tool_leader_memo, (content_rev, fold_rev), || {
+            crate::runtime::last_collapsed_tool_group_leader(blocks)
+        })
+        .clone()
+    }
+
+    /// Composer display snapshot keyed by composer revision and width; the
+    /// O(draft) rebuild only runs after an actual edit or resize.
+    pub(crate) fn composer_snapshot(
+        &mut self,
+        composer: &Composer,
+        width: u16,
+    ) -> &DisplaySnapshot {
+        memoized(
+            &mut self.composer_memo,
+            (composer.revision(), width),
+            || composer.display_snapshot(width as usize),
+        )
+    }
+
+    /// Slash completion matches; the filter runs only when the query or the
+    /// skill list changes, not per frame while the popup is open.
+    pub(crate) fn slash_matches(&mut self, state: &AppState, query: &str) -> Arc<Vec<String>> {
+        memoized(
+            &mut self.slash_memo,
+            (query.to_owned(), state.skills_revision()),
+            || Arc::new(crate::reducer::slash_matches_with_skills(state, query)),
+        )
+        .clone()
+    }
+
+    /// Flattened model-overlay rows keyed by (filter, collapsed, catalogs).
+    pub(crate) fn model_rows(
+        &mut self,
+        overlay: &ModelOverlay,
+        opencode: &[crate::api::OpenCodeModelView],
+        clinepass: &[crate::api::OpenCodeModelView],
+        command_code: &[crate::api::OpenCodeModelView],
+        zen: &[crate::api::OpenCodeModelView],
+        catalog_rev: u64,
+    ) -> Arc<Vec<ModelRow>> {
+        memoized(
+            &mut self.model_rows_memo,
+            (overlay.filter.clone(), overlay.collapsed, catalog_rev),
+            || Arc::new(overlay.rows(opencode, clinepass, command_code, zen)),
+        )
+        .clone()
+    }
+
+    /// Inspector panel lines keyed by (kind, content, status, wall second,
+    /// width, palette) — the open inspector no longer rescans the transcript
+    /// per frame. `None` renders the run summary.
+    pub(crate) fn inspector_lines(
+        &mut self,
+        state: &AppState,
+        kind: Option<InspectorKind>,
+        palette: &crate::runtime::Palette,
+        width: u16,
+        palette_key: InspectorPaletteKey,
+    ) -> Arc<Vec<RatatuiLine<'static>>> {
+        let base = inspector_memo_base_key(state, kind, width);
+        let key = (base, palette_key);
+        if let Some((stored, lines)) = &self.inspector_memo {
+            if *stored == key {
+                return lines.clone();
+            }
+        }
+        let lines = Arc::new(match kind {
+            Some(kind) => crate::runtime::inspector_lines(state, kind, palette, width),
+            None => crate::runtime::run_inspector_lines(state, palette, width),
+        });
+        // Color changes cannot change wrapping or row count; replacing the
+        // styled projection keeps the same semantic key available to probes.
+        self.inspector_memo = Some((key, lines.clone()));
+        lines
+    }
+
+    /// Returns the current inspector projection and its palette-independent
+    /// row count. Existing semantic input reuses the stored count even when a
+    /// renderer palette changed, so keyboard navigation never rebuilds rows.
+    pub(crate) fn inspector_line_metrics(
+        &mut self,
+        state: &AppState,
+        kind: Option<InspectorKind>,
+        palette: &crate::runtime::Palette,
+        width: u16,
+        palette_key: InspectorPaletteKey,
+    ) -> Arc<Vec<RatatuiLine<'static>>> {
+        let base = inspector_memo_base_key(state, kind, width);
+        if let Some((stored, lines)) = &self.inspector_memo {
+            if stored.0 == base {
+                return lines.clone();
+            }
+        }
+        let lines = Arc::new(match kind {
+            Some(kind) => crate::runtime::inspector_lines(state, kind, palette, width),
+            None => crate::runtime::run_inspector_lines(state, palette, width),
+        });
+        self.inspector_memo = Some(((base, palette_key), lines.clone()));
+        lines
+    }
+
+    /// Command palette matches keyed by query; the filter over the static
+    /// command list runs once per edit, not per frame.
+    pub(crate) fn palette_matches(&mut self, query: &str) -> Arc<Vec<&'static str>> {
+        memoized(&mut self.palette_memo, query.to_owned(), || {
+            Arc::new(crate::reducer::palette_matches(query))
+        })
+        .clone()
+    }
+
+    /// Lookup for the per-block rendered-lines memo. The produce step needs
+    /// `&mut WrapCache`, so get/store are split instead of a `memoized` call.
+    pub(crate) fn get_block_lines(
+        &mut self,
+        key: &BlockLinesKey,
+    ) -> Option<Arc<Vec<RatatuiLine<'static>>>> {
+        self.block_line_memos.get(key).cloned()
+    }
+
+    /// Stores produced block lines under `key`. Oversized entries bypass the
+    /// cache but are still returned — the frame always paints.
+    pub(crate) fn store_block_lines(
+        &mut self,
+        key: BlockLinesKey,
+        lines: Vec<RatatuiLine<'static>>,
+    ) -> Arc<Vec<RatatuiLine<'static>>> {
+        let bytes = cached_lines_bytes(&lines);
+        let lines = Arc::new(lines);
+        if bytes <= MAX_CACHED_BLOCK_LINES_BYTES {
+            self.block_line_memos.insert(key, lines.clone(), bytes);
+        }
+        lines
+    }
+
+    /// Footer rows keyed by every input `footer_lines` reads — revisions plus
+    /// the raw values, so nothing can serve stale rows.
+    pub(crate) fn footer_lines(
+        &mut self,
+        state: &AppState,
+        width: u16,
+        rows: u16,
+        activity_visible: bool,
+    ) -> Arc<Vec<String>> {
+        let key = FooterKey {
+            working: state.working,
+            mode: state.mode,
+            pinned: state.scroll.is_pinned(),
+            unseen: state.scroll.unseen,
+            authenticated: state.authenticated,
+            activity: state
+                .activity
+                .as_ref()
+                .map(|activity| activity.phase.clone()),
+            context_tokens: state.context_tokens,
+            context_window_tokens: state.context_window_tokens,
+            content_rev: state.revisions.content,
+            status_rev: state.revisions.status,
+            width,
+            rows,
+            activity_visible,
+        };
+        memoized(&mut self.footer_memo, key, || {
+            Arc::new(crate::view_model::footer_lines(
+                state,
+                width as usize,
+                rows,
+                activity_visible,
+            ))
+        })
+        .clone()
+    }
+
+    pub(crate) fn remember_heights(&mut self, pending: Vec<(HeightKey, usize)>) {
+        for (key, height) in pending {
+            self.heights.insert(key, height);
+        }
+    }
+
+    // Tag 2 measures only a grouped thinking member's body. It must not alias
+    // standalone block heights (tags 0/1), which include headings/boundaries.
+    pub(crate) fn thinking_body_height(
+        &mut self,
+        block: &Block,
+        width: u16,
+        pending: &mut Vec<(HeightKey, usize)>,
+    ) -> usize {
+        let key = (
+            block.cache_identity(),
+            block.content_generation(),
+            width,
+            2,
+            block.lifecycle_tag(),
+        );
+        if let Some(height) = self.heights.get(&key) {
+            return *height;
+        }
+        self.height_misses = self.height_misses.saturating_add(1);
+        let height = match block.kind() {
+            BlockKind::Thinking(text) => {
+                wrapped_row_count(text, thinking_body_width(width) as usize)
+            }
+            _ => 1,
+        };
+        pending.push((key, height));
+        height
+    }
+
     pub fn height_misses(&self) -> u64 {
         self.height_misses
     }
@@ -681,15 +1323,20 @@ impl WrapCache {
         self.bodies.retained_bytes()
     }
 
-    /// Drops every cached wrapped body. Call this when theme or render
-    /// configuration changes so stale color/style derivations are never reused.
+    /// Drops every cached wrapped body and styled memo. Call this when theme
+    /// or render configuration changes so stale color/style derivations are
+    /// never reused.
     pub fn invalidate_render_configuration(&mut self) {
         self.bodies.clear();
+        self.scratch_bodies.clear();
+        self.block_line_memos.clear();
+        self.inspector_memo = None;
     }
 
     /// Looks up the cached wrapped body for a stable block, or computes and
-    /// stores it via `produce` on a miss. Streaming blocks (content changes
-    /// per frame) bypass the cache by returning `produce` directly.
+    /// stores it via `produce` on a miss. Non-cacheable blocks (streaming or
+    /// oversized) reuse a small scratch slot per content generation so the
+    /// streaming tail wraps once per frame rather than once per use.
     pub fn wrapped_body<F, G>(
         &mut self,
         block: &crate::block::Block,
@@ -703,16 +1350,35 @@ impl WrapCache {
         F: FnOnce() -> Vec<RatatuiLine<'static>>,
         G: Fn(&[RatatuiLine<'static>]) -> usize,
     {
-        if !cacheable {
-            self.body_bypasses = self.body_bypasses.saturating_add(1);
-            return produce();
-        }
         let key = (
             block.cache_identity(),
             block.content_generation(),
             width,
             kind.tag(),
         );
+        if !cacheable {
+            if let Some((_, body)) = self
+                .scratch_bodies
+                .iter()
+                .find(|(stored, _)| *stored == key)
+            {
+                self.body_hits = self.body_hits.saturating_add(1);
+                return body.as_ref().clone();
+            }
+            self.body_bypasses = self.body_bypasses.saturating_add(1);
+            let body = Arc::new(produce());
+            if self.scratch_bodies.len() >= SCRATCH_BODY_SLOTS {
+                self.scratch_bodies.remove(0);
+            }
+            self.scratch_bodies.push((key, body));
+            return self
+                .scratch_bodies
+                .last()
+                .expect("scratch body inserted")
+                .1
+                .as_ref()
+                .clone();
+        }
         if let Some(body) = self.bodies.get(&key) {
             self.body_hits = self.body_hits.saturating_add(1);
             return body.clone();
@@ -750,9 +1416,24 @@ pub(crate) fn cached_lines_bytes(lines: &[RatatuiLine<'static>]) -> usize {
 impl Default for WrapCache {
     fn default() -> Self {
         Self {
+            selection_regions: [None, None],
             heights: BoundedCache::new(16_384),
             height_misses: 0,
             bodies: WeightedCache::new(MAX_BODY_CACHE_ENTRIES, MAX_BODY_CACHE_BYTES),
+            scratch_bodies: Vec::new(),
+            projections: Vec::new(),
+            height_indexes: HashMap::new(),
+            search_memo: None,
+            selected_memo: None,
+            tool_leader_memo: None,
+            composer_memo: None,
+            slash_memo: None,
+            model_rows_memo: None,
+            palette_memo: None,
+            streaming_blocks_memo: None,
+            block_line_memos: WeightedCache::new(MAX_BLOCK_LINE_MEMOS, MAX_BLOCK_LINE_MEMO_BYTES),
+            footer_memo: None,
+            inspector_memo: None,
             body_hits: 0,
             body_misses: 0,
             body_bypasses: 0,
@@ -765,6 +1446,89 @@ impl Default for WrapCache {
 mod height_cache_tests {
     use super::*;
     use crate::block::{Block, BlockKind, BlockLifecycle};
+
+    #[test]
+    fn grouped_thinking_heights_reuse_and_invalidate_per_member() {
+        let mut blocks: Vec<_> = (0..3)
+            .map(|index| {
+                Block::new(
+                    format!("t{index}"),
+                    BlockKind::Thinking("ação 日本語\n👩‍💻".into()),
+                    BlockLifecycle::Complete,
+                )
+            })
+            .collect();
+        blocks[0].fold = crate::block::FoldState::Expanded;
+        let mut cache = WrapCache::default();
+        let expected = |blocks: &[Block], width: u16| {
+            1 + blocks
+                .iter()
+                .map(|block| match block.kind() {
+                    BlockKind::Thinking(text) => {
+                        wrapped_row_count(text, super::thinking_body_width(width) as usize) as u64
+                    }
+                    _ => unreachable!(),
+                })
+                .sum::<u64>()
+        };
+        for width in [12, 12, 20, 12] {
+            assert_eq!(
+                HeightIndex::build(&blocks, width, &mut cache).total_rows,
+                expected(&blocks, width)
+            );
+        }
+        assert_eq!(cache.height_misses(), 6);
+        blocks[1].append_text("\nnew row");
+        assert_eq!(
+            HeightIndex::build(&blocks, 12, &mut cache).total_rows,
+            expected(&blocks, 12)
+        );
+        assert_eq!(cache.height_misses(), 7);
+        blocks[0].fold = crate::block::FoldState::Collapsed;
+        assert_eq!(HeightIndex::build(&blocks, 12, &mut cache).total_rows, 1);
+        blocks[0].fold = crate::block::FoldState::Expanded;
+        assert_eq!(
+            HeightIndex::build(&blocks, 12, &mut cache).total_rows,
+            expected(&blocks, 12)
+        );
+        assert_eq!(cache.height_misses(), 7);
+        // A standalone heading must not reuse the grouped body-only height.
+        assert_eq!(
+            HeightIndex::build(&blocks[..1], 12, &mut cache).total_rows,
+            block_height(&blocks[0], 12, &mut cache) as u64
+        );
+        let replacement = blocks[1].clone();
+        blocks[1] = replacement;
+        HeightIndex::build(&blocks, 12, &mut cache);
+        assert_eq!(cache.height_misses(), 9);
+    }
+
+    #[test]
+    fn grouped_thinking_eviction_preserves_exact_heights() {
+        let mut blocks: Vec<_> = (0..5)
+            .map(|index| {
+                Block::new(
+                    format!("t{index}"),
+                    BlockKind::Thinking("line\n".into()),
+                    BlockLifecycle::Complete,
+                )
+            })
+            .collect();
+        blocks[0].fold = crate::block::FoldState::Expanded;
+        let mut cache = WrapCache {
+            heights: BoundedCache::new(4),
+            ..WrapCache::default()
+        };
+        for _ in 0..3 {
+            assert_eq!(HeightIndex::build(&blocks, 80, &mut cache).total_rows, 11);
+            assert_eq!(cache.heights.len(), 4);
+        }
+        assert_eq!(
+            cache.height_misses(),
+            7,
+            "deferred insertion avoids a cascade of misses"
+        );
+    }
 
     #[test]
     fn retains_both_active_widths_without_recurring_misses() {
@@ -791,6 +1555,59 @@ mod height_cache_tests {
             16_384,
             "both active viewport widths should remain cached"
         );
+    }
+
+    #[test]
+    fn metrics_finds_last_visible_foldable_across_viewports() {
+        let mut cache = WrapCache::default();
+        let mut blocks: Vec<Block> = (0..200)
+            .map(|index| {
+                Block::new(
+                    format!("a{index}"),
+                    BlockKind::Assistant("line".into()),
+                    BlockLifecycle::Complete,
+                )
+            })
+            .collect();
+        for index in [60usize, 198] {
+            blocks[index] = Block::new(
+                format!("fold-{index}"),
+                BlockKind::Thinking("t".into()),
+                BlockLifecycle::Complete,
+            );
+        }
+        let index = HeightIndex::build(&blocks, 80, &mut cache);
+        let last_foldable = |block: &Block| {
+            index
+                .metrics(
+                    &FollowMode::Pinned(ScrollAnchor {
+                        block_id: block.id.clone(),
+                        row_offset: 0,
+                    }),
+                    10,
+                )
+                .last_visible_foldable_anchor
+                .map(|anchor| anchor.block_id)
+        };
+        assert_eq!(last_foldable(&blocks[0]), None);
+        assert_eq!(last_foldable(&blocks[59]), Some(blocks[60].id.clone()));
+        assert_eq!(last_foldable(&blocks[60]), Some(blocks[60].id.clone()));
+        assert_eq!(last_foldable(&blocks[61]), None);
+        assert_eq!(last_foldable(&blocks[199]), Some(blocks[198].id.clone()));
+    }
+
+    #[test]
+    fn streaming_probe_memoizes_on_content_revision() {
+        let mut cache = WrapCache::default();
+        let mut blocks = vec![Block::new(
+            "a",
+            BlockKind::Assistant("x".into()),
+            BlockLifecycle::Complete,
+        )];
+        assert!(!cache.has_streaming_block(&blocks, 1));
+        blocks[0].lifecycle = BlockLifecycle::Streaming;
+        assert!(!cache.has_streaming_block(&blocks, 1));
+        assert!(cache.has_streaming_block(&blocks, 2));
     }
 
     #[test]

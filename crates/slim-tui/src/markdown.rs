@@ -58,7 +58,7 @@ impl LineKind {
 }
 
 #[derive(Default)]
-struct LogicalLine {
+pub(crate) struct LogicalLine {
     pieces: Vec<Piece>,
     kind: LineKind,
 }
@@ -274,15 +274,8 @@ impl Projection {
         let separator = 2usize;
         let total = widths.iter().sum::<usize>() + separator.saturating_mul(cols.saturating_sub(1));
         if total > self.width {
-            let mut overflow = total.saturating_sub(self.width);
-            for width in widths.iter_mut().rev() {
-                if overflow == 0 {
-                    break;
-                }
-                let reduce = (*width).min(overflow).min(width.saturating_sub(1));
-                *width -= reduce;
-                overflow -= reduce;
-            }
+            self.emit_table_fallback(&rows, cols);
+            return;
         }
         for (row_index, row) in rows.iter().enumerate() {
             let mut line = String::new();
@@ -309,6 +302,41 @@ impl Projection {
             }
         }
     }
+
+    fn emit_table_fallback(&mut self, rows: &[Vec<String>], cols: usize) {
+        let headers = rows.first();
+        let labels = (0..cols)
+            .map(|index| {
+                headers
+                    .and_then(|row| row.get(index))
+                    .filter(|header| !header.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| format!("Column {}", index + 1))
+            })
+            .collect::<Vec<_>>();
+
+        let body_rows = rows.iter().skip(1);
+        if body_rows.clone().next().is_none() {
+            for label in &labels {
+                self.push_table_field(label, "");
+            }
+            return;
+        }
+
+        for row in body_rows {
+            for (index, label) in labels.iter().enumerate() {
+                let value = row.get(index).map(String::as_str).unwrap_or("");
+                self.push_table_field(label, value);
+            }
+        }
+    }
+
+    fn push_table_field(&mut self, header: &str, value: &str) {
+        self.current
+            .push(format!("{header}: "), Tone::H3, Modifier::empty());
+        self.current.push(value, Tone::Text, Modifier::empty());
+        self.finish_line(false);
+    }
 }
 
 fn pad_cells(text: &str, width: usize) -> String {
@@ -331,27 +359,47 @@ fn pad_cells(text: &str, width: usize) -> String {
     out
 }
 
+#[cfg(test)]
 pub(crate) fn render_markdown(
     source: &str,
     width: u16,
     styles: MarkdownStyles,
 ) -> Vec<Line<'static>> {
     let width = width.max(1) as usize;
-    wrap(project(source, width), width, styles)
+    wrap(&project(source, width), width, styles)
 }
 
-pub(crate) fn markdown_row_count(source: &str, width: u16) -> usize {
+/// Projects markdown into logical lines without styling so the same parse can
+/// feed both row counting and rendering (§12.2/§12.4 shared derivation).
+pub(crate) fn project_markdown(source: &str, width: u16) -> Vec<LogicalLine> {
+    project(source, width.max(1) as usize)
+}
+
+pub(crate) fn projected_row_count(lines: &[LogicalLine], width: u16) -> usize {
     let width = width.max(1) as usize;
-    project(source, width)
+    lines
         .iter()
         .map(|line| wrapped_line_count(line, width))
         .sum::<usize>()
         .max(1)
 }
 
+pub(crate) fn render_projected(
+    lines: &[LogicalLine],
+    width: u16,
+    styles: MarkdownStyles,
+) -> Vec<Line<'static>> {
+    wrap(lines, width.max(1) as usize, styles)
+}
+
+#[cfg(test)]
+pub(crate) fn markdown_row_count(source: &str, width: u16) -> usize {
+    projected_row_count(&project(source, width.max(1) as usize), width)
+}
+
 pub(crate) fn render_plain(source: &str, width: u16) -> Vec<String> {
     let width = width.max(1) as usize;
-    let safe = sanitize_terminal_text(source);
+    let safe = sanitize_terminal_text_cow(source);
     let mut rows = Vec::new();
     for line in safe.split('\n') {
         let mut row = String::new();
@@ -378,7 +426,7 @@ pub(crate) fn plain_row_count(source: &str, width: u16) -> usize {
             .map(|line| line.len().div_ceil(width).max(1))
             .sum();
     }
-    let safe = sanitize_terminal_text(source);
+    let safe = sanitize_terminal_text_cow(source);
     safe.split('\n')
         .map(|line| {
             let mut rows = 1usize;
@@ -398,7 +446,7 @@ pub(crate) fn plain_row_count(source: &str, width: u16) -> usize {
 }
 
 fn project(source: &str, width: usize) -> Vec<LogicalLine> {
-    let safe = sanitize_terminal_text(source);
+    let safe = sanitize_terminal_text_cow(source);
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     let mut projection = Projection {
@@ -527,13 +575,125 @@ fn wrapped_line_count(line: &LogicalLine, width: usize) -> usize {
     } else {
         width
     };
-    wrap_pieces(line, width).len()
+    let count = if line.kind.is_code() {
+        count_hard_wrapped(&line.pieces, width)
+    } else {
+        count_prose_lines(&line.pieces, width)
+    };
+    #[cfg(test)]
+    {
+        let reference = wrap_pieces(line, width).len();
+        assert_eq!(
+            count, reference,
+            "wrapped_line_count mismatch: count={count} reference={reference}, width={width}"
+        );
+    }
+    count
 }
 
-fn wrap(logical: Vec<LogicalLine>, width: usize, styles: MarkdownStyles) -> Vec<Line<'static>> {
+fn count_hard_wrapped(pieces: &[Piece], width: usize) -> usize {
+    let mut rows = 1usize;
+    let mut used = 0usize;
+    for piece in pieces {
+        for grapheme in piece.text.graphemes(true) {
+            let (_, cells) = normalized_grapheme(grapheme, width);
+            if starts_new_row(used, cells, width) {
+                rows += 1;
+                used = 0;
+            }
+            used = used.saturating_add(cells);
+        }
+    }
+    rows
+}
+
+struct MetricToken<'a> {
+    slices: Vec<(&'a str, usize)>,
+    width: usize,
+    whitespace: bool,
+}
+
+fn count_prose_lines(pieces: &[Piece], width: usize) -> usize {
+    let mut tokens: Vec<MetricToken> = Vec::new();
+    for piece in pieces {
+        for grapheme in piece.text.graphemes(true) {
+            let (display, cells) = normalized_grapheme(grapheme, width);
+            let whitespace = display.chars().all(char::is_whitespace);
+            if tokens.last().is_none_or(|t| t.whitespace != whitespace) {
+                tokens.push(MetricToken {
+                    slices: Vec::new(),
+                    width: 0,
+                    whitespace,
+                });
+            }
+            let token = tokens.last_mut().expect("token inserted");
+            token.slices.push((display, cells));
+            token.width = token.width.saturating_add(cells);
+        }
+    }
+
+    if tokens.is_empty() {
+        return 1;
+    }
+
+    let mut rows = 1usize;
+    let mut used = 0usize;
+    let mut row_has_word = false;
+    let mut pending_space: Option<&MetricToken> = None;
+
+    for token in &tokens {
+        if token.whitespace {
+            if used == 0 && rows == 1 && !row_has_word {
+                for &(_, cells) in &token.slices {
+                    if starts_new_row(used, cells, width) {
+                        rows += 1;
+                        used = 0;
+                    }
+                    used = used.saturating_add(cells);
+                }
+            } else {
+                pending_space = Some(token);
+            }
+            continue;
+        }
+
+        let pending_width = pending_space.map_or(0, |s| s.width);
+        if row_has_word
+            && used
+                .saturating_add(pending_width)
+                .saturating_add(token.width)
+                > width
+        {
+            rows += 1;
+            used = 0;
+            pending_space = None;
+        }
+
+        if let Some(space) = pending_space.take() {
+            for &(_, cells) in &space.slices {
+                if starts_new_row(used, cells, width) {
+                    rows += 1;
+                    used = 0;
+                }
+                used = used.saturating_add(cells);
+            }
+        }
+        for &(_, cells) in &token.slices {
+            if starts_new_row(used, cells, width) {
+                rows += 1;
+                used = 0;
+            }
+            used = used.saturating_add(cells);
+        }
+        row_has_word = true;
+    }
+    rows
+}
+
+fn wrap(logical: &[LogicalLine], width: usize, styles: MarkdownStyles) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for line in logical {
-        if is_horizontal_rule(&line) {
+        if is_horizontal_rule(line) {
             lines.push(Line::from(Span::styled(
                 "─".repeat(width.max(1)),
                 styles.quote,
@@ -546,7 +706,7 @@ fn wrap(logical: Vec<LogicalLine>, width: usize, styles: MarkdownStyles) -> Vec<
         } else {
             width
         };
-        for row in wrap_pieces(&line, content_width) {
+        for row in wrap_pieces(line, content_width) {
             let mut spans = Vec::new();
             for piece in row {
                 let style = style_for(piece.tone, piece.modifiers, styles);
@@ -808,9 +968,34 @@ fn is_safe_ascii(source: &str) -> bool {
         .all(|byte| byte == b'\n' || (b' '..=b'~').contains(&byte))
 }
 
-pub(crate) fn sanitize_terminal_text(source: &str) -> String {
+pub(crate) fn sanitize_terminal_text_cow(source: &str) -> std::borrow::Cow<'_, str> {
     if is_safe_ascii(source) {
-        return source.to_owned();
+        return std::borrow::Cow::Borrowed(source);
+    }
+    std::borrow::Cow::Owned(sanitize_terminal_text(source))
+}
+
+pub(crate) fn sanitize_terminal_text(source: &str) -> String {
+    sanitize_terminal_text_with_offsets(source, &[]).0
+}
+
+/// Sanitizes terminal text while translating raw UTF-8 byte boundaries into
+/// offsets in the visible projection. Offsets need not be sorted and are
+/// clamped to the source length. The parser is shared with
+/// [`sanitize_terminal_text`], so control stripping and tab expansion cannot
+/// diverge between the composer and the rest of the TUI.
+pub(crate) fn sanitize_terminal_text_with_offsets(
+    source: &str,
+    offsets: &[usize],
+) -> (String, Vec<usize>) {
+    if is_safe_ascii(source) {
+        return (
+            source.to_owned(),
+            offsets
+                .iter()
+                .map(|offset| (*offset).min(source.len()))
+                .collect(),
+        );
     }
 
     #[derive(Clone, Copy)]
@@ -825,7 +1010,16 @@ pub(crate) fn sanitize_terminal_text(source: &str) -> String {
     let mut state = State::Ground;
     let mut stripped = String::with_capacity(source.len());
     let mut has_tab = false;
-    for character in source.chars() {
+    let mut stripped_offsets = vec![0; offsets.len()];
+    let ordered_offsets = offset_order(offsets);
+    let mut next_offset = 0usize;
+    for (byte, character) in source.char_indices() {
+        while next_offset < ordered_offsets.len()
+            && offsets[ordered_offsets[next_offset]].min(source.len()) <= byte
+        {
+            stripped_offsets[ordered_offsets[next_offset]] = stripped.len();
+            next_offset += 1;
+        }
         state = match state {
             State::Ground => match character {
                 '\u{1b}' => State::Escape,
@@ -873,13 +1067,27 @@ pub(crate) fn sanitize_terminal_text(source: &str) -> String {
         };
     }
 
+    while next_offset < ordered_offsets.len() {
+        stripped_offsets[ordered_offsets[next_offset]] = stripped.len();
+        next_offset += 1;
+    }
+
     if !has_tab {
-        return stripped;
+        return (stripped, stripped_offsets);
     }
 
     let mut safe = String::with_capacity(stripped.len());
     let mut column = 0usize;
-    for grapheme in stripped.graphemes(true) {
+    let mut safe_offsets = vec![0; stripped_offsets.len()];
+    let ordered_offsets = offset_order(&stripped_offsets);
+    let mut next_offset = 0usize;
+    for (byte, grapheme) in stripped.grapheme_indices(true) {
+        while next_offset < ordered_offsets.len()
+            && stripped_offsets[ordered_offsets[next_offset]] <= byte
+        {
+            safe_offsets[ordered_offsets[next_offset]] = safe.len();
+            next_offset += 1;
+        }
         match grapheme {
             "\n" => {
                 safe.push('\n');
@@ -896,7 +1104,18 @@ pub(crate) fn sanitize_terminal_text(source: &str) -> String {
             }
         }
     }
-    safe
+
+    while next_offset < ordered_offsets.len() {
+        safe_offsets[ordered_offsets[next_offset]] = safe.len();
+        next_offset += 1;
+    }
+    (safe, safe_offsets)
+}
+
+fn offset_order(offsets: &[usize]) -> Vec<usize> {
+    let mut order = (0..offsets.len()).collect::<Vec<_>>();
+    order.sort_unstable_by_key(|index| offsets[*index]);
+    order
 }
 
 #[cfg(test)]
@@ -906,7 +1125,7 @@ mod tests {
 
     use super::{
         markdown_row_count, plain_row_count, render_markdown, render_plain, sanitize_terminal_text,
-        MarkdownStyles,
+        sanitize_terminal_text_with_offsets, MarkdownStyles,
     };
 
     fn line_text(line: &Line<'_>) -> String {
@@ -1026,6 +1245,20 @@ mod tests {
     }
 
     #[test]
+    fn narrow_table_fallback_keeps_cell_tails_and_row_count() {
+        let markdown = "| Field | Value |\n| --- | --- |\n| alpha | first value with tail-alpha |\n| beta | second value with tail-beta |";
+        let rendered = render_markdown(markdown, 18, styles());
+        let lines = rendered.iter().map(line_text).collect::<Vec<_>>();
+        let joined = lines.join("\n");
+        assert!(joined.contains("Field: alpha"), "{joined}");
+        assert!(joined.contains("Field: beta"), "{joined}");
+        assert!(joined.contains("tail-alpha"), "{joined}");
+        assert!(joined.contains("tail-beta"), "{joined}");
+        assert!(rendered.iter().all(|line| line.width() <= 18));
+        assert_eq!(markdown_row_count(markdown, 18), rendered.len());
+    }
+
+    #[test]
     fn tabs_expand_before_materialization() {
         let rendered = render_markdown("`a\tb`", 20, styles());
         assert!(rendered.iter().all(|line| !line_text(line).contains('\t')));
@@ -1058,5 +1291,16 @@ mod tests {
             sanitize_terminal_text("safe\u{9d}52;secret\u{9c}tail"),
             "safetail"
         );
+    }
+
+    #[test]
+    fn sanitized_offsets_follow_tabs_and_removed_controls() {
+        let source = "a\tb\u{1b}[31mcd";
+        let offsets = [source.len(), 0, 2];
+        let (safe, mapped) = sanitize_terminal_text_with_offsets(source, &offsets);
+        assert_eq!(safe, "a   bcd");
+        assert_eq!(mapped[0], safe.len());
+        assert_eq!(mapped[1], 0);
+        assert_eq!(&safe[..mapped[2]], "a   ");
     }
 }

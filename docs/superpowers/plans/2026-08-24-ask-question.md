@@ -1,6 +1,6 @@
 # Slim Ask Question Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Retomada deste plano:** revalide as pendências no código e execute somente o escopo autorizado, conforme o `AGENTS.md` vigente. Skills e delegação são escolhidas por necessidade; receitas e resultados da execução original não são obrigações gerais.
 
 **Goal:** adicionar uma tool `ask_question` que pausa um run TUI Auto/ReadOnly, oferece escolhas e devolve a resposta ao mesmo agent loop.
 

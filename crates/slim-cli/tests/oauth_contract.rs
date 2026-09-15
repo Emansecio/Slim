@@ -686,3 +686,146 @@ async fn background_refresh_within_ten_minutes_persists_rotated_token() {
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[derive(Clone, Copy)]
+struct NoopBrowser;
+
+impl BrowserLauncher for NoopBrowser {
+    fn open(&self, _url: &str) -> Result<(), OAuthError> {
+        Ok(())
+    }
+}
+
+fn xai_service(
+    auth_path: &std::path::Path,
+    device_code_url: String,
+    token_url: String,
+) -> OAuthService {
+    OAuthService::new(
+        OAuthEndpoints {
+            xai_device_code: device_code_url,
+            xai_token: token_url,
+            ..OAuthEndpoints::default()
+        },
+        Arc::new(NoopBrowser),
+        OAuthStore::at(auth_path),
+    )
+    .expect("xai service")
+}
+
+async fn serve_scripted(
+    listener: TcpListener,
+    bodies: Vec<(u16, String)>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        for (status, body) in bodies {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = vec![0_u8; 8192];
+            let _ = stream.read(&mut request).await;
+            let reason = if status == 200 { "OK" } else { "Bad Request" };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    })
+}
+
+fn xai_temp_auth(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = std::env::temp_dir().join(format!(
+        "slim-xai-oauth-{}-{}-{}",
+        label,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("root");
+    let auth_path = root.join("auth.json");
+    (root, auth_path)
+}
+
+#[tokio::test]
+async fn xai_device_login_polls_then_stores_oauth_credential() {
+    let (root, auth_path) = xai_temp_auth("login");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let base = format!("http://{address}");
+    let server = serve_scripted(
+        listener,
+        vec![
+            (200, r#"{"device_code":"device-1","user_code":"ABCD-1234","verification_uri":"https://auth.x.ai/device","verification_uri_complete":"https://auth.x.ai/device?code=ABCD-1234","interval":1,"expires_in":600}"#.into()),
+            (400, r#"{"error":"authorization_pending"}"#.into()),
+            (200, r#"{"access_token":"access-1","refresh_token":"refresh-1","expires_in":3600}"#.into()),
+        ],
+    )
+    .await;
+    let service = xai_service(
+        &auth_path,
+        format!("{base}/device/code"),
+        format!("{base}/token"),
+    );
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let credential = service
+        .login(OAuthProvider::Xai, progress_tx, cancel_rx)
+        .await
+        .expect("xai login");
+    assert_eq!(credential.access, "access-1");
+    assert_eq!(credential.refresh, "refresh-1");
+    assert_eq!(credential.account_id, None);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64;
+    let skew = now + 3_300_000 - credential.expires;
+    assert!(skew < 120_000, "5-minute refresh skew is applied: {skew}");
+    match progress_rx.recv().await.expect("progress") {
+        OAuthProgress::AuthUrl { user_code, .. } => {
+            assert_eq!(user_code.as_deref(), Some("ABCD-1234"))
+        }
+        other => panic!("device code progress expected, got {other:?}"),
+    }
+    let stored = OAuthStore::at(&auth_path)
+        .credential(OAuthProvider::Xai)
+        .expect("stored")
+        .expect("credential");
+    assert_eq!(stored.access, "access-1");
+    let _ = server.await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn xai_device_login_denied_is_a_clean_error() {
+    let (root, auth_path) = xai_temp_auth("denied");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let base = format!("http://{address}");
+    let server = serve_scripted(
+        listener,
+        vec![
+            (200, r#"{"device_code":"device-1","user_code":"ABCD-1234","verification_uri":"https://auth.x.ai/device","interval":1,"expires_in":600}"#.into()),
+            (400, r#"{"error":"access_denied"}"#.into()),
+        ],
+    )
+    .await;
+    let service = xai_service(
+        &auth_path,
+        format!("{base}/device/code"),
+        format!("{base}/token"),
+    );
+    let (progress_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let error = service
+        .login(OAuthProvider::Xai, progress_tx, cancel_rx)
+        .await
+        .expect_err("denied login fails");
+    assert!(error.to_string().contains("denied"), "{error}");
+    let _ = server.await;
+    let _ = std::fs::remove_dir_all(root);
+}

@@ -299,7 +299,10 @@ impl OAuthStore {
 }
 
 fn validate_api_key_provider(provider: &str) -> Result<(), OAuthError> {
-    if matches!(provider, "opencode-go" | "clinepass" | "command-code") {
+    if matches!(
+        provider,
+        "opencode-go" | "opencode-zen" | "clinepass" | "command-code" | "xai"
+    ) {
         Ok(())
     } else {
         Err(OAuthError::Store("unsupported API-key provider".into()))
@@ -310,6 +313,7 @@ fn parse_provider(value: &str) -> Option<OAuthProvider> {
     match value {
         "anthropic" => Some(OAuthProvider::Anthropic),
         "openai-codex" => Some(OAuthProvider::OpenAiCodex),
+        "xai" => Some(OAuthProvider::Xai),
         _ => None,
     }
 }

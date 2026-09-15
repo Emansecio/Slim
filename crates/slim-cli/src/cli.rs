@@ -31,7 +31,10 @@ Modes:
 
 Provider:
   --provider NAME    Provider route
-  --model MODEL      Model identifier
+  --model MODEL      Model identifier (Codex: astra, sol, terra, luna)
+  --effort LEVEL     Reasoning effort
+  --fast             Enable Codex Fast (higher usage)
+  --normal           Use normal Codex speed
   --endpoint URL     Override the provider endpoint
 
 Input and sessions:
@@ -40,6 +43,7 @@ Input and sessions:
   --session PATH     Persist the run to a session file
   --resume PATH      Continue an existing session
   --recover PATH     Repair a durable session without running a prompt
+  --abandon-pending  With --recover: abandon unfinished work; effects stay unverified
 
 Output:
   --verbose          Include detailed human-readable events
@@ -68,10 +72,13 @@ pub(crate) struct ParsedArgs {
     pub prompt: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub effort: Option<String>,
+    pub codex_fast: Option<bool>,
     pub endpoint: Option<String>,
     pub session_path: Option<String>,
     pub resume_path: Option<String>,
     pub recover_path: Option<String>,
+    pub abandon_pending: bool,
     pub image_paths: Vec<String>,
     pub positional: Vec<String>,
     pub tui: bool,
@@ -87,10 +94,13 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
         prompt: None,
         provider: None,
         model: None,
+        effort: None,
+        codex_fast: None,
         endpoint: None,
         session_path: None,
         resume_path: None,
         recover_path: None,
+        abandon_pending: false,
         image_paths: Vec::new(),
         positional: Vec::new(),
         tui: false,
@@ -104,12 +114,15 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
             "--tui" => parsed.tui = true,
             "--headless" => parsed.headless = true,
             "--fake" => parsed.fake = true,
+            "--abandon-pending" => parsed.abandon_pending = true,
+            "--fast" => parsed.codex_fast = Some(true),
+            "--normal" => parsed.codex_fast = Some(false),
             "--verbose" => parsed.verbose = true,
             "--plan" => parsed.mode = OperatingMode::Plan,
             "--read-only" => parsed.mode = OperatingMode::ReadOnly,
             "--jsonl" => parsed.format = OutputFormat::Jsonl,
             "--prompt" | "--provider" | "--model" | "--endpoint" | "--session" | "--resume"
-            | "--recover" | "--image" => {
+            | "--recover" | "--image" | "--effort" => {
                 let option = args[index].clone();
                 index += 1;
                 let value = args.get(index).cloned().ok_or_else(|| {
@@ -119,6 +132,7 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
                     "--prompt" => parsed.prompt = Some(value),
                     "--provider" => parsed.provider = Some(value),
                     "--model" => parsed.model = Some(value),
+                    "--effort" => parsed.effort = Some(value),
                     "--endpoint" => parsed.endpoint = Some(value),
                     "--session" => parsed.session_path = Some(value),
                     "--resume" => parsed.resume_path = Some(value),
@@ -151,6 +165,12 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
             "session flags are mutually exclusive; use only one of --session, --resume, or --recover\n",
         ));
     }
+    if parsed.abandon_pending && parsed.recover_path.is_none() {
+        return Err(failure(
+            ExitCode::InputRequired,
+            "--abandon-pending requires --recover PATH\n",
+        ));
+    }
     Ok(parsed)
 }
 
@@ -173,10 +193,13 @@ where
         prompt,
         provider,
         model,
+        effort,
+        codex_fast,
         endpoint,
         session_path,
         resume_path,
         recover_path,
+        abandon_pending,
         image_paths,
         positional,
         tui: _,
@@ -232,11 +255,11 @@ where
     };
 
     if let Some(path) = recover_path.as_deref() {
-        if let Err(output) = recover_path_explicitly(path) {
+        if let Err(output) = recover_path_explicitly(path, abandon_pending) {
             return output;
         }
         if prompt.trim().is_empty() {
-            return recovery_output(format_from_args(&args));
+            return recovery_output(format_from_args(&args), abandon_pending);
         }
     }
 
@@ -257,16 +280,24 @@ where
             "openai-codex" | "codex" => ProviderKind::OpenAiCodex,
             "anthropic" | "claude" => ProviderKind::Anthropic,
             "opencode-go" | "opencode_go" | "go" => ProviderKind::OpenCodeGo,
+            "opencode-zen" | "opencode_zen" | "zen" => ProviderKind::OpenCodeZen,
             "clinepass" | "cline-pass" | "cp" => ProviderKind::ClinePass,
             "command-code" | "commandcode" | "cmd" => ProviderKind::CommandCode,
+            "xai" | "grok" => ProviderKind::Xai,
             _ => {
                 return failure(
                     ExitCode::Provider,
-                    "unsupported provider; use openai-compatible, openai-codex, anthropic, opencode-go, clinepass, or command-code\n",
+                    "unsupported provider; use openai-compatible, openai-codex, anthropic, opencode-go, opencode-zen, clinepass, command-code, or xai\n",
                 )
             }
         };
         let default_endpoint = default_provider_endpoint(kind);
+        if codex_fast.is_some() && kind != ProviderKind::OpenAiCodex {
+            return failure(
+                ExitCode::InputRequired,
+                "--fast/--normal require the openai-codex provider\n",
+            );
+        }
         let default_model = default_provider_model(kind);
         let layered_config = match crate::config::load_layered() {
             Ok(config) => config,
@@ -278,6 +309,15 @@ where
         };
         let credential = match crate::auth::resolve_provider_credential(kind) {
             Ok(Some(credential)) => credential,
+            // The Zen free tier authenticates with the literal `public`
+            // bearer; the adapter still sends `x-opencode-session`.
+            Ok(None) if kind == ProviderKind::OpenCodeZen => {
+                crate::auth::ProviderCredential {
+                    access: slim_core::provider::OPENCODE_ZEN_PUBLIC_KEY.into(),
+                    account_id: None,
+                    oauth: false,
+                }
+            }
             Ok(None) => {
                 return failure(
                     ExitCode::Auth,
@@ -327,11 +367,21 @@ where
         };
         // G248: a configured model only applies when it validates against the
         // active provider kind; otherwise the provider default is used.
-        let model = model
-            .or_else(|| std::env::var("SLIM_MODEL").ok())
+        let explicit_model = model.or_else(|| std::env::var("SLIM_MODEL").ok());
+        if explicit_model
+            .as_deref()
+            .is_some_and(|model| !crate::provider_compatible_model(kind, model))
+        {
+            return failure(
+                ExitCode::InputRequired,
+                "explicit model is unsupported by the selected provider\n",
+            );
+        }
+        let model = explicit_model
             .or(layered_config.model)
             .filter(|model| crate::provider_compatible_model(kind, model))
             .unwrap_or_else(|| default_model.into());
+        let model = crate::canonical_provider_model(kind, &model);
         let timeout = match resolve_timeout_secs(layered_config.timeout_secs) {
             Ok(timeout) => timeout,
             Err(error) => return provider_failure(error),
@@ -351,8 +401,9 @@ where
         };
         // Reasoning effort: CLI/TUI env override first, then slim.toml
         // (global + project layers). Empty string means "unset".
-        let effort = std::env::var("SLIM_EFFORT")
-            .ok()
+        let codex_fast = codex_fast.or(layered_config.codex_fast).unwrap_or(false);
+        let effort = effort
+            .or_else(|| std::env::var("SLIM_EFFORT").ok())
             .filter(|value| !value.is_empty())
             .or(layered_config.effort);
         let mut options = ProviderRunOptions::default()
@@ -361,11 +412,15 @@ where
         if let Some(effort) = effort {
             options = options.with_reasoning_effort(effort);
         }
+        options.codex_fast = codex_fast;
         if let Some(calls) = layered_config.max_mutating_tool_calls {
             options = options.with_max_tool_calls(calls);
         }
         if let Some(calls) = layered_config.max_read_tool_calls {
             options = options.with_max_read_tool_calls(calls);
+        }
+        if let Some(calls) = layered_config.max_total_tool_calls {
+            options = options.with_max_total_tool_calls(calls);
         }
         if let Some(turns) = layered_config.max_turns {
             options = options.with_max_turns(turns);
@@ -444,6 +499,7 @@ fn refresh_headless_oauth(kind: ProviderKind) -> Result<(String, Option<String>)
     let provider = match kind {
         ProviderKind::Anthropic => OAuthProvider::Anthropic,
         ProviderKind::OpenAiCodex => OAuthProvider::OpenAiCodex,
+        ProviderKind::Xai => OAuthProvider::Xai,
         _ => return Err("OAuth is not available for this provider".into()),
     };
     let oauth = OAuthService::production().map_err(|error| error.to_string())?;
@@ -470,6 +526,7 @@ fn refresh_headless_oauth(kind: ProviderKind) -> Result<(String, Option<String>)
                 })?,
         ),
         OAuthProvider::Anthropic => Some(fresh.credential.account_id.unwrap_or_default()),
+        OAuthProvider::Xai => None,
     };
     Ok((fresh.credential.access, account_id))
 }
@@ -480,8 +537,10 @@ pub(crate) fn default_provider_endpoint(kind: ProviderKind) -> &'static str {
         ProviderKind::OpenAiCodex => "https://chatgpt.com/backend-api",
         ProviderKind::Anthropic => "https://api.anthropic.com/v1/messages",
         ProviderKind::OpenCodeGo => slim_core::provider::OPENCODE_GO_BASE_URL,
+        ProviderKind::OpenCodeZen => slim_core::provider::OPENCODE_ZEN_BASE_URL,
         ProviderKind::ClinePass => slim_core::provider::CLINEPASS_BASE_URL,
         ProviderKind::CommandCode => slim_core::provider::COMMANDCODE_BASE_URL,
+        ProviderKind::Xai => slim_core::provider::XAI_BASE_URL,
     }
 }
 
@@ -491,8 +550,10 @@ pub(crate) fn default_provider_model(kind: ProviderKind) -> &'static str {
         ProviderKind::OpenAiCodex => ModelAlias::Sol.id(),
         ProviderKind::Anthropic => "claude-sonnet-4-6",
         ProviderKind::OpenCodeGo => slim_core::provider::OPENCODE_GO_DEFAULT_MODEL,
+        ProviderKind::OpenCodeZen => slim_core::provider::OPENCODE_ZEN_DEFAULT_MODEL,
         ProviderKind::ClinePass => slim_core::provider::CLINEPASS_DEFAULT_MODEL,
         ProviderKind::CommandCode => slim_core::provider::COMMANDCODE_DEFAULT_MODEL,
+        ProviderKind::Xai => slim_core::provider::XAI_DEFAULT_MODEL,
     }
 }
 
@@ -517,14 +578,18 @@ fn provider_failure(error: slim_core::ProviderError) -> CliOutput {
         slim_core::ProviderError::Cancelled => {
             (ExitCode::Cancelled, "provider request cancelled".into())
         }
-        slim_core::ProviderError::Transport { .. } => {
-            (ExitCode::Provider, "provider transport failed".into())
-        }
+        slim_core::ProviderError::Transport { message, .. } => (
+            ExitCode::Provider,
+            format!("provider transport failed: {message}"),
+        ),
         slim_core::ProviderError::MalformedToolCall => (
             ExitCode::Provider,
             "provider returned a malformed tool call".into(),
         ),
-        slim_core::ProviderError::Remote { message }
+        slim_core::ProviderError::TransientRemote { message }
+        | slim_core::ProviderError::Remote { message }
+        | slim_core::ProviderError::Api { message, .. }
+        | slim_core::ProviderError::Http { message, .. }
         | slim_core::ProviderError::InvalidResponse { message } => (
             ExitCode::Provider,
             format!("provider error: {}", redact(&message)),
@@ -572,15 +637,23 @@ fn validate_resume_path(path: &str) -> Result<SessionPreflight, CliOutput> {
     {
         return Err(failure(
             ExitCode::Blocked,
-            "resume requires an explicit decision for existing pending, claimed, or suspended durable work\n",
+            "resume requires an explicit decision for existing pending, claimed, or suspended durable work; inspect prior effects, then use Slim --headless --recover PATH --abandon-pending to abandon without replay\n",
         ));
     }
     Ok(report)
 }
 
-fn recover_path_explicitly(path: &str) -> Result<(), CliOutput> {
+fn recover_path_explicitly(path: &str, abandon_pending: bool) -> Result<(), CliOutput> {
     match recover_durable_v2(path) {
-        Ok(repo) => {
+        Ok(mut repo) => {
+            if abandon_pending {
+                abandon_pending_work(&mut repo).map_err(|error| {
+                    failure(
+                        ExitCode::Blocked,
+                        &format!("pending work recovery rejected: {error}\n"),
+                    )
+                })?;
+            }
             drop(repo);
             Ok(())
         }
@@ -591,6 +664,117 @@ fn recover_path_explicitly(path: &str) -> Result<(), CliOutput> {
     }
 }
 
+/// The caller explicitly abandons ownership of unfinished work, never its effects.
+/// The repository lock remains held throughout reconstruction and append.
+fn abandon_pending_work(repo: &mut slim_core::session::JsonlRepo) -> std::io::Result<()> {
+    use slim_core::session::{
+        DurableEntry, DurableEntryRole, DurableErrorClass, DurableOperation, DurableOperationKind,
+        DurableRecord, DurableRepo, ResumePlan,
+    };
+    let report = SessionPreflight::from_open_repo(repo);
+    let plan = ResumePlan::from_records(repo.records()).map_err(std::io::Error::other)?;
+    // Canonical tool-phase logs still need their own reconciliation. Streaming
+    // conversation entries can be closed with explicit unknown-result records.
+    if !plan.tools().incomplete().is_empty() {
+        return Err(std::io::Error::other(
+            "unfinished durable tool phases need reconciliation; no execution result was inferred",
+        ));
+    }
+    let missing_results =
+        slim_core::session::recovery_tool_results(repo.records().iter().filter_map(|record| {
+            match record {
+                DurableRecord::Entry { entry, .. } => Some(entry),
+                _ => None,
+            }
+        }))
+        .map_err(std::io::Error::other)?;
+    let mut suffix = Vec::new();
+    let mut seq = repo.next_seq()?;
+    let mut parent = repo.records().iter().rev().find_map(|record| match record {
+        DurableRecord::Entry { entry, .. } => Some(entry.entry_id.clone()),
+        _ => None,
+    });
+    for mut entry in missing_results {
+        if !report
+            .summary
+            .pending_operation_ids
+            .contains(&entry.operation_id)
+            && !report
+                .summary
+                .claimed_operation_ids
+                .contains(&entry.operation_id)
+            && !report
+                .summary
+                .suspended_operation_ids
+                .contains(&entry.operation_id)
+        {
+            return Err(std::io::Error::other(
+                "incomplete tool transcript belongs to terminal work",
+            ));
+        }
+        entry.entry_id = format!("recovery-result-{seq}");
+        entry.parent_entry_id = parent.take();
+        parent = Some(entry.entry_id.clone());
+        suffix.push(DurableRecord::Entry { seq, entry });
+        seq = seq
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("recovery sequence overflow"))?;
+    }
+    for operation_id in report
+        .summary
+        .pending_operation_ids
+        .iter()
+        .chain(&report.summary.claimed_operation_ids)
+        .chain(&report.summary.suspended_operation_ids)
+    {
+        for attempt in plan
+            .attempts()
+            .attempts_for(operation_id)
+            .iter()
+            .filter(|attempt| attempt.outcome.is_none())
+        {
+            suffix.push(DurableRecord::Operation {
+                seq,
+                operation: DurableOperation {
+                    operation_id: operation_id.clone(),
+                    kind: DurableOperationKind::ProviderAttemptFailed {
+                        attempt_id: attempt.attempt_id.clone(),
+                        error: DurableErrorClass::Unknown,
+                    },
+                },
+            });
+            seq = seq
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::other("recovery sequence overflow"))?;
+        }
+        let mut entry_id = format!("recovery-{seq}");
+        while plan.state().entries().contains_key(&entry_id) {
+            entry_id.push('_');
+        }
+        suffix.push(DurableRecord::Entry { seq, entry: DurableEntry {
+            entry_id: entry_id.clone(), role: DurableEntryRole::Assistant,
+            content: "[Recovery decision] The user explicitly abandoned this unfinished operation without replay. Prior effects remain unverified and were not undone. Inspect the workspace and external state before repeating any action. This record does not confirm task completion.".into(),
+            parent_entry_id: parent.take(), operation_id: operation_id.clone(),
+            tool_call_id: None, tool_calls: Vec::new(), content_blocks: Vec::new(),
+        }});
+        parent = Some(entry_id);
+        seq = seq
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("recovery sequence overflow"))?;
+        suffix.push(DurableRecord::Operation {
+            seq,
+            operation: DurableOperation {
+                operation_id: operation_id.clone(),
+                kind: DurableOperationKind::Aborted,
+            },
+        });
+        seq = seq
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("recovery sequence overflow"))?;
+    }
+    repo.append_batch(suffix)
+}
+
 fn format_from_args(args: &[String]) -> OutputFormat {
     if args.iter().any(|arg| arg == "--jsonl") {
         OutputFormat::Jsonl
@@ -599,10 +783,15 @@ fn format_from_args(args: &[String]) -> OutputFormat {
     }
 }
 
-fn recovery_output(format: OutputFormat) -> CliOutput {
+fn recovery_output(format: OutputFormat, abandoned: bool) -> CliOutput {
     let result = HeadlessResult {
         code: ExitCode::Success,
-        message: "recovery_complete".into(),
+        message: if abandoned {
+            "recovery_complete: unfinished work abandoned without replay; effects remain unverified"
+                .into()
+        } else {
+            "recovery_complete".into()
+        },
     };
     let stdout = match format {
         OutputFormat::Text => render_text(&result),

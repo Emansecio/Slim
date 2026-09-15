@@ -117,7 +117,67 @@ fn wait_for_handles(
     }
 }
 
-#[cfg(not(windows))]
+/// Unix wait: `poll` on terminal input (fd 0 — the TUI only runs on a TTY)
+/// and the wake pipe together, so lane events interrupt the wait without
+/// waiting for terminal input or a 60 s fallback deadline.
+#[cfg(unix)]
+pub(crate) fn wait_for_runtime_signal(
+    wake: &WakeSignal,
+    timeout: Option<Duration>,
+) -> io::Result<WaitOutcome> {
+    use std::os::fd::AsRawFd;
+
+    // Keep the legacy 60 s cap as a defensive backstop even though callers
+    // armed the signal and probed the lanes before entering.
+    let timeout_ms = timeout.map_or(60_000, |value| {
+        i32::try_from(value.as_millis()).unwrap_or(i32::MAX).max(0)
+    });
+    let mut fds = [
+        libc::pollfd {
+            fd: std::io::stdin().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake.raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        // SAFETY: `fds` is a valid slice for the duration of the call and
+        // `nfds` matches its length.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready == 0 {
+            return Ok(WaitOutcome::Deadline);
+        }
+        break;
+    }
+    let input_ready =
+        fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
+    let wake_ready = fds[1].revents & libc::POLLIN != 0;
+    if wake_ready {
+        wake.drain_pipe();
+    }
+    if input_ready {
+        return Ok(WaitOutcome::Input);
+    }
+    if wake_ready {
+        return Ok(WaitOutcome::Wake);
+    }
+    // e.g. POLLNVAL on the wake fd — nothing actionable; treat as a deadline
+    // so the loop re-probes instead of spinning on a dead descriptor.
+    Ok(WaitOutcome::Deadline)
+}
+
+#[cfg(not(any(windows, unix)))]
 pub(crate) fn wait_for_runtime_signal(
     _wake: &WakeSignal,
     timeout: Option<Duration>,
@@ -179,6 +239,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn event_draw_consumes_current_motion_and_status_boundaries() {
+        // After an idle session starts work, the event-driven draw paints
+        // this clock before the runtime computes its next visual deadline.
+        let elapsed = Duration::from_millis(10_000);
+        let painted = runtime_clock(elapsed);
+        assert_eq!(
+            next_visual_deadline(
+                elapsed,
+                painted.frame,
+                painted.elapsed_ms / 1_000,
+                true,
+                true,
+                None,
+            ),
+            Some(Duration::from_millis(43)),
+        );
+        // Reduced motion retains the next real elapsed-time update.
+        assert_eq!(
+            next_visual_deadline(elapsed, painted.frame, 10, false, true, None),
+            Some(Duration::from_secs(1)),
+        );
+        // Recording a draw must not suppress an earlier toast milestone.
+        assert_eq!(
+            next_visual_deadline(elapsed, painted.frame, 10, true, true, Some(10_020)),
+            Some(Duration::from_millis(20)),
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn wake_interrupts_a_long_runtime_wait() {
@@ -191,6 +280,24 @@ mod tests {
 
         let started = std::time::Instant::now();
         let outcome = wait_for_handles(None, &wake, Some(Duration::from_secs(2))).expect("wait");
+        thread.join().expect("notifier");
+
+        assert_eq!(outcome, WaitOutcome::Wake);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wake_interrupts_a_long_runtime_wait() {
+        let wake = crate::api::WakeSignal::new().expect("wake");
+        let notifier = wake.clone();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            notifier.notify();
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = wait_for_runtime_signal(&wake, Some(Duration::from_secs(2))).expect("wait");
         thread.join().expect("notifier");
 
         assert_eq!(outcome, WaitOutcome::Wake);

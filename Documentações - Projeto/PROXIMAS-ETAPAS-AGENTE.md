@@ -1,13 +1,16 @@
 # Slim — próximas etapas: agente completo, harness leve
 
-> **Leitor:** agente executor. **N1–N3 estão feitos** (2026-08-25): OAuth da TUI
+> **Leitor:** agente executor. **N1–N6 estão feitos.** OAuth da TUI
 > alimenta o headless; tool `todo` + `TodoChanged` no loop; skills Slim em
 > `%USERPROFILE%/.slim/skills` (cwd `.slim/skills` sobrescreve) via tool `skill`
-> lazy — nada injetado até `list` ou `name`.
-> Próxima fatia: **N5** (`ask_question` no resume TUI). N1–N4 e N6 feitos.
-> Não reabrir N1–N4.
-> **Data da análise:** 2026-08-25. N1–N3 implementados no código na mesma data.
-> **Prevalência:** `RULES.md` > `AGENTS.md` > este arquivo > README > memória.
+> lazy — nada injetado até `list` ou `name`. N5: resume TUI cria
+> `interaction_route()` e passa no braço durável; headless resume permanece
+> sem rota. N7 continua adiado (`ApprovalRequired` não é emitido).
+> Não reabrir N1–N6.
+> **Data da análise:** 2026-08-25. N5 revalidado no código em 2026-09-09.
+> **Execução vigente:** siga AGENTS.md e as seções aplicáveis de RULES.md.
+> Este backlog e seus resultados são datados; revalide pendências no código
+> antes de retomar uma fatia autorizada.
 > Caminho:linha abaixo foi lido na sessão de 2026-08-25. Docs antigos
 > (`analysis_outputs/`, DESIGN M3, PLANO §10.1 “P0 cache”) descrevem o
 > passado — o código ganha.
@@ -46,13 +49,14 @@ Critério PESO (rejeitar): “a spec M3 pede”, “ficar mais completo visualme
 
 O loop já executa um coding agent: provider + read/list/search/write/patch/shell
 + compact + anti-loop + cancel + fila de prompts + `ask_question` na TUI
-não-durável.
+(incluindo resume). Headless não anuncia `ask_question`.
 
 O que falta é **ligar o que já está persistido/tipado** nas fatias restantes:
 
 1. ~~OAuth da TUI não alimenta o headless.~~ **N1 feito.**
-2. ~~Todo/Skills fora do run normal.~~ **N2–N3 feitos** (Plan/Goal UI e MCP/child continuam fora).
+2. ~~Todo/Skills fora do run normal.~~ **N2–N3 feitos** (Plan/Goal UI e child continuam fora; transporte MCP shipped depois — ver README §MCP).
 3. ~~Plan na TUI aborta o turno em vez de rodar o loop read-only.~~ **N4 feito.**
+4. ~~`ask_question` no resume TUI.~~ **N5 feito.**
 
 Inspectors, caches novos, `SurfaceBackend`, telemetry, transporte MCP e child
 provider-backed são peso: tipo sem caller, stub de protocolo, ou contrato M3
@@ -71,7 +75,7 @@ JWT) já foram corrigidos. Não reabrir.
 | N2 | Todo no loop + `TodoChanged` | Modelo não cria todos; dock `Ctrl+T` fica vazio | `tools/mod.rs` 58–86; `runtime/mod.rs` 276–281; `capability_bridge.rs` 480–510; `api.rs` 379 e 520–677; `app.rs` 1523–1526; slim-cli sem `RuntimeCapabilityBridge` | `TodoTracker`, `TaskMutation`, dock | S | Sem drawer; dock já existe | N3 (bridge no run) e “agente planeja o trabalho” |
 | N3 | Skill: discover + `invoke_script` | Skills em disco não são tools; adapter falha de propósito | `discovery.rs` 53; `invocation.rs` 35–48; `capability_bridge.rs` 69–74 e 143–145; `runtime/mod.rs` 301–316 | `SkillEntry`, `discover`, `invoke_script`, `CapabilityKind::Skill` | M | Sem crate/MCP; trust via `ask_question` | Agente que deveria seguir skills do repo |
 | N4 | Plan na TUI **roda** o loop | **FEITO 2026-08-27** | TUI `allow_plan_loop`; headless abort intacto |
-| N5 | `ask_question` no resume TUI | `--resume` zera a rota; sessão longa não pergunta | `tui.rs` 1996–2001; `runtime/mod.rs` 276–280 | `interaction_route()`, `ask_question_definition` | S | Mesma rota do path não-durável | Turnos TUI pós-resume sem clarificação |
+| N5 | `ask_question` no resume TUI | **FEITO** (código já ligado; doc stale até 2026-09-09) | `tui.rs` cria rota e a passa no resume; `headless.rs` `run_provider_resume_with_preflight_events_interactive_async`; headless resume continua sem rota | `interaction_route()`, `ask_question_definition` | S | Mesma rota do path não-durável | — |
 | N6 | Defaults Anthropic CLI vs TUI | **FEITO 2026-08-27** | `default_provider_model` = `claude-sonnet-4-6` |
 | N7 | Worker: `Approve`/`Reject` no run ativo | Só `AnswerQuestion` chega à rota; Y/N é rejeitado | `tui.rs` 1059–1070; `interaction.rs` 150–181 | `UiCommand::Approve`/`Reject`, bloco inline | S | Reusar pergunta Y/N ou oneshot irmão | Trust Explicit (N3) e PlanApprove |
 
@@ -84,7 +88,7 @@ O que **não** fazer neste ciclo: seção 11. P4–P8 revalidados: seção 12.
 
 ## 3. Três fatias imediatas (uma sessão cada)
 
-Implementar nesta ordem. **N1–N4 e N6 feitos.** Não abrir N5/N7
+Implementar nesta ordem. **N1–N6 feitos.** Não abrir N7
 antes de pedido explícito.
 
 ### Sessão 1 — N1: OAuth store → headless — **FEITO**
@@ -216,9 +220,10 @@ timeout 30 s, cap 64 KiB, cancel, só `OperatingMode::Auto` + `trusted`).
 `AuthorizationRequirement::Explicit`. Sem pergunta, o dispatch falha em
 trust — anunciar skill sem trust é pior que não anunciar.
 
-MCP **não** entra nesta fatia: `JsonLineFramer`, `authorize_http` e
-`McpLifecycle` são stubs; `McpCatalog::call_tool` é contrato in-process, não
-servidor.
+MCP **não** entrou nesta fatia (decisão do ciclo). Transporte real (stdio
+NDJSON + HTTP streamable, `McpManager` lazy) shipped depois — `spec.rs`,
+`stdio.rs`, `http.rs`, `manager.rs` em `slim-core/src/mcp/`; stubs
+`McpLifecycle`/`authorize_http` removidos.
 
 ---
 
@@ -251,26 +256,17 @@ no primeiro evento de conteúdo.
 
 ---
 
-## 8. N5 — `ask_question` no resume TUI
+## 8. N5 — `ask_question` no resume TUI — **FEITO**
 
-`start_active_run`: se `resume_path.is_some()`, `interaction_route` e
-`interaction_responder` são `None`. O loop não anuncia `ask_question`.
-Contrato atual (DESIGN/tracker): headless, Plan e resume durável não
-anunciam — para não replay de efeitos.
+`start_active_run` cria `interaction_route()` sempre e passa a rota nos
+braços durável e não-durável da TUI. Headless resume continua sem rota
+(`run_provider_resume_with_preflight_events` passa `None`).
 
-O buraco real é só TUI resume **nova** pergunta no turno novo, sem
-reexecutar tool pendente. Resume já reconstrói histórico e não replaya
-efeitos (`run_provider_resume_with_events`).
+O loop anuncia `ask_question` no turno novo da TUI retomada; não reexecuta
+tool pendente nem faz replay de `QuestionRequired` persistido. Plan e
+headless não anunciam.
 
-**Fazer:** passar `interaction_route()` também no braço durável TUI.
-Headless continua sem rota.
-
-**Não fazer:** anunciar em headless; replay de `QuestionRequired`
-persistido; mudar Plan.
-
-**Teste:** estender `ask_question_tui.rs` / `headless_resume.rs` com spawn
-`spawn_tui_runtime_with_resume` e assert de `"name":"ask_question"` no
-primeiro request do turno novo.
+**Não reabrir:** anunciar em headless; replay de pergunta persistida; mudar Plan.
 
 ---
 
@@ -358,7 +354,7 @@ P1–P3 daquela auditoria (IO sync de tool, backpressure, cache hit/usage)
 - Compactação bounded, `LoopGuard` one-strike, `max_turns` / `max_tool_calls`.
 - Tool output > cap → artifact store (`materialize_results`).
 - Cancel cooperativo provider/shell; fila TUI FIFO (G244).
-- `ask_question` TUI Auto/ReadOnly não-durável, setas no reducer (G252).
+- `ask_question` TUI Auto/ReadOnly com rota (Plan e headless não anunciam); setas no reducer (G252).
 - Resume sem replay de efeitos (Etapa 8).
 - `ProviderCache` LRU no cliente HTTP do run normal (G236).
 - Stdin piped headless (G253); projeto vence global no TOML (G254).
@@ -367,17 +363,19 @@ P1–P3 daquela auditoria (IO sync de tool, backpressure, cache hit/usage)
 
 ## 14. Como executar uma fatia (contrato de entrega)
 
-Prevalece `RULES.md` / `AGENTS.md`:
+Siga AGENTS.md e RULES.md no escopo da fatia autorizada:
 
-1. Teste RED primeiro no caminho que o usuário vê (CLI binário ou TUI
-   fixture), não só no tipo isolado.
-2. Completar caller existente; não criar cache/trait/drawer.
-3. `cargo test --workspace` verde (0 failed, 0 warnings).
-4. `.\refresh-slim.ps1 -Test` imprime `OK:` (binário no PATH).
-5. Atualizar este arquivo (marcar fatia feita), tracker §7, DESIGN §1.1 se
-   o comportamento visível mudou, e números de testes em todos os READMEs
-   que os citam.
-6. Checklist da seção 4 de `RULES.md` na resposta final.
+1. Confirme o fluxo afetado e reutilize testes existentes; acrescente uma
+   regressão apenas quando houver lacuna relevante.
+2. Complete o caller existente com a menor correção necessária.
+3. Execute os checks pertinentes. Se a suíte completa e o deploy forem
+   necessários e autorizados, refresh-slim.ps1 -Test cobre ambos. Não rode
+   cargo test --workspace imediatamente antes sem mudança intermediária.
+   Se os checks já passaram, o deploy autorizado usa o script sem -Test.
+4. Atualize somente os estados ou contratos documentais afetados, preservando
+   registros históricos e evitando copiar contagens entre READMEs.
+5. Entregue resultado, evidência e limitações conforme RULES.md seção 4;
+   indique os itens não aplicáveis, incluindo deploy quando não solicitado.
 
 Ao marcar uma fatia feita neste arquivo: risco residual, teste que prova, e
 o que **não** entrou. Não apagar a evidência de código — atualizar linhas se

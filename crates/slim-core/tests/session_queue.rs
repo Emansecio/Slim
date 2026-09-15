@@ -175,6 +175,8 @@ fn restore_reserves_entry_operation_ids_before_a_queue_intent_exists() {
             parent_entry_id: None,
             operation_id: "op-crash".into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            content_blocks: Vec::new(),
         },
     }];
 
@@ -185,6 +187,39 @@ fn restore_reserves_entry_operation_ids_before_a_queue_intent_exists() {
             if operation_id == "op-crash"
     ));
     assert!(queue.pending().is_empty());
+}
+
+#[test]
+fn restore_accepts_aborted_manual_operation_without_queueing_it() {
+    use slim_core::session::{DurableOperation, DurableOperationKind};
+    let operation = |seq, kind| DurableRecord::Operation {
+        seq,
+        operation: DurableOperation {
+            operation_id: "manual".into(),
+            kind,
+        },
+    };
+    let records = vec![
+        operation(
+            0,
+            DurableOperationKind::Started {
+                input_entry_id: "input".into(),
+            },
+        ),
+        operation(1, DurableOperationKind::Aborted),
+    ];
+    let mut restored = DurableQueue::from_records(1, &records).expect("cancelled manual turn");
+    assert!(restored.pending().is_empty());
+    assert!(restored.replay_candidates().is_empty());
+    assert_eq!(restored.status("manual"), None);
+    assert!(matches!(
+        restored.enqueue(QueueItem::operation("manual")),
+        Err(DurableQueueError::DuplicateOperation { .. })
+    ));
+    assert!(
+        DurableQueue::from_records(1, &records[1..]).is_err(),
+        "orphan abort still rejects"
+    );
 }
 
 #[test]
@@ -199,6 +234,8 @@ fn enqueue_persisted_rejects_entry_operation_id_after_crash_before_queue_intent(
             parent_entry_id: None,
             operation_id: "op-crash-persisted".into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            content_blocks: Vec::new(),
         },
     })
     .expect("persist entry prefix");
@@ -250,6 +287,8 @@ fn jsonl_reopen_preserves_entry_prefix_and_rejects_queue_id_without_mutation() {
             parent_entry_id: None,
             operation_id: "op-jsonl-crash".into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            content_blocks: Vec::new(),
         },
     };
     let mut repo = JsonlRepo::create(&path, header()).expect("create");

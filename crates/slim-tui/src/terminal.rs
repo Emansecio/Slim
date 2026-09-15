@@ -98,18 +98,59 @@ mod console {
     }
 }
 
+#[cfg(windows)]
+static ACTIVE_CONSOLE: std::sync::Mutex<Option<console::ConsoleState>> =
+    std::sync::Mutex::new(None);
+
+/// Installs a panic hook that restores terminal state before delegating to the
+/// previously installed hook, ensuring errors are readable on a clean terminal
+/// buffer and raw mode is disabled even on panic (tui-design ecosystem-rust).
+pub fn install_panic_hook() {
+    static HOOK_INSTALLED: std::sync::Once = std::sync::Once::new();
+    HOOK_INSTALLED.call_once(|| {
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            let mut stdout = io::stdout();
+            let _ = restore_surface(&mut stdout, true);
+            let _ = disable_raw_mode();
+            #[cfg(windows)]
+            if let Ok(mut guard) = ACTIVE_CONSOLE.lock() {
+                if let Some(console) = guard.take() {
+                    console::restore(console);
+                }
+            }
+            prev_hook(panic_info);
+        }));
+    });
+}
+
 impl TerminalGuard {
     pub fn enter(stdout: &mut Stdout) -> io::Result<Self> {
         #[cfg(windows)]
         let console = console::setup()?;
         #[cfg(windows)]
-        enable_with_rollback(enable_raw_mode, || console::restore(console))?;
+        if let Ok(mut guard) = ACTIVE_CONSOLE.lock() {
+            *guard = Some(console);
+        }
+        install_panic_hook();
+        #[cfg(windows)]
+        enable_with_rollback(enable_raw_mode, || {
+            if let Ok(mut guard) = ACTIVE_CONSOLE.lock() {
+                guard.take();
+            }
+            console::restore(console);
+        })?;
         #[cfg(not(windows))]
         enable_raw_mode()?;
         if let Err(error) = execute!(stdout, EnterAlternateScreen) {
             let _ = disable_raw_mode();
             #[cfg(windows)]
-            console::restore(console);
+            {
+                if let Ok(mut guard) = ACTIVE_CONSOLE.lock() {
+                    guard.take();
+                }
+                console::restore(console);
+            }
             return Err(error);
         }
         Ok(Self {
@@ -131,6 +172,10 @@ impl TerminalGuard {
             return Ok(());
         }
         self.active = false;
+        #[cfg(windows)]
+        if let Ok(mut guard) = ACTIVE_CONSOLE.lock() {
+            guard.take();
+        }
         let leave_result = restore_surface(stdout, self.mouse_capture);
         let raw_result = disable_raw_mode();
         #[cfg(windows)]
@@ -159,6 +204,11 @@ fn restore_surface<W: Write>(stdout: &mut W, mouse_capture: bool) -> io::Result<
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if self.active {
+            self.active = false;
+            #[cfg(windows)]
+            if let Ok(mut guard) = ACTIVE_CONSOLE.lock() {
+                guard.take();
+            }
             let mut stdout = io::stdout();
             let _ = restore_surface(&mut stdout, self.mouse_capture);
             let _ = disable_raw_mode();
@@ -196,5 +246,11 @@ mod tests {
 
         super::restore_surface(&mut output, false)
             .expect("terminal cleanup without mouse capture should succeed");
+    }
+
+    #[test]
+    fn install_panic_hook_is_idempotent() {
+        super::install_panic_hook();
+        super::install_panic_hook();
     }
 }

@@ -9,8 +9,8 @@ use slim_cli::{
     run_provider_headless_with_session_and_options, ExitCode, ProviderRequest, ProviderRunOptions,
 };
 use slim_core::provider::ProviderKind;
-use slim_core::session::recover;
-use slim_core::{EventKind, OperatingMode};
+use slim_core::session::{preflight_session, provider_messages_from_entries, DurableRecord};
+use slim_core::OperatingMode;
 
 const SERVER_DEADLINE: Duration = Duration::from_secs(5);
 const STREAM_TIMEOUT: Duration = Duration::from_secs(3);
@@ -152,7 +152,14 @@ fn spawn_openai_fixture(
                 // prompt follows as message 1.
                 assert_eq!(messages[0]["role"], "system");
                 assert_eq!(messages[1]["role"], "user");
-                assert_eq!(messages[1]["content"], prompt);
+                let content = messages[1]["content"].as_str().expect("user text");
+                let original = content
+                    .split_once("\n\nWorkspace paths observed before this turn")
+                    .map_or(content, |(original, _)| original);
+                assert_eq!(
+                    original, prompt,
+                    "optional path context preserves the user request"
+                );
                 write_sse(
                     &mut stream,
                     &[
@@ -318,46 +325,25 @@ fn anthropic_offline_e2e_runs_tool_turn_usage_and_session_without_secret_persist
     let output = slim_cli::render_provider_text(&result);
     assert!(!output.contains("fixture-anthropic-secret"));
 
-    let recovered = recover(&session).expect("session");
-    assert!(recovered.events.iter().any(|event| matches!(
-        event.kind,
-        EventKind::ToolOutput { ref output, .. } if output.contains("offline fixture")
-    )));
-    assert!(recovered.events.iter().any(|event| matches!(
-        event.kind,
-        EventKind::UsagePartial {
-            input_tokens: 7,
-            output_tokens: 0,
-            ..
-        }
-    )));
-    assert!(recovered.events.iter().any(|event| matches!(
-        event.kind,
-        EventKind::UsagePartial {
-            input_tokens: 9,
-            output_tokens: 0,
-            ..
-        }
-    )));
-    assert!(recovered.events.iter().any(|event| matches!(
-        event.kind,
-        EventKind::UsagePartial {
-            input_tokens: 0,
-            output_tokens: 4,
-            ..
-        }
-    )));
-    assert!(recovered.events.iter().any(|event| matches!(
-        event.kind,
-        EventKind::Usage {
-            input_tokens: 0,
-            output_tokens: 0
-        }
-    )));
-    assert!(recovered.events.iter().any(|event| matches!(
-        event.kind,
-        EventKind::AssistantEnded { ref reason } if reason == "end_turn"
-    )));
+    let recovered = preflight_session(&session).expect("session");
+    let messages =
+        provider_messages_from_entries(recovered.records.iter().filter_map(
+            |record| match record {
+                DurableRecord::Entry { entry, .. } => Some(entry),
+                _ => None,
+            },
+        ))
+        .expect("complete durable transcript");
+    assert!(messages
+        .iter()
+        .any(|m| m.role == "tool" && m.content.contains("offline fixture")));
+    assert_eq!(messages.last().unwrap().content, "final from anthropic");
+    assert_eq!(result.usage.requests.len(), 2);
+    assert_eq!(result.usage.requests[0].uncached_input_tokens, 7);
+    assert_eq!(result.usage.requests[1].uncached_input_tokens, 9);
+    assert_eq!(result.usage.requests[1].output_tokens, 4);
+    assert!(recovered.records.iter().any(|record| matches!(record,
+        DurableRecord::Usage { usage, .. } if usage.input_tokens == Some(16) && usage.output_tokens == Some(7))));
     let raw_session = std::fs::read_to_string(&session).expect("session bytes");
     assert!(!raw_session.contains("fixture-anthropic-secret"));
     temp.cleanup();
@@ -413,29 +399,36 @@ fn openai_compatible_offline_e2e_runs_structured_tool_turn_usage_and_session() {
     let output = slim_cli::render_provider_text(&result);
     assert!(!output.contains("fixture-openai-secret"));
 
-    let recovered = recover(&session).expect("session");
-    assert!(recovered.events.iter().any(|event| matches!(
-        event.kind,
-        EventKind::ToolOutput { ref output, .. } if output.contains("offline openai fixture")
-    )));
-    assert!(recovered.events.iter().any(|event| matches!(
-        event.kind,
-        EventKind::Usage {
-            input_tokens: 11,
-            output_tokens: 5
-        }
-    )));
-    assert!(recovered.events.iter().any(|event| matches!(
-        event.kind,
-        EventKind::Usage {
-            input_tokens: 13,
-            output_tokens: 7
-        }
-    )));
-    assert!(recovered.events.iter().any(|event| matches!(
-        event.kind,
-        EventKind::AssistantEnded { ref reason } if reason == "stop"
-    )));
+    let recovered = preflight_session(&session).expect("session");
+    let messages =
+        provider_messages_from_entries(recovered.records.iter().filter_map(
+            |record| match record {
+                DurableRecord::Entry { entry, .. } => Some(entry),
+                _ => None,
+            },
+        ))
+        .expect("complete durable transcript");
+    assert!(messages
+        .iter()
+        .any(|m| m.role == "tool" && m.content.contains("offline openai fixture")));
+    assert_eq!(messages.last().unwrap().content, "final from openai");
+    assert_eq!(result.usage.requests.len(), 2);
+    assert_eq!(
+        (
+            result.usage.requests[0].uncached_input_tokens,
+            result.usage.requests[0].output_tokens
+        ),
+        (11, 5)
+    );
+    assert_eq!(
+        (
+            result.usage.requests[1].uncached_input_tokens,
+            result.usage.requests[1].output_tokens
+        ),
+        (13, 7)
+    );
+    assert!(recovered.records.iter().any(|record| matches!(record,
+        DurableRecord::Usage { usage, .. } if usage.input_tokens == Some(24) && usage.output_tokens == Some(12))));
     let raw_session = std::fs::read_to_string(&session).expect("session bytes");
     assert!(!raw_session.contains("fixture-openai-secret"));
     temp.cleanup();

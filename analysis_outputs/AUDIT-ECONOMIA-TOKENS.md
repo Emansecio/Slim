@@ -1,5 +1,7 @@
 # AUDIT-ECONOMIA-TOKENS.md — Backlog consolidado de economia de tokens
 
+> Revisão do código atual em 2026-09-04: [economia nativa, implementações e limites](REVISAO-ECONOMIA-TOKENS-NATIVA-SLIM.md). Corrigidos paths repetidos de listagem, rótulos de padrões repetidos na mesma página e terminadores LF extras. Foram descartados cortes arbitrários de histórico/schemas e seleção especulativa de tools. Valores e hipóteses abaixo pertencem às auditorias históricas; não comprovam ganhos atuais ou faturados.
+
 > Origem: auditoria executada em **2026-08-21** contra `target\release\slim.exe`
 > (build 19:47) com captura real de payload via fixture localhost.
 > Método, números medidos e evidências completas: ver resposta da sessão de
@@ -13,6 +15,11 @@
 > **Checkpoint atual (2026-08-22):** números históricos abaixo não são baseline
 > do binário atual. A medição v2 e PERF-02–07 estão em
 > `bench/token-economy/v2/RESULTS.md` e prevalecem quando houver divergência.
+>
+> **Velocidade local (CPU de call/tool/read), 2026-09-04:** missão distinta
+> desta auditoria de tokens. Documento canônico:
+> `analysis_outputs/AUDIT-SPEED-CALLS-TOOLS-READS-2026-09-04.md`. Não reabrir
+> PERF-01..07 daqui; TOK-02/06/07 continuam neste arquivo.
 
 ## Status de implementação (slice TOK, 2026-08-21)
 

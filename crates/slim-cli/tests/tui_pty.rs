@@ -43,11 +43,19 @@ struct MatrixCase {
     expand_tools: bool,
 }
 
-const MATRIX: [MatrixCase; 5] = [
+const MATRIX: [MatrixCase; 6] = [
     MatrixCase {
         name: "120x30-normal",
         cols: 120,
         rows: 30,
+        reduced_motion: false,
+        no_color: false,
+        expand_tools: false,
+    },
+    MatrixCase {
+        name: "180x45-reading-column",
+        cols: 180,
+        rows: 45,
         reduced_motion: false,
         no_color: false,
         expand_tools: false,
@@ -234,7 +242,14 @@ fn evidence_dir() -> Result<PathBuf, String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let root = fs::canonicalize(&root)
         .map_err(|error| format!("resolve repository root {}: {error}", root.display()))?;
-    let directory = root.join("analysis_outputs/streaming-thinking-tools-tui/conpty");
+    // Keep the prior binary's captures intact when comparing a redesign.
+    let run = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("capture clock: {error}"))?
+        .as_millis();
+    let directory = root
+        .join("analysis_outputs/streaming-thinking-tools-tui/conpty")
+        .join(format!("{run}-{}", std::process::id()));
     fs::create_dir_all(&directory).map_err(|error| {
         format!(
             "create ConPTY evidence directory {}: {error}",
@@ -269,24 +284,39 @@ fn drain_available(receiver: &Receiver<u8>, output: &mut Vec<u8>) {
     output.extend(receiver.try_iter());
 }
 
-fn wait_for_text(receiver: &Receiver<u8>, output: &mut Vec<u8>, needle: &str) -> bool {
+fn wait_for_text(
+    receiver: &Receiver<u8>,
+    output: &mut Vec<u8>,
+    needle: &str,
+    writer: &mut dyn Write,
+) -> Result<bool, String> {
     let deadline = Instant::now() + PHASE_TIMEOUT;
     loop {
         if normalized_vt(output).contains(needle) {
-            return true;
+            return Ok(true);
         }
         let now = Instant::now();
         if now >= deadline {
             drain_available(receiver, output);
-            return normalized_vt(output).contains(needle);
+            return Ok(normalized_vt(output).contains(needle));
         }
         let wait = (deadline - now).min(Duration::from_millis(100));
         match receiver.recv_timeout(wait) {
-            Ok(byte) => output.push(byte),
+            Ok(byte) => {
+                output.push(byte);
+                // portable-pty creates ConPTY with INHERIT_CURSOR. Our empty
+                // host starts at 1;1 and must answer its startup DSR query.
+                if output.ends_with(b"\x1b[6n") {
+                    writer
+                        .write_all(b"\x1b[1;1R")
+                        .and_then(|()| writer.flush())
+                        .map_err(|error| format!("reply to ConPTY cursor query: {error}"))?;
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 drain_available(receiver, output);
-                return normalized_vt(output).contains(needle);
+                return Ok(normalized_vt(output).contains(needle));
             }
         }
     }
@@ -748,7 +778,7 @@ fn drive_case(
             .take_writer()
             .map_err(|error| format!("take ConPTY writer: {error}"))?;
 
-        if !wait_for_text(&receiver, &mut raw, "SLIM") {
+        if !wait_for_text(&receiver, &mut raw, "SLIM", writer.as_mut())? {
             let early = child.try_wait()?;
             return Err(format!(
                 "startup emitted no rendered SLIM frame; early_exit={early:?}; {}",
@@ -765,7 +795,7 @@ fn drive_case(
         writer
             .flush()
             .map_err(|error| format!("flush prompt: {error}"))?;
-        if !wait_for_text(&receiver, &mut raw, PROMPT) {
+        if !wait_for_text(&receiver, &mut raw, PROMPT, writer.as_mut())? {
             return Err("composer did not echo the typed prompt".into());
         }
         writer
@@ -774,7 +804,7 @@ fn drive_case(
         writer
             .flush()
             .map_err(|error| format!("flush submit: {error}"))?;
-        if !wait_for_text(&receiver, &mut raw, FINAL_ANSWER) {
+        if !wait_for_text(&receiver, &mut raw, FINAL_ANSWER, writer.as_mut())? {
             return Err("offline provider did not reach the final answer marker".into());
         }
 
@@ -989,13 +1019,32 @@ fn vt_normalization_and_sanitization_preserve_evidence_without_secrets() {
 }
 
 #[test]
+fn cursor_query_is_answered_without_synthesizing_a_rendered_frame() {
+    for (received, ready) in [(b"\x1b[6nSLIM".as_slice(), true), (b"\x1b[6n", false)] {
+        let (tx, rx) = mpsc::channel();
+        for byte in received {
+            tx.send(*byte).expect("fragmented output");
+        }
+        drop(tx);
+        let mut output = Vec::new();
+        let mut replies = Vec::new();
+        assert_eq!(
+            wait_for_text(&rx, &mut output, "SLIM", &mut replies).expect("cursor response"),
+            ready
+        );
+        assert_eq!(replies, b"\x1b[1;1R");
+        assert_eq!(output, received);
+    }
+}
+
+#[test]
 fn conpty_matrix_freezes_required_dimensions_and_modes() {
     assert_eq!(
         MATRIX
             .iter()
             .map(|case| (case.cols, case.rows))
             .collect::<Vec<_>>(),
-        [(120, 30), (80, 24), (60, 16), (40, 10), (32, 10)]
+        [(120, 30), (180, 45), (80, 24), (60, 16), (40, 10), (32, 10)]
     );
     assert!(MATRIX
         .iter()

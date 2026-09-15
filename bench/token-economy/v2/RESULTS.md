@@ -5,6 +5,12 @@
 > (**36 processos**, **78 requests capturados**). O código e as capturas atuais
 > prevalecem sobre números históricos. Método: `PLAN.md`, `run_benchmark.ps1`
 > e `analyze.py`.
+>
+> Investigação de **velocidade local** (CPU de CHAMADAS/TOOLS/LEITURAS, não
+> payload): `analysis_outputs/AUDIT-SPEED-CALLS-TOOLS-READS-2026-09-04.md`.
+> O §2 deste RESULTS (PERF-01, 6 tools / 1418 B) está stale frente ao bench
+> atual (7 tools / 3469 B, `code_intel` nas definições) — reler o audit de
+> velocidade antes de citar esses micros.
 
 ## 0. Compliance gate
 

@@ -34,6 +34,8 @@ fn entry(seq: u64, operation_id: &str, entry_id: &str) -> DurableRecord {
             parent_entry_id: None,
             operation_id: operation_id.into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            content_blocks: Vec::new(),
         },
     }
 }

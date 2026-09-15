@@ -8,8 +8,10 @@ pub enum LoginProvider {
     Anthropic,
     OpenAiCodex,
     OpenCodeGo,
+    OpenCodeZen,
     ClinePass,
     CommandCode,
+    Xai,
 }
 
 impl LoginProvider {
@@ -18,8 +20,10 @@ impl LoginProvider {
             Self::Anthropic => "Anthropic — Claude Pro/Max",
             Self::OpenAiCodex => "OpenAI Codex — ChatGPT Plus/Pro",
             Self::OpenCodeGo => "OpenCode Go — API key",
+            Self::OpenCodeZen => "OpenCode Zen — free tier / API key",
             Self::ClinePass => "ClinePass — API key",
             Self::CommandCode => "Command Code — API key",
+            Self::Xai => "xAI — Grok/X subscription",
         }
     }
 }
@@ -29,16 +33,18 @@ pub enum ModelAlias {
     Sol,
     Terra,
     Luna,
+    Astra,
 }
 
 impl ModelAlias {
-    pub const ALL: [Self; 3] = [Self::Sol, Self::Terra, Self::Luna];
+    pub const ALL: [Self; 4] = [Self::Sol, Self::Terra, Self::Luna, Self::Astra];
 
     pub fn id(self) -> &'static str {
         match self {
             Self::Sol => "gpt-5.6-sol",
             Self::Terra => "gpt-5.6-terra",
             Self::Luna => "gpt-5.6-luna",
+            Self::Astra => "gpt-6-astra",
         }
     }
 
@@ -47,6 +53,7 @@ impl ModelAlias {
             Self::Sol => "GPT-5.6 Sol",
             Self::Terra => "GPT-5.6 Terra",
             Self::Luna => "GPT-5.6 Luna",
+            Self::Astra => "GPT-6 Astra",
         }
     }
 
@@ -55,6 +62,7 @@ impl ModelAlias {
             "sol" | "gpt-5.6-sol" => Some(Self::Sol),
             "terra" | "gpt-5.6-terra" => Some(Self::Terra),
             "luna" | "gpt-5.6-luna" => Some(Self::Luna),
+            "astra" | "gpt-6-astra" => Some(Self::Astra),
             _ => None,
         }
     }
@@ -68,6 +76,7 @@ impl ModelAlias {
             Self::Sol => 0,
             Self::Terra => 1,
             Self::Luna => 2,
+            Self::Astra => 3,
         }
     }
 }
@@ -150,11 +159,12 @@ impl ReasoningEffort {
         Self::ALL[index.min(Self::ALL.len() - 1)]
     }
 
-    /// Levels actually supported by each model in the 5.6 family.
+    /// Request-level efforts supported by each built-in Codex model.
+    /// Astra Ultra requires Codex orchestration beyond this Responses client.
     pub fn supported(model: ModelAlias) -> &'static [Self] {
         match model {
             ModelAlias::Sol | ModelAlias::Terra => &Self::ALL,
-            ModelAlias::Luna => &Self::ALL[..Self::ALL.len() - 1],
+            ModelAlias::Luna | ModelAlias::Astra => &Self::ALL[..Self::ALL.len() - 1],
         }
     }
 
@@ -285,6 +295,13 @@ pub enum CommandCodeCatalogSource {
     Fallback,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ZenCatalogSource {
+    Live,
+    Cache,
+    Fallback,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenCodeModelView {
     pub id: String,
@@ -295,10 +312,38 @@ pub struct OpenCodeModelView {
     pub accepts_images: bool,
 }
 
+/// One configured MCP server as shown by `/mcp`. Status is pushed by the
+/// worker; `tools` is the cached tool count once a server is `Ready`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McpStatusView {
+    Disabled,
+    Disconnected,
+    Connecting,
+    Ready,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpServerView {
+    pub name: String,
+    pub transport: &'static str,
+    /// Command line or endpoint URL; never carries header/env values.
+    pub target: String,
+    pub status: McpStatusView,
+    pub tools: Option<usize>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TranscriptRole {
     User,
     Assistant,
+    Tool {
+        batch_id: ToolBatchId,
+        call_id: ToolCallId,
+        name: String,
+        arguments: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -312,14 +357,20 @@ pub enum UiEvent {
     SessionSnapshot {
         session_id: SessionId,
         cwd: String,
+        /// Workspace skills discovered off the UI thread; applied as-is.
+        skill_names: Vec<String>,
     },
     SessionRestored {
         session_id: SessionId,
         cwd: String,
         messages: Vec<TranscriptMessage>,
+        /// Workspace skills discovered off the UI thread; applied as-is.
+        skill_names: Vec<String>,
     },
     WorkspaceChanged {
         cwd: String,
+        /// Workspace skills discovered off the UI thread; applied as-is.
+        skill_names: Vec<String>,
     },
     AttachmentsChanged {
         labels: Vec<String>,
@@ -448,6 +499,9 @@ pub enum UiEvent {
         context_tokens: u64,
         context_window_tokens: u64,
     },
+    RequestCompleted {
+        provider_latency_ms: u64,
+    },
     ModeChanged {
         mode: OperatingMode,
     },
@@ -466,8 +520,15 @@ pub enum UiEvent {
         models: Vec<OpenCodeModelView>,
         source: CommandCodeCatalogSource,
     },
+    ZenCatalogLoaded {
+        models: Vec<OpenCodeModelView>,
+        source: ZenCatalogSource,
+    },
     EffortChanged {
         effort: ReasoningEffort,
+    },
+    CodexSpeedChanged {
+        fast: bool,
     },
     AuthStateChanged {
         provider: Option<LoginProvider>,
@@ -487,6 +548,10 @@ pub enum UiEvent {
     },
     Notification {
         message: String,
+    },
+    /// Fresh `/mcp` snapshot after any lifecycle change or poll tick.
+    McpServersChanged {
+        servers: Vec<McpServerView>,
     },
     /// Data-lane compaction checkpoint (§11.3): collapsed system block, not a toast.
     CompactionCompleted,
@@ -542,6 +607,7 @@ impl UiEvent {
                 | Self::Usage { .. }
                 | Self::UsageEstimate { .. }
                 | Self::UsageEstimateForRun { .. }
+                | Self::RequestCompleted { .. }
         )
     }
 
@@ -571,6 +637,7 @@ impl UiEvent {
                     | Self::InputRequired { .. }
                     | Self::QuestionRequired { .. }
                     | Self::InteractionAcknowledged { .. }
+                    | Self::RequestCompleted { .. }
             )
     }
 
@@ -600,6 +667,7 @@ impl UiEvent {
             slim_core::EventKind::SessionStarted { session_id } => Some(Self::SessionSnapshot {
                 session_id: SessionId(session_id.into()),
                 cwd: String::new(),
+                skill_names: Vec::new(),
             }),
             slim_core::EventKind::ModeChanged { mode } => Some(Self::ModeChanged { mode }),
             slim_core::EventKind::AssistantTextDelta { text } => {
@@ -614,8 +682,12 @@ impl UiEvent {
                 detail,
             } => {
                 let label = match phase {
-                    slim_core::ProviderPhase::Compacting => "Compacting context".to_owned(),
-                    slim_core::ProviderPhase::Connecting => "Connecting to provider".to_owned(),
+                    slim_core::ProviderPhase::Compacting => detail
+                        .filter(|text| !text.trim().is_empty())
+                        .unwrap_or_else(|| "Compacting context".to_owned()),
+                    slim_core::ProviderPhase::Connecting => detail
+                        .filter(|text| !text.trim().is_empty())
+                        .unwrap_or_else(|| "Connecting to provider".to_owned()),
                     slim_core::ProviderPhase::HeadersReceived => {
                         "Waiting for first byte".to_owned()
                     }
@@ -683,8 +755,8 @@ impl UiEvent {
                     content_handle: None,
                     batch_id,
                     call_id,
+                    preview: tool_output_preview(&name, &output),
                     name,
-                    preview: bounded_first_line(&output, 512),
                 })
             }
             slim_core::EventKind::ToolProgress {
@@ -700,6 +772,24 @@ impl UiEvent {
                     call_id,
                     name,
                     preview: bounded_first_line(&preview, 512),
+                })
+            }
+            slim_core::EventKind::ToolProcessFinished {
+                batch_id,
+                call_id,
+                name,
+                process,
+            } => {
+                let (batch_id, call_id) = projected_tool_identity(request_id, 1, batch_id, call_id);
+                Some(Self::ToolProgress {
+                    // Process facts arrive after ToolOutput. Keep any
+                    // inspector handle already attached to that output while
+                    // replacing the compact preview with typed status.
+                    content_handle: None,
+                    batch_id,
+                    call_id,
+                    name,
+                    preview: process_preview(&process),
                 })
             }
             slim_core::EventKind::ToolFinished {
@@ -725,9 +815,22 @@ impl UiEvent {
             | slim_core::EventKind::ResponseCacheHit
             | slim_core::EventKind::GoalAssurance { .. }
             | slim_core::EventKind::ToolEvidenceReused { .. }
+            | slim_core::EventKind::ToolEvidenceElided { .. }
             | slim_core::EventKind::ToolCallsSuppressed { .. }
-            | slim_core::EventKind::RequestCompleted { .. }
             | slim_core::EventKind::ArtifactStored { .. } => None,
+            slim_core::EventKind::RequestCompleted {
+                provider_latency_ms,
+                cancelled,
+                failed,
+            } => {
+                if !cancelled && !failed && provider_latency_ms > 0 {
+                    Some(Self::RequestCompleted {
+                        provider_latency_ms,
+                    })
+                } else {
+                    None
+                }
+            }
             slim_core::EventKind::CompactionCompleted => Some(Self::CompactionCompleted),
             slim_core::EventKind::CompactionAttemptStarted { .. }
             | slim_core::EventKind::CompactionAttemptCompleted { .. }
@@ -819,6 +922,13 @@ impl UiEvent {
                     })
                     .collect(),
             }),
+            // The host reports this bounded stop after finalization, with its
+            // full blocker context. It is not an unexpected worker failure.
+            slim_core::EventKind::TerminalError { message }
+                if message == "repeated failed tool call blocked" =>
+            {
+                None
+            }
             slim_core::EventKind::TerminalError { message } => Some(Self::FatalError {
                 run_id: None,
                 message,
@@ -852,6 +962,58 @@ fn projected_tool_identity(
         ToolBatchId(format!("legacy-batch-{start_seq}").into()),
         ToolCallId(format!("legacy-call-{start_seq}").into()),
     )
+}
+
+fn process_preview(process: &slim_core::process::ProcessExecutionFacts) -> String {
+    let mut parts = vec![format!(
+        "exit {}",
+        process
+            .exit_code
+            .map_or_else(|| "n/a".to_owned(), |code| code.to_string())
+    )];
+    if process.timed_out {
+        parts.push("timed out".into());
+    }
+    if process.cancelled {
+        parts.push("cancelled".into());
+    }
+    let discarded = process
+        .stdout_discarded_bytes
+        .saturating_add(process.stderr_discarded_bytes);
+    if discarded > 0 {
+        parts.push(format!("discarded {discarded} B"));
+    }
+    parts.join(" · ")
+}
+
+/// Bounded summary for the transcript; the complete output remains in the content store.
+pub fn tool_output_preview(name: &str, output: &str) -> String {
+    if name == "todo" {
+        if let Some(reason) = output
+            .lines()
+            .find(|line| line.starts_with("todo rejected ("))
+        {
+            return bounded_first_line(reason, 512);
+        }
+    }
+    if name == "shell" {
+        let status = output.lines().next().unwrap_or_default();
+        if status.starts_with("exit ") && status != "exit 0" {
+            let reason = output
+                .split_once("\nstderr:\n")
+                .and_then(|(_, stderr)| stderr.lines().find(|line| !line.trim().is_empty()))
+                .or_else(|| {
+                    output
+                        .split_once("\nstdout:\n")
+                        .and_then(|(_, rest)| rest.split("stderr:\n").next())
+                        .and_then(|stdout| stdout.lines().find(|line| !line.trim().is_empty()))
+                });
+            if let Some(reason) = reason {
+                return bounded_first_line(&format!("{status} · {}", reason.trim()), 512);
+            }
+        }
+    }
+    bounded_first_line(output, 512)
 }
 
 fn bounded_first_line(output: &str, limit: usize) -> String {
@@ -905,11 +1067,17 @@ pub enum UiCommand {
     SetModel {
         model: ModelAlias,
         effort: ReasoningEffort,
+        fast: bool,
     },
     RefreshOpenCodeModels,
+    RefreshZenModels,
     RefreshClinePassModels,
     RefreshCommandCodeModels,
     SetOpenCodeModel {
+        model: String,
+        effort: ReasoningEffort,
+    },
+    SetZenModel {
         model: String,
         effort: ReasoningEffort,
     },
@@ -921,8 +1089,41 @@ pub enum UiCommand {
         model: String,
         effort: ReasoningEffort,
     },
+    SetXaiModel {
+        model: String,
+        effort: ReasoningEffort,
+    },
     CancelRun,
     Shutdown,
+    /// Reload layered config into the MCP manager and push a fresh snapshot.
+    McpRefresh,
+    /// Connect (lazily) and count tools; the connection stays warm.
+    McpTest {
+        name: String,
+    },
+    McpReconnect {
+        name: String,
+    },
+    McpDisconnect {
+        name: String,
+    },
+    /// Remove from config file and drop the live entry.
+    McpRemove {
+        name: String,
+    },
+    /// Persist a new server into slim.toml (project, or global when
+    /// `global`) and add it to the manager.
+    McpAdd {
+        name: String,
+        command: Option<String>,
+        args: Vec<String>,
+        url: Option<String>,
+        global: bool,
+    },
+    /// Cheap status polling while the `/mcp` overlay is open.
+    McpWatch {
+        on: bool,
+    },
     RequestContentPage {
         handle: ContentHandle,
         request_id: ContentRequestId,
@@ -930,9 +1131,17 @@ pub enum UiCommand {
     },
 }
 
-#[cfg(windows)]
 struct WakeInner {
+    /// Set while the consumer sits in the drain→wait gap (armed). Producers
+    /// use `notify_waiter` on hot paths so a flood of lane events does not
+    /// pay a signal syscall per event while the consumer is busy.
+    waiting: std::sync::atomic::AtomicBool,
+    #[cfg(windows)]
     event: windows_sys::Win32::Foundation::HANDLE,
+    #[cfg(unix)]
+    reader: std::os::unix::net::UnixStream,
+    #[cfg(unix)]
+    writer: std::os::unix::net::UnixStream,
 }
 
 #[cfg(windows)]
@@ -951,9 +1160,8 @@ impl Drop for WakeInner {
     }
 }
 
-/// Cross-thread wake signal shared by event producers and the Windows terminal
-/// wait loop. It prevents quiescent polling without delaying bridge events.
-#[cfg(windows)]
+/// Cross-thread wake signal shared by event producers and the terminal wait
+/// loop. It prevents quiescent polling without delaying bridge events.
 #[derive(Clone)]
 pub struct WakeSignal(Arc<WakeInner>);
 
@@ -968,8 +1176,17 @@ fn finite_wait_timeout_ms(timeout: std::time::Duration) -> u32 {
     }
 }
 
-#[cfg(windows)]
+#[cfg(unix)]
+fn poll_timeout_ms(timeout: std::time::Duration) -> i32 {
+    if timeout.is_zero() {
+        0
+    } else {
+        i32::try_from(timeout.as_millis().max(1)).unwrap_or(i32::MAX)
+    }
+}
+
 impl WakeSignal {
+    #[cfg(windows)]
     pub fn new() -> std::io::Result<Self> {
         let event = unsafe {
             windows_sys::Win32::System::Threading::CreateEventW(
@@ -982,25 +1199,107 @@ impl WakeSignal {
         if event.is_null() {
             Err(std::io::Error::last_os_error())
         } else {
-            Ok(Self(Arc::new(WakeInner { event })))
+            Ok(Self(Arc::new(WakeInner {
+                waiting: std::sync::atomic::AtomicBool::new(false),
+                event,
+            })))
         }
     }
 
+    /// Unix wake: a non-blocking socketpair whose read end the wait loop
+    /// `poll`s together with terminal input (fd 0).
+    #[cfg(unix)]
+    pub fn new() -> std::io::Result<Self> {
+        let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
+        reader.set_nonblocking(true)?;
+        writer.set_nonblocking(true)?;
+        Ok(Self(Arc::new(WakeInner {
+            waiting: std::sync::atomic::AtomicBool::new(false),
+            reader,
+            writer,
+        })))
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    pub fn new() -> std::io::Result<Self> {
+        Ok(Self(Arc::new(WakeInner {
+            waiting: std::sync::atomic::AtomicBool::new(false),
+        })))
+    }
+
+    /// Unconditional signal. Used by one-shot producers (clipboard results,
+    /// lane-space release, loop self-wake) where the auto-reset/pipe state
+    /// must latch even when no waiter is armed yet.
     pub fn notify(&self) {
+        #[cfg(windows)]
         unsafe {
             windows_sys::Win32::System::Threading::SetEvent(self.0.event);
         }
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            // Non-blocking: a full pipe already means a pending signal.
+            let _ = (&self.0.writer).write_all(&[1u8]);
+        }
+        #[cfg(not(any(windows, unix)))]
+        {}
     }
 
+    /// Hot-path signal: skips the platform call unless the consumer is armed
+    /// for a wait. The consumer arms before its final lane probe, so a send
+    /// racing the drain→wait gap still wakes it.
+    pub fn notify_waiter(&self) {
+        if self.0.waiting.load(std::sync::atomic::Ordering::Acquire) {
+            self.notify();
+        }
+    }
+
+    /// Marks the consumer as about to wait. Callers must arm, then probe the
+    /// lanes/input once more, then wait — the probe is what closes the race
+    /// against producers that arrived before the arm.
+    pub(crate) fn arm(&self) {
+        self.0
+            .waiting
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn disarm(&self) {
+        self.0
+            .waiting
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Read end of the wake pipe, for `poll`-based terminal waits.
+    #[cfg(unix)]
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.0.reader.as_raw_fd()
+    }
+
+    /// Empties the notification pipe after a wakeup.
+    #[cfg(unix)]
+    pub(crate) fn drain_pipe(&self) {
+        use std::io::Read;
+        let mut buf = [0u8; 64];
+        loop {
+            match (&self.0.reader).read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => continue,
+            }
+        }
+    }
+
+    #[cfg(windows)]
     #[allow(dead_code)]
     pub(crate) fn raw_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
         self.0.event
     }
 
-    /// Waits for and consumes one notification from this auto-reset signal.
+    /// Waits for and consumes one notification from this signal.
     ///
     /// This single-handle form is primarily useful for deterministic bridge
     /// tests; the TUI runtime waits on this handle together with console input.
+    #[cfg(windows)]
     pub fn wait_timeout(&self, timeout: std::time::Duration) -> std::io::Result<bool> {
         use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
         use windows_sys::Win32::System::Threading::WaitForSingleObject;
@@ -1017,30 +1316,43 @@ impl WakeSignal {
             ))),
         }
     }
-}
 
-#[cfg(windows)]
-impl Default for WakeSignal {
-    fn default() -> Self {
-        Self::new().expect("create TUI wake event")
+    #[cfg(unix)]
+    pub fn wait_timeout(&self, timeout: std::time::Duration) -> std::io::Result<bool> {
+        let timeout_ms = poll_timeout_ms(timeout);
+        let mut fd = libc::pollfd {
+            fd: self.raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            // SAFETY: `fd` points at a valid pollfd for the call's duration.
+            let ready = unsafe { libc::poll(&mut fd, 1, timeout_ms) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if ready == 0 {
+                return Ok(false);
+            }
+            self.drain_pipe();
+            return Ok(fd.revents & libc::POLLIN != 0);
+        }
     }
-}
 
-#[cfg(not(windows))]
-#[derive(Clone, Default)]
-pub struct WakeSignal;
-
-#[cfg(not(windows))]
-impl WakeSignal {
-    pub fn new() -> std::io::Result<Self> {
-        Ok(Self)
-    }
-
-    pub fn notify(&self) {}
-
+    #[cfg(not(any(windows, unix)))]
     pub fn wait_timeout(&self, timeout: std::time::Duration) -> std::io::Result<bool> {
         std::thread::sleep(timeout);
         Ok(false)
+    }
+}
+
+impl Default for WakeSignal {
+    fn default() -> Self {
+        Self::new().expect("create TUI wake signal")
     }
 }
 
@@ -1083,6 +1395,7 @@ impl UiEvent {
                 | Self::Usage { .. }
                 | Self::UsageEstimate { .. }
                 | Self::UsageEstimateForRun { .. }
+                | Self::RequestCompleted { .. }
                 | Self::ToolStarted { .. }
                 | Self::ToolProgress { .. }
                 | Self::ToolEnded { .. }
@@ -1150,6 +1463,37 @@ mod tests {
             },
         );
         assert_eq!(UiEvent::from_core(event), None);
+    }
+
+    #[test]
+    fn process_finished_projects_typed_status_on_tool_progress_lane() {
+        let event = SessionEvent::new(
+            4,
+            EventKind::ToolProcessFinished {
+                batch_id: "batch-1".into(),
+                call_id: "call-1".into(),
+                name: "shell".into(),
+                process: slim_core::process::ProcessExecutionFacts {
+                    exit_code: Some(7),
+                    timed_out: true,
+                    cancelled: false,
+                    stdout_bytes: 12,
+                    stderr_bytes: 8,
+                    stdout_discarded_bytes: 3,
+                    stderr_discarded_bytes: 4,
+                },
+            },
+        );
+        assert_eq!(
+            UiEvent::from_core(event),
+            Some(UiEvent::ToolProgress {
+                content_handle: None,
+                batch_id: ToolBatchId("batch-1".into()),
+                call_id: ToolCallId("call-1".into()),
+                name: "shell".into(),
+                preview: "exit 7 · timed out · discarded 7 B".into(),
+            })
+        );
     }
 
     #[test]
@@ -1354,6 +1698,21 @@ mod tests {
                 "Connecting to provider",
             ),
             (
+                slim_core::ProviderPhase::Connecting,
+                Some("Retrying provider (1/2); waiting 30000 ms".to_owned()),
+                "Retrying provider (1/2); waiting 30000 ms",
+            ),
+            (
+                slim_core::ProviderPhase::Compacting,
+                Some("Retrying foreground compaction (1/2); waiting 250 ms".to_owned()),
+                "Retrying foreground compaction (1/2); waiting 250 ms",
+            ),
+            (
+                slim_core::ProviderPhase::Connecting,
+                Some(" ".to_owned()),
+                "Connecting to provider",
+            ),
+            (
                 slim_core::ProviderPhase::PreparingTool,
                 Some("read".to_owned()),
                 "Preparing tool · read",
@@ -1425,6 +1784,7 @@ mod tests {
                 session_id: SessionId("restored".into()),
                 cwd: "workspace".into(),
                 messages: Vec::new(),
+                skill_names: Vec::new(),
             },
             UiEvent::ToolStarted {
                 batch_id: ToolBatchId("batch".into()),
@@ -1472,6 +1832,12 @@ mod tests {
     #[test]
     fn gpt_56_efforts_match_codex_model_catalog() {
         assert_eq!(
+            ReasoningEffort::supported(ModelAlias::Astra),
+            &ReasoningEffort::ALL[..5]
+        );
+        assert_eq!(ModelAlias::parse("astra"), Some(ModelAlias::Astra));
+        assert_eq!(ModelAlias::parse("gpt-6-astra"), Some(ModelAlias::Astra));
+        assert_eq!(
             ReasoningEffort::supported(ModelAlias::Sol),
             &ReasoningEffort::ALL
         );
@@ -1484,5 +1850,46 @@ mod tests {
             &ReasoningEffort::ALL[..5]
         );
         assert!(!ReasoningEffort::supported(ModelAlias::Luna).contains(&ReasoningEffort::Ultra));
+    }
+}
+
+#[cfg(test)]
+mod output_preview_tests {
+    use super::tool_output_preview;
+
+    #[test]
+    fn partial_todo_failure_previews_the_rejection_instead_of_prior_success() {
+        let output = "todo 6 [completed]: first\ntodo rejected (second): only one todo may be in progress\nCurrent items:";
+        assert_eq!(
+            tool_output_preview("todo", output),
+            "todo rejected (second): only one todo may be in progress"
+        );
+        assert_eq!(
+            tool_output_preview("todo", "todo 0 [completed]: first"),
+            "todo 0 [completed]: first"
+        );
+    }
+
+    #[test]
+    fn failed_shell_previews_stderr_then_stdout_without_changing_success_output() {
+        assert_eq!(
+            tool_output_preview(
+                "shell",
+                "exit 1\nstdout:\nnoise\nstderr:\nAccess denied\nmore"
+            ),
+            "exit 1 · Access denied"
+        );
+        assert_eq!(
+            tool_output_preview("shell", "exit 2\nstdout:\nmissing file\nstderr:\n"),
+            "exit 2 · missing file"
+        );
+        assert_eq!(
+            tool_output_preview("shell", "exit 1\nstdout:\nstderr:\n"),
+            "exit 1"
+        );
+        assert_eq!(
+            tool_output_preview("shell", "exit 0\nstdout:\nok\nstderr:\nwarning"),
+            "exit 0"
+        );
     }
 }

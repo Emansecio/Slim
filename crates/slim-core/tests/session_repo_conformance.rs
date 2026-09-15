@@ -69,6 +69,8 @@ fn memory_repo_appends_and_reads() {
             parent_entry_id: None,
             operation_id: "op-1".into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            content_blocks: Vec::new(),
         },
     };
 
@@ -92,6 +94,8 @@ fn assert_common_contract<R: DurableRepo>(mut repo: R) {
                 parent_entry_id: None,
                 operation_id: "op-1".into(),
                 tool_call_id: None,
+                tool_calls: Vec::new(),
+                content_blocks: Vec::new(),
             },
         },
         DurableRecord::Operation {
@@ -238,6 +242,8 @@ fn invalid_lifecycle_records() -> [(&'static str, Vec<DurableRecord>); 3] {
                         parent_entry_id: None,
                         operation_id: "op-terminal".into(),
                         tool_call_id: None,
+                        tool_calls: Vec::new(),
+                        content_blocks: Vec::new(),
                     },
                 },
                 DurableRecord::Operation {

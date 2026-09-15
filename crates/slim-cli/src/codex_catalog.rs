@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -135,7 +136,7 @@ impl CodexCatalog {
                 }
             }
         }
-        let Some(entries) = read_cache(&self.cache_path)? else {
+        let Some(entries) = read_cache(&self.cache_path, &key)? else {
             return Ok(None);
         };
         if let Ok(mut guard) = MEMORY_CACHE.lock() {
@@ -180,10 +181,13 @@ impl CodexCatalog {
 }
 
 fn catalog_key(endpoint: &str, account_id: &str) -> String {
-    format!("{endpoint}\0{account_id}")
+    format!("{:x}", Sha256::digest(format!("{endpoint}\0{account_id}")))
 }
 
-fn read_cache(path: &Path) -> Result<Option<Vec<CodexCatalogEntry>>, CodexCatalogError> {
+fn read_cache(
+    path: &Path,
+    scope: &str,
+) -> Result<Option<Vec<CodexCatalogEntry>>, CodexCatalogError> {
     let mut file = match OpenOptions::new().read(true).open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -201,6 +205,11 @@ fn read_cache(path: &Path) -> Result<Option<Vec<CodexCatalogEntry>>, CodexCatalo
         serde_json::from_slice(&bytes).map_err(|_| CodexCatalogError::InvalidSchema)?;
     if document.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
         return Err(CodexCatalogError::InvalidSchema);
+    }
+    // Old unscoped files cannot establish the account/endpoint that supplied
+    // these limits. Treat them as a cache miss, like a different account.
+    if document.get("scope").and_then(serde_json::Value::as_str) != Some(scope) {
+        return Ok(None);
     }
     let entries = document
         .get("entries")
@@ -284,7 +293,7 @@ async fn fetch_with_client(
     if entries.is_empty() {
         return Err(CodexCatalogError::Empty);
     }
-    let _ = write_cache(cache_path, &entries);
+    let _ = write_cache(cache_path, &entries, &catalog_key(endpoint, account_id));
     if let Ok(mut guard) = MEMORY_CACHE.lock() {
         *guard = Some(MemoryCache {
             key: catalog_key(endpoint, account_id),
@@ -295,11 +304,16 @@ async fn fetch_with_client(
     Ok(CodexCatalogSnapshot { entries })
 }
 
-fn write_cache(path: &Path, entries: &[CodexCatalogEntry]) -> Result<(), CodexCatalogError> {
+fn write_cache(
+    path: &Path,
+    entries: &[CodexCatalogEntry],
+    scope: &str,
+) -> Result<(), CodexCatalogError> {
     let parent = path.parent().ok_or(CodexCatalogError::UnsafeCache)?;
     fs::create_dir_all(parent).map_err(|_| CodexCatalogError::CacheIo)?;
     let body = serde_json::json!({
         "version": 1,
+        "scope": scope,
         "entries": entries.iter().map(|entry| {
             serde_json::json!({
                 "slug": entry.slug,

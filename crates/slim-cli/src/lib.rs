@@ -7,8 +7,10 @@ mod config;
 mod exit_codes;
 mod headless;
 mod jsonl;
+mod mcp;
 pub mod oauth;
 pub mod opencode_go_catalog;
+pub mod opencode_zen_catalog;
 mod tui;
 
 use slim_core::AppHandle;
@@ -28,7 +30,7 @@ pub use headless::{
     run_provider_headless_with_resume, run_provider_headless_with_resume_and_options,
     run_provider_headless_with_session, run_provider_headless_with_session_and_options,
     HeadlessRequest, HeadlessResult, OutputFormat, ProviderHeadlessResult, ProviderRequest,
-    ProviderRunOptions, UsageCostSummary, MAX_IMAGE_BYTES,
+    ProviderRunOptions, ToolProcessFact, UsageCostSummary, MAX_IMAGE_BYTES,
 };
 pub use jsonl::render_jsonl;
 pub use tui::{
@@ -40,6 +42,18 @@ pub fn compose_app() -> AppHandle {
     AppHandle::fake()
 }
 
+pub(crate) fn canonical_provider_model(
+    kind: slim_core::provider::ProviderKind,
+    model: &str,
+) -> String {
+    if kind == slim_core::provider::ProviderKind::OpenAiCodex {
+        if let Some(model) = slim_core::provider::codex_model(model) {
+            return model.id.into();
+        }
+    }
+    model.into()
+}
+
 /// G248: model strings are provider-specific — a globally configured model
 /// (slim.toml, `SLIM_MODEL`, `--model`) belongs to the provider it was chosen
 /// for. Returns `true` when `model` validates against `kind`; OpenAI-compatible
@@ -48,13 +62,15 @@ pub(crate) fn provider_compatible_model(
     kind: slim_core::provider::ProviderKind,
     model: &str,
 ) -> bool {
-    use slim_core::provider::{open_code_model, ProviderKind};
+    use slim_core::provider::{open_code_model, zen_model, ProviderKind};
     use slim_tui::api::ModelAlias;
     match kind {
         ProviderKind::OpenAiCodex => ModelAlias::parse(model).is_some(),
         ProviderKind::OpenCodeGo => open_code_model(model).is_some(),
+        ProviderKind::OpenCodeZen => zen_model(model).is_some(),
         ProviderKind::ClinePass => slim_core::provider::is_clinepass_model_id(model),
         ProviderKind::CommandCode => slim_core::provider::is_command_code_model_id(model),
+        ProviderKind::Xai => slim_core::provider::is_xai_model_id(model),
         ProviderKind::Anthropic | ProviderKind::OpenAiCompatible => true,
     }
 }
@@ -96,6 +112,14 @@ mod provider_model_tests {
 
     #[test]
     fn codex_accepts_aliases_only() {
+        assert!(provider_compatible_model(
+            ProviderKind::OpenAiCodex,
+            "astra"
+        ));
+        assert!(provider_compatible_model(
+            ProviderKind::OpenAiCodex,
+            "gpt-6-astra"
+        ));
         assert!(provider_compatible_model(ProviderKind::OpenAiCodex, "luna"));
         assert!(provider_compatible_model(
             ProviderKind::OpenAiCodex,
@@ -116,6 +140,14 @@ mod provider_model_tests {
         assert!(provider_compatible_model(
             ProviderKind::OpenCodeGo,
             "deepseek-v4-flash"
+        ));
+        assert!(provider_compatible_model(
+            ProviderKind::OpenCodeGo,
+            "deepseek-flash"
+        ));
+        assert!(provider_compatible_model(
+            ProviderKind::OpenCodeGo,
+            "deepseek-v4.1-flash"
         ));
         assert!(!provider_compatible_model(ProviderKind::OpenCodeGo, "luna"));
         assert!(!provider_compatible_model(

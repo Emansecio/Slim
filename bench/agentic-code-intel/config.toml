@@ -1,0 +1,11 @@
+model = "gpt-5.6-luna"
+effort = "high"
+codex_fast = false
+max_turns = 20
+max_total_tool_calls = 40
+max_read_tool_calls = 32
+max_mutating_tool_calls = 12
+timeout_secs = 180
+[lsp]
+enabled = true
+request_timeout_ms = 30000

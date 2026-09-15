@@ -133,8 +133,11 @@ Contrato operacional:
 - somente built-ins comprovadamente read-only podem executar em paralelo;
 - shell, writes e MCP tools executam em série;
 - resultados entram no transcript em source order;
-- outputs grandes entram no prompt como head/tail bounded e marcador; o bruto
-  integral fica em artefato local recuperável por handle.
+- outputs grandes entram no prompt como head/tail bounded e marcador; o conteúdo
+  disponível antes desse corte fica em artefato local recuperável por handle.
+  Na ferramenta shell, a captura já retém até 8 KiB por stream (contrato de
+  12/09/2026), com início/fim e descarte explícito; seu artefato não é um log
+  bruto integral. APIs públicas de captura bruta mantêm seus próprios orçamentos.
 
 ### 3.7 Busca rápida
 

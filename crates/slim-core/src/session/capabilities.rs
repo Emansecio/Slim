@@ -535,8 +535,13 @@ pub enum TaskGoalAssurance {
 pub enum TaskMutation {
     TodoAdd {
         title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<TaskTodoStatus>,
     },
     TodoSetStatus {
+        /// Older durable records omit the target and retain legacy selection.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
         status: TaskTodoStatus,
     },
     PlanAddNode {
@@ -604,6 +609,21 @@ struct TaskProjection {
     goal_used: u64,
     goal_paused: bool,
     goal_complete: bool,
+}
+
+impl TaskProjection {
+    fn todo_index(&self, id: Option<u64>) -> Option<usize> {
+        match id {
+            Some(id) => usize::try_from(id)
+                .ok()
+                .filter(|id| *id < self.todo_statuses.len()),
+            None => self
+                .todo_statuses
+                .iter()
+                .position(|status| *status == TaskTodoStatus::Pending)
+                .or_else(|| self.todo_statuses.len().checked_sub(1)),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1422,15 +1442,14 @@ impl<R> CapabilityService<R> {
     ) -> Result<(), CapabilityLedgerError> {
         let projection = self.task_projection(&request.entity_id);
         match &request.mutation {
-            TaskMutation::TodoAdd { title } => {
+            TaskMutation::TodoAdd { title, status } => {
                 if title.chars().count() > MAX_TASK_TEXT_BYTES {
                     return Err(CapabilityLedgerError::InvalidTaskTransition(
                         "todo title too long",
                     ));
                 }
-                if projection
-                    .todo_statuses
-                    .contains(&TaskTodoStatus::InProgress)
+                if *status == Some(TaskTodoStatus::InProgress)
+                    && self.other_todo_in_progress(&request.entity_id, None)
                 {
                     return Err(CapabilityLedgerError::InvalidTaskTransition(
                         "todo already in progress",
@@ -1438,20 +1457,12 @@ impl<R> CapabilityService<R> {
                 }
                 Ok(())
             }
-            TaskMutation::TodoSetStatus { status } => {
-                if projection.todo_statuses.is_empty() {
-                    return Err(CapabilityLedgerError::InvalidTaskTransition(
-                        "todo status requires a todo",
-                    ));
-                }
+            TaskMutation::TodoSetStatus { id, status } => {
+                let target = projection.todo_index(*id).ok_or(
+                    CapabilityLedgerError::InvalidTaskTransition("todo id not found"),
+                )?;
                 if *status == TaskTodoStatus::InProgress
-                    && self.tasks.iter().any(|(entity_id, task)| {
-                        entity_id != &request.entity_id
-                            && self
-                                .task_projection_from_mutations(&task.mutations)
-                                .todo_statuses
-                                .contains(&TaskTodoStatus::InProgress)
-                    })
+                    && self.other_todo_in_progress(&request.entity_id, Some(target))
                 {
                     return Err(CapabilityLedgerError::InvalidTaskTransition(
                         "only one todo may be in progress",
@@ -1544,6 +1555,19 @@ impl<R> CapabilityService<R> {
             .unwrap_or_default()
     }
 
+    fn other_todo_in_progress(&self, target_entity: &str, target: Option<usize>) -> bool {
+        self.tasks.iter().any(|(entity_id, task)| {
+            self.task_projection_from_mutations(&task.mutations)
+                .todo_statuses
+                .iter()
+                .enumerate()
+                .any(|(index, status)| {
+                    *status == TaskTodoStatus::InProgress
+                        && (entity_id != target_entity || Some(index) != target)
+                })
+        })
+    }
+
     /// Rebuilds the typed task state (todos, plan, goal) from an entity's
     /// mutation history. Pure and strictly ordered: later mutations overwrite
     /// earlier effects, matching the stored TaskProjection semantics.
@@ -1551,12 +1575,14 @@ impl<R> CapabilityService<R> {
         let mut projection = TaskProjection::default();
         for request in mutations {
             match &request.mutation {
-                TaskMutation::TodoAdd { title: _ } => {
-                    projection.todo_statuses.push(TaskTodoStatus::Pending);
+                TaskMutation::TodoAdd { status, .. } => {
+                    projection
+                        .todo_statuses
+                        .push(status.clone().unwrap_or(TaskTodoStatus::Pending));
                 }
-                TaskMutation::TodoSetStatus { status } => {
-                    if let Some(last) = projection.todo_statuses.last_mut() {
-                        *last = status.clone();
+                TaskMutation::TodoSetStatus { id, status } => {
+                    if let Some(index) = projection.todo_index(*id) {
+                        projection.todo_statuses[index] = status.clone();
                     }
                 }
                 TaskMutation::PlanAddNode {
@@ -1603,7 +1629,7 @@ fn validate_task_request(request: &TaskMutationRequest) -> Result<(), Capability
     }
     let valid_text = |text: &str| !text.is_empty() && text.len() <= MAX_TASK_TEXT_BYTES;
     match &request.mutation {
-        TaskMutation::TodoAdd { title } if !valid_text(title) => {
+        TaskMutation::TodoAdd { title, .. } if !valid_text(title) => {
             return Err(CapabilityLedgerError::InvalidIdentifier("task mutation"));
         }
         TaskMutation::PlanAddNode {

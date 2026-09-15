@@ -43,6 +43,300 @@ big-bang**. A ordem dos milestones é normativa.
 
 ### 1.1 Checkpoint de implementação atual
 
+Ferramentas nativas (12/09/2026): o término de shell também entrega fatos
+tipados de processo. A prévia distingue código de saída, timeout, cancelamento
+e bytes descartados de uma validação da tarefa. Atualizar essa prévia sem um
+novo handle mantém os detalhes de saída já registrados no inspector. Avisos
+de admissão permanecem no resultado mostrado ao modelo, inclusive após corte
+de contexto e reaproveitamento de evidência. Não há mudança de layout, timer
+ou política de frames. [Contrato e validação do checkout](../README.md#admissão-e-resultados-nativos).
+
+Confiabilidade e recuperação do turno (2026-09-06), nove correções revistas,
+implementadas e verificadas sequencialmente:
+
+1. Texto parcial e resultados confirmados do lote corrente são preservados em
+   erro/cancelamento, inclusive quando um artefato não pode ser gravado.
+2. O timeout do processo cobre pipes herdados e a tentativa de encerramento tem
+   prazo. Falha em confirmar descendentes no Windows retorna incerteza explícita.
+3. Todo usa fatos `task.v1` persistidos junto do turno e restaurados no runtime e
+   na TUI; novo prompt e retomada não reinicializam silenciosamente a lista.
+4. HTTP conserva status e `Retry-After` em segundos/data, com espera acumulada de
+   até 30 s e cancelamento; prazo remoto acima do orçamento não dispara retry cedo.
+5. JSON de tool inválido em lote completo com identidade conhecida recebe até duas
+   oportunidades de correção, sem executar os integrantes do lote rejeitado.
+6. Compactação em primeiro plano repete falhas transitórias seguras até duas vezes;
+   erro permanente/resumo inválido preserva a conversa original.
+7. Paradas por limites, repetição de falha, truncamento e erro do finalizador têm
+   diagnóstico local persistente. A causa de transporte preserva a fase conhecida.
+8. `--headless --recover PATH --abandon-pending` registra a decisão explícita de
+   abandono e efeitos não verificados; não executa/reverte ferramentas. Retomada
+   normal continua bloqueando pendências. Fases incompletas de logs externos não
+   são convertidas em resultados presumidos; recuperação respeita o lock existente.
+9. Fechamento inesperado dos canais TUI retorna erro; o chamador observa falha da
+   thread. `Shutdown` explícito continua encerrando normalmente.
+
+Limites: fixtures HTTP locais e subprocessos, sem provider comercial nem console
+físico. Encerramento de todo descendente órfão no Windows não é garantido; a falha
+é devolvida explicitamente. Não há replay automático nem declaração de tarefa
+concluída em uma recuperação de estado incerto.
+
+Gate desta entrega: `refresh-slim.ps1 -Test` / `cargo test --workspace`, Cargo
+Offline, **1211 passed / 0 failed / 3 ignored / 74 suítes / 0 warnings**, EXIT=0
+sem `--skip`. Um ignorado é o ConPTY físico; dois são fixtures auxiliares
+executadas indiretamente pelo teste de pipes herdados. Clippy core/CLI/TUI
+`--all-targets -- -D warnings` e diff-check verdes. Fmt global mantém diferenças
+preexistentes; formatter aplicado aos fontes alterados sem formatar o App inteiro.
+`OK: Slim slim 0.1.0 implantado em C:\Users\User\bin\Slim.exe (build de 09/06/2026 06:39:39)`.
+Target/PATH: 15.143.936 bytes, SHA-256 `0D1CC3690B410B0DA945629AC11DC39569D1244683929E7A51216322F90C52E1`.
+`--version` e `--help` instalados: EXIT=0; a opção `--abandon-pending` está presente.
+Uma fixture HTTP preexistente apresentou ConnectionReset 10054 em execução
+intermediária; passou isolada e no gate completo sem alteração da assertion.
+
+Histórico anterior — Retomada após cancelamento (2026-09-06): o leitor da fila aceita `Aborted` de uma
+operação manual já conhecida, sem criar item na fila ou candidato a replay.
+Abort sem identidade anterior continua inválido; regras das operações enfileiradas
+permanecem ativas. A regressão reproduziu exatamente `unknown durable queue operation`
+no `/resume`; após a correção, seleção e render mostram a resposta final anterior e
+o texto parcial salvo. A fixture de continuação com ferramentas também confere as
+duas respostas finais no frame. Restauração não emite comandos nem altera a sessão.
+Não houve alteração do arquivo da conversa do usuário ou validação em console físico.
+Evidência histórica dessa correção está no tracker; o gate e o build atuais estão acima.
+
+Falha silenciosa e recuperação do provider (2026-09-06): `provider_error` agora
+publica `RunFailed`, mantém um bloco de erro após o toast e salva a razão com
+segredos removidos junto do histórico de ferramentas. Conclusão normal sem texto
+de resposta nem chamada de ferramenta é erro, inclusive quando só houve reasoning.
+O loop repete apenas a requisição que falhou, até duas vezes por execução, para
+conexão segura, HTTP 429/500/502/503/504 ou EOF sem marcador terminal antes de
+resposta/ferramenta. Esperas de 250/500 ms aceitam cancelamento, preservam resultados
+anteriores e consomem o orçamento de turnos. Erro permanente, saída parcial,
+cancelamento, filtro e parada por orçamento não forçam continuação. Sete regressões
+locais cobrem persistência, proteção de segredo, resultado vazio, limite, cancelamento
+e ferramentas sem replay. Fixtures antigas de sucesso vazio passam a emitir resposta
+válida; a fixture CLI confere o conteúdo da leitura no request seguinte.
+O registro antigo não permite recuperar a causa exata da falha; não houve chamada
+comercial nem validação em console físico neste slice.
+
+Recuperação de provider (2026-09-09): o loop ainda limita a duas novas tentativas
+por execução e não reenvia um request que já emitiu ferramenta. Passa a retentar
+timeout/interrupção de transporte mesmo com entrega incerta no HTTP, HTTP 408, e
+stream incompleto depois de texto parcial (o parcial é preservado e o modelo
+continua a partir dele). `Retry-After` acima do orçamento de espera (60 s
+acumulados, canceláveis) é limitado ao restante — não aborta o retry nem espera
+uma hora. 401/403, cota/gasto estruturados, cancelamento e JSON de tool inválido
+continuam terminais. O HTTP continua marcando timeout pós-envio como
+`safe_to_retry: false` para o ledger durável.
+`refresh-slim.ps1 -Test`: **1190 passed / 0 failed / 1 ignored / 74 suítes / 0 warnings**,
+EXIT=0 e `OK:`. Clippy core/CLI all-targets com `-D warnings`, rustfmt e diff-check
+verdes. Build instalado 2026-09-06 04:16:18, 14.755.840 bytes; SHA-256 idêntico
+ao target/release: `B8345005E0F83A07F42D5841B7E26DD0FED60244589092358EAE8514A5A19674`.
+
+Simplificação da tela principal (2026-09-06, solicitada pelo usuário): transcript
+usa toda a largura quando nenhum inspector foi aberto por atalho; o painel Run
+não aparece automaticamente. Cabeçalho mantém identidade e contexto compacto;
+ActivityRail concentra fase/tempo, sem repetir estado ou contadores de tools.
+Totais de entrada/saída e velocidade ficam em Diagnostics (Ctrl+G), sem ↑/↓ no
+footer. Todo concluído/cancelado recolhe para uma row e Ctrl+T expande os itens.
+No checkout de 2026-09-07, ao receber `RunCompleted` com Todo pendente, em andamento ou bloqueado, a TUI
+acrescenta um bloco de sistema com a contagem de pendências. A execução termina
+normalmente, a lista mantém seus estados e um terminal repetido não duplica o
+aviso. O bloco permanece no transcript; não dispara continuação automática.
+Prévia de falha parcial de todo mostra a rejeição; shell sem sucesso inclui a
+primeira linha disponível de stderr, ou stdout, mantendo o output integral nos
+detalhes. Validação por TestBackend e regressões de projeção; console físico
+não foi exercitado nesta mudança.
+Gate desse slice visual: `refresh-slim.ps1 -Test` executou `cargo test --workspace` com Cargo
+em modo offline: 1183 passed / 0 failed / 1 ignored / 74 suítes / 0 warnings.
+Clippy TUI/CLI all-targets com `-D warnings`, rustfmt dos arquivos alterados e
+`git diff --check` passaram. A primeira cópia foi bloqueada pelo Slim aberto;
+após o usuário fechar a sessão, `refresh-slim.ps1` imprimiu `OK:`. Build instalado
+2026-09-06 03:34:14, 14.725.120 bytes, SHA-256 igual ao target/release:
+`F2D51787534389F1CFA7EE1860DAEBC2A6C646A9574910BE03C8381E5C86297A`.
+Não houve nova chamada comercial nessa atualização visual.
+
+OpenCode Go / Muse (2026-09-06): Muse Spark 1.2 e 1.3 Contributor usam
+`/responses`, conforme a [tabela oficial](https://opencode.ai/docs/go/#endpoints),
+em vez de Chat Completions. O Slim oferece low, medium, high e xhigh para ambos;
+o nível escolhido vai em `reasoning.effort`. Regressões reproduziram a rota
+anterior e a rejeição local de xhigh; validam ferramentas/histórico, compactação,
+eventos Responses e opções de esforço entregues ao seletor TUI.
+Após autorização, dois testes sintéticos no Go real com Muse 1.3/xhigh
+(debug e executável instalado) responderam `OK`, exit 0, sem o HTTP 500.
+Isso verifica conectividade/resposta simples; tarefas completas não foram exercitadas.
+Gate: 1180 passed / 0 failed / 1 ignored / 74 suítes / 0 compiler warnings
+(`cargo test --offline --locked --workspace`, EXIT=0). Clippy de slim-core e
+slim-cli `--all-targets -- -D warnings` verde. `refresh-slim.ps1` concluiu com
+`OK:` em 2026-09-06; build 02:26:15, 14.745.088 bytes, SHA-256 idêntico no
+release e PATH. [Identificação do executável instalado](../release/README.md).
+
+Paginação de read (2026-09-06): registra o início da próxima página antes do
+lookahead e incorpora esse checkpoint ao índice limitado existente. A regressão
+da segunda página caiu de 4303 para 2211 bytes consumidos pelo leitor, mantendo
+saída e digest completos; cobre Unicode, LF/CRLF e EOF sem quebra de linha.
+Workspace: 1178 passed / 0 failed / 1 ignored / 74 suítes / 0 compiler warnings;
+`cargo test --offline --locked --workspace` e Clippy de slim-core
+`--all-targets -- -D warnings`, EXIT=0. Sem refresh/deploy ou medição de latência/tokens.
+
+Cache (2026-09-06): evidências de arquivo conferem identidade, tamanho e mtime
+pelo handle aberto; substituição com tamanho/mtime iguais invalida a entrada.
+Cursor de busca sem snapshot exige reinício explícito, sem reaplicar o offset
+a resultados novos. Deduplicação consulta o conteúdo integral no histórico ativo,
+inclusive em retomadas; compactação só permite omissão se o original permanecer.
+Quatro regressões novas e fixtures existentes ampliadas cobrem esses contratos.
+Workspace: 1177 passed / 0 failed / 1 ignored / 74 suítes / 0 compiler warnings
+(`cargo test --offline --locked --workspace`, EXIT=0). Clippy de slim-core
+`--all-targets -- -D warnings` verde. Sem refresh/deploy ou
+provider comercial; economia total de tokens e latência não medidas.
+
+LSP (2026-09-06): truncamento usa o mesmo iterador para coletar o prefixo e
+observar um caractere adicional; elimina contagem integral sem mudar a saída.
+Um teste novo cobre vazio, limite zero/exato, excesso e Unicode. Workspace:
+1173 passed / 0 failed / 1 ignored / 74 suítes / 0 compiler warnings; Clippy
+slim-lsp `--all-targets -- -D warnings` verde. Sem refresh/deploy ou benchmark.
+
+LSP (2026-09-06): `read_capped` limita o próprio I/O a tamanho máximo + 1 byte,
+rejeitando excesso sem ler o restante quando o arquivo cresce após o stat.
+Regressão determinística: limite 8, consumo anterior 4096, consumo corrigido 9.
+Dois testes novos cobrem excesso, limite exato, UTF-8, CRLF e falha de leitura.
+Gate desse slice: 1172 passed / 0 failed / 1 ignored / 74 suítes, sem compiler warnings;
+Clippy slim-lsp `--all-targets -- -D warnings` verde. Sem refresh/deploy.
+
+LSP (2026-09-05): sete sugestões reconfirmadas por regressões e implementadas
+sequencialmente, com revisão antes da próxima: escrita/cancelamento/exit bounded,
+diagnósticos ausentes ou sem versão não conclusivos, desativação individual e
+caminho configurado respeitados, parsing de null separado de resposta inválida,
+definição sem coordenadas fabricadas, cortes explícitos e recência do cache.
+Gate local: `cargo test --offline --locked --workspace`, 1170 passed / 0 failed /
+1 ignored / 74 suítes; Clippy dos crates slim-lsp/core/cli com `-D warnings` verde.
+Sem refresh/deploy, provider comercial ou validação com rust-analyzer real.
+
+Isolamento de fixtures (2026-09-05): criação exclusiva em `native_tool_recovery`
+e `session_continuation`, com novo sufixo em colisão. Regressão reproduziu remoção
+cruzada com timestamp idêntico e passou após a correção. Gate em paralelo: 1151
+passed / 0 failed / 1 ignored / 74 suítes, 16,04 s incluindo compilação; três
+repetições da suíte afetada com 16 threads também verdes. Clippy e refresh verdes.
+
+Histórico visual de ferramentas (2026-09-05): `/resume` e a abertura com sessão
+restauram os blocos salvos completos, recolhidos e identificados como `history`.
+Enter mostra argumentos/resultados persistidos, sem executar ações. Identidades
+visuais incluem o batch para separar IDs reutilizados. Não se infere sucesso ou
+duração a partir do texto salvo. Testes cobrem a bridge, continuação, correlação e
+renderização fullscreen em 44/100 colunas; console físico não foi exercitado.
+
+Continuação com ferramentas (2026-09-05): `--session` cria v2; `--resume` e a
+bridge TUI restauram chamadas/resultados correlacionados e executam novos turnos
+com os modos/orçamentos atuais, raiz salva e novas guardas de leitura. O registro
+do turno independe da compactação ativa; checkpoints não podem separar chamadas
+e resultados. Interrupção ambígua permanece bloqueada sem replay automático.
+Validação com HTTP local, processos CLI separados e bridge TUI; sem provider
+real ou console físico. [Uso e limites](../README.md#continuação-de-sessões-com-ferramentas).
+
+Leitura de 200 linhas, patch atômico/CRLF e shell com argumentos literais. Conclusões Responses mantêm index/call_id. Write anuncia path/content e exige leitura completa recente para arquivos existentes; guarda explícita continua aceita pela API. Processos filhos recebem stdio Python UTF-8 por padrão, preservando override. Prompt v1.7 orienta parsers/serializers para dados estruturados. A bateria anterior v1.7 aprovou 48/48 pares: Luna -3,53% e DeepSeek -7,68% tokens no agregado, com 14/24 vitórias em cada modelo. A economia ampla continua não demonstrada.
+
+Contexto inicial equilibrado e prazos HTTP (2026-09-05): raiz antes das subpastas, até 8 caminhos por diretório não raiz, profundidade 3, mesmos limites de bytes/orçamento/ignore. TCP/TLS usa connect; upload/cabeçalhos usam idle/first_semantic, com cancelamento e wall preservados. A bateria do novo hash terminou com 32/32 pares e 64/64 braços aprovados: Luna -10,76% tokens e DeepSeek -21,31%, com vantagem em 6/8 e 7/8 cenários, respectivamente. Os oráculos passaram integralmente; a vantagem em qualquer provider/tarefa permanece não demonstrada. [Evidência](../bench/luna-live/README.md#contexto-equilibrado-e-prazos-http). A meta ampla permanece aberta.
+
+Gate atual do checkout: **1211 passed / 0 failed / 3 ignored / 74 suítes / 0 compiler warnings**.
+
+Ciclo adicional de economia encerrado (2026-09-05): leitura numerada opcional
+descartada, com +11,63% tokens no Luna e +27,18% no DeepSeek nos pares completos.
+Contrato anterior restaurado e gate acima revalidado. Conversa durável excluída
+da comparação pelo bloqueio de ferramentas no resume headless vigente naquela bateria; interrupções
+permanecem registradas. [Resultados](../bench/economy-next/numbered/README.md#resultado-final).
+
+Economia nativa (2026-09-05): read sem prefixos, overwrite condicionado aos bytes
+observados em leitura completa, patch em lote atômico e catálogo LSP por workspace.
+Thinking DeepSeek V4 ativado quando solicitado, com estado de continuação preservado
+e isolado por modelo/credencial/endpoint. A vantagem ampla em tokens depende da
+bateria correspondente ao hash instalado; [evidência e limites](../bench/luna-live/README.md#economia-transversal--prefixo-compartilhado).
+
+Streaming Chat (2026-09-05): fragmentos com `id:null` preservam a identidade
+anterior pelo índice, como fragmentos com ID omitido. Falha reproduzida em
+OpenCode Go/DeepSeek e em HTTP localhost; guards de conflito e argumentos
+continuam ativos. [Captura e validação](../bench/luna-live/README.md#deepseekopencode-go-falha-real-de-streaming).
+
+Economia compartilhada (2026-09-05): prompt e descrições de ferramentas
+consolidados; `todo` anuncia uma forma canônica em lote, preservando no parser
+as chamadas já aceitas. Limites, conteúdo de arquivos, histórico, esforço e
+validações não foram reduzidos. [Medições e andamento](../bench/luna-live/README.md#economia-transversal--prefixo-compartilhado).
+
+Tarefas nativas (2026-09-05): `todo` preserva IDs e status inicial no parser,
+ledger e bridge. Respostas devolvem o estado real; falhas parciais também
+emitem `TodoChanged`. Testes cobrem retomada da bridge com registros antigos
+e novos; retomada completa de conversa/TUI não foi validada por este slice.
+[Defeito, correção e limites](../bench/luna-live/README.md#correção-dos-ids-e-status-de-todo).
+
+Recuperação nativa (2026-09-05): write com path/content e guarda da leitura completa,
+API de precondição explícita preservada, shell PowerShell ou argumentos literais,
+erros acionáveis de arquivo ausente e artefatos criados sob demanda. O fluxo
+compartilhado agrupa leituras e evita revisão opcional após validação suficiente.
+Responses preserva argumentos opcionais; GPT conhecido recebe verbosidade baixa,
+sem reduzir effort/velocidade. [Benchmark, causas e limites](../bench/luna-live/README.md#correções-e-validação-ampliada).
+
+Codex/Astra (2026-09-05): `gpt-6-astra`/`astra` integra catálogo, picker,
+CLI e limites de contexto/saída. O picker expõe low/medium/high/xhigh/max e
+Tab alterna Normal/Fast antes de Enter aplicar e persistir; Esc cancela.
+Fast envia `service_tier: "priority"` apenas ao Codex. Ultra não é exposto
+para Astra, pois este cliente não implementa a orquestração Codex correspondente.
+[Uso, contrato oficial e limites de validação](../README.md#openai-codex--gpt-6-astra).
+
+Revisão de economia nativa (2026-09-04): `list` retorna paths relativos ao workspace,
+busca compartilha a legenda dos padrões na própria página somente quando menor e
+não duplica o terminador LF. Layout, schemas, budgets, esforço e protocolos preservados.
+Gate histórico e deploy dessa revisão estão no relatório:
+[Diagnóstico, medições e limites](../analysis_outputs/REVISAO-ECONOMIA-TOKENS-NATIVA-SLIM.md).
+
+Quick wins de agilidade nativa (2026-09-04): patch aceita trechos LF de leitura
+em CRLF uniforme, informa arquivo/linha e devolve localizações na ambiguidade.
+Schemas explicam precondições; sem alteração visual. [Gate histórico, evidência e limites](../analysis_outputs/QUICK-WINS-AGILIDADE-NATIVA-SLIM.md).
+
+Otimização de testes/build (2026-09-04): fixtures de budget atendem a finalização
+sem tools e testes TUI em memória compartilham um executável. Dois casos exclusivos
+da biblioteca padrão foram removidos; regressões das cinco etapas preservadas.
+O gate próprio, incluindo a regressão concorrente do composer, consta no relatório.
+A otimização não altera produção/perfis Cargo; os ajustes
+concorrentes de contraste/composer foram preservados. [Medições, autoria e limites](../analysis_outputs/OTIMIZACAO-TESTES-E-BUILD-SLIM.md).
+
+Etapa 5 do harness (2026-09-04): configuração chega aos adapters ClinePass/Command
+Code/Anthropic, aliases Codex são canonicalizados e escolha explícita inválida
+não vira fallback silencioso. Compactação preserva contrato de esforço/saída;
+cache de catálogo Codex separa conta/endpoint; Go/xAI validam capacidades existentes.
+Sem mudança visual ou de preferência pessoal. [Evidência e síntese das cinco etapas](../analysis_outputs/HARNESS-SLIM-ETAPA-5.md).
+
+Etapa 4 do harness (2026-09-04): transporte compartilhado encerra Responses/Messages
+no término nativo, preserva usage observado em falhas e classifica timeouts pós-envio
+como inseguros para retry. Parsing SSE evita revarrer prefixos; cancelamento já pronto
+precede o envio. Sem mudança de layout. [Evidência local e limites](../analysis_outputs/HARNESS-SLIM-ETAPA-4.md).
+
+Etapa 3 do harness (2026-09-04): contexto preserva argumentos de tools,
+pedido recente e instruções já fornecidas; checkpoint único e artefato do
+texto removido na compactação. Reasoning Responses opaco é conservado dentro
+da mesma instância de adapter, sem entrar na UI; retomada durável continua
+textual. Sem mudança visual. [Evidência e limites](../analysis_outputs/HARNESS-SLIM-ETAPA-3.md).
+
+Correção tok/s (2026-09-04): a taxa final de cada request usa a duração observada
+pelo runtime desde o primeiro evento semântico, sem relógios de consumo da UI.
+Ausência de usage final usa a estimativa existente com prefixo `~`; ausência de
+tempo válido oculta a taxa. Não é uma medição instantânea de decode do servidor.
+[Reprodução e validação](../analysis_outputs/HARNESS-SLIM-ETAPA-1.md#correção-posterior--indicador-toks).
+
+Etapa 2 do harness (2026-09-04): status real do shell; orçamento preserva o
+prefixo do lote; histórico completo antes da parada; repetição respeita progresso,
+fronteiras voláteis e compactação; cancelamento prevalece na finalização.
+Sem mudança visual. [Evidência e continuidade](../analysis_outputs/HARNESS-SLIM-ETAPA-2.md).
+
+Etapa 1 de simplicidade interna (2026-09-04): streaming mantém o `AppHandle`
+no runtime durante o await; CLI/resume compartilham a gestão do LSP temporário;
+a TUI recebe o `ToolLoopLimits` existente diretamente. Layout e contratos públicos
+preservados. [Decisões e evidência](../analysis_outputs/HARNESS-SLIM-ETAPA-1.md).
+
+Revisão visual (2026-09-04): metadados com maior contraste; sessão neutra;
+ActivityRail sem contadores zerados nem atalho de cancelamento duplicado;
+nome de modelo abreviado por células; outputs expandidos em texto secundário;
+ANSI16 diferencia aviso/erro e clareia texto cromático. O host publica o modo
+inicial via `ModeChanged` após `WorkspaceChanged`, antes de auth/modelo; flags
+como `--read-only` deixam de aparecer como Auto no composer. Scheduling, caches,
+harness e protocolos preservados. [Relatório e limites da observação por PTY](../analysis_outputs/REVISAO-VISUAL-TUI-SLIM.md).
+
 Esta seção separa o **contrato-alvo** do que existe hoje. As demais seções
 continuam normativas: um tipo, helper ou arquivo presente não significa que o
 milestone correspondente passou seu gate.
@@ -50,8 +344,8 @@ milestone correspondente passou seu gate.
 | Área | Estado atual | Confirmado | Falta para o gate |
 |---|---|---|---|
 | M0 — contratos/testkit | **Quase completo** | `UiEvent`/`UiCommand` ampliados (Tool*/Input/Question tipados), `AppState` único com `FrameClock`/`ActivityState`, reducer como única rota de mutação, effects executados pelo runtime, blocos User/Assistant/Thinking/Tool/System/Error/Activity/QueuedUser, `RevisionSet` de 6 campos, IDs monotônicos, `MemorySurface` + frames determinísticos + proptest | `SurfaceBackend` trait compartilhada, variantes Plan/Compaction/Custom, sequences explícitas por stream |
-| M1 — fullscreen Windows | **Fatia ampla; gate físico pendente** | TerminalGuard RAII + UTF-8/VT flags com restore exato inclusive se raw-mode falhar, alternate screen/raw mode/paste/cursor oculto, mouse capability-gated, composer adaptativo de 1–5 rows com cursor grapheme-safe, edição Left/Right/Home/End/Delete/Backspace e viewport horizontal (cauda visível com hint `<`, G232/G338; prompt ASCII `>` porque `›` é Ambiguous no Windows e estacionava o caret na última letra, G264), ActivityRail, scrollback navegável com pin/live-edge/unseen, paleta §21.3 estratificada em truecolor/256/16/no-color, layout de emergência, golden matrix via TestBackend; ContextRail removida por W2 e SessionRail conversacional reintroduzida no Slice 5 | PTY/ConPTY E2E físico (teste escrito, `#[ignore]`, requer console real) e validação manual Windows Terminal + alternativo |
-| M2 — integração/performance | **Integração central + pipeline essencial** | bridge tipada com control lane imediata 256 + stream lane causal/lossless 1024; runtime drena lotes máximos de 32/1.024, rearma o wake ao esgotar o budget e bloqueia em console+wake+deadline visual, sem polling ocioso; `FrameClock` deriva do tempo monotônico; coalescer lossless no runtime real; SSE compartilhado preserva UTF-8 entre chunks, catálogos/OAuth/sessões têm leitura bruta bounded, tool blocks com lifecycle completo/agregação e progresso shell 1 Hz; captura shell bounded preserva início+fim por stream (8 MiB brutos e 8 KiB de contexto) com descarte exato, e a barreira global preserva início+fim do resultado `shell` antes dos adapters; lifecycle de reasoning no Responses, deadline pré-semântico independente de heartbeat, HeightIndex + WrapCache bounded generation/instance-keyed + render virtualizado (alturas 16.384 com chave `(cache_identity, content_generation, width, folded)`; corpos byte-weighted 4.096 entradas/32 MiB global/128 KiB por entrada conectados ao markdown estável antes dos overlays dinâmicos, G236/G335), Todo dock por eventos do loop (`todo` + `TodoChanged`), cancelamento provider/shell/OAuth, usage, modos, modelo/effort; bench misto ~5 MiB com nearest-rank p95 ≤16 ms; capability bridge no agent loop (Todo + dispatcher `skill` lazy) | ParseCache/LayoutCache dedicados, métricas §26 expostas |
+| M1 — fullscreen Windows | **Fatia ampla; gate físico pendente** | TerminalGuard RAII + UTF-8/VT flags com restore exato inclusive se raw-mode falhar, alternate screen/raw mode/paste/cursor oculto, mouse capability-gated, composer adaptativo de 1–5 rows com cursor grapheme-safe, edição Left/Right/Home/End/Delete/Backspace e quebra visual sem alterar o payload (prompt ASCII `>`; §15.3), ActivityRail, scrollback navegável com pin/live-edge/unseen, paleta §21.3 estratificada em truecolor/256/16/no-color, layout de emergência, golden matrix via TestBackend; ContextRail removida por W2 e SessionRail conversacional reintroduzida no Slice 5 | PTY/ConPTY E2E físico (teste escrito, `#[ignore]`, requer console real) e validação manual Windows Terminal + alternativo |
+| M2 — integração/performance | **Integração central + pipeline essencial** | bridge tipada com control lane imediata 256 + stream lane causal/lossless 1024; runtime drena lotes máximos de 32/1.024, rearma o wake ao esgotar o budget e bloqueia em console+wake+deadline visual, sem polling ocioso; `FrameClock` deriva do tempo monotônico; coalescer lossless no runtime real; SSE compartilhado preserva UTF-8 entre chunks, catálogos/OAuth/sessões têm leitura bruta bounded, tool blocks com lifecycle completo/agregação e progresso shell 1 Hz; captura shell bounded preserva início+fim por stream (8 KiB no consumidor nativo; APIs públicas brutas preservadas) com descarte exato, e a barreira global preserva início+fim do resultado `shell` antes dos adapters; lifecycle de reasoning no Responses, deadline pré-semântico independente de heartbeat, HeightIndex + WrapCache bounded generation/instance-keyed + render virtualizado (alturas 16.384 com chave `(cache_identity, content_generation, width, layout_kind)`; corpos byte-weighted 4.096 entradas/32 MiB global/128 KiB por entrada conectados ao markdown estável antes dos overlays dinâmicos, G236/G335), Todo dock por eventos do loop (`todo` + `TodoChanged`), cancelamento provider/shell/OAuth, usage, modos, modelo/effort; bench misto ~5 MiB com nearest-rank p95 ≤16 ms; capability bridge no agent loop (Todo + dispatcher `skill` lazy) | ParseCache/LayoutCache dedicados, métricas §26 expostas |
 | M3 — experiência completa | **Fatia ampla; gate final pendente** | overlays login/modelo/effort integrados, picker agrupado com filtro/viewport/Home/End, command palette Ctrl+P, Markdown com code rail e diff semântico, motion por `FrameClock` concentrado em atividade/caret, ActivityRail por fase/tempo, welcome estática, reduced motion, usage/contexto vivos, page-fill/anchor/scrollbar, inspectors Changes/Activity/Session/Diagnostics responsivos, busca Ctrl+F, cópia Unicode Ctrl+Y, `/image PATH` com chips e content blocks reais, footer sem métricas fictícias e headless answer-first; golden/fault/property tests via TestBackend | gate PTY/ConPTY físico, Plan/Goal completos na TUI, métricas §26 exportadas, resync por snapshot e matriz final de estados de domínio |
 
 #### O que já funciona end-to-end
@@ -62,7 +356,11 @@ milestone correspondente passou seu gate.
 - prompt do composer até provider, agent loop e tools reais;
 - `ask_question` em runs TUI comuns Auto/ReadOnly: opções estruturadas, navegação
   por setas/números, alternativa `Outro...`, resposta livre e continuação no
-  mesmo agent loop; headless, Plan e resume durável não anunciam a tool;
+  mesmo agent loop; pergunta pendente renderiza um painel dockado acima do
+  composer (quebra por palavra, atalhos do próprio modo, sem chrome Y/N);
+  o bloco inline permanece o registro no transcript; headless e Plan não
+  anunciam a tool; resume TUI anuncia no turno novo (sem replay de pergunta
+  persistida);
 - primeiro delta SSE publicado antes do término da resposta;
 - resume inicial transporta um único `SessionPreflight` até a abertura durável,
   preservando a comparação TOCTOU sem repetir leitura/parse do JSONL;
@@ -115,11 +413,12 @@ milestone correspondente passou seu gate.
   `max_read_tool_calls` (96) e `max_mutating_tool_calls` (32) são caps **por
   turn** (batch), não acumulados no run — exploração 1-tool/turn encontra
   `max_turns` primeiro; um batch paralelo acima do cap ainda aborta em
-  `tool_limit`; ActivityRail mostra `turn N/M · read n/m mut n/m` quando
-  largura ≥ 72 (`read`/`mut` deste turn); aviso one-shot ao cruzar 80% dos
-  turns do run e 80% do batch deste turn; resume durável não executa tools
-  (fail-closed) e diz isso explicitamente em vez de fingir 32/96;
-- OpenCode Go integrado como provider lógico próprio: 24 modelos documentados,
+  `tool_limit`; ActivityRail mostra `turn N/M · reads n/m · edits n/m` quando
+  largura ≥ 72, omite contadores zerados e inclui somente os que cabem
+  (`reads`/`edits` deste turn); aviso one-shot ao cruzar 80% dos
+  turns do run e 80% do batch deste turn; resume durável respeita os limites
+  configurados e só usa a mensagem de orçamento zero quando os caps são 0/0;
+- OpenCode Go integrado como provider lógico próprio: 25 modelos documentados,
   roteamento explícito por Chat Completions/Responses/Messages, chave por
   env/auth file, login TUI mascarado, `/models` com atualização background e
   cache/fallback bounded; seleção aplica contexto, output, reasoning e imagem
@@ -294,10 +593,13 @@ milestone correspondente passou seu gate.
   entrada e saída separadamente; fila de prompts tem teto 8; composer mantém
   contagem incremental e coalesce de texto para latência constante em drafts
   longos. Esses contratos são provider-agnostic e não alteram protocolo de rede;
-  Compactação Parity+ (2026-08-26, limiar G319 2026-08-27): política
-  compartilhada aplica soft 60% e hard 85% em janelas abaixo de 1M, soft 30%
-  e hard 50% em janelas maiores; mantém 20k tokens recentes sem separar pares
-  assistant/tool e preserva a instrução raiz literalmente. A TUI prepara
+  Compactação Parity+ (2026-08-26, limiar G319 2026-08-27, reserva 2026-09-10):
+  política compartilhada aplica soft 60% e hard 85% em janelas abaixo de 1M,
+  soft 30% e hard 50% em janelas maiores, medidos sobre o uso da conversa (o
+  mesmo `ctx` do rodapé). `max_output` só antecipa compactação quando
+  uso+reserva excede a janela; não entra no percentual. Mantém 20k tokens
+  recentes sem separar pares assistant/tool e preserva a instrução raiz
+  literalmente. A TUI prepara
   summary validada em background, mostra `preparing`/`ready` no contexto e
   expõe `/compact [instruções]`; o hard boundary reutiliza somente checkpoint
   com provider/modelo e fingerprint compatíveis. Sem prepared no hard, o loop
@@ -344,9 +646,16 @@ milestone correspondente passou seu gate.
 - layout do transcript (2026-08-31): sem inspector docked, a conversa usa toda a
   largura disponível do scrollback; o cap de 144 células permanece somente no
   workspace compartilhado com inspector docked;
-- verificação integral mais recente: workspace verde (87 suítes / 1085 passed /
-  0 failed / 1 ignored — ConPTY físico / 0 compiler warnings; 1 teste preexistente
-  quebrado filtrado via `--skip`, sem implementação em `crates/`), incluindo
+- anti-loop nativo (2026-09-04): a primeira releitura após compactação entrega
+  novamente o conteúdo; limites numéricos respeitam env > TOML na CLI/TUI;
+  falhas reutilizam a identidade causal e avisos orientam o próximo turno,
+  dentro do limite existente de duas mensagens. Finalização distingue ausência
+  de progresso de orçamento esgotado, reduz campos de saída existentes a até
+  2048 tokens e usa `low` somente quando o catálogo local confirma suporte;
+  modelos high-only mantêm o esforço configurado;
+- verificação integral mais recente: workspace verde (74 suítes / 1211 passed /
+  0 failed / 3 ignored — ConPTY físico / 0 compiler warnings; 2026-09-06,
+  `cargo test --workspace` sem `--skip`), incluindo
   proptest, fault injection, golden matrix e E2E offline do bridge; Grok Slice 2
   fechado após 16 passes Fusion sem achados finais. Grok Slice 3 recebeu um
   único revisor independente final após G85–G179; seus achados G180–G183 foram
@@ -420,6 +729,90 @@ real, com degradação explícita e testes golden (G340–G341).
 
 ### 1.2 Direção visual revisada
 
+**Revisão autorizada em 10/09/2026, refinada em 14/09/2026 — referência Cursor CLI:** a superfície passa
+a usar uma coluna de leitura central de até 100 células, compartilhada por
+conversa, atividade, composer e footer. Com inspector docked, preserva-se o
+workspace de até 144 células. O composer mantém seu box e edição multilinha;
+modelo/esforço/contexto passam para o footer alinhado à esquerda, com duas rows
+no estado comum em altura >=12 e uma nos tamanhos menores. Metadados degradam
+antes de cancelamento, acesso ao login e retorno ao live edge.
+
+Welcome é curto, alinhado à esquerda e próximo da entrada. Texto, estados e
+contadores vêm dos eventos existentes; chamadas de ferramentas não representam
+contagens de arquivos distintos. Tabelas que excedem a largura disponível usam
+campos empilhados com conteúdo integral. Detalhes continuam expansíveis.
+
+A revisão de 14/09 também mantém seleções de menus visíveis, dá rolagem própria
+aos inspetores e prioriza a consulta editada sobre os atalhos da busca. O
+composer usa quebra visual sem modificar o payload enviado (§15.3).
+
+Polimento complementar autorizado em 14/09: a roda do mouse atua no inspetor
+sob o ponteiro, sem deslocar a conversa; overlays modais não deixam a roda
+rolar o conteúdo oculto. Métricas de navegação reutilizam a projeção existente,
+respeitando largura, conteúdo e capacidades de cor. A seleção dos menus de
+modelo, esforço, login e comandos preenche a linha com fundo neutro distinto
+(`#2A2A2A` sobre `#181818`), mantendo `>` e
+negrito como indicação independente da cor. Em ANSI16, o foco usa DarkGray para
+continuar distinto da superfície preta; sem cor, preserva marcador e negrito.
+
+A paleta usa superfícies pretas neutras, texto marfim, metadata legível e
+verde funcional. O indicador de atividade muda somente uma célula sobre o
+clock de 83 ms; etapas concluídas permanecem
+estáticas e discretas. Reduced motion congela o indicador, mantendo estados e
+elapsed; idle continua sem timer periódico. Não há atraso artificial de texto.
+
+O item ativo do TODO usa marcador estático; o indicador contínuo fica no
+Thinking visível ou na ActivityRail. Notificações transitórias recebem realce
+de peso por 249 ms e então retornam ao estilo normal, sem mover texto. O modo
+de movimento reduzido exibe o estilo final imediatamente. Esse feedback agenda
+somente sua transição e expiração; sem atividade ou aviso, não há ticks.
+
+Refinamento de agrupamento (12/09/2026): os trechos do agente entre mensagens
+efetivamente enviadas pelo usuário compõem uma única resposta visual. Somente
+o primeiro trecho abre com uma linha de respiro e o cabeçalho `Slim`, verde
+discreto em negrito. Continuações permanecem na ordem original, intercaladas
+com ferramentas e pensamento, sem repetir o cabeçalho. Rascunho e mensagem
+enfileirada não abrem outro grupo. O cabeçalho permanece durante streaming e
+após a conclusão; interrupção ou falha de um trecho permanece indicada no
+cabeçalho do grupo. O agrupamento não altera blocos nem histórico durável. A faixa
+do usuário usa `user_prompt_bg = #242319`, mais próxima da superfície.
+
+Polimento do pensamento: o único indicador animado fica no cabeçalho Thinking
+quando esse cabeçalho está visível, e na ActivityRail nos demais casos. A
+superfície sem o pulso permanece estática. Pensamento concluído usa chevron
+`▸`/`▾` para indicar recolhido/expandido, com hint de Enter apenas selecionado.
+Preview e corpo expandido alinham sob o texto do cabeçalho. Reduced motion,
+ausência de cor e overlays congelam o pulso; nenhuma duração por bloco é inferida.
+Quando o cabeçalho Thinking está visível e a fase atual é Thinking, a ActivityRail
+não repete seu nome nem outro indicador: mantém apenas tempo global/de fase e orçamentos reais,
+sem alterar a altura do layout. Fora da viewport, o indicador e o nome voltam
+à ActivityRail. Outras fases mantêm seu nome real e indicador estático se o
+cabeçalho ainda estiver visível. `AwaitingProvider` aparece como `Waiting for provider`, sem
+afirmar que o modelo está emitindo raciocínio. A animação não invalida as linhas
+estáveis do corpo; um draw por evento consome os marcos de animação/status já
+pintados, evitando solicitar imediatamente o mesmo frame.
+
+Esta revisão substitui as prescrições conflitantes de largura total, palette
+fria, welcome centralizado e modelo no contorno do composer descritas no
+checkpoint histórico abaixo. Os testes de interação e lifecycle permanecem
+obrigatórios; expectativa visual deve seguir esta revisão.
+
+Revisão de 2026-09-04: evolução contida do Slim, usando o Pi como referência de
+simplicidade operacional, sem reproduzir sua aparência. A conversa mantém a
+prioridade; identificação da sessão e metadados ficam neutros. A ActivityRail
+mostra fase, tempo e o que o agente está fazendo; omite turn/reads/edits abaixo
+de 80% do limite e deixa o atalho de cancelamento no footer. Saídas expandidas
+usam `secondary_text`, pois são conteúdo consultado, não apenas metadata.
+Nomes longos de modelo recebem elipse
+antes de desaparecer; esforço e modo permanecem legíveis. Sem novos timers,
+configurações, dependências ou cards.
+
+Este refinamento substitui as prescrições cromáticas conflitantes abaixo:
+`muted = #828A94`, `accent = #7DCFFF`, `border_focus = #4B7891` e
+`composer_bg = #0D1014`. Verde Slim continua nos sucessos e H1. Em ANSI16,
+avisos usam amarelo e erros vermelho claro; informação azul/ciano usa variantes
+claras para leitura sobre o fundo escuro. Cores dependem da paleta do terminal.
+
 A referência primária é a linguagem visual do **Universe TUI/Grok Build**:
 profundidade por surfaces near-black, prompt elevado, composer contornado,
 headings coloridos, metadata discreta, scrollbar, progress rail e motion de
@@ -454,10 +847,10 @@ Evitar:
 - animação de tela inteira ou motion que dificulte leitura;
 - boxes em cada mensagem, canto decorativo ou chrome sem função.
 
-A profundidade vem de cinco níveis controlados: `background`, `surface`,
-`surface_alt`, `surface_elevated` e overlays. Motion vem de progress rail,
-spinner, streaming caret, tool progress e pulso sutil de foco; nunca de conteúdo
-textual se movendo.
+A profundidade vem de superfícies discretas: `background`, `surface`,
+`surface_alt` e overlays. O pulso fica no cabeçalho Thinking visível ou na
+ActivityRail, nunca nos dois; há também o caret do streaming. O foco do composer
+permanece estático. O conteúdo textual não recebe animação de deslocamento.
 
 ## 2. Decisões fechadas
 
@@ -938,6 +1331,17 @@ visível (`interaction route unavailable`); a TUI nunca simula sucesso local.
   (implementado em G244, 2026-08-25: Enter/Alt+Enter durante run enfileira;
   a fronteira de turno drena um prompt por vez via `SendPrompt`).
 
+### 7.4.1 Seleção de Astra e velocidade Codex
+
+`/models` inclui GPT-6 Astra; Enter abre a escolha de reasoning
+`low`, `medium`, `high`, `xhigh` ou `max`. Tab alterna Normal/Fast
+sem aplicar; Enter envia modelo, esforço e velocidade juntos. Esc retorna
+ao picker sem alterar a velocidade ativa. O backend confirma a projeção com
+`ModelChanged`, `EffortChanged` e `CodexSpeedChanged`; falha de autenticação
+mantém a seleção anterior. Persistência usa `model`, `effort` e `codex_fast`.
+Fast solicita prioridade de processamento com maior uso; não reduz reasoning
+e não habilita novas ferramentas. Disponibilidade continua sujeita à conta Codex.
+
 ### 7.5 Provider OpenCode Go
 
 `ProviderKind::OpenCodeGo` é identidade lógica própria. O modelo selecionado
@@ -946,13 +1350,20 @@ Messages — sem probing faturável e sem depender de arquivos do Pi. O modelo
 padrão é `deepseek-v4-flash`; a base oficial é
 `https://opencode.ai/zen/go/v1`.
 
-O registro embutido contém somente os 24 modelos presentes na tabela oficial
-OpenCode Go consultada em 2026-08-24, mais `muse-spark-1.3-contributor`
-adicionado em 2026-09-03 (ao vivo no catálogo público; metadados espelham o
-checkpoint 1.2-contributor no mesmo gateway). IDs retornados por `/v1/models` sem
+O registro embutido contém somente os 25 modelos presentes na tabela oficial
+OpenCode Go, mais `muse-spark-1.3-contributor` (adicionado em 2026-09-03) e
+`deepseek-flash` (DeepSeek V4.1 Flash, adicionado em 2026-09-10; o id digitado
+`deepseek-v4.1-flash` é aceito e normalizado para o id roteável do gateway,
+distinto do `deepseek-v4-flash` 4.0). IDs retornados por `/v1/models` sem
 protocolo documentado não ficam selecionáveis. Context window, output cap,
 imagem e reasoning só são anunciados quando há metadata conhecida; campo
 incerto permanece desconhecido e nunca vira valor exato inventado.
+
+Muse Spark 1.2 e 1.3 Contributor usam Responses (`/responses`), conforme a
+[tabela oficial de endpoints](https://opencode.ai/docs/go/#endpoints) conferida
+em 2026-09-06. Atualizar disponibilidade não altera o protocolo embutido.
+O seletor oferece low, medium, high e xhigh, enviados em `reasoning.effort`;
+o Slim não anuncia max para esses modelos no Go.
 
 `/models` materializa cache/fallback imediatamente e atualiza disponibilidade
 em background pelo catálogo público bounded. Refresh válido intersecta IDs com
@@ -1359,6 +1770,11 @@ outcome visual.
 
 #### 11.4.1 Agregação visual por turno
 
+Ferramentas restauradas de sessão são blocos individuais recolhidos com a marca
+`history`, símbolo neutro e argumentos/resultados consultáveis por Enter. Não
+participam dos grupos de sucesso nem das contagens operacionais atuais, pois o
+transcript salvo não preserva um outcome individual ou duração confiáveis.
+
 Cada resposta do provider possui um `ToolBatchId`; suas calls executam
 serialmente na ordem recebida. Calls concluídas com sucesso são agregadas
 **somente para apresentação** quando são consecutivas no transcript
@@ -1366,7 +1782,7 @@ serialmente na ordem recebida. Calls concluídas com sucesso são agregadas
 por batch empilhava `✓ shell` em rows separadas:
 
 ```text
-✓ 4 tools · read ×3, shell · 42ms               Enter details
+✓ Read 3 files, Ran shell · 42ms               Enter details
 ```
 
 O modelo de blocos continua preservando cada call, argumento, resultado,
@@ -1383,13 +1799,14 @@ Regras normativas:
   (thinking, assistant, user, failed ou cancelled); `ToolBatchId` distinto
   **não** quebra o grupo;
 - argumento/target não aparece na row agregada; fica nos detalhes;
-- nomes são resumidos na ordem da primeira ocorrência, com `×N`, no máximo três
-  nomes distintos e `+N` para o restante; se a largura não comportar, degrada
-  para `✓ N tools · duração`;
+- o header usa resumo verbal (`Read 3 files`, `Ran shell`, `Edited`), não
+  `N tools · name ×N`; se a largura não comportar, degrada para
+  `✓ N tools · duração`;
 - duração total só aparece quando todos os membros possuem duração conhecida;
 - pending e running ocupam row própria enquanto estiverem ativos;
-- failed e cancelled sempre ocupam row própria e mostram o comando/target
-  acionável; nunca ficam escondidos em uma contagem;
+- failed e cancelled sempre ocupam row própria com razão curta; segmentos
+  `key=value` e telemetria (`out `, `err `) não entram na row colapsada;
+  comando/target completos ficam na expansão; nunca somem numa contagem;
 - quando uma call running conclui com sucesso, ela pode ser incorporada ao grupo
   do próprio batch sem atravessar failure/cancel;
 - o glyph ocupa a coluna da rail; o texto da tool começa no mesmo eixo das
@@ -1597,47 +2014,45 @@ vai a `Top`; `End` volta a `LiveEdge` sem prompt preso.
 ### 14.1 Regiões fullscreen
 
 ```text
-  cwd display-safe ─────────────────────── context atual
-│ Scrollback                                      │ Inspector? │
-│                                                 │            │
-├ Todo dock? ──────────────────────────────────────────────────┤
-  Activity rail? · working/retry/cancel
- ╭ Composer: draft ─────────────────── model (effort) · mode ╮
- ╰────────────────────────────────────────────────────────────╯
-  shortcuts/status ─────────────────────── context/tokens
+  SLIM · cwd
+  Conversa na coluna de leitura                 Inspector?
+  Todo compacto, quando existir
+  ○ Atividade atual · elapsed
+  ╭──────────────────────────────────────────╮
+  │> draft                                   │
+  ╰──────────────────────────────────────────╯
+  Auto · Shift+Tab mode
+  model (effort) · ctx ~42%
+  / commands · Ctrl+P · Ctrl+C exit
 ```
 
-Sem inspector docked, o transcript usa toda a largura disponível do scrollback;
-não existe coluna de leitura fixa nem centralização lateral. O limite de 144
-células aplica-se apenas ao workspace compartilhado com inspector docked.
+Sem inspector, o workspace central tem até 100 células. Conversa, composer,
+atividade, perguntas e footer compartilham essa faixa, com inset de uma célula
+no chrome. Com inspector docked o workspace central pode chegar a 144 células.
+Alturas, wrap, scroll, seleção e cursor usam a largura real dessas regiões.
+Conversas que cabem crescem a partir da entrada, com uma row de respiro; o
+histórico longo preserva o page-fill e a âncora de leitura existentes.
 
-`SessionRail` existe somente quando há transcript, largura `≥80`, altura `≥12` e
-cwd informativo. Cwd vazio, `~` ou o diretório home resolvido são triviais e não
-consomem uma row.
-Ocupa uma row no topo com cwd display-safe à esquerda e contexto atual à direita.
-A projeção compartilhada sanitiza controles, normaliza newline para espaço e
-trunca por grapheme/célula antes de posicionar contexto; fullscreen e ViewModel
-usam a mesma largura real. Welcome e layout de emergência nunca a exibem. Quando visível, remove contexto
-do footer sem remover totais `↑/↓`; quando oculta, o footer volta a projetar o
-contexto compacto. Não há branding permanente no topo.
+`SessionRail` mostra apenas `SLIM · cwd`, quando há transcript, cwd informativo,
+largura >=80 e altura >=12. Cwd trivial, welcome e emergência não gastam essa
+row. Contexto fica no footer; nenhuma rail repete contadores ou estado READY.
 
-`ActivityRail` ocupa zero ou uma row imediatamente acima do composer, depois do
-Todo dock. Só aparece durante run/retry/tool longa/input requerido; mostra o
-spinner existente e cancelamento sem duplicar transcript. Se a altura exige
-removê-la, estado crítico migra para o footer como `Working…` com Esc/Ctrl+C.
-Atalhos são contextuais: autenticado ocioso anuncia `Ctrl+C:exit`; durante run,
-`Ctrl+C:cancel`. A borda inferior do composer é o separador: `op_divider`
-reserva zero rows.
+`ActivityRail` ocupa zero ou uma row acima do composer e abaixo do Todo. Mostra
+fase e elapsed reais; near-limit continua warning. O indicador é o único glyph
+animado, alternando ○/● a cada seis ticks. Tools/thinking no transcript mantêm
+marcadores estáticos. Modal/input capturando navegação pausa a animação. Estado
+crítico e cancelamento migram para o footer quando a atividade não cabe.
 
 ### 14.2 Breakpoints
 
 | Largura | SessionRail | Inspector | Operational bar |
 |---:|---|---|---|
-| `<80` | oculta | overlay central/full-height | contexto compacto + usage |
-| `80–99` | transcript + altura ≥12 | overlay central/full-height | usage sem contexto |
-| `100–139` | transcript + altura ≥12 | drawer temporário que reduz scrollback | usage sem contexto |
-| `≥140` | transcript + altura ≥12 | drawer simultâneo opcional | usage sem contexto |
+| `<80` | oculta | overlay central/full-height | contexto compacto |
+| `80–99` | transcript + altura ≥12 | overlay central/full-height | atalhos sem contexto |
+| `100–139` | transcript + altura ≥12 | drawer temporário que reduz scrollback | atalhos sem contexto |
+| `≥140` | transcript + altura ≥12 | drawer simultâneo opcional | atalhos sem contexto |
 
+Nenhum inspector abre automaticamente, inclusive em terminais largos. Os atalhos abrem e fecham os painéis sob demanda.
 Os breakpoints acima valem para Diff, Activity, Session Tree e Diagnostics. Eles
 **não alteram o Todo**.
 
@@ -1649,7 +2064,8 @@ composer. Não é sidebar, drawer nem overlay.
 | Condição | Altura do dock | Conteúdo |
 |---|---:|---|
 | sem Todo ativo | 0 rows | dock ausente |
-| Todo ativo, estado compacto | 2 rows | progresso + item ativo; resumo dos demais |
+| Todo ativo, estado compacto | 1 row | progresso + item ativo |
+| Todos concluídos/cancelados | 1 row | resumo recolhido; Ctrl+T expande |
 | terminal com altura `<10` | 1 row | progresso + item ativo truncado |
 | estado expandido | até 6 rows | lista completa com scroll interno se necessário |
 
@@ -1660,6 +2076,7 @@ Regras:
 - items não fazem wrap no modo compacto; usam ellipsis;
 - `Ctrl+T` alterna compacto/expandido;
 - quando expanded, o dock pode receber foco e setas; `Esc` volta ao compacto;
+- conclusão/cancelamento de todos os items recolhe o dock; Ctrl+T permite reabrir a lista;
 - o dock é projeção de `TodoState`, nunca autoridade paralela;
 - mudança de Todo chega como `UiEvent::TodoChanged`, incrementa
   `todo_dock_revision` e persiste no event log do harness; não exige um novo
@@ -1670,7 +2087,7 @@ Regras:
 Prioridade quando a altura diminui dentro do mínimo suportado (`40×8`):
 
 1. preservar ao menos uma row editável do composer e a operational bar mínima;
-2. ocultar SessionRail e devolver contexto compacto à operational bar;
+2. reduzir rows de metadata; ocultar SessionRail;
 3. ocultar ActivityRail e mover estado ativo para a operational bar;
 4. remover divider do Todo;
 5. reduzir Todo dock de duas para uma row, depois ocultá-lo;
@@ -1701,29 +2118,29 @@ Para terminal menor que 40×8:
 
 ### 15.1 Footer operacional
 
-O footer usa uma row imediatamente abaixo da borda do composer, sem
-divider/row vazia intermediária. Sem SessionRail ele mostra contexto + usage:
+O footer fica imediatamente abaixo do composer, na mesma coluna e alinhado à
+esquerda. O estado comum usa duas rows (modo+modelo/esforço/contexto, controles)
+quando a altura permite; alturas menores oferecem uma row priorizando
+fase/cancelamento, login ou live edge. Informação adicional deve justificar
+qualquer altura extra. O planner reduz metadata antes de sacrificar a edição.
+Durante execução os atalhos passam a Esc stop / Esc×2 force / Ctrl+C cancel;
+pinned conserva unseen / End latest também durante o run. O valor ativo usa
+accent, enquanto descrições e atalhos usam texto secundário.
 
-```text
-Shift+Tab:mode │ Ctrl+C:cancel │ Ctrl+P:commands  ctx ~42% · 9.4k/22.4k · ↑0 ↓0
-```
+O nome do modelo é abreviado por células/graphemes, preservando esforço e
+contexto quando cabem. Modelo e esforço só aparecem após autenticação.
+`ctx --` é omitido; ~ continua distinguindo estimativa de uso confirmado.
+O contexto vem da request real, e nenhum estado visual altera o accounting.
+`model_metadata` e `footer_lines` compartilham a projeção entre as superfícies.
+O contorno do composer contém somente metadata contextual do draft (pergunta,
+imagens e linhas), alinhada à esquerda, sem repetir modo ou modelo.
 
-Shortcuts realmente acionáveis ficam à esquerda; contexto/usage à direita. Com
-SessionRail visível, o contexto aparece somente nela e o footer preserva os
-totais `↑/↓` somente depois de algum token observado. `ctx --`, `↑0` e `↓0`
-não aparecem no estado inicial. A window vem da configuração real da request — nunca de literal
-universal. Prefixo `~` identifica estimativa; usage final seguido de `AssistantEnded` fecha o accounting ainda aproximado, e somente `RunCompleted` confirma o contexto da request e remove `~`. Estimativas correlacionadas são monotônicas por `(run_id, request_id, window)`; identidade anterior, conflitante ou pós-terminal é ignorada. Headless/JSONL expõem `usage_complete` e `usage_overflowed` junto aos totais.
-`model (effort) · mode` vive no label inferior do composer. Estado crítico
-(signed-out `/login`, working/cancel, error/retry, pinned/unseen) substitui
-shortcuts antes de qualquer truncamento. Em largura reduzida, usar variantes
-abreviadas medidas em células; nenhum grupo faz wrap ou invade o outro.
-Quando o cwd é trivial, a SessionRail fica oculta e o contexto retorna ao footer.
 No headless texto, a resposta é a primeira saída humana. `--verbose` acrescenta
 depois dela stop, usage e timeline de tools derivada dos eventos já redigidos
 (nome, status, contagem e duração), sem argumentos nem outputs; a única exceção
 é a linha de falha (`✕`), que inclui a primeira linha redigida do output/preview
-do mesmo call_id como razão curta (mesmo conteúdo que a TUI projeta na row de
-tool falha). JSONL permanece
+do mesmo call_id como razão curta. Na TUI, a prévia prioriza a rejeição de todo
+e stderr/stdout de shell sem sucesso; o output integral permanece nos detalhes. JSONL permanece
 byte-stable; `--verbose --jsonl` é inválido.
 
 ```text
@@ -1745,7 +2162,10 @@ Responsabilidades:
 - mostrar live-edge/unseen indicator;
 - fornecer seleção/copy/search.
 - renderizar input/approval como bloco inline: pergunta/summary, opções ou hint
-  `Y approve · N reject`, estado persisted/ephemeral e ack aceito/rejeitado.
+  `Y approve · N reject`, estado persisted/ephemeral e ack aceito/rejeitado;
+- `ask_question` pendente: cartão contido (máx. 72 colunas, alinhado ao composer) acima do
+  composer, título `Question`, opções `[x]`/`[ ]`; `1`–`5` selecionam sem
+  aparecer no chrome. Após ack, bloco compacto no transcript.
 
 Não interpreta `AgentEvent`; recebe blocks já materializados.
 
@@ -1764,25 +2184,31 @@ o `row_offset` dentro da nova altura.
 - chrome conversacional segue a hierarquia Grok CLI: user em faixa elevada,
   metadata (thinking/tools) em `muted`, resposta em `text` com headings
   cromáticos; sem card completo por mensagem;
-- prompt do usuário usa `user_prompt_bg` em toda largura útil, com padding
-  horizontal de duas células; não usa borda, cantos nem rail `│`; label `You`
-  em row própria, corpo imediatamente abaixo, alinhados no mesmo eixo;
+- prompt do usuário usa `user_prompt_bg` em toda a largura útil (faixa
+  preenchida, não só o label), padding de duas células; sem borda, cantos nem
+  rail `│`; `You` prefixa a primeira row da faixa e o corpo segue na mesma
+  linha, com hanging indent nas seguintes;
 - após o corpo do user há exatamente uma row vazia (fora da faixa) antes de
   thinking, tools ou assistant; o `HeightIndex` conta essa row;
-- assistant permanece sobre `surface`, com padding de duas células em todas as
-  rows e sem label `Slim` por bloco; H1 em `assistant_accent` carrega a
-  identidade do papel;
-- thinking colapsado ocupa uma row muted `{glyph} Thought` quando completo;
+- o primeiro assistant da resposta mostra `Slim` em accent/bold antes do corpo,
+  precedido por uma row de respiro; continuações não repetem o cabeçalho.
+  Cancelamento/falha em qualquer trecho permanece indicado no cabeçalho do
+  grupo em estilo secundário. H1 permanece em `assistant_accent`. Medição,
+  materialização, caches e projeção textual usam o mesmo agrupamento;
+- thinking colapsado ocupa uma row muted `▸ Thought` quando completo;
+  `▾` indica expandido; seleção mostra `Enter expand`/`Enter collapse` se couber.
   em streaming, `{spinner} Thinking` é seguido pela cauda atualizada de até
   duas rows físicas dos 256 grafemas finais do reasoning, com `…` quando o
-  início ficou oculto; o corpo completo só aparece com `fold == Expanded`;
+  início ficou oculto; preview e corpo usam inset de quatro células. O corpo
+  completo só aparece com `fold == Expanded`;
   `FoldState::Auto` conta
   como colapsado; bloco omitido se reasoning vazio;
-- tools colapsados ocupam uma row: glyph de lifecycle colorido, nome(s) e
-  duração em `muted`; concluídos não exibem `command=` nem preview, mas
-  tools ativas mantêm nome, limite e progresso e tools falhas mantêm uma razão
-  curta redigida. Toda summary ocupa exatamente uma row física: o comando perde
-  largura primeiro. Args e output completos só aparecem expandidos; `Enter
+- tools colapsados ocupam uma row: glyph de lifecycle discreto, resumo verbal
+  do grupo (`3 reads`, `Ran 2 commands`) ou o nome da call isolada, e duração em
+  `muted`; concluídos não exibem `command=` nem preview, mas tools ativas
+  mantêm nome, limite e progresso e tools falhas mantêm uma razão curta
+  redigida, sem telemetria `key=value`. Toda summary ocupa exatamente uma row
+  física: o comando perde largura primeiro. Args e output completos só aparecem expandidos; `Enter
   details` à direita quando cabe **somente** no grupo selecionado ou no último
   grupo colapsado do run ativo;
 - prosa Markdown faz soft-wrap no último limite de palavra disponível; código,
@@ -1791,20 +2217,20 @@ o `row_offset` dentro da nova altura.
   `Preparing tool · <name>` e fecha apenas o caret visual do assistant; a
   publicação/execução da tool continua dependente do terminal autoritativo;
 - footer `ctx`: percentual inteiro com piso de 1% quando `tokens > 0`;
-- dentro de um turno, thinking, tools e assistant são adjacentes (sem row
-  vazia extra entre eles);
+- dentro de um turno, thinking e tools são adjacentes; somente o primeiro
+  trecho da resposta do agente abre com respiro e seu cabeçalho;
 - antes de todo `User` posterior ao primeiro há exatamente uma row física vazia,
   medida pelo `HeightIndex` e materializada pelo renderer; o primeiro user não
   recebe espaçamento superior;
-- mensagens usam 100% da largura útil do scrollback: sem `max-width`, coluna
-  central ou balões estreitos;
+- mensagens usam a largura útil do scrollback dentro da coluna central de até
+  100 células (§14.1), sem balões individuais estreitos;
 - headings Markdown removem os marcadores visuais `#`/`##`/`###`: H1 usa
   `assistant_accent`, H2 usa `heading_accent`, H3 usa `thinking_accent` e níveis
   maiores usam `heading_accent`; links usam `link_accent`; prosa comum permanece
   em `text`;
 - blocos Markdown de nível raiz (heading, parágrafo, lista, código, quote,
   tabela, hr) têm exatamente uma row vazia entre si; itens de lista não ganham
-  gap extra; tabelas GFM alinham colunas na largura útil e não quebram no wrap;
+  gap extra; tabelas GFM que cabem alinham colunas; as largas usam campos com wrap;
 - texto longo quebra na borda direita; linhas de continuação alinham com o
   texto, nunca com um rail;
 - inspector aberto e scrollbar reduzem a largura útil; não mudam a regra;
@@ -1815,7 +2241,8 @@ o `row_offset` dentro da nova altura.
 - scrollbar ocupa uma célula somente quando `total_rows > viewport_rows`; a
   largura útil é então remedida com `width - 1`; track é quase invisível, thumb
   tem mínimo de uma row e usa estilo muted em live edge/normal em pinned;
-- code e diff preservam linhas e usam viewport horizontal.
+- code e diff fazem wrap sem perder texto. Tabelas que cabem ficam alinhadas;
+  tabelas largas viram campos `header: valor`, preservando texto e sanitização.
 
 ### 15.3 Composer
 
@@ -1855,15 +2282,16 @@ Regras:
   Windows avança duas células enquanto unicode-width/Ratatui contam uma,
   o que estaciona o caret sobre a última letra digitada (G264) — o
   composer não usa esse glifo;
-- `model (effort) · mode` ocupa o label inferior direito em `muted`; abrevia por
-  largura sem tocar os cantos;
+- modelo/esforço/modo vivem no footer (§15.1); o label inferior esquerdo
+  contém somente metadata do draft, abreviada sem tocar os cantos;
 - topo, conteúdo e base usam o mesmo `Rect`; `Block::title_bottom` substitui
   células internas, nunca encurta a base ou desloca `╯`;
-- texto digitado usa viewport horizontal em torno do cursor; cada linha lógica
-  longa não faz wrap e mantém o hint de overflow;
-  o recorte à esquerda usa hint ASCII `<` (não `‹`, G264);
-- draft multiline continua permitido; a viewport vertical mantém a linha do
-  cursor visível e mostra `N lines` quando houver mais de uma;
+- texto digitado faz quebra visual pela largura disponível, sem inserir
+  newlines no prompt enviado e sem separar graphemes; layout e cursor usam a
+  mesma projeção de rows visuais;
+- draft multiline continua permitido; a viewport vertical mantém a row visual
+  do cursor visível e cresce até o limite de cinco rows de conteúdo. Paste
+  tokens continuam representando payloads atômicos;
 - Enter envia quando completion/modal não captura;
 - Shift+Enter insere newline quando distinguível;
 - Ctrl+Enter também insere newline como fallback Windows configurável;
@@ -1898,27 +2326,42 @@ estado completo mantêm a célula como espaço, sem reflow. O caret nunca entra 
 ### 15.4 Sinais operacionais e ActivityRail
 
 `ActivityRail` materializa a fase transitória corrente: Thinking, Responding,
-tool em execução, AwaitingProvider, awaiting input, fase External, elapsed e
-ação de cancelamento. `Thinking` começa em `ThinkingStarted`; `Responding`
+resumo verbal das tools em voo, awaiting input, elapsed e cancelamento no
+footer. HTTP de conexão (`Connecting`, headers, first byte) e `AwaitingProvider`
+aparecem como `Thinking` — o agente continua no turno, não “reconecta” aos
+olhos do utilizador. `Retrying` e `Compacting` continuam literais quando o
+evento traz esse detalhe. `Thinking` começa em `ThinkingStarted`; `Responding`
 começa no primeiro `AssistantDelta`; `ToolEnded` entra em `AwaitingProvider`
-até reasoning/texto novo ou outcome terminal. Silêncio e timers nunca inventam
-uma transição de domínio.
+(rótulo `Thinking`) até reasoning/texto novo ou outcome terminal. Silêncio e
+timers nunca inventam uma transição de domínio.
 `Retrying` só pode aparecer por evento real. Possui uma row e desaparece quando
 deixa de ser acionável; `ActivityBlock` fica reservado a histórico persistido:
 
 ```text
-◒ Responding · 15s                         ctx ~9.45k/22.4k · Ctrl+C stop
+○ Thinking · 15s
 ```
 
-Spinner usa sequência estável de glyphs e 12 fps nominais em motion normal. O
+Tools em voo usam um resumo quieto (`Reading · 3 calls`, `Running command`,
+`Reading, Searching`); o nome cru da ferramenta não ocupa a rail.
+Sem ActivityRail, a operational bar conserva a fase abreviada e o cancelamento,
+priorizando-os sobre o contexto numérico.
+
+Em largura ≥72, `turn`/`reads`/`edits` só entram quando o uso atinge 80% do
+limite e couberem integralmente; nesse caso o contador usa warning. A fase
+comum usa texto e o indicador usa accent, sem sinalizar alerta.
+Reads/edits referem-se ao lote atual. Os avisos de orçamento do harness continuam
+existindo e não são suprimidos. O atalho `Ctrl+C cancel` permanece no footer.
+
+O clock continua a 12 fps nominais; o pulso ○/● muda a cada seis ticks (498 ms). O
 elapsed deriva de `FrameClock.elapsed_ms - ActivityState.started_ms`, nunca de
 `Instant` no AppState. Tool com
 progresso conhecido usa `progress_track/progress_fill`; sem progresso conhecido,
 usa spinner e elapsed, nunca barra falsa.
 
-`FirstByte` significa apenas que o stream HTTP abriu e deve ser apresentado como
-`Stream open · waiting for content`, nunca como resposta semântica. Headers,
-primeiro byte e primeiro conteúdo preservam seus `elapsed_ms` em Diagnostics.
+`FirstByte` significa apenas que o stream HTTP abriu, nunca uma resposta
+semântica. Na ActivityRail aparece como `Thinking`; Diagnostics conservam
+`Stream open · waiting for content` e os `elapsed_ms` de headers, primeiro
+byte e primeiro conteúdo.
 No protocolo Responses, a abertura/fechamento de um item `reasoning` publica
 `ThinkingStarted`/`ThinkingEnded`. Heartbeats e comentários SSE não satisfazem o
 deadline pré-semântico; após o primeiro evento semântico, continuam valendo os
@@ -1932,8 +2375,8 @@ volta ao contrato compacto de nome + duração, salvo expansão explícita.
 
 Durante run, a ActivityRail pode mostrar o mesmo snapshot contextual vivo sem duplicá-lo em outra rail. Cada chamada ao provider — inclusive summary de compaction — publica antes do envio um `ContextSnapshot` com `request_id` derivado da sequence, window configurada e estimativa conservadora das mensagens + system prompt nativo + schema das tools. Chars de reasoning/assistant recebidos aumentam a estimativa monotonicamente dentro dessa request. `UsagePartial` soma contadores sem remover `~`; `Usage` terminal + `AssistantEnded` ainda permanecem aproximados, e somente o outcome final `RunCompleted` confirma o total exato. Usage null/incompleto mantém `~`; componentes numéricos isolados permanecem visíveis via `UsagePartial`, nunca são promovidos a exatos, e cache nunca armazena/reproduz usage billable. Completeness por componente acompanha o protocolo e também é persistida em `EventKind::UsagePartial` como knownness retrocompatível: no Anthropic, cache tokens sem `input_tokens` base não completam input; input e output completos geram marcador terminal aditivo zero. Usage é u64 end-to-end; overflow marca `UsageTotals.overflowed` em turns diretos e merges de compaction, mantém headless sem custo e TUI aproximada. Custo usa aritmética checked em u128 antes de uma divisão única e só é publicado com accounting terminal completo, outcome bem-sucedido e resultado representável em u64. Cache (máx. 4.096 eventos/entrada, 2 MiB/entrada, 128 entradas e 8 MiB total; replay cancelável) abandona captura incremental ao atingir o cap, compacta strings/vetores e contabiliza capacities realmente retidas, inclusive spare capacity do `Vec`; inclui configuração wire, query não secreta, headers semânticos e credential scope apenas hasheados, além de endpoint/model/messages/tools; tool-required não é cacheável. Codex preserva query no URL, envia output cap e normaliza `response.incomplete/max_output_tokens` como truncation. Provider sem usage final mantém `~`. Nova request é identificada por `run_id + request_id + window`, substitui o snapshot anterior e pode refletir queda após compaction; estimativa atrasada de run cancelada não cruza a próxima run. APIs diretas sem `AgentLoopConfig` também emitem snapshot, com window 0 (`ctx --`). Summary de compaction só substitui transcript após exatamente um stop textual normal canônico, nunca stop/evento de tool nem conteúdo pós-stop; usage já observado é publicado mesmo quando summary falha ou é cancelado. Um único Usage terminal tardio é permitido após stop e antes do fechamento; qualquer outro evento pós-stop ou usage após accounting terminal é inválido. Tool calls fragmentadas usam o mesmo normalizer no runtime e no bridge livre; cada call exige `id` ou `index` fornecido pelo provider, siblings malformados invalidam o payload inteiro e argumentos residuais precisam formar JSON válido. Sequence pública usa avanço checked e falha antes do request/evento quando não há espaço para snapshot e terminal obrigatório; ArtifactStore reserva a sequence antes de qualquer escrita em disco. Streams SSE de sucesso são limitadas a 64 MiB e 1 MiB por linha/payload; erros públicos do adapter são limitados a 512 caracteres. Credenciais em query entram no redactor cross-delta antes de runtime/TUI/persistência. Saída headless texto e JSONL expõe explicitamente `usage_complete` e `usage_overflowed`, além dos componentes conhecidos, para parcial/saturado nunca parecer exato.
 
-O footer mantém shortcuts, contexto/usage, estado crítico, Goal curto e unseen
-count. Mode/model/effort vivem no label do composer. Quando há Goal ativo,
+O footer mantém o chip de modo, contexto, estado crítico, Goal curto e unseen
+count. Modelo/esforço vivem no footer. Quando há Goal ativo,
 mostra `active`, `paused` ou `blocked`, budget restante e
 `verified`/`unverified`. Goal completo expande in-place no transcript, não vira
 painel permanente.
@@ -1976,6 +2419,16 @@ pub enum InspectorKind { Diff, Activity, SessionTree, Diagnostics }
 Cada inspector tem ViewModel próprio e comandos tipados. Nenhum lê estado
 global por singleton.
 
+O painel ativo possui rolagem independente da conversa. Setas, PageUp/PageDown
+e Home/End navegam suas linhas; o painel indica a janela visível, e Esc devolve
+o foco à conversa sem deslocar seu histórico. A posição deve ser limitada ao
+conteúdo disponível antes de cada movimento, inclusive após chegar ao início
+ou ao fim.
+
+Activity e Changes usam marcador neutro e `history` para ferramentas restauradas,
+assim como o transcript. `Complete` na restauração significa conteúdo disponível,
+não confirmação de sucesso da ferramenta.
+
 ### 15.7 OverlayStack
 
 ```rust
@@ -2005,7 +2458,7 @@ registrar diagnóstico e manter o stack existente.
   (`Tick`/`StatusTick`/`SyncClock`);
 - cada toast visível ocupa uma row truncada pela largura do scrollback;
 - reduced motion desativa transições, não duração.
-- `tool_limit` / `turn_limit`: mensagem humanizada via bloco `System` colapsado (não toast efêmero); `turn_limit` mostra o teto `(N/N)` (default 128); `tool_limit` com caps 0/0 (resume durável) usa mensagem dedicada, não 32/96; ActivityRail mostra `turn N/M · read n/m mut n/m` quando largura ≥ 72 (`read`/`mut` deste turn); aviso one-shot ao atingir 80% dos turns do run e 80% do batch deste turn.
+- `tool_limit` / `turn_limit`: mensagem humanizada via bloco `System` colapsado (não toast efêmero); `turn_limit` mostra o teto `(N/N)` (default 128); `tool_limit` com caps 0/0 explicitamente configurados usa mensagem dedicada, não 32/96; ActivityRail mostra `turn N/M · reads n/m · edits n/m` só a partir de 80% do limite, quando largura ≥ 72 (`reads`/`edits` deste turn); aviso one-shot ao atingir 80% dos turns do run e 80% do batch deste turn.
 
 ## 16. State machines
 
@@ -2040,6 +2493,12 @@ Regras:
   evento seguinte decide entre `Thinking`, `Responding`, tool ou terminal;
 - evento tardio depois de outcome terminal pode completar somente a cauda já
   terminalizada; nunca reabre lifecycle nem ActivityRail.
+- Resposta com lifecycle `Cancelled` mantém o cabeçalho `Slim · interrupted · partial`
+  após expirar o toast. A atualização terminal alcança somente o último trecho
+  do turno atual; a apresentação reflete esse estado no cabeçalho compartilhado,
+  sem reclassificar blocos concluídos ou respostas de turnos anteriores.
+  Esse rótulo deriva do estado da TUI aberta; não acrescenta metadados ao histórico
+  durável nem afirma rollback de ferramentas.
 
 ### 16.2 Tool lifecycle
 
@@ -2187,6 +2646,22 @@ Suportar:
   visualização e wheel/teclado);
 - seleção interna somente se não conflitar com seleção nativa;
 - Shift como escape para seleção do emulador quando aplicável.
+
+Revisão autorizada de 14/09/2026 — seleção textual: o início do arrasto usa
+as regiões de conteúdo do último frame pintado. A seleção permanece na conversa
+ou no interior do inspetor de origem, sem alcançar composer, rodapé, scrollbar,
+bordas ou menus sobrepostos. Realce e cópia usam o mesmo intervalo de texto
+visível, sem pintar o preenchimento vazio à direita; preservam indentação,
+espaços internos e quebras entre linhas. Arrasto invertido e glyphs largos
+devem selecionar unidades completas. Resize, scroll e mudança de conteúdo
+invalidam a seleção por coordenadas, evitando copiar outra posição silenciosamente.
+O clique direito copia o trecho selecionado; sem seleção, mantém o paste
+existente. Um arrasto sem texto não cola nem cancela a execução. A seleção é
+materializada antes da cópia mesmo quando drag e clique chegam no mesmo lote.
+Após sucesso efetivo do clipboard, mostrar um único aviso discreto `Copiado`,
+reutilizando o toast existente e sua expiração; falha nunca produz confirmação
+de sucesso. Não é seleção de conteúdo fora da viewport nem nova integração
+com a seleção nativa do emulador.
 
 `LayoutPlan` produz `HitRegion { rect, target, z_index }`. Hit test percorre por
 z-index. Nunca reconstruir layout dentro do handler de mouse.
@@ -2367,41 +2842,41 @@ Paleta truecolor normativa:
 
 | Token | Valor | Uso |
 |---|---|---|
-| `background` | `#080A0D` | fundo mais profundo do terminal |
-| `surface` | `#0D1014` | transcript e região principal |
-| `surface_alt` | `#12161B` | rails, docks e regiões secundárias |
-| `surface_elevated` | `#191E24` | overlays, drawers e prompt destacado |
-| `composer_bg` | `#151A20` | composer focado/ativo |
-| `user_prompt_bg` | `#1B2026` | faixa integral da mensagem do usuário |
-| `text` | `#C6CDD5` | texto principal (cinza-suave; branco puro sofre halation e parece negrito) |
-| `muted` | `#747B84` | metadata, pendente e hints |
-| `secondary_text` | `#A9B0B8` | labels, counters e paste token |
-| `accent` | `#78D99B` | identidade principal Slim |
-| `heading_accent` | `#82AFFF` | headings e estrutura de resposta |
-| `link_accent` | `#8CB4FF` | links e targets navegáveis |
-| `border` | `#2B3139` | separadores e boxes funcionais |
-| `border_focus` | `#4F7D5E` | composer/drawer focado |
-| `operational_divider` | `#252B33` | rails operacionais |
+| `background` | `#000000` | fundo mais profundo do terminal |
+| `surface` | `#000000` | transcript e região principal |
+| `surface_alt` | `#181818` | rails, docks e regiões secundárias |
+| `surface_elevated` | `#181818` | overlays e drawers |
+| `composer_bg` | `#000000` | composer integrado ao transcript |
+| `user_prompt_bg` | `#101010` | faixa discreta da mensagem do usuário |
+| `text` | `#E8E5DB` | texto principal marfim |
+| `muted` | `#99978E` | metadata, pendente e hints legíveis |
+| `secondary_text` | `#BCB9AF` | labels, counters e paste token |
+| `accent` | `#72CC91` | foco e controles; verde Slim em assistant/success |
+| `heading_accent` | `#91C28F` | headings e estrutura de resposta |
+| `link_accent` | `#7EAB7F` | links e targets navegáveis |
+| `border` | `#3A3A3A` | separadores e boxes funcionais |
+| `border_focus` | `#72CC91` | composer/drawer focado |
+| `operational_divider` | `#3A3A3A` | rails operacionais |
 | `progress_track` | `#262D35` | trilho de progresso |
 | `progress_fill` | `#78D99B` | progresso conhecido e saudável |
-| `scrollbar_track` | `#151A20` | trilho quase invisível da scrollbar |
-| `scrollbar_thumb` | `#4B5563` | posição da viewport |
-| `user_accent` | `#A9B0B8` | label/rail do usuário |
-| `assistant_accent` | `#78D99B` | label Slim, cursor e foco |
-| `thinking_accent` | `#9AA4AF` | reasoning e elapsed |
-| `tool_accent` | `#7DCFFF` | tools e activity estrutural |
-| `success` | `#78D99B` | conclusão/healthy |
-| `warning` | `#E6B450` | running/ativo/atenção |
-| `error` | `#F07178` | falha/cancelamento relevante |
-| `code_rail` | `#46505C` | rail de code/output expandido |
-| `selection` | `#263A30` | seleção/foco textual |
-| `diff_add` | `#78D99B` | `+` e metadata de adição |
-| `diff_remove` | `#F07178` | `-` e metadata de remoção |
-| `diff_add_bg` | `#0B1A10` | row adicionada |
-| `diff_remove_bg` | `#1C0D11` | row removida |
-| `diff_add_emphasis_bg` | `#163D22` | trecho intraline adicionado |
-| `diff_remove_emphasis_bg` | `#421820` | trecho intraline removido |
-| `code_bg` | `#0B0E12` | code comum separado do transcript |
+| `scrollbar_track` | `#24231A` | trilho quase invisível da scrollbar |
+| `scrollbar_thumb` | `#626756` | posição da viewport |
+| `user_accent` | `#BCB9AF` | label/rail do usuário |
+| `assistant_accent` | `#72CC91` | label Slim, cursor e foco |
+| `thinking_accent` | `#AFA99D` | reasoning e elapsed |
+| `tool_accent` | `#72CC91` | tools e activity estrutural |
+| `success` | `#72CC91` | conclusão/healthy |
+| `warning` | `#E7C15A` | atenção e limites próximos |
+| `error` | `#E87973` | falha/cancelamento relevante |
+| `code_rail` | `#68665A` | rail de code/output expandido |
+| `selection` | `#2A4C38` | seleção/foco textual |
+| `diff_add` | `#72CC91` | `+` e metadata de adição |
+| `diff_remove` | `#E87973` | `-` e metadata de remoção |
+| `diff_add_bg` | `#172A1E` | row adicionada |
+| `diff_remove_bg` | `#2A1816` | row removida |
+| `diff_add_emphasis_bg` | `#225734` | trecho intraline adicionado |
+| `diff_remove_emphasis_bg` | `#512A25` | trecho intraline removido |
+| `code_bg` | `#0A0A0A` | code comum separado do transcript |
 
 Componentes não podem inferir semântica a partir do RGB resolvido; usam tokens.
 
@@ -2411,18 +2886,23 @@ Componentes não podem inferir semântica a partir do RGB resolvido; usam tokens
 - boxes são funcionais: composer, overlays e drawers; não envolver cada mensagem;
 - profundidade vem de surfaces near-black e borders, não de sombras simuladas;
 - user prompt usa faixa elevada sem cantos nem rail; assistant usa surface
-  principal sem label de papel;
-- SessionRail, ActivityRail e OperationalBar têm uma row cada quando visíveis;
+  principal com um único cabeçalho `Slim` por resposta;
+- SessionRail e ActivityRail têm uma row cada; OperationalBar tem uma a três rows;
   SessionRail é conversacional e adaptativa, nunca aparece no welcome/emergência;
 - composer tem uma a cinco rows de conteúdo conforme draft/altura e uma row no
   modo de emergência;
 - rails verticais não aparecem em user/assistant; tool/code expandidos usam
   indentação de quatro células;
-- uma row vazia depois do user band; zero rows vazias entre thinking, tools e
-  assistant; exatamente uma row antes de cada novo user após o primeiro;
+- output textual de tool expandida usa `secondary_text`; resumo concluído usa
+  `muted`. Não há mudança de paginação, retenção ou quantidade de linhas;
+- uma row vazia depois do user band; thinking e tools são adjacentes; a
+  resposta abre com respiro e cabeçalho Slim; exatamente uma row antes de
+  cada novo user após o primeiro;
 - thinking colapsado e tool rows colapsados têm uma row cada;
 - números dinâmicos usam largura/tabulação estável para não deslocar layout;
-- glyphs normativos: `✓` complete, `◒`/`◌` running, `○` pending, `✕` failed,
+- glyphs normativos: `✓` tool complete, `○` running/pending no transcript,
+  `○`/`●` no único pulso (Thinking visível ou ActivityRail), `✕` failed,
+  `▸`/`▾` para pensamento recolhido/expandido (fallback `>`/`v`),
   `>` composer (sempre ASCII: `›` é Ambiguous no Windows, G264);
 - fallback ASCII: `+`, `~`, `o`, `x`, `>` respectivamente;
 - no-color mantém significado por glyph, label e texto de status;
@@ -2520,6 +3000,8 @@ Se um renderer de bloco falha:
 - manter draft/estado autoritativo;
 - publicar `EffectFailed`;
 - mostrar error block/toast conforme severidade;
+- falha terminal do provider usa `RunFailed` e permanece em um error block após
+  expirar o toast; a sessão salva inclui a razão com segredos removidos mesmo após ferramentas;
 - oferecer retry somente quando operação for idempotente.
 
 ### 24.4 Gap de eventos

@@ -1,3 +1,6 @@
+#[path = "../../../tests/support/budget_finalization.rs"]
+mod budget_finalization;
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -34,7 +37,13 @@ fn temp_path(label: &str) -> PathBuf {
 fn create_v2(path: &Path) {
     let mut repo = JsonlRepo::create(
         path,
-        DurableSessionHeader::new("stage8", "now", "D:\\Slim", None, None),
+        DurableSessionHeader::new(
+            "stage8",
+            "now",
+            path.parent().unwrap().to_str().unwrap(),
+            None,
+            None,
+        ),
     )
     .expect("v2 session");
     repo.append(DurableRecord::Entry {
@@ -46,6 +55,8 @@ fn create_v2(path: &Path) {
             parent_entry_id: None,
             operation_id: "seed-op".into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            content_blocks: Vec::new(),
         },
     })
     .expect("seed entry");
@@ -86,6 +97,8 @@ fn create_v2_with_history(path: &Path) {
             parent_entry_id: None,
             operation_id: "history-op".into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            content_blocks: Vec::new(),
         },
     })
     .expect("history user");
@@ -98,6 +111,8 @@ fn create_v2_with_history(path: &Path) {
             parent_entry_id: Some("history-user".into()),
             operation_id: "history-op".into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            content_blocks: Vec::new(),
         },
     })
     .expect("history assistant");
@@ -114,6 +129,8 @@ fn add_tool_call_metadata(path: &Path) {
             parent_entry_id: Some("history-assistant".into()),
             operation_id: "history-op".into(),
             tool_call_id: Some("tool-call-1".into()),
+            tool_calls: Vec::new(),
+            content_blocks: Vec::new(),
         },
     })
     .expect("tool call metadata");
@@ -224,6 +241,10 @@ fn spawn_capturing_fixture(
             )
             .expect("headers");
         stream.write_all(payload).expect("events");
+        drop(stream);
+        if tool_call {
+            budget_finalization::reject_budget_finalization(&listener);
+        }
     });
     (format!("http://{address}"), server)
 }
@@ -333,24 +354,38 @@ fn resume_rejects_tool_call_metadata_history_without_provider_or_mutation() {
 }
 
 #[test]
-fn resume_tool_call_is_blocked_before_side_effect_and_records_failed_terminal() {
+fn resume_explicit_zero_tool_budget_blocks_side_effect_and_records_failed_terminal() {
     let path = temp_path("tool-blocked");
     create_v2(&path);
-    let workspace = path.parent().expect("parent").join("workspace");
+    let workspace = path.parent().expect("parent").to_path_buf();
     std::fs::create_dir_all(&workspace).expect("workspace");
     let request_body = Arc::new(Mutex::new(None));
     let (endpoint, server) = spawn_capturing_fixture(Arc::clone(&request_body), true);
     let result = run_provider_headless_with_resume_and_options(
         request(endpoint),
         &path,
-        slim_cli::ProviderRunOptions::default().with_workspace_root(&workspace),
+        slim_cli::ProviderRunOptions::default()
+            .with_workspace_root(&workspace)
+            .with_max_tool_calls(0)
+            .with_max_read_tool_calls(0),
     )
     .expect("tool-limit is a truthful result");
     server.join().expect("server");
     assert_eq!(result.code, ExitCode::Tool);
     assert_eq!(result.stop, "tool_limit");
+    let rendered = slim_cli::render_provider_text(&result);
+    assert!(rendered.contains("Task remains pending"), "{rendered}");
+    assert!(
+        rendered.contains("Final response failed") && rendered.contains("503"),
+        "{rendered}"
+    );
+    let jsonl: serde_json::Value =
+        serde_json::from_str(slim_cli::render_provider_jsonl(&result).unwrap().trim()).unwrap();
+    assert!(jsonl["stop_message"].as_str().unwrap().contains("503"));
     assert!(!workspace.join("stage8-side-effect.txt").exists());
     let report = preflight_session(&path).expect("report");
+    assert!(report.records.iter().any(|record| matches!(record,
+        DurableRecord::Entry { entry, .. } if entry.content.contains("[Run stopped]") && entry.content.contains("503"))));
     assert!(report.records.iter().any(|record| {
         matches!(
             record,
@@ -385,6 +420,8 @@ fn resume_surfaces_pending_old_work_instead_of_silently_ignoring_it() {
             parent_entry_id: None,
             operation_id: "pending-op".into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            content_blocks: Vec::new(),
         },
     })
     .expect("pending entry");
@@ -493,4 +530,356 @@ fn recover_is_strictly_recovery_only_and_does_not_run_provider() {
     assert!(output.stderr.contains("recovery-only"));
     assert_eq!(std::fs::read(&path).expect("unchanged"), before);
     let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+}
+
+#[test]
+fn explicit_abandon_resolves_queue_states_is_locked_and_idempotent() {
+    let path = temp_path("abandon-queue");
+    create_v2(&path);
+    let mut repo = JsonlRepo::open_no_repair(&path).unwrap();
+    for (id, state) in [("pending", 0), ("claimed", 1), ("suspended", 2)] {
+        repo.append(DurableRecord::Operation {
+            seq: repo.next_seq().unwrap(),
+            operation: DurableOperation {
+                operation_id: id.into(),
+                kind: DurableOperationKind::QueueIntent {
+                    input_entry_id: None,
+                },
+            },
+        })
+        .unwrap();
+        if state > 0 {
+            repo.append(DurableRecord::Operation {
+                seq: repo.next_seq().unwrap(),
+                operation: DurableOperation {
+                    operation_id: id.into(),
+                    kind: DurableOperationKind::Claimed,
+                },
+            })
+            .unwrap();
+        }
+        if state > 1 {
+            repo.append(DurableRecord::Operation {
+                seq: repo.next_seq().unwrap(),
+                operation: DurableOperation {
+                    operation_id: id.into(),
+                    kind: DurableOperationKind::Suspended {
+                        reason: "interrupted".into(),
+                    },
+                },
+            })
+            .unwrap();
+        }
+    }
+    let before = std::fs::read(&path).unwrap();
+    let args = [
+        "--headless",
+        "--recover",
+        path.to_str().unwrap(),
+        "--abandon-pending",
+    ];
+    assert_eq!(
+        run_cli(args, "").code,
+        ExitCode::Blocked,
+        "live writer must block recovery"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    drop(repo);
+    assert_eq!(
+        run_cli(["--headless", "--abandon-pending"], "").code,
+        ExitCode::InputRequired
+    );
+    assert_eq!(
+        run_cli(["--headless", "--recover", path.to_str().unwrap()], "").code,
+        ExitCode::Success
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "repair alone cannot abandon work"
+    );
+    let output = run_cli(args, "");
+    assert_eq!(output.code, ExitCode::Success, "{}", output.stderr);
+    let after = std::fs::read(&path).unwrap();
+    assert!(after.starts_with(&before));
+    assert_eq!(run_cli(args, "").code, ExitCode::Success);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        after,
+        "second decision adds nothing"
+    );
+    let report = preflight_session(&path).unwrap();
+    assert_eq!(
+        report.summary.pending_count()
+            + report.summary.claimed_count()
+            + report.summary.suspended_count(),
+        0
+    );
+    slim_core::session::resume_plan_from_preflight(&report).unwrap();
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
+fn failed_provider_after_tools_persists_the_redacted_reason_and_tool_history() {
+    for partial in [false, true] {
+        let path = temp_path("failed-after-tools");
+        create_v2(&path);
+        let workspace = path.parent().unwrap();
+        std::fs::write(workspace.join("source.txt"), "retained evidence").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            // A truncated stream is recoverable: the runtime retries it up to
+            // MAX_PROVIDER_RECOVERIES, so the partial branch must keep serving.
+            let turns = if partial { 4 } else { 2 };
+            for turn in 0..turns {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "fixture accept deadline");
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 16 * 1024];
+                loop {
+                    let n = stream.read(&mut chunk).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let (status, body) = if turn == 0 {
+                    let call = serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"read-source","function":{"name":"read","arguments":"{\"path\":\"source.txt\"}"}}]},"finish_reason":"tool_calls"}]});
+                    (200, format!("data: {call}\n\ndata: [DONE]\n\n"))
+                } else {
+                    let body = String::from_utf8(request).unwrap();
+                    assert!(body.contains("retained evidence"));
+                    if partial {
+                        (
+                            200,
+                            format!(
+                                "data: {}\n\n",
+                                serde_json::json!({"choices":[{"delta":{"content":"visible partial fixture-secret ".repeat(20)}}]})
+                            ),
+                        )
+                    } else {
+                        (401, "denied fixture-secret".into())
+                    }
+                };
+                stream.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+            }
+        });
+        let result = run_provider_headless_with_resume_and_options(
+            request(endpoint),
+            &path,
+            slim_cli::ProviderRunOptions::default().with_workspace_root(workspace),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(result.code, ExitCode::Provider);
+        assert_eq!(result.stop, "provider_error");
+        let report = preflight_session(&path).unwrap();
+        let entries: Vec<_> = report
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                DurableRecord::Entry { entry, .. } => Some(entry),
+                _ => None,
+            })
+            .collect();
+        assert!(entries
+            .iter()
+            .any(|entry| entry.role == DurableEntryRole::Tool
+                && entry.content.contains("retained evidence")));
+        let failure = entries.last().unwrap();
+        assert!(
+            failure.content.starts_with("[Run failed]\n"),
+            "{}",
+            failure.content
+        );
+        if partial {
+            assert!(entries
+                .iter()
+                .any(|entry| entry.content.starts_with("[Interrupted turn]")
+                    && entry.content.contains("visible partial [REDACTED]")));
+            assert!(failure.content.contains("stream ended"));
+        } else {
+            assert!(failure.content.contains("http 401"));
+            assert!(failure.content.contains("[REDACTED]"));
+        }
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("fixture-secret"));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+}
+
+#[test]
+fn todo_state_survives_failed_turn_and_durable_resume() {
+    let path = temp_path("todo-state");
+    create_v2(&path);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        for turn in 0..4 {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "request {turn} missing");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut raw = Vec::new();
+            let mut chunk = [0; 16384];
+            loop {
+                let n = stream.read(&mut chunk).unwrap();
+                assert!(n > 0);
+                raw.extend_from_slice(&chunk[..n]);
+                if let Some(end) = raw.windows(4).position(|s| s == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&raw[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    if raw.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let request = String::from_utf8(raw).unwrap();
+            let (status, body) = if turn == 1 {
+                assert!(request.contains("todo 0 [pending]: saved task"));
+                (401, "fixture failure".to_owned())
+            } else if turn == 3 {
+                assert!(
+                    request.contains("todo 0 [completed]: saved task"),
+                    "{request}"
+                );
+                assert!(!request.contains("todo not found"));
+                (
+                    200,
+                    format!(
+                        "data: {}\n\ndata: [DONE]\n\n",
+                        serde_json::json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]})
+                    ),
+                )
+            } else {
+                let arguments = if turn == 0 {
+                    serde_json::json!({"todos":[{"title":"saved task"}]})
+                } else {
+                    serde_json::json!({"todos":[{"id":0,"status":"completed"}]})
+                };
+                let call = serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("todo-{turn}"),"function":{"name":"todo","arguments":arguments.to_string()}}]},"finish_reason":"tool_calls"}]});
+                (200, format!("data: {call}\n\ndata: [DONE]\n\n"))
+            };
+            stream.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+        }
+    });
+    let first = run_provider_headless_with_resume(request(endpoint.clone()), &path).unwrap();
+    assert_eq!(first.code, ExitCode::Provider);
+    let blocker = first.stop_message.as_deref().unwrap();
+    assert!(
+        blocker.contains("Pending tasks:") && blocker.contains("saved task"),
+        "{blocker}"
+    );
+    let report = preflight_session(&path).unwrap();
+    let facts: Vec<_> = report
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            DurableRecord::Fact { fact, .. } if fact.namespace == "task.v1" => Some(fact),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(facts.len(), 1);
+    assert!(!serde_json::to_string(&facts)
+        .unwrap()
+        .contains("fixture-secret"));
+    let second = run_provider_headless_with_resume(request(endpoint), &path).unwrap();
+    assert_eq!(second.code, ExitCode::Success);
+    server.join().unwrap();
+    let report = preflight_session(&path).unwrap();
+    let facts: Vec<_> = report
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            DurableRecord::Fact { fact, .. } if fact.namespace == "task.v1" => Some(fact.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(facts.len(), 2, "old mutation must not be persisted twice");
+    let mut runtime = slim_core::runtime::Runtime::new();
+    runtime
+        .restore_task_facts(&facts, path.parent().unwrap())
+        .unwrap();
+    assert_eq!(runtime.todo_items().len(), 1);
+    assert_eq!(runtime.todo_items()[0].status, "completed");
+    assert!(runtime.app.events().is_empty());
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn credential_bearing_tool_is_rejected_before_durable_effects() {
+    let path = temp_path("secret-tool-rejected");
+    create_v2(&path);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut bytes = [0; 32768];
+        let _ = stream.read(&mut bytes).unwrap();
+        let payload = serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"unsafe-todo",
+            "function":{"name":"todo","arguments":"{\"todos\":[{\"title\":\"saved fixture-secret\"}]}"}}]},"finish_reason":"tool_calls"}]});
+        let body = format!("data: {payload}\n\ndata: [DONE]\n\n");
+        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+    });
+    let result = run_provider_headless_with_resume(request(endpoint), &path).unwrap();
+    server.join().unwrap();
+    assert_eq!(result.code, ExitCode::Provider);
+    assert!(result
+        .stop_message
+        .unwrap()
+        .contains("registered sensitive material"));
+    let report = preflight_session(&path).unwrap();
+    assert!(!report.records.iter().any(|record| matches!(record,
+        DurableRecord::Fact { fact, .. } if fact.namespace == "task.v1")));
+    assert!(!std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("fixture-secret"));
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }

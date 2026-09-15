@@ -1,0 +1,5 @@
+[build]
+# Limit concurrent compiler/linker processes on this host: available commit,
+# rather than logical core count, has constrained builds. This does not cap
+# test-runner threads or guarantee that an individual compiler fits in memory.
+jobs = 1

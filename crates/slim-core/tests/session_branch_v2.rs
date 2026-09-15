@@ -37,6 +37,8 @@ fn record(seq: u64) -> DurableRecord {
             parent_entry_id: None,
             operation_id: format!("operation-{seq}"),
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            content_blocks: Vec::new(),
         },
     }
 }
@@ -116,6 +118,8 @@ fn async_branch_wrapper_appends_a_branch_compaction_checkpoint() {
                 parent_entry_id: None,
                 operation_id: format!("operation-{seq}"),
                 tool_call_id: None,
+                tool_calls: Vec::new(),
+                content_blocks: Vec::new(),
             },
         })
         .expect("append");
@@ -140,5 +144,167 @@ fn async_branch_wrapper_appends_a_branch_compaction_checkpoint() {
             if checkpoint.reason == slim_core::context::CompactionReason::Branch
     ));
     drop(child);
+    cleanup(&path);
+}
+
+#[test]
+fn branch_compaction_prompt_excludes_the_pinned_latest_instruction() {
+    let path = path("compact-pinned.jsonl");
+    let mut repo = JsonlRepo::create(
+        &path,
+        DurableSessionHeader::new("parent-pinned", "now", "D:\\Slim", None, None),
+    )
+    .expect("create");
+    let mut entries = vec![
+        (0, DurableEntryRole::User, "root instruction".to_owned()),
+        (
+            1,
+            DurableEntryRole::Assistant,
+            "closed work that must remain summarized".to_owned(),
+        ),
+        (
+            2,
+            DurableEntryRole::User,
+            "latest instruction: preserve this exact constraint".to_owned(),
+        ),
+    ];
+    for seq in 3..=9 {
+        entries.push((
+            seq,
+            DurableEntryRole::Assistant,
+            format!("recent work {seq} {}", "x".repeat(12_000)),
+        ));
+    }
+    for (seq, role, content) in entries {
+        repo.append(DurableRecord::Entry {
+            seq,
+            entry: DurableEntry {
+                entry_id: format!("entry-{seq}"),
+                role,
+                content,
+                parent_entry_id: None,
+                operation_id: format!("operation-{seq}"),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+                content_blocks: Vec::new(),
+            },
+        })
+        .expect("append");
+    }
+    drop(repo);
+
+    let seen_prompt = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let prompt_capture = std::sync::Arc::clone(&seen_prompt);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime
+        .block_on(create_durable_branch_compacted(
+            &path,
+            "child-pinned",
+            9,
+            move |prompt| {
+                *prompt_capture.lock().expect("capture") = Some(prompt);
+                async { Ok("## Goal\nContinue with the exact constraint".to_owned()) }
+            },
+        ))
+        .expect("branch");
+
+    let prompt = seen_prompt
+        .lock()
+        .expect("capture")
+        .clone()
+        .expect("summary prompt");
+    assert!(prompt.contains("closed work that must remain summarized"));
+    assert!(!prompt.contains("latest instruction: preserve this exact constraint"));
+    cleanup(&path);
+}
+
+#[test]
+fn branch_compaction_uses_tool_presentation_fact_before_checkpoint_fingerprint() {
+    let path = path("compact-projection.jsonl");
+    let mut repo = JsonlRepo::create(
+        &path,
+        DurableSessionHeader::new("parent-projection", "now", "D:\\Slim", None, None),
+    )
+    .expect("create");
+    let tool_call = slim_core::provider::ProviderToolCall {
+        id: "same".into(),
+        name: "read".into(),
+        arguments: "{}".into(),
+    };
+    let messages = [
+        (0, slim_core::provider::ProviderMessage::user("root")),
+        (
+            1,
+            slim_core::provider::ProviderMessage::assistant("", vec![tool_call]),
+        ),
+        (
+            2,
+            slim_core::provider::ProviderMessage::tool("read", "same", "raw-capture"),
+        ),
+        (
+            3,
+            slim_core::provider::ProviderMessage::assistant(
+                "recent-a ".to_owned() + &"x".repeat(40_000),
+                Vec::new(),
+            ),
+        ),
+        (
+            4,
+            slim_core::provider::ProviderMessage::assistant(
+                "recent-b ".to_owned() + &"x".repeat(40_000),
+                Vec::new(),
+            ),
+        ),
+    ];
+    for (seq, message) in messages {
+        let entry = DurableEntry::from_provider_message(
+            format!("entry-{seq}"),
+            None,
+            "operation".into(),
+            message,
+        )
+        .expect("entry");
+        repo.append(DurableRecord::Entry { seq, entry })
+            .expect("append");
+    }
+    repo.append(DurableRecord::Fact {
+        seq: 5,
+        fact: slim_core::session::DurableFact {
+            namespace: "tool.presentation.v1".into(),
+            key: "entry-2".into(),
+            value: serde_json::json!({
+                "name": "read",
+                "call_id": "same",
+                "output": "shown-projection"
+            }),
+        },
+    })
+    .expect("projection fact");
+    drop(repo);
+
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let seen_prompt = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let capture = std::sync::Arc::clone(&seen_prompt);
+    runtime
+        .block_on(create_durable_branch_compacted(
+            &path,
+            "child-projection",
+            5,
+            move |prompt| {
+                *capture.lock().expect("capture") = Some(prompt);
+                async { Ok("## Goal\nContinue".to_owned()) }
+            },
+        ))
+        .expect("branch");
+    let prompt = seen_prompt
+        .lock()
+        .expect("capture")
+        .clone()
+        .expect("summary prompt");
+    assert!(prompt.contains("shown-projection"), "{prompt}");
+    assert!(
+        !prompt.contains("raw-capture"),
+        "raw entry leaked: {prompt}"
+    );
     cleanup(&path);
 }

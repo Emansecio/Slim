@@ -291,6 +291,15 @@ impl UsageTotals {
                         );
                     }
                 }
+                EventKind::ToolEvidenceElided {
+                    original_bytes,
+                    emitted_bytes,
+                    ..
+                } => add(
+                    &mut totals.duplicate_evidence_bytes_avoided,
+                    original_bytes.saturating_sub(*emitted_bytes),
+                    &mut totals.overflowed,
+                ),
                 EventKind::ToolCallsSuppressed { count } => add(
                     &mut totals.tool_calls_suppressed,
                     *count,

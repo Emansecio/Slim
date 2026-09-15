@@ -1,6 +1,6 @@
 # Real TUI Integration Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Retomada deste plano:** revalide as pendências no código e execute somente o escopo autorizado, conforme o `AGENTS.md` vigente. Skills e delegação são escolhidas por necessidade; receitas e resultados da execução original não são obrigações gerais.
 
 **Goal:** Replace demo route with fullscreen TUI connected to existing provider/agent/tool runtime, including live event projection, usage, cancellation, and terminal restoration.
 
@@ -18,7 +18,7 @@ export RUSTC_WRAPPER=
 
 Every Cargo command below uses `cargo.exe` from that MSVC toolchain.
 
-**Workspace note:** `D:\Slim` is not Git. No commit/reset/checkout/clean steps.
+**Historical workspace note:** the original execution described a non-Git workspace. The current checkout uses Git; inspect its status and preserve WIP before editing. The toolchain commands above also belong to that execution; use current `RULES.md` R8 when Cargo is needed.
 
 ---
 

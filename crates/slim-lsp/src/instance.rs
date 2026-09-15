@@ -38,6 +38,85 @@ use crate::transport::{
 pub const PROTOCOL_VERSION: &str = "3.17";
 const SHUTDOWN_REQUEST_GRACE: Duration = Duration::from_millis(500);
 
+struct SyncTransaction<'a> {
+    transport: &'a LspTransport,
+    committed: bool,
+}
+
+impl Drop for SyncTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.transport.invalidate();
+        }
+    }
+}
+
+fn sync_contract(
+    sync: Option<&lsp_types::TextDocumentSyncCapability>,
+) -> (lsp_types::TextDocumentSyncKind, Option<bool>) {
+    use lsp_types::{
+        TextDocumentSyncCapability as Capability, TextDocumentSyncKind as Kind,
+        TextDocumentSyncSaveOptions as Save,
+    };
+    let (mode, save) = match sync {
+        Some(Capability::Kind(kind)) => (*kind, None),
+        Some(Capability::Options(options)) => (
+            options.change.unwrap_or(Kind::NONE),
+            match &options.save {
+                Some(Save::Supported(true)) => Some(false),
+                Some(Save::SaveOptions(options)) => Some(options.include_text.unwrap_or(false)),
+                _ => None,
+            },
+        ),
+        None => (Kind::NONE, None),
+    };
+    // Unknown numeric kinds cannot justify incrementals; use a complete change.
+    let mode = if [Kind::NONE, Kind::FULL, Kind::INCREMENTAL].contains(&mode) {
+        mode
+    } else {
+        Kind::FULL
+    };
+    (mode, save)
+}
+
+fn incremental_changes(
+    patch: &slim_core::codeintel::CodeIntelPatch,
+    encoding: PositionEncoding,
+) -> Option<Vec<TextDocumentContentChangeEvent>> {
+    if patch.edits.is_empty() {
+        return None;
+    }
+    patch
+        .edits
+        .iter()
+        .map(|edit| {
+            let position = |p: &slim_core::codeintel::CodeIntelEditPosition| {
+                // An offset inside CRLF has no equivalent LSP position. Full resync
+                // preserves the exact patch semantics in this unusual case.
+                if p.prefix.ends_with('\r') {
+                    return None;
+                }
+                Some(lsp_types::Position::new(
+                    p.line,
+                    crate::position::PositionCodec::byte_to_character(
+                        encoding,
+                        &p.prefix,
+                        p.prefix.len(),
+                    )?,
+                ))
+            };
+            Some(TextDocumentContentChangeEvent {
+                range: Some(lsp_types::Range::new(
+                    position(&edit.start)?,
+                    position(&edit.end)?,
+                )),
+                range_length: None,
+                text: edit.text.clone(),
+            })
+        })
+        .collect()
+}
+
 /// Converts an internal file URL to an lsp-types Uri (wire format).
 pub fn to_lsp_uri(url: &url::Url) -> lsp_types::Uri {
     url.to_string().parse().expect("file url parses as lsp Uri")
@@ -92,6 +171,9 @@ pub struct InstanceSnapshot {
 #[derive(Clone, Debug)]
 pub struct DiagnosticsSnapshot {
     pub version: Option<i64>,
+    pub stale: bool,
+    pub total: usize,
+    pub truncated: bool,
     pub items: Vec<lsp_types::Diagnostic>,
 }
 
@@ -100,10 +182,22 @@ struct InstanceState {
     caps: Option<ServerCapabilities>,
     encoding: PositionEncoding,
     indexing_observed: bool,
-    indexing_active: bool,
+    /// Tokens with an open begin and no matching end. Progress is per-token
+    /// in the protocol; a single bool would let one token's end hide another
+    /// token's ongoing work.
+    active_progress: std::collections::HashSet<ProgressToken>,
+    /// Begins that arrived while the tracked set was full. Counted as active
+    /// so a dropped begin can only over-report indexing, never under-report.
+    progress_overflow: usize,
     documents: DocumentStore,
     diagnostics: DiagnosticsStore,
 }
+
+/// Distinct in-flight progress tokens tracked per server. WorkDone cycles
+/// number in the handful; the cap only bounds a misbehaving flood.
+const MAX_TRACKED_PROGRESS_TOKENS: usize = 256;
+
+static NEXT_INSTANCE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl InstanceState {
     fn new(max_open_documents: usize) -> Self {
@@ -112,7 +206,8 @@ impl InstanceState {
             caps: None,
             encoding: PositionEncoding::Utf16,
             indexing_observed: false,
-            indexing_active: false,
+            active_progress: std::collections::HashSet::new(),
+            progress_overflow: 0,
             documents: DocumentStore::new(max_open_documents),
             diagnostics: DiagnosticsStore::new(
                 crate::diagnostics::DEFAULT_MAX_DIAGNOSTICS_PER_URI,
@@ -120,13 +215,22 @@ impl InstanceState {
             ),
         }
     }
+
+    fn indexing_active(&self) -> bool {
+        !self.active_progress.is_empty() || self.progress_overflow > 0
+    }
 }
 
 /// Live server connection.
 pub struct LspServerInstance {
+    /// Process-unique identifier; a respawned server always gets a fresh id,
+    /// so continuations can reject pages that would mix server generations.
+    id: u64,
     state: Arc<Mutex<InstanceState>>,
-    /// Serializes didOpen/didChange/didSave/didClose sequences for this server.
-    document_sync: Mutex<()>,
+    /// Ordering is per document; unrelated semantic queries remain concurrent.
+    document_sync: std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<Mutex<()>>>>,
+    /// Only opening/closing and LRU eviction share this lifecycle barrier.
+    document_lifecycle: Mutex<()>,
     transport: LspTransport,
     config: ServerInstanceConfig,
     stderr_tail: Arc<Mutex<String>>,
@@ -145,7 +249,7 @@ fn client_capabilities() -> ClientCapabilities {
                 dynamic_registration: None,
                 will_save: None,
                 will_save_wait_until: None,
-                did_save: None,
+                did_save: Some(true),
             }),
             publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
                 related_information: Some(false),
@@ -202,8 +306,10 @@ impl LspServerInstance {
         let options = config.transport_options.clone();
         let (transport, notifications) = LspTransport::new(io, options, handler);
         let mut instance = Self {
+            id: NEXT_INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             state: Arc::new(Mutex::new(InstanceState::new(config.max_open_documents))),
-            document_sync: Mutex::new(()),
+            document_sync: std::sync::Mutex::new(std::collections::HashMap::new()),
+            document_lifecycle: Mutex::new(()),
             transport,
             config,
             stderr_tail,
@@ -320,7 +426,7 @@ impl LspServerInstance {
                     // Real rust-analyzer reports work under string tokens such as
                     // "rustAnalyzer/Roots Scanned" (never the bare
                     // "rustAnalyzer/indexing"), so every rustAnalyzer/* token
-                    // drives the indexing flag; begin/end pairs toggle it.
+                    // is tracked; begin/end open/close that token only.
                     let tracked = matches!(params.token, ProgressToken::String(ref token) if token.starts_with("rustAnalyzer/"))
                         || matches!(params.token, ProgressToken::Number(_));
                     if tracked {
@@ -328,8 +434,26 @@ impl LspServerInstance {
                         let mut guard = state.lock().await;
                         guard.indexing_observed = true;
                         match progress {
-                            WorkDoneProgress::Begin(_) => guard.indexing_active = true,
-                            WorkDoneProgress::End(_) => guard.indexing_active = false,
+                            WorkDoneProgress::Begin(_) => {
+                                if guard.active_progress.contains(&params.token) {
+                                    // Duplicate begin: nothing changes.
+                                } else if guard.active_progress.len() < MAX_TRACKED_PROGRESS_TOKENS
+                                {
+                                    guard.active_progress.insert(params.token.clone());
+                                } else {
+                                    guard.progress_overflow =
+                                        guard.progress_overflow.saturating_add(1);
+                                }
+                            }
+                            WorkDoneProgress::End(_) => {
+                                if !guard.active_progress.remove(&params.token) {
+                                    // Probably the end of a begin dropped
+                                    // for capacity; an unmatched end still
+                                    // cannot push the count below zero.
+                                    guard.progress_overflow =
+                                        guard.progress_overflow.saturating_sub(1);
+                                }
+                            }
                             WorkDoneProgress::Report(_) => {}
                         }
                     }
@@ -339,9 +463,7 @@ impl LspServerInstance {
         }
     }
 
-    /// Full-text sync. First open sends didOpen; later changes send didChange.
-    /// Returns the new document version when the path is served by this
-    /// server's language, otherwise None (not served: no sync).
+    /// First open sends the complete document. Later changes follow negotiation.
     pub async fn sync_document(&self, path: &Path, text: String) -> Option<i64> {
         let path = crate::path_policy::existing_workspace_path(&self.config.root, path)?;
         let content = DocumentContent::from_text(text, FileStamp::for_path(&path));
@@ -353,71 +475,12 @@ impl LspServerInstance {
         path: &Path,
         content: Arc<DocumentContent>,
     ) -> Option<i64> {
-        let _document_sync = self.document_sync.lock().await;
-        let path = crate::path_policy::existing_workspace_path(&self.config.root, path)?;
-        let language_id = self.config.spec.language_id_for(&path)?;
-        let uri = file_uri(&path)?;
-        let update = {
-            let mut state = self.state.lock().await;
-            state
-                .documents
-                .upsert_content(path, uri.clone(), language_id, content)
-        };
-
-        match update {
-            DocumentUpdate::Opened { document, evicted } => {
-                Self::send_evicted_did_closes(&self.transport, &evicted).await;
-                let params = DidOpenTextDocumentParams {
-                    text_document: TextDocumentItem {
-                        uri: to_lsp_uri(&uri),
-                        language_id: language_id.to_owned(),
-                        version: wire_version(document.version),
-                        text: document.content.text().to_owned(),
-                    },
-                };
-                let _ = self
-                    .transport
-                    .notify(
-                        "textDocument/didOpen",
-                        serde_json::to_value(&params).unwrap_or(Value::Null),
-                    )
-                    .await;
-                Some(document.version)
-            }
-            DocumentUpdate::Changed { document, evicted } => {
-                Self::send_evicted_did_closes(&self.transport, &evicted).await;
-                let params = DidChangeTextDocumentParams {
-                    text_document: VersionedTextDocumentIdentifier {
-                        uri: to_lsp_uri(&uri),
-                        version: wire_version(document.version),
-                    },
-                    content_changes: vec![TextDocumentContentChangeEvent {
-                        range: None,
-                        range_length: None,
-                        text: document.content.text().to_owned(),
-                    }],
-                };
-                let _ = self
-                    .transport
-                    .notify(
-                        "textDocument/didChange",
-                        serde_json::to_value(&params).unwrap_or(Value::Null),
-                    )
-                    .await;
-                Some(document.version)
-            }
-            DocumentUpdate::Unchanged { version } => Some(version),
-        }
+        self.synchronize(path, content, None, false).await
     }
 
-    /// didChange + didSave for a file just written by the agent.
     pub async fn notify_file_changed(&self, path: &Path, text: String) {
-        let Some(path) = crate::path_policy::existing_workspace_path(&self.config.root, path)
-        else {
-            return;
-        };
-        let content = DocumentContent::from_text(text, FileStamp::for_path(&path));
-        self.notify_file_changed_content(&path, content).await;
+        let content = DocumentContent::from_text(text, FileStamp::for_path(path));
+        self.notify_file_changed_content(path, content).await;
     }
 
     pub(crate) async fn notify_file_changed_content(
@@ -425,101 +488,251 @@ impl LspServerInstance {
         path: &Path,
         content: Arc<DocumentContent>,
     ) {
-        let _document_sync = self.document_sync.lock().await;
-        let Some(path) = crate::path_policy::existing_workspace_path(&self.config.root, path)
-        else {
-            return;
+        self.synchronize(path, content, None, true).await;
+    }
+
+    pub(crate) async fn notify_file_updated_content(
+        &self,
+        path: &Path,
+        content: Arc<DocumentContent>,
+        patch: Option<&slim_core::codeintel::CodeIntelPatch>,
+    ) {
+        self.synchronize(path, content, patch, true).await;
+    }
+
+    async fn synchronize(
+        &self,
+        path: &Path,
+        content: Arc<DocumentContent>,
+        patch: Option<&slim_core::codeintel::CodeIntelPatch>,
+        save: bool,
+    ) -> Option<i64> {
+        let path = crate::path_policy::existing_workspace_path(&self.config.root, path)?;
+        let _document_sync = self.document_lock(&path).lock_owned().await;
+        let lifecycle = self.document_lifecycle.lock().await;
+        if self.transport.is_closed() {
+            return None;
+        }
+        let language_id = self.config.spec.language_id_for(&path)?;
+        let uri = file_uri(&path)?;
+        let (previous, mode, save_text, encoding) = {
+            let state = self.state.lock().await;
+            let sync = state
+                .caps
+                .as_ref()
+                .and_then(|caps| caps.text_document_sync.as_ref());
+            let (mode, save_text) = sync_contract(sync);
+            (
+                state.documents.get(&path).cloned(),
+                mode,
+                save_text,
+                state.encoding,
+            )
         };
-        let Some(language_id) = self.config.spec.language_id_for(&path) else {
-            return;
+        let _lifecycle = if previous.is_none() {
+            Some(lifecycle)
+        } else {
+            drop(lifecycle);
+            None
         };
-        let Some(uri) = file_uri(&path) else {
-            return;
+        if save && previous.is_none() {
+            return None;
+        }
+        if let Some(previous) = &previous {
+            if previous.content.text() == content.text() {
+                self.state
+                    .lock()
+                    .await
+                    .documents
+                    .upsert_content(path, uri, language_id, content);
+                return Some(previous.version);
+            }
+        }
+        let version = previous
+            .as_ref()
+            .map_or(Some(1), |doc| doc.version.checked_add(1))?;
+        if version > i32::MAX as i64 {
+            self.transport.invalidate();
+            return None;
+        }
+        // If this future is dropped after a frame, discard the connection: its
+        // peer may already have advanced even though our local commit did not.
+        let mut transaction = SyncTransaction {
+            transport: &self.transport,
+            committed: false,
         };
+        self.state.lock().await.diagnostics.invalidate(&uri);
+        if previous.is_none() {
+            let evicted = self
+                .state
+                .lock()
+                .await
+                .documents
+                .reserve_open(content.text().len());
+            Self::send_evicted_did_closes(&self.transport, &evicted)
+                .await
+                .ok()?;
+        }
+        let (method, params) = if let Some(previous) = &previous {
+            if mode == lsp_types::TextDocumentSyncKind::NONE {
+                // No change channel exists. Do not claim the new text is mirrored.
+                if save {
+                    if let Some(include_text) = save_text {
+                        self.send_save(&uri, &content, include_text).await.ok()?;
+                    }
+                }
+                transaction.committed = true;
+                return None;
+            }
+            let changes = if mode == lsp_types::TextDocumentSyncKind::INCREMENTAL {
+                patch
+                    .filter(|patch| patch.matches_before(previous.content.text()))
+                    .and_then(|patch| incremental_changes(patch, encoding))
+            } else {
+                None
+            };
+            (
+                "textDocument/didChange",
+                serde_json::to_value(DidChangeTextDocumentParams {
+                    text_document: VersionedTextDocumentIdentifier {
+                        uri: to_lsp_uri(&uri),
+                        version: wire_version(version),
+                    },
+                    content_changes: changes.unwrap_or_else(|| {
+                        vec![TextDocumentContentChangeEvent {
+                            range: None,
+                            range_length: None,
+                            text: content.text().to_owned(),
+                        }]
+                    }),
+                })
+                .ok()?,
+            )
+        } else {
+            (
+                "textDocument/didOpen",
+                serde_json::to_value(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: to_lsp_uri(&uri),
+                        language_id: language_id.to_owned(),
+                        version: wire_version(version),
+                        text: content.text().to_owned(),
+                    },
+                })
+                .ok()?,
+            )
+        };
+        self.transport.notify(method, params).await.ok()?;
+        if save {
+            if let Some(include_text) = save_text {
+                self.send_save(&uri, &content, include_text).await.ok()?;
+            }
+        }
         let update = {
             let mut state = self.state.lock().await;
-            if !state.documents.is_open(&path) {
-                return;
+            if self.transport.is_closed() {
+                return None;
+            }
+            if state.documents.get(&path).map(|doc| doc.version)
+                != previous.as_ref().map(|doc| doc.version)
+            {
+                // Eviction raced an in-flight update. Its increment cannot be
+                // replayed as a new open; rebuild on the next connection.
+                return None;
             }
             state
                 .documents
-                .upsert_content(path, uri.clone(), language_id, content)
+                .upsert_content(path, uri, language_id, content)
         };
-        let (document, evicted) = match update {
-            DocumentUpdate::Opened { document, evicted }
-            | DocumentUpdate::Changed { document, evicted } => (document, evicted),
-            DocumentUpdate::Unchanged { .. } => return,
+        let evicted = match update {
+            DocumentUpdate::Opened { evicted, .. } | DocumentUpdate::Changed { evicted, .. } => {
+                evicted
+            }
+            DocumentUpdate::Unchanged { .. } => Vec::new(),
         };
-        Self::send_evicted_did_closes(&self.transport, &evicted).await;
+        Self::send_evicted_did_closes(&self.transport, &evicted)
+            .await
+            .ok()?;
+        transaction.committed = true;
+        Some(version)
+    }
 
-        let did_change_params = DidChangeTextDocumentParams {
-            text_document: VersionedTextDocumentIdentifier {
-                uri: to_lsp_uri(&uri),
-                version: wire_version(document.version),
-            },
-            content_changes: vec![TextDocumentContentChangeEvent {
-                range: None,
-                range_length: None,
-                text: document.content.text().to_owned(),
-            }],
-        };
-        let _ = self
-            .transport
-            .notify(
-                "textDocument/didChange",
-                serde_json::to_value(&did_change_params).unwrap_or(Value::Null),
-            )
-            .await;
-        let save_params = DidSaveTextDocumentParams {
-            text_document: TextDocumentIdentifier {
-                uri: to_lsp_uri(&uri),
-            },
-            text: Some(document.content.text().to_owned()),
-        };
-        let _ = self
-            .transport
+    async fn send_save(
+        &self,
+        uri: &url::Url,
+        content: &DocumentContent,
+        include_text: bool,
+    ) -> Result<(), TransportError> {
+        self.transport
             .notify(
                 "textDocument/didSave",
-                serde_json::to_value(&save_params).unwrap_or(Value::Null),
+                serde_json::to_value(DidSaveTextDocumentParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: to_lsp_uri(uri),
+                    },
+                    text: include_text.then(|| content.text().to_owned()),
+                })
+                .map_err(|error| TransportError::Protocol(error.to_string()))?,
             )
-            .await;
+            .await
+    }
+
+    fn document_lock(&self, path: &Path) -> Arc<Mutex<()>> {
+        let mut locks = self.document_sync.lock().unwrap_or_else(|e| e.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(path).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(path.to_owned(), Arc::downgrade(&lock));
+        lock
     }
 
     /// Fire-and-forget didClose for a list of evicted documents (LRU eviction).
     async fn send_evicted_did_closes(
         transport: &LspTransport,
         evicted: &[crate::document::OpenDocument],
-    ) {
+    ) -> Result<(), TransportError> {
         for doc in evicted {
             let params = lsp_types::DidCloseTextDocumentParams {
                 text_document: lsp_types::TextDocumentIdentifier {
                     uri: to_lsp_uri(&doc.uri),
                 },
             };
-            let _ = transport
+            transport
                 .notify(
                     "textDocument/didClose",
                     serde_json::to_value(&params).unwrap_or(Value::Null),
                 )
-                .await;
+                .await?;
         }
+        Ok(())
     }
 
     /// didClose for a document (LRU eviction or shutdown path).
     pub async fn close_document(&self, path: &Path) {
-        let _document_sync = self.document_sync.lock().await;
         let Some(path) = crate::path_policy::existing_workspace_path(&self.config.root, path)
         else {
             return;
         };
+        let _document_sync = self.document_lock(&path).lock_owned().await;
+        let _lifecycle = self.document_lifecycle.lock().await;
+        if self.transport.is_closed() {
+            return;
+        }
         let Some(uri) = file_uri(&path) else {
             return;
+        };
+        let mut transaction = SyncTransaction {
+            transport: &self.transport,
+            committed: false,
         };
         let removed = {
             let mut state = self.state.lock().await;
             state.documents.remove(&path).is_some()
         };
         if !removed {
+            transaction.committed = true;
             return;
         }
         let params = DidCloseTextDocumentParams {
@@ -527,13 +740,14 @@ impl LspServerInstance {
                 uri: to_lsp_uri(&uri),
             },
         };
-        let _ = self
+        let result = self
             .transport
             .notify(
                 "textDocument/didClose",
                 serde_json::to_value(&params).unwrap_or(Value::Null),
             )
             .await;
+        transaction.committed = result.is_ok();
     }
 
     /// Low-level typed request used by the manager for LSP queries.
@@ -558,12 +772,20 @@ impl LspServerInstance {
 
     pub async fn document_version_async(&self, path: &Path) -> Option<i64> {
         let path = crate::path_policy::existing_workspace_path(&self.config.root, path)?;
+        let _document_sync = self.document_lock(&path).lock_owned().await;
+        if self.transport.is_closed() {
+            return None;
+        }
         let state = self.state.lock().await;
         state.documents.get(&path).map(|doc| doc.version)
     }
 
     pub async fn document_snapshot_async(&self, path: &Path) -> Option<(i64, String)> {
         let path = crate::path_policy::existing_workspace_path(&self.config.root, path)?;
+        let _document_sync = self.document_lock(&path).lock_owned().await;
+        if self.transport.is_closed() {
+            return None;
+        }
         let state = self.state.lock().await;
         state
             .documents
@@ -576,10 +798,14 @@ impl LspServerInstance {
         path: &Path,
     ) -> Option<(i64, Arc<DocumentContent>)> {
         let path = crate::path_policy::existing_workspace_path(&self.config.root, path)?;
-        let state = self.state.lock().await;
+        let _document_sync = self.document_lock(&path).lock_owned().await;
+        if self.transport.is_closed() {
+            return None;
+        }
+        let mut state = self.state.lock().await;
         state
             .documents
-            .get(&path)
+            .get_and_touch(&path)
             .map(|document| (document.version, Arc::clone(&document.content)))
     }
 
@@ -589,6 +815,10 @@ impl LspServerInstance {
         include_info: bool,
     ) -> Option<DiagnosticsSnapshot> {
         let path = crate::path_policy::url_workspace_path(&self.config.root, uri)?;
+        let _document_sync = self.document_lock(&path).lock_owned().await;
+        if self.transport.is_closed() {
+            return None;
+        }
         let uri = file_uri(&path)?;
         let state = self.state.lock().await;
         let stored = state.diagnostics.get(&uri)?;
@@ -600,6 +830,13 @@ impl LspServerInstance {
             .collect();
         Some(DiagnosticsSnapshot {
             version: stored.version,
+            stale: stored.stale,
+            total: if include_info {
+                stored.total
+            } else {
+                stored.total_without_info
+            },
+            truncated: stored.truncated,
             items,
         })
     }
@@ -621,6 +858,12 @@ impl LspServerInstance {
         state.diagnostics.uris().cloned().collect()
     }
 
+    pub async fn diagnostic_totals(&self, include_info: bool) -> (Option<usize>, bool, u64) {
+        let state = self.state.lock().await;
+        let (total, truncated) = state.diagnostics.totals(include_info);
+        (total, truncated, state.diagnostics.revision())
+    }
+
     pub fn language_id_for(&self, path: &Path) -> Option<&str> {
         self.config.spec.language_id_for(path)
     }
@@ -637,7 +880,7 @@ impl LspServerInstance {
                 state.ready,
                 state.encoding,
                 state.indexing_observed,
-                state.indexing_active,
+                state.indexing_active(),
                 state.documents.open_documents().len(),
                 state.diagnostics.len(),
             )
@@ -670,12 +913,20 @@ impl LspServerInstance {
                 let _ = request.await;
             }
         }
-        let _ = self.transport.notify("exit", json!(null)).await;
+        let _ = self
+            .transport
+            .notify_with_timeout("exit", json!(null), SHUTDOWN_REQUEST_GRACE)
+            .await;
         self.drain_task.abort();
     }
 
     pub fn root(&self) -> &Path {
         &self.config.root
+    }
+
+    /// Unique per process and never reused; a respawn always differs.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// True once the transport observed EOF or a framing error. The pool
@@ -705,20 +956,30 @@ fn server_request_handler(
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            // One answer per requested item, positions aligned: only our
-            // section carries settings, anything else is explicitly null.
+            // One answer per requested item, positions aligned. A section
+            // asks for the *content* under that key: wrapping the settings
+            // in `{ settings_section: ... }` again would double-nest them and
+            // the server would silently drop the real values. Subsections of
+            // ours resolve to their subtree; unrelated sections get null.
             Ok(Value::Array(
                 items
                     .iter()
-                    .map(|item| {
-                        let section = item.get("section").and_then(Value::as_str);
-                        if section.is_none_or(|section| section == settings_section) {
+                    .map(|item| match item.get("section").and_then(Value::as_str) {
+                        None | Some("") => {
                             let mut row = serde_json::Map::new();
                             row.insert(settings_section.clone(), settings.clone());
                             Value::Object(row)
-                        } else {
-                            Value::Null
                         }
+                        Some(section) if section == settings_section => settings.clone(),
+                        Some(section) => section
+                            .strip_prefix(settings_section.as_str())
+                            .and_then(|rest| rest.strip_prefix('.'))
+                            .and_then(|rest| {
+                                rest.split('.')
+                                    .try_fold(&settings, |node, key| node.get(key))
+                                    .cloned()
+                            })
+                            .unwrap_or(Value::Null),
                     })
                     .collect(),
             ))
@@ -742,6 +1003,211 @@ fn wire_version(version: i64) -> i32 {
 mod tests {
     use super::*;
 
+    fn sync_fixture(capacity: usize) -> (LspServerInstance, tokio::io::DuplexStream, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "slim-sync-fault-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("main.rs");
+        std::fs::write(&path, "old").unwrap();
+        let path = std::fs::canonicalize(path).unwrap();
+        let (client, server) = tokio::io::duplex(capacity);
+        let (transport, notifications) = LspTransport::new(
+            Box::new(client),
+            TransportOptions::default(),
+            server_request_handler(Value::Null, "test".into()),
+        );
+        let mut state = InstanceState::new(4);
+        state.ready = true;
+        state.caps = Some(serde_json::from_value(json!({"textDocumentSync": 2})).unwrap());
+        state
+            .documents
+            .upsert(path.clone(), file_uri(&path).unwrap(), "rust", "old".into());
+        let mut instance = LspServerInstance {
+            id: NEXT_INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            state: Arc::new(Mutex::new(state)),
+            document_sync: std::sync::Mutex::new(std::collections::HashMap::new()),
+            document_lifecycle: Mutex::new(()),
+            transport,
+            config: ServerInstanceConfig::for_rust_analyzer(
+                root,
+                crate::discovery::rust_analyzer_spec("unused".into()),
+            ),
+            stderr_tail: Arc::new(Mutex::new(String::new())),
+            drain_task: tokio::spawn(async {}),
+        };
+        instance.drain_task = instance.spawn_drain(notifications);
+        (instance, server, path)
+    }
+
+    #[tokio::test]
+    async fn failed_or_aborted_sync_never_commits_the_new_version() {
+        use tokio::io::AsyncReadExt;
+        for phase in ["before", "partial"] {
+            let (instance, mut server, path) = sync_fixture(32);
+            let future = instance.sync_document(&path, "new".repeat(200));
+            tokio::pin!(future);
+            if phase == "before" {
+                drop(server);
+                assert_eq!(future.as_mut().await, None);
+            } else {
+                // A nonempty prefix proves the frame actually started.
+                let mut prefix = [0u8; 8];
+                tokio::select! {
+                    result = &mut future => panic!("sync completed before frame drained: {result:?}"),
+                    result = server.read_exact(&mut prefix) => { result.unwrap(); },
+                }
+                drop(server);
+                assert_eq!(future.as_mut().await, None);
+            }
+            assert!(instance.is_closed());
+            assert_eq!(
+                instance
+                    .state
+                    .lock()
+                    .await
+                    .documents
+                    .get(&path)
+                    .unwrap()
+                    .version,
+                1
+            );
+            let _ = std::fs::remove_dir_all(&instance.config.root);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_sync_closes_generation_and_document_waiters_do_not_see_partial_state() {
+        use tokio::io::AsyncReadExt;
+        let (instance, mut server, path) = sync_fixture(32);
+        {
+            let future = instance.sync_document(&path, "new".repeat(200));
+            tokio::pin!(future);
+            let mut prefix = [0u8; 8];
+            tokio::select! {
+                result = &mut future => panic!("unexpected completion: {result:?}"),
+                result = server.read_exact(&mut prefix) => { result.unwrap(); },
+            }
+            let first = instance.document_content_snapshot_async(&path);
+            let second = instance.document_content_snapshot_async(&path);
+            tokio::pin!(first, second);
+            tokio::select! {
+                _ = &mut first => panic!("first query observed uncommitted sync"),
+                _ = &mut second => panic!("second query observed uncommitted sync"),
+                _ = tokio::task::yield_now() => {},
+            }
+            let other = instance.config.root.join("other.rs");
+            std::fs::write(&other, "other").unwrap();
+            assert_eq!(instance.document_version_async(&other).await, None);
+        }
+        assert!(instance.is_closed());
+        assert_eq!(
+            instance
+                .state
+                .lock()
+                .await
+                .documents
+                .get(&path)
+                .unwrap()
+                .version,
+            1
+        );
+        assert!(instance
+            .document_content_snapshot_async(&path)
+            .await
+            .is_none());
+        let _ = std::fs::remove_dir_all(&instance.config.root);
+    }
+
+    #[test]
+    #[ignore = "release CPU measurement of actual incremental range conversion and serialization"]
+    fn measure_incremental_range_serialization() {
+        use slim_core::codeintel::{CodeIntelEditPosition, CodeIntelPatch, CodeIntelTextEdit};
+        use std::time::Instant;
+        fn stats(label: &str, samples: &mut [u128]) {
+            samples.sort_unstable();
+            println!(
+                "{label} n={} median_ns={} min_ns={} max_ns={}",
+                samples.len(),
+                samples[samples.len() / 2],
+                samples[0],
+                samples[samples.len() - 1]
+            );
+        }
+        for size in [1024usize, 64 * 1024, 1024 * 1024] {
+            for replacement_bytes in [8usize, 4096] {
+                let before = format!("fn old() {{}}\n//{}", "x".repeat(size));
+                let replacement = "z".repeat(replacement_bytes);
+                let after = before.replacen("old", &replacement, 1);
+                let patch = CodeIntelPatch::new(
+                    &before,
+                    vec![CodeIntelTextEdit {
+                        start: CodeIntelEditPosition {
+                            line: 0,
+                            prefix: "fn ".into(),
+                        },
+                        end: CodeIntelEditPosition {
+                            line: 0,
+                            prefix: "fn old".into(),
+                        },
+                        text: replacement,
+                    }],
+                );
+                let mut ranges = Vec::new();
+                let mut guards = Vec::new();
+                let mut full_json = Vec::new();
+                let mut incremental_json = Vec::new();
+                for _ in 0..101 {
+                    let start = Instant::now();
+                    let changes = std::hint::black_box(
+                        incremental_changes(std::hint::black_box(&patch), PositionEncoding::Utf16)
+                            .unwrap(),
+                    );
+                    ranges.push(start.elapsed().as_nanos());
+                    let start = Instant::now();
+                    assert!(std::hint::black_box(
+                        patch.matches_before(std::hint::black_box(&before))
+                    ));
+                    guards.push(start.elapsed().as_nanos());
+                    for (events, times) in [
+                        (
+                            vec![TextDocumentContentChangeEvent {
+                                range: None,
+                                range_length: None,
+                                text: after.clone(),
+                            }],
+                            &mut full_json,
+                        ),
+                        (changes, &mut incremental_json),
+                    ] {
+                        let params = DidChangeTextDocumentParams {
+                            text_document: VersionedTextDocumentIdentifier {
+                                uri: "file:///fixture.rs".parse().unwrap(),
+                                version: 2,
+                            },
+                            content_changes: events,
+                        };
+                        let start = Instant::now();
+                        let value = serde_json::to_value(&params).unwrap();
+                        let bytes = serde_json::to_vec(&json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":value})).unwrap();
+                        std::hint::black_box(bytes);
+                        times.push(start.elapsed().as_nanos());
+                    }
+                }
+                let label = format!("size={size} replacement={replacement_bytes}");
+                stats(&format!("{label} range_codec"), &mut ranges);
+                stats(&format!("{label} before_digest_guard"), &mut guards);
+                stats(&format!("{label} full_json"), &mut full_json);
+                stats(&format!("{label} incremental_json"), &mut incremental_json);
+            }
+        }
+    }
+
     fn progress_notification(token: serde_json::Value, kind: &str) -> ServerNotification {
         ServerNotification {
             method: "$/progress".to_owned(),
@@ -754,22 +1220,38 @@ mod tests {
 
     #[test]
     fn configuration_answers_per_requested_section() {
-        let handler =
-            server_request_handler(json!({ "checkOnSave": false }), "rust-analyzer".into());
+        let handler = server_request_handler(
+            json!({ "checkOnSave": false, "cargo": { "allTargets": true } }),
+            "rust-analyzer".into(),
+        );
         let response = handler(
             "workspace/configuration",
-            Some(&json!({ "items": [{ "section": "rust-analyzer" }, { "section": "other" }] })),
+            Some(&json!({
+                "items": [
+                    { "section": "rust-analyzer" },
+                    { "section": "rust-analyzer.cargo" },
+                    { "section": "rust-analyzer.check" },
+                    { "section": "rust-analyzerX" },
+                    { "section": "other" },
+                    {},
+                ]
+            })),
         )
         .expect("configuration answered");
         assert_eq!(
             response,
-            json!([{ "rust-analyzer": { "checkOnSave": false } }, null])
+            json!([
+                { "checkOnSave": false, "cargo": { "allTargets": true } },
+                { "allTargets": true },
+                null,
+                null,
+                null,
+                { "rust-analyzer": { "checkOnSave": false, "cargo": { "allTargets": true } } },
+            ]),
+            "section content must be answered verbatim, never re-wrapped"
         );
-        let empty = handler(
-            "workspace/configuration",
-            Some(&json!({ "items": [] })),
-        )
-        .expect("empty configuration answered");
+        let empty = handler("workspace/configuration", Some(&json!({ "items": [] })))
+            .expect("empty configuration answered");
         assert_eq!(empty, json!([]));
         assert!(handler("client/registerCapability", None).is_err());
         assert_eq!(
@@ -791,7 +1273,7 @@ mod tests {
         {
             let guard = state.lock().await;
             assert!(guard.indexing_observed);
-            assert!(guard.indexing_active);
+            assert!(guard.indexing_active());
         }
         LspServerInstance::handle_notification(
             &state,
@@ -799,14 +1281,35 @@ mod tests {
             progress_notification(serde_json::json!("rustAnalyzer/Roots Scanned"), "report"),
         )
         .await;
-        assert!(state.lock().await.indexing_active);
+        assert!(state.lock().await.indexing_active());
         LspServerInstance::handle_notification(
             &state,
             root,
             progress_notification(serde_json::json!("rustAnalyzer/Roots Scanned"), "end"),
         )
         .await;
-        assert!(!state.lock().await.indexing_active);
+        assert!(!state.lock().await.indexing_active());
+    }
+
+    #[tokio::test]
+    async fn one_tokens_end_does_not_close_another_tokens_begin() {
+        let state = Arc::new(Mutex::new(InstanceState::new(8)));
+        let root = Path::new("D:/demo");
+        for (token, kind) in [
+            ("rustAnalyzer/Roots Scanned", "begin"),
+            ("rustAnalyzer/Indexing", "begin"),
+            ("rustAnalyzer/Roots Scanned", "end"),
+        ] {
+            LspServerInstance::handle_notification(
+                &state,
+                root,
+                progress_notification(serde_json::json!(token), kind),
+            )
+            .await;
+        }
+        let guard = state.lock().await;
+        assert!(guard.indexing_active(), "the Indexing token is still open");
+        assert_eq!(guard.active_progress.len(), 1);
     }
 
     #[tokio::test]
@@ -821,6 +1324,6 @@ mod tests {
         .await;
         let guard = state.lock().await;
         assert!(!guard.indexing_observed);
-        assert!(!guard.indexing_active);
+        assert!(!guard.indexing_active());
     }
 }

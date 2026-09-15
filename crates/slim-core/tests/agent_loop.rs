@@ -1,3 +1,6 @@
+#[path = "../../../tests/support/budget_finalization.rs"]
+mod budget_finalization;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -38,6 +41,11 @@ fn code_intel_fixture_outcome(label: &str, elapsed_ms: u64) -> CodeIntelOutcome 
 
 #[async_trait]
 impl CodeIntelligence for DelayedCodeIntel {
+    fn supports_workspace(&self, workspace: &Path) -> bool {
+        std::fs::read_to_string(workspace.join("intel-availability.txt"))
+            .map_or(true, |value| value == "on")
+    }
+
     async fn status(&self, _workspace: &Path) -> CodeIntelOutcome {
         code_intel_fixture_outcome("status", 0)
     }
@@ -72,8 +80,25 @@ impl CodeIntelligence for DelayedCodeIntel {
     async fn notify_file_changed(&self, _workspace: &Path, _path: &Path, _text: Option<String>) {}
 }
 
+fn strip_channel_from_user_items(json: &mut Value, items: &str) {
+    const MARKER: &str = "\n\nHarness channel:";
+    let Some(array) = json.get_mut(items).and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in array {
+        if item.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        if let Some(content) = item.get("content").and_then(Value::as_str) {
+            if let Some(at) = content.find(MARKER) {
+                item["content"] = Value::String(content[..at].into());
+            }
+        }
+    }
+}
+
 fn accept_with_deadline(listener: &TcpListener) -> TcpStream {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -126,7 +151,650 @@ fn read_http_request(stream: &mut TcpStream) -> String {
 }
 
 #[test]
+fn provider_catalog_refreshes_when_tool_work_changes_backend_availability() {
+    let root = std::env::temp_dir().join(format!("slim-catalog-refresh-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("workspace");
+    std::fs::write(root.join("intel-availability.txt"), "off").expect("initial state");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+    let server = thread::spawn(move || {
+        for turn in 0..3 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            let wire: Value = serde_json::from_str(request.split_once("\r\n\r\n").expect("body").1)
+                .expect("JSON");
+            let advertised = wire["tools"]
+                .as_array()
+                .expect("tools")
+                .iter()
+                .any(|tool| tool["function"]["name"] == "code_intel");
+            assert_eq!(advertised, turn == 1, "catalog at turn {turn}");
+            let (delta, stop) = if turn == 2 {
+                (json!({"content":"done"}), "stop")
+            } else {
+                let (expected, content) = if turn == 0 {
+                    ("off", "on")
+                } else {
+                    ("on", "off")
+                };
+                (
+                    json!({"tool_calls":[{"index":0,"id":format!("catalog-{turn}"),"function":{"name":"write",
+                    "arguments":json!({"path":"intel-availability.txt","content":content,"expected":expected}).to_string()}}]}),
+                    "tool_calls",
+                )
+            };
+            let event = json!({"choices":[{"delta":delta,"finish_reason":stop}]});
+            let response = format!("data: {event}\n\ndata: [DONE]\n\n");
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).expect("response");
+        }
+    });
+    let client = HttpProviderClient::new(
+        OpenAiCompatibleAdapter::new(ProviderConfig::openai(&endpoint, "fixture", "fixture"))
+            .expect("adapter"),
+        Duration::from_secs(3),
+    )
+    .expect("client");
+    let mut runtime = Runtime::new();
+    runtime.set_code_intelligence(Arc::new(DelayedCodeIntel));
+    let result = tokio::runtime::Runtime::new()
+        .expect("tokio")
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "Update the project.",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig::default(),
+        ))
+        .expect("loop");
+    server.join().expect("server");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(result.tool_results.len(), 2);
+    assert!(result.tool_results.iter().all(|tool| tool.success));
+    std::fs::remove_dir_all(&root).expect("remove own fixture");
+}
+
+#[test]
+fn deepseek_thinking_replays_exact_scoped_state_after_native_tools() {
+    use slim_core::provider::OpenCodeGoAdapter;
+    let root = std::env::temp_dir().join(format!("slim-chat-thinking-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("workspace");
+    std::fs::write(root.join("source.txt"), "verified source\n").expect("source");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+    let server = thread::spawn(move || {
+        for turn in 0..2 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            let wire: Value = serde_json::from_str(request.split_once("\r\n\r\n").expect("body").1)
+                .expect("JSON");
+            assert_eq!(wire["thinking"], json!({"type":"enabled"}));
+            assert_eq!(wire["reasoning_effort"], "high");
+            let deltas = if turn == 0 {
+                vec![
+                    json!({"reasoning_content":"state fixture-"}),
+                    json!({"reasoning_content":"key kept intact"}),
+                    json!({"tool_calls":[{"index":0,"id":"read-1","function":{"name":"read","arguments":"{\"path\":\"source.txt\"}"}}]}),
+                ]
+            } else {
+                let history = wire["messages"].as_array().expect("messages");
+                let assistant = history
+                    .iter()
+                    .find(|m| m["role"] == "assistant")
+                    .expect("assistant");
+                assert_eq!(
+                    assistant["reasoning_content"],
+                    "state fixture-key kept intact"
+                );
+                assert_eq!(assistant["tool_calls"][0]["id"], "read-1");
+                assert!(history.last().unwrap()["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("verified source"));
+                vec![
+                    json!({"reasoning_content":"final state"}),
+                    json!({"content":"done"}),
+                ]
+            };
+            let mut response = String::new();
+            for delta in deltas {
+                response.push_str(&format!(
+                    "data: {}\n\n",
+                    json!({"choices":[{"delta":delta,"finish_reason":null}]})
+                ));
+            }
+            response.push_str(&format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices":[{"delta":{},"finish_reason":if turn == 0 {"tool_calls"} else {"stop"}}]})));
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).expect("response");
+        }
+    });
+    let adapter =
+        OpenCodeGoAdapter::new(&endpoint, "deepseek-v4-flash", "fixture-key", Some("high"))
+            .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(3)).expect("client");
+    let mut runtime = Runtime::new();
+    let result = tokio::runtime::Runtime::new()
+        .expect("tokio")
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "Read source.txt.",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig::default(),
+        ))
+        .expect("loop");
+    server.join().expect("server");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert!(result.tool_results[0].success);
+    let history = runtime.conversation();
+    assert!(history[1].chat_reasoning.is_some());
+    assert!(history.last().unwrap().chat_reasoning.is_some());
+    assert!(!format!("{history:?}").contains("fixture-key"));
+    assert!(!format!("{:?}", runtime.app.events()).contains("fixture-key"));
+    assert!(!slim_core::context::has_compactable_history(&history[..3]));
+    for (endpoint, model, key) in [
+        (endpoint.as_str(), "deepseek-v4-flash", "different-key"),
+        (endpoint.as_str(), "deepseek-v4-pro", "fixture-key"),
+        (
+            "https://elsewhere.invalid/v1",
+            "deepseek-v4-flash",
+            "fixture-key",
+        ),
+    ] {
+        let foreign = OpenCodeGoAdapter::new(endpoint, model, key, Some("high")).unwrap();
+        let request = foreign
+            .prepare_messages_request_with_tools_checked(history, &[])
+            .unwrap();
+        let wire: Value = serde_json::from_slice(request.body()).unwrap();
+        assert!(wire["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .all(|m| m["reasoning_content"] == ""));
+    }
+    std::fs::remove_dir_all(&root).expect("remove own fixture");
+}
+
+#[test]
+fn compact_tool_results_preserve_a_complete_task_across_provider_wires() {
+    use slim_core::provider::{
+        ClinePassAdapter, CommandCodeAdapter, OpenCodeGoAdapter, ProviderKind, XaiAdapter,
+    };
+
+    let root = std::env::temp_dir().join(format!("slim-token-economy-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("src")).expect("src");
+    let paths = (0..20)
+        .map(|index| Path::new("src").join(format!("ação-{index:02}.rs")))
+        .collect::<Vec<_>>();
+    let line = "fn reconstruir_contexto() { persistir_checkpoint(); }";
+    let source = format!("{line}\n").repeat(20);
+    for (index, path) in paths.iter().enumerate() {
+        std::fs::write(root.join(path), if index == 0 { &source } else { "" }).expect("file");
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+    let server = thread::spawn(move || {
+        let mut captures = Vec::new();
+        for turn in 0..4 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            let body = request.split_once("\r\n\r\n").expect("body").1.to_owned();
+            let wire: Value = serde_json::from_str(&body).expect("json");
+            let (delta, stop) = if turn == 3 {
+                let text = wire["messages"]
+                    .as_array()
+                    .expect("messages")
+                    .last()
+                    .expect("read")["content"]
+                    .as_str()
+                    .expect("text");
+                assert_eq!(text, format!("{line}\n").repeat(20));
+                (
+                    json!({"content":"Found and read the implementation."}),
+                    "stop",
+                )
+            } else {
+                let (name, args) = match turn {
+                    0 => ("list", json!({"path":"src"})),
+                    1 => (
+                        "search",
+                        json!({"path":"src","patterns":["reconstruir_contexto","persistir_checkpoint"]}),
+                    ),
+                    _ => {
+                        // Use the returned list entry verbatim, as the next tool argument.
+                        let listing = wire["messages"]
+                            .as_array()
+                            .expect("messages")
+                            .iter()
+                            .find(|message| message["role"] == "tool" && message["name"] == "list")
+                            .expect("list result");
+                        let path = listing["content"]
+                            .as_str()
+                            .expect("list")
+                            .lines()
+                            .next()
+                            .expect("entry");
+                        ("read", json!({"path":path}))
+                    }
+                };
+                (
+                    json!({"tool_calls":[{"index":0,"id":format!("economy-{turn}"),"function":{"name":name,"arguments":args.to_string()}}]}),
+                    "tool_calls",
+                )
+            };
+            captures.push(body);
+            let event = json!({"choices":[{"delta":delta,"finish_reason":stop}]});
+            let response = format!("data: {event}\n\ndata: [DONE]\n\n");
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).expect("response");
+        }
+        captures
+    });
+    let config = ProviderConfig::openai(&endpoint, "fixture-model", "fixture-key");
+    let client = HttpProviderClient::new(
+        OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+            &endpoint,
+            "fixture-model",
+            "fixture-key",
+        ))
+        .expect("chat"),
+        Duration::from_secs(3),
+    )
+    .expect("client");
+    let mut runtime = Runtime::new();
+    let result = tokio::runtime::Runtime::new()
+        .expect("tokio")
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "Locate and read the implementation. Preserve files.",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig::default(),
+        ))
+        .expect("loop");
+    let captures = server.join().expect("server");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(result.turns, 4);
+    assert_eq!(result.tool_results.len(), 3);
+    assert!(result
+        .tool_results
+        .iter()
+        .all(|tool| tool.success && tool.artifact.is_none()));
+    assert_eq!(
+        std::fs::read_to_string(root.join(&paths[0])).expect("source"),
+        source
+    );
+    let snapshot_chars = runtime
+        .app
+        .events()
+        .iter()
+        .filter_map(|event| match event.kind {
+            EventKind::ContextSnapshot {
+                serialized_chars, ..
+            } => Some(serialized_chars),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        snapshot_chars,
+        captures
+            .iter()
+            .map(|body| body.chars().count() as u64)
+            .collect::<Vec<_>>()
+    );
+
+    // Reconstruct only the old renderings; keep requests, arguments and task
+    // sequence identical. This is a byte comparison, not model-quality usage.
+    let canonical = std::fs::canonicalize(&root).expect("canonical");
+    let old_list = paths
+        .iter()
+        .map(|path| canonical.join(path).display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let new_list = &result.tool_results[0].output;
+    assert_eq!(
+        new_list,
+        &paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let mut old_hits = Vec::new();
+    for number in 1..=20 {
+        for (index, pattern) in ["reconstruir_contexto", "persistir_checkpoint"]
+            .iter()
+            .enumerate()
+        {
+            old_hits.push(format!(
+                "[pattern {}: {pattern}] {}:{number}: {line}\n",
+                index + 1,
+                paths[0].display()
+            ));
+        }
+    }
+    let new_search = &result.tool_results[1].output;
+    let footer = new_search.rsplit_once('\n').expect("skip footer").1;
+    let old_search = format!("{}\n{footer}", old_hits.join("\n"));
+    println!(
+        "tool content: list before={} after={}; search before={} after={} bytes",
+        old_list.len(),
+        new_list.len(),
+        old_search.len(),
+        new_search.len()
+    );
+    let history = runtime.conversation();
+    let mut old_history = history.to_vec();
+    old_history[2].content.clone_from(&old_list);
+    old_history[4].content.clone_from(&old_search);
+    let old_read = (1..=20)
+        .map(|number| format!("{number}: {line}\n"))
+        .collect::<String>();
+    old_history[6].content.clone_from(&old_read);
+    let tools = runtime.advertised_tool_definitions(OperatingMode::Auto);
+    let mut adapters: Vec<Box<dyn ProviderAdapter>> = vec![
+        Box::new(OpenAiCompatibleAdapter::new(config).expect("chat")),
+        Box::new(
+            OpenAiCodexAdapter::new(ProviderConfig::openai_codex(
+                &endpoint,
+                "gpt-5.6-terra",
+                "fixture-key",
+                "fixture-account",
+            ))
+            .expect("codex"),
+        ),
+        Box::new(
+            AnthropicAdapter::new(ProviderConfig::anthropic(
+                &endpoint,
+                "claude-sonnet-4-6",
+                "fixture-key",
+            ))
+            .expect("messages"),
+        ),
+        Box::new(XaiAdapter::new(&endpoint, "grok-4.5", "fixture-key", Some("high")).expect("xai")),
+        Box::new(
+            ClinePassAdapter::new(
+                &endpoint,
+                "cline-pass/qwen3.7-max",
+                "fixture-key",
+                Some("high"),
+            )
+            .expect("cline"),
+        ),
+    ];
+    for model in ["deepseek-v4-flash", "gpt-5.6-luna", "minimax-m3"] {
+        adapters.push(Box::new(
+            OpenCodeGoAdapter::new(&endpoint, model, "fixture-key", Some("high")).expect("go"),
+        ));
+    }
+    for model in ["gpt-5.6-sol", "claude-sonnet-4-6"] {
+        adapters.push(Box::new(
+            CommandCodeAdapter::new(&endpoint, model, "fixture-key", Some("high"))
+                .expect("command"),
+        ));
+    }
+    for adapter in adapters {
+        let mut before_bytes = 0;
+        let mut after_bytes = 0;
+        for (turn, length) in [1, 3, 5, 7].into_iter().enumerate() {
+            let before = adapter
+                .prepare_messages_request_with_tools_checked(&old_history[..length], &tools)
+                .expect("before");
+            let after = adapter
+                .prepare_messages_request_with_tools_checked(&history[..length], &tools)
+                .expect("after");
+            let mut before_json: Value =
+                serde_json::from_slice(before.body()).expect("before json");
+            let after_json: Value = serde_json::from_slice(after.body()).expect("after json");
+            // Restore only the changed tool-result fields and compare all
+            // other wire content, including IDs, schemas and native cache intent.
+            let items = if adapter.wire_kind() == ProviderKind::OpenAiCodex {
+                "input"
+            } else {
+                "messages"
+            };
+            for item in before_json[items].as_array_mut().expect("items") {
+                let output = match adapter.wire_kind() {
+                    ProviderKind::OpenAiCodex if item["type"] == "function_call_output" => {
+                        Some(&mut item["output"])
+                    }
+                    ProviderKind::Anthropic if item["content"][0]["type"] == "tool_result" => {
+                        Some(&mut item["content"][0]["content"])
+                    }
+                    ProviderKind::OpenAiCompatible if item["role"] == "tool" => {
+                        Some(&mut item["content"])
+                    }
+                    _ => None,
+                };
+                if let Some(output) = output {
+                    if output.as_str() == Some(&old_list) {
+                        *output = json!(new_list);
+                    }
+                    if output.as_str() == Some(&old_search) {
+                        *output = json!(new_search);
+                    }
+                    if output.as_str() == Some(&old_read) {
+                        *output = json!(source);
+                    }
+                }
+            }
+            assert_eq!(before_json, after_json, "{:?} turn {turn}", adapter.kind());
+            if adapter.kind() == ProviderKind::OpenAiCompatible {
+                let mut captured: Value =
+                    serde_json::from_slice(captures[turn].as_bytes()).expect("captured json");
+                strip_channel_from_user_items(&mut captured, items);
+                assert_eq!(
+                    after_json, captured,
+                    "prepared body is the actual HTTP body"
+                );
+            }
+            before_bytes += before.body().len();
+            after_bytes += after.body().len();
+        }
+        assert!(after_bytes < before_bytes);
+        println!(
+            "{:?}/{:?}/{}: requests=4 before={} after={} avoided={} bytes",
+            adapter.kind(),
+            adapter.wire_kind(),
+            adapter.model(),
+            before_bytes,
+            after_bytes,
+            before_bytes - after_bytes
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn patch_recovery_returns_locations_and_crlf_receipt_to_the_next_request() {
+    let root = std::env::temp_dir().join(format!("slim-patch-recovery-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("root");
+    std::fs::write(root.join("fixture.txt"), "header\r\nsame\r\nsame\r\ntail").expect("fixture");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        for turn in 0..4 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            let wire: Value = serde_json::from_str(request.split_once("\r\n\r\n").expect("body").1)
+                .expect("json");
+            let messages = wire["messages"].as_array().expect("messages");
+            if turn > 0 {
+                let output = messages.last().expect("tool result");
+                assert_eq!(output["role"], "tool");
+                assert_eq!(output["tool_call_id"], format!("edit-{}", turn - 1));
+                let text = output["content"].as_str().expect("content");
+                match turn {
+                    1 => assert_eq!(text, "header\r\nsame\r\nsame\r\ntail"),
+                    2 => {
+                        assert!(text.contains("lines 2, 3"), "{text}");
+                        assert!(text.contains("unchanged"), "{text}");
+                    }
+                    3 => {
+                        assert!(text.contains("fixture.txt:1"), "{text}");
+                        assert!(text.contains("LF input normalized to CRLF"), "{text}");
+                        let call = &messages[messages.len() - 2]["tool_calls"][0];
+                        let args: Value = serde_json::from_str(
+                            call["function"]["arguments"].as_str().expect("arguments"),
+                        )
+                        .expect("args");
+                        assert_eq!(args["expected"], "header\nsame\n");
+                        assert_eq!(args["replacement"], "header\nnew\n");
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let (delta, stop) = if turn == 3 {
+                (json!({"content":"Edited the first occurrence."}), "stop")
+            } else {
+                let (name, args) = match turn {
+                    0 => ("read", json!({"path":"fixture.txt"})),
+                    1 => (
+                        "patch",
+                        json!({"path":"fixture.txt", "expected":"same\n", "replacement":"new\n"}),
+                    ),
+                    _ => (
+                        "patch",
+                        json!({"path":"fixture.txt", "expected":"header\nsame\n", "replacement":"header\nnew\n"}),
+                    ),
+                };
+                (
+                    json!({"tool_calls":[{"index":0,"id":format!("edit-{turn}"),"function":{"name":name,"arguments":args.to_string()}}]}),
+                    "tool_calls",
+                )
+            };
+            let event = json!({"choices":[{"delta":delta}]});
+            let terminal = json!({"choices":[{"delta":{},"finish_reason":stop}]});
+            let body = format!("data: {event}\n\ndata: {terminal}\n\ndata: [DONE]\n\n");
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).expect("response");
+        }
+    });
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+    let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let mut runtime = Runtime::new();
+    let result = tokio_runtime
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "Edit the first occurrence",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig::default(),
+        ))
+        .expect("loop");
+    server.join().expect("server");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(result.turns, 4);
+    assert_eq!(
+        result
+            .tool_results
+            .iter()
+            .map(|result| result.success)
+            .collect::<Vec<_>>(),
+        [true, false, true]
+    );
+    assert_eq!(
+        std::fs::read(root.join("fixture.txt")).expect("bytes"),
+        b"header\r\nnew\r\nsame\r\ntail"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn superseded_read_output_is_elided_from_later_requests() {
+    let root = std::env::temp_dir().join(format!("slim-elision-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("root");
+    std::fs::write(
+        root.join("fixture.txt"),
+        "original bytes that will be overwritten entirely\n".repeat(4),
+    )
+    .expect("fixture");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        for turn in 0..3 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            let wire: Value = serde_json::from_str(request.split_once("\r\n\r\n").expect("body").1)
+                .expect("json");
+            let messages = wire["messages"].as_array().expect("messages");
+            if turn == 2 {
+                let read_result = messages
+                    .iter()
+                    .find(|message| {
+                        message["role"] == "tool" && message["tool_call_id"] == "read-0"
+                    })
+                    .expect("retained read result");
+                assert_eq!(
+                    read_result["content"].as_str().expect("content"),
+                    "[superseded read output elided; fixture.txt was overwritten by a later write]"
+                );
+            }
+            let (delta, stop) = match turn {
+                0 => (
+                    json!({"tool_calls":[{"index":0,"id":"read-0","function":{"name":"read","arguments":"{\"path\":\"fixture.txt\"}"}}]}),
+                    "tool_calls",
+                ),
+                1 => (
+                    json!({"tool_calls":[{"index":0,"id":"write-1","function":{"name":"write","arguments":"{\"path\":\"fixture.txt\",\"content\":\"replaced\\n\"}"}}]}),
+                    "tool_calls",
+                ),
+                _ => (json!({"content":"Done."}), "stop"),
+            };
+            let event = json!({"choices":[{"delta":delta}]});
+            let terminal = json!({"choices":[{"delta":{},"finish_reason":stop}]});
+            let body = format!("data: {event}\n\ndata: {terminal}\n\ndata: [DONE]\n\n");
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).expect("response");
+        }
+    });
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+    let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let mut runtime = Runtime::new();
+    let result = tokio_runtime
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "Replace the fixture",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig::default(),
+        ))
+        .expect("loop");
+    server.join().expect("server");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(result.turns, 3);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn ask_question_returns_the_selected_answer_to_the_provider_in_the_same_loop() {
+    question_round_trip(false);
+}
+
+#[test]
+fn truncation_after_question_recovers_without_asking_again() {
+    question_round_trip(true);
+}
+
+fn question_round_trip(truncate_after_answer: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("address");
@@ -138,6 +806,8 @@ fn ask_question_returns_the_selected_answer_to_the_provider_in_the_same_loop() {
             .expect("first request");
         let first_request = String::from_utf8_lossy(&first_request[..first_size]);
         assert!(first_request.contains("\"name\":\"ask_question\""));
+        assert!(first_request.contains("Harness channel: Auto, interactive"));
+        assert!(!first_request.contains("unattended"));
         let tool_call = json!({
             "choices": [{
                 "delta": {
@@ -180,6 +850,24 @@ fn ask_question_returns_the_selected_answer_to_the_provider_in_the_same_loop() {
         assert!(second_request.contains("\\\"answer\\\":\\\"core\\\""));
         assert!(second_request.contains("\\\"source\\\":\\\"option\\\""));
         assert!(second_request.contains("\\\"option_index\\\":0"));
+        if truncate_after_answer {
+            let body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Planning the selected change\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n";
+            second_stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).expect("truncated response");
+            drop(second_stream);
+            second_stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut second_stream);
+            let wire: Value = serde_json::from_str(request.split_once("\r\n\r\n").expect("body").1)
+                .expect("JSON");
+            assert_eq!(wire["max_tokens"], 16_384);
+            let messages = wire["messages"].as_array().expect("messages");
+            assert_eq!(messages.iter().filter(|m| m["role"] == "tool").count(), 1);
+            assert!(request.contains("question-call-1"));
+            assert!(request.contains("\\\"answer\\\":\\\"core\\\""));
+            assert!(messages.last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains("one small next step"));
+        }
         let final_body = "data: {\"choices\":[{\"delta\":{\"content\":\"Selected core\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         let final_response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -226,7 +914,8 @@ fn ask_question_returns_the_selected_answer_to_the_provider_in_the_same_loop() {
             std::env::temp_dir(),
             1,
             AgentLoopConfig {
-                max_turns: 2,
+                max_turns: if truncate_after_answer { 3 } else { 2 },
+                context_window_tokens: 128_000,
                 max_mutating_tool_calls: 1,
                 ..AgentLoopConfig::default()
             },
@@ -437,7 +1126,7 @@ fn repeated_failed_tool_call_stops_the_multi_turn_loop() {
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
                 )
                 .expect("headers");
-            let event = json!({
+            let mut event = json!({
                 "choices": [{
                     "delta": {
                         "tool_calls": [{
@@ -455,6 +1144,11 @@ fn repeated_failed_tool_call_stops_the_multi_turn_loop() {
                     }
                 }]
             });
+            event["choices"][0]["delta"]["tool_calls"].as_array_mut().unwrap().push(json!({
+                "index": 1, "id": "later-failed-read", "function": {
+                    "name": "read", "arguments": json!({"path": "another-missing-file.txt"}).to_string()
+                }
+            }));
             stream
                 .write_all(format!("data: {event}\n\n").as_bytes())
                 .expect("tool");
@@ -497,7 +1191,16 @@ fn repeated_failed_tool_call_stops_the_multi_turn_loop() {
 
     assert_eq!(result.stop, AgentLoopStop::RepeatedFailedTool);
     assert_eq!(result.turns, 2);
-    assert_eq!(result.tool_results.len(), 2);
+    assert_eq!(result.tool_results.len(), 4);
+    assert_eq!(
+        runtime
+            .conversation()
+            .iter()
+            .filter(|message| message.role == "tool")
+            .count(),
+        4,
+        "every executed call must retain its result before stopping"
+    );
     assert_eq!(result.usage.total_input_tokens(), 10);
     assert_eq!(result.usage.output_tokens, 4);
     assert!(runtime
@@ -550,6 +1253,7 @@ fn tool_limit_blocks_excess_mutating_calls_before_execution() {
             body
         );
         stream.write_all(response.as_bytes()).expect("response");
+        budget_finalization::reject_budget_finalization(&listener);
     });
 
     let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
@@ -638,11 +1342,17 @@ fn tool_limit_blocks_excess_mutating_calls_before_execution() {
     assert!(executor_ids
         .windows(2)
         .all(|pair| pair[0].0 == pair[1].0 && pair[0].1 == pair[1].1));
+    let tool_messages = runtime
+        .conversation()
+        .iter()
+        .filter(|msg| msg.role == "tool")
+        .count();
+    assert_eq!(tool_messages, 1);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn one_provider_batch_executes_tools_serially_in_source_order() {
+fn one_provider_batch_runs_disjoint_mutations_with_ordered_results() {
     let root = std::env::temp_dir().join(format!("slim-serial-tool-order-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("root");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -671,6 +1381,7 @@ fn one_provider_batch_executes_tools_serially_in_source_order() {
             body
         );
         stream.write_all(response.as_bytes()).expect("response");
+        budget_finalization::reject_budget_finalization(&listener);
     });
 
     let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
@@ -735,19 +1446,38 @@ fn one_provider_batch_executes_tools_serially_in_source_order() {
             _ => None,
         })
         .collect::<Vec<_>>();
+    // Disjoint-path mutations form one independent segment: starts announce
+    // together, execution overlaps, and results keep source order.
+    let batch_id = lifecycle.first().expect("first lifecycle event").1;
     assert_eq!(
         lifecycle
             .iter()
+            .take(2)
             .map(|(phase, _, call_id, name)| (*phase, *call_id, *name))
             .collect::<Vec<_>>(),
         [
             ("start", "write-first", "write"),
-            ("output", "write-first", "write"),
-            ("finish", "write-first", "write"),
             ("start", "write-second", "write"),
-            ("output", "write-second", "write"),
-            ("finish", "write-second", "write"),
         ]
+    );
+    let position = |phase: &str, call_id: &str| {
+        lifecycle
+            .iter()
+            .position(|candidate| *candidate == (phase, batch_id, call_id, "write"))
+            .expect("lifecycle event")
+    };
+    for call_id in ["write-first", "write-second"] {
+        assert!(
+            position("start", call_id) < position("output", call_id)
+                && position("output", call_id) < position("finish", call_id),
+            "call {call_id} must complete its own lifecycle in order: {lifecycle:?}"
+        );
+    }
+    assert!(
+        result.tool_results[0].output.contains("first")
+            && result.tool_results[1].output.contains("second"),
+        "results must keep provider source order: {:?}",
+        result.tool_results
     );
     let batch_id = lifecycle.first().expect("first lifecycle event").1;
     assert!(!batch_id.is_empty());
@@ -845,6 +1575,85 @@ fn length_stop_blocks_all_tool_side_effects() {
     }));
     assert_eq!(result.stop, AgentLoopStop::ProviderTruncated);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn repeated_truncation_stops_after_two_recoveries_and_preserves_usage() {
+    bounded_truncation_fixture(false);
+}
+
+#[test]
+fn rejected_output_growth_recovers_at_original_limit() {
+    bounded_truncation_fixture(true);
+}
+
+fn bounded_truncation_fixture(reject_growth: bool) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let limits = if reject_growth {
+            [4096, 16_384, 4096]
+        } else {
+            [4096, 16_384, 32_768]
+        };
+        for (index, limit) in limits.into_iter().enumerate() {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            let wire: Value = serde_json::from_str(request.split_once("\r\n\r\n").expect("body").1)
+                .expect("JSON");
+            assert_eq!(wire["max_tokens"], limit);
+            if reject_growth && index == 1 {
+                let body = r#"{"error":{"type":"invalid_request_error","message":"max_tokens must be <= 4096"}}"#;
+                stream.write_all(format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).expect("rejection");
+                continue;
+            }
+            let body = if reject_growth && index == 2 {
+                "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":4096,\"total_tokens\":4196}}\n\ndata: [DONE]\n\n"
+            } else {
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Still planning\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":4096,\"total_tokens\":4196}}\n\ndata: [DONE]\n\n"
+            };
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).expect("response");
+        }
+    });
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+    let mut runtime = Runtime::new();
+    let result = tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "Continue the task",
+            OperatingMode::Auto,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig {
+                max_turns: 10,
+                context_window_tokens: 128_000,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .expect("loop");
+    server.join().expect("server");
+    assert_eq!(
+        result.stop,
+        if reject_growth {
+            AgentLoopStop::ProviderCompleted
+        } else {
+            AgentLoopStop::ProviderTruncated
+        }
+    );
+    assert_eq!(result.turns, 3);
+    assert!(result.tool_results.is_empty());
+    assert_eq!(
+        result.usage.output_tokens,
+        if reject_growth { 2 * 4096 } else { 3 * 4096 }
+    );
 }
 
 #[test]
@@ -1039,7 +1848,10 @@ fn codex_subscription_responses_execute_tool_and_send_function_output() {
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("address");
     let path = "fixture.txt".to_owned();
+    let reasoning = json!({"type":"reasoning", "id":"rs-1", "summary":[], "encrypted_content":"opaque-fixture-token=="});
+    let server_reasoning = reasoning;
     let server = thread::spawn(move || {
+        let mut first_body = Value::Null;
         for turn in 0..2 {
             let mut stream = accept_with_deadline(&listener);
             let mut request = [0_u8; 32 * 1024];
@@ -1051,15 +1863,37 @@ fn codex_subscription_responses_execute_tool_and_send_function_output() {
                 .map(|(_, body)| body)
                 .expect("HTTP body");
             assert!(!body.contains("\"max_output_tokens\""));
+            let wire: Value = serde_json::from_str(body).expect("wire");
             if turn == 1 {
-                assert!(request.contains("function_call_output"));
-                assert!(request.contains("codex content"));
+                let items = wire["input"].as_array().expect("input");
+                assert_eq!(
+                    items.iter().find(|item| item["type"] == "reasoning"),
+                    Some(&server_reasoning)
+                );
+                let call = items
+                    .iter()
+                    .find(|item| item["type"] == "function_call")
+                    .expect("call");
+                assert_eq!(
+                    call["arguments"],
+                    json!({"path":path,"content":"codex content\n"}).to_string()
+                );
+                assert!(items
+                    .iter()
+                    .any(|item| item["type"] == "function_call_output"
+                        && item["call_id"] == "call-1"));
+                assert_eq!(wire["instructions"], first_body["instructions"]);
+                assert_eq!(wire["tools"], first_body["tools"]);
+                assert_eq!(wire["prompt_cache_key"], first_body["prompt_cache_key"]);
+            } else {
+                first_body = wire;
             }
             let events = if turn == 0 {
                 vec![
-                    json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call-1","name":"read","arguments":""}}),
-                    json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":serde_json::json!({"path":path,"max_lines":10}).to_string()}),
-                    json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call-1","name":"read","arguments":serde_json::json!({"path":path,"max_lines":10}).to_string()}}),
+                    json!({"type":"response.output_item.done","output_index":0,"item":server_reasoning}),
+                    json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call-1","name":"write","arguments":""}}),
+                    json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":serde_json::json!({"path":path,"content":"codex content\n"}).to_string()}),
+                    json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call-1","name":"write","arguments":serde_json::json!({"path":path,"content":"codex content\n"}).to_string()}}),
                     json!({"type":"response.completed","response":{"usage":{"input_tokens":2,"output_tokens":1}}}),
                 ]
             } else {
@@ -1092,7 +1926,7 @@ fn codex_subscription_responses_execute_tool_and_send_function_output() {
     let result = tokio_runtime
         .block_on(runtime.run_agent_loop(
             &client,
-            "read fixture",
+            "write fixture",
             OperatingMode::Auto,
             &root,
             1,
@@ -1100,6 +1934,41 @@ fn codex_subscription_responses_execute_tool_and_send_function_output() {
         ))
         .expect("loop");
     server.join().expect("server");
+    assert_eq!(
+        std::fs::read_to_string(root.join("fixture.txt")).expect("written"),
+        "codex content\n"
+    );
+    assert!(!format!("{:?}", runtime.app.events()).contains("opaque-fixture-token"));
+    assert!(
+        !slim_core::context::build_summary_prompt(runtime.conversation())
+            .contains("opaque-fixture-token")
+    );
+    assert!(!format!("{:?}", runtime.conversation()).contains("opaque-fixture-token"));
+    assert!(!slim_core::context::has_compactable_history(
+        &runtime.conversation()[..3]
+    ));
+    let same = client
+        .adapter()
+        .build_messages_request(runtime.conversation());
+    assert!(same.body.contains("opaque-fixture-token=="));
+    let switched = OpenAiCodexAdapter::new(ProviderConfig::openai_codex(
+        format!("http://{address}"),
+        "other-model",
+        "other-token",
+        "other-account",
+    ))
+    .expect("switched");
+    assert!(!switched
+        .build_messages_request(runtime.conversation())
+        .body
+        .contains("opaque-fixture-token"));
+    let chat =
+        OpenAiCompatibleAdapter::new(ProviderConfig::openai("http://localhost", "fixture", "key"))
+            .expect("chat");
+    assert!(!chat
+        .build_messages_request(runtime.conversation())
+        .body
+        .contains("opaque-fixture-token"));
     assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
     assert_eq!(result.tool_results.len(), 1);
     assert_eq!(result.usage.total_input_tokens(), 5);
@@ -1260,7 +2129,9 @@ fn large_tool_output_is_materialized_and_referenced_in_the_next_turn() {
     let root = std::env::temp_dir().join(format!("slim-agent-artifact-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("root");
     let source = root.join("large.txt");
-    let content = "large-output-".repeat(32);
+    // Complete reads under 64 KiB pass through in full by design; the output
+    // must exceed COMPLETE_READ_PROMPT_BYTES to exercise artifact materialization.
+    let content = "large-output-".repeat(6000);
     std::fs::write(&source, &content).expect("source");
     let artifact_root = root.join("artifacts");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1310,7 +2181,7 @@ fn large_tool_output_is_materialized_and_referenced_in_the_next_turn() {
             } else {
                 stream
                     .write_all(
-                        b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
                     )
                     .expect("finish");
             }
@@ -1346,7 +2217,7 @@ fn large_tool_output_is_materialized_and_referenced_in_the_next_turn() {
     let handle = result.tool_results[0].artifact.as_ref().expect("handle");
     assert_eq!(
         std::fs::read_to_string(&handle.path).expect("artifact"),
-        format!("1: {content}\n")
+        content
     );
     assert!(runtime
         .app
@@ -1361,20 +2232,21 @@ fn context_below_threshold_sends_only_the_normal_request() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("address");
-    let server =
-        thread::spawn(move || {
-            let mut stream = accept_with_deadline(&listener);
-            let mut request = [0_u8; 16 * 1024];
-            let size = stream.read(&mut request).expect("request");
-            let body = String::from_utf8_lossy(&request[..size]).into_owned();
-            stream.write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-        ).expect("headers");
-            stream.write_all(
-            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+    let server = thread::spawn(move || {
+        let mut stream = accept_with_deadline(&listener);
+        let mut request = [0_u8; 16 * 1024];
+        let size = stream.read(&mut request).expect("request");
+        let body = String::from_utf8_lossy(&request[..size]).into_owned();
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .expect("headers");
+        stream.write_all(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
         ).expect("response");
-            body
-        });
+        body
+    });
 
     let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
         format!("http://{address}"),
@@ -1404,18 +2276,19 @@ fn context_below_threshold_sends_only_the_normal_request() {
         .events()
         .iter()
         .any(|event| matches!(event.kind, EventKind::CompactionCompleted)));
-    let tools = Runtime::new().advertised_tool_definitions(OperatingMode::Auto);
-    let request = client
-        .adapter()
-        .build_messages_request_with_tools_checked(
-            &[slim_core::provider::ProviderMessage::user("small")],
-            &tools,
-        )
-        .expect("request");
+    // Optional initial paths are real provider context and must be included
+    // in accounting. Compare against the captured wire, not a bare prompt.
+    let request_body = body.split_once("\r\n\r\n").expect("HTTP body").1;
+    let request = serde_json::from_str::<Value>(request_body).expect("request JSON");
+    assert_eq!(request["messages"].as_array().unwrap().len(), 2);
+    assert!(request["messages"][1]["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("small"));
     let expected = slim_core::context::AdaptiveTokenEstimator::default().estimate(
         "openai-compatible",
         client.adapter().model(),
-        request.body.chars().count() as u64,
+        request_body.chars().count() as u64,
     );
     let snapshot = runtime
         .app
@@ -1451,7 +2324,7 @@ fn sole_prompt_above_threshold_but_within_window_is_sent_unchanged() {
             .expect("headers");
         stream
             .write_all(
-                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
             )
             .expect("response");
         body
@@ -1485,7 +2358,7 @@ fn sole_prompt_above_threshold_but_within_window_is_sent_unchanged() {
             std::env::temp_dir(),
             1,
             AgentLoopConfig {
-                context_window_tokens: fixed_tokens + 64,
+                context_window_tokens: fixed_tokens + 256,
                 context_reserve_tokens: 0,
                 ..AgentLoopConfig::default()
             },
@@ -1499,11 +2372,10 @@ fn sole_prompt_above_threshold_but_within_window_is_sent_unchanged() {
     // messages[0] is the native Slim system prompt; the sole user prompt is
     // messages[1] and must be sent unchanged (no compaction).
     assert_eq!(body["messages"][0]["role"], "system");
-    assert_eq!(body["messages"][1]["content"], prompt);
-    assert!(!body["messages"][1]["content"]
-        .as_str()
-        .expect("prompt")
-        .contains("Summarize the prior agent transcript"));
+    let sent = body["messages"][1]["content"].as_str().expect("prompt");
+    assert_eq!(slim_core::without_workspace_snapshot(sent), prompt);
+    assert!(sent.contains("Harness channel: Auto, unattended"));
+    assert!(!sent.contains("Summarize the prior agent transcript"));
     assert!(!runtime
         .app
         .events()
@@ -1599,6 +2471,10 @@ fn threshold_requests_summary_then_real_turn_with_same_provider_model() {
                         b"data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\nsummary from fixture\\n## Constraints\\nNone\\n## Progress\\nDone\\n## Blocked\\nNone\\n## Decisions\\nKeep context\\n## Next steps\\nContinue\\n## Critical context\\nFixture\"}}]}\n\n",
                     )
                     .expect("summary");
+            } else {
+                stream
+                    .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n")
+                    .expect("answer");
             }
             stream.write_all(
                 b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
@@ -1654,7 +2530,11 @@ fn threshold_requests_summary_then_real_turn_with_same_provider_model() {
         })
         .collect::<Vec<_>>();
     assert_eq!(bodies[0]["messages"][0]["role"], "system");
-    assert_eq!(bodies[0]["messages"][1]["content"], "start");
+    let first_user = bodies[0]["messages"][1]["content"]
+        .as_str()
+        .expect("first user");
+    assert_eq!(slim_core::without_workspace_snapshot(first_user), "start");
+    assert!(first_user.contains("Harness channel: Auto, unattended"));
     assert_eq!(
         bodies[1]["messages"][0]["content"],
         slim_core::context::COMPACTION_SYSTEM_PROMPT
@@ -1667,7 +2547,16 @@ fn threshold_requests_summary_then_real_turn_with_same_provider_model() {
         .as_str()
         .expect("summary transcript")
         .contains("Summarize the prior agent transcript"));
-    assert_eq!(bodies[2]["messages"][1]["content"], "start");
+    let resumed_user = bodies[2]["messages"][1]["content"]
+        .as_str()
+        .expect("resumed user");
+    assert_eq!(slim_core::without_workspace_snapshot(resumed_user), "start");
+    assert!(
+        serde_json::to_string(&bodies[2])
+            .expect("third request")
+            .contains("Harness channel: Auto, unattended"),
+        "compacted follow-up must keep the unattended channel"
+    );
     assert!(bodies[2]["messages"][2]["content"]
         .as_str()
         .expect("compacted context")
@@ -2151,7 +3040,9 @@ fn completed_background_summary_is_reused_before_overflow_retry() {
                 (
                     "200 OK",
                     format!(
-                        "data: {tool_call}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+                        // Calibrate below the soft threshold, so a fast summary
+                        // cannot be applied before the request that must overflow.
+                        "data: {tool_call}\n\ndata: {{\"usage\":{{\"prompt_tokens\":10000,\"completion_tokens\":1}}}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
                     ),
                 )
             };
@@ -2339,7 +3230,7 @@ fn volatile_code_intel_calls_remain_serial_barriers_in_provider_order() {
 }
 
 #[test]
-fn mixed_batch_parallelizes_contiguous_reads_without_crossing_write_barrier() {
+fn mixed_batch_hoists_independent_reads_and_preserves_result_order() {
     let root = std::env::temp_dir().join(format!("slim-mixed-segments-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("root");
     std::fs::write(root.join("a.txt"), "alpha").expect("a");
@@ -2375,6 +3266,7 @@ fn mixed_batch_parallelizes_contiguous_reads_without_crossing_write_barrier() {
                 .as_bytes(),
             )
             .expect("tool calls");
+        budget_finalization::reject_budget_finalization(&listener);
     });
 
     let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
@@ -2413,9 +3305,13 @@ fn mixed_batch_parallelizes_contiguous_reads_without_crossing_write_barrier() {
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        &lifecycle[..2],
-        [("start", "read-a"), ("start", "read-b")],
-        "the contiguous reads must both start before either completes"
+        &lifecycle[..3],
+        [
+            ("start", "read-a"),
+            ("start", "read-b"),
+            ("start", "read-d")
+        ],
+        "independent snapshot reads start together before any completes"
     );
     let position = |phase, call_id| {
         lifecycle
@@ -2424,12 +3320,15 @@ fn mixed_batch_parallelizes_contiguous_reads_without_crossing_write_barrier() {
             .expect("lifecycle event")
     };
     let write_start = position("start", "write-barrier");
-    let write_finish = position("finish", "write-barrier");
+    // Snapshot reads are hoisted across mutations they cannot observe
+    // (read-d targets a path disjoint from the write); the mutation itself
+    // still starts only after every snapshot read has completed.
     assert!(
         write_start > position("finish", "read-a")
             && write_start > position("finish", "read-b")
-            && position("start", "read-d") > write_finish,
-        "no segment may cross the write barrier: {lifecycle:?}"
+            && write_start > position("finish", "read-d")
+            && position("start", "read-d") < write_start,
+        "reads run ahead of an unrelated write; the write waits for all of them: {lifecycle:?}"
     );
     let ordered_results = result
         .tool_results
@@ -2459,11 +3358,8 @@ fn mixed_batch_parallelizes_contiguous_reads_without_crossing_write_barrier() {
 }
 
 #[test]
-fn validation_shell_joins_the_parallel_read_segment() {
-    let root = std::env::temp_dir().join(format!(
-        "slim-validation-segment-{}",
-        std::process::id()
-    ));
+fn validation_shell_is_serialized_as_a_workspace_boundary() {
+    let root = std::env::temp_dir().join(format!("slim-validation-segment-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("root");
     std::fs::write(root.join("a.txt"), "alpha").expect("a");
     std::fs::write(root.join("b.txt"), "bravo").expect("b");
@@ -2496,6 +3392,7 @@ fn validation_shell_joins_the_parallel_read_segment() {
                 .as_bytes(),
             )
             .expect("tool calls");
+        budget_finalization::reject_budget_finalization(&listener);
     });
 
     let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
@@ -2533,10 +3430,19 @@ fn validation_shell_joins_the_parallel_read_segment() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        &lifecycle[..3],
-        [("start", "read-a"), ("start", "cargo-check"), ("start", "read-b")],
-        "allowlisted validation shell must start inside the parallel read segment: {lifecycle:?}"
+    let position = |phase, call_id| {
+        lifecycle
+            .iter()
+            .position(|candidate| *candidate == (phase, call_id))
+            .expect("lifecycle event")
+    };
+    assert!(
+        position("start", "cargo-check") > position("finish", "read-a"),
+        "validation must not overlap preceding snapshot read: {lifecycle:?}"
+    );
+    assert!(
+        position("start", "read-b") > position("finish", "cargo-check"),
+        "read after validation must wait for validation barrier: {lifecycle:?}"
     );
     let ordered_names = result
         .tool_results
@@ -2621,7 +3527,9 @@ fn hard_threshold_without_prepared_compacts_locally_without_summary_post() {
     };
     let handle = CompactionHandle::default();
     let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
-    let mut runtime = Runtime::new();
+    let artifact_root =
+        std::env::temp_dir().join(format!("slim-context-recovery-{}", std::process::id()));
+    let mut runtime = Runtime::with_artifact_store(&artifact_root).expect("store");
     runtime.set_compaction_handle(handle.clone());
     runtime.set_background_compaction_enabled(false);
     let result = tokio_runtime
@@ -2636,6 +3544,17 @@ fn hard_threshold_without_prepared_compacts_locally_without_summary_post() {
         .expect("loop");
     server.join().expect("server");
 
+    let artifacts = std::fs::read_dir(&artifact_root)
+        .expect("artifacts")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("entries");
+    assert_eq!(artifacts.len(), 1);
+    let transcript_path = artifacts[0].path();
+    let restored = std::fs::read_to_string(&transcript_path).expect("full transcript");
+    assert!(restored.contains(&initial[1].content));
+    assert!(runtime.conversation().iter().any(|message| message
+        .content
+        .contains(&transcript_path.display().to_string())));
     assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
     assert_eq!(handle.status(), CompactionStatus::Applied);
     assert!(runtime
@@ -2643,8 +3562,8 @@ fn hard_threshold_without_prepared_compacts_locally_without_summary_post() {
         .events()
         .iter()
         .any(|event| matches!(event.kind, EventKind::CompactionCompleted)));
+    std::fs::remove_dir_all(artifact_root).expect("cleanup");
 }
-
 #[test]
 fn discarded_background_summary_still_counts_observed_usage() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -2955,7 +3874,7 @@ fn truncated_summary_publishes_usage_but_never_compacts() {
             std::env::temp_dir(),
             1,
             AgentLoopConfig {
-                context_window_tokens: fixed_tokens + 32,
+                context_window_tokens: fixed_tokens + 256,
                 context_reserve_tokens: 0,
                 ..AgentLoopConfig::default()
             },
@@ -3066,7 +3985,7 @@ fn tool_call_summary_is_rejected_without_replacing_the_transcript() {
             std::env::temp_dir(),
             1,
             AgentLoopConfig {
-                context_window_tokens: fixed_tokens + 32,
+                context_window_tokens: fixed_tokens + 256,
                 context_reserve_tokens: 0,
                 ..AgentLoopConfig::default()
             },
@@ -3097,7 +4016,7 @@ fn duplicate_tool_output_goes_on_the_wire_as_a_pointer_and_context_snapshot_is_l
             .as_nanos()
     ));
     std::fs::create_dir_all(&root).expect("mkdir");
-    std::fs::write(root.join("dup.txt"), "alpha\n").expect("fixture");
+    std::fs::write(root.join("dup.txt"), "alpha".repeat(40)).expect("fixture");
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.set_nonblocking(true).expect("nonblocking");
@@ -3186,7 +4105,7 @@ fn duplicate_tool_output_goes_on_the_wire_as_a_pointer_and_context_snapshot_is_l
         .last()
         .expect("tool message");
     assert_eq!(first_read["role"], "tool");
-    assert_eq!(first_read["content"], "1: alpha\n");
+    assert_eq!(first_read["content"], "alpha".repeat(40));
 
     let second_messages = bodies[2]["messages"].as_array().expect("messages");
     assert!(second_messages.iter().any(|message| {
@@ -3195,7 +4114,10 @@ fn duplicate_tool_output_goes_on_the_wire_as_a_pointer_and_context_snapshot_is_l
                 .as_str()
                 .is_some_and(|content| content.contains("[duplicate read result omitted"))
     }));
-    assert_eq!(second_messages.last().expect("steer message")["role"], "user");
+    assert_eq!(
+        second_messages.last().expect("steer message")["role"],
+        "user"
+    );
 
     assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
     assert!(runtime.app.events().iter().any(|event| matches!(
@@ -3211,7 +4133,112 @@ fn duplicate_tool_output_goes_on_the_wire_as_a_pointer_and_context_snapshot_is_l
 }
 
 #[test]
-fn post_compaction_identical_reread_omits_full_output_with_compacted_pointer() {
+fn resumed_turn_deduplicates_retained_read_but_sends_changed_content_in_full() {
+    let root = std::env::temp_dir().join(format!(
+        "slim-resumed-dedup-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let original = "alpha".repeat(40);
+    let changed = "bravo".repeat(40);
+    std::fs::write(root.join("dup.txt"), &original).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let mut bodies = Vec::new();
+        for index in 0..6 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            bodies.push(
+                serde_json::from_str::<Value>(request.split_once("\r\n\r\n").unwrap().1).unwrap(),
+            );
+            let (delta, finish) = if index % 2 == 0 {
+                (
+                    json!({"tool_calls": [{"id": format!("call-{index}"), "function": {
+                        "name": "read", "arguments": r#"{"path":"dup.txt","max_lines":10}"#
+                    }}]}),
+                    "tool_calls",
+                )
+            } else {
+                (json!({"content": "done"}), "stop")
+            };
+            let response = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"choices": [{"delta": delta}]}),
+                json!({"choices": [{"delta": {}, "finish_reason": finish}]})
+            );
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).unwrap();
+        }
+        bodies
+    });
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .unwrap();
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).unwrap();
+    let executor = tokio::runtime::Runtime::new().unwrap();
+    let mut messages = Vec::new();
+    let tools = slim_core::tools::ToolRegistry::default();
+    for turn in 0..3 {
+        if turn == 2 {
+            std::fs::rename(root.join("dup.txt"), root.join("old.txt")).unwrap();
+            std::fs::write(root.join("dup.txt"), &changed).unwrap();
+        }
+        messages.push(ProviderMessage::user("Read dup.txt again"));
+        let mut runtime = Runtime::new();
+        runtime.set_tool_registry(tools.clone());
+        let result = executor
+            .block_on(runtime.run_agent_loop_with_messages(
+                &client,
+                &messages,
+                OperatingMode::ReadOnly,
+                &root,
+                1,
+                AgentLoopConfig {
+                    max_turns: 4,
+                    context_window_tokens: 64_000,
+                    ..AgentLoopConfig::default()
+                },
+            ))
+            .unwrap();
+        assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+        messages = runtime.conversation().to_vec();
+    }
+    let bodies = server.join().unwrap();
+    let outputs = |index: usize| {
+        bodies[index]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .map(|message| message["content"].as_str().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(outputs(1), vec![original.as_str()]);
+    let repeated = outputs(3);
+    assert_eq!(repeated.len(), 2);
+    assert_eq!(repeated[0], original);
+    assert_eq!(
+        repeated[1],
+        "[duplicate read result omitted; identical output already in context]"
+    );
+    assert!(repeated[1].len() < original.len());
+    let updated = outputs(5);
+    assert_eq!(updated.len(), 3);
+    assert_eq!(updated[0], original);
+    assert_eq!(updated[2], changed);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn post_compaction_identical_reread_reuses_retained_full_output() {
     let root = std::env::temp_dir().join(format!(
         "slim-compact-dedup-{}-{}",
         std::process::id(),
@@ -3221,7 +4248,8 @@ fn post_compaction_identical_reread_omits_full_output_with_compacted_pointer() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&root).expect("mkdir");
-    std::fs::write(root.join("dup.txt"), "alpha\n").expect("fixture");
+    let original = "alpha".repeat(40);
+    std::fs::write(root.join("dup.txt"), &original).expect("fixture");
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.set_nonblocking(true).expect("nonblocking");
@@ -3314,7 +4342,10 @@ fn post_compaction_identical_reread_omits_full_output_with_compacted_pointer() {
             1,
             AgentLoopConfig {
                 max_turns: 4,
-                context_window_tokens: fixed_tokens + 512,
+                // Slack must cover the retained post-compaction content: the
+                // workspace snapshot inside the root user message, the summary,
+                // and the kept tool-result suffix.
+                context_window_tokens: fixed_tokens + 2048,
                 context_reserve_tokens: 120,
                 ..AgentLoopConfig::default()
             },
@@ -3330,18 +4361,25 @@ fn post_compaction_identical_reread_omits_full_output_with_compacted_pointer() {
         })
         .collect::<Vec<_>>();
 
+    for index in [2, 3] {
+        assert!(bodies[index]["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .any(|message| message["role"] == "tool" && message["content"] == original));
+    }
     let post_compaction_read = bodies[3]["messages"]
         .as_array()
         .expect("messages")
         .last()
         .expect("post-compaction tool message");
     assert_eq!(post_compaction_read["role"], "tool");
-    assert!(post_compaction_read["content"]
-        .as_str()
-        .expect("content")
-        .contains("[compacted read result omitted"));
+    assert_eq!(
+        post_compaction_read["content"],
+        "[duplicate read result omitted; identical output already in context]"
+    );
 
-    assert!(runtime.app.events().iter().any(|event| matches!(
+    assert!(!runtime.app.events().iter().any(|event| matches!(
         event.kind,
         EventKind::ToolEvidenceReused {
             post_compaction: true,
@@ -3385,6 +4423,14 @@ fn agent_loop_announces_todo_and_applies_add_with_ledger_event() {
             first_request.contains("\"name\":\"todo\""),
             "first request should announce todo: {first_request}"
         );
+        assert!(
+            first_request.contains("Harness channel: Auto, unattended"),
+            "headless Auto must state the unattended channel: {first_request}"
+        );
+        assert!(
+            !first_request.contains("\"name\":\"ask_question\""),
+            "unattended Auto must not advertise ask_question: {first_request}"
+        );
         let tool_call = json!({
             "choices": [{
                 "delta": {
@@ -3419,6 +4465,8 @@ fn agent_loop_announces_todo_and_applies_add_with_ledger_event() {
         let second_request = String::from_utf8_lossy(&second_request[..second_size]);
         assert!(second_request.contains("todo-call-1"));
         assert!(second_request.contains("ship n2"));
+        assert!(second_request.contains("todo 0 [pending]: ship n2"));
+        assert!(second_request.contains("todo 1 [pending]: verify gate"));
         assert!(
             second_request.contains("verify gate"),
             "second todo in the array must be applied: {second_request}"
@@ -3921,6 +4969,7 @@ fn read_exhaustion_stops_with_tool_limit() {
                 .as_bytes(),
             )
             .expect("response");
+        budget_finalization::reject_budget_finalization(&listener);
     });
 
     let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
@@ -3954,7 +5003,110 @@ fn read_exhaustion_stops_with_tool_limit() {
 }
 
 #[test]
-fn mixed_batch_truncates_read_bucket_before_mutating_budget() {
+fn max_total_tool_calls_stops_across_multiple_turns_with_tool_limit() {
+    let root = std::env::temp_dir().join(format!("slim-total-tool-limit-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("root");
+    std::fs::write(root.join("f1.txt"), "f1").expect("f1");
+    std::fs::write(root.join("f2.txt"), "f2").expect("f2");
+    std::fs::write(root.join("f3.txt"), "f3").expect("f3");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        // Turn 1: 2 reads
+        let mut stream = accept_with_deadline(&listener);
+        let _ = read_http_request(&mut stream);
+        let first = json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [
+                        {"index": 0, "id": "read-1", "function": {"name": "read", "arguments": json!({"path": "f1.txt"}).to_string()}},
+                        {"index": 1, "id": "read-2", "function": {"name": "read", "arguments": json!({"path": "f2.txt"}).to_string()}}
+                    ]
+                }
+            }]
+        });
+        let body = format!(
+            "data: {first}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+        );
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .expect("turn 1 response");
+
+        // Turn 2: 2 reads (but max_total_tool_calls = 3, so only 1 should run, stopping with ToolLimit)
+        let mut stream2 = accept_with_deadline(&listener);
+        let _ = read_http_request(&mut stream2);
+        let second = json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [
+                        {"index": 0, "id": "read-3", "function": {"name": "read", "arguments": json!({"path": "f3.txt"}).to_string()}},
+                        {"index": 1, "id": "read-4", "function": {"name": "read", "arguments": json!({"path": "f1.txt"}).to_string()}}
+                    ]
+                }
+            }]
+        });
+        let body2 = format!(
+            "data: {second}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+        );
+        stream2
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body2}",
+                    body2.len()
+                )
+                .as_bytes(),
+            )
+            .expect("turn 2 response");
+        budget_finalization::reject_budget_finalization(&listener);
+    });
+
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(3)).expect("client");
+    let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let mut runtime = Runtime::new();
+    let result = tokio_runtime
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "read across turns",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig {
+                max_turns: 4,
+                max_read_tool_calls: 10,
+                max_total_tool_calls: 3,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .expect("loop");
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ToolLimit);
+    assert_eq!(result.tool_results.len(), 3);
+    let tool_messages = runtime
+        .conversation()
+        .iter()
+        .filter(|msg| msg.role == "tool")
+        .count();
+    assert_eq!(tool_messages, 3);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn mixed_batch_budget_preserves_the_execution_prefix() {
     let root = std::env::temp_dir().join(format!("slim-mixed-batch-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("root");
     std::fs::write(root.join("probe.txt"), "probe").expect("probe");
@@ -3993,6 +5145,7 @@ fn mixed_batch_truncates_read_bucket_before_mutating_budget() {
                 .as_bytes(),
             )
             .expect("response");
+        budget_finalization::reject_budget_finalization(&listener);
     });
 
     let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
@@ -4022,7 +5175,7 @@ fn mixed_batch_truncates_read_bucket_before_mutating_budget() {
     server.join().expect("server");
 
     assert_eq!(result.stop, AgentLoopStop::ToolLimit);
-    assert_eq!(result.tool_results.len(), 3);
+    assert_eq!(result.tool_results.len(), 2);
     assert_eq!(
         result
             .tool_results
@@ -4037,11 +5190,11 @@ fn mixed_batch_truncates_read_bucket_before_mutating_budget() {
             .iter()
             .filter(|result| result.name == "write")
             .count(),
-        1
+        0
     );
-    assert_eq!(
-        std::fs::read_to_string(root.join("out.txt")).expect("out"),
-        "done"
+    assert!(
+        !root.join("out.txt").exists(),
+        "do not cross a suppressed operation"
     );
     let _ = std::fs::remove_dir_all(root);
 }
@@ -4143,6 +5296,115 @@ fn sequential_read_calls_refresh_per_turn_budget() {
 }
 
 #[test]
+fn per_turn_mutating_overflow_continues_when_turns_remain() {
+    let root = std::env::temp_dir().join(format!("slim-per-turn-overflow-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("root");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let write_batch = |stream: &mut TcpStream, calls: Value| {
+            let payload = json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": calls
+                    }
+                }]
+            });
+            let body = format!(
+                "data: {payload}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+            );
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .expect("tool response");
+        };
+
+        let mut first = accept_with_deadline(&listener);
+        let _ = read_http_request(&mut first);
+        write_batch(
+            &mut first,
+            json!([
+                {"index": 0, "id": "write-1", "function": {"name": "write", "arguments": json!({"path":"first.txt","content":"first"}).to_string()}},
+                {"index": 1, "id": "write-2", "function": {"name": "write", "arguments": json!({"path":"second.txt","content":"second"}).to_string()}}
+            ]),
+        );
+
+        let mut second = accept_with_deadline(&listener);
+        let _ = read_http_request(&mut second);
+        write_batch(
+            &mut second,
+            json!([
+                {"index": 0, "id": "write-3", "function": {"name": "write", "arguments": json!({"path":"second.txt","content":"second"}).to_string()}}
+            ]),
+        );
+
+        let mut third = accept_with_deadline(&listener);
+        let _ = read_http_request(&mut third);
+        let done = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        third
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{done}",
+                    done.len()
+                )
+                .as_bytes(),
+            )
+            .expect("final response");
+    });
+
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(5)).expect("client");
+    let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let mut runtime = Runtime::new();
+    let result = tokio_runtime
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "write two files",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig {
+                max_turns: 3,
+                max_mutating_tool_calls: 1,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .expect("loop");
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(
+        std::fs::read_to_string(root.join("first.txt")).expect("first"),
+        "first"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("second.txt")).expect("second"),
+        "second"
+    );
+    assert_eq!(
+        result
+            .tool_results
+            .iter()
+            .filter(|result| result.name == "write" && result.success)
+            .count(),
+        2
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn budget_exhaustion_still_returns_final_answer_without_tools() {
     let root = std::env::temp_dir().join(format!("slim-budget-final-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("root");
@@ -4223,6 +5485,7 @@ fn budget_exhaustion_still_returns_final_answer_without_tools() {
     assert_eq!(result.stop, AgentLoopStop::TurnLimit);
     assert_eq!(result.tool_results.len(), 1);
     assert!(finalize_request.contains("Budget exhausted"));
+    assert!(finalize_request.contains("\"max_tokens\":2048"));
     let conversation_text = runtime
         .conversation()
         .iter()
@@ -4321,8 +5584,16 @@ fn duplicate_read_injects_between_turns_steer_once() {
 
     assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
     assert_eq!(result.tool_results.len(), 2);
-    assert!(!second_request.contains("Do not re-read"));
-    assert!(third_request.contains("Do not re-read"));
+    assert!(
+        !runtime
+            .app
+            .events()
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ToolEvidenceReused { .. })),
+        "a pointer must not enlarge short output"
+    );
+    assert!(!second_request.contains("repeated evidence without a relevant state change"));
+    assert!(third_request.contains("repeated evidence without a relevant state change"));
     let conversation_text = runtime
         .conversation()
         .iter()
@@ -4343,9 +5614,14 @@ fn repeated_identical_reads_stop_with_no_progress_and_final_answer() {
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("address");
     let server = thread::spawn(move || {
-        for _ in 0..4 {
+        for index in 0..4 {
             let mut stream = accept_with_deadline(&listener);
-            let _ = read_http_request(&mut stream);
+            let request = read_http_request(&mut stream);
+            if index == 3 {
+                assert!(request.contains(
+                    "Tool read call read-a repeated evidence without a relevant state change"
+                ));
+            }
             let payload = json!({
                 "choices": [{
                     "delta": {
@@ -4375,7 +5651,9 @@ fn repeated_identical_reads_stop_with_no_progress_and_final_answer() {
         }
 
         let mut final_stream = accept_with_deadline(&listener);
-        let _ = read_http_request(&mut final_stream);
+        let final_request = read_http_request(&mut final_stream);
+        assert!(final_request.contains("Execution stopped because repeated tool work"));
+        assert!(!final_request.contains("Budget exhausted"));
         let done = "data: {\"choices\":[{\"delta\":{\"content\":\"no-progress-final\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         final_stream
             .write_all(
@@ -4415,7 +5693,10 @@ fn repeated_identical_reads_stop_with_no_progress_and_final_answer() {
     assert_eq!(result.stop, AgentLoopStop::NoProgress);
     assert_eq!(result.turns, 4);
     assert_eq!(result.tool_results.len(), 4);
-    assert!(result.tool_results.iter().all(|result| result.name == "read"));
+    assert!(result
+        .tool_results
+        .iter()
+        .all(|result| result.name == "read"));
     let conversation_text = runtime
         .conversation()
         .iter()
@@ -4424,4 +5705,1239 @@ fn repeated_identical_reads_stop_with_no_progress_and_final_answer() {
         .join("\n");
     assert!(conversation_text.contains("no-progress-final"));
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn failed_validation_can_retry_after_an_observed_external_change() {
+    let root = std::env::temp_dir().join(format!("slim-validation-retry-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("state.txt"), "before").unwrap();
+    let server_root = root.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for index in 0..5 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            if index == 2 {
+                std::fs::write(server_root.join("state.txt"), "externally changed").unwrap();
+            }
+            let (delta, reason) = if index == 4 {
+                assert!(!request.contains("repeated evidence without a relevant state change"));
+                (
+                    json!({"content":"validation still fails; report the blocker"}),
+                    "stop",
+                )
+            } else {
+                let (name, arguments) = if index % 2 == 0 {
+                    ("read", json!({"path":"state.txt"}))
+                } else {
+                    // Empty workspace: cargo fails locally without building or accessing a provider.
+                    ("shell", json!({"command":"cargo check"}))
+                };
+                (
+                    json!({"tool_calls":[{"index":0,"id":format!("call-{index}"),
+                    "function":{"name":name,"arguments":arguments.to_string()}}]}),
+                    "tool_calls",
+                )
+            };
+            let event = json!({"choices":[{"delta":delta}]});
+            let stop = json!({"choices":[{"delta":{},"finish_reason":reason}]});
+            let body = format!("data: {event}\n\ndata: {stop}\n\ndata: [DONE]\n\n");
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .unwrap();
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(3)).unwrap();
+    let mut runtime = Runtime::new();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "check after the external edit",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig {
+                max_turns: 6,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(result.tool_results.len(), 4);
+    assert!(!result.tool_results[1].success);
+    assert!(!result.tool_results[3].success);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cancellation_during_budget_finalization_reports_cancelled() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let cancellation = CancellationToken::new();
+    let server_cancel = cancellation.clone();
+    let server = thread::spawn(move || {
+        let mut first = accept_with_deadline(&listener);
+        read_http_request(&mut first);
+        let event = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"read",
+            "function":{"name":"read","arguments":r#"{"path":"slim-finalization-missing.txt"}"#}}]}}]});
+        let body = format!("data: {event}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n");
+        write!(first, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        let mut final_stream = accept_with_deadline(&listener);
+        let request = read_http_request(&mut final_stream);
+        assert!(request.contains("Budget exhausted"));
+        server_cancel.cancel();
+    });
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .unwrap();
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(3)).unwrap();
+    let mut runtime = Runtime::new();
+    runtime.set_cancellation_token(cancellation);
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "one attempt",
+            OperatingMode::Auto,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig {
+                max_turns: 1,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(result.stop, AgentLoopStop::Cancelled);
+    assert_eq!(result.tool_results.len(), 1);
+}
+
+#[test]
+fn failed_volatile_shell_keeps_its_side_effects_and_allows_continuation() {
+    let root = std::env::temp_dir().join(format!("slim-volatile-retry-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for index in 0..3 {
+            let mut stream = accept_with_deadline(&listener);
+            read_http_request(&mut stream);
+            let (delta, reason) = if index == 2 {
+                (json!({"content":"partial changes recorded"}), "stop")
+            } else {
+                let command = "Add-Content -LiteralPath 'progress.txt' -Value 'progressed'; exit 1";
+                (
+                    json!({"tool_calls":[{"index":0,"id":format!("shell-{index}"),
+                    "function":{"name":"shell","arguments":json!({"command":command}).to_string()}}]}),
+                    "tool_calls",
+                )
+            };
+            let event = json!({"choices":[{"delta":delta}]});
+            let stop = json!({"choices":[{"delta":{},"finish_reason":reason}]});
+            let body = format!("data: {event}\n\ndata: {stop}\n\ndata: [DONE]\n\n");
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .unwrap();
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(3)).unwrap();
+    let mut runtime = Runtime::new();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "continue after partial effects",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig {
+                max_turns: 4,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    server.join().unwrap();
+    assert_eq!(result.tool_results.len(), 2);
+    assert!(result.tool_results.iter().all(|result| !result.success));
+    assert_eq!(
+        std::fs::read_to_string(root.join("progress.txt"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn structured_budget_errors_stop_without_retrying() {
+    for body in [
+        json!({"error":{"type":"insufficient_quota","code":"insufficient_quota","message":"Quota exhausted"}}),
+        json!({"error":{"type":"rate_limit_error","code":"credit_balance_exhausted","message":"Credit balance exhausted"}}),
+        json!({"error":{"type":"rate_limit_error","details":{"error_code":"enforced_spend_limit_reached"},"message":"Spend limit reached"}}),
+    ] {
+        let (client, done, server) = recovery_fixture(vec![(429, body.to_string()); 3]);
+        let mut runtime = Runtime::new();
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(runtime.run_agent_loop(
+                &client,
+                "Answer",
+                OperatingMode::ReadOnly,
+                std::env::temp_dir(),
+                1,
+                AgentLoopConfig::default(),
+            ));
+        let _ = done.send(());
+        let requests = server.join().unwrap();
+        assert!(result.is_err(), "budget exhaustion cannot succeed");
+        assert_eq!(
+            requests.len(),
+            1,
+            "budget error must not be retried: {body}"
+        );
+    }
+}
+
+#[test]
+fn chat_stream_recovers_structured_overload_before_output() {
+    let failure = format!(
+        "data: {}\n\n",
+        json!({"error":{"type":"server_error","code":null,"message":"Upstream overloaded"}})
+    );
+    let success = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"delta":{"content":"Recovered"},"finish_reason":"stop"}]})
+    );
+    let (client, done, server) = recovery_fixture(vec![(200, failure), (200, success)]);
+    let mut runtime = Runtime::new();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "Answer",
+            OperatingMode::ReadOnly,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig::default(),
+        ));
+    let _ = done.send(());
+    let requests = server.join().unwrap();
+    assert_eq!(
+        result.expect("explicit overload is recoverable").stop,
+        AgentLoopStop::ProviderCompleted
+    );
+    assert_eq!(requests.len(), 2);
+}
+
+fn recovery_fixture(
+    responses: Vec<(u16, String)>,
+) -> (
+    HttpProviderClient<OpenAiCompatibleAdapter>,
+    std::sync::mpsc::Sender<()>,
+    thread::JoinHandle<Vec<String>>,
+) {
+    recovery_fixture_with_headers(responses, "")
+}
+
+fn recovery_fixture_with_headers(
+    responses: Vec<(u16, String)>,
+    headers: &str,
+) -> (
+    HttpProviderClient<OpenAiCompatibleAdapter>,
+    std::sync::mpsc::Sender<()>,
+    thread::JoinHandle<Vec<String>>,
+) {
+    let headers = headers.to_owned();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (done, stop) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for (status, body) in responses {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                if stop.try_recv().is_ok() {
+                    return requests;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "recovery fixture deadline");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            requests.push(read_http_request(&mut stream));
+            let response = format!("HTTP/1.1 {status} Fixture\r\n{headers}Content-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            stream.write_all(response.as_bytes()).expect("response");
+        }
+        requests
+    });
+    let client = HttpProviderClient::new(
+        OpenAiCompatibleAdapter::new(ProviderConfig::openai(&endpoint, "fixture", "fixture"))
+            .unwrap(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    (client, done, server)
+}
+
+#[test]
+fn reasoning_only_completion_is_not_success() {
+    let body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let (client, done, server) = recovery_fixture(vec![(200, body.into())]);
+    let mut runtime = Runtime::new();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "Answer the question",
+            OperatingMode::ReadOnly,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig::default(),
+        ));
+    let _ = done.send(());
+    let requests = server.join().unwrap();
+    assert!(
+        matches!(result, Err(ProviderError::InvalidResponse { message }) if message.contains("without assistant text"))
+    );
+    assert_eq!(requests.len(), 1);
+}
+
+#[test]
+fn transient_recovery_preserves_completed_tools_and_retries_only_the_failed_request() {
+    let root = std::env::temp_dir().join(format!("slim-recovery-tools-{}", std::process::id()));
+    std::fs::create_dir(&root).expect("exclusive fixture");
+    let call = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"write-once","function":{"name":"write","arguments":json!({"path":"result.txt","content":"saved once"}).to_string()}}]},"finish_reason":"tool_calls"}]});
+    let incomplete =
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"still thinking\"}}]}\n\n";
+    let final_answer = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let (client, done, server) = recovery_fixture(vec![
+        (200, format!("data: {call}\n\ndata: [DONE]\n\n")),
+        (503, "temporarily unavailable".into()),
+        (200, incomplete.into()),
+        (200, final_answer.into()),
+    ]);
+    let mut runtime = Runtime::new();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "Write once, then answer",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig::default(),
+        ));
+    let _ = done.send(());
+    let requests = server.join().unwrap();
+    let result = result.expect("recovered");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(result.tool_results.len(), 1);
+    assert!(result.tool_results[0].success);
+    assert_eq!(
+        std::fs::read_to_string(root.join("result.txt")).unwrap(),
+        "saved once"
+    );
+    assert_eq!(requests.len(), 4);
+    let bodies: Vec<&str> = requests
+        .iter()
+        .map(|r| r.split_once("\r\n\r\n").unwrap().1)
+        .collect();
+    assert_eq!(bodies[1], bodies[2]);
+    assert_eq!(bodies[2], bodies[3]);
+    let history: Value = serde_json::from_str(bodies[3]).unwrap();
+    assert_eq!(
+        history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .count(),
+        1
+    );
+    assert_eq!(result.usage.retry_count, 2);
+    std::fs::remove_dir_all(&root).expect("remove own fixture");
+}
+
+#[test]
+fn provider_recovery_is_bounded_and_does_not_retry_permanent_errors() {
+    for (status, max_turns, expected_requests) in [
+        (503, 10, 3),
+        (408, 10, 3),
+        (401, 10, 1),
+        (403, 10, 1),
+        (503, 1, 1),
+    ] {
+        let (client, done, server) = recovery_fixture(vec![(status, "failed".into()); 3]);
+        let mut runtime = Runtime::new();
+        let config = AgentLoopConfig {
+            max_turns,
+            ..AgentLoopConfig::default()
+        };
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(runtime.run_agent_loop(
+                &client,
+                "Answer",
+                OperatingMode::ReadOnly,
+                std::env::temp_dir(),
+                1,
+                config,
+            ));
+        let _ = done.send(());
+        let requests = server.join().unwrap();
+        assert!(
+            matches!(result, Err(ProviderError::Http { .. })),
+            "status {status}: {result:?}"
+        );
+        assert_eq!(requests.len(), expected_requests);
+        assert_eq!(
+            runtime
+                .app
+                .events()
+                .iter()
+                .filter(|event| matches!(event.kind, EventKind::RequestCompleted { .. }))
+                .count(),
+            expected_requests
+        );
+    }
+}
+
+#[test]
+fn provider_recovery_continues_from_a_visible_partial_answer() {
+    let partial = format!(
+        "data: {}\n\n",
+        json!({"choices":[{"delta":{"content":"visible answer ".repeat(20)}}]})
+    );
+    let success = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"delta":{"content":" continued"},"finish_reason":"stop"}]})
+    );
+    let (client, done, server) = recovery_fixture(vec![(200, partial), (200, success)]);
+    let mut runtime = Runtime::new();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "Answer",
+            OperatingMode::ReadOnly,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig::default(),
+        ));
+    let _ = done.send(());
+    let requests = server.join().unwrap();
+    assert_eq!(
+        result.expect("partial stream is recoverable").stop,
+        AgentLoopStop::ProviderCompleted
+    );
+    assert_eq!(requests.len(), 2);
+    let retry_body = requests[1].split_once("\r\n\r\n").unwrap().1;
+    let history: Value = serde_json::from_str(retry_body).unwrap();
+    let messages = history["messages"].as_array().unwrap();
+    assert!(messages.iter().any(|message| {
+        message["role"] == "assistant"
+            && message["content"].as_str().is_some_and(|content| {
+                content.contains("visible answer") && content.contains("[Interrupted turn]")
+            })
+    }));
+    assert!(messages.iter().any(|message| {
+        message["role"] == "user"
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Continue from the preserved partial"))
+    }));
+    assert!(runtime
+        .conversation()
+        .iter()
+        .any(|message| message.role == "assistant" && message.content.contains("continued")));
+}
+
+#[test]
+fn cancellation_interrupts_provider_recovery_backoff() {
+    let (client, done, server) = recovery_fixture_with_headers(
+        vec![(503, "temporarily unavailable".into()); 3],
+        "Retry-After: 30\r\n",
+    );
+    let started = Instant::now();
+    let cancellation = CancellationToken::new();
+    let (sender, receiver) = SessionEventSender::bounded(64, cancellation.clone());
+    let cancel = cancellation.clone();
+    let watcher = thread::spawn(move || loop {
+        let event = receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("retry event");
+        if matches!(event.kind, EventKind::ProviderPhase { detail: Some(ref detail), .. } if detail.starts_with("Retrying provider"))
+        {
+            cancel.cancel();
+            break;
+        }
+    });
+    let mut runtime = Runtime::new();
+    runtime.app.set_event_sender(sender);
+    runtime.set_cancellation_token(cancellation);
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "Answer",
+            OperatingMode::ReadOnly,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig::default(),
+        ));
+    let _ = done.send(());
+    let requests = server.join().unwrap();
+    watcher.join().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "cancellation must interrupt server delay"
+    );
+    assert_eq!(result.unwrap().stop, AgentLoopStop::Cancelled);
+    assert_eq!(requests.len(), 1);
+}
+
+#[test]
+fn artifact_failure_keeps_completed_batch_in_transcript() {
+    let root = std::env::temp_dir().join(format!(
+        "slim-interrupted-artifact-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("source.txt"), "evidence ".repeat(1000)).unwrap();
+    let mut runtime = Runtime::with_artifact_store(root.join("artifacts")).unwrap();
+    runtime.capture_turn_transcript();
+    std::fs::write(root.join("artifacts"), "blocked destination").unwrap();
+    let calls = json!({"choices":[{"delta":{"tool_calls":[
+        {"index":0,"id":"write-once","function":{"name":"write","arguments":r#"{"path":"done.txt","content":"once"}"#}},
+        {"index":1,"id":"read-evidence","function":{"name":"read","arguments":r#"{"path":"source.txt"}"#}}
+    ]},"finish_reason":"tool_calls"}]});
+    let (client, done, server) =
+        recovery_fixture(vec![(200, format!("data: {calls}\n\ndata: [DONE]\n\n"))]);
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "write then inspect",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig {
+                max_result_bytes: 128,
+                ..AgentLoopConfig::default()
+            },
+        ));
+    let _ = done.send(());
+    assert_eq!(server.join().unwrap().len(), 1);
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read_to_string(root.join("done.txt")).unwrap(),
+        "once"
+    );
+    let transcript = runtime.take_turn_transcript();
+    assert_eq!(transcript.iter().filter(|m| m.role == "tool").count(), 2);
+    assert!(transcript
+        .iter()
+        .any(|m| m.tool_call_id.as_deref() == Some("read-evidence")
+            && m.content.contains("evidence")));
+    let entries = transcript
+        .into_iter()
+        .enumerate()
+        .map(|(index, message)| {
+            slim_core::session::DurableEntry::from_provider_message(
+                index.to_string(),
+                None,
+                "interrupted".into(),
+                message,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    slim_core::session::provider_messages_from_entries(&entries).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn provider_recovery_respects_retry_after() {
+    let final_body = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"delta":{"content":"recovered"},"finish_reason":"stop"}]})
+    );
+    let (client, done, server) = recovery_fixture_with_headers(
+        vec![(429, "slow down".into()), (200, final_body)],
+        "Retry-After: 1\r\n",
+    );
+    let started = Instant::now();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Runtime::new().run_agent_loop(
+            &client,
+            "answer",
+            OperatingMode::ReadOnly,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig::default(),
+        ));
+    let _ = done.send(());
+    assert_eq!(server.join().unwrap().len(), 2);
+    assert_eq!(result.unwrap().stop, AgentLoopStop::ProviderCompleted);
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "retry ignored server delay: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn provider_recovery_retries_headers_timeout_when_no_tools_ran() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (done, stop) = std::sync::mpsc::channel();
+    let success = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"delta":{"content":"recovered"},"finish_reason":"stop"}]})
+    );
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for (index, body) in [None, Some(success)].into_iter().enumerate() {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                if stop.try_recv().is_ok() {
+                    return requests;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "timeout fixture deadline {index}"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            requests.push(read_http_request(&mut stream));
+            if let Some(body) = body {
+                let response = format!(
+                    "HTTP/1.1 200 Fixture\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).expect("response");
+            } else {
+                thread::sleep(Duration::from_millis(400));
+            }
+        }
+        requests
+    });
+    let client = HttpProviderClient::new(
+        OpenAiCompatibleAdapter::new(ProviderConfig::openai(&endpoint, "fixture", "fixture"))
+            .unwrap(),
+        Duration::from_millis(150),
+    )
+    .unwrap();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Runtime::new().run_agent_loop(
+            &client,
+            "answer",
+            OperatingMode::ReadOnly,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig::default(),
+        ));
+    let _ = done.send(());
+    let requests = server.join().unwrap();
+    assert_eq!(
+        result.expect("headers timeout is recoverable").stop,
+        AgentLoopStop::ProviderCompleted
+    );
+    assert_eq!(requests.len(), 2);
+}
+
+#[test]
+fn malformed_arguments_are_repaired_without_executing_the_rejected_batch() {
+    let root = std::env::temp_dir().join(format!("slim-argument-repair-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("source.txt"), "retained evidence").unwrap();
+    let malformed = json!({"choices":[{"delta":{"content":"Inspecting the source.", "tool_calls":[
+        {"index":0,"id":"rejected-write","function":{"name":"write","arguments":json!({"path":"must-not-exist.txt","content":"not authorized by valid batch"}).to_string()}},
+        {"index":1,"id":"invalid-read","function":{"name":"read","arguments":"{\"path\":\"source.txt\""}}
+    ]},"finish_reason":"tool_calls"}]});
+    let corrected = json!({"choices":[{"delta":{"tool_calls":[
+        {"index":0,"id":"corrected-read","function":{"name":"read","arguments":json!({"path":"source.txt"}).to_string()}}
+    ]},"finish_reason":"tool_calls"}]});
+    let final_answer = json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]});
+    let (client, done, server) = recovery_fixture(
+        vec![malformed, corrected, final_answer]
+            .into_iter()
+            .map(|event| (200, format!("data: {event}\n\ndata: [DONE]\n\n")))
+            .collect(),
+    );
+    let mut runtime = Runtime::new();
+    runtime.capture_turn_transcript();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "inspect",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig::default(),
+        ));
+    let _ = done.send(());
+    let requests = server.join().unwrap();
+    let result = result.expect("arguments can be repaired without effects");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1].contains("[Tool argument validation]"));
+    assert!(requests[1].contains("invalid-read"));
+    assert!(requests[1].contains("Inspecting the source."));
+    assert!(!root.join("must-not-exist.txt").exists());
+    assert_eq!(result.tool_results.len(), 1);
+    assert_eq!(result.tool_results[0].name, "read");
+    assert!(result.tool_results[0].success);
+    assert!(runtime
+        .app
+        .events()
+        .iter()
+        .all(|event| !matches!(&event.kind,
+        EventKind::ToolStarted { call_id, .. } if call_id == "rejected-write")));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn anthropic_recovery_fixture(
+    responses: Vec<(u16, String)>,
+) -> (
+    HttpProviderClient<AnthropicAdapter>,
+    std::sync::mpsc::Sender<()>,
+    thread::JoinHandle<Vec<String>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (done, stop) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for (status, body) in responses {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                if stop.try_recv().is_ok() {
+                    return requests;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "anthropic recovery fixture deadline"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            requests.push(read_http_request(&mut stream));
+            let response = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            stream.write_all(response.as_bytes()).expect("response");
+        }
+        requests
+    });
+    let client = HttpProviderClient::new(
+        AnthropicAdapter::new(ProviderConfig::anthropic(
+            &endpoint,
+            "claude-fixture",
+            "fixture",
+        ))
+        .unwrap(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    (client, done, server)
+}
+
+fn anthropic_tool_sse(
+    calls: &[(&str, &str, &str)],
+    stop_reason: &str,
+    include_block_stop: bool,
+) -> String {
+    let mut events = Vec::new();
+    for (index, (id, name, arguments)) in calls.iter().enumerate() {
+        events.push(json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "tool_use", "id": id, "name": name}
+        }));
+        events.push(json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"partial_json": arguments}
+        }));
+        if include_block_stop {
+            events.push(json!({"type": "content_block_stop", "index": index}));
+        }
+    }
+    events.push(json!({"type": "message_delta", "delta": {"stop_reason": stop_reason}}));
+    events.push(json!({"type": "message_stop"}));
+    events
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect()
+}
+
+fn anthropic_text_sse(text: &str) -> String {
+    let events = [
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"text":text}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+        json!({"type":"message_stop"}),
+    ];
+    events
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect()
+}
+
+#[test]
+fn anthropic_malformed_arguments_are_repaired_without_executing_the_rejected_batch() {
+    let root = std::env::temp_dir().join(format!(
+        "slim-anthropic-argument-repair-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("source.txt"), "retained evidence").unwrap();
+    let malformed = anthropic_tool_sse(
+        &[
+            (
+                "rejected-write",
+                "write",
+                &json!({"path":"must-not-exist.txt","content":"not authorized by valid batch"})
+                    .to_string(),
+            ),
+            ("invalid-read", "read", "{\"path\":\"source.txt\""),
+        ],
+        "end_turn",
+        false,
+    );
+    let corrected = anthropic_tool_sse(
+        &[(
+            "corrected-read",
+            "read",
+            &json!({"path":"source.txt"}).to_string(),
+        )],
+        "tool_use",
+        true,
+    );
+    let (client, done, server) = anthropic_recovery_fixture(vec![
+        (200, malformed),
+        (200, corrected),
+        (200, anthropic_text_sse("done")),
+    ]);
+    let mut runtime = Runtime::new();
+    runtime.capture_turn_transcript();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "inspect",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig::default(),
+        ));
+    let _ = done.send(());
+    let requests = server.join().unwrap();
+    let result = result.expect("Anthropic arguments can be repaired without effects");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1].contains("[Tool argument validation]"));
+    assert!(requests[1].contains("invalid-read"));
+    assert!(!root.join("must-not-exist.txt").exists());
+    assert_eq!(result.tool_results.len(), 1);
+    assert_eq!(result.tool_results[0].name, "read");
+    assert!(result.tool_results[0].success);
+    assert!(runtime.app.events().iter().all(|event| !matches!(
+        &event.kind,
+        EventKind::ToolStarted { call_id, .. } if call_id == "rejected-write"
+    )));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn argument_repair_is_bounded_and_requires_known_identity() {
+    for (id, max_turns, expected) in [
+        (Some("bad-args"), 10, 3),
+        (Some("bad-args"), 1, 1),
+        (None, 10, 1),
+    ] {
+        let call = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":id,"function":{"name":"read","arguments":"{"}}]},"finish_reason":"tool_calls"}]});
+        let (client, done, server) =
+            recovery_fixture(vec![(200, format!("data: {call}\n\ndata: [DONE]\n\n")); 3]);
+        let mut runtime = Runtime::new();
+        let error = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(runtime.run_agent_loop(
+                &client,
+                "inspect",
+                OperatingMode::Auto,
+                std::env::temp_dir(),
+                1,
+                AgentLoopConfig {
+                    max_turns,
+                    ..AgentLoopConfig::default()
+                },
+            ))
+            .unwrap_err();
+        let _ = done.send(());
+        assert_eq!(server.join().unwrap().len(), expected);
+        if id.is_some() {
+            assert!(
+                matches!(error, ProviderError::InvalidResponse { message } if message.contains("task remains pending"))
+            );
+        } else {
+            assert!(matches!(error, ProviderError::MalformedToolCall));
+        }
+        assert!(runtime
+            .app
+            .events()
+            .iter()
+            .all(|event| !matches!(event.kind, EventKind::ToolStarted { .. })));
+    }
+}
+
+#[test]
+fn foreground_compaction_recovers_transient_failure_and_preserves_original_on_permanent_error() {
+    let text = |content: &str| {
+        format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"content":content},"finish_reason":"stop"}]})
+        )
+    };
+    let history = vec![
+        ProviderMessage::user("original task"),
+        ProviderMessage::assistant("prior evidence", Vec::new()),
+        ProviderMessage::user("continue"),
+    ];
+    for status in [503, 401] {
+        let (client, done, server) = recovery_fixture(vec![(status, "temporary failure".into()), (200, text("## Goal\noriginal task\n## Constraints\nNone\n## Progress\nprior evidence\n## Blocked\nNone\n## Decisions\nKeep evidence\n## Next steps\nContinue\n## Critical context\nFixture")), (200, text("done"))]);
+        let handle = CompactionHandle::default();
+        handle.request_manual("").unwrap();
+        let mut runtime = Runtime::new();
+        runtime.set_compaction_handle(handle);
+        let result =
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(runtime.run_agent_loop_with_messages(
+                    &client,
+                    &history,
+                    OperatingMode::ReadOnly,
+                    std::env::temp_dir(),
+                    1,
+                    AgentLoopConfig::default(),
+                ));
+        let _ = done.send(());
+        let requests = server.join().unwrap();
+        if status == 503 {
+            assert_eq!(
+                result.expect("recover compaction").stop,
+                AgentLoopStop::ProviderCompleted
+            );
+            assert_eq!(requests.len(), 3);
+            assert_eq!(
+                requests[0].split_once("\r\n\r\n").unwrap().1,
+                requests[1].split_once("\r\n\r\n").unwrap().1
+            );
+            assert!(runtime
+                .app
+                .events()
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::CompactionCompleted)));
+        } else {
+            assert!(matches!(
+                result,
+                Err(ProviderError::Http { status: 401, .. })
+            ));
+            assert_eq!(requests.len(), 1);
+            assert_eq!(runtime.conversation(), history.as_slice());
+            assert!(!runtime
+                .app
+                .events()
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::CompactionCompleted)));
+        }
+    }
+}
+
+#[test]
+fn foreground_compaction_backoff_is_cancellable_and_does_not_replace_history() {
+    let (client, done, server) =
+        recovery_fixture_with_headers(vec![(503, "unavailable".into()); 3], "Retry-After: 30\r\n");
+    let history = vec![
+        ProviderMessage::user("original task"),
+        ProviderMessage::assistant("prior evidence", Vec::new()),
+        ProviderMessage::user("continue"),
+    ];
+    let handle = CompactionHandle::default();
+    handle.request_manual("").unwrap();
+    let cancellation = CancellationToken::new();
+    let (sender, receiver) = SessionEventSender::bounded(64, cancellation.clone());
+    let cancel = cancellation.clone();
+    let watcher = thread::spawn(move || loop {
+        let event = receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+        if matches!(event.kind, EventKind::ProviderPhase { detail: Some(ref detail), .. } if detail.starts_with("Retrying foreground compaction"))
+        {
+            cancel.cancel();
+            break;
+        }
+    });
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle);
+    runtime.app.set_event_sender(sender);
+    runtime.set_cancellation_token(cancellation);
+    let started = Instant::now();
+    let result =
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(runtime.run_agent_loop_with_messages(
+                &client,
+                &history,
+                OperatingMode::ReadOnly,
+                std::env::temp_dir(),
+                1,
+                AgentLoopConfig::default(),
+            ));
+    let _ = done.send(());
+    assert_eq!(server.join().unwrap().len(), 1);
+    watcher.join().unwrap();
+    assert_eq!(result.unwrap().stop, AgentLoopStop::Cancelled);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(runtime.conversation(), history.as_slice());
+    assert!(!runtime
+        .app
+        .events()
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::CompactionCompleted)));
+}
+
+#[test]
+fn foreground_compaction_stops_after_two_retries_without_replacing_history() {
+    let (client, done, server) = recovery_fixture(vec![(503, "unavailable".into()); 4]);
+    let history = vec![
+        ProviderMessage::user("original task"),
+        ProviderMessage::assistant("prior evidence", Vec::new()),
+        ProviderMessage::user("continue"),
+    ];
+    let handle = CompactionHandle::default();
+    handle.request_manual("").unwrap();
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle);
+    let result =
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(runtime.run_agent_loop_with_messages(
+                &client,
+                &history,
+                OperatingMode::ReadOnly,
+                std::env::temp_dir(),
+                1,
+                AgentLoopConfig::default(),
+            ));
+    let _ = done.send(());
+    assert_eq!(server.join().unwrap().len(), 3);
+    assert!(matches!(
+        result,
+        Err(ProviderError::Http { status: 503, .. })
+    ));
+    assert_eq!(runtime.conversation(), history.as_slice());
+    assert!(!runtime
+        .app
+        .events()
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::CompactionCompleted)));
+}
+
+#[test]
+fn responses_server_error_continues_partial_without_replaying_completed_tools() {
+    use slim_core::provider::OpenCodeGoAdapter;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let complete = json!({"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":5}}});
+        let batches = [
+            vec![
+                json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"listed-once","name":"list","arguments":"{\"path\":\".\",\"max_entries\":1}"}}),
+                complete.clone(),
+            ],
+            vec![
+                json!({"type":"response.output_text.delta","delta":"Preserved partial answer."}),
+                json!({"type":"response.failed","response":{"error":{"code":"server_error","message":"upstream failed"}}}),
+            ],
+            vec![
+                json!({"type":"response.output_text.delta","delta":"Recovered final answer."}),
+                complete,
+            ],
+        ];
+        let mut requests = Vec::new();
+        for batch in batches {
+            let mut stream = accept_with_deadline(&listener);
+            requests.push(read_http_request(&mut stream));
+            let body = batch
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+        }
+        requests
+    });
+    let adapter = OpenCodeGoAdapter::new(
+        &endpoint,
+        "muse-spark-1.3-contributor",
+        "fixture",
+        Some("high"),
+    )
+    .unwrap();
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).unwrap();
+    let mut runtime = Runtime::new();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "Inspect",
+            OperatingMode::ReadOnly,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig::default(),
+        ))
+        .unwrap();
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(result.tool_results.len(), 1);
+    assert!(requests[2].contains("listed-once"));
+    assert!(requests[2].contains("function_call_output"));
+    assert!(requests[2].contains("Preserved partial answer."));
+    assert!(requests[2].contains("Do not repeat completed actions"));
+    assert!(runtime
+        .conversation()
+        .iter()
+        .any(|m| m.content.contains("Recovered final answer.")));
+    assert_eq!(runtime.app.events().iter().filter(|event| matches!(&event.kind, EventKind::AssistantTextDelta { text } if text == "Preserved partial answer.")).count(),1);
+}
+
+/// A provider that hallucinates an `mcp` call in ReadOnly must get the
+/// explicit mode gate, not a real dispatch: the meta-tool is not advertised
+/// outside Auto and the worker path refuses it anyway.
+#[test]
+fn mcp_call_in_readonly_mode_is_rejected_by_the_gate() {
+    use slim_core::mcp::{McpManager, McpServerSpec, McpTransport};
+    use slim_core::process::ExecutableResolver;
+    use std::collections::BTreeMap;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+    let server = thread::spawn(move || {
+        // Turn 0: hallucinated mcp call. The request must not advertise it.
+        let mut stream = accept_with_deadline(&listener);
+        let request = read_http_request(&mut stream);
+        let wire: Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").expect("body").1).expect("JSON");
+        let advertised = wire["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .any(|tool| tool["function"]["name"] == "mcp");
+        assert!(!advertised, "mcp must not be advertised in ReadOnly");
+        let tool_call = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"mcp-1","function":{"name":"mcp","arguments":"{\"list\":true}"}}]},"finish_reason":"tool_calls"}]});
+        let response = format!("data: {tool_call}\n\ndata: [DONE]\n\n");
+        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).expect("response");
+
+        // Turn 1: the tool output came back; finish.
+        let mut stream = accept_with_deadline(&listener);
+        let request = read_http_request(&mut stream);
+        assert!(request.contains("mcp-1"));
+        assert!(request.contains("Auto mode"), "{request}");
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).expect("final");
+    });
+
+    let client = HttpProviderClient::new(
+        OpenAiCompatibleAdapter::new(ProviderConfig::openai(&endpoint, "fixture", "fixture"))
+            .expect("adapter"),
+        Duration::from_secs(3),
+    )
+    .expect("client");
+    let mut runtime = Runtime::new();
+    // An enabled server is configured so nothing but the gate stops dispatch.
+    runtime.set_mcp_manager(Some(Arc::new(McpManager::new(
+        BTreeMap::from([(
+            "srv".to_owned(),
+            McpServerSpec {
+                name: "srv".into(),
+                transport: McpTransport::Stdio {
+                    command: "cmd".into(),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                },
+                enabled: true,
+                timeout: Duration::from_millis(1_000),
+            },
+        )]),
+        std::env::temp_dir(),
+        ExecutableResolver::default(),
+    ))));
+    let result = tokio::runtime::Runtime::new()
+        .expect("tokio")
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "list servers",
+            OperatingMode::ReadOnly,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig {
+                max_turns: 2,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .expect("loop");
+    server.join().expect("server");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(result.tool_results.len(), 1);
+    assert!(!result.tool_results[0].success);
+    assert!(result.tool_results[0].output.contains("Auto mode"));
 }

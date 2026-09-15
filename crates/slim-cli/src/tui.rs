@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7,11 +7,13 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use slim_core::mcp::{McpManager, McpServerStatus};
 use slim_core::provider::{
     clinepass_model, fetch_clinepass_catalog, is_clinepass_model_id, is_command_code_model_id,
-    open_code_model, ProviderKind, CLINEPASS_BASE_URL, CLINEPASS_DEFAULT_MODEL,
-    COMMANDCODE_BASE_URL, COMMANDCODE_DEFAULT_MODEL, OPENCODE_GO_BASE_URL,
-    OPENCODE_GO_DEFAULT_MODEL,
+    is_xai_model_id, open_code_model, zen_model, ProviderKind, CLINEPASS_BASE_URL,
+    CLINEPASS_DEFAULT_MODEL, COMMANDCODE_BASE_URL, COMMANDCODE_DEFAULT_MODEL, OPENCODE_GO_BASE_URL,
+    OPENCODE_GO_DEFAULT_MODEL, OPENCODE_ZEN_BASE_URL, OPENCODE_ZEN_DEFAULT_MODEL,
+    OPENCODE_ZEN_PUBLIC_KEY, XAI_BASE_URL, XAI_DEFAULT_MODEL,
 };
 use slim_core::runtime::CancellationToken;
 use slim_core::session::{DurableSessionHeader, JsonlRepo, SessionFormat, SessionPreflight};
@@ -21,9 +23,10 @@ use slim_core::{
 };
 use slim_tui::api::{
     ClinePassCatalogSource, CommandCodeCatalogSource, ContentHandle, ContentRequestId,
-    InteractionRequestId, LoginProvider, ModelAlias, OpenCodeCatalogSource, OpenCodeModelView,
-    PageCursor, ReasoningEffort, ToolBatchId, ToolCallId, TranscriptMessage, TranscriptRole,
-    UiChannels, UiCommand, UiEvent, WakeSignal,
+    InteractionRequestId, LoginProvider, McpServerView, McpStatusView, ModelAlias,
+    OpenCodeCatalogSource, OpenCodeModelView, PageCursor, ReasoningEffort, ToolBatchId, ToolCallId,
+    TranscriptMessage, TranscriptRole, UiChannels, UiCommand, UiEvent, WakeSignal,
+    ZenCatalogSource,
 };
 
 use crate::cli::parse_cli_args;
@@ -33,12 +36,13 @@ use crate::headless::{
     execute_provider_turn, execute_provider_turn_async, format_run_stop_message,
     resolve_max_mutating_tool_calls, resolve_max_read_tool_calls, resolve_max_turns,
     resolve_timeout_secs, resume_messages_from_preflight,
-    run_provider_resume_with_preflight_events_interactive_async, OutputFormat, ProviderExecution,
-    ProviderRequest, ProviderRunOptions, SkillInstructions, ToolLoopLimits,
+    run_provider_resume_with_preflight_events_interactive_async, McpHandle, OutputFormat,
+    ProviderExecution, ProviderRequest, ProviderRunOptions, SkillInstructions,
     MAX_SLASH_SKILL_BODY_BYTES,
 };
 use crate::oauth::{OAuthCredential, OAuthError, OAuthProgress, OAuthProvider, OAuthService};
 use crate::opencode_go_catalog::{CatalogSnapshot, CatalogSource, OpenCodeCatalog};
+use crate::opencode_zen_catalog::OpenCodeZenCatalog;
 use crate::{delete_api_key, load_local_images, resolve_provider_credential, save_api_key};
 
 pub struct TuiRuntimeHandle {
@@ -96,6 +100,27 @@ struct SelectedTuiSession {
     history: Vec<ProviderMessage>,
 }
 
+fn restored_todo_event(preflight: &SessionPreflight) -> Result<UiEvent, String> {
+    let mut runtime = slim_core::runtime::Runtime::new();
+    let cwd = preflight
+        .header
+        .as_ref()
+        .ok_or("session header unavailable")?;
+    runtime
+        .restore_task_facts(
+            &crate::headless::session_task_facts(preflight),
+            std::path::Path::new(&cwd.cwd),
+        )
+        .map_err(provider_error_message)?;
+    UiEvent::from_core(slim_core::SessionEvent::new(
+        0,
+        slim_core::EventKind::TodoChanged {
+            items: runtime.todo_items(),
+        },
+    ))
+    .ok_or_else(|| "task state event unavailable".into())
+}
+
 enum SlashSkillCommand {
     Selected {
         name: String,
@@ -113,6 +138,42 @@ fn valid_slash_skill_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+/// Skill names for slash completion, discovered here (never on the TUI
+/// thread) and attached to the workspace events that carry them.
+fn workspace_skill_names(workspace_root: &Path) -> Vec<String> {
+    if !workspace_root.is_dir() {
+        return Vec::new();
+    }
+    slim_core::skills::discover_workspace(workspace_root)
+        .map(|discovery| {
+            discovery
+                .active_entries()
+                .iter()
+                .filter(|entry| valid_slash_skill_name(&entry.name))
+                .map(|entry| entry.name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Memoized variant of [`workspace_skill_names`] so the startup
+/// WorkspaceChanged + SessionRestored pair scans the same workspace once.
+fn memoized_skill_names(
+    memo: &mut Option<(PathBuf, Vec<String>)>,
+    root: Option<PathBuf>,
+) -> Vec<String> {
+    let Some(root) = root else {
+        return Vec::new();
+    };
+    let root = root.canonicalize().unwrap_or(root);
+    if let Some((_, names)) = memo.as_ref().filter(|(cached, _)| *cached == root) {
+        return names.clone();
+    }
+    let names = workspace_skill_names(&root);
+    *memo = Some((root, names.clone()));
+    names
 }
 
 fn resolve_slash_skill_command(
@@ -259,15 +320,13 @@ fn select_previous_tui_session(
         if current_path.as_ref() == Some(&canonical_path) {
             continue;
         }
-        let preflight = match slim_core::session::preflight_session(&canonical_path) {
-            Ok(preflight) => preflight,
-            Err(_) => continue,
-        };
-        let Some(header) = preflight.header.as_ref() else {
+        // Header-only scan: a full preflight parses every record line, which
+        // would make startup O(all session bytes) as sessions accumulate. The
+        // strict header decode already rejects non-v2 schema versions.
+        let Some(header) = read_session_header(&canonical_path) else {
             continue;
         };
-        if preflight.format != Some(SessionFormat::DurableV2)
-            || !header.id.starts_with("tui-")
+        if !header.id.starts_with("tui-")
             || canonical_path.file_stem().and_then(|stem| stem.to_str()) != Some(header.id.as_str())
         {
             continue;
@@ -279,27 +338,27 @@ fn select_previous_tui_session(
         if header_cwd != canonical_workspace {
             continue;
         }
-        if preflight.can_resume_v2() && preflight.records.is_empty() {
-            continue;
-        }
         let created = header.timestamp.parse::<u128>().unwrap_or(0);
         let modified = fs::metadata(&canonical_path)
             .and_then(|metadata| metadata.modified())
             .map(system_time_nanos)
             .unwrap_or(created);
-        candidates.push((
-            modified,
-            created,
-            header.id.clone(),
-            canonical_path,
-            preflight,
-        ));
+        candidates.push((modified, created, header.id.clone(), canonical_path));
     }
 
     candidates.sort_by(|left, right| {
         (&left.0, &left.1, &left.2, &left.3).cmp(&(&right.0, &right.1, &right.2, &right.3))
     });
-    while let Some((_, _, _, _, preflight)) = candidates.pop() {
+    while let Some((_, _, _, path)) = candidates.pop() {
+        let preflight = match slim_core::session::preflight_session(&path) {
+            Ok(preflight) => preflight,
+            Err(_) => continue,
+        };
+        if preflight.format != Some(SessionFormat::DurableV2)
+            || (preflight.can_resume_v2() && preflight.records.is_empty())
+        {
+            continue;
+        }
         super::headless::ensure_resume_preflight(&preflight)
             .map_err(|error| format!("previous session cannot be resumed: {error}"))?;
         slim_core::session::resume_plan_from_preflight(&preflight)
@@ -314,21 +373,64 @@ fn select_previous_tui_session(
     Ok(None)
 }
 
+/// First-line decode of a durable session header. The strict deserialize
+/// rejects non-v2 schema versions and non-session record types.
+fn read_session_header(path: &Path) -> Option<DurableSessionHeader> {
+    let file = fs::File::open(path).ok()?;
+    let mut first_line = Vec::new();
+    std::io::BufRead::read_until(&mut std::io::BufReader::new(file), b'\n', &mut first_line)
+        .ok()?;
+    serde_json::from_slice(&first_line).ok()
+}
+
 fn transcript_messages(history: &[ProviderMessage]) -> Vec<TranscriptMessage> {
-    history
-        .iter()
-        .filter_map(|message| match message.role.as_str() {
-            "user" => Some(TranscriptMessage {
+    let mut restored = Vec::new();
+    let mut pending = std::collections::BTreeMap::new();
+    for (index, message) in history.iter().enumerate() {
+        match message.role.as_str() {
+            "user" => restored.push(TranscriptMessage {
                 role: TranscriptRole::User,
                 text: message.content.clone(),
             }),
-            "assistant" => Some(TranscriptMessage {
-                role: TranscriptRole::Assistant,
-                text: message.content.clone(),
-            }),
-            _ => None,
-        })
-        .collect()
+            "assistant" => {
+                if !message.content.trim().is_empty() {
+                    restored.push(TranscriptMessage {
+                        role: TranscriptRole::Assistant,
+                        text: message.content.clone(),
+                    });
+                }
+                for call in &message.tool_calls {
+                    pending.insert(call.id.as_str(), restored.len());
+                    restored.push(TranscriptMessage {
+                        role: TranscriptRole::Tool {
+                            batch_id: ToolBatchId(format!("history-batch-{index}").into()),
+                            call_id: ToolCallId(format!("history-{index}:{}", call.id).into()),
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        },
+                        text: String::new(),
+                    });
+                }
+            }
+            "tool" => {
+                if let Some(position) = message
+                    .tool_call_id
+                    .as_deref()
+                    .and_then(|id| pending.remove(id))
+                {
+                    restored[position].text.clone_from(&message.content);
+                }
+            }
+            _ => {}
+        }
+    }
+    restored
+}
+
+fn session_transcript(preflight: &SessionPreflight) -> Result<Vec<TranscriptMessage>, String> {
+    let history = slim_core::session::provider_messages_from_records(preflight.records.iter())
+        .map_err(str::to_owned)?;
+    Ok(transcript_messages(&history))
 }
 
 pub fn run_tui(args: Vec<String>) -> Result<(), TuiError> {
@@ -345,8 +447,8 @@ pub fn run_tui(args: Vec<String>) -> Result<(), TuiError> {
     }
     let result = slim_tui::run_app(channels)
         .map_err(|error| TuiError::new(ExitCode::Internal, error.to_string()));
-    drop(runtime);
-    result
+    let worker_result = runtime.finish();
+    result.and(worker_result)
 }
 
 fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, TuiError> {
@@ -418,19 +520,23 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
         .endpoint
         .or_else(|| std::env::var("SLIM_ENDPOINT").ok())
         .or(layered_config.endpoint);
-    let model_override = parsed
-        .model
-        .or_else(|| std::env::var("SLIM_MODEL").ok())
-        .or(layered_config.model);
-    let configured_effort = std::env::var("SLIM_EFFORT")
-        .ok()
-        .and_then(|value| ReasoningEffort::parse(&value))
-        .or_else(|| {
-            layered_config
-                .effort
-                .as_deref()
-                .and_then(ReasoningEffort::parse)
-        });
+    let explicit_model = parsed.model.or_else(|| std::env::var("SLIM_MODEL").ok());
+    let model_override = explicit_model.clone().or(layered_config.model);
+    let configured_effort = parsed
+        .effort
+        .or_else(|| std::env::var("SLIM_EFFORT").ok())
+        .filter(|value| !value.is_empty())
+        .or(layered_config.effort)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            ReasoningEffort::parse(&value).ok_or_else(|| {
+                TuiError::new(
+                    ExitCode::InputRequired,
+                    "unsupported configured reasoning effort",
+                )
+            })
+        })
+        .transpose()?;
     let mut effort = configured_effort.unwrap_or(ReasoningEffort::High);
     let explicit_provider = parsed
         .provider
@@ -518,6 +624,31 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
         }
     };
     if let Some(request) = request.as_mut() {
+        if parsed.codex_fast.is_some() && request.kind != ProviderKind::OpenAiCodex {
+            return Err(TuiError::new(
+                ExitCode::InputRequired,
+                "--fast/--normal require the openai-codex provider",
+            ));
+        }
+        if request.kind == ProviderKind::OpenAiCodex {
+            if let Some(alias) = ModelAlias::parse(&request.model) {
+                if !ReasoningEffort::supported(alias).contains(&effort) {
+                    return Err(TuiError::new(
+                        ExitCode::InputRequired,
+                        "configured effort is unsupported by the Codex model",
+                    ));
+                }
+            }
+        }
+        if explicit_model
+            .as_deref()
+            .is_some_and(|model| !crate::provider_compatible_model(request.kind, model))
+        {
+            return Err(TuiError::new(
+                ExitCode::InputRequired,
+                "explicit model is unsupported by the selected provider",
+            ));
+        }
         request.timeout = timeout;
     }
 
@@ -531,6 +662,27 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
                 return Err(TuiError::new(
                     ExitCode::InputRequired,
                     "configured effort is unsupported by the OpenCode Go model",
+                ));
+            }
+            effort = model
+                .reasoning_levels
+                .iter()
+                .find_map(|level| ReasoningEffort::parse(level))
+                .unwrap_or(ReasoningEffort::High);
+        }
+    }
+    if let Some(model) = request
+        .as_ref()
+        .filter(|request| request.kind == ProviderKind::OpenCodeZen)
+        .and_then(|request| zen_model(&request.model))
+    {
+        // Models without reasoning levels expose no effort knob; a globally
+        // configured effort is left unsent by the adapter, not an error.
+        if !model.reasoning_levels.is_empty() && !model.reasoning_levels.contains(&effort.id()) {
+            if configured_effort.is_some() {
+                return Err(TuiError::new(
+                    ExitCode::InputRequired,
+                    "configured effort is unsupported by the OpenCode Zen model",
                 ));
             }
             effort = model
@@ -565,6 +717,9 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
     if let Some(calls) = layered_config.max_read_tool_calls {
         options = options.with_max_read_tool_calls(calls);
     }
+    if let Some(calls) = layered_config.max_total_tool_calls {
+        options = options.with_max_total_tool_calls(calls);
+    }
     if let Some(turns) = layered_config.max_turns {
         options = options.with_max_turns(turns);
     }
@@ -574,17 +729,11 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
     if let Some(bytes) = layered_config.max_result_bytes {
         options = options.with_max_result_bytes(bytes);
     }
-    if configured_effort.is_some()
-        && request.as_ref().is_some_and(|request| {
-            matches!(
-                request.kind,
-                ProviderKind::OpenAiCodex
-                    | ProviderKind::OpenCodeGo
-                    | ProviderKind::ClinePass
-                    | ProviderKind::CommandCode
-            ) || ModelAlias::parse(&request.model).is_some()
-        })
-    {
+    options.codex_fast = parsed
+        .codex_fast
+        .or(layered_config.codex_fast)
+        .unwrap_or(false);
+    if configured_effort.is_some() {
         options = options.with_reasoning_effort(effort.id());
     }
     Ok(TuiStartup {
@@ -610,11 +759,13 @@ fn provider_kind(name: &str) -> Result<ProviderKind, TuiError> {
         "openai-codex" | "codex" => Ok(ProviderKind::OpenAiCodex),
         "anthropic" | "claude" => Ok(ProviderKind::Anthropic),
         "opencode-go" | "opencode_go" | "go" => Ok(ProviderKind::OpenCodeGo),
+        "opencode-zen" | "opencode_zen" | "zen" => Ok(ProviderKind::OpenCodeZen),
         "clinepass" | "cline-pass" | "cp" => Ok(ProviderKind::ClinePass),
         "command-code" | "commandcode" | "cmd" => Ok(ProviderKind::CommandCode),
+        "xai" | "grok" => Ok(ProviderKind::Xai),
         _ => Err(TuiError::new(
             ExitCode::Provider,
-            "unsupported provider; use openai-compatible, openai-codex, anthropic, opencode-go, clinepass, or command-code",
+            "unsupported provider; use openai-compatible, openai-codex, anthropic, opencode-go, opencode-zen, clinepass, command-code, or xai",
         )),
     }
 }
@@ -629,6 +780,39 @@ fn defaults(kind: ProviderKind) -> (&'static str, &'static str) {
         crate::cli::default_provider_endpoint(kind),
         crate::cli::default_provider_model(kind),
     )
+}
+
+fn activate_zen_provider(
+    startup: &mut TuiStartup,
+    oauth: &OAuthService,
+    model: &str,
+) -> Result<bool, String> {
+    if startup
+        .request
+        .as_ref()
+        .is_some_and(|request| request.kind == ProviderKind::OpenCodeZen)
+    {
+        return Ok(false);
+    }
+    let api_key = oauth
+        .activate_api_key("opencode-zen")
+        .map_err(|error| format!("Authentication: {error}"))?
+        .unwrap_or_else(|| OPENCODE_ZEN_PUBLIC_KEY.into());
+    startup.request = Some(ProviderRequest {
+        prompt: String::new(),
+        mode: startup.mode,
+        kind: ProviderKind::OpenCodeZen,
+        endpoint: startup
+            .endpoint_override
+            .clone()
+            .unwrap_or_else(|| OPENCODE_ZEN_BASE_URL.into()),
+        model: model.into(),
+        api_key,
+        account_id: None,
+        timeout: startup.timeout,
+    });
+    startup.oauth_session = None;
+    Ok(true)
 }
 
 fn activate_saved_api_key_provider(
@@ -674,8 +858,16 @@ fn api_key_request(
     endpoint: Option<&str>,
     model: Option<&str>,
 ) -> Result<Option<ProviderRequest>, TuiError> {
-    let Some(credential) = resolve_provider_credential(kind).map_err(tui_auth_error)? else {
-        return Ok(None);
+    let credential = match resolve_provider_credential(kind).map_err(tui_auth_error)? {
+        Some(credential) => credential,
+        // Zen's free tier answers the literal `public` bearer; the adapter
+        // still sends the required `x-opencode-session` header.
+        None if kind == ProviderKind::OpenCodeZen => crate::auth::ProviderCredential {
+            access: OPENCODE_ZEN_PUBLIC_KEY.into(),
+            account_id: None,
+            oauth: false,
+        },
+        None => return Ok(None),
     };
     if credential.oauth {
         return Ok(None);
@@ -688,6 +880,7 @@ fn api_key_request(
         .filter(|model| crate::provider_compatible_model(kind, model))
         .map(str::to_owned)
         .unwrap_or_else(|| default_model.to_owned());
+    let model = crate::canonical_provider_model(kind, &model);
     Ok(Some(ProviderRequest {
         prompt: String::new(),
         mode,
@@ -718,12 +911,14 @@ fn oauth_request(
         .filter(|model| crate::provider_compatible_model(kind, model))
         .map(str::to_owned)
         .unwrap_or_else(|| default_model.to_owned());
+    let model = crate::canonical_provider_model(kind, &model);
     let account_id =
         match provider {
             OAuthProvider::Anthropic => Some(String::new()),
             OAuthProvider::OpenAiCodex => Some(credential.account_id.clone().ok_or_else(|| {
                 TuiError::new(ExitCode::Auth, "Codex OAuth account id is missing")
             })?),
+            OAuthProvider::Xai => None,
         };
     Ok(ProviderRequest {
         prompt: String::new(),
@@ -741,17 +936,35 @@ fn provider_kind_for_oauth(provider: OAuthProvider) -> ProviderKind {
     match provider {
         OAuthProvider::Anthropic => ProviderKind::Anthropic,
         OAuthProvider::OpenAiCodex => ProviderKind::OpenAiCodex,
+        OAuthProvider::Xai => ProviderKind::Xai,
+    }
+}
+
+impl TuiRuntimeHandle {
+    /// Shut down and observe the worker result without exposing panic payloads.
+    pub fn finish(mut self) -> Result<(), TuiError> {
+        self.shutdown_and_join()
+    }
+
+    fn shutdown_and_join(&mut self) -> Result<(), TuiError> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(UiCommand::Shutdown);
+        }
+        if let Some(worker) = self.worker.take() {
+            worker.join().map_err(|_| {
+                TuiError::new(
+                    ExitCode::Internal,
+                    "TUI worker thread failed; run completion and prior effects are unverified",
+                )
+            })?;
+        }
+        Ok(())
     }
 }
 
 impl Drop for TuiRuntimeHandle {
     fn drop(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(UiCommand::Shutdown);
-        }
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        let _ = self.shutdown_and_join();
     }
 }
 
@@ -880,6 +1093,10 @@ fn spawn_tui_session(
     oauth: OAuthService,
 ) -> Result<(TuiRuntimeHandle, UiChannels), ProviderError> {
     startup.options.ensure_shared_tool_registry();
+    startup
+        .options
+        .provider_session_id
+        .get_or_insert_with(slim_core::provider::OpenCodeGoAdapter::new_session_id);
     if startup.options.workspace_root.is_none() {
         startup.options.workspace_root =
             Some(
@@ -930,17 +1147,15 @@ fn spawn_tui_session(
 
 fn image_model_error(request: Option<&ProviderRequest>) -> Option<String> {
     let request = request?;
-    if request.kind != ProviderKind::OpenCodeGo {
-        return None;
-    }
-    let model = open_code_model(&request.model)?;
+    let (model, label) = match request.kind {
+        ProviderKind::OpenCodeGo => (open_code_model(&request.model)?, "OpenCode Go"),
+        ProviderKind::OpenCodeZen => (zen_model(&request.model)?, "OpenCode Zen"),
+        _ => return None,
+    };
     if model.accepts_images {
         None
     } else {
-        Some(format!(
-            "OpenCode Go model {} does not accept images",
-            model.id
-        ))
+        Some(format!("{label} model {} does not accept images", model.id))
     }
 }
 
@@ -978,7 +1193,9 @@ impl EventSink {
             return self.send_control(event);
         }
         if self.data().send(event).is_ok() {
-            self.wake.notify();
+            // Gated signal: the consumer probes the lanes before waiting, so
+            // per-event SetEvent/pipe writes only matter while it is parked.
+            self.wake.notify_waiter();
             return true;
         }
         false
@@ -986,7 +1203,7 @@ impl EventSink {
 
     fn send_control(&self, event: UiEvent) -> bool {
         if self.control().send(event).is_ok() {
-            self.wake.notify();
+            self.wake.notify_waiter();
             return true;
         }
         false
@@ -999,7 +1216,7 @@ impl EventSink {
             self.data().try_send(event)
         };
         if result.is_ok() {
-            self.wake.notify();
+            self.wake.notify_waiter();
         }
         result
     }
@@ -1031,7 +1248,7 @@ impl EventSink {
             };
             match sender.try_send(event) {
                 Ok(()) => {
-                    self.wake.notify();
+                    self.wake.notify_waiter();
                     return true;
                 }
                 Err(mpsc::TrySendError::Full(pending)) => {
@@ -1207,6 +1424,8 @@ enum ActiveEvent {
     /// Grace period after the first Esc elapsed while the run still ignores
     /// the cancellation token: force the abort instead of waiting forever.
     CancelTimeout,
+    /// One-second status poll while /mcp stays open over an active run.
+    McpTick,
 }
 
 enum LoginEvent {
@@ -1276,7 +1495,13 @@ fn run_worker(
             }
         }
     });
-    let tokio_runtime = match tokio::runtime::Runtime::new() {
+    // Two workers suffice: heavy work runs on spawn_blocking threads, and the
+    // async tasks (login, catalogs, provider driver) are IO-bound.
+    let tokio_runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
         Ok(runtime) => runtime,
         Err(error) => {
             let _ = sink.send(UiEvent::RunFailed {
@@ -1287,18 +1512,41 @@ fn run_worker(
         }
     };
     tokio_runtime.block_on(async move {
+        let mut skill_memo = None;
         let cwd = startup
             .options
             .workspace_root
             .as_deref()
             .map(display_workspace_path)
             .unwrap_or_default();
-        sink.send(UiEvent::WorkspaceChanged { cwd });
-        if let Some(root) = startup.options.workspace_root.clone() {
-            if let Some(intel) = startup.options.code_intelligence.as_ref() {
-                intel.warm_workspace(root);
+        let skill_names =
+            memoized_skill_names(&mut skill_memo, startup.options.workspace_root.clone());
+        sink.send(UiEvent::WorkspaceChanged { cwd, skill_names });
+        if let Some(preflight) = startup.resume_preflight.as_ref() {
+            match session_transcript(preflight) {
+                Ok(messages) => {
+                    let todo_event = match restored_todo_event(preflight) {
+                        Ok(event) => event,
+                        Err(message) => { sink.send(UiEvent::RunFailed { run_id: None, message }); return; }
+                    };
+                    if let Some(header) = preflight.header.as_ref() {
+                        let skill_names = memoized_skill_names(
+                            &mut skill_memo,
+                            Some(PathBuf::from(&header.cwd)),
+                        );
+                        sink.send(UiEvent::SessionRestored {
+                            session_id: slim_tui::api::SessionId(header.id.clone().into()),
+                            cwd: header.cwd.clone(),
+                            messages,
+                            skill_names,
+                        });
+                        sink.send(todo_event);
+                    }
+                }
+                Err(message) => { sink.send(UiEvent::RunFailed { run_id: None, message }); return; }
             }
         }
+        sink.send(UiEvent::ModeChanged { mode: startup.mode });
         let provider = startup
             .oauth_session
             .as_ref()
@@ -1309,8 +1557,10 @@ fn run_worker(
                 startup.request.as_ref().and_then(|request| {
                     match request.kind {
                         ProviderKind::OpenCodeGo => Some(LoginProvider::OpenCodeGo),
+                        ProviderKind::OpenCodeZen => Some(LoginProvider::OpenCodeZen),
                         ProviderKind::ClinePass => Some(LoginProvider::ClinePass),
                         ProviderKind::CommandCode => Some(LoginProvider::CommandCode),
+                        ProviderKind::Xai => Some(LoginProvider::Xai),
                         _ => None,
                     }
                 })
@@ -1329,6 +1579,9 @@ fn run_worker(
         let _ = sink.send(UiEvent::EffortChanged {
             effort: startup.effort,
         });
+        let _ = sink.send(UiEvent::CodexSpeedChanged {
+            fast: startup.options.codex_fast,
+        });
         if !startup.image_labels.is_empty() {
             let _ = sink.send(UiEvent::AttachmentsChanged {
                 labels: startup.image_labels.clone(),
@@ -1341,17 +1594,46 @@ fn run_worker(
         let mut next_run_id = 1_u64;
         let content_store = SharedContentStore::default();
         let open_code_catalog = OpenCodeCatalog::production().ok();
+        let zen_catalog = OpenCodeZenCatalog::production().ok();
         let command_code_catalog = CommandCodeCatalog::production().ok();
         let cline_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .expect("reqwest client");
         let open_code_inflight = Arc::new(AtomicBool::new(false));
+        let zen_inflight = Arc::new(AtomicBool::new(false));
         let cline_inflight = Arc::new(AtomicBool::new(false));
         let command_code_inflight = Arc::new(AtomicBool::new(false));
         let open_code_gen = Arc::new(AtomicU64::new(0));
+        let zen_gen = Arc::new(AtomicU64::new(0));
         let cline_gen = Arc::new(AtomicU64::new(0));
         let command_code_gen = Arc::new(AtomicU64::new(0));
+        // Application-scoped MCP manager: built once from layered config,
+        // never spawns a process until a server is actually exercised.
+        if startup.options.mcp.is_none() {
+            let cwd = startup
+                .options
+                .workspace_root
+                .clone()
+                .unwrap_or_default();
+            if let Ok(layered) = crate::config::load_layered() {
+                if let Some(manager) = crate::mcp::build_mcp_manager(&layered.mcp, &cwd) {
+                    startup.options.mcp = Some(McpHandle::new(manager));
+                }
+            }
+        }
+        let mut mcp_manager = startup
+            .options
+            .mcp
+            .as_ref()
+            .map(|handle| handle.manager().clone());
+        let mut mcp_watch = false;
+        // Shared with spawned /mcp ops: an op that already pushed a snapshot
+        // records the revision it published so the watch tick doesn't
+        // re-send an identical one a second later.
+        let mcp_seen_revision = Arc::new(AtomicU64::new(0_u64));
+        let mut mcp_watch_tick = tokio::time::interval(Duration::from_secs(1));
+        let mcp_inflight = Arc::new(Mutex::new(HashSet::<String>::new()));
         loop {
             if let Some(mut run) = pending.take() {
                 if let Some(projector) = run.projector.take() {
@@ -1367,20 +1649,54 @@ fn run_worker(
                         run.delivery.extend(deferred);
                     } else {
                         run.projector = Some(projector);
-                        if service_pending_command(&mut run, &mut async_rx, &sink) {
-                            break;
+                        // Wake on either the pacing tick or a command so
+                        // Cancel/Shutdown stays responsive while the provider
+                        // task unwinds.
+                        tokio::select! {
+                            command = async_rx.recv() => {
+                                if dispatch_pending_command(
+                                    &mut run,
+                                    command,
+                                    &sink,
+                                    &mut mcp_watch,
+                                    &mcp_manager,
+                                ) {
+                                    break;
+                                }
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(1)) => {}
                         }
                         pending = Some(run);
-                        tokio::time::sleep(Duration::from_millis(1)).await;
                         continue;
                     }
                 }
 
-                match advance_pending_delivery(&mut run, &mut async_rx, &sink) {
+                match advance_pending_delivery(
+                    &mut run,
+                    &mut async_rx,
+                    &sink,
+                    &mut mcp_watch,
+                    &mcp_manager,
+                ) {
                     PendingDeliveryStep::Complete => {}
                     PendingDeliveryStep::Pending => {
+                        // Backpressure pacing plus command wake: a cancel no
+                        // longer waits for the drain to finish first.
+                        tokio::select! {
+                            command = async_rx.recv() => {
+                                if dispatch_pending_command(
+                                    &mut run,
+                                    command,
+                                    &sink,
+                                    &mut mcp_watch,
+                                    &mcp_manager,
+                                ) {
+                                    break;
+                                }
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                        }
                         pending = Some(run);
-                        tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                     PendingDeliveryStep::Shutdown | PendingDeliveryStep::Disconnected => break,
                 }
@@ -1413,6 +1729,18 @@ fn run_worker(
                         | UiCommand::Approve { request_id }
                         | UiCommand::Reject { request_id },
                     )) => reject_unbound_interaction(&sink, request_id),
+                    // Read-only MCP state stays live behind the login overlay:
+                    // a dropped McpWatch toggle would wedge the /mcp view.
+                    LoginEvent::Command(Some(UiCommand::McpWatch { on })) => {
+                        mcp_watch = on;
+                    }
+                    LoginEvent::Command(Some(UiCommand::McpRefresh)) => {
+                        if let Some(manager) = mcp_manager.as_ref() {
+                            let _ = sink.send(UiEvent::McpServersChanged {
+                                servers: mcp_server_views(manager),
+                            });
+                        }
+                    }
                     LoginEvent::Command(Some(_)) => {
                         let _ = sink.send(UiEvent::Notification {
                             message: "login is already active".into(),
@@ -1481,11 +1809,13 @@ fn run_worker(
                                 command = async_rx.recv() => ActiveEvent::Command(command),
                                 result = &mut run.task => ActiveEvent::Finished(Box::new(result)),
                                 _ = tokio::time::sleep(grace) => ActiveEvent::CancelTimeout,
+                                _ = mcp_watch_tick.tick(), if mcp_watch => ActiveEvent::McpTick,
                             }
                         }
                         None => tokio::select! {
                             command = async_rx.recv() => ActiveEvent::Command(command),
                             result = &mut run.task => ActiveEvent::Finished(Box::new(result)),
+                            _ = mcp_watch_tick.tick(), if mcp_watch => ActiveEvent::McpTick,
                         },
                     }
                 };
@@ -1551,10 +1881,33 @@ fn run_worker(
                         | UiCommand::Approve { request_id }
                         | UiCommand::Reject { request_id },
                     )) => reject_unbound_interaction(&sink, request_id),
+                    // Read-only MCP state is safe mid-run: the overlay stays
+                    // viewable; mutating actions still hit the catch-all.
+                    ActiveEvent::Command(Some(UiCommand::McpWatch { on })) => {
+                        mcp_watch = on;
+                    }
+                    ActiveEvent::Command(Some(UiCommand::McpRefresh)) => {
+                        if let Some(manager) = mcp_manager.as_ref() {
+                            let _ = sink.send(UiEvent::McpServersChanged {
+                                servers: mcp_server_views(manager),
+                            });
+                        }
+                    }
                     ActiveEvent::Command(Some(_)) => {
                         let _ = sink.send(UiEvent::Notification {
                             message: "a run is already active".into(),
                         });
+                    }
+                    ActiveEvent::McpTick => {
+                        if let Some(manager) = mcp_manager.as_ref() {
+                            let revision = manager.revision();
+                            if revision != mcp_seen_revision.load(Ordering::Relaxed) {
+                                mcp_seen_revision.store(revision, Ordering::Relaxed);
+                                let _ = sink.send(UiEvent::McpServersChanged {
+                                    servers: mcp_server_views(manager),
+                                });
+                            }
+                        }
                     }
                     ActiveEvent::Finished(result) => {
                         // An Esc-armed run that settles on its own still counts
@@ -1563,14 +1916,17 @@ fn run_worker(
                         let esc_cancelled = last_esc_at.is_some();
                         last_esc_at = None;
                         if let Ok(Ok(execution)) = &*result {
+                            if execution.history.is_some() {
+                                startup.options.task_facts.clone_from(&execution.task_facts);
+                            }
                             if let Some(preflight) = execution.resume_preflight.clone() {
                                 startup.resume_path = Some(preflight.path.clone());
                                 startup.resume_preflight = Some(preflight);
                             }
-                            if execution.result.code == ExitCode::Success {
-                                if let Some(history) = execution.history.as_ref() {
-                                    startup.options.history.clone_from(history);
-                                } else if let Some(request) = startup.request.as_ref() {
+                            if let Some(history) = execution.history.as_ref() {
+                                startup.options.history.clone_from(history);
+                            } else if execution.result.code == ExitCode::Success {
+                                if let Some(request) = startup.request.as_ref() {
                                     record_completed_turn(
                                         &mut startup.options,
                                         &request.prompt,
@@ -1597,7 +1953,28 @@ fn run_worker(
                 continue;
             }
 
-            let Some(command) = async_rx.recv().await else {
+            let command = if mcp_watch {
+                // Status polling only runs while the /mcp overlay is open; a
+                // revision counter keeps identical snapshots off the UI lane.
+                tokio::select! {
+                    command = async_rx.recv() => command,
+                    _ = mcp_watch_tick.tick() => {
+                        if let Some(manager) = mcp_manager.as_ref() {
+                            let revision = manager.revision();
+                            if revision != mcp_seen_revision.load(Ordering::Relaxed) {
+                                mcp_seen_revision.store(revision, Ordering::Relaxed);
+                                let _ = sink.send(UiEvent::McpServersChanged {
+                                    servers: mcp_server_views(manager),
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                async_rx.recv().await
+            };
+            let Some(command) = command else {
                 break;
             };
             match command {
@@ -1605,10 +1982,10 @@ fn run_worker(
                     let workspace = startup
                         .options
                         .workspace_root
-                        .as_deref()
+                        .clone()
                         .expect("workspace root initialized");
                     match select_previous_tui_session(
-                        workspace,
+                        &workspace,
                         startup.resume_path.as_deref(),
                     ) {
                         Ok(Some(selected)) => {
@@ -1617,8 +1994,15 @@ fn run_worker(
                                 .session_id
                                 .clone()
                                 .unwrap_or_else(|| "unknown".into());
-                            let cwd = display_workspace_path(workspace);
-                            let messages = transcript_messages(&selected.history);
+                            let cwd = display_workspace_path(&workspace);
+                            let messages = match session_transcript(&selected.preflight) {
+                                Ok(messages) => messages,
+                                Err(message) => { sink.send(UiEvent::RunFailed { run_id: None, message }); continue; }
+                            };
+                            let todo_event = match restored_todo_event(&selected.preflight) {
+                                Ok(event) => event,
+                                Err(message) => { sink.send(UiEvent::RunFailed { run_id: None, message }); continue; }
+                            };
                             if let Some(policy) = startup
                                 .options
                                 .compaction
@@ -1629,13 +2013,20 @@ fn run_worker(
                                     Some(slim_core::context::CompactionHandle::new(policy));
                             }
                             startup.options.history = selected.history;
+                            startup.options.task_facts = crate::headless::session_task_facts(&selected.preflight);
+                            startup.options.tool_registry = None;
+                            startup.options.ensure_shared_tool_registry();
                             startup.resume_path = Some(selected.preflight.path.clone());
                             startup.resume_preflight = Some(selected.preflight);
+                            let skill_names =
+                                memoized_skill_names(&mut skill_memo, Some(workspace.clone()));
                             let _ = sink.send(UiEvent::SessionRestored {
                                 session_id: slim_tui::api::SessionId(session_id.into()),
                                 cwd,
                                 messages,
+                                skill_names,
                             });
+                            let _ = sink.send(todo_event);
                             let _ = sink.send(UiEvent::Notification {
                                 message: "Previous session restored. Send a prompt to continue."
                                     .into(),
@@ -1708,6 +2099,54 @@ fn run_worker(
                                 Err(_) => {
                                     let _ = sink.send(UiEvent::LoginFailed {
                                         message: "OpenCode Go key save task failed".into(),
+                                    });
+                                }
+                            }
+                        }
+                        LoginProvider::OpenCodeZen => {
+                            let saved = tokio::task::spawn_blocking(move || {
+                                save_api_key(ProviderKind::OpenCodeZen, &key_to_save)
+                            })
+                            .await;
+                            match saved {
+                                Ok(Ok(())) => {
+                                    let model = startup
+                                        .model_override
+                                        .as_deref()
+                                        .filter(|model| zen_model(model).is_some())
+                                        .unwrap_or(OPENCODE_ZEN_DEFAULT_MODEL)
+                                        .to_owned();
+                                    startup.request = Some(ProviderRequest {
+                                        prompt: String::new(),
+                                        mode: startup.mode,
+                                        kind: ProviderKind::OpenCodeZen,
+                                        endpoint: startup
+                                            .endpoint_override
+                                            .clone()
+                                            .unwrap_or_else(|| OPENCODE_ZEN_BASE_URL.into()),
+                                        model: model.clone(),
+                                        api_key: key,
+                                        account_id: None,
+                                        timeout: startup.timeout,
+                                    });
+                                    startup.oauth_session = None;
+                                    let _ = sink.send(UiEvent::AuthStateChanged {
+                                        provider: Some(LoginProvider::OpenCodeZen),
+                                        authenticated: true,
+                                    });
+                                    let _ = sink.send(UiEvent::ModelChanged { model });
+                                    let _ = sink.send(UiEvent::Notification {
+                                        message: "Connected: OpenCode Zen".into(),
+                                    });
+                                }
+                                Ok(Err(error)) => {
+                                    let _ = sink.send(UiEvent::LoginFailed {
+                                        message: error.to_string(),
+                                    });
+                                }
+                                Err(_) => {
+                                    let _ = sink.send(UiEvent::LoginFailed {
+                                        message: "OpenCode Zen key save task failed".into(),
                                     });
                                 }
                             }
@@ -1808,6 +2247,54 @@ fn run_worker(
                                 }
                             }
                         }
+                        LoginProvider::Xai => {
+                            let saved = tokio::task::spawn_blocking(move || {
+                                save_api_key(ProviderKind::Xai, &key_to_save)
+                            })
+                            .await;
+                            match saved {
+                                Ok(Ok(())) => {
+                                    let model = startup
+                                        .model_override
+                                        .as_deref()
+                                        .filter(|m| is_xai_model_id(m))
+                                        .unwrap_or(XAI_DEFAULT_MODEL)
+                                        .to_owned();
+                                    startup.request = Some(ProviderRequest {
+                                        prompt: String::new(),
+                                        mode: startup.mode,
+                                        kind: ProviderKind::Xai,
+                                        endpoint: startup
+                                            .endpoint_override
+                                            .clone()
+                                            .unwrap_or_else(|| XAI_BASE_URL.into()),
+                                        model: model.clone(),
+                                        api_key: key,
+                                        account_id: None,
+                                        timeout: startup.timeout,
+                                    });
+                                    startup.oauth_session = None;
+                                    let _ = sink.send(UiEvent::AuthStateChanged {
+                                        provider: Some(LoginProvider::Xai),
+                                        authenticated: true,
+                                    });
+                                    let _ = sink.send(UiEvent::ModelChanged { model });
+                                    let _ = sink.send(UiEvent::Notification {
+                                        message: "Connected: xAI".into(),
+                                    });
+                                }
+                                Ok(Err(error)) => {
+                                    let _ = sink.send(UiEvent::LoginFailed {
+                                        message: error.to_string(),
+                                    });
+                                }
+                                Err(_) => {
+                                    let _ = sink.send(UiEvent::LoginFailed {
+                                        message: "xAI key save task failed".into(),
+                                    });
+                                }
+                            }
+                        }
                         _ => {
                             let _ = sink.send(UiEvent::LoginFailed {
                                 message: "API-key login is unavailable for this provider."
@@ -1846,6 +2333,41 @@ fn run_worker(
                                 let _ = sink.send(UiEvent::Notification {
                                     message: format!(
                                         "OpenCode Go live catalog unavailable; using cache/fallback: {error}"
+                                    ),
+                                });
+                            }
+                        }
+                    });
+                }
+                UiCommand::RefreshZenModels => {
+                    let sink = sink.clone();
+                    let Some(catalog) = zen_catalog.clone() else {
+                        let _ = sink.send(UiEvent::Notification {
+                            message: "OpenCode Zen catalog path is unavailable".into(),
+                        });
+                        continue;
+                    };
+                    let _ = sink.send(zen_catalog_event(catalog.load_or_fallback()));
+                    if zen_inflight.swap(true, Ordering::AcqRel) {
+                        continue;
+                    }
+                    let generation = zen_gen.fetch_add(1, Ordering::AcqRel) + 1;
+                    let inflight = zen_inflight.clone();
+                    let gen_cell = zen_gen.clone();
+                    tokio::spawn(async move {
+                        let result = catalog.refresh().await;
+                        inflight.store(false, Ordering::Release);
+                        if gen_cell.load(Ordering::Acquire) != generation {
+                            return;
+                        }
+                        match result {
+                            Ok(snapshot) => {
+                                let _ = sink.send(zen_catalog_event(snapshot));
+                            }
+                            Err(error) => {
+                                let _ = sink.send(UiEvent::Notification {
+                                    message: format!(
+                                        "OpenCode Zen live catalog unavailable; using cache/fallback: {error}"
                                     ),
                                 });
                             }
@@ -1954,7 +2476,8 @@ fn run_worker(
                             Err(error) => {
                                 let detail = match error {
                                     slim_core::ProviderError::InvalidResponse { message }
-                                    | slim_core::ProviderError::Remote { message } => message,
+                                    | slim_core::ProviderError::Api { message, .. }
+                                    | slim_core::ProviderError::TransientRemote { message } | slim_core::ProviderError::Remote { message } | slim_core::ProviderError::Http { message, .. } => message,
                                     _ => "Command Code catalog request failed".into(),
                                 };
                                 let _ = sink.send(UiEvent::Notification {
@@ -2005,7 +2528,46 @@ fn run_worker(
                     }
                     startup.model_override = Some(model.clone());
                     startup.options.reasoning_effort = Some(effort.id().into());
-                    persist_model(&sink, &model, effort.id());
+                    persist_model(&sink, &model, effort.id(), None);
+                    let _ = sink.send(UiEvent::ModelChanged { model });
+                    let _ = sink.send(UiEvent::EffortChanged { effort });
+                }
+                UiCommand::SetZenModel { model, effort } => {
+                    let supported = zen_model(&model).is_some_and(|model| {
+                        model.reasoning_levels.is_empty()
+                            || model.reasoning_levels.contains(&effort.id())
+                    });
+                    if !supported {
+                        let _ = sink.send(UiEvent::Notification {
+                            message: "Unsupported OpenCode Zen model or reasoning effort".into(),
+                        });
+                        continue;
+                    }
+                    let switched = match activate_zen_provider(&mut startup, &oauth, &model) {
+                        Ok(switched) => switched,
+                        Err(message) => {
+                            let _ = sink.send(UiEvent::Notification { message });
+                            continue;
+                        }
+                    };
+                    let Some(request) = startup.request.as_mut() else {
+                        continue;
+                    };
+                    request.model.clone_from(&model);
+                    if switched {
+                        let _ = sink.send(UiEvent::AuthStateChanged {
+                            provider: Some(LoginProvider::OpenCodeZen),
+                            authenticated: true,
+                        });
+                        let _ = sink.send(UiEvent::Notification {
+                            message: "Connected: OpenCode Zen".into(),
+                        });
+                    }
+                    startup.model_override = Some(model.clone());
+                    startup.options.reasoning_effort = zen_model(&model)
+                        .filter(|model| model.reasoning_levels.is_empty())
+                        .map_or_else(|| Some(effort.id().into()), |_| None);
+                    persist_model(&sink, &model, effort.id(), None);
                     let _ = sink.send(UiEvent::ModelChanged { model });
                     let _ = sink.send(UiEvent::EffortChanged { effort });
                 }
@@ -2050,7 +2612,7 @@ fn run_worker(
                     }
                     startup.model_override = Some(model.clone());
                     startup.options.reasoning_effort = Some(effort.id().into());
-                    persist_model(&sink, &model, effort.id());
+                    persist_model(&sink, &model, effort.id(), None);
                     let _ = sink.send(UiEvent::ModelChanged { model });
                     let _ = sink.send(UiEvent::EffortChanged { effort });
                 }
@@ -2091,7 +2653,48 @@ fn run_worker(
                     }
                     startup.model_override = Some(model.clone());
                     startup.options.reasoning_effort = Some(effort.id().into());
-                    persist_model(&sink, &model, effort.id());
+                    persist_model(&sink, &model, effort.id(), None);
+                    let _ = sink.send(UiEvent::ModelChanged { model });
+                    let _ = sink.send(UiEvent::EffortChanged { effort });
+                }
+                UiCommand::SetXaiModel { model, effort } => {
+                    if !is_xai_model_id(&model) {
+                        let _ = sink.send(UiEvent::Notification {
+                            message: "Unsupported xAI model".into(),
+                        });
+                        continue;
+                    }
+                    let switched = match activate_saved_api_key_provider(
+                        &mut startup,
+                        &oauth,
+                        ProviderKind::Xai,
+                        "xai",
+                        XAI_BASE_URL,
+                        &model,
+                        "xAI",
+                    ) {
+                        Ok(switched) => switched,
+                        Err(message) => {
+                            let _ = sink.send(UiEvent::Notification { message });
+                            continue;
+                        }
+                    };
+                    let Some(request) = startup.request.as_mut() else {
+                        continue;
+                    };
+                    request.model.clone_from(&model);
+                    if switched {
+                        let _ = sink.send(UiEvent::AuthStateChanged {
+                            provider: Some(LoginProvider::Xai),
+                            authenticated: true,
+                        });
+                        let _ = sink.send(UiEvent::Notification {
+                            message: "Connected: xAI".into(),
+                        });
+                    }
+                    startup.model_override = Some(model.clone());
+                    startup.options.reasoning_effort = Some(effort.id().into());
+                    persist_model(&sink, &model, effort.id(), None);
                     let _ = sink.send(UiEvent::ModelChanged { model });
                     let _ = sink.send(UiEvent::EffortChanged { effort });
                 }
@@ -2120,8 +2723,10 @@ fn run_worker(
                             matches!(
                                 kind,
                                 ProviderKind::OpenCodeGo
+                                    | ProviderKind::OpenCodeZen
                                     | ProviderKind::ClinePass
                                     | ProviderKind::CommandCode
+                                    | ProviderKind::Xai
                             )
                         })
                     {
@@ -2133,6 +2738,10 @@ fn run_worker(
                                 &["SLIM_API_KEY", "COMMANDCODE_API_KEY", "CMD_API_KEY"],
                                 "Command Code",
                             ),
+                            ProviderKind::Xai => (&["SLIM_API_KEY", "XAI_API_KEY"], "xAI"),
+                            ProviderKind::OpenCodeZen => {
+                                (&["SLIM_API_KEY", "OPENCODE_API_KEY"], "OpenCode Zen")
+                            }
                             _ => (&["SLIM_API_KEY", "OPENCODE_API_KEY"], "OpenCode Go"),
                         };
                         match tokio::task::spawn_blocking(move || delete_api_key(kind)).await {
@@ -2273,9 +2882,14 @@ fn run_worker(
                     }
                     match create_tui_session(&mut startup) {
                         Ok(Some((session_id, cwd))) => {
+                            let skill_names = memoized_skill_names(
+                                &mut skill_memo,
+                                startup.options.workspace_root.clone(),
+                            );
                             let _ = sink.send(UiEvent::SessionSnapshot {
                                 session_id: slim_tui::api::SessionId(session_id.into()),
                                 cwd,
+                                skill_names,
                             });
                         }
                         Ok(None) => {}
@@ -2442,7 +3056,14 @@ fn run_worker(
                 UiCommand::SetModel {
                     model: alias,
                     effort,
+                    fast,
                 } => {
+                    if !ReasoningEffort::supported(alias).contains(&effort) {
+                        let _ = sink.send(UiEvent::Notification {
+                            message: "Unsupported reasoning effort for this Codex model".into(),
+                        });
+                        continue;
+                    }
                     let switching_provider = !startup
                         .request
                         .as_ref()
@@ -2501,9 +3122,221 @@ fn run_worker(
                     if let Some(request) = startup.request.as_mut() {
                         request.model.clone_from(&model);
                     }
-                    persist_model(&sink, &model, effort.id());
+                    startup.options.codex_fast = fast;
+                    persist_model(&sink, &model, effort.id(), Some(fast));
+                    let _ = sink.send(UiEvent::CodexSpeedChanged { fast });
                     let _ = sink.send(UiEvent::ModelChanged { model });
                     let _ = sink.send(UiEvent::EffortChanged { effort });
+                }
+                UiCommand::McpWatch { on } => {
+                    mcp_watch = on;
+                }
+                UiCommand::McpRefresh => match crate::config::load_layered() {
+                    Ok(layered) => {
+                        match mcp_manager.as_ref() {
+                            Some(manager) => {
+                                manager.reconcile(crate::mcp::specs_from_config(&layered.mcp));
+                            }
+                            None => {
+                                let cwd = startup
+                                    .options
+                                    .workspace_root
+                                    .clone()
+                                    .unwrap_or_default();
+                                if let Some(manager) =
+                                    crate::mcp::build_mcp_manager(&layered.mcp, &cwd)
+                                {
+                                    startup.options.mcp = Some(McpHandle::new(manager.clone()));
+                                    mcp_manager = Some(manager);
+                                }
+                            }
+                        }
+                        mcp_seen_revision.store(
+                            mcp_manager.as_ref().map_or(0, |manager| manager.revision()),
+                            Ordering::Relaxed,
+                        );
+                        let _ = sink.send(UiEvent::McpServersChanged {
+                            servers: mcp_manager
+                                .as_ref()
+                                .map(|manager| mcp_server_views(manager))
+                                .unwrap_or_default(),
+                        });
+                    }
+                    Err(error) => {
+                        let _ = sink.send(UiEvent::Notification {
+                            message: format!("config: {error}"),
+                        });
+                    }
+                },
+                UiCommand::McpTest { name } => {
+                    spawn_mcp_op(
+                        &mcp_manager,
+                        &mcp_inflight,
+                        &mcp_seen_revision,
+                        &sink,
+                        name,
+                        |manager, name| async move {
+                            manager
+                                .test(&name)
+                                .await
+                                .map(|count| format!("ok — {count} tool(s)"))
+                        },
+                    );
+                }
+                UiCommand::McpReconnect { name } => {
+                    spawn_mcp_op(
+                        &mcp_manager,
+                        &mcp_inflight,
+                        &mcp_seen_revision,
+                        &sink,
+                        name,
+                        |manager, name| async move {
+                            manager.reconnect(&name).await.map(|()| "reconnected".to_owned())
+                        },
+                    );
+                }
+                UiCommand::McpDisconnect { name } => {
+                    spawn_mcp_op(
+                        &mcp_manager,
+                        &mcp_inflight,
+                        &mcp_seen_revision,
+                        &sink,
+                        name,
+                        |manager, name| async move {
+                            manager
+                                .disconnect(&name)
+                                .await
+                                .map(|()| "disconnected".to_owned())
+                        },
+                    );
+                }
+                UiCommand::McpRemove { name } => {
+                    match crate::config::remove_mcp_server(&name) {
+                        Ok(edited) => {
+                            let mut still_defined = false;
+                            if let Some(manager) = mcp_manager.as_ref() {
+                                // Reconcile against the reloaded config: the
+                                // server may survive in another layer, and a
+                                // blind remove would kill it anyway.
+                                still_defined = match crate::config::load_layered() {
+                                    Ok(layered) => {
+                                        manager.reconcile(crate::mcp::specs_from_config(
+                                            &layered.mcp,
+                                        ));
+                                        layered.mcp.servers.contains_key(&name)
+                                    }
+                                    Err(_) => {
+                                        manager.remove(&name);
+                                        false
+                                    }
+                                };
+                                mcp_seen_revision
+                                    .store(manager.revision(), Ordering::Relaxed);
+                                let _ = sink.send(UiEvent::McpServersChanged {
+                                    servers: mcp_server_views(manager),
+                                });
+                            }
+                            let message = match edited {
+                                Some(path) => {
+                                    if still_defined {
+                                        format!(
+                                            "mcp {name} removed from {} (still defined in another layer)",
+                                            path.display()
+                                        )
+                                    } else {
+                                        format!("mcp {name} removed from {}", path.display())
+                                    }
+                                }
+                                None => format!("mcp {name} is not in slim.toml"),
+                            };
+                            let _ = sink.send(UiEvent::Notification { message });
+                        }
+                        Err(error) => {
+                            let _ = sink.send(UiEvent::Notification {
+                                message: format!("mcp remove {name}: {error}"),
+                            });
+                        }
+                    }
+                }
+                UiCommand::McpAdd {
+                    name,
+                    command,
+                    args,
+                    url,
+                    global,
+                } => {
+                    let file = crate::config::FileMcpServerConfig {
+                        command,
+                        args: if args.is_empty() { None } else { Some(args) },
+                        url,
+                        ..crate::config::FileMcpServerConfig::default()
+                    };
+                    let server = crate::config::McpServerConfig {
+                        command: file.command.clone(),
+                        args: file.args.clone().unwrap_or_default(),
+                        url: file.url.clone(),
+                        ..crate::config::McpServerConfig::default()
+                    };
+                    let mut check = crate::config::McpConfig::default();
+                    check.servers.insert(name.clone(), server.clone());
+                    let path = if global {
+                        crate::config::global_config_path()
+                    } else {
+                        Some(PathBuf::from(crate::config::PROJECT_CONFIG_FILE))
+                    };
+                    let result = check
+                        .validate()
+                        .and_then(|()| {
+                            path.clone()
+                                .ok_or_else(|| "global config path unavailable".to_owned())
+                        })
+                        .and_then(|path| {
+                            crate::config::upsert_mcp_server_to(&path, &name, &file)
+                                .map(|()| path)
+                        });
+                    match result {
+                        Ok(path) => {
+                            // Reconcile from the merged config so the live
+                            // entry matches what the next load_layered sees
+                            // (other layers may contribute env/headers/etc).
+                            let cwd = startup
+                                .options
+                                .workspace_root
+                                .clone()
+                                .unwrap_or_default();
+                            let manager = match mcp_manager.as_ref() {
+                                Some(manager) => manager.clone(),
+                                None => {
+                                    let manager = Arc::new(McpManager::new(
+                                        std::collections::BTreeMap::new(),
+                                        cwd,
+                                        Default::default(),
+                                    ));
+                                    startup.options.mcp =
+                                        Some(McpHandle::new(manager.clone()));
+                                    mcp_manager = Some(manager.clone());
+                                    manager
+                                }
+                            };
+                            if let Ok(layered) = crate::config::load_layered() {
+                                manager.reconcile(crate::mcp::specs_from_config(&layered.mcp));
+                            } else {
+                                manager.upsert(crate::mcp::server_spec(&name, &server));
+                            }
+                            mcp_seen_revision.store(manager.revision(), Ordering::Relaxed);
+                            let _ = sink.send(UiEvent::McpServersChanged {
+                                servers: mcp_server_views(&manager),
+                            });
+                            let _ = sink.send(UiEvent::Notification {
+                                message: format!("mcp {name} saved to {}", path.display()),
+                            });
+                        }
+                        Err(error) => {
+                            let _ = sink.send(UiEvent::Notification {
+                                message: format!("mcp add {name}: {error}"),
+                            });
+                        }
+                    }
                 }
                 UiCommand::CancelRun => {}
                 UiCommand::Shutdown => {
@@ -2517,11 +3350,117 @@ fn run_worker(
                 } => serve_content_page(&content_store, &sink, handle, request_id, cursor),
             }
         }
+        if let Some(manager) = mcp_manager.as_ref() {
+            manager.disconnect_all().await;
+        }
         if let Some(code_intelligence) = startup.options.code_intelligence.take() {
             code_intelligence.shutdown().await;
         }
     });
     let _ = forwarder.join();
+}
+
+/// Scrubs text headed for UI surfaces: the CLI-side redactor plus every
+/// configured MCP env/header value (a stderr tail can echo them).
+fn redact_mcp_text(manager: &McpManager, input: &str) -> String {
+    let mut text = crate::redact(input);
+    for secret in manager.sensitive_values() {
+        if !secret.is_empty() {
+            text = text.replace(&secret, "[REDACTED]");
+        }
+    }
+    text
+}
+
+/// Maps manager state to the UI view: target/error lines are bounded,
+/// redacted, and never carry header or env values.
+fn mcp_server_views(manager: &McpManager) -> Vec<McpServerView> {
+    manager
+        .statuses()
+        .into_iter()
+        .map(|info| {
+            let (status, tools, error) = match &info.status {
+                McpServerStatus::Disabled => (McpStatusView::Disabled, None, None),
+                McpServerStatus::Disconnected => (McpStatusView::Disconnected, None, None),
+                McpServerStatus::Connecting => (McpStatusView::Connecting, None, None),
+                McpServerStatus::Ready { tools } => (McpStatusView::Ready, Some(tools.len()), None),
+                McpServerStatus::Failed { error } => {
+                    let first = error.lines().next().unwrap_or("");
+                    let first = if first.chars().count() > 160 {
+                        format!("{}…", first.chars().take(160).collect::<String>())
+                    } else {
+                        first.to_owned()
+                    };
+                    (
+                        McpStatusView::Failed,
+                        None,
+                        Some(redact_mcp_text(manager, &first)),
+                    )
+                }
+            };
+            McpServerView {
+                name: info.name,
+                transport: info.transport,
+                target: info.target,
+                status,
+                tools,
+                error,
+            }
+        })
+        .collect()
+}
+
+/// Runs a `/mcp` action off the UI lane: one in-flight op per server, a
+/// notification with the outcome, then a fresh status snapshot.
+fn spawn_mcp_op<F, Fut>(
+    mcp_manager: &Option<Arc<McpManager>>,
+    mcp_inflight: &Arc<Mutex<HashSet<String>>>,
+    mcp_seen_revision: &Arc<AtomicU64>,
+    sink: &EventSink,
+    name: String,
+    op: F,
+) where
+    F: FnOnce(Arc<McpManager>, String) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<String, slim_core::mcp::McpError>> + Send,
+{
+    let Some(manager) = mcp_manager.clone() else {
+        let _ = sink.send(UiEvent::Notification {
+            message: "no MCP servers configured".into(),
+        });
+        return;
+    };
+    {
+        let mut guard = mcp_inflight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !guard.insert(name.clone()) {
+            return;
+        }
+    }
+    let inflight = Arc::clone(mcp_inflight);
+    let seen_revision = Arc::clone(mcp_seen_revision);
+    let sink = sink.clone();
+    tokio::spawn(async move {
+        let result = op(manager.clone(), name.clone()).await;
+        inflight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&name);
+        // Bound and redact: op errors can embed server-controlled stderr or
+        // remote strings that may echo configured env/header secrets.
+        let detail = match &result {
+            Ok(summary) => summary.chars().take(160).collect::<String>(),
+            Err(error) => error.to_string(),
+        };
+        let detail = redact_mcp_text(&manager, &detail);
+        let _ = sink.send(UiEvent::Notification {
+            message: format!("mcp {name}: {detail}"),
+        });
+        seen_revision.store(manager.revision(), Ordering::Relaxed);
+        let _ = sink.send(UiEvent::McpServersChanged {
+            servers: mcp_server_views(&manager),
+        });
+    });
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2536,6 +3475,8 @@ fn advance_pending_delivery(
     run: &mut PendingRun,
     commands: &mut tokio::sync::mpsc::UnboundedReceiver<UiCommand>,
     sink: &EventSink,
+    mcp_watch: &mut bool,
+    mcp_manager: &Option<Arc<McpManager>>,
 ) -> PendingDeliveryStep {
     let Some(event) = run.delivery.pop_front() else {
         return PendingDeliveryStep::Complete;
@@ -2545,7 +3486,7 @@ fn advance_pending_delivery(
         Ok(()) => PendingDeliveryStep::Pending,
         Err(mpsc::TrySendError::Full(event)) => {
             run.delivery.push_front(event);
-            if service_pending_command(run, commands, sink) {
+            if service_pending_command(run, commands, sink, mcp_watch, mcp_manager) {
                 return PendingDeliveryStep::Shutdown;
             }
             if run.cancel_requested {
@@ -2568,31 +3509,61 @@ fn advance_pending_delivery(
     }
 }
 
-fn service_pending_command(
+/// Handles one already-received command (or channel close) while a run is
+/// mid-delivery. Returns true when the worker should shut down.
+fn dispatch_pending_command(
     run: &mut PendingRun,
-    commands: &mut tokio::sync::mpsc::UnboundedReceiver<UiCommand>,
+    command: Option<UiCommand>,
     sink: &EventSink,
+    mcp_watch: &mut bool,
+    mcp_manager: &Option<Arc<McpManager>>,
 ) -> bool {
-    match commands.try_recv() {
-        Ok(UiCommand::CancelRun) => run.request_cancel(),
-        Ok(UiCommand::RequestContentPage {
+    match command {
+        Some(UiCommand::CancelRun) => run.request_cancel(),
+        Some(UiCommand::RequestContentPage {
             handle,
             request_id,
             cursor,
         }) => serve_content_page(&run.content_store, sink, handle, request_id, cursor),
-        Ok(
+        Some(
             UiCommand::AnswerInput { request_id, .. }
             | UiCommand::Approve { request_id }
             | UiCommand::Reject { request_id },
         ) => run.delivery.push_back(unbound_interaction_ack(request_id)),
-        Ok(UiCommand::Shutdown) | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+        // Read-only MCP state must survive the drain: a dropped watch toggle
+        // would leave an open /mcp overlay stale until the next action.
+        Some(UiCommand::McpWatch { on }) => *mcp_watch = on,
+        Some(UiCommand::McpRefresh) => {
+            if let Some(manager) = mcp_manager.as_ref() {
+                let _ = sink.send(UiEvent::McpServersChanged {
+                    servers: mcp_server_views(manager),
+                });
+            }
+        }
+        Some(UiCommand::Shutdown) | None => {
             run.request_cancel();
             sink.send_control(UiEvent::Shutdown);
             return true;
         }
-        Ok(_) | Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+        Some(_) => {}
     }
     false
+}
+
+fn service_pending_command(
+    run: &mut PendingRun,
+    commands: &mut tokio::sync::mpsc::UnboundedReceiver<UiCommand>,
+    sink: &EventSink,
+    mcp_watch: &mut bool,
+    mcp_manager: &Option<Arc<McpManager>>,
+) -> bool {
+    match commands.try_recv() {
+        Ok(command) => dispatch_pending_command(run, Some(command), sink, mcp_watch, mcp_manager),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+            dispatch_pending_command(run, None, sink, mcp_watch, mcp_manager)
+        }
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
+    }
 }
 
 fn start_login(oauth: OAuthService, provider: OAuthProvider, sink: EventSink) -> ActiveLogin {
@@ -2637,8 +3608,8 @@ fn take_run_id(next_run_id: &mut u64) -> Option<u64> {
 
 /// Persists the selected model+effort into the global config so the choice
 /// survives restarts. Failures are surfaced as a non-fatal toast.
-fn persist_model(sink: &EventSink, model: &str, effort: &str) {
-    match crate::config::save_global_model(model, effort) {
+fn persist_model(sink: &EventSink, model: &str, effort: &str, codex_fast: Option<bool>) {
+    match crate::config::save_global_model(model, effort, codex_fast) {
         Ok(_) => {}
         Err(error) => {
             let _ = sink.send(UiEvent::Notification {
@@ -2674,6 +3645,32 @@ fn open_code_catalog_event(snapshot: CatalogSnapshot) -> UiEvent {
     UiEvent::OpenCodeCatalogLoaded { models, source }
 }
 
+fn zen_catalog_event(snapshot: crate::opencode_zen_catalog::CatalogSnapshot) -> UiEvent {
+    let models = snapshot
+        .model_ids
+        .iter()
+        .filter_map(|id| zen_model(id))
+        .map(|model| OpenCodeModelView {
+            id: model.id.to_owned(),
+            name: model.name.to_owned(),
+            context_window_tokens: model.context_window.unwrap_or_default(),
+            max_output_tokens: model.max_output_tokens.unwrap_or_default() as u64,
+            reasoning_levels: model
+                .reasoning_levels
+                .iter()
+                .filter_map(|level| ReasoningEffort::parse(level))
+                .collect(),
+            accepts_images: model.accepts_images,
+        })
+        .collect();
+    let source = match snapshot.source {
+        crate::opencode_zen_catalog::CatalogSource::Live => ZenCatalogSource::Live,
+        crate::opencode_zen_catalog::CatalogSource::Cache => ZenCatalogSource::Cache,
+        crate::opencode_zen_catalog::CatalogSource::Fallback => ZenCatalogSource::Fallback,
+    };
+    UiEvent::ZenCatalogLoaded { models, source }
+}
+
 fn command_code_catalog_event(snapshot: crate::command_code_catalog::CatalogSnapshot) -> UiEvent {
     let models = snapshot
         .models
@@ -2699,7 +3696,11 @@ fn oauth_provider(provider: LoginProvider) -> Option<OAuthProvider> {
     match provider {
         LoginProvider::Anthropic => Some(OAuthProvider::Anthropic),
         LoginProvider::OpenAiCodex => Some(OAuthProvider::OpenAiCodex),
-        LoginProvider::OpenCodeGo | LoginProvider::ClinePass | LoginProvider::CommandCode => None,
+        LoginProvider::Xai => Some(OAuthProvider::Xai),
+        LoginProvider::OpenCodeGo
+        | LoginProvider::OpenCodeZen
+        | LoginProvider::ClinePass
+        | LoginProvider::CommandCode => None,
     }
 }
 
@@ -2707,6 +3708,7 @@ fn login_provider(provider: OAuthProvider) -> LoginProvider {
     match provider {
         OAuthProvider::Anthropic => LoginProvider::Anthropic,
         OAuthProvider::OpenAiCodex => LoginProvider::OpenAiCodex,
+        OAuthProvider::Xai => LoginProvider::Xai,
     }
 }
 
@@ -2904,7 +3906,7 @@ fn project_core_event(
         return UiEvent::from_core(SessionEvent::new(seq, kind));
     };
     let handle = ContentHandle(format!("tool:{run_id}:{batch_id}:{call_id}").into());
-    let preview = bounded_tool_output_preview(&output);
+    let preview = slim_tui::api::tool_output_preview(&name, &output);
     let content_handle = store
         .lock()
         .map(|mut store| store.insert_owned(handle.clone(), output))
@@ -2927,15 +3929,6 @@ fn project_core_event(
         *projected_handle = content_handle;
     }
     Some(projected)
-}
-
-fn bounded_tool_output_preview(output: &str) -> String {
-    let mut chars = output.lines().next().unwrap_or("").chars();
-    let mut preview = chars.by_ref().take(512).collect::<String>();
-    if chars.next().is_some() {
-        preview.push('.');
-    }
-    preview
 }
 
 fn record_completed_turn(options: &mut ProviderRunOptions, user: &str, assistant: &str) {
@@ -2977,6 +3970,9 @@ fn start_active_run(
     )?;
     options.workspace_root = Some(workspace_root.clone());
     let cwd_display = display_workspace_path(&workspace_root);
+    // Fresh discovery per run (off the UI thread): skills added mid-session
+    // appear on the next prompt.
+    let projector_skill_names = workspace_skill_names(&workspace_root);
     let cancellation = CancellationToken::new();
     let (core_tx, core_rx) = SessionEventSender::bounded(1_024, cancellation.clone());
     let projector_cancellation = cancellation.clone();
@@ -2986,7 +3982,10 @@ fn start_active_run(
         .spawn(move || {
             for event in core_rx {
                 if let Some(event) = project_core_event(event, run_id, &projector_content_store) {
-                    let event = attach_workspace_to_snapshot(event, &cwd_display);
+                    let mut event = attach_workspace_to_snapshot(event, &cwd_display);
+                    if let UiEvent::SessionSnapshot { skill_names, .. } = &mut event {
+                        skill_names.clone_from(&projector_skill_names);
+                    }
                     let event = associate_projected_run(event, run_id);
                     if !sink.send_projected(event, &projector_cancellation) {
                         break;
@@ -3034,7 +4033,7 @@ fn start_active_run(
         } else {
             execute_provider_turn_async(
                 request,
-                None,
+                false,
                 options,
                 skill_instructions,
                 Some(core_tx),
@@ -3082,7 +4081,9 @@ async fn abort_active_with_grace(
             Ok(result) => result,
             Err(_) => {
                 run.task.abort();
-                (&mut run.task).await
+                let result = (&mut run.task).await;
+                run.cancellation.wait_for_native_work().await;
+                result
             }
         };
         Some(PendingRun {
@@ -3101,18 +4102,16 @@ async fn abort_active_with_grace(
 }
 
 fn run_stop_message(execution: &ProviderExecution) -> String {
+    if let Some(message) = &execution.result.stop_message {
+        return message.clone();
+    }
     if execution.result.stop == "provider_error" {
         return execution.result.text.clone();
     }
     format_run_stop_message(
         &execution.result.stop,
         &execution.tool_results,
-        ToolLoopLimits {
-            max_mutating_tool_calls: execution.max_mutating_tool_calls,
-            max_read_tool_calls: execution.max_read_tool_calls,
-            max_turns: execution.max_turns,
-            max_output_tokens: execution.max_output_tokens,
-        },
+        execution.limits,
     )
 }
 
@@ -3125,6 +4124,10 @@ fn send_cancel_result(
         Ok(Ok(execution)) => match execution.result.code {
             ExitCode::Success => UiEvent::RunCompleted { run_id },
             ExitCode::Cancelled => UiEvent::RunCancelled { run_id },
+            _ if execution.result.stop == "provider_error" => UiEvent::RunFailed {
+                run_id: Some(run_id),
+                message: run_stop_message(&execution),
+            },
             _ => UiEvent::RunStopped {
                 run_id,
                 message: run_stop_message(&execution),
@@ -3164,6 +4167,10 @@ fn execution_result_events(
             match execution.result.code {
                 ExitCode::Success => UiEvent::RunCompleted { run_id },
                 ExitCode::Cancelled => UiEvent::RunCancelled { run_id },
+                _ if execution.result.stop == "provider_error" => UiEvent::RunFailed {
+                    run_id: Some(run_id),
+                    message: run_stop_message(&execution),
+                },
                 _ => UiEvent::RunStopped {
                     run_id,
                     message: run_stop_message(&execution),
@@ -3196,7 +4203,10 @@ fn tui_provider_error(error: ProviderError) -> TuiError {
         ProviderError::Cancelled => ExitCode::Cancelled,
         ProviderError::Transport { .. }
         | ProviderError::MalformedToolCall
-        | ProviderError::Remote { .. } => ExitCode::Provider,
+        | ProviderError::TransientRemote { .. }
+        | ProviderError::Remote { .. }
+        | ProviderError::Api { .. }
+        | ProviderError::Http { .. } => ExitCode::Provider,
         ProviderError::InvalidResponse { .. } => ExitCode::Internal,
     };
     TuiError::new(code, provider_error_message(error))
@@ -3205,9 +4215,13 @@ fn tui_provider_error(error: ProviderError) -> TuiError {
 fn provider_error_message(error: ProviderError) -> String {
     match error {
         ProviderError::Cancelled => "provider request cancelled".into(),
-        ProviderError::Transport { .. } => "provider transport failed".into(),
+        ProviderError::Transport { message, .. } => format!("provider transport failed: {message}"),
         ProviderError::MalformedToolCall => "provider returned a malformed tool call".into(),
-        ProviderError::Remote { message } | ProviderError::InvalidResponse { message } => message,
+        ProviderError::TransientRemote { message }
+        | ProviderError::Remote { message }
+        | ProviderError::Api { message, .. }
+        | ProviderError::Http { message, .. }
+        | ProviderError::InvalidResponse { message } => message,
     }
 }
 
@@ -3222,6 +4236,61 @@ mod local_session_tests {
     };
 
     use super::select_previous_tui_session;
+
+    #[test]
+    fn restored_tasks_repopulate_the_dock_without_execution() {
+        use slim_core::runtime::{CancellationToken, RuntimeCapabilityBridge};
+        use slim_core::session::{
+            AuthorizationGrant, CapabilityCatalog, TaskMutation, TaskMutationRequest,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "slim-todo-dock-{}-{}",
+            std::process::id(),
+            super::system_time_nanos(std::time::SystemTime::now())
+        ));
+        let mut bridge = RuntimeCapabilityBridge::new(
+            JsonlRepo::create(
+                root.join("session.jsonl"),
+                DurableSessionHeader::new("todo", "now", root.to_string_lossy(), None, None),
+            )
+            .unwrap(),
+            CapabilityCatalog::with_native_tools(),
+            &Default::default(),
+            &[],
+            Default::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        bridge
+            .apply_task_mutation(
+                TaskMutationRequest {
+                    idempotency_key: "saved-todo".into(),
+                    entity_id: "session".into(),
+                    revision: 1,
+                    mutation: TaskMutation::TodoAdd {
+                        title: "retained pending task".into(),
+                        status: None,
+                    },
+                },
+                slim_core::OperatingMode::Auto,
+                AuthorizationGrant::Explicit,
+            )
+            .unwrap();
+        let preflight =
+            slim_core::session::SessionPreflight::from_open_repo(bridge.service().repo());
+        let event = super::restored_todo_event(&preflight).unwrap();
+        let mut app = slim_tui::app::AppState::new();
+        let effects =
+            slim_tui::reducer::reduce(&mut app, slim_tui::reducer::Action::UiEventReceived(event));
+        assert_eq!(app.todo_items.len(), 1);
+        assert_eq!(app.todo_items[0].title, "retained pending task");
+        assert!(app.todo_dock_open);
+        assert!(effects
+            .iter()
+            .all(|effect| matches!(effect, slim_tui::reducer::Effect::RequestRender)));
+        drop(bridge);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     struct FixtureExecutor;
     struct FailingExecutor;
@@ -3330,6 +4399,78 @@ mod local_session_tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&foreign);
     }
+
+    #[test]
+    fn resume_after_cancel_restores_final_and_partial_answers_without_mutation() {
+        struct CancelledExecutor;
+        impl ManualExecutor for CancelledExecutor {
+            type Error = std::io::Error;
+            fn execute(
+                &mut self,
+                _: &slim_core::session::Effect,
+            ) -> Result<ProviderResponse, Self::Error> {
+                Ok(ProviderResponse::with_outcome(
+                    "partial answer",
+                    None,
+                    DurableOutcome::Cancelled,
+                ))
+            }
+        }
+        let root = std::env::temp_dir().join(format!(
+            "slim-resume-cancel-{}-{}",
+            std::process::id(),
+            super::system_time_nanos(std::time::SystemTime::now())
+        ));
+        let sessions = root.join(".slim/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("tui-cancelled.jsonl");
+        create_completed(&path, "tui-cancelled", &root);
+        let mut repo = JsonlRepo::open_no_repair(&path).unwrap();
+        let seq = repo.next_seq().unwrap();
+        ManualDrive::new(&mut repo, &mut CancelledExecutor)
+            .run(ManualRunSpec::new(
+                "cancelled",
+                "cancelled-attempt",
+                "cancelled-input",
+                "cancelled-answer",
+                "cancelled question",
+                seq,
+            ))
+            .unwrap();
+        drop(repo);
+        let before = std::fs::read(&path).unwrap();
+        let selected = select_previous_tui_session(&root, None)
+            .expect("resume cancelled session")
+            .unwrap();
+        let messages = super::session_transcript(&selected.preflight).unwrap();
+        let mut app = slim_tui::app::AppState::new();
+        let effects = slim_tui::reducer::reduce(
+            &mut app,
+            slim_tui::reducer::Action::UiEventReceived(slim_tui::api::UiEvent::SessionRestored {
+                session_id: slim_tui::api::SessionId("tui-cancelled".into()),
+                cwd: root.to_string_lossy().into_owned(),
+                messages,
+                skill_names: Vec::new(),
+            }),
+        );
+        assert!(
+            effects
+                .iter()
+                .all(|effect| matches!(effect, slim_tui::reducer::Effect::RequestRender)),
+            "restore must only request rendering"
+        );
+        let frame = slim_tui::render::render(&app, 100, 30).lines.join("\n");
+        for text in [
+            "previous question",
+            "previous answer",
+            "cancelled question",
+            "partial answer",
+        ] {
+            assert!(frame.contains(text), "missing {text}: {frame}");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -3431,7 +4572,7 @@ mod cancel_tests {
         CONTENT_STORE_ENTRIES, ESC_FORCE_WINDOW,
     };
     use crate::exit_codes::ExitCode;
-    use crate::headless::{ProviderExecution, ProviderHeadlessResult};
+    use crate::headless::{ProviderExecution, ProviderHeadlessResult, ToolLoopLimits};
     use slim_core::provider::ProviderKind;
     use slim_core::runtime::{AgentLoopConfig, CancellationToken};
     use slim_core::{EventKind, SessionEvent};
@@ -3530,8 +4671,8 @@ mod cancel_tests {
                 EventKind::ToolOutput {
                     batch_id: "batch".into(),
                     call_id: "call".into(),
-                    name: "read".into(),
-                    output: "safe [REDACTED]".into(),
+                    name: "shell".into(),
+                    output: "exit 1\nstdout:\nstderr:\nsafe [REDACTED]".into(),
                 },
             ),
             7,
@@ -3540,6 +4681,7 @@ mod cancel_tests {
         .expect("projected");
         let UiEvent::ToolProgress {
             content_handle: Some(handle),
+            preview,
             ..
         } = projected
         else {
@@ -3551,7 +4693,8 @@ mod cancel_tests {
             .expect("store")
             .page(&handle, Some(PageCursor(0)))
             .expect("page");
-        assert_eq!(page.text, "safe [REDACTED]");
+        assert_eq!(page.text, "exit 1\nstdout:\nstderr:\nsafe [REDACTED]");
+        assert_eq!(preview, "exit 1 · safe [REDACTED]");
     }
 
     #[test]
@@ -3560,6 +4703,7 @@ mod cancel_tests {
             UiEvent::SessionSnapshot {
                 session_id: SessionId("session".into()),
                 cwd: String::new(),
+                skill_names: Vec::new(),
             },
             r"D:\Slim",
         );
@@ -3568,6 +4712,7 @@ mod cancel_tests {
             UiEvent::SessionSnapshot {
                 session_id: SessionId("session".into()),
                 cwd: r"D:\Slim".into(),
+                skill_names: Vec::new(),
             }
         );
     }
@@ -3581,8 +4726,28 @@ mod cancel_tests {
         assert_eq!(take_run_id(&mut next), None);
     }
 
+    #[test]
+    fn provider_failure_is_durable_in_the_ui_after_toast_expiry() {
+        let mut execution = execution(ExitCode::Provider);
+        execution.result.stop = "provider_error".into();
+        execution.result.text = "provider error: http 401: denied".into();
+        let events = execution_result_events(7, Ok(Ok(execution)), true);
+        assert!(matches!(events.back(), Some(UiEvent::RunFailed { .. })));
+        let mut state = slim_tui::app::AppState::new();
+        state.apply_event(UiEvent::run_started(7));
+        for event in events {
+            state.apply_event(event);
+        }
+        state.clock.elapsed_ms = 10_000;
+        state.prune_notifications();
+        assert!(!state.working);
+        assert!(state.blocks().iter().any(|block| matches!(block.kind(), slim_tui::block::BlockKind::Error(message) if message.contains("http 401"))));
+    }
+
     fn execution(code: ExitCode) -> ProviderExecution {
         ProviderExecution {
+            turn_transcript: Vec::new(),
+            task_facts: Vec::new(),
             result: ProviderHeadlessResult {
                 code,
                 provider: ProviderKind::OpenAiCompatible,
@@ -3599,14 +4764,19 @@ mod cancel_tests {
                 costs: crate::headless::UsageCostSummary::default(),
                 validation_source: None,
                 tool_summary_lines: Vec::new(),
+                tool_process_facts: Vec::new(),
+                stop_message: None,
             },
             history: None,
             events: Vec::new(),
             tool_results: Vec::new(),
-            max_mutating_tool_calls: AgentLoopConfig::DEFAULT_MAX_MUTATING_TOOL_CALLS,
-            max_read_tool_calls: AgentLoopConfig::DEFAULT_MAX_READ_TOOL_CALLS,
-            max_turns: AgentLoopConfig::DEFAULT_MAX_TURNS,
-            max_output_tokens: slim_core::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+            limits: ToolLoopLimits {
+                max_mutating_tool_calls: AgentLoopConfig::DEFAULT_MAX_MUTATING_TOOL_CALLS,
+                max_read_tool_calls: AgentLoopConfig::DEFAULT_MAX_READ_TOOL_CALLS,
+                max_total_tool_calls: AgentLoopConfig::DEFAULT_MAX_TOTAL_TOOL_CALLS,
+                max_turns: AgentLoopConfig::DEFAULT_MAX_TURNS,
+                max_output_tokens: slim_core::provider::DEFAULT_MAX_OUTPUT_TOKENS,
+            },
             resume_preflight: None,
         }
     }
@@ -3960,7 +5130,7 @@ mod cancel_tests {
         commands.send(UiCommand::CancelRun).expect("cancel");
 
         assert_eq!(
-            advance_pending_delivery(&mut run, &mut command_rx, &sink),
+            advance_pending_delivery(&mut run, &mut command_rx, &sink, &mut false, &None),
             PendingDeliveryStep::Complete
         );
         assert!(cancellation.is_cancelled());
@@ -3995,7 +5165,7 @@ mod cancel_tests {
         commands.send(UiCommand::Shutdown).expect("shutdown");
 
         assert_eq!(
-            advance_pending_delivery(&mut run, &mut command_rx, &sink),
+            advance_pending_delivery(&mut run, &mut command_rx, &sink, &mut false, &None),
             PendingDeliveryStep::Shutdown
         );
         assert!(cancellation.is_cancelled());
@@ -4035,7 +5205,7 @@ mod cancel_tests {
             .expect("answer");
 
         assert_eq!(
-            advance_pending_delivery(&mut run, &mut command_rx, &sink),
+            advance_pending_delivery(&mut run, &mut command_rx, &sink, &mut false, &None),
             PendingDeliveryStep::Pending
         );
         assert_eq!(
@@ -4049,7 +5219,7 @@ mod cancel_tests {
 
         commands.send(UiCommand::CancelRun).expect("cancel");
         assert_eq!(
-            advance_pending_delivery(&mut run, &mut command_rx, &sink),
+            advance_pending_delivery(&mut run, &mut command_rx, &sink, &mut false, &None),
             PendingDeliveryStep::Complete
         );
         assert_eq!(
@@ -4121,6 +5291,72 @@ mod tests {
     use super::{prepare_tui, spawn_tui_session, TuiStartup};
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn worker_join_reports_panic_and_normal_shutdown_is_success() {
+        let failed = super::TuiRuntimeHandle {
+            shutdown: None,
+            worker: Some(std::thread::spawn(|| panic!("fixture worker failure"))),
+        }
+        .finish()
+        .unwrap_err();
+        assert_eq!(failed.code(), crate::ExitCode::Internal);
+        assert!(failed.to_string().contains("effects are unverified"));
+        assert!(!failed.to_string().contains("fixture worker failure"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        super::TuiRuntimeHandle {
+            shutdown: Some(tx),
+            worker: Some(std::thread::spawn(move || {
+                assert_eq!(rx.recv().unwrap(), super::UiCommand::Shutdown);
+            })),
+        }
+        .finish()
+        .unwrap();
+    }
+
+    #[test]
+    fn deepseek_flash_catalog_displays_v4_1_with_canonical_selection_id() {
+        let super::UiEvent::OpenCodeCatalogLoaded { models, source } =
+            super::open_code_catalog_event(super::CatalogSnapshot {
+                model_ids: vec!["deepseek-flash".into(), "deepseek-v4-flash".into()],
+                source: super::CatalogSource::Live,
+            })
+        else {
+            panic!("catalog event")
+        };
+        assert_eq!(source, super::OpenCodeCatalogSource::Live);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "deepseek-flash");
+        assert_eq!(models[0].name, "DeepSeek V4.1 Flash");
+        assert_eq!(models[1].id, "deepseek-v4-flash");
+        assert_eq!(models[1].name, "DeepSeek V4 Flash");
+    }
+
+    #[test]
+    fn muse_catalog_offers_efforts_through_xhigh() {
+        let super::UiEvent::OpenCodeCatalogLoaded { models, .. } =
+            super::open_code_catalog_event(super::CatalogSnapshot {
+                model_ids: vec![
+                    "muse-spark-1.2-contributor".into(),
+                    "muse-spark-1.3-contributor".into(),
+                ],
+                source: super::CatalogSource::Live,
+            })
+        else {
+            panic!("catalog event")
+        };
+        assert_eq!(models.len(), 2);
+        for model in models {
+            assert_eq!(
+                model
+                    .reasoning_levels
+                    .iter()
+                    .map(|effort| effort.id())
+                    .collect::<Vec<_>>(),
+                ["low", "medium", "high", "xhigh"]
+            );
+        }
+    }
 
     fn wait_for_auth_provider(
         channels: &slim_tui::api::UiChannels,
@@ -4552,6 +5788,7 @@ mod tests {
             "SLIM_API_KEY",
             "OPENAI_API_KEY",
             "OPENCODE_API_KEY",
+            "SLIM_EFFORT",
         ];
         let previous = variables.map(std::env::var_os);
         for name in variables {
@@ -4573,10 +5810,16 @@ mod tests {
         .expect("service");
 
         std::env::set_var("OPENAI_API_KEY", "openai-environment");
-        let default = prepare_tui(vec!["--tui".into()], &oauth)
-            .expect("default environment credential")
+        std::env::set_var("SLIM_EFFORT", "low");
+        let default_startup =
+            prepare_tui(vec!["--tui".into()], &oauth).expect("default environment credential");
+        let sent_effort = default_startup.options.reasoning_effort;
+        let default = default_startup
             .request
             .map(|request| (request.kind, request.api_key));
+        std::env::set_var("SLIM_EFFORT", "invalid-effort");
+        let invalid_effort = prepare_tui(vec!["--tui".into()], &oauth).err();
+        std::env::remove_var("SLIM_EFFORT");
         std::env::remove_var("OPENAI_API_KEY");
         std::env::set_var("OPENCODE_API_KEY", "opencode-environment");
         let explicit = prepare_tui(
@@ -4587,6 +5830,16 @@ mod tests {
         .request
         .map(|request| (request.kind, request.api_key));
 
+        let invalid_model = prepare_tui(
+            vec![
+                "--provider".into(),
+                "opencode-go".into(),
+                "--model".into(),
+                "unknown-model".into(),
+            ],
+            &oauth,
+        )
+        .err();
         let _ = std::fs::remove_dir_all(root);
         for (name, value) in variables.into_iter().zip(previous) {
             match value {
@@ -4594,6 +5847,9 @@ mod tests {
                 None => std::env::remove_var(name),
             }
         }
+        assert_eq!(sent_effort.as_deref(), Some("low"));
+        assert!(invalid_effort.is_some());
+        assert!(invalid_model.is_some());
         assert_eq!(
             default,
             Some((
@@ -4663,6 +5919,7 @@ mod tests {
             .send(super::UiCommand::SetModel {
                 model: super::ModelAlias::Sol,
                 effort: super::ReasoningEffort::High,
+                fast: false,
             })
             .expect("select Codex model");
 
@@ -4818,6 +6075,7 @@ mod tests {
             .send(super::UiCommand::SetModel {
                 model: super::ModelAlias::Sol,
                 effort: super::ReasoningEffort::High,
+                fast: false,
             })
             .expect("select Codex model");
         wait_for_auth_provider(&channels, super::LoginProvider::OpenAiCodex);
@@ -4834,5 +6092,39 @@ mod tests {
             Some("openai-codex".into())
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod restored_tool_tests {
+    use super::*;
+
+    #[test]
+    fn restored_tools_keep_batch_order_and_namespace_reused_call_ids() {
+        let call = |id: &str| slim_core::provider::ProviderToolCall {
+            id: id.into(),
+            name: "read".into(),
+            arguments: format!("{{\"path\":\"{id}\"}}"),
+        };
+        let history = vec![
+            ProviderMessage::assistant("checking", vec![call("a"), call("b")]),
+            ProviderMessage::tool("read", "b", "second result"),
+            ProviderMessage::tool("read", "a", "first result"),
+            ProviderMessage::assistant("", vec![call("a")]),
+            ProviderMessage::tool("read", "a", "later result"),
+        ];
+        let messages = transcript_messages(&history);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1].text, "first result");
+        assert_eq!(messages[2].text, "second result");
+        assert_eq!(messages[3].text, "later result");
+        let ids = messages
+            .iter()
+            .filter_map(|message| match &message.role {
+                TranscriptRole::Tool { call_id, .. } => Some(&call_id.0),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids.len(), 3);
     }
 }

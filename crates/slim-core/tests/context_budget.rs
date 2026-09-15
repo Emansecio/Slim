@@ -16,11 +16,24 @@ fn very_large_windows_use_the_fifty_percent_threshold() {
 }
 
 #[test]
-fn projected_reserve_can_trigger_compaction_before_threshold() {
+fn reserve_does_not_trigger_compaction_before_usage_threshold() {
     let budget = ContextBudget::new(32_000, 26_000, 2_100);
-    assert!(budget.should_compact());
+    assert!(!budget.should_compact());
     assert!(budget.can_fit(5_999));
     assert!(!budget.can_fit(6_001));
+}
+
+#[test]
+fn large_output_reserve_does_not_compact_low_conversation_usage() {
+    assert!(!ContextBudget::new(1_000_000, 126_000, 384_000).should_compact());
+    assert!(!ContextBudget::new(1_000_000, 299_999, 384_000).should_compact());
+    assert!(ContextBudget::new(1_000_000, 500_000, 384_000).should_compact());
+}
+
+#[test]
+fn reserve_triggers_compaction_only_when_output_would_not_fit() {
+    assert!(!ContextBudget::new(32_000, 16_000, 16_000).should_compact());
+    assert!(ContextBudget::new(32_000, 16_001, 16_000).should_compact());
 }
 
 #[test]

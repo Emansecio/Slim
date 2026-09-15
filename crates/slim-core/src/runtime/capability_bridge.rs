@@ -663,24 +663,30 @@ fn apply_typed_mutation(
 ) -> Result<(), CapabilityLedgerError> {
     let error = || CapabilityLedgerError::InvalidIdentifier("task invariant");
     match mutation {
-        TaskMutation::TodoAdd { title } => {
-            todos
-                .entry(entity_id.into())
-                .or_default()
-                .add(title.clone());
-        }
-        TaskMutation::TodoSetStatus { status } => {
+        TaskMutation::TodoAdd { title, status } => {
             let tracker = todos.entry(entity_id.into()).or_default();
-            let id = tracker
-                .items()
-                .iter()
-                .find(|item| item.status == TodoStatus::Pending)
-                .or_else(|| tracker.items().last())
-                .map(|item| item.id)
+            let id = tracker.add(title.clone());
+            if let Some(status) = status {
+                tracker
+                    .set_status(id, todo_status(status.clone()))
+                    .map_err(CapabilityLedgerError::InvalidTaskTransition)?;
+            }
+        }
+        TaskMutation::TodoSetStatus { id, status } => {
+            let tracker = todos.entry(entity_id.into()).or_default();
+            let id = id
+                .or_else(|| {
+                    tracker
+                        .items()
+                        .iter()
+                        .find(|item| item.status == TodoStatus::Pending)
+                        .or_else(|| tracker.items().last())
+                        .map(|item| item.id)
+                })
                 .ok_or_else(error)?;
             tracker
                 .set_status(id, todo_status(status.clone()))
-                .map_err(|_| error())?;
+                .map_err(CapabilityLedgerError::InvalidTaskTransition)?;
         }
         TaskMutation::PlanAddNode {
             node_id,

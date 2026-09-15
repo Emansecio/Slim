@@ -13,7 +13,9 @@ use slim_core::provider::{
     ProviderMessage, ProviderPhase, ProviderTimeouts,
 };
 use slim_core::runtime::CancellationToken;
-use slim_core::{AppHandle, EventKind, Runtime, SessionEventSender};
+use slim_core::{
+    AgentLoopConfig, AppHandle, EventKind, OperatingMode, Runtime, SessionEventSender,
+};
 
 struct CountingAdapter {
     inner: OpenAiCompatibleAdapter,
@@ -166,37 +168,57 @@ fn shared_transport_skips_cache_key_hash_on_live_stream() {
 
 #[test]
 fn connect_timeout_fails_fast_without_waiting_for_idle() {
-    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
-        "http://192.0.2.1:1",
-        "fixture-model",
-        "fixture-key",
-    ))
-    .expect("adapter");
-    let timeouts = ProviderTimeouts {
-        connect: Duration::from_millis(100),
-        idle: Duration::from_secs(30),
-        first_semantic: Duration::from_secs(30),
-        wall: Duration::from_secs(30),
-    };
-    let client = HttpProviderClient::with_timeouts(adapter, timeouts).expect("client");
-    let started = Instant::now();
-    let error = tokio::runtime::Runtime::new()
-        .expect("runtime")
-        .block_on(client.send("hello"))
-        .expect_err("TEST-NET-1 must be unreachable");
-    let elapsed = started.elapsed();
-    assert!(
-        matches!(error, ProviderError::Transport { .. }),
-        "expected transport error, got {error:?}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "connect timeout must fail fast, elapsed {elapsed:?}"
-    );
+    for shared in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept TLS connection");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            let mut hello = [0_u8; 4096];
+            assert!(stream.read(&mut hello).expect("TLS ClientHello") > 0);
+            // Do not complete TLS: the transport's connection deadline must fire.
+            let _ = stream.read(&mut hello);
+        });
+        let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+            format!("https://{address}"),
+            "fixture-model",
+            "fixture-key",
+        ))
+        .expect("adapter");
+        let timeouts = ProviderTimeouts {
+            connect: Duration::from_millis(100),
+            idle: Duration::from_secs(30),
+            first_semantic: Duration::from_secs(30),
+            wall: Duration::from_secs(30),
+        };
+        let client = if shared {
+            HttpProviderClient::with_shared_transport(adapter, timeouts)
+        } else {
+            HttpProviderClient::with_timeouts(adapter, timeouts)
+        }
+        .expect("client");
+        let started = Instant::now();
+        let error = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(client.send("hello"))
+            .expect_err("TLS must time out");
+        let elapsed = started.elapsed();
+        server.join().expect("server");
+        assert!(
+            matches!(error, ProviderError::Transport { .. }),
+            "{error:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "connect timeout must fail fast: {elapsed:?}"
+        );
+    }
 }
 
 #[test]
-fn accepted_connection_without_headers_fails_at_connect_timeout() {
+fn accepted_connection_without_headers_fails_at_first_semantic_timeout() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let address = listener.local_addr().expect("address");
     let server = thread::spawn(move || {
@@ -212,9 +234,9 @@ fn accepted_connection_without_headers_fails_at_connect_timeout() {
     ))
     .expect("adapter");
     let timeouts = ProviderTimeouts {
-        connect: Duration::from_millis(100),
+        connect: Duration::from_millis(40),
         idle: Duration::from_secs(30),
-        first_semantic: Duration::from_secs(30),
+        first_semantic: Duration::from_millis(150),
         wall: Duration::from_secs(30),
     };
     let client = HttpProviderClient::with_timeouts(adapter, timeouts).expect("client");
@@ -222,7 +244,7 @@ fn accepted_connection_without_headers_fails_at_connect_timeout() {
     let error = tokio::runtime::Runtime::new()
         .expect("runtime")
         .block_on(client.send("hello"))
-        .expect_err("silent accepted socket must not wait for idle");
+        .expect_err("silent accepted socket must stop at first-semantic budget");
     let elapsed = started.elapsed();
     let _ = server.join();
 
@@ -231,9 +253,59 @@ fn accepted_connection_without_headers_fails_at_connect_timeout() {
         "expected transport error, got {error:?}"
     );
     assert!(
-        elapsed < Duration::from_secs(2),
-        "header wait must use connect timeout, elapsed {elapsed:?}"
+        !error.is_retryable(),
+        "the server already received the POST"
     );
+    assert!(
+        elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(2),
+        "header wait must use first-semantic budget, elapsed {elapsed:?}"
+    );
+}
+
+#[test]
+fn accepted_connection_waits_for_headers_within_first_semantic_budget() {
+    for shared in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let request = read_http_request(&mut stream);
+            assert!(request.starts_with("POST "));
+            thread::sleep(Duration::from_millis(200));
+            let body = success_sse(false, true);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+            format!("http://{address}"),
+            "fixture-model",
+            "fixture-key",
+        ))
+        .expect("adapter");
+        let timeouts = ProviderTimeouts {
+            connect: Duration::from_millis(40),
+            idle: Duration::from_secs(2),
+            first_semantic: Duration::from_secs(2),
+            wall: Duration::from_secs(3),
+        };
+        let client = if shared {
+            HttpProviderClient::with_shared_transport(adapter, timeouts)
+        } else {
+            HttpProviderClient::with_timeouts(adapter, timeouts)
+        }
+        .expect("client");
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(client.send("hello"));
+        server.join().expect("server");
+        let events = result.expect("server queue time is not a TCP connection timeout");
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::TextDelta(text) if text == "ok")));
+    }
 }
 
 #[test]
@@ -286,9 +358,10 @@ fn heartbeat_stream_cannot_extend_first_semantic_deadline() {
     server.join().expect("server");
 
     assert!(
-        matches!(error, ProviderError::Transport { .. }),
+        matches!(&error, ProviderError::Transport { message, .. } if message.contains("first semantic")),
         "{error:?}"
     );
+    assert!(!error.is_retryable(), "a response already started");
     assert!(
         elapsed < Duration::from_millis(400),
         "semantic deadline must win over idle timeout: {elapsed:?}"
@@ -450,7 +523,7 @@ fn provider_stream_reports_content_free_transport_phases() {
 }
 
 #[test]
-fn compaction_request_uses_low_reasoning_and_bounded_output() {
+fn compaction_request_preserves_effort_and_bounds_existing_output() {
     let adapter = OpenAiCompatibleAdapter::new(
         ProviderConfig::openai("http://127.0.0.1:9", "fixture-model", "fixture-key")
             .with_reasoning_effort("high")
@@ -461,7 +534,7 @@ fn compaction_request_uses_low_reasoning_and_bounded_output() {
         .build_compaction_request_checked(&[ProviderMessage::user("summary input")])
         .expect("compaction request");
     let body: Value = serde_json::from_str(&request.body).expect("json body");
-    assert_eq!(body["reasoning_effort"], "low");
+    assert_eq!(body["reasoning_effort"], "high");
     assert_eq!(body["max_tokens"], 2_048);
     assert_eq!(
         body["messages"][0]["content"],
@@ -475,7 +548,7 @@ fn compaction_request_uses_low_reasoning_and_bounded_output() {
 }
 
 #[test]
-fn codex_compaction_request_inserts_bounded_output() {
+fn codex_compaction_request_does_not_invent_output_control() {
     let adapter = OpenAiCodexAdapter::new(ProviderConfig::openai_codex(
         "https://example.invalid/backend-api",
         "gpt-test",
@@ -488,7 +561,7 @@ fn codex_compaction_request_inserts_bounded_output() {
         .expect("compaction request");
     let body: Value = serde_json::from_str(&request.body).expect("json body");
 
-    assert_eq!(body["max_output_tokens"], 2_048);
+    assert!(body.get("max_output_tokens").is_none());
 }
 
 #[test]
@@ -497,8 +570,7 @@ fn http_client_normalizes_chunked_sse_from_local_fixture_server() {
     let address = listener.local_addr().expect("address");
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
-        let mut request = [0_u8; 64 * 1024];
-        let _ = stream.read(&mut request);
+        let request = read_http_request(&mut stream);
         stream
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
@@ -516,6 +588,7 @@ fn http_client_normalizes_chunked_sse_from_local_fixture_server() {
         stream.flush().expect("flush");
         stream.write_all(second.as_bytes()).expect("second");
         stream.write_all(b"data: [DONE]\n\n").expect("done");
+        request
     });
 
     let builds = Arc::new(AtomicUsize::new(0));
@@ -535,7 +608,13 @@ fn http_client_normalizes_chunked_sse_from_local_fixture_server() {
     let next_seq = tokio_runtime
         .block_on(runtime.run_provider(&client, "hello", 1))
         .expect("events");
-    server.join().expect("server");
+    let request = server.join().expect("server");
+    let wire_chars = request
+        .split_once("\r\n\r\n")
+        .expect("body")
+        .1
+        .chars()
+        .count() as u64;
     let events = runtime.app.drain_events();
     assert_eq!(next_seq, events.len() as u64 + 1);
     let events = events
@@ -547,9 +626,10 @@ fn http_client_normalizes_chunked_sse_from_local_fixture_server() {
         events[0].kind,
         EventKind::ContextSnapshot {
             estimated_tokens,
+            serialized_chars,
             context_window_tokens: 0,
             ..
-        } if estimated_tokens > 0
+        } if estimated_tokens > 0 && serialized_chars == wire_chars
     ));
     assert_eq!(
         events[1].kind,
@@ -625,6 +705,115 @@ fn http_client_preserves_utf8_split_across_sse_chunks() {
         })
         .collect::<String>();
     assert_eq!(text, "olá");
+}
+
+#[test]
+fn http_stream_preserves_whitespace_deltas_in_output_and_chat_history() {
+    let reasoning_chunks = [" ", "\n", "\r\n", "\t", "推論"];
+    let text_chunks = [" ", "\n", "\r\n", "\t", "café"];
+    let expected_reasoning = reasoning_chunks.concat();
+    let expected_text = text_chunks.concat();
+    let mut body = String::new();
+    for chunk in &reasoning_chunks {
+        body.push_str(&format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"reasoning_content":chunk}}]})
+        ));
+    }
+    for chunk in &text_chunks {
+        body.push_str(&format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"content":chunk}}]})
+        ));
+    }
+    body.push_str(&format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"delta":{},"finish_reason":"stop"}]})
+    ));
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let _ = read_http_request(&mut stream);
+        stream.write_all(response.as_bytes()).expect("response");
+    });
+
+    let adapter = OpenAiCompatibleAdapter::new(
+        ProviderConfig::openai(
+            format!("http://{address}"),
+            "deepseek-v4-flash",
+            "fixture-key",
+        )
+        .with_reasoning_effort("high"),
+    )
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+    let mut runtime = Runtime::new();
+    let result = tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "hello",
+            OperatingMode::ReadOnly,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig {
+                max_turns: 1,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .expect("provider run");
+    server.join().expect("server");
+
+    assert_eq!(result.stop, slim_core::AgentLoopStop::ProviderCompleted);
+    let output = runtime
+        .app
+        .events()
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::AssistantTextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    let reasoning = runtime
+        .app
+        .events()
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ReasoningDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(output, expected_text);
+    assert_eq!(reasoning, expected_reasoning);
+
+    let assistant = runtime
+        .conversation()
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+        .expect("assistant history");
+    assert_eq!(assistant.content, expected_text);
+    assert!(assistant.chat_reasoning.is_some());
+    let request = client
+        .adapter()
+        .build_messages_request_checked(runtime.conversation())
+        .expect("history request");
+    let wire: Value = serde_json::from_str(&request.body).expect("history JSON");
+    let assistant_wire = wire["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant wire history");
+    assert_eq!(assistant_wire["content"], expected_text);
+    assert_eq!(assistant_wire["reasoning_content"], expected_reasoning);
 }
 
 #[test]
@@ -704,7 +893,7 @@ fn runtime_redacts_registered_secret_echoed_by_provider_error() {
     server.join().expect("server");
     assert!(matches!(
         error,
-        ProviderError::Remote { message }
+        ProviderError::Http { message, .. }
             if message.contains("[REDACTED]") && !message.contains("fixture-error-secret")
     ));
 }
@@ -749,7 +938,7 @@ fn query_credential_is_redacted_and_error_body_read_is_bounded() {
     );
     assert!(matches!(
         error,
-        ProviderError::Remote { message }
+        ProviderError::Http { message, .. }
             if message.contains("[REDACTED]") && !message.contains("query-error-secret")
     ));
     release_tx.send(()).expect("release fixture");
@@ -825,16 +1014,17 @@ fn runtime_redacts_a_registered_secret_split_across_tool_arguments() {
     let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
     let mut runtime = Runtime::new();
     runtime.register_sensitive_value("fixture-tool-secret");
-    tokio_runtime
+    let error = tokio_runtime
         .block_on(runtime.run_provider(&client, "hello", 1))
-        .expect("provider run");
+        .expect_err("sensitive executable input must be rejected");
     server.join().expect("server");
 
-    assert!(runtime.app.events().iter().any(|event| matches!(
-        &event.kind,
-        EventKind::ProviderToolCall { arguments, .. }
-            if arguments == r#"{"path":"[REDACTED]"}"#
+    assert!(format!("{error:?}").contains("registered sensitive material"));
+    assert!(!runtime.app.events().iter().any(|event| matches!(
+        event.kind,
+        EventKind::ProviderToolCall { .. } | EventKind::ToolStarted { .. }
     )));
+    assert!(!format!("{:?}", runtime.app.events()).contains("fixture-tool-secret"));
 }
 
 #[test]
@@ -1040,6 +1230,30 @@ fn opencode_go_progressive_terminal_usage_keeps_the_largest_snapshot() {
         &event.kind,
         EventKind::AssistantTextDelta { text } if text == "Ola"
     )));
+
+    let (endpoint, server) = spawn_fixture_server(1, FixtureMode::UsageThenFailure);
+    let adapter = OpenCodeGoAdapter::new(&endpoint, "deepseek-v4-flash", "fixture-key", None)
+        .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+    let mut runtime = Runtime::new();
+    assert!(tokio_runtime
+        .block_on(runtime.run_provider(&client, "failure", 1))
+        .is_err());
+    assert_eq!(server.join().expect("server").len(), 1);
+    assert!(
+        runtime.app.events().iter().any(|event| matches!(
+            event.kind,
+            EventKind::Usage {
+                input_tokens: 7,
+                output_tokens: 3
+            }
+        )),
+        "failure must preserve already observed usage"
+    );
+    assert!(matches!(
+        runtime.app.events().last().expect("completed").kind,
+        EventKind::RequestCompleted { failed: true, .. }
+    ));
 }
 
 #[test]
@@ -1232,7 +1446,7 @@ fn free_provider_bridge_preserves_parallel_fragmented_tool_calls() {
         let _ = stream.read(&mut request);
         stream
             .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a\"}},{\"index\":1,\"id\":\"call-b\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"b\"}}]}}]}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\".txt\\\"}\"}},{\"index\":1,\"function\":{\"arguments\":\".txt\\\"}\"}}]}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a\"}},{\"index\":1,\"id\":\"call-b\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"b\"}}]}}]}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":null,\"type\":\"function\",\"function\":{\"name\":null,\"arguments\":\".txt\\\"}\"}},{\"index\":1,\"function\":{\"arguments\":\".txt\\\"}\"}}]}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
             )
             .expect("response");
     });
@@ -1272,6 +1486,141 @@ fn free_provider_bridge_preserves_parallel_fragmented_tool_calls() {
             ("call-a", "read", "{\"path\":\"a.txt\"}"),
             ("call-b", "read", "{\"path\":\"b.txt\"}")
         ]
+    );
+}
+
+#[test]
+fn free_provider_bridge_preserves_parallel_identical_tool_calls_by_id() {
+    let calls = json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [
+                    {"index": 0, "id": "call-identical-a", "function": {
+                        "name": "read", "arguments": r#"{"path":"README.md"}"#
+                    }},
+                    {"index": 1, "id": "call-identical-b", "function": {
+                        "name": "read", "arguments": r#"{"path":"README.md"}"#
+                    }}
+                ]
+            }
+        }]
+    });
+    let finish = json!({
+        "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+    });
+    let sse = format!("data: {calls}\n\ndata: {finish}\n\ndata: [DONE]\n\n");
+    let app = run_openai_fixture_sse(&sse)
+        .expect("parallel calls with identical content must retain distinct identities");
+
+    let actual = app
+        .events()
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ProviderToolCall {
+                id,
+                name,
+                arguments,
+            } => Some((id.as_str(), name.as_str(), arguments.as_str())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            ("call-identical-a", "read", r#"{"path":"README.md"}"#),
+            ("call-identical-b", "read", r#"{"path":"README.md"}"#),
+        ]
+    );
+}
+
+#[test]
+fn codex_completed_calls_keep_identity_when_names_and_arguments_repeat() {
+    // Reduced from the live Luna capture: list, read, then an identical list
+    // with a different call_id. Completion must never match by content alone.
+    let mut events = Vec::new();
+    let calls = [
+        (1, "call-list-a", "list", r#"{"path":"","max_entries":200}"#),
+        (
+            2,
+            "call-read",
+            "read",
+            r#"{"path":"SPEC.md","offset":1,"max_lines":4096}"#,
+        ),
+        (3, "call-list-b", "list", r#"{"path":"","max_entries":200}"#),
+        (
+            4,
+            "call-list-done-only",
+            "list",
+            r#"{"path":"","max_entries":200}"#,
+        ),
+    ];
+    for (index, id, name, arguments) in calls {
+        if index != 4 {
+            events.push(
+                json!({"type":"response.output_item.added","output_index":index,
+                "item":{"type":"function_call","call_id":id,"name":name,"arguments":""}}),
+            );
+            events.push(
+                json!({"type":"response.function_call_arguments.delta","output_index":index,
+                "delta":arguments}),
+            );
+        }
+        events.push(
+            json!({"type":"response.output_item.done","output_index":index,
+            "item":{"type":"function_call","call_id":id,"name":name,"arguments":arguments}}),
+        );
+    }
+    events.push(json!({"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":5}}}));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut request = [0_u8; 64 * 1024];
+        let _ = stream.read(&mut request);
+        let body = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("response");
+    });
+    let adapter = OpenAiCodexAdapter::new(ProviderConfig::openai_codex(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+        "fixture-account",
+    ))
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+    let mut app = AppHandle::fake();
+    let result =
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(run_http_provider_messages(
+                &client,
+                &mut app,
+                &[ProviderMessage::user("inspect")],
+                1,
+            ));
+    server.join().expect("server");
+    result.expect("distinct calls with identical contents are valid");
+    let actual = app
+        .events()
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ProviderToolCall {
+                id,
+                name,
+                arguments,
+            } => Some((id.as_str(), name.as_str(), arguments.as_str())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        calls
+            .iter()
+            .map(|(_, id, name, arguments)| (*id, *name, *arguments))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -1498,6 +1847,31 @@ fn free_provider_bridge_recovers_when_valid_tool_call_follows_placeholder() {
 }
 
 #[test]
+fn free_provider_bridge_keeps_valid_tool_when_a_later_slot_stays_empty() {
+    let app = run_openai_fixture_sse(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"plan\",\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}]}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"name\":\"\"}}]}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+         data: [DONE]\n\n",
+    )
+    .expect("an unused trailing tool slot must not reject the valid call");
+
+    assert!(app.events().iter().any(|event| matches!(
+        &event.kind,
+        EventKind::ReasoningDelta { text } if text == "plan"
+    )));
+    assert!(!app
+        .events()
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::AssistantTextDelta { .. })));
+    assert!(app.events().iter().any(|event| matches!(
+        &event.kind,
+        EventKind::ProviderToolCall { id, name, arguments }
+            if id == "call-a" && name == "read" && arguments == r#"{"path":"README.md"}"#
+    )));
+}
+
+#[test]
 fn free_provider_bridge_never_executes_tool_call_terminated_by_normal_stop() {
     let app = run_openai_fixture_sse(
         "data: {\"choices\":[{\"delta\":{\"content\":\"answer\",\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\\\"unsafe.txt\\\",\\\"content\\\":\\\"x\\\"}\"}}]}}]}\n\n\
@@ -1537,15 +1911,90 @@ fn free_provider_bridge_rejects_malformed_sibling_when_execution_is_required() {
 }
 
 #[test]
-fn free_provider_bridge_rejects_null_sibling_when_execution_is_required() {
-    let error = run_openai_fixture_sse(
+fn free_provider_bridge_keeps_valid_tool_when_a_null_sibling_is_present() {
+    let app = run_openai_fixture_sse(
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}},null]}}]}\n\n\
          data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
          data: [DONE]\n\n",
     )
-    .expect_err("a null sibling must block the entire tool batch");
+    .expect("a null sibling is unused padding");
 
-    assert_eq!(error, ProviderError::MalformedToolCall);
+    assert!(app.events().iter().any(|event| matches!(
+        &event.kind,
+        EventKind::ProviderToolCall { id, name, arguments }
+            if id == "call-a" && name == "read" && arguments == "{}"
+    )));
+}
+
+#[test]
+fn free_provider_bridge_keeps_valid_tool_when_an_empty_object_sibling_is_present() {
+    let app = run_openai_fixture_sse(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}},{}]}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+         data: [DONE]\n\n",
+    )
+    .expect("an empty tool object is unused padding");
+
+    assert!(app.events().iter().any(|event| matches!(
+        &event.kind,
+        EventKind::ProviderToolCall { id, name, arguments }
+            if id == "call-a" && name == "read" && arguments == "{}"
+    )));
+}
+
+#[test]
+fn free_provider_bridge_null_type_continuation_attaches_to_the_identified_call() {
+    let app = run_openai_fixture_sse(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"\"}}]}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":null,\"type\":null,\"function\":{\"name\":null,\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}]}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+         data: [DONE]\n\n",
+    )
+    .expect("null type continues the identified call");
+
+    assert!(app.events().iter().any(|event| matches!(
+        &event.kind,
+        EventKind::ProviderToolCall { id, name, arguments }
+            if id == "call-a" && name == "read" && arguments == r#"{"path":"README.md"}"#
+    )));
+}
+
+#[test]
+fn free_provider_bridge_identical_repeated_stop_reason_is_idempotent() {
+    let app = run_openai_fixture_sse(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n\
+         data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n\
+         data: [DONE]\n\n",
+    )
+    .expect("identical stop is idempotent");
+
+    assert!(app.events().iter().any(|event| matches!(
+        &event.kind,
+        EventKind::AssistantTextDelta { text } if text == "done"
+    )));
+    assert_eq!(
+        app.events()
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::AssistantEnded { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn free_provider_bridge_redacts_request_credentials_split_across_tool_arguments() {
+    let fragments = [
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-redaction","function":{"name":"read","arguments":"{\"path\":\"fixture-"}}]}}]}),
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"key\"}"}}]},"finish_reason":"tool_calls"}]}),
+    ];
+    let sse = fragments
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>()
+        + "data: [DONE]\n\n";
+    let error = run_openai_fixture_sse(&sse).expect_err("credential-bearing tool call rejected");
+    assert!(format!("{error:?}").contains("registered sensitive material"));
+    assert!(!format!("{error:?}").contains("fixture-key"));
 }
 
 fn run_openai_fixture_sse(sse: &str) -> Result<AppHandle, ProviderError> {
@@ -1579,6 +2028,41 @@ fn run_openai_fixture_sse(sse: &str) -> Result<AppHandle, ProviderError> {
             ));
     server.join().expect("server");
     result.map(|_| app)
+}
+
+#[test]
+fn multiline_sse_preserves_framing_and_eof_usage() {
+    let payload = serde_json::to_string_pretty(&json!({
+        "choices":[{"delta":{"content":"á\r\n ok"},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":7,"completion_tokens":3}
+    }))
+    .unwrap();
+    for newline in ["\n", "\r\n"] {
+        for terminator in ["", newline] {
+            let mut sse = format!(": comment{newline}event: message{newline}id: 42{newline}");
+            for line in payload.lines() {
+                sse.push_str(&format!("data: {line}{newline}"));
+            }
+            sse.push_str(terminator);
+            let app = run_openai_fixture_sse(&sse).unwrap();
+            let text = app
+                .events()
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    slim_core::EventKind::AssistantTextDelta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(text, "á\r\n ok");
+        }
+    }
+}
+
+#[test]
+fn multiline_sse_aggregate_is_bounded() {
+    let line = format!("data: {}\n", " ".repeat(400_000));
+    let error = run_openai_fixture_sse(&format!("{line}{line}{line}\n")).unwrap_err();
+    assert!(format!("{error:?}").contains("SSE event exceeded byte limit"));
 }
 
 #[test]
@@ -1706,7 +2190,7 @@ fn http_client_does_not_follow_cross_origin_redirects() {
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     assert!(matches!(
         runtime.block_on(client.send("redirect")),
-        Err(slim_core::ProviderError::Remote { .. })
+        Err(slim_core::ProviderError::Http { .. })
     ));
     origin_thread.join().expect("origin thread");
     stop_tx.send(()).expect("stop destination");
@@ -1810,6 +2294,8 @@ enum FixtureMode {
     DoneOnly,
     DoneStopsReading,
     AnthropicWithoutDone,
+    ResponsesWithoutDone,
+    UsageThenFailure,
 }
 
 fn read_http_request(stream: &mut TcpStream) -> String {
@@ -1893,6 +2379,11 @@ fn spawn_fixture_server(
             let request = read_http_request(&mut stream);
             requests.push(request.clone());
             match mode {
+                FixtureMode::UsageThenFailure => write_fixture_response(
+                    &mut stream,
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\ndata: not-json\n\n",
+                    200,
+                ),
                 FixtureMode::Failure => write_fixture_response(&mut stream, "fixture failure", 500),
                 FixtureMode::PartialThenSuccess if index == 0 => write_fixture_response(
                     &mut stream,
@@ -1922,8 +2413,17 @@ fn spawn_fixture_server(
                     ),
                     200,
                 ),
-                FixtureMode::AnthropicWithoutDone => {
-                    write_fixture_response(&mut stream, &success_sse(true, false), 200)
+                FixtureMode::AnthropicWithoutDone | FixtureMode::ResponsesWithoutDone => {
+                    let body = if matches!(mode, FixtureMode::AnthropicWithoutDone) {
+                        format!("{}data: {{\"type\":\"message_stop\"}}\n\n", success_sse(true, false))
+                    } else {
+                        format!("data: {}\n\n", json!({"type":"response.completed","response":{"usage":{"input_tokens":7,"output_tokens":3}}}))
+                    };
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{body}\r\n", body.len()).expect("native terminal");
+                    stream.flush().expect("flush");
+                    // No HTTP EOF: completion must drop the body on the native event.
+                    stream.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+                    assert_eq!(stream.read(&mut [0_u8; 1]).expect("client closes"), 0);
                 }
                 _ => write_fixture_response(
                     &mut stream,
@@ -2339,6 +2839,75 @@ fn anthropic_stop_completes_without_done_sentinel() {
     assert!(events.contains(&ProviderEvent::Stopped {
         reason: "end_turn".into()
     }));
+}
+
+#[test]
+fn responses_completion_closes_stream_and_preserves_terminal_usage() {
+    let (endpoint, server) = spawn_fixture_server(1, FixtureMode::ResponsesWithoutDone);
+    let client = HttpProviderClient::new(
+        OpenAiCodexAdapter::new(ProviderConfig::openai_codex(
+            endpoint,
+            "fixture-model",
+            "fixture-key",
+            "fixture-account",
+        ))
+        .expect("adapter"),
+        Duration::from_secs(2),
+    )
+    .expect("client");
+    let started = Instant::now();
+    let result = tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(client.send("stop"));
+    let elapsed = started.elapsed();
+    server.join().expect("server");
+    println!(
+        "native completion elapsed_ms={} result={result:?}",
+        elapsed.as_millis()
+    );
+    let events = result.expect("native terminal must not wait for HTTP EOF");
+    assert!(events.contains(&ProviderEvent::Usage {
+        input_tokens: 7,
+        output_tokens: 3
+    }));
+    assert!(elapsed < Duration::from_secs(1));
+
+    let (endpoint, server) = spawn_fixture_server(1, FixtureMode::ResponsesWithoutDone);
+    let client = HttpProviderClient::new(
+        slim_core::provider::XaiAdapter::new(&endpoint, "grok-4.5", "fixture-key", None)
+            .expect("xAI"),
+        Duration::from_secs(2),
+    )
+    .expect("client");
+    let events = tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(client.send("stop"))
+        .expect("xAI native terminal");
+    server.join().expect("server");
+    assert!(events.contains(&ProviderEvent::Usage {
+        input_tokens: 7,
+        output_tokens: 3
+    }));
+}
+
+#[test]
+fn pre_cancelled_stream_does_not_start_transport() {
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        "http://127.0.0.1:1",
+        "fixture-model",
+        "fixture-key",
+    ))
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+    let result = tokio::runtime::Runtime::new().expect("runtime").block_on(
+        client.stream_messages_with_tools_cancellable(
+            &[ProviderMessage::user("cancelled")],
+            &[],
+            std::future::ready(()),
+            |_| panic!("transport must not start after cancellation"),
+        ),
+    );
+    assert_eq!(result, Err(ProviderError::Cancelled));
 }
 
 #[test]

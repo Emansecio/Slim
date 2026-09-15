@@ -35,6 +35,7 @@ fn build_corpus() -> AppState {
                     "+ let token = refresh.lock().await;\n".repeat(36)
                 )),
                 4 => BlockKind::Tool(ToolState {
+                    historical: false,
                     batch_id: slim_tui::api::ToolBatchId(format!("bench-batch-{index}").into()),
                     call_id: slim_tui::api::ToolCallId(format!("bench-call-{index}").into()),
                     name: format!("read-{index}"),

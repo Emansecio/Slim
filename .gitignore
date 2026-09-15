@@ -11,12 +11,38 @@
 /bench/token-economy/v2/.task-v2/
 /bench/token-economy/v2/.agent-dirs-v2/
 /bench/token-economy/v2/campaigns/
+/bench/luna-live/*/
+!/bench/luna-live/README.md
+!/bench/luna-live/*.md
+!/bench/luna-live/*.py
+/bench/economy-next/*
+!/bench/economy-next/README.md
+!/bench/economy-next/**/README.md
+!/bench/economy-next/**/*.py
+!/bench/economy-next/**/*.ps1
+/bench/agentic-code-intel/results/
+!/bench/agentic-code-intel/README.md
+!/bench/agentic-code-intel/*.py
+!/bench/agentic-code-intel/*.json
+/bench/**/captures/
+/bench/**/runs/
+/bench/**/*.log
+/bench/**/summary.json
+/bench/**/final-validation.log
 __pycache__/
 # Runtime local (sessoes, memoria de agentes, logs de crash, rascunhos)
 /.slim/
+**/.slim/
 /.workbuddy-ai/
+/.pit/
+/.superpowers/
+/.commandcode/
 hs_err_pid*.log
 /librust_out.rmeta
 /tmp/
 # Backups locais
 /_backup-*/
+# Evidencia efemera de auditorias (relatorios .md permanecem versionados)
+/analysis_outputs/AUDIT-*/probe/
+/analysis_outputs/AUDIT-*/*.log
+/analysis_outputs/streaming-thinking-tools-tui/conpty/

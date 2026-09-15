@@ -7,6 +7,7 @@ mod index;
 mod inspection;
 mod jsonl_repo;
 mod manual_drive;
+mod manual_journal;
 mod memory_repo;
 mod observability_hooks;
 mod observability_snapshot;
@@ -20,6 +21,7 @@ mod resume;
 mod schema_v2;
 mod snapshot;
 mod tool_phases;
+mod transcript;
 
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +52,7 @@ pub use manual_drive::{
     drive_manual, drive_manual_async, restore_manual_run, ConflictKind, ManualDrive,
     ManualDriveError, ManualDriver, ManualExecutor, ManualRunSpec, ProviderResponse,
 };
+pub use manual_journal::ManualRunJournal;
 pub use memory_repo::MemoryRepo;
 pub use observability_hooks::{
     append_with_hooks, DurableAppendProjection, DurableOperationProjection, FactValueKind,
@@ -86,6 +89,9 @@ pub use snapshot::SessionSnapshot;
 pub use tool_phases::{
     ReplayDisposition, ReplayItem, ReplayPlan, ToolBatch, ToolCallState, ToolOutput,
     ToolPhaseError, ToolPhaseLedger,
+};
+pub use transcript::{
+    provider_messages_from_entries, provider_messages_from_records, recovery_tool_results,
 };
 
 pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 1;

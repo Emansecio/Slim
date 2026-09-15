@@ -1,0 +1,775 @@
+{
+  "generated_utc": "2026-09-09 14:03:26Z",
+  "manifests": {
+    "20260909-134056Z": {
+      "model": "gpt-5.6-luna",
+      "provider": "openai-codex",
+      "effort": "high",
+      "speed": "normal",
+      "order": [
+        "slim",
+        "pi"
+      ],
+      "workspace": "C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-2cf3dzd3",
+      "prompt": "Read SPEC.md and implement ranges.py. Run python check.py and fix any failures. Do not change SPEC.md or check.py. Do not install dependencies. Finish with a brief summary of the result.",
+      "scenario": "merge_ranges",
+      "executables": {
+        "pi": {
+          "path": "C:\\nvm4w\\nodejs\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js",
+          "sha256": "e6d7fcf36a239cf3746e67ddf4222081ac01a601b85a3ee688bdfe9c161d754c",
+          "version": "0.85.1"
+        },
+        "slim": {
+          "path": "C:\\Users\\User\\bin\\Slim.exe",
+          "sha256": "c4e8c1d9c06eb0df6a5dbdc82bc52b7e6bca119b1abe471aa60c28a90dec50bf",
+          "version": "slim 0.1.0"
+        }
+      },
+      "route": "native openai-codex; each CLI uses its own configured authentication"
+    },
+    "20260909-134154Z": {
+      "model": "gpt-5.6-luna",
+      "provider": "openai-codex",
+      "effort": "high",
+      "speed": "normal",
+      "order": [
+        "pi",
+        "slim"
+      ],
+      "workspace": "C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-8ebozprt",
+      "prompt": "Read SPEC.md and implement ranges.py. Run python check.py and fix any failures. Do not change SPEC.md or check.py. Do not install dependencies. Finish with a brief summary of the result.",
+      "scenario": "merge_ranges",
+      "executables": {
+        "pi": {
+          "path": "C:\\nvm4w\\nodejs\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js",
+          "sha256": "e6d7fcf36a239cf3746e67ddf4222081ac01a601b85a3ee688bdfe9c161d754c",
+          "version": "0.85.1"
+        },
+        "slim": {
+          "path": "C:\\Users\\User\\bin\\Slim.exe",
+          "sha256": "c4e8c1d9c06eb0df6a5dbdc82bc52b7e6bca119b1abe471aa60c28a90dec50bf",
+          "version": "slim 0.1.0"
+        }
+      },
+      "route": "native openai-codex; each CLI uses its own configured authentication"
+    }
+  },
+  "aggregate": {
+    "pi": {
+      "total": {
+        "wall_ms": 59431,
+        "model_calls": 11,
+        "tool_calls": 12,
+        "tool_failures": 2,
+        "tool_ms_sum": 640,
+        "provider_ms_sum": 51788,
+        "residual_ms": 7003,
+        "total_tokens": 22723,
+        "input": 20914,
+        "uncached": 16818,
+        "cache": 4096,
+        "output": 1809,
+        "reasoning": 805
+      },
+      "errors": {
+        "read-missing": 2
+      },
+      "pairs": 2
+    },
+    "slim": {
+      "total": {
+        "wall_ms": 54515,
+        "model_calls": 8,
+        "tool_calls": 10,
+        "tool_failures": 0,
+        "tool_ms_sum": 690,
+        "provider_ms_sum": 53667,
+        "residual_ms": 158,
+        "total_tokens": 21686,
+        "input": 19531,
+        "uncached": 17995,
+        "cache": 1536,
+        "output": 2155,
+        "reasoning": 1265
+      },
+      "errors": {},
+      "pairs": 2
+    }
+  },
+  "arms": [
+    {
+      "campaign": "20260909-134056Z",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260909-134056Z",
+      "wall_ms": 34873,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 0,
+      "fixtures_unchanged": true,
+      "model_calls": 7,
+      "tool_calls": 6,
+      "tool_failures": 1,
+      "tool_ms_sum": 401,
+      "provider_ms_sum": 30878,
+      "residual_ms": 3594,
+      "total_tokens": 13731,
+      "input": 12778,
+      "uncached": 8682,
+      "cache": 4096,
+      "output": 953,
+      "reasoning": 469,
+      "provider_ms": 30878,
+      "error_breakdown": {
+        "read-missing": 1
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "input": 1153,
+          "uncached": 1153,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 33,
+          "reasoning": 13,
+          "provider_ms": 4143,
+          "tools": [
+            "read"
+          ],
+          "model": "gpt-5.6-luna"
+        },
+        {
+          "turn": 2,
+          "input": 1333,
+          "uncached": 1333,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 18,
+          "reasoning": 0,
+          "provider_ms": 3562,
+          "tools": [
+            "read"
+          ],
+          "model": "gpt-5.6-luna"
+        },
+        {
+          "turn": 3,
+          "input": 1402,
+          "uncached": 1402,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 42,
+          "reasoning": 7,
+          "provider_ms": 2048,
+          "tools": [
+            "bash"
+          ],
+          "model": "gpt-5.6-luna"
+        },
+        {
+          "turn": 4,
+          "input": 1569,
+          "uncached": 1569,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 32,
+          "reasoning": 12,
+          "provider_ms": 1676,
+          "tools": [
+            "read"
+          ],
+          "model": "gpt-5.6-luna"
+        },
+        {
+          "turn": 5,
+          "input": 1898,
+          "uncached": 1898,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 767,
+          "reasoning": 430,
+          "provider_ms": 14940,
+          "tools": [
+            "write"
+          ],
+          "model": "gpt-5.6-luna"
+        },
+        {
+          "turn": 6,
+          "input": 2680,
+          "uncached": 1144,
+          "cache": 1536,
+          "cache_write": 0,
+          "output": 33,
+          "reasoning": 7,
+          "provider_ms": 2688,
+          "tools": [
+            "bash"
+          ],
+          "model": "gpt-5.6-luna"
+        },
+        {
+          "turn": 7,
+          "input": 2743,
+          "uncached": 183,
+          "cache": 2560,
+          "cache_write": 0,
+          "output": 28,
+          "reasoning": 0,
+          "provider_ms": 1821,
+          "tools": [],
+          "model": "gpt-5.6-luna"
+        }
+      ],
+      "tools": [
+        {
+          "call_id": "call_OKZofgk9LTHz2p8teBrc6snk|fc_0ac273297c9aa876016aa16219e8c487d2b537c83d780f6bd3",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 3,
+          "args": "{\"path\": \"SPEC.md\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:c83d780f6bd3"
+        },
+        {
+          "call_id": "call_JFBCMcZMwYLQJPBY6z2MBRTc|fc_0ac273297c9aa876016aa1621d5bd487d2af2fe3afec57043d",
+          "name": "read",
+          "turn": 3,
+          "success": false,
+          "duration_ms": 1,
+          "args": "{\"path\": \"ranges.py\"}",
+          "error_kind": "read-missing",
+          "error": "ENOENT: no such file or directory, access 'C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-2cf3dzd3\\pi\\ranges.py'",
+          "trace": "pi.audit.jsonl:e3afec57043d"
+        },
+        {
+          "call_id": "call_PuwdHLaD7w6NI18NNwRlwlbc|fc_0ac273297c9aa876016aa1621f8f0487d299346d6e332656c3",
+          "name": "bash",
+          "turn": 3,
+          "success": true,
+          "duration_ms": 266,
+          "args": "{\"command\": \"ls -la && find . -maxdepth 2 -type f -print\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:6d6e332656c3"
+        },
+        {
+          "call_id": "call_fvZPYfwK7Hmh46JSrH57DKnS|fc_0ac273297c9aa876016aa162218c4487d2b0b8815a6aee4e1d",
+          "name": "read",
+          "turn": 5,
+          "success": true,
+          "duration_ms": 1,
+          "args": "{\"path\": \"check.py\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:815a6aee4e1d"
+        },
+        {
+          "call_id": "call_eEU82d6hijRynSxJVHb1PcEv|fc_0ac273297c9aa876016aa1622b0ad487d29d7f4904a3a17297",
+          "name": "write",
+          "turn": 5,
+          "success": true,
+          "duration_ms": 4,
+          "args": "{\"path\": \"ranges.py\", \"content\": \"\\\"\\\"\\\"Utilities for merging integer ranges.\\\"\\\"\\\"\\n\\n\\ndef merge_ranges(ranges):\\n \\\"\\...",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:4904a3a17297"
+        },
+        {
+          "call_id": "call_vogu9lBHLTa1QXvvuP7BMJC5|fc_0ac273297c9aa876016aa162332a6487d2bf58d142fb0bb3a5",
+          "name": "bash",
+          "turn": 6,
+          "success": true,
+          "duration_ms": 126,
+          "args": "{\"command\": \"python check.py\", \"timeout\": 120}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:d142fb0bb3a5"
+        }
+      ],
+      "scenario": "merge_ranges",
+      "order": [
+        "slim",
+        "pi"
+      ]
+    },
+    {
+      "campaign": "20260909-134056Z",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260909-134056Z",
+      "wall_ms": 23391,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 0,
+      "fixtures_unchanged": true,
+      "model_calls": 4,
+      "tool_calls": 5,
+      "tool_failures": 0,
+      "tool_ms_sum": 384,
+      "provider_ms_sum": 22918,
+      "residual_ms": 89,
+      "total_tokens": 10714,
+      "input": 9855,
+      "uncached": 9855,
+      "cache": 0,
+      "output": 859,
+      "reasoning": 391,
+      "provider_ms": 22918,
+      "error_breakdown": {},
+      "rows": [
+        {
+          "turn": 1,
+          "seq": null,
+          "input": 1701,
+          "uncached": 1701,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 102,
+          "reasoning": 24,
+          "provider_ms": 4463,
+          "tools": [
+            "read",
+            "read",
+            "list"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 6836,
+          "history_bytes": 891
+        },
+        {
+          "turn": 2,
+          "seq": null,
+          "input": 2265,
+          "uncached": 2265,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 596,
+          "reasoning": 273,
+          "provider_ms": 12543,
+          "tools": [
+            "write"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 6836,
+          "history_bytes": 2979
+        },
+        {
+          "turn": 3,
+          "seq": null,
+          "input": 2904,
+          "uncached": 2904,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 37,
+          "reasoning": 10,
+          "provider_ms": 2086,
+          "tools": [
+            "shell"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 6836,
+          "history_bytes": 7747
+        },
+        {
+          "turn": 4,
+          "seq": null,
+          "input": 2985,
+          "uncached": 2985,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 124,
+          "reasoning": 84,
+          "provider_ms": 3826,
+          "tools": [],
+          "system_bytes": 1556,
+          "schema_bytes": 6836,
+          "history_bytes": 9496
+        }
+      ],
+      "tools": [
+        {
+          "call_id": "call_5UnyVf3b6Kr1mCfhFF0y9ekV",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": null,
+          "args": "{\"path\":\"SPEC.md\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...FF0y9ekV"
+        },
+        {
+          "call_id": "call_b4wBeG1s7GdBP0vk9wGs9TcL",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": null,
+          "args": "{\"path\":\"check.py\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...9wGs9TcL"
+        },
+        {
+          "call_id": "call_TYT6ZGx35U10AJ2lFbwqCAC1",
+          "name": "list",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": null,
+          "args": "{\"path\":\"\",\"max_entries\":100}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...FbwqCAC1"
+        },
+        {
+          "call_id": "call_xjjRiH34YU5VyncvbPBryXQj",
+          "name": "write",
+          "turn": 2,
+          "seq": null,
+          "success": true,
+          "duration_ms": null,
+          "args": "{\"path\":\"ranges.py\",\"content\":\"\\\"\\\"\\\"Utilities for validating and merging integer ranges.\\\"\\\"\\\"\\n\\n\\ndef merge_ranges(ra...",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...bPBryXQj"
+        },
+        {
+          "call_id": "call_6KzA6RaxqZkh5SGoWgZSMPP8",
+          "name": "shell",
+          "turn": 3,
+          "seq": null,
+          "success": true,
+          "duration_ms": null,
+          "args": "{\"command\":\"python check.py\",\"timeout_ms\":30000}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...WgZSMPP8"
+        }
+      ],
+      "scenario": "merge_ranges",
+      "order": [
+        "slim",
+        "pi"
+      ]
+    },
+    {
+      "campaign": "20260909-134154Z",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260909-134154Z",
+      "wall_ms": 24558,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 0,
+      "fixtures_unchanged": true,
+      "model_calls": 4,
+      "tool_calls": 6,
+      "tool_failures": 1,
+      "tool_ms_sum": 239,
+      "provider_ms_sum": 20910,
+      "residual_ms": 3409,
+      "total_tokens": 8992,
+      "input": 8136,
+      "uncached": 8136,
+      "cache": 0,
+      "output": 856,
+      "reasoning": 336,
+      "provider_ms": 20910,
+      "error_breakdown": {
+        "read-missing": 1
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "input": 1151,
+          "uncached": 1151,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 93,
+          "reasoning": 13,
+          "provider_ms": 3564,
+          "tools": [
+            "read",
+            "read",
+            "read",
+            "bash"
+          ],
+          "model": "gpt-5.6-luna"
+        },
+        {
+          "turn": 2,
+          "input": 1848,
+          "uncached": 1848,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 674,
+          "reasoning": 316,
+          "provider_ms": 13207,
+          "tools": [
+            "write"
+          ],
+          "model": "gpt-5.6-luna"
+        },
+        {
+          "turn": 3,
+          "input": 2537,
+          "uncached": 2537,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 33,
+          "reasoning": 7,
+          "provider_ms": 1796,
+          "tools": [
+            "bash"
+          ],
+          "model": "gpt-5.6-luna"
+        },
+        {
+          "turn": 4,
+          "input": 2600,
+          "uncached": 2600,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 56,
+          "reasoning": 0,
+          "provider_ms": 2343,
+          "tools": [],
+          "model": "gpt-5.6-luna"
+        }
+      ],
+      "tools": [
+        {
+          "call_id": "call_8EX4FsjXleOenjKYFgFXCPZP|fc_046e4c1d8b5b2647016aa1623c81a887d287f9779bf16ba39b",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 14,
+          "args": "{\"path\": \"SPEC.md\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:779bf16ba39b"
+        },
+        {
+          "call_id": "call_K2rUx9vdx0cnq354tFLVdqnD|fc_046e4c1d8b5b2647016aa1623c81c087d28d3ed83189494fa6",
+          "name": "read",
+          "turn": 2,
+          "success": false,
+          "duration_ms": 10,
+          "args": "{\"path\": \"ranges.py\"}",
+          "error_kind": "read-missing",
+          "error": "ENOENT: no such file or directory, access 'C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-8ebozprt\\pi\\ranges.py'",
+          "trace": "pi.audit.jsonl:d83189494fa6"
+        },
+        {
+          "call_id": "call_qh1FD2NZEUVw3s5WrsYF6TpW|fc_046e4c1d8b5b2647016aa1623c81cc87d2a70cd04550e9f282",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 11,
+          "args": "{\"path\": \"check.py\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:d04550e9f282"
+        },
+        {
+          "call_id": "call_KgOGo225F8pprstXdlFhP2Fw|fc_046e4c1d8b5b2647016aa1623c81d887d29adad71180935ac1",
+          "name": "bash",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 75,
+          "args": "{\"command\": \"ls -la\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:d71180935ac1"
+        },
+        {
+          "call_id": "call_NQe5Nl4FTH4BmDUz5Ahg52kL|fc_046e4c1d8b5b2647016aa1624431e087d288087768725213c7",
+          "name": "write",
+          "turn": 3,
+          "success": true,
+          "duration_ms": 2,
+          "args": "{\"path\": \"ranges.py\", \"content\": \"\\\"\\\"\\\"Utilities for validating and merging closed integer intervals.\\\"\\\"\\\"\\n\\n\\ndef me...",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:7768725213c7"
+        },
+        {
+          "call_id": "call_KN8YlpYSt7rIAkd3DoUvkJj1|fc_046e4c1d8b5b2647016aa1624b8ac087d2995318ed81a53280",
+          "name": "bash",
+          "turn": 3,
+          "success": true,
+          "duration_ms": 127,
+          "args": "{\"command\": \"python check.py\", \"timeout\": 120}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:18ed81a53280"
+        }
+      ],
+      "scenario": "merge_ranges",
+      "order": [
+        "pi",
+        "slim"
+      ]
+    },
+    {
+      "campaign": "20260909-134154Z",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260909-134154Z",
+      "wall_ms": 31124,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 0,
+      "fixtures_unchanged": true,
+      "model_calls": 4,
+      "tool_calls": 5,
+      "tool_failures": 0,
+      "tool_ms_sum": 306,
+      "provider_ms_sum": 30749,
+      "residual_ms": 69,
+      "total_tokens": 10972,
+      "input": 9676,
+      "uncached": 8140,
+      "cache": 1536,
+      "output": 1296,
+      "reasoning": 874,
+      "provider_ms": 30749,
+      "error_breakdown": {},
+      "rows": [
+        {
+          "turn": 1,
+          "seq": null,
+          "input": 1701,
+          "uncached": 1701,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 104,
+          "reasoning": 26,
+          "provider_ms": 3876,
+          "tools": [
+            "read",
+            "read",
+            "list"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 6836,
+          "history_bytes": 891
+        },
+        {
+          "turn": 2,
+          "seq": null,
+          "input": 2267,
+          "uncached": 2267,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 505,
+          "reasoning": 225,
+          "provider_ms": 10901,
+          "tools": [
+            "write"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 6836,
+          "history_bytes": 3018
+        },
+        {
+          "turn": 3,
+          "seq": null,
+          "input": 2814,
+          "uncached": 2814,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 36,
+          "reasoning": 9,
+          "provider_ms": 2357,
+          "tools": [
+            "shell"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 6836,
+          "history_bytes": 7161
+        },
+        {
+          "turn": 4,
+          "seq": null,
+          "input": 2894,
+          "uncached": 1358,
+          "cache": 1536,
+          "cache_write": 0,
+          "output": 651,
+          "reasoning": 614,
+          "provider_ms": 13615,
+          "tools": [],
+          "system_bytes": 1556,
+          "schema_bytes": 6836,
+          "history_bytes": 8907
+        }
+      ],
+      "tools": [
+        {
+          "call_id": "call_zVeWMcRiE2sVWMAzZEljLXDc",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": null,
+          "args": "{\"path\":\"SPEC.md\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...ZEljLXDc"
+        },
+        {
+          "call_id": "call_2Oep905FvdWVRBlsXK6fglxH",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": null,
+          "args": "{\"path\":\"check.py\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...XK6fglxH"
+        },
+        {
+          "call_id": "call_0Lyc8qVitG27ZiLPA3xhLCGD",
+          "name": "list",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": null,
+          "args": "{\"path\":\"\",\"max_entries\":200}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...A3xhLCGD"
+        },
+        {
+          "call_id": "call_zYjIHMKc8aE9tcPeyQQHrblH",
+          "name": "write",
+          "turn": 2,
+          "seq": null,
+          "success": true,
+          "duration_ms": null,
+          "args": "{\"path\":\"ranges.py\",\"content\":\"\\\"\\\"\\\"Utilities for validating and merging integer ranges.\\\"\\\"\\\"\\n\\n\\ndef merge_ranges(ra...",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...yQQHrblH"
+        },
+        {
+          "call_id": "call_5jVZc5eVmxQFuBmtIdizaXhk",
+          "name": "shell",
+          "turn": 3,
+          "seq": null,
+          "success": true,
+          "duration_ms": null,
+          "args": "{\"command\":\"python check.py\",\"timeout_ms\":30000}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...IdizaXhk"
+        }
+      ],
+      "scenario": "merge_ranges",
+      "order": [
+        "pi",
+        "slim"
+      ]
+    }
+  ],
+  "problems": []
+}

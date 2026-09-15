@@ -7,6 +7,8 @@ use slim_core::provider::{
 fn bundled_gpt_56_aliases_use_codex_catalog_window_not_loop_default() {
     for id in [
         "gpt-5.6-sol",
+        "gpt-6-astra",
+        "astra",
         "sol",
         "gpt-5.6-terra",
         "terra",
@@ -18,7 +20,7 @@ fn bundled_gpt_56_aliases_use_codex_catalog_window_not_loop_default() {
         assert!(model.context_window > 32_000);
         assert_eq!(model.max_output_tokens, 128_000);
     }
-    assert_eq!(codex_models().len(), 3);
+    assert_eq!(codex_models().len(), 4);
     assert!(codex_model("deepseek-v4-flash").is_none());
 }
 

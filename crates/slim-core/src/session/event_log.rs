@@ -114,9 +114,9 @@ impl SessionWriter {
         for event in events {
             write_line(
                 &mut bytes,
-                &SessionLine::Event {
+                &EventLineRef::Event {
                     seq: event.seq,
-                    event: event.clone(),
+                    event,
                 },
             )?;
         }
@@ -131,7 +131,17 @@ impl SessionWriter {
     }
 }
 
-fn write_line(file: &mut impl Write, line: &SessionLine) -> io::Result<()> {
+/// Serialization-only mirror of `SessionLine::Event` that borrows the event:
+/// appends stay alloc-light instead of cloning every `SessionEvent` payload.
+/// The serde shape must stay identical — the equality test below guards it.
+#[derive(serde::Serialize)]
+#[serde(tag = "type")]
+enum EventLineRef<'a> {
+    #[serde(rename = "event")]
+    Event { seq: u64, event: &'a SessionEvent },
+}
+
+fn write_line(file: &mut impl Write, line: &impl serde::Serialize) -> io::Result<()> {
     let bytes = serde_json::to_vec(line).map_err(io::Error::other)?;
     file.write_all(&bytes)?;
     file.write_all(b"\n")?;
@@ -267,4 +277,31 @@ fn reparse_error(path: &Path) -> io::Error {
             path.display()
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::EventKind;
+
+    #[test]
+    fn event_line_ref_serializes_identically_to_owned_session_line() {
+        let event = SessionEvent::new(
+            7,
+            EventKind::AssistantTextDelta {
+                text: "partial output".into(),
+            },
+        );
+        let owned = serde_json::to_vec(&SessionLine::Event {
+            seq: event.seq,
+            event: event.clone(),
+        })
+        .expect("owned serialization");
+        let borrowed = serde_json::to_vec(&EventLineRef::Event {
+            seq: event.seq,
+            event: &event,
+        })
+        .expect("borrowed serialization");
+        assert_eq!(owned, borrowed);
+    }
 }

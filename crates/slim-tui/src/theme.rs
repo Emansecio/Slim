@@ -1,5 +1,10 @@
 use ratatui::style::Color;
 
+/// Neutral fill for the currently focused row in modal menus. Keeping this
+/// separate from the modal surface makes keyboard focus visible without
+/// changing the semantic foreground/accent roles.
+pub(crate) const MENU_SELECTION_BG: (u8, u8, u8) = (0x2A, 0x2A, 0x2A);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ColorDepth {
     TrueColor,
@@ -55,6 +60,19 @@ pub struct Theme {
     pub code_bg: (u8, u8, u8),
 }
 
+pub fn env_flag_enabled(name: &str, default_enabled: bool) -> bool {
+    env_flag_from_value(std::env::var_os(name).as_deref(), default_enabled)
+}
+
+pub fn env_flag_from_value(value: Option<&std::ffi::OsStr>, default_enabled: bool) -> bool {
+    match value.and_then(|flag| flag.to_str()) {
+        None => default_enabled,
+        Some("0" | "off" | "false") => false,
+        Some("1" | "on" | "true") => true,
+        Some(_) => default_enabled,
+    }
+}
+
 pub fn detect_capabilities() -> Capabilities {
     let no_color = std::env::var_os("NO_COLOR").is_some();
     let truecolor = std::env::var("COLORTERM")
@@ -69,7 +87,9 @@ pub fn detect_capabilities() -> Capabilities {
         } else {
             ColorDepth::Ansi16
         },
-        mouse: std::env::var_os("SLIM_MOUSE").is_some_and(|value| value == "1"),
+        // Default on: capturing without in-app selection stole native copy/paste.
+        // SLIM_MOUSE=0 restores the previous "leave the mouse to the terminal" mode.
+        mouse: env_flag_enabled("SLIM_MOUSE", true),
         clipboard: cfg!(windows)
             || std::env::var_os("SLIM_CLIPBOARD").is_some_and(|value| value == "1"),
         images: std::env::var_os("SLIM_IMAGES").is_some_and(|value| value == "1"),
@@ -79,42 +99,42 @@ pub fn detect_capabilities() -> Capabilities {
 
 pub fn resolve_theme(capabilities: Capabilities) -> Theme {
     let mut theme = Theme {
-        // Normative truecolor palette (DESIGN-SLIM-TUI §21.3).
-        background: (0x08, 0x0A, 0x0D),
-        // text é cinza-suave (não branco): texto ~91% branco sobre fundo
-        // near-black sofre halation e parece negrito (feedback W3, ref. Grok).
-        foreground: (0xC6, 0xCD, 0xD5),
-        muted: (0x74, 0x7B, 0x84),
-        secondary_text: (0xA9, 0xB0, 0xB8),
-        accent: (0x7D, 0xCF, 0xFF),
-        surface: (0x0D, 0x10, 0x14),
-        surface_alt: (0x12, 0x16, 0x1B),
-        // W8: composer/footer share transcript depth; border carries shape.
-        composer_bg: (0x0D, 0x10, 0x14),
-        user_prompt_bg: (0x1B, 0x20, 0x26),
-        border: (0x2B, 0x31, 0x39),
-        border_focus: (0x4B, 0x78, 0x91),
-        operational_divider: (0x25, 0x2B, 0x33),
-        scrollbar_track: (0x15, 0x1A, 0x20),
-        scrollbar_thumb: (0x4B, 0x55, 0x63),
-        user_accent: (0xA9, 0xB0, 0xB8),
-        assistant_accent: (0x78, 0xD9, 0x9B),
-        thinking_accent: (0x9A, 0xA4, 0xAF),
-        heading_accent: (0x82, 0xAF, 0xFF),
-        link_accent: (0x8C, 0xB4, 0xFF),
-        tool_accent: (0x7D, 0xCF, 0xFF),
-        success: (0x78, 0xD9, 0x9B),
-        warning: (0xE6, 0xB4, 0x50),
-        error: (0xF0, 0x71, 0x78),
-        code_rail: (0x46, 0x50, 0x5C),
-        selection: (0x26, 0x3A, 0x30),
-        diff_add: (0x78, 0xD9, 0x9B),
-        diff_remove: (0xF0, 0x71, 0x78),
-        diff_add_bg: (0x0B, 0x1A, 0x10),
-        diff_remove_bg: (0x1C, 0x0D, 0x11),
-        diff_add_emphasis_bg: (0x16, 0x3D, 0x22),
-        diff_remove_emphasis_bg: (0x42, 0x18, 0x20),
-        code_bg: (0x0B, 0x0E, 0x12),
+        // True-black transcript surface keeps the reading column quiet.
+        background: (0x00, 0x00, 0x00),
+        // Ivory text keeps long sessions comfortable without harsh pure white.
+        foreground: (0xE8, 0xE5, 0xDB),
+        muted: (0x99, 0x97, 0x8E),
+        secondary_text: (0xBC, 0xB9, 0xAF),
+        accent: (0x72, 0xCC, 0x91),
+        surface: (0x00, 0x00, 0x00),
+        // Overlays and secondary docks sit one quiet step above the transcript.
+        surface_alt: (0x18, 0x18, 0x18),
+        // Composer/footer share transcript depth; border carries shape.
+        composer_bg: (0x00, 0x00, 0x00),
+        user_prompt_bg: (0x10, 0x10, 0x10),
+        border: (0x3A, 0x3A, 0x3A),
+        border_focus: (0x72, 0xCC, 0x91),
+        operational_divider: (0x3A, 0x3A, 0x3A),
+        scrollbar_track: (0x24, 0x23, 0x1A),
+        scrollbar_thumb: (0x62, 0x67, 0x56),
+        user_accent: (0xBC, 0xB9, 0xAF),
+        assistant_accent: (0x72, 0xCC, 0x91),
+        thinking_accent: (0xAF, 0xA9, 0x9D),
+        heading_accent: (0x91, 0xC2, 0x8F),
+        link_accent: (0x7E, 0xAB, 0x7F),
+        tool_accent: (0x72, 0xCC, 0x91),
+        success: (0x72, 0xCC, 0x91),
+        warning: (0xE7, 0xC1, 0x5A),
+        error: (0xE8, 0x79, 0x73),
+        code_rail: (0x68, 0x66, 0x5A),
+        selection: (0x2A, 0x4C, 0x38),
+        diff_add: (0x72, 0xCC, 0x91),
+        diff_remove: (0xE8, 0x79, 0x73),
+        diff_add_bg: (0x17, 0x2A, 0x1E),
+        diff_remove_bg: (0x2A, 0x18, 0x16),
+        diff_add_emphasis_bg: (0x22, 0x57, 0x34),
+        diff_remove_emphasis_bg: (0x51, 0x2A, 0x25),
+        code_bg: (0x0A, 0x0A, 0x0A),
     };
     if capabilities.color_depth == ColorDepth::None {
         let white = (255, 255, 255);
@@ -188,12 +208,21 @@ fn to_ansi16(rgb: (u8, u8, u8)) -> Color {
             _ => Color::White,
         };
     }
-    if g >= r && g >= b {
-        Color::Green
+    // Preserve mixed hues: an amber warning must not degrade to error red.
+    // Bright variants keep chromatic text readable on the dark surfaces.
+    let high = |channel: u8| u16::from(channel) * 4 >= u16::from(max) * 3;
+    if high(r) && high(g) {
+        Color::Yellow
+    } else if high(g) && high(b) {
+        Color::LightCyan
+    } else if high(r) && high(b) {
+        Color::LightMagenta
+    } else if g >= r && g >= b {
+        Color::LightGreen
     } else if r >= g && r >= b {
-        Color::Red
+        Color::LightRed
     } else {
-        Color::Blue
+        Color::LightBlue
     }
 }
 
@@ -202,5 +231,75 @@ pub fn glyph(capabilities: Capabilities, preferred: char, ascii_fallback: char) 
         ascii_fallback
     } else {
         preferred
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn mouse_flag_defaults_on_and_can_be_disabled() {
+        use std::ffi::OsStr;
+        assert!(super::env_flag_from_value(None, true));
+        assert!(!super::env_flag_from_value(Some(OsStr::new("0")), true));
+        assert!(!super::env_flag_from_value(Some(OsStr::new("off")), true));
+        assert!(super::env_flag_from_value(Some(OsStr::new("1")), false));
+        assert!(super::env_flag_from_value(Some(OsStr::new("maybe")), true));
+    }
+
+    #[test]
+    fn dark_palette_preserves_semantic_roles_and_fallbacks() {
+        let capabilities = super::Capabilities {
+            color_depth: super::ColorDepth::TrueColor,
+            mouse: false,
+            clipboard: false,
+            images: false,
+            reduced_motion: false,
+        };
+        let theme = super::resolve_theme(capabilities);
+
+        assert_eq!(theme.background, (0x00, 0x00, 0x00));
+        assert_eq!(theme.surface, (0x00, 0x00, 0x00));
+        assert_eq!(theme.composer_bg, theme.surface);
+        assert_eq!(theme.surface_alt, (0x18, 0x18, 0x18));
+        assert_eq!(theme.user_prompt_bg, (0x10, 0x10, 0x10));
+        assert_eq!(theme.code_bg, (0x0A, 0x0A, 0x0A));
+        assert_eq!(theme.border, (0x3A, 0x3A, 0x3A));
+        assert_eq!(theme.foreground, (0xE8, 0xE5, 0xDB));
+        assert_eq!(theme.muted, (0x99, 0x97, 0x8E));
+        assert_eq!(theme.secondary_text, (0xBC, 0xB9, 0xAF));
+        assert_eq!(theme.accent, (0x72, 0xCC, 0x91));
+        assert_eq!(theme.border_focus, theme.accent);
+        assert_eq!(theme.assistant_accent, theme.accent);
+        assert_eq!(theme.tool_accent, theme.accent);
+        assert_eq!(theme.success, theme.accent);
+
+        assert_eq!(
+            super::to_terminal_color(super::ColorDepth::Ansi256, theme.background),
+            super::to_terminal_color(super::ColorDepth::Ansi256, theme.surface)
+        );
+        assert_ne!(
+            super::to_terminal_color(super::ColorDepth::Ansi256, theme.background),
+            super::to_terminal_color(super::ColorDepth::Ansi256, theme.user_prompt_bg)
+        );
+        assert_eq!(
+            super::to_terminal_color(super::ColorDepth::Ansi16, theme.accent),
+            ratatui::style::Color::LightGreen
+        );
+        assert_eq!(
+            super::to_terminal_color(super::ColorDepth::Ansi16, theme.warning),
+            ratatui::style::Color::Yellow
+        );
+        assert_eq!(
+            super::to_terminal_color(super::ColorDepth::Ansi16, theme.error),
+            ratatui::style::Color::LightRed
+        );
+
+        let no_color = super::resolve_theme(super::Capabilities {
+            color_depth: super::ColorDepth::None,
+            ..capabilities
+        });
+        assert_eq!(no_color.foreground, (255, 255, 255));
+        assert_eq!(no_color.muted, (255, 255, 255));
+        assert_eq!(no_color.secondary_text, (255, 255, 255));
     }
 }

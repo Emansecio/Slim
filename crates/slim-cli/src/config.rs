@@ -34,10 +34,13 @@ pub struct FileConfig {
     pub endpoint: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
+    pub codex_fast: Option<bool>,
     #[serde(default)]
     pub max_mutating_tool_calls: Option<usize>,
     #[serde(default)]
     pub max_read_tool_calls: Option<usize>,
+    #[serde(default)]
+    pub max_total_tool_calls: Option<usize>,
     #[serde(default)]
     pub max_turns: Option<usize>,
     #[serde(default)]
@@ -50,6 +53,8 @@ pub struct FileConfig {
     pub compaction: Option<FileCompactionConfig>,
     #[serde(default)]
     pub lsp: Option<FileLspConfig>,
+    #[serde(default)]
+    pub mcp: Option<FileMcpConfig>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
@@ -87,10 +92,19 @@ pub struct LspConfig {
     pub servers: BTreeMap<String, LspServerConfig>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LspServerConfig {
     pub enabled: bool,
     pub path: Option<String>,
+}
+
+impl Default for LspServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: None,
+        }
+    }
 }
 
 impl Default for LspConfig {
@@ -103,6 +117,113 @@ impl Default for LspConfig {
             max_open_documents: 64,
             servers: BTreeMap::new(),
         }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
+pub struct FileMcpConfig {
+    #[serde(default)]
+    pub servers: Option<BTreeMap<String, FileMcpServerConfig>>,
+}
+
+/// One `[mcp.servers.<name>]` entry: stdio (`command`) or streamable HTTP
+/// (`url`). Exactly one transport key must be set; enforced by validation.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
+pub struct FileMcpServerConfig {
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
+    #[serde(default)]
+    pub env: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+/// Merged MCP configuration with defaults applied.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct McpConfig {
+    pub servers: BTreeMap<String, McpServerConfig>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpServerConfig {
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub url: Option<String>,
+    pub headers: BTreeMap<String, String>,
+    pub enabled: bool,
+    pub timeout_ms: u64,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            command: None,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
+            enabled: true,
+            timeout_ms: 30_000,
+        }
+    }
+}
+
+impl McpConfig {
+    /// Fails loud on ambiguous server entries so a typo cannot silently
+    /// disable or reroute a configured server.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, server) in &self.servers {
+            if name.is_empty()
+                || name.len() > 64
+                || !name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+            {
+                return Err(format!(
+                    "mcp.servers.{name}: name must match ^[A-Za-z0-9_-]{{1,64}}$"
+                ));
+            }
+            match (server.command.is_some(), server.url.is_some()) {
+                (true, true) => {
+                    return Err(format!(
+                        "mcp.servers.{name}: set either command (stdio) or url (http), not both"
+                    ))
+                }
+                (false, false) => {
+                    return Err(format!(
+                        "mcp.servers.{name}: missing command (stdio) or url (http)"
+                    ))
+                }
+                _ => {}
+            }
+            if let Some(command) = &server.command {
+                if command.trim().is_empty() {
+                    return Err(format!("mcp.servers.{name}: command must not be empty"));
+                }
+            }
+            if let Some(url) = &server.url {
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    return Err(format!(
+                        "mcp.servers.{name}: url must start with http:// or https://"
+                    ));
+                }
+            }
+            if !(1_000..=600_000).contains(&server.timeout_ms) {
+                return Err(format!(
+                    "mcp.servers.{name}: timeout_ms must be between 1000 and 600000"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -126,14 +247,17 @@ pub struct LayeredConfig {
     pub model: Option<String>,
     pub endpoint: Option<String>,
     pub effort: Option<String>,
+    pub codex_fast: Option<bool>,
     pub max_mutating_tool_calls: Option<usize>,
     pub max_read_tool_calls: Option<usize>,
+    pub max_total_tool_calls: Option<usize>,
     pub max_turns: Option<usize>,
     pub max_output_tokens: Option<u32>,
     pub timeout_secs: Option<u64>,
     pub max_result_bytes: Option<usize>,
     pub compaction: FileCompactionConfig,
     pub lsp: LspConfig,
+    pub mcp: McpConfig,
 }
 
 impl LayeredConfig {
@@ -223,7 +347,7 @@ impl FileConfig {
     }
 }
 
-/// OS config directory for Slim (e.g. `%APPDATA%\slim` on Windows).
+/// OS config directory for Slim (e.g. `%APPDATA%\slim\config` on Windows).
 pub fn global_config_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("SLIM_CONFIG_FILE").filter(|path| !path.is_empty()) {
         return Some(PathBuf::from(path));
@@ -243,19 +367,28 @@ pub fn global_config_path() -> Option<PathBuf> {
 }
 
 /// Persists the selected model and effort into the global config TOML
-/// (`%APPDATA%\slim\slim.toml`), preserving unknown keys (endpoint, future
+/// (`%APPDATA%\slim\config\slim.toml`), preserving unknown keys (endpoint, future
 /// fields) by editing a parsed table instead of rewriting from scratch.
 /// Returns the path written on success so callers can surface it in toasts.
-pub fn save_global_model(model: &str, effort: &str) -> Result<PathBuf, String> {
+pub fn save_global_model(
+    model: &str,
+    effort: &str,
+    codex_fast: Option<bool>,
+) -> Result<PathBuf, String> {
     let path = global_config_path()
         .ok_or_else(|| "unable to resolve the global config directory".to_owned())?;
-    save_global_model_to(&path, model, effort)?;
+    save_global_model_to(&path, model, effort, codex_fast)?;
     Ok(path)
 }
 
 /// Writes `model`/`effort` into the TOML file at `path`, preserving unknown
 /// keys. Exposed for hermetic tests; production uses [`save_global_model`].
-fn save_global_model_to(path: &Path, model: &str, effort: &str) -> Result<(), String> {
+fn save_global_model_to(
+    path: &Path,
+    model: &str,
+    effort: &str,
+    codex_fast: Option<bool>,
+) -> Result<(), String> {
     let _write_guard = CONFIG_WRITE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -272,8 +405,130 @@ fn save_global_model_to(path: &Path, model: &str, effort: &str) -> Result<(), St
         .map_err(|error| format!("{}: {error}", path.display()))?;
     table.insert("model".into(), model.into());
     table.insert("effort".into(), effort.into());
+    if let Some(fast) = codex_fast {
+        table.insert("codex_fast".into(), fast.into());
+    }
     let serialized =
         toml::to_string(&table).map_err(|error| format!("{}: {error}", path.display()))?;
+    write_config_atomic(path, serialized.as_bytes())
+}
+
+/// Writes or replaces `[mcp.servers.<name>]` in the TOML at `path`,
+/// preserving all other keys. Only fields actually set on `server` are
+/// written, so a re-add does not resurrect stale keys.
+pub fn upsert_mcp_server_to(
+    path: &Path,
+    name: &str,
+    server: &FileMcpServerConfig,
+) -> Result<(), String> {
+    let _write_guard = CONFIG_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut table = read_config_table_locked(path)?;
+    let entry = mcp_servers_table(&mut table);
+    let mut fields = toml::Table::new();
+    if let Some(command) = &server.command {
+        fields.insert("command".into(), command.clone().into());
+    }
+    if let Some(args) = &server.args {
+        fields.insert(
+            "args".into(),
+            toml::Value::Array(args.iter().cloned().map(toml::Value::String).collect()),
+        );
+    }
+    if let Some(env) = &server.env {
+        fields.insert(
+            "env".into(),
+            toml::Value::Table(
+                env.iter()
+                    .map(|(k, v)| (k.clone(), v.clone().into()))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(url) = &server.url {
+        fields.insert("url".into(), url.clone().into());
+    }
+    if let Some(headers) = &server.headers {
+        fields.insert(
+            "headers".into(),
+            toml::Value::Table(
+                headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone().into()))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(enabled) = server.enabled {
+        fields.insert("enabled".into(), enabled.into());
+    }
+    if let Some(timeout_ms) = server.timeout_ms {
+        fields.insert("timeout_ms".into(), (timeout_ms as i64).into());
+    }
+    entry.insert(name.to_owned(), toml::Value::Table(fields));
+    write_config_table_locked(path, &table)
+}
+
+/// Deletes `[mcp.servers.<name>]` from the first layer that defines it
+/// (project file first, then global). Returns the edited path, or `None`
+/// when the server was not configured anywhere.
+pub fn remove_mcp_server(name: &str) -> Result<Option<PathBuf>, String> {
+    let _write_guard = CONFIG_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut paths = vec![PathBuf::from(PROJECT_CONFIG_FILE)];
+    if let Some(global) = global_config_path() {
+        paths.push(global);
+    }
+    for path in paths {
+        let mut table = match read_config_table_locked(&path) {
+            Ok(table) => table,
+            Err(_) if !path.exists() => continue,
+            Err(error) => return Err(error),
+        };
+        if mcp_servers_table(&mut table).remove(name).is_some() {
+            write_config_table_locked(&path, &table)?;
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+fn read_config_table_locked(path: &Path) -> Result<toml::Table, String> {
+    match read_config(path) {
+        Ok(contents) => contents
+            .parse()
+            .map_err(|error| format!("{}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(toml::Table::new()),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+fn mcp_servers_table(table: &mut toml::Table) -> &mut toml::Table {
+    let mcp = table
+        .entry("mcp")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if !mcp.is_table() {
+        *mcp = toml::Value::Table(toml::Table::new());
+    }
+    let servers = mcp
+        .as_table_mut()
+        .expect("mcp table")
+        .entry("servers")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if !servers.is_table() {
+        *servers = toml::Value::Table(toml::Table::new());
+    }
+    servers.as_table_mut().expect("servers table")
+}
+
+fn write_config_table_locked(path: &Path, table: &toml::Table) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    let serialized =
+        toml::to_string(table).map_err(|error| format!("{}: {error}", path.display()))?;
     write_config_atomic(path, serialized.as_bytes())
 }
 
@@ -355,7 +610,28 @@ pub fn load_layered() -> Result<LayeredConfig, String> {
         paths.push(global);
     }
     paths.push(PathBuf::from(PROJECT_CONFIG_FILE));
-    load_layered_from(paths)
+    let mut config = load_layered_from(paths)?;
+    // A file value is a default, not an explicit ProviderRunOptions override.
+    // Leave env-backed values unset so the shared resolvers validate them;
+    // invalid/empty environment settings must not silently fall back to TOML.
+    config.max_mutating_tool_calls = file_default(
+        config.max_mutating_tool_calls,
+        "SLIM_MAX_MUTATING_TOOL_CALLS",
+    );
+    config.max_read_tool_calls =
+        file_default(config.max_read_tool_calls, "SLIM_MAX_READ_TOOL_CALLS");
+    config.max_total_tool_calls =
+        file_default(config.max_total_tool_calls, "SLIM_MAX_TOTAL_TOOL_CALLS");
+    config.max_turns = file_default(config.max_turns, "SLIM_MAX_TURNS");
+    config.max_output_tokens = file_default(config.max_output_tokens, "SLIM_MAX_OUTPUT_TOKENS");
+    config.timeout_secs = file_default(config.timeout_secs, "SLIM_TIMEOUT_SECS");
+    config.max_result_bytes = file_default(config.max_result_bytes, "SLIM_MAX_RESULT_BYTES");
+    config.mcp.validate()?;
+    Ok(config)
+}
+
+fn file_default<T>(value: Option<T>, env_key: &str) -> Option<T> {
+    value.filter(|_| std::env::var_os(env_key).is_none())
 }
 
 pub(crate) fn load_layered_from(
@@ -364,6 +640,18 @@ pub(crate) fn load_layered_from(
     let mut layered = LayeredConfig::default();
     for path in paths {
         if let Some(config) = FileConfig::load(&path)? {
+            // Per-layer rejection: one file setting both transports is a
+            // typo; merging then can no longer detect it (a layer's `command`
+            // legitimately clears an inherited `url` and vice versa).
+            if let Some(servers) = config.mcp.as_ref().and_then(|mcp| mcp.servers.as_ref()) {
+                for (name, server) in servers {
+                    if server.command.is_some() && server.url.is_some() {
+                        return Err(format!(
+                            "mcp.servers.{name}: set either command (stdio) or url (http), not both"
+                        ));
+                    }
+                }
+            }
             merge_layer(&mut layered, config);
         }
     }
@@ -380,11 +668,17 @@ fn merge_layer(target: &mut LayeredConfig, source: FileConfig) {
     if source.effort.is_some() {
         target.effort = source.effort;
     }
+    if source.codex_fast.is_some() {
+        target.codex_fast = source.codex_fast;
+    }
     if source.max_mutating_tool_calls.is_some() {
         target.max_mutating_tool_calls = source.max_mutating_tool_calls;
     }
     if source.max_read_tool_calls.is_some() {
         target.max_read_tool_calls = source.max_read_tool_calls;
+    }
+    if source.max_total_tool_calls.is_some() {
+        target.max_total_tool_calls = source.max_total_tool_calls;
     }
     if source.max_turns.is_some() {
         target.max_turns = source.max_turns;
@@ -422,6 +716,41 @@ fn merge_layer(target: &mut LayeredConfig, source: FileConfig) {
                 }
                 if let Some(path) = server.path {
                     entry.path = Some(path);
+                }
+            }
+        }
+    }
+    if let Some(mcp) = source.mcp {
+        if let Some(servers) = mcp.servers {
+            for (name, server) in servers {
+                let entry = target.mcp.servers.entry(name).or_default();
+                // A layer that picks one transport clears the other's keys so
+                // `command`+`url` never coexist in the merged entry.
+                if let Some(command) = server.command {
+                    entry.command = Some(command);
+                    entry.url = None;
+                    entry.headers.clear();
+                }
+                if let Some(args) = server.args {
+                    entry.args = args;
+                }
+                if let Some(env) = server.env {
+                    entry.env.extend(env);
+                }
+                if let Some(url) = server.url {
+                    entry.url = Some(url);
+                    entry.command = None;
+                    entry.args.clear();
+                    entry.env.clear();
+                }
+                if let Some(headers) = server.headers {
+                    entry.headers.extend(headers);
+                }
+                if let Some(enabled) = server.enabled {
+                    entry.enabled = enabled;
+                }
+                if let Some(timeout_ms) = server.timeout_ms {
+                    entry.timeout_ms = timeout_ms;
                 }
             }
         }
@@ -619,14 +948,19 @@ mod tests {
         )
         .expect("seed");
 
-        super::save_global_model_to(&path, "gpt-5.6-luna", "low").expect("save");
+        super::save_global_model_to(&path, "gpt-6-astra", "max", Some(true)).expect("save");
 
         let reloaded = fs::read_to_string(&path).expect("read back");
         assert!(
-            reloaded.contains("model = \"gpt-5.6-luna\""),
+            reloaded.contains("model = \"gpt-6-astra\""),
             "model written"
         );
-        assert!(reloaded.contains("effort = \"low\""), "effort written");
+        assert!(reloaded.contains("effort = \"max\""), "effort written");
+        let loaded = super::load_layered_from([path.clone()]).expect("load fast config");
+        assert_eq!(loaded.codex_fast, Some(true));
+        super::save_global_model_to(&path, "gpt-6-astra", "max", Some(false)).expect("normal");
+        let loaded = super::load_layered_from([path]).expect("load normal config");
+        assert_eq!(loaded.codex_fast, Some(false));
         assert!(
             reloaded.contains("future_key = true"),
             "unknown keys survive"
@@ -644,7 +978,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let path = dir.join(PROJECT_CONFIG_FILE);
 
-        super::save_global_model_to(&path, "grok-4", "high").expect("save");
+        super::save_global_model_to(&path, "grok-4", "high", None).expect("save");
         let reloaded = fs::read_to_string(&path).expect("read back");
         assert!(reloaded.contains("model = \"grok-4\""));
         assert!(reloaded.contains("effort = \"high\""));
@@ -680,6 +1014,7 @@ mod tests {
                         &path,
                         &format!("model-{index}-{iteration}"),
                         if iteration % 2 == 0 { "low" } else { "high" },
+                        None,
                     )
                     .expect("atomic save");
                 }
@@ -735,5 +1070,237 @@ mod tests {
             Config::resolve(None, None, Some("proj"), Some("glob")),
             Some("proj")
         );
+    }
+    #[test]
+    fn lsp_path_only_is_enabled_and_explicit_disable_survives_layering() {
+        let mut layered = LayeredConfig::default();
+        merge_layer(
+            &mut layered,
+            FileConfig::parse("[lsp.servers.rust-analyzer]\npath = 'custom-ra.exe'\n").unwrap(),
+        );
+        let server = &layered.lsp.servers["rust-analyzer"];
+        assert!(
+            server.enabled,
+            "path-only configuration keeps enabled default"
+        );
+        assert_eq!(server.path.as_deref(), Some("custom-ra.exe"));
+        merge_layer(
+            &mut layered,
+            FileConfig::parse("[lsp.servers.rust-analyzer]\nenabled = false\n").unwrap(),
+        );
+        merge_layer(
+            &mut layered,
+            FileConfig::parse("[lsp.servers.rust-analyzer]\npath = 'another-ra.exe'\n").unwrap(),
+        );
+        assert!(!layered.lsp.servers["rust-analyzer"].enabled);
+        assert_eq!(
+            layered.lsp.servers["rust-analyzer"].path.as_deref(),
+            Some("another-ra.exe"),
+        );
+    }
+
+    #[test]
+    fn mcp_parse_and_project_layer_overrides_global_fields() {
+        let mut layered = LayeredConfig::default();
+        merge_layer(
+            &mut layered,
+            FileConfig::parse(
+                "[mcp.servers.fs]\ncommand = \"npx\"\nargs = [\"-y\", \"fs-server\"]\ntimeout_ms = 5000\n[mcp.servers.web]\nurl = \"https://mcp.example.com\"\n[mcp.servers.web.headers]\nAuthorization = \"Bearer global\"\n",
+            )
+            .unwrap(),
+        );
+        merge_layer(
+            &mut layered,
+            FileConfig::parse(
+                "[mcp.servers.fs]\nargs = [\"-y\", \"fs-server-v2\"]\n[mcp.servers.fs.env]\nKEY = \"v\"\n[mcp.servers.web]\nenabled = false\n",
+            )
+            .unwrap(),
+        );
+        let fs = &layered.mcp.servers["fs"];
+        assert_eq!(fs.command.as_deref(), Some("npx"));
+        assert_eq!(fs.args, vec!["-y", "fs-server-v2"]);
+        assert_eq!(fs.env.get("KEY").map(String::as_str), Some("v"));
+        assert_eq!(fs.timeout_ms, 5_000);
+        let web = &layered.mcp.servers["web"];
+        assert!(!web.enabled);
+        assert_eq!(
+            web.headers.get("Authorization").map(String::as_str),
+            Some("Bearer global")
+        );
+    }
+
+    #[test]
+    fn mcp_validate_rejects_ambiguous_or_missing_transport() {
+        let mut config = McpConfig::default();
+        config.servers.insert(
+            "both".into(),
+            McpServerConfig {
+                command: Some("npx".into()),
+                url: Some("https://x".into()),
+                ..McpServerConfig::default()
+            },
+        );
+        assert!(config
+            .validate()
+            .expect_err("both transports")
+            .contains("not both"));
+        config.servers.clear();
+        config
+            .servers
+            .insert("none".into(), McpServerConfig::default());
+        assert!(config
+            .validate()
+            .expect_err("no transport")
+            .contains("missing command"));
+        config.servers.clear();
+        config.servers.insert(
+            "bad name!".into(),
+            McpServerConfig {
+                command: Some("npx".into()),
+                ..McpServerConfig::default()
+            },
+        );
+        assert!(config
+            .validate()
+            .expect_err("bad name")
+            .contains("name must match"));
+        config.servers.clear();
+        config.servers.insert(
+            "slow".into(),
+            McpServerConfig {
+                command: Some("npx".into()),
+                timeout_ms: 10,
+                ..McpServerConfig::default()
+            },
+        );
+        assert!(config
+            .validate()
+            .expect_err("tiny timeout")
+            .contains("timeout_ms"));
+    }
+
+    #[test]
+    fn mcp_upsert_and_remove_preserve_unrelated_toml() {
+        let path =
+            std::env::temp_dir().join(format!("slim-mcp-upsert-{}.toml", std::process::id()));
+        fs::write(&path, "model = \"keep-me\"\n[other]\nx = 1\n").expect("seed");
+        let server = FileMcpServerConfig {
+            command: Some("npx".into()),
+            args: Some(vec!["-y".into(), "srv".into()]),
+            ..FileMcpServerConfig::default()
+        };
+        upsert_mcp_server_to(&path, "fs", &server).expect("upsert");
+
+        let contents = fs::read_to_string(&path).expect("read back");
+        let parsed: toml::Table = contents.parse().expect("still valid toml");
+        assert_eq!(
+            parsed.get("model").and_then(toml::Value::as_str),
+            Some("keep-me")
+        );
+        assert!(parsed.contains_key("other"));
+        let mcp = parsed
+            .get("mcp")
+            .and_then(|m| m.get("servers"))
+            .and_then(|s| s.get("fs"))
+            .expect("mcp.servers.fs written");
+        assert_eq!(
+            mcp.get("command").and_then(toml::Value::as_str),
+            Some("npx")
+        );
+        assert_eq!(
+            mcp.get("args")
+                .and_then(toml::Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+
+        // Re-add replaces the entry without resurrecting stale keys.
+        let http = FileMcpServerConfig {
+            url: Some("https://mcp.example.com".into()),
+            ..FileMcpServerConfig::default()
+        };
+        upsert_mcp_server_to(&path, "fs", &http).expect("re-upsert");
+        let parsed: toml::Table = fs::read_to_string(&path)
+            .expect("read back")
+            .parse()
+            .expect("valid");
+        let mcp = parsed["mcp"]["servers"]["fs"].as_table().expect("table");
+        assert!(mcp.get("command").is_none());
+        assert_eq!(
+            mcp.get("url").and_then(toml::Value::as_str),
+            Some("https://mcp.example.com")
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mcp_layer_can_switch_transport_without_coexistence() {
+        // Global http → project stdio: url and http-only headers clear.
+        let mut layered = LayeredConfig::default();
+        merge_layer(
+            &mut layered,
+            FileConfig::parse(
+                "[mcp.servers.srv]\nurl = \"https://mcp.example.com\"\n[mcp.servers.srv.headers]\nAuthorization = \"Bearer s\"\n",
+            )
+            .unwrap(),
+        );
+        merge_layer(
+            &mut layered,
+            FileConfig::parse("[mcp.servers.srv]\ncommand = \"npx\"\nargs = [\"srv\"]\n").unwrap(),
+        );
+        let srv = &layered.mcp.servers["srv"];
+        assert_eq!(srv.command.as_deref(), Some("npx"));
+        assert!(srv.url.is_none());
+        assert!(srv.headers.is_empty());
+        layered.mcp.validate().expect("merged config validates");
+
+        // Global stdio → project http: command, args and env clear.
+        let mut layered = LayeredConfig::default();
+        merge_layer(
+            &mut layered,
+            FileConfig::parse(
+                "[mcp.servers.srv]\ncommand = \"npx\"\nargs = [\"srv\"]\n[mcp.servers.srv.env]\nKEY = \"v\"\n",
+            )
+            .unwrap(),
+        );
+        merge_layer(
+            &mut layered,
+            FileConfig::parse("[mcp.servers.srv]\nurl = \"https://mcp.example.com\"\n").unwrap(),
+        );
+        let srv = &layered.mcp.servers["srv"];
+        assert_eq!(srv.url.as_deref(), Some("https://mcp.example.com"));
+        assert!(srv.command.is_none());
+        assert!(srv.args.is_empty());
+        assert!(srv.env.is_empty());
+        layered.mcp.validate().expect("merged config validates");
+    }
+
+    #[test]
+    fn mcp_single_layer_with_both_transports_is_rejected() {
+        let path = std::env::temp_dir().join(format!("slim-mcp-both-{}.toml", std::process::id()));
+        fs::write(
+            &path,
+            "[mcp.servers.bad]\ncommand = \"npx\"\nurl = \"https://x\"\n",
+        )
+        .expect("seed");
+        let error = load_layered_from([path.clone()]).expect_err("both transports in one layer");
+        assert!(error.contains("not both"), "{error}");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mcp_validate_rejects_non_http_url() {
+        let mut config = McpConfig::default();
+        config.servers.insert(
+            "ws".into(),
+            McpServerConfig {
+                url: Some("ftp://x".into()),
+                ..McpServerConfig::default()
+            },
+        );
+        assert!(config
+            .validate()
+            .expect_err("non-http url")
+            .contains("http://"));
     }
 }

@@ -44,7 +44,7 @@ pub use provider::{
     ProviderTimeouts, ProviderToolCall, UsageBreakdown,
 };
 pub use runtime::{
-    tool_call_is_read_only, AgentLoopConfig, AgentLoopResult, AgentLoopStop,
-    InProcessCapabilityAdapter, RequestUsage, Runtime, RuntimeCapabilityAdapter,
+    tool_call_is_read_only, without_workspace_snapshot, AgentLoopConfig, AgentLoopResult,
+    AgentLoopStop, InProcessCapabilityAdapter, RequestUsage, Runtime, RuntimeCapabilityAdapter,
     RuntimeCapabilityBridge, RuntimeCapabilityTarget, UsageTotals,
 };

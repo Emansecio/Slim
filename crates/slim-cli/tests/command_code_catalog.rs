@@ -61,7 +61,9 @@ fn invalid_id_characters_fail_closed() {
 
 #[tokio::test]
 async fn refresh_fetches_public_catalog_and_publishes_cache() {
-    let body = br#"{"object":"list","data":[{"id":"future/open-model","name":"Future Open","context_length":128000}]}"#;
+    // The live catalog includes :free IDs alongside DeepSeek. Rejecting one
+    // unrelated entry must not make the supported V4.1 entry disappear.
+    let body = br#"{"object":"list","data":[{"id":"deepseek/deepseek-v4.1-flash","name":"DeepSeek V4.1 Flash","context_length":1000000},{"id":"meituan/LongCat-2.0:free"}]}"#;
     let (url, server) = catalog_server(body);
     let root = temp_path("refresh");
     let cache = root.join("models.json");
@@ -71,8 +73,13 @@ async fn refresh_fetches_public_catalog_and_publishes_cache() {
     server.join().expect("server");
 
     assert_eq!(snapshot.source, CatalogSource::Live);
-    assert_eq!(snapshot.models.len(), 1);
-    assert_eq!(snapshot.models[0].id, "future/open-model");
+    assert_eq!(snapshot.models.len(), 2);
+    assert_eq!(snapshot.models[0].id, "deepseek/deepseek-v4.1-flash");
+    assert_eq!(snapshot.models[0].name, "DeepSeek V4.1 Flash");
+    assert_eq!(snapshot.models[0].context_window, 1_000_000);
     assert!(cache.is_file());
+    let cached = catalog.load_or_fallback();
+    assert_eq!(cached.source, CatalogSource::Cache);
+    assert_eq!(cached.models, snapshot.models);
     let _ = std::fs::remove_dir_all(root);
 }

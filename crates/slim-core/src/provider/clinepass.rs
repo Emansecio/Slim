@@ -217,6 +217,10 @@ pub async fn fetch_clinepass_catalog(
         .await
         .map_err(|error| ProviderError::Transport {
             safe_to_retry: error.is_connect() || error.is_timeout(),
+            message: super::redact_values(
+                &format!("ClinePass catalog connection: {}", error.without_url()),
+                &[api_key.to_owned()],
+            ),
         })?;
     if !response.status().is_success() {
         return Err(ProviderError::Remote {
@@ -240,8 +244,12 @@ pub async fn fetch_clinepass_catalog(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|_| ProviderError::Transport {
+        .map_err(|error| ProviderError::Transport {
             safe_to_retry: true,
+            message: super::redact_values(
+                &format!("ClinePass catalog stream: {}", error.without_url()),
+                &[api_key.to_owned()],
+            ),
         })?
     {
         if bytes
@@ -296,6 +304,16 @@ impl ClinePassAdapter {
 
     pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.inner.set_system_prompt(prompt);
+        self
+    }
+
+    pub fn with_response_cache_scope_id(mut self, id: u64) -> Self {
+        self.inner.set_response_cache_scope_id(id);
+        self
+    }
+
+    pub fn with_max_output_tokens(mut self, tokens: u32) -> Self {
+        self.inner.config.max_output_tokens = tokens.max(1);
         self
     }
 }

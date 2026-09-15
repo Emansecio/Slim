@@ -87,8 +87,17 @@ struct AuthProviders {
         skip_serializing_if = "Option::is_none"
     )]
     opencode_go: Option<AuthProvider>,
+    #[serde(
+        rename = "opencode-zen",
+        alias = "opencode_zen",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    opencode_zen: Option<AuthProvider>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     anthropic: Option<AuthProvider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    xai: Option<AuthProvider>,
     #[serde(
         rename = "clinepass",
         alias = "cline-pass",
@@ -162,8 +171,11 @@ pub fn resolve_provider_credential(
         ProviderKind::OpenAiCodex => "CODEX_ACCESS_TOKEN",
         ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
         ProviderKind::OpenCodeGo => "OPENCODE_API_KEY",
+        // The Zen account key is the same OPENCODE_API_KEY issued for Go.
+        ProviderKind::OpenCodeZen => "OPENCODE_API_KEY",
         ProviderKind::ClinePass => "CLINEPASS_API_KEY",
         ProviderKind::CommandCode => "COMMANDCODE_API_KEY",
+        ProviderKind::Xai => "XAI_API_KEY",
     };
     if let Some(value) = non_empty_environment_value("SLIM_API_KEY") {
         return Ok(Some(env_credential(value)));
@@ -230,8 +242,10 @@ pub fn load_auth_credential(
         ProviderKind::OpenAiCodex => document.providers.openai_codex,
         ProviderKind::Anthropic => document.providers.anthropic,
         ProviderKind::OpenCodeGo => document.providers.opencode_go,
+        ProviderKind::OpenCodeZen => document.providers.opencode_zen,
         ProviderKind::ClinePass => document.providers.clinepass,
         ProviderKind::CommandCode => document.providers.command_code,
+        ProviderKind::Xai => document.providers.xai,
     };
     let Some(provider) = provider else {
         return Ok(None);
@@ -311,8 +325,10 @@ fn provider_name(kind: ProviderKind) -> &'static str {
         ProviderKind::OpenAiCodex => "openai-codex",
         ProviderKind::Anthropic => "anthropic",
         ProviderKind::OpenCodeGo => "opencode-go",
+        ProviderKind::OpenCodeZen => "opencode-zen",
         ProviderKind::ClinePass => "clinepass",
         ProviderKind::CommandCode => "command-code",
+        ProviderKind::Xai => "xai",
     }
 }
 
@@ -322,8 +338,10 @@ fn set_provider(providers: &mut AuthProviders, kind: ProviderKind, provider: Opt
         ProviderKind::OpenAiCodex => providers.openai_codex = provider,
         ProviderKind::Anthropic => providers.anthropic = provider,
         ProviderKind::OpenCodeGo => providers.opencode_go = provider,
+        ProviderKind::OpenCodeZen => providers.opencode_zen = provider,
         ProviderKind::ClinePass => providers.clinepass = provider,
         ProviderKind::CommandCode => providers.command_code = provider,
+        ProviderKind::Xai => providers.xai = provider,
     }
 }
 

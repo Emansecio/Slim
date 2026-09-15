@@ -1,10 +1,10 @@
 use serde_json::Value;
 
 use super::{
-    endpoint_sensitive_values, harden_compaction_body, normalize_messages, AnthropicAdapter,
-    HttpRequest, OpenAiCodexAdapter, OpenAiCompatibleAdapter, PreparedProviderRequest,
-    ProviderAdapter, ProviderCapabilities, ProviderConfig, ProviderError, ProviderEvent,
-    ProviderKind, ProviderMessage,
+    endpoint_sensitive_values, harden_compaction_body, materialize_native_prompt_cache_key,
+    normalize_messages, AnthropicAdapter, HttpRequest, OpenAiCodexAdapter, OpenAiCompatibleAdapter,
+    PreparedProviderRequest, ProviderAdapter, ProviderCapabilities, ProviderConfig, ProviderError,
+    ProviderEvent, ProviderKind, ProviderMessage,
 };
 
 pub const OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
@@ -35,6 +35,7 @@ const REASONING_LOW_HIGH: &[&str] = &["low", "high"];
 const REASONING_LOW_HIGH_MAX: &[&str] = &["low", "high", "max"];
 const REASONING_FULL: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const REASONING_STANDARD: &[&str] = &["low", "medium", "high"];
+const REASONING_LOW_XHIGH: &[&str] = &["low", "medium", "high", "xhigh"];
 const REASONING_MAX: &[&str] = &["max"];
 
 const MODELS: &[OpenCodeModel] = &[
@@ -111,6 +112,15 @@ const MODELS: &[OpenCodeModel] = &[
         REASONING_HIGH,
     ),
     model(
+        "deepseek-flash",
+        "DeepSeek V4.1 Flash",
+        OpenCodeApi::ChatCompletions,
+        1000000,
+        384000,
+        true,
+        REASONING_LOW_HIGH_MAX,
+    ),
+    model(
         "deepseek-v4-pro",
         "DeepSeek V4 Pro",
         OpenCodeApi::ChatCompletions,
@@ -185,12 +195,14 @@ const MODELS: &[OpenCodeModel] = &[
     model(
         "muse-spark-1.2-contributor",
         "Muse Spark 1.2 Contributor",
-        OpenCodeApi::ChatCompletions,
+        OpenCodeApi::Responses,
         1048576,
         131072,
         true,
-        REASONING_HIGH,
+        REASONING_LOW_XHIGH,
     ),
+    // Go routes both Muse contributor models through /responses:
+    // https://opencode.ai/docs/go/#endpoints (verified 2026-09-06).
     // Live on the public catalog since 2026-09-02; metadata mirrors the 1.2
     // contributor checkpoint on the same gateway (1M context, 131072 output
     // ceiling, multimodal input, reasoning). Source: Meta model docs +
@@ -198,11 +210,11 @@ const MODELS: &[OpenCodeModel] = &[
     model(
         "muse-spark-1.3-contributor",
         "Muse Spark 1.3 Contributor",
-        OpenCodeApi::ChatCompletions,
+        OpenCodeApi::Responses,
         1048576,
         131072,
         true,
-        REASONING_HIGH,
+        REASONING_LOW_XHIGH,
     ),
     model(
         "qwen3.8-max",
@@ -260,7 +272,7 @@ const MODELS: &[OpenCodeModel] = &[
     ),
 ];
 
-const fn model(
+pub(super) const fn model(
     id: &'static str,
     name: &'static str,
     api: OpenCodeApi,
@@ -285,6 +297,10 @@ pub fn open_code_models() -> &'static [OpenCodeModel] {
 }
 
 pub fn open_code_model(id: &str) -> Option<&'static OpenCodeModel> {
+    let id = match id {
+        "deepseek-v4.1-flash" => "deepseek-flash",
+        other => other,
+    };
     MODELS.iter().find(|model| model.id == id)
 }
 
@@ -302,9 +318,25 @@ enum WireAdapter {
 pub struct OpenCodeGoAdapter {
     model: &'static OpenCodeModel,
     wire: WireAdapter,
+    session_id: String,
 }
 
 impl OpenCodeGoAdapter {
+    pub fn validate_messages(&self, messages: &[ProviderMessage]) -> Result<(), ProviderError> {
+        normalize_messages(messages)?;
+        if !self.model.accepts_images
+            && messages
+                .iter()
+                .flat_map(|message| &message.content_blocks)
+                .any(|block| matches!(block, super::ProviderContentBlock::Image { .. }))
+        {
+            return Err(ProviderError::InvalidResponse {
+                message: format!("OpenCode Go model {} does not accept images", self.model.id),
+            });
+        }
+        Ok(())
+    }
+
     pub fn new(
         endpoint: &str,
         model: &str,
@@ -314,6 +346,11 @@ impl OpenCodeGoAdapter {
         let model = open_code_model(model).ok_or_else(|| ProviderError::InvalidResponse {
             message: format!("unsupported OpenCode Go model: {model}"),
         })?;
+        if reasoning_effort.is_some_and(|effort| !model.reasoning_levels.contains(&effort)) {
+            return Err(ProviderError::InvalidResponse {
+                message: "unsupported OpenCode Go reasoning effort".into(),
+            });
+        }
         let wire = match model.api {
             OpenCodeApi::ChatCompletions => {
                 let mut config = ProviderConfig::openai(
@@ -348,7 +385,51 @@ impl OpenCodeGoAdapter {
                 }
             }
         };
-        Ok(Self { model, wire })
+        Ok(Self {
+            model,
+            wire,
+            session_id: Self::new_session_id(),
+        })
+    }
+
+    pub fn new_session_id() -> String {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!(
+            "slim-{}-{stamp}-{}",
+            std::process::id(),
+            super::next_response_cache_scope_id()
+        )
+    }
+
+    pub fn with_session_id(mut self, session_id: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        // Opaque, header-safe identity; never expose a local session path.
+        self.session_id = format!("slim-{:x}", Sha256::digest(session_id.as_bytes()));
+        self
+    }
+
+    fn add_session_headers(&self, headers: &mut Vec<(String, String)>) {
+        headers.retain(|(name, _)| {
+            !name.eq_ignore_ascii_case("user-agent")
+                && !name.eq_ignore_ascii_case("x-opencode-session")
+        });
+        headers.push((
+            "user-agent".into(),
+            concat!("slim/", env!("CARGO_PKG_VERSION")).into(),
+        ));
+        headers.push(("x-opencode-session".into(), self.session_id.clone()));
+    }
+
+    pub fn with_response_cache_scope_id(mut self, id: u64) -> Self {
+        match &mut self.wire {
+            WireAdapter::Chat(adapter) => adapter.set_response_cache_scope_id(id),
+            WireAdapter::Messages(adapter) => adapter.set_response_cache_scope_id(id),
+            WireAdapter::Responses { parser, .. } => parser.set_response_cache_scope_id(id),
+        }
+        self
     }
 
     pub fn with_max_output_tokens(mut self, max_output_tokens: u32) -> Self {
@@ -469,7 +550,7 @@ impl ProviderAdapter for OpenCodeGoAdapter {
     }
 
     fn build_request(&self, prompt: &str) -> HttpRequest {
-        match &self.wire {
+        let mut request = match &self.wire {
             WireAdapter::Chat(adapter) => adapter.build_request(prompt),
             WireAdapter::Messages(adapter) => adapter.build_request(prompt),
             WireAdapter::Responses {
@@ -485,11 +566,13 @@ impl ProviderAdapter for OpenCodeGoAdapter {
                 &[],
                 *max_output_tokens,
             ),
-        }
+        };
+        self.add_session_headers(&mut request.headers);
+        request
     }
 
     fn build_messages_request(&self, messages: &[ProviderMessage]) -> HttpRequest {
-        match &self.wire {
+        let mut request = match &self.wire {
             WireAdapter::Chat(adapter) => adapter.build_messages_request(messages),
             WireAdapter::Messages(adapter) => adapter.build_messages_request(messages),
             WireAdapter::Responses {
@@ -505,7 +588,9 @@ impl ProviderAdapter for OpenCodeGoAdapter {
                 &[],
                 *max_output_tokens,
             ),
-        }
+        };
+        self.add_session_headers(&mut request.headers);
+        request
     }
 
     fn build_messages_request_with_tools(
@@ -513,7 +598,7 @@ impl ProviderAdapter for OpenCodeGoAdapter {
         messages: &[ProviderMessage],
         tools: &[Value],
     ) -> HttpRequest {
-        match &self.wire {
+        let mut request = match &self.wire {
             WireAdapter::Chat(adapter) => {
                 adapter.build_messages_request_with_tools(messages, tools)
             }
@@ -533,7 +618,18 @@ impl ProviderAdapter for OpenCodeGoAdapter {
                 tools,
                 *max_output_tokens,
             ),
-        }
+        };
+        self.add_session_headers(&mut request.headers);
+        request
+    }
+
+    fn build_messages_request_with_tools_checked(
+        &self,
+        messages: &[ProviderMessage],
+        tools: &[Value],
+    ) -> Result<HttpRequest, ProviderError> {
+        self.validate_messages(messages)?;
+        Ok(self.build_messages_request_with_tools(messages, tools))
     }
 
     fn prepare_messages_request_with_tools_checked(
@@ -541,8 +637,8 @@ impl ProviderAdapter for OpenCodeGoAdapter {
         messages: &[ProviderMessage],
         tools: &[Value],
     ) -> Result<PreparedProviderRequest, ProviderError> {
-        normalize_messages(messages)?;
-        let prepared = match &self.wire {
+        self.validate_messages(messages)?;
+        let mut prepared = match &self.wire {
             WireAdapter::Chat(adapter) => {
                 adapter.prepare_messages_request_with_tools_checked(messages, tools)?
             }
@@ -555,10 +651,10 @@ impl ProviderAdapter for OpenCodeGoAdapter {
                 api_key,
                 max_output_tokens,
             } => {
-                let mut body = parser.request_body(messages, tools);
+                let (mut body, stable_prefixes) =
+                    parser.request_body_with_prefixes(messages, tools);
                 body["max_output_tokens"] = Value::from(*max_output_tokens);
-                parser.materialize_prompt_cache_intent(&mut body);
-                PreparedProviderRequest::from_http_body(
+                PreparedProviderRequest::from_http_body_with_prefixes(
                     endpoint.clone(),
                     vec![
                         ("Authorization".into(), format!("Bearer {api_key}")),
@@ -567,9 +663,11 @@ impl ProviderAdapter for OpenCodeGoAdapter {
                     ],
                     body,
                     self,
+                    stable_prefixes,
                 )?
             }
         };
+        self.add_session_headers(&mut prepared.headers);
         Ok(prepared.with_routing_identity(self.kind(), self.wire_kind(), self.model()))
     }
 
@@ -577,8 +675,8 @@ impl ProviderAdapter for OpenCodeGoAdapter {
         &self,
         messages: &[ProviderMessage],
     ) -> Result<PreparedProviderRequest, ProviderError> {
-        normalize_messages(messages)?;
-        let prepared = match &self.wire {
+        self.validate_messages(messages)?;
+        let mut prepared = match &self.wire {
             WireAdapter::Chat(adapter) => adapter.prepare_compaction_request_checked(messages)?,
             WireAdapter::Messages(adapter) => {
                 adapter.prepare_compaction_request_checked(messages)?
@@ -589,11 +687,11 @@ impl ProviderAdapter for OpenCodeGoAdapter {
                 api_key,
                 max_output_tokens,
             } => {
-                let mut body = parser.request_body(messages, &[]);
+                let (mut body, _) = parser.request_body_with_prefixes(messages, &[]);
                 body["max_output_tokens"] = Value::from(*max_output_tokens);
                 harden_compaction_body(&mut body, false)?;
-                parser.materialize_prompt_cache_intent(&mut body);
-                PreparedProviderRequest::from_http_body(
+                let stable_prefixes = materialize_native_prompt_cache_key(parser, &mut body);
+                PreparedProviderRequest::from_http_body_with_prefixes(
                     endpoint.clone(),
                     vec![
                         ("Authorization".into(), format!("Bearer {api_key}")),
@@ -602,9 +700,11 @@ impl ProviderAdapter for OpenCodeGoAdapter {
                     ],
                     body,
                     self,
+                    stable_prefixes,
                 )?
             }
         };
+        self.add_session_headers(&mut prepared.headers);
         Ok(prepared.with_routing_identity(self.kind(), self.wire_kind(), self.model()))
     }
 
@@ -617,7 +717,7 @@ impl ProviderAdapter for OpenCodeGoAdapter {
     }
 }
 
-fn protocol_url(endpoint: &str, route: &str) -> String {
+pub(super) fn protocol_url(endpoint: &str, route: &str) -> String {
     if let Ok(mut url) = reqwest::Url::parse(endpoint) {
         let mut path = url.path().trim_end_matches('/').to_owned();
         for known in ["/chat/completions", "/responses", "/messages"] {

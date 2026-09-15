@@ -3,7 +3,7 @@
 > **Status de implementação:** checkpoint de integração; definição de v1 ainda
 > não satisfeita. Consulte o [status atual](README.md) e o tracker do Harness v2.
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use `subagent-driven-development` or `executing-plans` to implement this plan task-by-task.
+> **Retomada deste plano:** revalide as pendências no código e execute somente o escopo autorizado, conforme o `AGENTS.md` vigente. Skills e delegação são escolhidas por necessidade; receitas e resultados da execução original não são obrigações gerais.
 
 **Goal:** Construir a v1 diária do Slim em Rust, Windows-only, com runtime único para headless/TUI, sessões, compaction, skills, MCP, subagentes, Todo/Plan/Goal e execução irrestrita em `Auto`.
 
@@ -16,23 +16,42 @@ tools, contexto, skills, MCP e subagentes; headless e TUI apenas compõem o mesm
 JSONL append-only, ACL nativa Windows via `windows-sys`, provider adapters
 tipados, MCP stdio/Streamable HTTP e testes unit/property/golden/PTY.
 
-## Estado de implementação (atualizado em 2026-09-03)
+## Estado de implementação (atualizado em 2026-09-04)
 
-O workspace tem 1085 passed / 0 failed / 1 ignored (ConPTY físico) em 87 suítes
-(1 teste preexistente quebrado filtrado via `--skip`, sem implementação em `crates/`)
-e build/deploy release por via manual equivalente (o `refresh-slim.ps1` aborta sob
-`ErrorActionPreference=Stop` do harness; build release + cópia + smoke `slim --version` verificados).
-O gate `cargo clippy --workspace --all-targets -- -D warnings` está verde.
-`cargo check --workspace` e `git diff --check` também estão verdes (`cargo fmt --all -- --check`
-acusa somente drift preexistente do rustfmt 1.98; trechos novos estão formatados). O release atual
-tem: `Slim.exe` do target e do PATH têm 18.706.944 bytes e
-SHA-256 idêntico
-`3586F8F4B080C0E540073B404742254F3D56513C51D0EA90281C9864A3D62A76`.
+[Quick wins de agilidade nativa](../analysis_outputs/QUICK-WINS-AGILIDADE-NATIVA-SLIM.md): leitura e patch compatíveis em CRLF uniforme, rejeição com localização, resultado de edição e precondições claras. Implementados no core compartilhado; gate histórico e deploy registrados no relatório, sem inferência comercial.
+
+Revisão do harness concluída até a [etapa 5: configuração e providers](../analysis_outputs/HARNESS-SLIM-ETAPA-5.md), com síntese das cinco etapas e limitações live explícitas.
+
+[Revisão visual da TUI](../analysis_outputs/REVISAO-VISUAL-TUI-SLIM.md): metadados mais legíveis, atividade contida, output expandido, modelo longo e projeção do modo inicial. Contrato atualizado; observação por PTY com fixtures locais, sem declarar concluída a matriz física.
+
+[Otimização posterior de testes/build](../analysis_outputs/OTIMIZACAO-TESTES-E-BUILD-SLIM.md): finalização de budget com falha HTTP explícita nas fixtures; 17 módulos TUI em um executável. Sem mudança de fonte de produção ou perfis Cargo; mediana do gate já compilado 18,735 → 10,183 s.
+
+[Revisão da economia nativa](../analysis_outputs/REVISAO-ECONOMIA-TOKENS-NATIVA-SLIM.md): listagem relativa, legenda por página de busca quando menor e LF sem linhas extras. Dez combinações de rota/protocolo preservam conteúdo e controles; medição em bytes, sem inferência comercial.
+
+Codex inclui Astra com cinco esforços e Normal/Fast persistidos, no picker e
+na CLI. [Uso e limites](../README.md#openai-codex--gpt-6-astra).
+
+Nove correções de confiabilidade foram verificadas e implementadas uma por vez,
+com recuperação limitada e sem replay de efeitos incertos.
+[Detalhes e limites](DESIGN-SLIM-TUI.md#11-checkpoint-de-implementação-atual).
+
+O checkout tem 1211 passed / 0 failed / 3 ignored (ConPTY físico + duas fixtures auxiliares) em 74 suítes
+(contagem de 2026-09-06 via `refresh-slim.ps1 -Test` / `cargo test --workspace`, testes verdes).
+As sete melhorias LSP foram reconfirmadas, implementadas e revistas uma por vez;
+Clippy de slim-lsp/core/cli `--all-targets -- -D warnings` está verde.
+Refresh/deploy do checkout autorizado e executado em 2026-09-06 com `OK:`.
+Em validação comercial anterior, Muse 1.3/xhigh respondeu `OK` no Go real via debug e executável instalado;
+sem erro HTTP 500 nesses testes sintéticos, sem ferramentas.
+Contexto inicial distribuído por pasta e prazos TCP/TLS separados da espera de cabeçalhos. A bateria anterior registrada no benchmark terminou com 32/32 pares e 64/64 braços aprovados: Luna -10,76% tokens e DeepSeek -21,31%, com vantagem em 6/8 e 7/8 cenários, respectivamente. Os oráculos passaram integralmente; a vantagem em qualquer provider/tarefa permanece não demonstrada. [Código e benchmark](../bench/luna-live/README.md#contexto-equilibrado-e-prazos-http).
+
+O release atual tem: `C:\Users\User\bin\Slim.exe` com 15.143.936 bytes e
+SHA-256 `0D1CC3690B410B0DA945629AC11DC39569D1244683929E7A51216322F90C52E1`
+(build 2026-09-06 06:39:39). `slim --version` = `slim 0.1.0`.
 Isso comprova componentes, headless, bridge TUI e capability bridge offline,
 não integração v1 completa.
 
 Integrado no headless: providers OpenAI-compatible, Anthropic, Codex subscription
-e OpenCode Go; este último roteia 24 modelos por Chat Completions, Responses ou
+e OpenCode Go; este último roteia 25 modelos por Chat Completions, Responses ou
 Messages com catálogo bounded/cache/fallback. Também: read/list/search,
 write/patch/shell; filtragem de capabilities; auth nativa com DACL; `--image`
 local; compaction; usage; artifact handles; anti-loop; e gravação JSONL nova via
@@ -56,8 +75,9 @@ com gate §27 (p95 input→frame 1,132 ms e scroll 0,794 ms ≤ 16 ms em release
 0 compiler warnings — detalhes e achados de ambiente no tracker §§7–8.
 (2026-08-28: cache de corpos da TUI conectado — total 908 passed.)
 
-Ainda não integrado no caminho normal: `ask_question` no resume durável (N5);
-MCP transporte e child provider-backed. Plan na TUI já roda o loop read-only
+Ainda não integrado no caminho normal: MCP transporte e child provider-backed.
+`ask_question` no resume TUI (N5) está ligado; headless resume permanece sem
+rota. Plan na TUI já roda o loop read-only
 (N4); headless `--plan` continua `approval_required`.
 Todo no loop Auto. Skills Slim via tool `skill` lazy (`%USERPROFILE%/.slim/skills`);
 não entram no schema. Cache HTTP e
@@ -231,7 +251,13 @@ Contrato mínimo:
 - profiles `default`, `fast`, `deep`, `compact` carregam provider/model/effort;
 - provider gera stream normalizado de texto, reasoning, tool call, usage,
   stop reason e erro;
-- retry automático existe apenas para transporte seguro;
+- retry automático do loop é limitado a duas novas tentativas por execução,
+  dentro do orçamento de turnos, para transporte (incluindo timeout pós-envio),
+  HTTP 408/429/500/502/503/504/529, erros estruturados transitórios ou EOF sem
+  marcador terminal, inclusive após texto parcial; não reenvia request que já
+  emitiu ferramenta; `Retry-After` é honrado até o orçamento de espera de 60 s
+  (capado, não abortado); resultados anteriores são preservados e a espera aceita
+  cancelamento;
 - nenhuma troca silenciosa de provider/modelo;
 - reasoning textual é persistido, mas a TUI o recolhe.
 
@@ -758,9 +784,9 @@ essa lista:
 ## 10.1 Trabalho de integração restante (prioridade)
 
 > **Fila curta do ciclo atual (agente completo, harness leve):**
-> [PROXIMAS-ETAPAS-AGENTE.md](PROXIMAS-ETAPAS-AGENTE.md) — **N1–N3 feitos**
-> (OAuth headless, Todo no loop, Skill de projeto, Plan TUI, default Anthropic).
-> Próximo: N5 `ask_question` no resume TUI.
+> [PROXIMAS-ETAPAS-AGENTE.md](PROXIMAS-ETAPAS-AGENTE.md) — **N1–N6 feitos**
+> (OAuth headless, Todo no loop, Skill de projeto, Plan TUI, default Anthropic,
+> `ask_question` no resume TUI). N7 adiado.
 > Inspectors, caches novos, MCP transporte e child provider-backed estão WONTFIX
 > nesse ciclo. Quando este §10.1 e aquele arquivo divergirem no *próximo* patch,
 > prevalece o arquivo de próximas etapas.
@@ -799,7 +825,7 @@ especificação das tarefas; esta seção registra evidência do worktree atual.
 
 | Área | Estado | Evidência/limite |
 |---|---|---|
-| Tasks 1–9 + tracker TUI + Harness v2 Etapas 8–10 | componentes/contratos, headless, TUI e capability bridge no loop (todo + skill lazy) | suíte atual: 1030 passed / 0 failed / 1 ignored / 87 suítes; ConPTY físico `#[ignore]`; MCP/child provider-backed continuam fora |
+| Tasks 1–9 + tracker TUI + Harness v2 Etapas 8–10 | componentes/contratos, headless, TUI e capability bridge no loop (todo + skill lazy) | suíte atual: 1211 passed / 0 failed / 3 ignored / 74 suítes; ConPTY físico `#[ignore]`; MCP/child provider-backed continuam fora |
 | Task 10 | componentes M0/reducer/testes | usados pela aplicação TUI real |
 | Task 11 | lifecycle/input M1 integrado | `--tui` usa composer/fullscreen real e restauração RAII |
 | Task 12 | integração M2 central concluída | `AppHandle` publica SSE incremental para bridge; tools/usage/cancel funcionam; cache HTTP e transporte compartilhado ativos |
@@ -825,3 +851,11 @@ mas a v1 não deve ser declarada validada em produção ou fisicamente universal
 não houve provider live nem matriz correspondente de emulador, mouse, IME,
 clipboard e terminais. O detalhe de cada limitação está em
 [POC-RESULTS.md](../POC-RESULTS.md).
+
+Continuação de sessões: novos arquivos `--session` usam v2; CLI e bridge TUI
+retomam conversas com chamadas/resultados e novas ferramentas, preservando modo,
+orçamentos e raiz salva. Interrupções ambíguas ficam bloqueadas sem replay; v1
+não é migrado. [Validação offline e limites](../README.md#continuação-de-sessões-com-ferramentas).
+
+A retomada TUI também restaura ferramentas em blocos `history` recolhidos; Enter
+consulta argumentos e resultados salvos, sem replay ou inferência de sucesso.

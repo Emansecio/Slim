@@ -58,6 +58,7 @@ pub(super) struct PendingCall {
     spec: Option<ToolOperationalSpec>,
     confidence: CausalConfidence,
     diagnostics: bool,
+    admission_prefix: Option<String>,
 }
 
 impl PendingCall {
@@ -83,6 +84,7 @@ struct ProgressLedger {
     observed: BTreeMap<String, ObservedDependency>,
     evidence: HashMap<String, EvidenceRecord>,
     seen_evidence: HashSet<String>,
+    validations: HashMap<String, ValidationResult>,
     stagnant_turns: u32,
     turn: TurnState,
 }
@@ -133,11 +135,35 @@ struct EvidenceRecord {
     repetitions: u32,
 }
 
+struct ValidationResult {
+    success: bool,
+    workspace_revision: u64,
+    uncertainty_epoch: u64,
+}
+
 impl CausalGovernor {
-    /// True once the ledger emitted `WouldStop`: the loop must stop instead of
-    /// spinning (the shadow action becomes a real backstop).
+    /// Stop only when the completed batch has no progress or uncertain boundary.
     pub(super) fn stop_requested(&self) -> bool {
         self.stop_requested
+    }
+
+    pub(super) fn validations_satisfied(&self) -> bool {
+        self.ledger
+            .validations
+            .values()
+            .all(|result| result.success)
+            && self.ledger.validations.values().any(|result| {
+                result.success
+                    && result.workspace_revision == self.ledger.workspace_revision
+                    && result.uncertainty_epoch == self.ledger.uncertainty_epoch
+            })
+    }
+
+    pub(super) fn forget_compacted_evidence(&mut self) {
+        self.ledger.evidence.clear();
+        self.ledger.seen_evidence.clear();
+        self.ledger.stagnant_turns = 0;
+        self.stop_requested = false;
     }
 
     fn note_stop(&mut self, action: CausalShadowAction) {
@@ -197,6 +223,7 @@ impl CausalGovernor {
                 spec: Some(spec),
                 confidence,
                 diagnostics: prepared.name == "code_intel" && prepared.arguments.is_diagnostics(),
+                admission_prefix: crate::tools::admission_output_prefix(&prepared.admission_notes),
             },
             Vec::new(),
         )
@@ -278,7 +305,12 @@ impl CausalGovernor {
                     kind: CausalProgressKind::ExternalInput,
                     tool_name: pending.tool_name.clone(),
                     call_fingerprint: pending.call_fingerprint,
-                    evidence_id: evidence_id(&pending.tool_name, result, false),
+                    evidence_id: evidence_id(
+                        &pending.tool_name,
+                        result,
+                        false,
+                        pending.admission_prefix.as_deref(),
+                    ),
                     workspace_revision: self.ledger.workspace_revision,
                 }]
             }
@@ -313,10 +345,13 @@ impl CausalGovernor {
             return Vec::new();
         }
         if turn.made_progress {
+            self.stop_requested = false;
             self.ledger.stagnant_turns = 0;
             return Vec::new();
         }
         if turn.boundary || !turn.classifiable {
+            self.stop_requested = false;
+            self.ledger.stagnant_turns = 0;
             return Vec::new();
         }
         self.ledger.stagnant_turns = self.ledger.stagnant_turns.saturating_add(1);
@@ -435,7 +470,18 @@ impl CausalGovernor {
         result: &ToolResult,
         _receipt: &ToolExecutionReceipt,
     ) -> Vec<GovernorObservation> {
-        let outcome = if validation_green(result) {
+        let success = validation_green(result, pending.admission_prefix.as_deref());
+        // Track every outcome, including repetitions suppressed by the progress
+        // ledger. A different green command cannot resolve this command's failure.
+        self.ledger.validations.insert(
+            pending.canonical_fingerprint.clone(),
+            ValidationResult {
+                success,
+                workspace_revision: self.ledger.workspace_revision,
+                uncertainty_epoch: self.ledger.uncertainty_epoch,
+            },
+        );
+        let outcome = if success {
             EvidenceOutcome::ValidationGreen
         } else {
             EvidenceOutcome::Failure
@@ -474,7 +520,12 @@ impl CausalGovernor {
         let is_validation = pending
             .spec
             .is_some_and(|spec| spec.effect_class == ToolEffectClass::Validation);
-        let evidence_id = evidence_id(&pending.tool_name, result, is_validation);
+        let evidence_id = evidence_id(
+            &pending.tool_name,
+            result,
+            is_validation,
+            pending.admission_prefix.as_deref(),
+        );
         let seen_key = if is_validation {
             hash_fields(&[
                 b"slim-causal-seen-validation-v1",
@@ -588,6 +639,7 @@ impl CausalGovernor {
                 spec: None,
                 confidence: CausalConfidence::Low,
                 diagnostics: false,
+                admission_prefix: None,
             },
             vec![GovernorObservation::Boundary {
                 batch_id,
@@ -843,10 +895,19 @@ fn stateful_call_fingerprint(
     ])
 }
 
-fn evidence_id(tool_name: &str, result: &ToolResult, validation: bool) -> String {
+fn evidence_id(
+    tool_name: &str,
+    result: &ToolResult,
+    validation: bool,
+    admission_prefix: Option<&str>,
+) -> String {
     let success = if result.success { "success" } else { "failure" };
     let class = if validation { "validation" } else { "tool" };
-    let normalized = normalize_output(tool_name, &result.output, validation);
+    let normalized = normalize_output(
+        tool_name,
+        evidence_output(result, admission_prefix),
+        validation,
+    );
     hash_fields(&[
         b"slim-causal-evidence-v2",
         tool_name.as_bytes(),
@@ -856,10 +917,17 @@ fn evidence_id(tool_name: &str, result: &ToolResult, validation: bool) -> String
     ])
 }
 
-fn validation_green(result: &ToolResult) -> bool {
+fn evidence_output<'a>(result: &'a ToolResult, admission_prefix: Option<&str>) -> &'a str {
+    // Strip only this invocation's generated metadata, never a marker guessed
+    // from file content. Presentation choices must not count as new evidence.
+    admission_prefix
+        .and_then(|prefix| result.output.strip_prefix(prefix))
+        .unwrap_or(&result.output)
+}
+
+fn validation_green(result: &ToolResult, admission_prefix: Option<&str>) -> bool {
     result.success
-        && result
-            .output
+        && evidence_output(result, admission_prefix)
             .lines()
             .next()
             .is_some_and(|line| line == "exit 0")
@@ -1002,6 +1070,13 @@ mod tests {
             }
         )));
 
+        // A repeated read can request a stop before a later operation in the
+        // same batch observes a real dependency change.
+        for _ in 0..2 {
+            let (pending, _) = governor.observe_before_identified(&second, "batch", "repeat");
+            governor.observe_after(pending, &outcome.result, &outcome.receipt);
+        }
+
         fs::write(&path, "changed\n").expect("change fixture");
         let third =
             registry.prepare_invocation(OperatingMode::Auto, temp.path(), "read", arguments);
@@ -1016,6 +1091,54 @@ mod tests {
                 ..
             }
         )));
+        governor.finish_turn();
+        assert!(!governor.stop_requested(), "the batch made real progress");
+    }
+
+    #[test]
+    fn admission_notes_do_not_turn_identical_search_evidence_into_progress() {
+        let temp = TestRoot::new("admission-evidence");
+        fs::write(temp.path().join("sample.txt"), "needle\n").unwrap();
+        let registry = ToolRegistry::default();
+        let mut governor = CausalGovernor::default();
+        for (index, context) in [10, 11, 12].into_iter().enumerate() {
+            let prepared = registry.prepare_invocation(
+                OperatingMode::Auto,
+                temp.path(),
+                "search",
+                &serde_json::json!({"query":"needle", "context_lines": context}).to_string(),
+            );
+            let (pending, _) =
+                governor.observe_before_identified(&prepared, "batch", &index.to_string());
+            let outcome =
+                registry.execute_prepared_with_cancellation_and_progress(&prepared, None, |_| {});
+            assert!(outcome.result.success);
+            assert!(outcome
+                .result
+                .output
+                .contains(&format!("context_lines {context} -> 3")));
+            let observations = governor.observe_after(pending, &outcome.result, &outcome.receipt);
+            assert_eq!(
+                observations
+                    .iter()
+                    .any(|event| matches!(event, GovernorObservation::Progress { .. })),
+                index == 0,
+                "presentation-only changes cannot reset progress: {observations:?}",
+            );
+            if index > 0 {
+                assert!(observations
+                    .iter()
+                    .any(|event| matches!(event, GovernorObservation::Anomaly { .. })));
+            }
+            governor.finish_turn();
+        }
+        let content = ToolResult {
+            name: "read".into(),
+            success: true,
+            output: "[admission: literal file content]\nneedle".into(),
+            artifact: None,
+        };
+        assert_eq!(super::evidence_output(&content, None), content.output);
     }
 
     #[test]
@@ -1100,11 +1223,23 @@ mod tests {
     fn successful_allowlisted_validation_stays_green_without_fake_dependencies() {
         let temp = TestRoot::new("validation");
         let registry = ToolRegistry::default();
+        for arguments in [
+            r#"{"command":"cargo clippy --fix --allow-dirty"}"#,
+            r#"{"command":"cargo","args":["clippy","--fix","--allow-dirty"]}"#,
+        ] {
+            let fixing =
+                registry.prepare_invocation(OperatingMode::Auto, temp.path(), "shell", arguments);
+            assert_eq!(
+                fixing.spec.unwrap().effect_class,
+                crate::tools::ToolEffectClass::PotentiallyVolatile,
+                "automatic fixes must remain a serial mutation barrier"
+            );
+        }
         let prepared = registry.prepare_invocation(
             OperatingMode::Auto,
             temp.path(),
             "shell",
-            r#"{"command":"cargo check"}"#,
+            r#"{"command":"cargo","args":["check"]}"#,
         );
         let mut governor = CausalGovernor::default();
         let (pending, _) = governor.observe_before_identified(&prepared, "batch", "validation");
@@ -1232,6 +1367,113 @@ mod tests {
                     ..
                 }
             )));
+    }
+
+    #[test]
+    fn validation_outcomes_require_each_failed_command_to_recover() {
+        let temp = TestRoot::new("validation-outcomes");
+        let registry = ToolRegistry::default();
+        let mut governor = CausalGovernor::default();
+        let observe = |governor: &mut CausalGovernor, command: &str, success: bool| {
+            let prepared = registry.prepare_invocation(
+                OperatingMode::Auto,
+                temp.path(),
+                "shell",
+                &serde_json::json!({"command": command}).to_string(),
+            );
+            let (pending, _) = governor.observe_before_identified(&prepared, "batch", command);
+            let result = ToolResult {
+                name: "shell".into(),
+                output: if success {
+                    "exit 0\n"
+                } else {
+                    "exit 1\nfailed"
+                }
+                .into(),
+                success,
+                artifact: None,
+            };
+            let receipt = ToolExecutionReceipt::unobserved(&prepared, 0, 0, 1);
+            governor.observe_after(pending, &result, &receipt);
+        };
+        assert!(!governor.validations_satisfied());
+        observe(&mut governor, "cargo check", true);
+        assert!(governor.validations_satisfied());
+        observe(&mut governor, "cargo test", false);
+        assert!(!governor.validations_satisfied());
+        observe(&mut governor, "cargo check", true);
+        assert!(
+            !governor.validations_satisfied(),
+            "a different check cannot resolve failure"
+        );
+        governor.forget_compacted_evidence();
+        assert!(
+            !governor.validations_satisfied(),
+            "compaction must retain unresolved validation"
+        );
+        observe(&mut governor, "cargo test", true);
+        assert!(governor.validations_satisfied());
+        observe(&mut governor, "cargo test", false);
+        observe(&mut governor, "cargo test", true);
+        observe(&mut governor, "cargo test", false);
+        assert!(
+            !governor.validations_satisfied(),
+            "previously seen failures still invalidate success"
+        );
+        observe(&mut governor, "cargo test", true);
+        governor.ledger.workspace_revision += 1;
+        assert!(
+            !governor.validations_satisfied(),
+            "green evidence predates the mutation"
+        );
+        observe(&mut governor, "cargo test", true);
+        assert!(governor.validations_satisfied());
+        governor.ledger.uncertainty_epoch += 1;
+        assert!(
+            !governor.validations_satisfied(),
+            "volatile effects invalidate old evidence"
+        );
+    }
+
+    #[test]
+    fn non_validation_commands_cannot_satisfy_task_validation() {
+        let temp = TestRoot::new("help-not-validation");
+        let registry = ToolRegistry::default();
+        for arguments in [
+            serde_json::json!({"command":"cargo test --help"}),
+            serde_json::json!({"command":"cargo test -h"}),
+            serde_json::json!({"command":"cargo fmt --check --help"}),
+            serde_json::json!({"command":"cargo check '-h'"}),
+            serde_json::json!({"command":"cargo", "args":["clippy", "--version"]}),
+            serde_json::json!({"command":"cargo --version"}),
+            serde_json::json!({"command":"rustc --version"}),
+            serde_json::json!({"command":"rustfmt --version"}),
+            serde_json::json!({"command":"git status"}),
+            serde_json::json!({"command":"git diff --check"}),
+        ] {
+            let prepared = registry.prepare_invocation(
+                OperatingMode::Auto,
+                temp.path(),
+                "shell",
+                &arguments.to_string(),
+            );
+            let mut governor = CausalGovernor::default();
+            let (pending, _) = governor.observe_before_identified(&prepared, "batch", "help");
+            governor.observe_after(
+                pending,
+                &ToolResult {
+                    name: "shell".into(),
+                    output: "exit 0\nUsage: cargo ...\n".into(),
+                    success: true,
+                    artifact: None,
+                },
+                &ToolExecutionReceipt::unobserved(&prepared, 0, 0, 1),
+            );
+            assert!(
+                !governor.validations_satisfied(),
+                "command is not validation: {arguments}"
+            );
+        }
     }
 
     #[test]
@@ -1512,20 +1754,41 @@ mod tests {
             "read",
             r#"{"path":"same.txt"}"#,
         );
+        // Path and offset normalize to the same call, so the fingerprint
+        // (and the governor's identity) still matches.
+        let normalized = registry.prepare_invocation(
+            OperatingMode::Auto,
+            temp.path(),
+            "read",
+            r#"{"offset":1,"path":"./same.txt"}"#,
+        );
+        assert_eq!(
+            implicit.canonical_fingerprint,
+            normalized.canonical_fingerprint
+        );
+        // An explicit max_lines is a different call from an omitted one: the
+        // read service only widens the omitted default, so identities differ.
         let explicit = registry.prepare_invocation(
             OperatingMode::Auto,
             temp.path(),
             "read",
-            r#"{"max_lines":80,"offset":1,"path":"./same.txt"}"#,
+            &serde_json::json!({
+                "max_lines": crate::tools::DEFAULT_MAX_READ_LINES,
+                "offset": 1,
+                "path": "./same.txt"
+            })
+            .to_string(),
         );
-        assert_eq!(
+        assert_ne!(
             implicit.canonical_fingerprint,
             explicit.canonical_fingerprint
         );
         let mut governor = CausalGovernor::default();
         let (left, _) = governor.observe_before_identified(&implicit, "b", "1");
-        let (right, _) = governor.observe_before_identified(&explicit, "b", "2");
+        let (right, _) = governor.observe_before_identified(&normalized, "b", "2");
         assert_eq!(left.call_fingerprint(), right.call_fingerprint());
+        let (distinct, _) = governor.observe_before_identified(&explicit, "b", "3");
+        assert_ne!(left.call_fingerprint(), distinct.call_fingerprint());
 
         let optional_code_intel_path = registry.prepare_invocation(
             OperatingMode::Auto,

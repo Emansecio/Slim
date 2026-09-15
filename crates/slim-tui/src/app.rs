@@ -1,5 +1,4 @@
 use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use slim_core::OperatingMode;
@@ -8,7 +7,7 @@ use crate::api::{
     BlockId, ClinePassCatalogSource, CommandCodeCatalogSource, ContentRequestId,
     InteractionRequestId, LoginProvider, ModelAlias, OpenCodeCatalogSource, OpenCodeModelView,
     ReasoningEffort, SensitiveText, SessionId, TranscriptMessage, TranscriptRole, UiCommand,
-    UiEvent,
+    UiEvent, ZenCatalogSource,
 };
 use crate::block::{
     Block, BlockKind, BlockLifecycle, FoldState, InteractionRequestKind, InteractionRequestState,
@@ -42,6 +41,24 @@ fn default_command_code_models() -> Vec<OpenCodeModelView> {
             max_output_tokens: 0,
             reasoning_levels: Vec::new(),
             accepts_images: false,
+        })
+        .collect()
+}
+
+fn default_zen_models() -> Vec<OpenCodeModelView> {
+    slim_core::provider::zen_models()
+        .iter()
+        .map(|m| OpenCodeModelView {
+            id: m.id.to_owned(),
+            name: m.name.to_owned(),
+            context_window_tokens: m.context_window.unwrap_or_default(),
+            max_output_tokens: m.max_output_tokens.unwrap_or_default() as u64,
+            reasoning_levels: m
+                .reasoning_levels
+                .iter()
+                .filter_map(|level| ReasoningEffort::parse(level))
+                .collect(),
+            accepts_images: m.accepts_images,
         })
         .collect()
 }
@@ -216,7 +233,9 @@ impl LoginOverlay {
             1 => LoginProvider::OpenAiCodex,
             2 => LoginProvider::OpenCodeGo,
             3 => LoginProvider::ClinePass,
-            _ => LoginProvider::CommandCode,
+            4 => LoginProvider::CommandCode,
+            5 => LoginProvider::Xai,
+            _ => LoginProvider::OpenCodeZen,
         }
     }
 }
@@ -230,8 +249,17 @@ pub struct ModelOverlay {
     /// Case-insensitive substring filter typed by the user (§15.7-style).
     pub filter: String,
     /// Collapsed state per group: 0 = OpenAI Codex, 1 = OpenCode Go,
-    /// 2 = ClinePass, 3 = Command Code.
-    pub collapsed: [bool; 4],
+    /// 2 = ClinePass, 3 = Command Code, 4 = OpenCode Zen.
+    pub collapsed: [bool; 5],
+}
+
+/// `/mcp` overlay: flat server list with an inline remove confirmation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct McpOverlay {
+    pub selected: usize,
+    pub viewport_start: usize,
+    /// Server name armed for removal; `y`/`Enter` confirms, `n`/`Esc` cancels.
+    pub confirm_remove: Option<String>,
 }
 
 /// A single flattened row in the grouped overlay.
@@ -239,7 +267,7 @@ pub struct ModelOverlay {
 pub enum ModelRow {
     /// Collapsible group header, carrying the group index.
     Header(usize),
-    /// An OpenAI Codex alias (Sol/Terra/Luna).
+    /// An OpenAI Codex alias (Astra/Sol/Terra/Luna).
     Alias(ModelAlias),
     /// An OpenCode Go catalog model, carrying its index into
     /// `AppState::open_code_models`.
@@ -249,6 +277,9 @@ pub enum ModelRow {
     /// A Command Code model, carrying its index into
     /// `AppState::command_code_models`.
     CommandCode(usize),
+    /// An OpenCode Zen free-tier model, carrying its index into
+    /// `AppState::zen_models`.
+    Zen(usize),
 }
 
 impl ModelOverlay {
@@ -258,11 +289,12 @@ impl ModelOverlay {
         opencode_models: &[OpenCodeModelView],
         clinepass_models: &[OpenCodeModelView],
         command_code_models: &[OpenCodeModelView],
+        zen_models: &[OpenCodeModelView],
     ) -> Vec<ModelRow> {
         let query = self.filter.to_lowercase();
         let mut out = Vec::new();
 
-        // Group 0: OpenAI Codex (3 built-in aliases)
+        // Group 0: OpenAI Codex built-in aliases
         let codex_hidden = self.collapsed[0] && query.is_empty();
         out.push(ModelRow::Header(0));
         if !codex_hidden {
@@ -318,12 +350,26 @@ impl ModelOverlay {
             }
         }
 
+        // Group 4: OpenCode Zen free-tier catalog
+        let zen_hidden = self.collapsed[4] && query.is_empty();
+        out.push(ModelRow::Header(4));
+        if !zen_hidden {
+            for (index, model) in zen_models.iter().enumerate() {
+                if query.is_empty()
+                    || model.id.to_lowercase().contains(&query)
+                    || model.name.to_lowercase().contains(&query)
+                {
+                    out.push(ModelRow::Zen(index));
+                }
+            }
+        }
+
         out
     }
 
     /// Toggles the collapsed state of a provider group.
     pub fn toggle_collapsed(&mut self, group: usize) {
-        if group < 4 {
+        if group < 5 {
             self.collapsed[group] = !self.collapsed[group];
         }
     }
@@ -336,6 +382,7 @@ impl ModelOverlay {
         opencode_models: &[OpenCodeModelView],
         clinepass_models: &[OpenCodeModelView],
         command_code_models: &[OpenCodeModelView],
+        zen_models: &[OpenCodeModelView],
     ) -> Self {
         let active_group = if ModelAlias::parse(current_model).is_some() {
             0
@@ -354,20 +401,30 @@ impl ModelOverlay {
             .any(|model| model.id == current_model)
         {
             3
+        } else if zen_models.iter().any(|model| model.id == current_model) {
+            4
         } else {
             active_provider.map_or(0, |provider| match provider {
                 LoginProvider::OpenAiCodex | LoginProvider::Anthropic => 0,
                 LoginProvider::OpenCodeGo => 1,
                 LoginProvider::ClinePass => 2,
                 LoginProvider::CommandCode => 3,
+                LoginProvider::OpenCodeZen => 4,
+                // xAI tem grupo próprio adiado no /models; cai no grupo 0.
+                LoginProvider::Xai => 0,
             })
         };
         let mut overlay = Self {
-            collapsed: [true; 4],
+            collapsed: [true; 5],
             ..Self::default()
         };
         overlay.collapsed[active_group] = false;
-        let rows = overlay.rows(opencode_models, clinepass_models, command_code_models);
+        let rows = overlay.rows(
+            opencode_models,
+            clinepass_models,
+            command_code_models,
+            zen_models,
+        );
         overlay.selected = rows
             .iter()
             .position(|row| match row {
@@ -381,6 +438,7 @@ impl ModelOverlay {
                 ModelRow::CommandCode(idx) => command_code_models
                     .get(*idx)
                     .is_some_and(|m| m.id == current_model),
+                ModelRow::Zen(idx) => zen_models.get(*idx).is_some_and(|m| m.id == current_model),
                 _ => false,
             })
             .unwrap_or_else(|| {
@@ -404,6 +462,7 @@ pub struct SlashSuggestions {
 pub struct EffortOverlay {
     pub model: ModelAlias,
     pub selected: usize,
+    pub fast: bool,
 }
 
 impl EffortOverlay {
@@ -422,6 +481,7 @@ pub struct AppState {
     pub mode: OperatingMode,
     pub model: String,
     pub effort: ReasoningEffort,
+    pub codex_fast: bool,
     pub auth_provider: Option<LoginProvider>,
     pub authenticated: bool,
     pub login_overlay: Option<LoginOverlay>,
@@ -429,10 +489,22 @@ pub struct AppState {
     pub open_code_models: Vec<OpenCodeModelView>,
     pub cline_pass_models: Vec<OpenCodeModelView>,
     pub command_code_models: Vec<OpenCodeModelView>,
+    pub zen_models: Vec<OpenCodeModelView>,
     pub open_code_catalog_source: Option<OpenCodeCatalogSource>,
     pub cline_pass_catalog_source: Option<ClinePassCatalogSource>,
     pub command_code_catalog_source: Option<CommandCodeCatalogSource>,
+    pub zen_catalog_source: Option<ZenCatalogSource>,
+    /// Bumped whenever a model catalog Vec is replaced; render memos key on it
+    /// because catalog swaps can otherwise reuse a stale row list.
+    pub catalog_revision: u64,
     skill_names: Vec<String>,
+    /// Bumped whenever `skill_names` is replaced so render memos can key on
+    /// the skill list without re-scanning it.
+    skills_revision: u64,
+    pub mcp_overlay: Option<McpOverlay>,
+    pub mcp_servers: Vec<crate::api::McpServerView>,
+    /// Bumped on every `McpServersChanged` so render memos key on it.
+    pub mcp_revision: u64,
     pub effort_overlay: Option<EffortOverlay>,
     /// Command palette query while open (None = closed).
     pub palette_query: Option<String>,
@@ -467,6 +539,7 @@ pub struct AppState {
     request_estimate_open: bool,
     pub working: bool,
     active_run_id: Option<u64>,
+    latest_run_assistant: Option<BlockId>,
     terminal_tail: Option<TerminalTail>,
     thinking_open: bool,
     snapshot_resync_needed: bool,
@@ -491,6 +564,12 @@ pub struct AppState {
     next_content_request_id: u64,
     pub shutdown: bool,
     pub revisions: RevisionSet,
+    /// Completed request throughput in tenths of tok/s, timed by the runtime.
+    pub last_tok_per_sec: Option<u64>,
+    pub last_tok_per_sec_estimated: bool,
+    pub selection: Option<crate::selection::ScreenSelection>,
+    pub selection_area: Option<ratatui::layout::Rect>,
+    pub selection_text: String,
 }
 
 impl Default for AppState {
@@ -501,6 +580,7 @@ impl Default for AppState {
             mode: OperatingMode::Auto,
             model: ModelAlias::Sol.id().into(),
             effort: ReasoningEffort::High,
+            codex_fast: false,
             auth_provider: None,
             authenticated: false,
             login_overlay: None,
@@ -508,10 +588,17 @@ impl Default for AppState {
             open_code_models: Vec::new(),
             cline_pass_models: default_clinepass_models(),
             command_code_models: default_command_code_models(),
+            zen_models: default_zen_models(),
             open_code_catalog_source: None,
             cline_pass_catalog_source: None,
             command_code_catalog_source: None,
+            zen_catalog_source: None,
+            catalog_revision: 0,
             skill_names: Vec::new(),
+            skills_revision: 0,
+            mcp_overlay: None,
+            mcp_servers: Vec::new(),
+            mcp_revision: 0,
             effort_overlay: None,
             palette_query: None,
             palette_selected: 0,
@@ -544,6 +631,7 @@ impl Default for AppState {
             working: false,
             queued_prompts: VecDeque::new(),
             active_run_id: None,
+            latest_run_assistant: None,
             terminal_tail: None,
             thinking_open: false,
             snapshot_resync_needed: false,
@@ -565,30 +653,13 @@ impl Default for AppState {
             next_content_request_id: 1,
             shutdown: false,
             revisions: RevisionSet::default(),
+            last_tok_per_sec: None,
+            last_tok_per_sec_estimated: false,
+            selection: None,
+            selection_area: None,
+            selection_text: String::new(),
         }
     }
-}
-
-fn workspace_path_from_display(cwd: &str) -> Option<PathBuf> {
-    if cwd.is_empty() {
-        return None;
-    }
-    let Some(relative) = cwd.strip_prefix('~') else {
-        return Some(PathBuf::from(cwd));
-    };
-    if !relative.is_empty() && !relative.starts_with(['/', '\\']) {
-        return Some(PathBuf::from(cwd));
-    }
-    let profile = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-    Some(PathBuf::from(profile).join(relative.trim_start_matches(['/', '\\'])))
-}
-
-fn valid_slash_skill_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 128
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 impl AppState {
@@ -600,33 +671,36 @@ impl AppState {
         &self.skill_names
     }
 
+    /// Monotonic counter bumped on every `skill_names` replacement; slash
+    /// suggestion memos key on it instead of scanning the list per frame.
+    pub(crate) fn skills_revision(&self) -> u64 {
+        self.skills_revision
+    }
+
     #[cfg(test)]
     pub(crate) fn set_skill_names_for_test(&mut self, names: Vec<String>) {
         self.skill_names = names;
+        self.skills_revision = self.skills_revision.wrapping_add(1);
     }
 
-    fn set_workspace(&mut self, cwd: String) {
+    /// Workspace plus its already-discovered skill names (discovery runs off
+    /// the UI thread, at the event producer).
+    fn set_workspace(&mut self, cwd: String, skill_names: Vec<String>) {
         self.cwd = cwd;
-        self.skill_names = workspace_path_from_display(&self.cwd)
-            .filter(|path| path.is_dir())
-            .and_then(|path| slim_core::skills::discover_workspace(&path).ok())
-            .map(|discovery| {
-                discovery
-                    .active_entries()
-                    .iter()
-                    .filter(|entry| valid_slash_skill_name(&entry.name))
-                    .map(|entry| entry.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
+        if self.skill_names != skill_names {
+            self.skill_names = skill_names;
+            self.skills_revision = self.skills_revision.wrapping_add(1);
+        }
     }
 
-    pub fn apply_snapshot(&mut self, session_id: SessionId, cwd: String) {
+    pub fn apply_snapshot(&mut self, session_id: SessionId, cwd: String, skill_names: Vec<String>) {
         self.session_id = Some(session_id);
-        self.set_workspace(cwd);
+        self.set_workspace(cwd, skill_names);
         self.thinking_open = false;
         self.snapshot_resync_needed = false;
         self.scroll = ScrollState::default();
+        self.last_tok_per_sec = None;
+        self.last_tok_per_sec_estimated = false;
         self.revisions.status += 1;
         self.revisions.viewport += 1;
     }
@@ -636,9 +710,10 @@ impl AppState {
         session_id: SessionId,
         cwd: String,
         messages: Vec<TranscriptMessage>,
+        skill_names: Vec<String>,
     ) {
         self.session_id = Some(session_id);
-        self.set_workspace(cwd);
+        self.set_workspace(cwd, skill_names);
         self.blocks.clear();
         self.block_ids.clear();
         self.queued_prompts.clear();
@@ -649,6 +724,7 @@ impl AppState {
         self.slash_suggestions = None;
         self.working = false;
         self.active_run_id = None;
+        self.latest_run_assistant = None;
         self.terminal_tail = None;
         self.thinking_open = false;
         self.snapshot_resync_needed = false;
@@ -671,6 +747,8 @@ impl AppState {
         self.request_usage_overflowed = false;
         self.request_estimate_open = false;
         self.provider_timings = ProviderTimingState::default();
+        self.last_tok_per_sec = None;
+        self.last_tok_per_sec_estimated = false;
         self.turns_used = 0;
         self.turn_budget_warned = false;
         self.reset_this_turn_tool_budget();
@@ -681,6 +759,7 @@ impl AppState {
             let id = self.fresh_id(match message.role {
                 TranscriptRole::User => "user",
                 TranscriptRole::Assistant => "assistant",
+                TranscriptRole::Tool { .. } => "tool",
             });
             let mut block = match message.role {
                 TranscriptRole::User => {
@@ -697,8 +776,32 @@ impl AppState {
                     BlockKind::Assistant(message.text),
                     BlockLifecycle::Complete,
                 ),
+                TranscriptRole::Tool {
+                    batch_id,
+                    call_id,
+                    name,
+                    arguments,
+                } => Block::new(
+                    id,
+                    BlockKind::Tool(ToolState {
+                        historical: true,
+                        batch_id,
+                        call_id,
+                        name,
+                        materialized_output: format!(
+                            "Arguments:\n{arguments}\n\nResult (saved):\n{}",
+                            message.text
+                        ),
+                        ..ToolState::default()
+                    }),
+                    BlockLifecycle::Complete,
+                ),
             };
-            block.fold = FoldState::Auto;
+            block.fold = if matches!(block.kind(), BlockKind::Tool(_)) {
+                FoldState::Collapsed
+            } else {
+                FoldState::Auto
+            };
             self.blocks.push(block);
         }
         self.revisions.content += 1;
@@ -882,6 +985,25 @@ impl AppState {
             self.revisions.content += 1;
         }
         changed
+    }
+
+    pub(crate) fn record_question_answer(
+        &mut self,
+        request_id: &InteractionRequestId,
+        answer: String,
+    ) {
+        let changed = self
+            .blocks
+            .iter_mut()
+            .rev()
+            .find(|block| {
+                matches!(block.kind(), BlockKind::InteractionRequest(state)
+                if &state.request_id == request_id)
+            })
+            .is_some_and(|block| block.record_question_answer(answer));
+        if changed {
+            self.revisions.content += 1;
+        }
     }
 
     /// The foldable block addressed by the stable scroll anchor. Live edge
@@ -1220,6 +1342,9 @@ impl AppState {
             self.context_tokens = context_tokens;
             self.request_context_base_tokens = context_tokens;
             self.request_estimate_open = true;
+            self.last_tok_per_sec = None;
+            self.last_tok_per_sec_estimated = false;
+            self.provider_timings.first_semantic_ms = None;
             if run_id.is_some() {
                 self.turns_used = self.turns_used.saturating_add(1);
                 self.reset_this_turn_tool_budget();
@@ -1316,7 +1441,42 @@ impl AppState {
         }
     }
 
+    fn recalculate_tok_per_sec(&mut self, provider_latency_ms: u64) {
+        self.last_tok_per_sec = None;
+        self.last_tok_per_sec_estimated = false;
+        self.revisions.status += 1;
+        let Some(ms) = self
+            .provider_timings
+            .first_semantic_ms
+            .and_then(|start| provider_latency_ms.checked_sub(start))
+            .filter(|ms| *ms > 0)
+        else {
+            return;
+        };
+        if self.request_usage_overflowed {
+            return;
+        }
+        let estimated = !self.request_usage_finalized;
+        let output_tokens = self
+            .request_usage
+            .filter(|_| !estimated)
+            .map(|(_, out)| out)
+            .unwrap_or_else(|| {
+                slim_core::context::estimate_text_tokens_from_chars(self.stream_output_chars)
+            });
+        if output_tokens > 0 {
+            let tenths = (u128::from(output_tokens) * 10_000 / u128::from(ms))
+                .min(u128::from(u64::MAX)) as u64;
+            self.last_tok_per_sec = Some(tenths);
+            self.last_tok_per_sec_estimated = estimated;
+        }
+    }
+
     fn terminalize_streaming(&mut self, lifecycle: BlockLifecycle) {
+        // Lifecycle changes are content changes for the height/selection memos;
+        // callers bump too, but the invariant lives here so a future caller
+        // cannot forget it.
+        self.revisions.content += 1;
         for block in &mut self.blocks {
             if block.lifecycle == BlockLifecycle::Streaming
                 && matches!(
@@ -1330,8 +1490,12 @@ impl AppState {
     }
 
     fn terminalize_latest_assistant(&mut self, lifecycle: BlockLifecycle) {
-        if let Some(block) = self.blocks.iter_mut().rev().find(|block| {
-            matches!(block.kind(), BlockKind::Assistant(_))
+        let Some(id) = self.latest_run_assistant.take() else {
+            return;
+        };
+        self.revisions.content += 1;
+        if let Some(block) = self.blocks.iter_mut().find(|block| {
+            block.id == id
                 && matches!(
                     block.lifecycle,
                     BlockLifecycle::Streaming | BlockLifecycle::Complete
@@ -1372,14 +1536,19 @@ impl AppState {
 
     pub fn apply_event(&mut self, event: UiEvent) {
         match event {
-            UiEvent::SessionSnapshot { session_id, cwd } => self.apply_snapshot(session_id, cwd),
+            UiEvent::SessionSnapshot {
+                session_id,
+                cwd,
+                skill_names,
+            } => self.apply_snapshot(session_id, cwd, skill_names),
             UiEvent::SessionRestored {
                 session_id,
                 cwd,
                 messages,
-            } => self.restore_session(session_id, cwd, messages),
-            UiEvent::WorkspaceChanged { cwd } => {
-                self.set_workspace(cwd);
+                skill_names,
+            } => self.restore_session(session_id, cwd, messages, skill_names),
+            UiEvent::WorkspaceChanged { cwd, skill_names } => {
+                self.set_workspace(cwd, skill_names);
                 self.revisions.status += 1;
             }
             UiEvent::AttachmentsChanged { labels } => {
@@ -1406,9 +1575,12 @@ impl AppState {
                     self.terminal_tail = None;
                     self.thinking_open = false;
                     self.active_run_id = Some(run_id);
+                    self.latest_run_assistant = None;
                     self.working = true;
                     self.run_started_ms = Some(self.clock.elapsed_ms);
                     self.activity = None;
+                    self.last_tok_per_sec = None;
+                    self.last_tok_per_sec_estimated = false;
                     self.max_mutating_tool_calls = max_mutating_tool_calls;
                     self.max_read_tool_calls = max_read_tool_calls;
                     self.max_turns = max_turns;
@@ -1447,7 +1619,30 @@ impl AppState {
             UiEvent::RunCompleted { run_id } => {
                 if self.accept_terminal(run_id, BlockLifecycle::Complete) {
                     self.terminalize_streaming(BlockLifecycle::Complete);
+                    self.latest_run_assistant = None;
                     self.close_request_usage(true);
+                    let pending = self
+                        .todo_items
+                        .iter()
+                        .filter(|item| {
+                            !matches!(
+                                item.status,
+                                crate::api::TodoItemStatus::Completed
+                                    | crate::api::TodoItemStatus::Cancelled
+                            )
+                        })
+                        .count();
+                    if pending > 0 {
+                        let id = self.fresh_id("pending-tasks");
+                        self.blocks.push(Block::new(
+                            id,
+                            BlockKind::System(format!(
+                                "Run ended; {pending} recorded task(s) remain pending."
+                            )),
+                            BlockLifecycle::Complete,
+                        ));
+                        self.note_new_content();
+                    }
                     self.working = false;
                     self.thinking_open = false;
                     self.run_started_ms = None;
@@ -1467,19 +1662,12 @@ impl AppState {
                     self.run_started_ms = None;
                     self.activity = None;
                     self.request_estimate_open = false;
-                    if message.starts_with("Tool budget exhausted")
-                        || message.starts_with("Turn limit reached")
-                        || message.starts_with("Durable resume cannot execute tools")
-                    {
-                        let id = self.fresh_id("limit");
-                        let mut block =
-                            Block::new(id, BlockKind::System(message), BlockLifecycle::Complete);
-                        block.fold = FoldState::Collapsed;
-                        self.blocks.push(block);
-                        self.note_new_content();
-                    } else {
-                        self.push_notification(message);
-                    }
+                    let id = self.fresh_id("stop");
+                    let mut block =
+                        Block::new(id, BlockKind::System(message), BlockLifecycle::Complete);
+                    block.fold = FoldState::Collapsed;
+                    self.blocks.push(block);
+                    self.note_new_content();
                     self.turns_used = 0;
                     self.turn_budget_warned = false;
                     self.reset_this_turn_tool_budget();
@@ -1586,6 +1774,7 @@ impl AppState {
                     self.blocks
                         .push(Block::new(id, BlockKind::Assistant(text), lifecycle));
                 }
+                self.latest_run_assistant = self.blocks.last().map(|block| block.id.clone());
                 self.note_new_content();
                 self.revisions.content += 1;
             }
@@ -1717,6 +1906,9 @@ impl AppState {
                 input_tokens,
                 output_tokens,
             } => self.note_request_usage(input_tokens, output_tokens, true),
+            UiEvent::RequestCompleted {
+                provider_latency_ms,
+            } => self.recalculate_tok_per_sec(provider_latency_ms),
             UiEvent::ModeChanged { mode } => {
                 self.mode = mode;
                 self.revisions.status += 1;
@@ -1729,6 +1921,7 @@ impl AppState {
             UiEvent::OpenCodeCatalogLoaded { models, source } => {
                 self.open_code_models = models;
                 self.open_code_catalog_source = Some(source);
+                self.catalog_revision += 1;
                 // When the unified overlay is open, rebuild its layout so the
                 // catalog items appear as soon as they arrive.
                 if let Some(overlay) = self.model_overlay.as_mut() {
@@ -1736,6 +1929,7 @@ impl AppState {
                         &self.open_code_models,
                         &self.cline_pass_models,
                         &self.command_code_models,
+                        &self.zen_models,
                     );
                     overlay.selected = overlay.selected.min(rows.len().saturating_sub(1));
                 }
@@ -1744,11 +1938,13 @@ impl AppState {
             UiEvent::ClinePassCatalogLoaded { models, source } => {
                 self.cline_pass_models = models;
                 self.cline_pass_catalog_source = Some(source);
+                self.catalog_revision += 1;
                 if let Some(overlay) = self.model_overlay.as_mut() {
                     let rows = overlay.rows(
                         &self.open_code_models,
                         &self.cline_pass_models,
                         &self.command_code_models,
+                        &self.zen_models,
                     );
                     overlay.selected = overlay.selected.min(rows.len().saturating_sub(1));
                 }
@@ -1757,14 +1953,66 @@ impl AppState {
             UiEvent::CommandCodeCatalogLoaded { models, source } => {
                 self.command_code_models = models;
                 self.command_code_catalog_source = Some(source);
+                self.catalog_revision += 1;
                 if let Some(overlay) = self.model_overlay.as_mut() {
                     let rows = overlay.rows(
                         &self.open_code_models,
                         &self.cline_pass_models,
                         &self.command_code_models,
+                        &self.zen_models,
                     );
                     overlay.selected = overlay.selected.min(rows.len().saturating_sub(1));
                 }
+                self.revisions.status += 1;
+            }
+            UiEvent::ZenCatalogLoaded { models, source } => {
+                self.zen_models = models;
+                self.zen_catalog_source = Some(source);
+                self.catalog_revision += 1;
+                if let Some(overlay) = self.model_overlay.as_mut() {
+                    let rows = overlay.rows(
+                        &self.open_code_models,
+                        &self.cline_pass_models,
+                        &self.command_code_models,
+                        &self.zen_models,
+                    );
+                    overlay.selected = overlay.selected.min(rows.len().saturating_sub(1));
+                }
+                self.revisions.status += 1;
+            }
+            UiEvent::McpServersChanged { servers } => {
+                // Snapshots can reorder or drop entries (a server removed via
+                // config or /mcp remove): keep the cursor on the same server
+                // by name, not on the same numeric index.
+                let selected_name = self.mcp_overlay.as_ref().and_then(|overlay| {
+                    self.mcp_servers
+                        .get(overlay.selected)
+                        .map(|server| server.name.clone())
+                });
+                self.mcp_servers = servers;
+                self.mcp_revision += 1;
+                if let Some(overlay) = self.mcp_overlay.as_mut() {
+                    overlay.selected = selected_name
+                        .and_then(|name| {
+                            self.mcp_servers
+                                .iter()
+                                .position(|server| server.name == name)
+                        })
+                        .unwrap_or_else(|| {
+                            overlay
+                                .selected
+                                .min(self.mcp_servers.len().saturating_sub(1))
+                        });
+                    if let Some(name) = overlay.confirm_remove.as_ref() {
+                        if !self.mcp_servers.iter().any(|server| &server.name == name) {
+                            overlay.confirm_remove = None;
+                        }
+                    }
+                }
+                self.revisions.status += 1;
+            }
+            UiEvent::CodexSpeedChanged { fast } => {
+                self.codex_fast = fast;
                 self.revisions.status += 1;
             }
             UiEvent::EffortChanged { effort } => {
@@ -1836,6 +2084,7 @@ impl AppState {
                 self.blocks.push(Block::new(
                     id,
                     BlockKind::Tool(ToolState {
+                        historical: false,
                         batch_id,
                         call_id,
                         name,
@@ -1865,7 +2114,13 @@ impl AppState {
                 }) {
                     block.set_tool_preview(preview);
                     if let Some(state) = block.tool_state_mut() {
-                        state.content_handle = content_handle;
+                        // Process summaries are projected through the same
+                        // progress lane after ToolOutput. A missing handle
+                        // means "leave the existing inspector attachment";
+                        // only a newly supplied handle replaces it.
+                        if content_handle.is_some() {
+                            state.content_handle = content_handle;
+                        }
                     }
                     true
                 } else {
@@ -1984,6 +2239,7 @@ impl AppState {
                 acknowledgement: None,
                 selected_question_option: 0,
                 custom_question_answer: false,
+                answered: None,
             }),
             UiEvent::InputRequired {
                 request_id,
@@ -1998,6 +2254,7 @@ impl AppState {
                 acknowledgement: None,
                 selected_question_option: 0,
                 custom_question_answer: false,
+                answered: None,
             }),
             UiEvent::QuestionRequired {
                 request_id,
@@ -2012,6 +2269,7 @@ impl AppState {
                 acknowledgement: None,
                 selected_question_option: 0,
                 custom_question_answer: false,
+                answered: None,
             }),
             UiEvent::InteractionAcknowledged {
                 request_id,
@@ -2030,7 +2288,13 @@ impl AppState {
             }
             UiEvent::TodoChanged { items } => {
                 self.todo_items = items;
-                self.todo_dock_open = !self.todo_items.is_empty();
+                self.todo_dock_open = self.todo_items.iter().any(|item| {
+                    !matches!(
+                        item.status,
+                        crate::api::TodoItemStatus::Completed
+                            | crate::api::TodoItemStatus::Cancelled
+                    )
+                });
                 self.revisions.status += 1;
             }
             UiEvent::ContentPageLoaded {

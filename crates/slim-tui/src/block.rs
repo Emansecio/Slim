@@ -1,5 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
 use super::api::{
     BlockId, ContentHandle, ContentRequestId, InteractionRequestId, PageCursor, ToolBatchId,
     ToolCallId,
@@ -13,6 +16,7 @@ fn fresh_cache_identity() -> u64 {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ToolState {
+    pub historical: bool,
     pub batch_id: ToolBatchId,
     pub call_id: ToolCallId,
     pub name: String,
@@ -61,6 +65,7 @@ pub struct InteractionRequestState {
     pub acknowledgement: Option<InteractionAcknowledgement>,
     pub selected_question_option: usize,
     pub custom_question_answer: bool,
+    pub answered: Option<String>,
 }
 
 impl InteractionRequestState {
@@ -71,52 +76,8 @@ impl InteractionRequestState {
     }
 
     pub fn display_text(&self) -> String {
-        if let InteractionRequestKind::Question { question, options } = &self.kind {
-            let mut lines = vec![question.clone()];
-            if options.is_empty() {
-                lines.push("Type your answer and press Enter".into());
-            } else {
-                for (index, option) in options.iter().enumerate() {
-                    let marker = if self.selected_question_option == index {
-                        ">"
-                    } else {
-                        " "
-                    };
-                    let description = if option.description.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" — {}", option.description)
-                    };
-                    lines.push(format!(
-                        "{marker} {}. {}{description}",
-                        index + 1,
-                        option.label
-                    ));
-                }
-                let marker = if self.selected_question_option == options.len() {
-                    ">"
-                } else {
-                    " "
-                };
-                lines.push(format!("{marker} Outro..."));
-                if self.custom_question_answer {
-                    lines.push("Type your answer and press Enter".into());
-                }
-            }
-            if self.response_pending {
-                lines.push("Response sent · awaiting acknowledgement".into());
-            } else if let Some(acknowledgement) = &self.acknowledgement {
-                lines.push(if acknowledgement.message.is_empty() {
-                    if acknowledgement.accepted {
-                        "Accepted".into()
-                    } else {
-                        "Rejected".into()
-                    }
-                } else {
-                    acknowledgement.message.clone()
-                });
-            }
-            return lines.join("\n");
+        if matches!(self.kind, InteractionRequestKind::Question { .. }) {
+            return self.layout_lines(80).join("\n");
         }
         let (request, hint) = match &self.kind {
             InteractionRequestKind::Input { prompt, options } => {
@@ -151,6 +112,147 @@ impl InteractionRequestState {
         };
         format!("{request}\n{hint}\n{persistence} · {status}")
     }
+
+    pub fn layout_lines(&self, width: usize) -> Vec<String> {
+        let InteractionRequestKind::Question { question, options } = &self.kind else {
+            return self.display_text().lines().map(str::to_owned).collect();
+        };
+        let width = width.max(8);
+        let mut lines = wrap_hanging("? ", question, width);
+        let collapsed = self.acknowledgement.is_some();
+        if collapsed {
+            let answer = self
+                .answered
+                .as_deref()
+                .or_else(|| {
+                    self.acknowledgement
+                        .as_ref()
+                        .map(|acknowledgement| acknowledgement.message.as_str())
+                        .filter(|message| !message.is_empty())
+                })
+                .unwrap_or(
+                    if self
+                        .acknowledgement
+                        .as_ref()
+                        .is_some_and(|ack| ack.accepted)
+                    {
+                        "accepted"
+                    } else {
+                        "rejected"
+                    },
+                );
+            lines.extend(wrap_hanging("  · ", answer, width));
+            return lines;
+        }
+        if !options.is_empty() {
+            lines.push(String::new());
+            for (index, option) in options.iter().enumerate() {
+                let selected =
+                    !self.custom_question_answer && self.selected_question_option == index;
+                let prefix = question_option_marker(selected).to_owned();
+                lines.extend(wrap_hanging(&prefix, &option.label, width));
+                if !option.description.is_empty() {
+                    let hang = " ".repeat(UnicodeWidthStr::width(prefix.as_str()).min(width));
+                    lines.extend(wrap_hanging(&hang, &option.description, width));
+                }
+            }
+            let other_selected =
+                !self.custom_question_answer && self.selected_question_option == options.len();
+            lines.push(format!(
+                "{}Outro...",
+                question_option_marker(other_selected)
+            ));
+        }
+        if self.response_pending {
+            lines.extend(wrap_hanging("  · ", "sent", width));
+        } else if self.custom_question_answer {
+            lines.extend(wrap_hanging("  · ", "type answer below", width));
+        }
+        lines
+    }
+}
+
+pub(crate) fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used = 0usize;
+    for word in text.split_whitespace() {
+        let word_width = UnicodeWidthStr::width(word);
+        if word_width > width {
+            if used > 0 {
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            rows.extend(hard_wrap_token(word, width));
+            continue;
+        }
+        if used == 0 {
+            row.push_str(word);
+            used = word_width;
+            continue;
+        }
+        if used.saturating_add(1).saturating_add(word_width) <= width {
+            row.push(' ');
+            row.push_str(word);
+            used = used.saturating_add(1).saturating_add(word_width);
+        } else {
+            rows.push(std::mem::take(&mut row));
+            row.push_str(word);
+            used = word_width;
+        }
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
+}
+
+fn hard_wrap_token(token: &str, width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used = 0usize;
+    for grapheme in token.graphemes(true) {
+        let cells = UnicodeWidthStr::width(grapheme).max(1);
+        if used.saturating_add(cells) > width && used > 0 {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+        row.push_str(grapheme);
+        used = used.saturating_add(cells);
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+pub(crate) fn question_option_marker(selected: bool) -> &'static str {
+    if selected {
+        "[x] "
+    } else {
+        "[ ] "
+    }
+}
+
+fn wrap_hanging(prefix: &str, body: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let hang_width = UnicodeWidthStr::width(prefix).min(width.saturating_sub(1));
+    let hang = " ".repeat(hang_width);
+    wrap_words(body, width.saturating_sub(hang_width).max(1))
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            if index == 0 {
+                format!("{prefix}{line}")
+            } else {
+                format!("{hang}{line}")
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -183,7 +285,8 @@ pub enum FoldState {
 }
 
 pub fn is_complete_tool(block: &Block) -> bool {
-    block.lifecycle == BlockLifecycle::Complete && matches!(block.kind(), BlockKind::Tool(_))
+    block.lifecycle == BlockLifecycle::Complete
+        && matches!(block.kind(), BlockKind::Tool(tool) if !tool.historical)
 }
 
 pub fn is_collapsed_complete_thinking(block: &Block) -> bool {
@@ -416,6 +519,18 @@ impl Block {
         true
     }
 
+    pub(crate) fn record_question_answer(&mut self, answer: String) -> bool {
+        let Some(state) = self.interaction_state_mut() else {
+            return false;
+        };
+        if !matches!(state.kind, InteractionRequestKind::Question { .. }) {
+            return false;
+        }
+        state.answered = Some(answer);
+        self.touch_content();
+        true
+    }
+
     pub(crate) fn acknowledge_interaction(&mut self, accepted: bool, message: String) -> bool {
         let Some(state) = self.interaction_state_mut() else {
             return false;
@@ -436,6 +551,27 @@ impl Block {
 
     pub fn content_generation(&self) -> u64 {
         self.content_generation
+    }
+
+    /// Compact key for caches: `lifecycle` is assigned directly (bypassing
+    /// `touch_content`), so presentation caches must key on it separately.
+    pub(crate) fn lifecycle_tag(&self) -> u8 {
+        match self.lifecycle {
+            BlockLifecycle::Pending => 0,
+            BlockLifecycle::Streaming => 1,
+            BlockLifecycle::Complete => 2,
+            BlockLifecycle::Failed => 3,
+            BlockLifecycle::Cancelled => 4,
+        }
+    }
+
+    /// Compact key for caches: `fold` is likewise assigned directly.
+    pub(crate) fn fold_tag(&self) -> u8 {
+        match self.fold {
+            FoldState::Auto => 0,
+            FoldState::Collapsed => 1,
+            FoldState::Expanded => 2,
+        }
     }
 
     pub(crate) fn turn_boundary_before(&self) -> bool {
@@ -490,5 +626,73 @@ impl Block {
 
     fn touch_content(&mut self) {
         self.content_generation = self.content_generation.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{wrap_words, InteractionRequestKind, InteractionRequestState};
+    use crate::api::InteractionRequestId;
+
+    fn question_state(
+        question: &str,
+        options: Vec<slim_core::QuestionOption>,
+    ) -> InteractionRequestState {
+        InteractionRequestState {
+            request_id: InteractionRequestId("q".into()),
+            kind: InteractionRequestKind::Question {
+                question: question.into(),
+                options,
+            },
+            persisted: false,
+            response_pending: false,
+            acknowledgement: None,
+            selected_question_option: 0,
+            custom_question_answer: false,
+            answered: None,
+        }
+    }
+
+    #[test]
+    fn wrap_words_breaks_on_word_boundaries() {
+        let rows = wrap_words("Quer que eu execute o download completo agora?", 24);
+        assert!(rows.iter().any(|row| row.contains("download")), "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|row| !row.trim_end().ends_with("downlo") && !row.starts_with("ad ")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn question_layout_keeps_description_under_the_label() {
+        let state = question_state(
+            "Which crate should change?",
+            vec![
+                slim_core::QuestionOption {
+                    label: "core".into(),
+                    description: "Runtime and protocol".into(),
+                },
+                slim_core::QuestionOption {
+                    label: "tui".into(),
+                    description: "Interface only".into(),
+                },
+            ],
+        );
+        let lines = state.layout_lines(36);
+        let joined = lines.join("\n");
+        assert!(joined.contains("? Which crate should change?"), "{joined}");
+        assert!(joined.contains("[x] core"), "{joined}");
+        assert!(joined.contains("Runtime and protocol"), "{joined}");
+        let core = lines
+            .iter()
+            .position(|line| line.contains("[x] core"))
+            .unwrap();
+        assert!(
+            !lines[core].contains("Runtime"),
+            "description must not crowd the label: {}",
+            lines[core]
+        );
+        assert!(lines[core + 1].contains("Runtime and protocol"), "{joined}");
     }
 }

@@ -16,6 +16,8 @@ pub struct ProviderResponse {
     pub content: String,
     pub usage: Option<DurableUsage>,
     pub outcome: DurableOutcome,
+    pub transcript: Vec<crate::provider::ProviderMessage>,
+    pub task_facts: Vec<super::schema_v2::DurableFact>,
 }
 
 impl ProviderResponse {
@@ -24,6 +26,8 @@ impl ProviderResponse {
             content: content.into(),
             usage,
             outcome: DurableOutcome::Success,
+            transcript: Vec::new(),
+            task_facts: Vec::new(),
         }
     }
 
@@ -36,6 +40,8 @@ impl ProviderResponse {
             content: content.into(),
             usage,
             outcome,
+            transcript: Vec::new(),
+            task_facts: Vec::new(),
         }
     }
 }
@@ -70,6 +76,7 @@ pub struct ManualRunSpec {
     pub parent_entry_id: Option<String>,
     pub input: String,
     pub first_seq: u64,
+    pub input_content_blocks: Vec<crate::provider::ProviderContentBlock>,
 }
 
 impl ManualRunSpec {
@@ -89,6 +96,7 @@ impl ManualRunSpec {
             parent_entry_id: None,
             input: input.into(),
             first_seq,
+            input_content_blocks: Vec::new(),
         }
     }
 
@@ -199,7 +207,7 @@ where
     }
 }
 
-fn persist_manual_prefix<R, E>(
+pub(super) fn persist_manual_prefix<R, E>(
     repo: &mut R,
     spec: &ManualRunSpec,
 ) -> Result<u64, ManualDriveError<E>>
@@ -218,6 +226,8 @@ where
             parent_entry_id: spec.parent_entry_id.clone(),
             operation_id: spec.operation_id.clone(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            content_blocks: spec.input_content_blocks.clone(),
         },
     });
     seq = next_seq(seq)?;
@@ -246,7 +256,7 @@ where
     Ok(seq)
 }
 
-fn persist_manual_failure<R, E>(
+pub(super) fn persist_manual_failure<R, E>(
     repo: &mut R,
     spec: &ManualRunSpec,
     seq: u64,
@@ -273,30 +283,68 @@ fn persist_manual_success<R, E>(
     repo: &mut R,
     spec: ManualRunSpec,
     mut seq: u64,
-    response: ProviderResponse,
+    mut response: ProviderResponse,
 ) -> Result<(), ManualDriveError<E>>
 where
     R: DurableRepo,
 {
-    seq = next_seq(seq)?;
     let mut suffix = Vec::with_capacity(if response.usage.is_some() { 4 } else { 3 });
-    suffix.push(DurableRecord::Entry {
-        seq,
-        entry: DurableEntry {
-            entry_id: spec.assistant_entry_id.clone(),
-            role: DurableEntryRole::Assistant,
-            content: response.content,
-            parent_entry_id: Some(spec.input_entry_id.clone()),
-            operation_id: spec.operation_id.clone(),
-            tool_call_id: None,
-        },
-    });
+    let transcript = if response.transcript.is_empty() {
+        vec![crate::provider::ProviderMessage::assistant(
+            std::mem::take(&mut response.content),
+            Vec::new(),
+        )]
+    } else {
+        std::mem::take(&mut response.transcript)
+    };
+    let mut parent = Some(spec.input_entry_id.clone());
+    let last_index = transcript.len() - 1;
+    let mut entries = Vec::with_capacity(transcript.len());
+    for (index, message) in transcript.into_iter().enumerate() {
+        let id = if index == last_index {
+            spec.assistant_entry_id.clone()
+        } else {
+            format!("{}-message-{index}", spec.operation_id)
+        };
+        let entry = DurableEntry::from_provider_message(
+            id.clone(),
+            parent,
+            spec.operation_id.clone(),
+            message,
+        )
+        .map_err(ManualDriveError::InvalidInput)?;
+        entries.push(entry);
+        parent = Some(id);
+    }
+    super::provider_messages_from_entries(&entries).map_err(ManualDriveError::InvalidInput)?;
+    for entry in entries {
+        seq = next_seq(seq)?;
+        suffix.push(DurableRecord::Entry { seq, entry });
+    }
 
+    persist_manual_terminal(repo, spec, seq, suffix, response)
+}
+
+pub(super) fn persist_manual_terminal<R: DurableRepo, E>(
+    repo: &mut R,
+    spec: ManualRunSpec,
+    mut seq: u64,
+    mut suffix: Vec<DurableRecord>,
+    response: ProviderResponse,
+) -> Result<(), ManualDriveError<E>> {
     if let Some(mut usage) = response.usage {
         usage.operation_id.clone_from(&spec.operation_id);
         usage.attempt_id.clone_from(&spec.attempt_id);
         seq = next_seq(seq)?;
         suffix.push(DurableRecord::Usage { seq, usage });
+    }
+
+    for fact in response.task_facts {
+        if fact.namespace != "task.v1" {
+            return Err(ManualDriveError::InvalidInput("task fact namespace"));
+        }
+        seq = next_seq(seq)?;
+        suffix.push(DurableRecord::Fact { seq, fact });
     }
 
     seq = next_seq(seq)?;
@@ -313,6 +361,9 @@ where
     seq = next_seq(seq)?;
     let terminal = match response.outcome {
         DurableOutcome::Cancelled => DurableOperationKind::Aborted,
+        DurableOutcome::Unknown => DurableOperationKind::Suspended {
+            reason: "tool execution did not produce a known terminal result".into(),
+        },
         outcome => DurableOperationKind::Finished { outcome },
     };
     suffix.push(DurableRecord::Operation {
@@ -382,6 +433,9 @@ where
             DurableRecord::Fact { .. }
             | DurableRecord::Usage { .. }
             | DurableRecord::Compaction { .. } => {}
+        }
+        if parent_found && input_exists && assistant_exists && operation_exists && attempt_exists {
+            break;
         }
     }
     if !parent_found {

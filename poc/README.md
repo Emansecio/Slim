@@ -1,16 +1,13 @@
-# POCs do Slim
+# POCs históricas
 
-> **Status de implementação:** material histórico e evidência de componentes;
-> POCs verdes/parciais não equivalem à integração completa da v1.
+Provas de conceito usadas antes da integração no workspace principal. **Não fazem
+parte do build de produção** (`cargo build --workspace` ignora esta pasta).
 
-Área de validação da Task 0. Os POCs devem produzir evidência local antes da
-implementação das Tasks 1–9.
+| POC | Propósito | Como rodar (opcional) |
+|---|---|---|
+| [search/](search/) | Candidato Rust para busca/indexação | `pwsh -File search/run-poc.ps1` |
+| [tui/](tui/) | Probes de renderer e long session | `cargo run --manifest-path tui/Cargo.toml` |
+| [toolchain/](toolchain/) | Validação de toolchain | Ver README local |
 
-## Ordem
-
-1. `toolchain` — Rust stable, Cargo e linker MSVC;
-2. `tui` — lifecycle fullscreen e contrato visual;
-3. `search` — `fff-search` versus `ripgrep`.
-
-Cada POC deve registrar comando, ambiente, resultado, artefatos, limitações e
-decisão em `D:\Slim\POC-RESULTS.md`.
+Artefatos de build (`target/`) estão no `.gitignore`. Preserve apenas fontes e
+READMEs; não commitar outputs de compilação.

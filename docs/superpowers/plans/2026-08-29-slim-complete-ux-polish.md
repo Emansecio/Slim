@@ -3,7 +3,7 @@
 **Status:** concluído em 2026-08-29; evidência final registrada no §7 de
 `Documentações - Projeto/AUDIT-SLIM-TUI-TRACKER.md`.
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. This checkout must be executed inline because the user requested immediate execution and repository policy requires preserving the current WIP.
+> **Retomada deste plano:** revalide as pendências no código e execute somente o escopo autorizado, conforme o `AGENTS.md` vigente. Skills e delegação são escolhidas por necessidade; receitas e resultados da execução original não são obrigações gerais.
 
 **Goal:** Deliver the accepted Slim TUI/CLI visual and interaction polish with real editor semantics, bounded pickers, code/diff surfaces, inspectors/search, contextual chrome and capability-safe clipboard/image handling.
 
@@ -284,4 +284,4 @@ Expected: final line beginning with `OK:` and identical release/PATH hashes.
 - No task depends on a provider call or fabricated image protocol.
 - Public state/type names are consistent across tasks.
 - Tests are vertical and each implementation begins only after observed RED.
-- No commits, worktrees or subagents are required or authorized.
+- The recorded execution did not authorize commits, worktrees or subagents; a new task follows its own authorization and the current AGENTS.md.

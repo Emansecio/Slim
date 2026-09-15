@@ -422,8 +422,7 @@ impl LspProcessPool {
                             process.wait_or_force_kill(PROCESS_EXIT_GRACE).await;
                         }
                         let mut state = this.state.lock().await;
-                        state.shutdowns_in_flight =
-                            state.shutdowns_in_flight.saturating_sub(1);
+                        state.shutdowns_in_flight = state.shutdowns_in_flight.saturating_sub(1);
                         drop(state);
                         this.lifecycle.notify_waiters();
                     });
@@ -454,21 +453,21 @@ impl LspProcessPool {
                     let occupied = state.entries.len().saturating_add(state.starting.len());
                     if occupied >= self.config.max_servers.max(1) {
                         let idle_key = state.entries.iter().find_map(|(key, entry)| {
-                            (entry.leases.load(Ordering::Acquire) == 0)
-                                .then(|| key.clone())
+                            (entry.leases.load(Ordering::Acquire) == 0).then(|| key.clone())
                         });
                         let Some(idle_key) = idle_key else {
                             return Err(PoolError::ServerLimit {
                                 limit: self.config.max_servers.max(1),
                             });
                         };
-                        let mut idle =
-                            state.entries.remove(&idle_key).expect("idle key checked above");
+                        let mut idle = state
+                            .entries
+                            .remove(&idle_key)
+                            .expect("idle key checked above");
                         if let Some(task) = idle.idle_task.take() {
                             task.abort();
                         }
-                        state.shutdowns_in_flight =
-                            state.shutdowns_in_flight.saturating_add(1);
+                        state.shutdowns_in_flight = state.shutdowns_in_flight.saturating_add(1);
                         drop(state);
                         let this = self.clone();
                         tokio::spawn(async move {
@@ -477,8 +476,7 @@ impl LspProcessPool {
                                 process.wait_or_force_kill(PROCESS_EXIT_GRACE).await;
                             }
                             let mut state = this.state.lock().await;
-                            state.shutdowns_in_flight =
-                                state.shutdowns_in_flight.saturating_sub(1);
+                            state.shutdowns_in_flight = state.shutdowns_in_flight.saturating_sub(1);
                             drop(state);
                             this.lifecycle.notify_waiters();
                         });
@@ -497,92 +495,104 @@ impl LspProcessPool {
             }
 
             let signal = leader_signal.expect("leader registers a singleflight signal");
-            let started = self
-                .start_server(
-                    root.clone(),
-                    spec.clone(),
-                    config_payload,
-                    transport_options.clone(),
-                    max_open_documents,
-                )
-                .await;
+            // The pool owns initialization, not the first consumer. Dropping
+            // its JoinHandle detaches startup; its eventual Lease is dropped
+            // normally, while other consumers still observe the shared flight.
+            let this = self.clone();
+            let config_payload = config_payload.clone();
+            return tokio::spawn(async move {
+                let started = this
+                    .start_server(
+                        root.clone(),
+                        spec.clone(),
+                        &config_payload,
+                        transport_options.clone(),
+                        max_open_documents,
+                    )
+                    .await;
 
-            match started {
-                Ok((instance, process)) => {
-                    self.failures.lock().await.remove(&key);
-                    let mut state = self.state.lock().await;
-                    let owns_flight = state
-                        .starting
-                        .get(&key)
-                        .is_some_and(|current| Arc::ptr_eq(current, &signal));
-                    if !owns_flight || state.closed {
-                        let reason = if state.closed {
-                            "process pool closed during server startup"
-                        } else {
-                            "server startup was superseded"
-                        };
-                        drop(state);
-                        instance.shutdown().await;
-                        if let Some(process) = process {
-                            process.wait_or_force_kill(PROCESS_EXIT_GRACE).await;
-                        }
-                        if owns_flight {
-                            let mut state = self.state.lock().await;
-                            if state
-                                .starting
-                                .get(&key)
-                                .is_some_and(|current| Arc::ptr_eq(current, &signal))
-                            {
-                                state.starting.remove(&key);
+                match started {
+                    Ok((instance, process)) => {
+                        this.failures.lock().await.remove(&key);
+                        let mut state = this.state.lock().await;
+                        let owns_flight = state
+                            .starting
+                            .get(&key)
+                            .is_some_and(|current| Arc::ptr_eq(current, &signal));
+                        if !owns_flight || state.closed {
+                            let reason = if state.closed {
+                                "process pool closed during server startup"
+                            } else {
+                                "server startup was superseded"
+                            };
+                            drop(state);
+                            instance.shutdown().await;
+                            if let Some(process) = process {
+                                process.wait_or_force_kill(PROCESS_EXIT_GRACE).await;
                             }
+                            if owns_flight {
+                                let mut state = this.state.lock().await;
+                                if state
+                                    .starting
+                                    .get(&key)
+                                    .is_some_and(|current| Arc::ptr_eq(current, &signal))
+                                {
+                                    state.starting.remove(&key);
+                                }
+                            }
+                            signal.notify_waiters();
+                            this.lifecycle.notify_waiters();
+                            return Err(PoolError::Unavailable {
+                                server: spec.id.clone(),
+                                reason: reason.into(),
+                            });
                         }
-                        signal.notify_waiters();
-                        self.lifecycle.notify_waiters();
-                        return Err(PoolError::Unavailable {
-                            server: spec.id.clone(),
-                            reason: reason.into(),
-                        });
-                    }
-                    state.starting.remove(&key);
-                    let leases = Arc::new(AtomicUsize::new(1));
-                    state.entries.insert(
-                        key.clone(),
-                        PoolEntry {
-                            instance: instance.clone(),
-                            process,
-                            leases: leases.clone(),
-                            idle_task: None,
-                        },
-                    );
-                    self.leases_total.fetch_add(1, Ordering::AcqRel);
-                    drop(state);
-                    signal.notify_waiters();
-                    return Ok(Lease {
-                        pool: self.clone(),
-                        key,
-                        instance,
-                        leases,
-                    });
-                }
-                Err(error) => {
-                    self.record_failure(&key).await;
-                    let mut state = self.state.lock().await;
-                    if state
-                        .starting
-                        .get(&key)
-                        .is_some_and(|current| Arc::ptr_eq(current, &signal))
-                    {
                         state.starting.remove(&key);
+                        let leases = Arc::new(AtomicUsize::new(1));
+                        state.entries.insert(
+                            key.clone(),
+                            PoolEntry {
+                                instance: instance.clone(),
+                                process,
+                                leases: leases.clone(),
+                                idle_task: None,
+                            },
+                        );
+                        this.leases_total.fetch_add(1, Ordering::AcqRel);
+                        drop(state);
+                        signal.notify_waiters();
+                        Ok(Lease {
+                            pool: this.clone(),
+                            key,
+                            instance,
+                            leases,
+                        })
                     }
-                    drop(state);
-                    signal.notify_waiters();
-                    self.lifecycle.notify_waiters();
-                    return Err(PoolError::Unavailable {
-                        server: spec.id.clone(),
-                        reason: error,
-                    });
+                    Err(error) => {
+                        this.record_failure(&key).await;
+                        let mut state = this.state.lock().await;
+                        if state
+                            .starting
+                            .get(&key)
+                            .is_some_and(|current| Arc::ptr_eq(current, &signal))
+                        {
+                            state.starting.remove(&key);
+                        }
+                        drop(state);
+                        signal.notify_waiters();
+                        this.lifecycle.notify_waiters();
+                        Err(PoolError::Unavailable {
+                            server: spec.id.clone(),
+                            reason: error,
+                        })
+                    }
                 }
-            }
+            })
+            .await
+            .map_err(|error| PoolError::Unavailable {
+                server: "language server".into(),
+                reason: format!("startup task failed: {error}"),
+            })?;
         }
     }
 

@@ -1,6 +1,6 @@
 # Slim Durable Harness v2 — Etapa 2 Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox syntax for tracking.
+> **Retomada deste plano:** revalide as pendências no código e execute somente o escopo autorizado, conforme o `AGENTS.md` vigente. Skills e delegação são escolhidas por necessidade; receitas e resultados da execução original não são obrigações gerais.
 
 **Goal:** Entregar `MemoryRepo` e `JsonlRepo` v2 sob um contrato mínimo comum, com conformance compartilhada e recuperação JSONL segura, sem ligar o v2 ao runtime/writer de produção.
 

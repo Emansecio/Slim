@@ -2,6 +2,7 @@
 //! process so framing, process lifecycle and protocol ordering exercise the
 //! same code paths as production language servers.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::PathBuf;
@@ -9,6 +10,8 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+
+use slim_lsp::{PositionCodec, PositionEncoding};
 
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
@@ -20,16 +23,21 @@ struct Arguments {
 
 #[derive(Default)]
 struct MockConfig {
+    text_document_sync: Value,
+    position_encoding: String,
+    responses: serde_json::Map<String, Value>,
     log_path: Option<PathBuf>,
     request_delay: Duration,
     definition_uri: Option<String>,
     publish_diagnostics: bool,
     diagnostic_version_delta: i64,
     document_symbol_nested: bool,
+    semantic_from_document: bool,
 }
 
 struct Logger {
     writer: Option<BufWriter<File>>,
+    started: std::time::Instant,
 }
 
 impl Logger {
@@ -43,14 +51,29 @@ impl Logger {
             }
             None => None,
         };
-        Ok(Self { writer })
+        Ok(Self {
+            writer,
+            started: std::time::Instant::now(),
+        })
     }
 
     fn write(&mut self, value: &Value) -> io::Result<()> {
         let Some(writer) = self.writer.as_mut() else {
             return Ok(());
         };
-        serde_json::to_writer(&mut *writer, value)?;
+        #[derive(serde::Serialize)]
+        struct TimedRow<'a> {
+            elapsed_us: u128,
+            #[serde(flatten)]
+            value: &'a Value,
+        }
+        serde_json::to_writer(
+            &mut *writer,
+            &TimedRow {
+                elapsed_us: self.started.elapsed().as_micros(),
+                value,
+            },
+        )?;
         writer.write_all(b"\n")?;
         writer.flush()
     }
@@ -75,6 +98,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = stdin.lock();
     let mut writer = stdout.lock();
     let mut config = MockConfig::default();
+    let mut documents = HashMap::<String, String>::new();
+    let mut document_versions = HashMap::<String, i64>::new();
     let mut shutdown_requested = false;
 
     while let Some(message) = read_frame(&mut reader)? {
@@ -86,11 +111,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let id = message.get("id").cloned();
         let params = message.get("params").cloned().unwrap_or(Value::Null);
 
+        if let Some(result) = config.responses.get(method).filter(|_| id.is_some()) {
+            delay(config.request_delay);
+            respond(&mut writer, &mut logger, id, result.clone())?;
+            continue;
+        }
+
         match method {
             "initialize" => {
                 config = MockConfig::from_initialize(&params);
                 if let Some(log_path) = config.log_path.take() {
-                    logger = Logger::new(Some(log_path))?;
+                    logger.writer = Logger::new(Some(log_path))?.writer;
+                    logger.write(&json!({"direction":"client_to_server", "message":message}))?;
                 }
                 if !arguments.initialize_delay.is_zero() {
                     thread::sleep(arguments.initialize_delay);
@@ -101,8 +133,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     id,
                     json!({
                         "capabilities": {
-                            "positionEncoding": "utf-16",
-                            "textDocumentSync": 1,
+                            "positionEncoding": config.position_encoding.clone(),
+                            "textDocumentSync": config.text_document_sync,
                             "definitionProvider": true,
                             "referencesProvider": true,
                             "hoverProvider": true,
@@ -113,8 +145,73 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }),
                 )?;
             }
-            "initialized" => {}
-            "textDocument/didOpen" | "textDocument/didChange" => {
+            "initialized" => {
+                // Mirror rust-analyzer: a completed Roots Scanned cycle right
+                // after initialization, so indexing_observed is reachable.
+                notify(
+                    &mut writer,
+                    &mut logger,
+                    "$/progress",
+                    json!({
+                        "token": "rustAnalyzer/Roots Scanned",
+                        "value": { "kind": "begin", "title": "Roots Scanned" }
+                    }),
+                )?;
+                notify(
+                    &mut writer,
+                    &mut logger,
+                    "$/progress",
+                    json!({
+                        "token": "rustAnalyzer/Roots Scanned",
+                        "value": { "kind": "end" }
+                    }),
+                )?;
+            }
+            "textDocument/didOpen" => {
+                let uri = params
+                    .pointer("/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .ok_or("didOpen without URI")?
+                    .to_owned();
+                let text = params
+                    .pointer("/textDocument/text")
+                    .and_then(Value::as_str)
+                    .ok_or("didOpen without text")?
+                    .to_owned();
+                let version = params
+                    .pointer("/textDocument/version")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(1);
+                documents.insert(uri.clone(), text);
+                document_versions.insert(uri, version);
+                logger.write(&json!({"event":"didOpen_applied"}))?;
+                if config.publish_diagnostics {
+                    publish_diagnostics(&mut writer, &mut logger, &params, &config)?;
+                }
+            }
+            "textDocument/didChange" => {
+                let uri = params
+                    .pointer("/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .ok_or("didChange without URI")?
+                    .to_owned();
+                let document = documents
+                    .get_mut(&uri)
+                    .ok_or_else(|| format!("didChange for unopened document {uri}"))?;
+                for change in params
+                    .get("contentChanges")
+                    .and_then(Value::as_array)
+                    .ok_or("didChange without contentChanges")?
+                {
+                    apply_content_change(document, change, &config.position_encoding)
+                        .map_err(|error| format!("invalid didChange for {uri}: {error}"))?;
+                }
+                if let Some(version) = params
+                    .pointer("/textDocument/version")
+                    .and_then(Value::as_i64)
+                {
+                    document_versions.insert(uri.clone(), version);
+                }
                 if config.publish_diagnostics {
                     publish_diagnostics(&mut writer, &mut logger, &params, &config)?;
                 }
@@ -122,12 +219,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "textDocument/didSave" | "textDocument/didClose" => {}
             "textDocument/hover" => {
                 delay(config.request_delay);
+                let uri = params
+                    .pointer("/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let value = if config.semantic_from_document {
+                    documents
+                        .get(uri)
+                        .map(|text| text.chars().take(600).collect::<String>())
+                        .unwrap_or_default()
+                } else {
+                    "mock hover".to_owned()
+                };
                 respond(
                     &mut writer,
                     &mut logger,
                     id,
                     json!({
-                        "contents": { "kind": "plaintext", "value": "mock hover" }
+                        "contents": { "kind": "plaintext", "value": value }
                     }),
                 )?;
             }
@@ -174,6 +283,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }]),
                 )?;
+            }
+            "mock/documentState" => {
+                let uri = params
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                respond(
+                    &mut writer,
+                    &mut logger,
+                    id,
+                    json!({
+                        "text": documents.get(uri),
+                        "version": document_versions.get(uri),
+                    }),
+                )?;
+            }
+            "mock/crash" => {
+                return Err(
+                    io::Error::new(io::ErrorKind::BrokenPipe, "intentional mock crash").into(),
+                );
             }
             "textDocument/documentSymbol" => {
                 delay(config.request_delay);
@@ -243,7 +372,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }),
                 )?;
                 respond(&mut writer, &mut logger, id, Value::Null)?;
-            }            "mock/flood" => {
+            }
+            "mock/flood" => {
                 let count = params.get("count").and_then(Value::as_u64).unwrap_or(128);
                 let uri = params
                     .get("uri")
@@ -296,6 +426,20 @@ impl MockConfig {
             .get("initializationOptions")
             .and_then(|value| value.get("mock"));
         Self {
+            text_document_sync: mock
+                .and_then(|value| value.get("textDocumentSync"))
+                .cloned()
+                .unwrap_or(json!(1)),
+            position_encoding: mock
+                .and_then(|value| value.get("positionEncoding"))
+                .and_then(Value::as_str)
+                .unwrap_or("utf-16")
+                .to_owned(),
+            responses: mock
+                .and_then(|value| value.get("responses"))
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
             log_path: mock
                 .and_then(|value| value.get("logPath"))
                 .and_then(Value::as_str)
@@ -321,8 +465,74 @@ impl MockConfig {
                 .and_then(|value| value.get("documentSymbolNested"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            semantic_from_document: mock
+                .and_then(|value| value.get("semanticFromDocument"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         }
     }
+}
+
+fn apply_content_change(
+    document: &mut String,
+    change: &Value,
+    encoding: &str,
+) -> Result<(), String> {
+    let replacement = change
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "change text is not a string".to_owned())?;
+    let Some(range) = change.get("range") else {
+        replacement.clone_into(document);
+        return Ok(());
+    };
+    let start = range_position(document, range.get("start"), encoding)?;
+    let end = range_position(document, range.get("end"), encoding)?;
+    if start > end {
+        return Err("range start is after range end".to_owned());
+    }
+    document.replace_range(start..end, replacement);
+    Ok(())
+}
+
+fn range_position(document: &str, value: Option<&Value>, encoding: &str) -> Result<usize, String> {
+    let position = value.ok_or_else(|| "missing range position".to_owned())?;
+    let line = position
+        .get("line")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "range line is not an integer".to_owned())? as usize;
+    let character = position
+        .get("character")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "range character is not an integer".to_owned())?
+        as usize;
+    let mut line_start = 0;
+    let mut current_line = 0;
+    for (index, byte) in document.bytes().enumerate() {
+        if current_line == line {
+            break;
+        }
+        if byte == b'\n' {
+            current_line += 1;
+            line_start = index + 1;
+        }
+    }
+    if current_line != line {
+        return Err(format!("line {line} is outside the document"));
+    }
+    let line_end = document[line_start..]
+        .find('\n')
+        .map(|offset| line_start + offset)
+        .unwrap_or(document.len());
+    let line_text = &document[line_start..line_end];
+    let position_encoding = match encoding.to_ascii_lowercase().as_str() {
+        "utf-8" => PositionEncoding::Utf8,
+        "utf-32" => PositionEncoding::Utf32,
+        _ => PositionEncoding::Utf16,
+    };
+    PositionCodec::character_to_byte(position_encoding, line_text, character as u32)
+        .map(|offset| line_start + offset)
+        .ok_or_else(|| format!("character {character} is outside line {line}"))
 }
 
 fn parse_arguments() -> Result<Arguments, Box<dyn std::error::Error>> {

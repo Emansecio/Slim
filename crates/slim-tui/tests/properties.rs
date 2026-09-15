@@ -58,10 +58,46 @@ fn height_index_resolves_every_grouped_block_without_rescan() {
         .collect::<Vec<_>>();
     let mut cache = WrapCache::default();
     let index = HeightIndex::build(state.blocks(), 80, &mut cache);
-    assert_eq!(index.entries.len(), 1, "tools should aggregate visually");
+    assert_eq!(index.len(), 1, "tools should aggregate visually");
     for id in ids {
         assert_eq!(index.prefix_for_block(&id), Some(0));
     }
+}
+
+#[test]
+fn process_progress_keeps_existing_inspector_handle() {
+    let mut state = AppState::new();
+    let batch_id = slim_tui::api::ToolBatchId("batch".into());
+    let call_id = slim_tui::api::ToolCallId("call".into());
+    state.apply_event(UiEvent::ToolStarted {
+        batch_id: batch_id.clone(),
+        call_id: call_id.clone(),
+        name: "shell".into(),
+        arguments_summary: String::new(),
+    });
+    state.apply_event(UiEvent::ToolProgress {
+        content_handle: Some(slim_tui::api::ContentHandle("artifact".into())),
+        batch_id: batch_id.clone(),
+        call_id: call_id.clone(),
+        name: "shell".into(),
+        preview: "captured output".into(),
+    });
+    state.apply_event(UiEvent::ToolProgress {
+        content_handle: None,
+        batch_id,
+        call_id,
+        name: "shell".into(),
+        preview: "exit 0".into(),
+    });
+    let tool = match state.blocks().first().map(|block| block.kind()) {
+        Some(slim_tui::block::BlockKind::Tool(tool)) => tool,
+        _ => panic!("tool block"),
+    };
+    assert_eq!(tool.preview, "exit 0");
+    assert_eq!(
+        tool.content_handle,
+        Some(slim_tui::api::ContentHandle("artifact".into()))
+    );
 }
 
 #[test]

@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod app;
+pub mod bitmap;
 pub mod block;
 pub mod cache;
 pub mod clipboard;
@@ -17,6 +18,7 @@ pub mod reducer;
 pub mod render;
 pub mod runtime;
 mod runtime_wait;
+pub mod selection;
 pub mod terminal;
 pub mod testkit;
 pub mod theme;

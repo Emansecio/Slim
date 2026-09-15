@@ -114,6 +114,9 @@ fn production_chatgpt_hosts_opt_into_live_catalog() {
 
 #[test]
 fn seeded_disk_cache_is_available_without_network() {
+    use sha2::{Digest, Sha256};
+    let endpoint = "http://127.0.0.1:9/backend-api";
+    let scope = format!("{:x}", Sha256::digest(format!("{endpoint}\0acct-offline")));
     let cache = std::env::temp_dir().join(format!(
         "slim-codex-catalog-seeded-{}-{}",
         std::process::id(),
@@ -124,7 +127,7 @@ fn seeded_disk_cache_is_available_without_network() {
     ));
     std::fs::write(
         &cache,
-        br#"{"version":1,"entries":[{"slug":"gpt-5.6-sol","context_window":345678}]}"#,
+        serde_json::to_vec(&serde_json::json!({"version":1,"scope":scope,"entries":[{"slug":"gpt-5.6-sol","context_window":345678}]})).unwrap(),
     )
     .expect("seed cache");
     let catalog = CodexCatalog::at(&cache).expect("catalog");
@@ -137,5 +140,13 @@ fn seeded_disk_cache_is_available_without_network() {
     assert_eq!(snapshot.entries.len(), 1);
     assert_eq!(snapshot.entries[0].slug, "gpt-5.6-sol");
     assert_eq!(snapshot.entries[0].context_window, 345_678);
+    assert!(catalog
+        .load_cached(endpoint, "other-account")
+        .unwrap()
+        .is_none());
+    assert!(catalog
+        .load_cached("http://127.0.0.1:8/backend-api", "acct-offline")
+        .unwrap()
+        .is_none());
     let _ = std::fs::remove_file(cache);
 }

@@ -5,6 +5,7 @@ mod codex;
 pub mod pkce;
 mod store;
 mod types;
+mod xai;
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,7 +46,7 @@ pub struct OAuthService {
     browser: Arc<dyn BrowserLauncher>,
     store: OAuthStore,
     refresh_gate: Arc<AsyncMutex<()>>,
-    background_inflight: Arc<[AtomicBool; 2]>,
+    background_inflight: Arc<[AtomicBool; 3]>,
     background_warning: Arc<Mutex<Option<String>>>,
 }
 
@@ -75,7 +76,11 @@ impl OAuthService {
             browser,
             store,
             refresh_gate: Arc::new(AsyncMutex::new(())),
-            background_inflight: Arc::new([AtomicBool::new(false), AtomicBool::new(false)]),
+            background_inflight: Arc::new([
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+            ]),
             background_warning: Arc::new(Mutex::new(None)),
         })
     }
@@ -134,6 +139,16 @@ impl OAuthService {
             }
             OAuthProvider::OpenAiCodex => {
                 codex::login(
+                    &self.client,
+                    &self.endpoints,
+                    self.browser.clone(),
+                    &progress,
+                    cancel,
+                )
+                .await?
+            }
+            OAuthProvider::Xai => {
+                xai::login(
                     &self.client,
                     &self.endpoints,
                     self.browser.clone(),
@@ -212,6 +227,7 @@ impl OAuthService {
             OAuthProvider::OpenAiCodex => {
                 codex::refresh(&self.client, &self.endpoints, &credential).await?
             }
+            OAuthProvider::Xai => xai::refresh(&self.client, &self.endpoints, &credential).await?,
         };
         let persistence_warning = self.persist_refreshed(provider, &refreshed).await;
         Ok(FreshCredential {
@@ -315,6 +331,7 @@ fn background_inflight_slot(provider: OAuthProvider) -> usize {
     match provider {
         OAuthProvider::Anthropic => 0,
         OAuthProvider::OpenAiCodex => 1,
+        OAuthProvider::Xai => 2,
     }
 }
 

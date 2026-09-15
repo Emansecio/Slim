@@ -3,32 +3,63 @@ use std::collections::HashSet;
 use serde_json::{json, Value};
 
 use super::{
-    endpoint_sensitive_values, harden_compaction_body, normalize_messages,
-    provider_native_prompt_cache_key, HttpRequest, PreparedProviderRequest, ProviderAdapter,
-    ProviderAuth, ProviderCapabilities, ProviderConfig, ProviderContentBlock, ProviderError,
-    ProviderEvent, ProviderKind, ProviderMessage, UsageBreakdown,
+    endpoint_sensitive_values, harden_compaction_body, materialize_native_prompt_cache_key,
+    normalize_messages, HttpRequest, PreparedProviderRequest, ProviderAdapter, ProviderAuth,
+    ProviderCapabilities, ProviderConfig, ProviderContentBlock, ProviderError, ProviderEvent,
+    ProviderKind, ProviderMessage, ProviderRequestFingerprints, ResponsesReasoning, UsageBreakdown,
 };
 
 pub struct OpenAiCodexAdapter {
     config: ProviderConfig,
+    fast_mode: bool,
 }
 
 impl OpenAiCodexAdapter {
-    pub fn new(config: ProviderConfig) -> Result<Self, ProviderError> {
+    pub fn new(mut config: ProviderConfig) -> Result<Self, ProviderError> {
         if config.kind != ProviderKind::OpenAiCodex {
             return Err(ProviderError::InvalidResponse {
                 message: "provider kind mismatch".into(),
+            });
+        }
+        if let Some(id) = normalize_codex_model_id(&config.model) {
+            config.model = id.into();
+        }
+        if config.model == "gpt-6-astra"
+            && config
+                .reasoning_effort()
+                .is_some_and(|effort| !["low", "medium", "high", "xhigh", "max"].contains(&effort))
+        {
+            return Err(ProviderError::InvalidResponse {
+                message: "Astra reasoning effort must be low, medium, high, xhigh, or max".into(),
             });
         }
         match config.auth() {
             ProviderAuth::OAuth {
                 account_id: Some(account_id),
                 ..
-            } if !account_id.is_empty() => Ok(Self { config }),
+            } if !account_id.is_empty() => Ok(Self {
+                config,
+                fast_mode: false,
+            }),
             _ => Err(ProviderError::InvalidResponse {
                 message: "Codex OAuth requires a ChatGPT account id".into(),
             }),
         }
+    }
+
+    pub fn with_response_cache_scope_id(mut self, id: u64) -> Self {
+        self.config.response_cache_scope_id = id;
+        self
+    }
+
+    pub fn set_response_cache_scope_id(&mut self, id: u64) {
+        self.config.response_cache_scope_id = id;
+    }
+
+    /// Codex Fast uses the priority service tier; Normal leaves backend defaults intact.
+    pub fn with_fast_mode(mut self, enabled: bool) -> Self {
+        self.fast_mode = enabled;
+        self
     }
 
     pub(crate) fn set_system_prompt(&mut self, prompt: impl Into<String>) {
@@ -78,8 +109,27 @@ impl OpenAiCodexAdapter {
     }
 
     pub(super) fn request_body(&self, messages: &[ProviderMessage], tools: &[Value]) -> Value {
+        self.request_body_with_prefixes(messages, tools).0
+    }
+
+    pub(super) fn request_body_with_prefixes(
+        &self,
+        messages: &[ProviderMessage],
+        tools: &[Value],
+    ) -> (Value, Option<ProviderRequestFingerprints>) {
         let mut input = Vec::new();
         for message in messages {
+            input.extend(
+                message
+                    .responses_reasoning
+                    .iter()
+                    .filter(|state| {
+                        message.role == "assistant"
+                            && state.scope_id == self.config.response_cache_scope_id()
+                            && state.model == self.config.model
+                    })
+                    .map(|state| state.item.clone()),
+            );
             if message.role == "tool" {
                 input.push(json!({
                     "type": "function_call_output",
@@ -109,6 +159,9 @@ impl OpenAiCodexAdapter {
                     "name": tool.get("name").cloned().unwrap_or(Value::Null),
                     "description": tool.get("description").cloned().unwrap_or(Value::Null),
                     "parameters": tool.get("input_schema").cloned().unwrap_or_else(|| json!({"type":"object"})),
+                    // Keep native optional arguments optional. Responses may
+                    // otherwise normalize them into required schema fields.
+                    "strict": false,
                 })
             })
             .collect::<Vec<_>>();
@@ -128,8 +181,14 @@ impl OpenAiCodexAdapter {
             reasoning["effort"] = json!(effort);
         }
         body["reasoning"] = reasoning;
-        self.materialize_prompt_cache_intent(&mut body);
-        body
+        if codex_model(&self.config.model).is_some() {
+            body["text"] = json!({"verbosity": "low"});
+        }
+        if self.fast_mode {
+            body["service_tier"] = json!("priority");
+        }
+        let stable_prefixes = materialize_native_prompt_cache_key(self, &mut body);
+        (body, stable_prefixes)
     }
 }
 
@@ -197,13 +256,7 @@ impl ProviderAdapter for OpenAiCodexAdapter {
     }
 
     fn materialize_prompt_cache_intent(&self, body: &mut Value) {
-        if self.capabilities().supports_prompt_cache_key {
-            body["prompt_cache_key"] = Value::String(provider_native_prompt_cache_key(
-                self.wire_kind(),
-                self.model(),
-                body,
-            ));
-        }
+        materialize_native_prompt_cache_key(self, body);
     }
 
     fn response_cache_scope_id(&self) -> Option<u64> {
@@ -244,11 +297,13 @@ impl ProviderAdapter for OpenAiCodexAdapter {
         tools: &[Value],
     ) -> Result<PreparedProviderRequest, ProviderError> {
         normalize_messages(messages)?;
-        PreparedProviderRequest::from_http_body(
+        let (body, stable_prefixes) = self.request_body_with_prefixes(messages, tools);
+        PreparedProviderRequest::from_http_body_with_prefixes(
             codex_url(&self.config.endpoint),
             self.headers(),
-            self.request_body(messages, tools),
+            body,
             self,
+            stable_prefixes,
         )
     }
 
@@ -257,14 +312,15 @@ impl ProviderAdapter for OpenAiCodexAdapter {
         messages: &[ProviderMessage],
     ) -> Result<PreparedProviderRequest, ProviderError> {
         normalize_messages(messages)?;
-        let mut body = self.request_body(messages, &[]);
+        let (mut body, _) = self.request_body_with_prefixes(messages, &[]);
         harden_compaction_body(&mut body, false)?;
-        self.materialize_prompt_cache_intent(&mut body);
-        PreparedProviderRequest::from_http_body(
+        let stable_prefixes = materialize_native_prompt_cache_key(self, &mut body);
+        PreparedProviderRequest::from_http_body_with_prefixes(
             codex_url(&self.config.endpoint),
             self.headers(),
             body,
             self,
+            stable_prefixes,
         )
     }
 
@@ -345,20 +401,26 @@ impl ProviderAdapter for OpenAiCodexAdapter {
                         .get("arguments")
                         .and_then(Value::as_str)
                         .ok_or(ProviderError::MalformedToolCall)?;
-                    vec![
-                        ProviderEvent::ToolCallDelta {
-                            index: Some(index),
-                            id: Some(id.into()),
-                            name: Some(name.into()),
-                            arguments: String::new(),
-                        },
-                        ProviderEvent::ToolCall {
-                            name: name.into(),
-                            arguments: arguments.into(),
-                        },
-                    ]
+                    vec![ProviderEvent::ToolCallComplete {
+                        index,
+                        id: id.into(),
+                        name: name.into(),
+                        arguments: arguments.into(),
+                    }]
                 } else if item.get("type").and_then(Value::as_str) == Some("reasoning") {
-                    vec![ProviderEvent::ReasoningEnded]
+                    let mut events = vec![ProviderEvent::ReasoningEnded];
+                    if item
+                        .get("encrypted_content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| !content.is_empty())
+                    {
+                        events.push(ProviderEvent::ResponsesReasoning(ResponsesReasoning {
+                            scope_id: self.config.response_cache_scope_id(),
+                            model: self.config.model.clone(),
+                            item: item.clone(),
+                        }));
+                    }
+                    events
                 } else {
                     Vec::new()
                 }
@@ -454,16 +516,7 @@ impl ProviderAdapter for OpenAiCodexAdapter {
                 events
             }
             "error" | "response.failed" => {
-                return Err(ProviderError::Remote {
-                    message: value
-                        .pointer("/error/message")
-                        .or_else(|| value.pointer("/response/error/message"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("Codex provider error")
-                        .chars()
-                        .take(512)
-                        .collect(),
-                })
+                return Err(super::stream_provider_error(value, &self.config));
             }
             _ => Vec::new(),
         };
@@ -488,7 +541,7 @@ fn optional_tool_index(value: Option<&Value>) -> Result<Option<u32>, ProviderErr
         .transpose()
 }
 
-/// Codex CLI bundled `context_window` for GPT-5.6 Sol/Terra/Luna.
+/// Codex CLI bundled `context_window` for Astra and GPT-5.6 Sol/Terra/Luna.
 ///
 /// This is the coding-client catalog value (~272k input). The public API
 /// documents 1,050,000; ChatGPT `/backend-api/codex/models` is authoritative
@@ -535,6 +588,12 @@ impl std::error::Error for CodexCatalogError {}
 
 const CODEX_MODELS: &[CodexModel] = &[
     CodexModel {
+        id: "gpt-6-astra",
+        name: "GPT-6 Astra",
+        context_window: CODEX_BUNDLED_CONTEXT_WINDOW,
+        max_output_tokens: 128_000,
+    },
+    CodexModel {
         id: "gpt-5.6-sol",
         name: "GPT-5.6 Sol",
         context_window: CODEX_BUNDLED_CONTEXT_WINDOW,
@@ -564,6 +623,7 @@ pub fn codex_models() -> &'static [CodexModel] {
 
 pub fn normalize_codex_model_id(id: &str) -> Option<&'static str> {
     match id.trim().to_ascii_lowercase().as_str() {
+        "astra" | "gpt-6-astra" => Some("gpt-6-astra"),
         "sol" | "gpt-5.6-sol" => Some("gpt-5.6-sol"),
         "terra" | "gpt-5.6-terra" => Some("gpt-5.6-terra"),
         "luna" | "gpt-5.6-luna" => Some("gpt-5.6-luna"),

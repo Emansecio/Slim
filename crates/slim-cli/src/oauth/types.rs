@@ -6,6 +6,7 @@ use std::fmt;
 pub enum OAuthProvider {
     Anthropic,
     OpenAiCodex,
+    Xai,
 }
 
 impl OAuthProvider {
@@ -13,6 +14,7 @@ impl OAuthProvider {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenAiCodex => "openai-codex",
+            Self::Xai => "xai",
         }
     }
 
@@ -20,6 +22,7 @@ impl OAuthProvider {
         match self {
             Self::Anthropic => "Anthropic — Claude Pro/Max",
             Self::OpenAiCodex => "OpenAI Codex — ChatGPT Plus/Pro",
+            Self::Xai => "xAI — Grok/X subscription",
         }
     }
 }
@@ -103,6 +106,8 @@ pub struct OAuthEndpoints {
     pub codex_device_code: String,
     pub codex_device_token: String,
     pub codex_device_verify: String,
+    pub xai_device_code: String,
+    pub xai_token: String,
 }
 
 impl Default for OAuthEndpoints {
@@ -115,6 +120,8 @@ impl Default for OAuthEndpoints {
             codex_device_code: "https://auth.openai.com/api/accounts/deviceauth/usercode".into(),
             codex_device_token: "https://auth.openai.com/api/accounts/deviceauth/token".into(),
             codex_device_verify: "https://auth.openai.com/codex/device".into(),
+            xai_device_code: "https://auth.x.ai/oauth2/device/code".into(),
+            xai_token: "https://auth.x.ai/oauth2/token".into(),
         }
     }
 }

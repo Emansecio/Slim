@@ -1,0 +1,1 @@
+Trabalhe somente neste workspace descartável. Preserve arquivos fora do objetivo. Grave resposta estruturada em answer.json, sem Markdown. Em src/catalog.rs identifique método zeta_export_window, seu tipo contêiner e assinatura. Não altere código. Em answer.json informe path, container, signature (assinatura pública completa sem corpo) e return_type.

@@ -105,8 +105,51 @@ fn auto_with_code_intel_advertises_code_intel() {
 }
 
 #[test]
+fn mcp_meta_tool_only_in_auto_with_enabled_servers() {
+    use slim_core::mcp::{McpManager, McpServerSpec, McpTransport};
+    use slim_core::process::ExecutableResolver;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    fn spec(enabled: bool) -> McpServerSpec {
+        McpServerSpec {
+            name: "srv".into(),
+            transport: McpTransport::Stdio {
+                command: "cmd".into(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+            },
+            enabled,
+            timeout: Duration::from_millis(1_000),
+        }
+    }
+    fn manager(enabled: bool) -> Arc<McpManager> {
+        Arc::new(McpManager::new(
+            BTreeMap::from([("srv".to_owned(), spec(enabled))]),
+            PathBuf::from("."),
+            ExecutableResolver::default(),
+        ))
+    }
+
+    let bare = Runtime::new();
+    assert!(!advertised_names(&bare, OperatingMode::Auto).contains(&"mcp".into()));
+
+    let mut disabled = Runtime::new();
+    disabled.set_mcp_manager(Some(manager(false)));
+    assert!(!advertised_names(&disabled, OperatingMode::Auto).contains(&"mcp".into()));
+
+    let mut enabled = Runtime::new();
+    enabled.set_mcp_manager(Some(manager(true)));
+    assert!(advertised_names(&enabled, OperatingMode::Auto).contains(&"mcp".into()));
+    assert!(!advertised_names(&enabled, OperatingMode::ReadOnly).contains(&"mcp".into()));
+    assert!(!advertised_names(&enabled, OperatingMode::Plan).contains(&"mcp".into()));
+}
+
+#[test]
 fn plan_does_not_advertise_ask_question_when_interactive() {
     let mut runtime = Runtime::new();
+    assert!(!advertised_names(&runtime, OperatingMode::ReadOnly).contains(&"ask_question".into()));
     let (route, _responder) = slim_core::interaction_route();
     runtime.set_interaction_route(route);
     let plan = advertised_names(&runtime, OperatingMode::Plan);
@@ -114,7 +157,8 @@ fn plan_does_not_advertise_ask_question_when_interactive() {
     assert!(!plan.contains(&"ask_question".into()));
     assert!(!plan.contains(&"write".into()));
     let readonly = advertised_names(&runtime, OperatingMode::ReadOnly);
-    assert!(!readonly.contains(&"ask_question".into()));
+    assert!(readonly.contains(&"ask_question".into()));
+    assert!(!readonly.contains(&"write".into()));
     let auto = advertised_names(&runtime, OperatingMode::Auto);
     assert!(auto.contains(&"ask_question".into()));
 }

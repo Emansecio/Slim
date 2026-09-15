@@ -8,7 +8,9 @@ mod shell;
 mod write;
 
 use crate::context::ArtifactHandle;
-use crate::process::{ExecutableResolver, ProcessRunner};
+use crate::process::{
+    ExecutableResolver, ProcessExecutionFacts, ProcessOutputBudget, ProcessRunner,
+};
 use crate::runtime::CancellationToken;
 use crate::OperatingMode;
 use serde_json::{json, Value};
@@ -17,15 +19,17 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 pub(crate) use execution::{
-    canonical_workspace, digest_bytes, path_identity, DependencyKind, DependencyObservation,
-    FastStamp, MutationObservation, PreparedToolArguments, PreparedToolInvocation,
-    ToolExecutionError, ToolExecutionOutcome, ToolExecutionReceipt,
+    canonical_workspace, digest_bytes, path_identity, present_unstructured, CodeIntelPresentation,
+    DependencyKind, DependencyObservation, FastStamp, MutationObservation, PreparedToolArguments,
+    PreparedToolInvocation, ToolExecutionError, ToolExecutionOutcome, ToolExecutionReceipt,
+    ToolPresentationSource,
 };
 
+pub(crate) use code_intel::presentation_for_code_intel;
 pub use code_intel::{
     code_intel_definition, parse_code_intel_request, render_code_intel, CodeIntelRequest,
     CODE_INTEL_ACTIONS,
@@ -33,11 +37,11 @@ pub use code_intel::{
 pub use list::{list_directory, DEFAULT_MAX_ENTRIES, MAX_ENTRIES_CAP};
 pub use patch::apply_exact_patch;
 pub use read::{read_file, read_file_range, DEFAULT_MAX_READ_LINES, MAX_READ_LINES_CAP};
-pub(crate) use search::MAX_SEARCH_PATTERNS;
 pub use search::{
     format_search_page, search_bounded, search_literal, SearchHit, SearchOptions, SearchPage,
     DEFAULT_MAX_HITS, MAX_HITS_CAP,
 };
+pub(crate) use search::{MAX_SEARCH_PATTERNS, SKIP_DIR_NAMES};
 pub use shell::{
     run_shell, run_shell_timeout, run_shell_timeout_cancellable,
     run_shell_timeout_cancellable_with_progress, ShellProgress, TimedShellOutput,
@@ -50,10 +54,6 @@ const PREFERRED_ARGUMENT_KEYS: &[&str] = &[
     "path", "command", "query", "pattern", "glob", "url", "file", "target", "name", "id",
 ];
 const MAX_SHELL_TIMEOUT_MS: u64 = 120_000;
-
-fn bounded_shell_timeout_ms(timeout_ms: u64) -> u64 {
-    timeout_ms.clamp(1, MAX_SHELL_TIMEOUT_MS)
-}
 
 /// One-line tool argument for the TUI: preferred keys, never raw JSON dumps.
 pub fn summarize_tool_arguments(arguments: &str) -> String {
@@ -83,6 +83,19 @@ pub fn summarize_tool_arguments(arguments: &str) -> String {
 }
 
 pub fn summarize_tool_arguments_for(name: &str, arguments: &str) -> String {
+    if name == "mcp" {
+        let Ok(value) = serde_json::from_str::<Value>(arguments) else {
+            return summarize_tool_arguments(arguments);
+        };
+        return match (
+            value.get("server").and_then(Value::as_str),
+            value.get("tool").and_then(Value::as_str),
+        ) {
+            (Some(server), Some(tool)) => bound_argument_summary(&format!("{server}.{tool}")),
+            (Some(server), None) => bound_argument_summary(server),
+            _ => summarize_tool_arguments(arguments),
+        };
+    }
     if name != "shell" {
         return summarize_tool_arguments(arguments);
     }
@@ -92,12 +105,18 @@ pub fn summarize_tool_arguments_for(name: &str, arguments: &str) -> String {
     let Some(command) = value.get("command").and_then(Value::as_str) else {
         return summarize_tool_arguments(arguments);
     };
-    let timeout_ms = bounded_shell_timeout_ms(
-        value
-            .get("timeout_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(30_000),
-    );
+    let timeout_ms = match value.get("timeout_ms") {
+        None => 30_000,
+        Some(value) => {
+            let Some(timeout_ms) = value
+                .as_u64()
+                .filter(|timeout_ms| (1..=MAX_SHELL_TIMEOUT_MS).contains(timeout_ms))
+            else {
+                return summarize_tool_arguments(arguments);
+            };
+            timeout_ms
+        }
+    };
     let limit = if timeout_ms.is_multiple_of(1_000) {
         format!("{}s", timeout_ms / 1_000)
     } else {
@@ -105,7 +124,18 @@ pub fn summarize_tool_arguments_for(name: &str, arguments: &str) -> String {
     };
     let suffix = format!(" · limit {limit}");
     let available = ARGUMENT_SUMMARY_LIMIT.saturating_sub(suffix.chars().count());
-    let command = bound_argument_summary_exact(&format!("command={command}"), available);
+    let invocation = if let Some(args) = value.get("args").and_then(Value::as_array) {
+        let args = args
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|arg| format!("{arg:?}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("program={command} {args}")
+    } else {
+        format!("command={command}")
+    };
+    let command = bound_argument_summary_exact(&invocation, available);
     format!("{command}{suffix}")
 }
 
@@ -265,7 +295,7 @@ pub struct ToolRegistry {
 #[derive(Clone, Debug)]
 struct CachedEvidence {
     fingerprint: String,
-    outcome: ToolExecutionOutcome,
+    outcome: Arc<ToolExecutionOutcome>,
 }
 
 #[derive(Debug)]
@@ -307,12 +337,125 @@ fn reused_evidence(mut outcome: ToolExecutionOutcome) -> ToolExecutionOutcome {
     outcome
 }
 
+const ADMISSION_OUTPUT_PREFIX_BYTES: usize = 512;
+
+fn with_admission_feedback(
+    mut outcome: ToolExecutionOutcome,
+    admission_notes: &[String],
+) -> ToolExecutionOutcome {
+    let Some(prefix) = admission_output_prefix(admission_notes) else {
+        return outcome;
+    };
+    if let Some(source) = outcome.receipt.presentation.take() {
+        outcome.receipt.presentation = Some(source.with_prefix(prefix.clone()));
+    }
+    outcome.result.output.insert_str(0, &prefix);
+    outcome
+}
+
+pub(crate) fn admission_output_prefix(admission_notes: &[String]) -> Option<String> {
+    if admission_notes.is_empty() {
+        return None;
+    }
+    let mut body = String::new();
+    for note in admission_notes {
+        let note = note.replace(['\r', '\n'], " ");
+        if note.is_empty() {
+            continue;
+        }
+        if !body.is_empty() {
+            body.push_str("; ");
+        }
+        body.push_str(&note);
+    }
+    if body.is_empty() {
+        return None;
+    }
+    let marker = "[admission: ";
+    let suffix = "]\n";
+    let available = ADMISSION_OUTPUT_PREFIX_BYTES
+        .saturating_sub(marker.len())
+        .saturating_sub(suffix.len());
+    let mut bounded = String::new();
+    let mut consumed = 0usize;
+    let mut truncated = false;
+    for character in body.chars() {
+        let width = character.len_utf8();
+        if consumed.saturating_add(width) > available {
+            truncated = true;
+            break;
+        }
+        bounded.push(character);
+        consumed = consumed.saturating_add(width);
+    }
+    if truncated {
+        while bounded.len() > available.saturating_sub("…".len()) {
+            bounded.pop();
+        }
+        bounded.push('…');
+    }
+    Some(format!("{marker}{bounded}{suffix}"))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolResult {
     pub name: String,
     pub success: bool,
     pub output: String,
     pub artifact: Option<ArtifactHandle>,
+}
+
+/// Internal allowance for one model-facing tool projection.
+///
+/// The execution layer retains the complete result and optional artifact. This
+/// value is only the per-call allowance selected by the aggregate planner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PresentationBudget {
+    pub(crate) max_bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ToolPresentation {
+    pub(crate) text: String,
+    /// Number of complete logical records included in the presentation.
+    pub(crate) delivered_records: usize,
+    /// True when the source was delivered without an omitted continuation.
+    pub(crate) complete: bool,
+    /// True when the first record itself did not fit the allowance.
+    pub(crate) oversized_record: bool,
+}
+
+impl ToolPresentation {
+    pub(crate) fn complete(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            delivered_records: 0,
+            complete: true,
+            oversized_record: false,
+        }
+    }
+
+    pub(crate) fn bounded(
+        text: impl Into<String>,
+        delivered_records: usize,
+        oversized_record: bool,
+    ) -> Self {
+        Self {
+            text: text.into(),
+            delivered_records,
+            complete: false,
+            oversized_record,
+        }
+    }
+
+    pub(crate) fn omitted(message: impl Into<String>) -> Self {
+        Self {
+            text: message.into(),
+            delivered_records: 0,
+            complete: false,
+            oversized_record: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -322,21 +465,32 @@ pub struct ToolExecutionProgress {
 
 struct ExecutedTool {
     output: String,
+    success: bool,
     dependencies: Vec<DependencyObservation>,
     mutations: Vec<MutationObservation>,
     bytes_read: u64,
-    synced_text: Option<String>,
+    synced_text: Option<crate::codeintel::CodeIntelFileUpdate>,
+    process: Option<ProcessExecutionFacts>,
+    presentation: Option<ToolPresentationSource>,
 }
 
 impl ExecutedTool {
-    fn output(output: String) -> Self {
+    fn output(output: String, success: bool) -> Self {
         Self {
             output,
+            success,
             dependencies: Vec::new(),
             mutations: Vec::new(),
             bytes_read: 0,
             synced_text: None,
+            process: None,
+            presentation: None,
         }
+    }
+
+    fn with_process(mut self, process: Option<ProcessExecutionFacts>) -> Self {
+        self.process = process;
+        self
     }
 }
 
@@ -406,6 +560,21 @@ impl Default for ToolRegistry {
             ))),
         }
     }
+}
+
+static MODE_DEFINITIONS_AUTO: LazyLock<Arc<[Value]>> =
+    LazyLock::new(|| mode_definitions_base(OperatingMode::Auto));
+static MODE_DEFINITIONS_READ_ONLY: LazyLock<Arc<[Value]>> =
+    LazyLock::new(|| mode_definitions_base(OperatingMode::ReadOnly));
+static MODE_DEFINITIONS_PLAN: LazyLock<Arc<[Value]>> =
+    LazyLock::new(|| mode_definitions_base(OperatingMode::Plan));
+
+fn mode_definitions_base(mode: OperatingMode) -> Arc<[Value]> {
+    ToolRegistry::default()
+        .names_for_mode(mode)
+        .into_iter()
+        .map(tool_definition)
+        .collect()
 }
 
 impl ToolRegistry {
@@ -488,11 +657,16 @@ impl ToolRegistry {
             .map(ToolOperationalSpec::mutates_workspace)
     }
 
+    pub(crate) fn definitions_for_mode_shared(&self, mode: OperatingMode) -> Arc<[Value]> {
+        match mode {
+            OperatingMode::Auto => Arc::clone(&MODE_DEFINITIONS_AUTO),
+            OperatingMode::ReadOnly => Arc::clone(&MODE_DEFINITIONS_READ_ONLY),
+            OperatingMode::Plan => Arc::clone(&MODE_DEFINITIONS_PLAN),
+        }
+    }
+
     pub fn definitions_for_mode(&self, mode: OperatingMode) -> Vec<Value> {
-        self.names_for_mode(mode)
-            .into_iter()
-            .map(tool_definition)
-            .collect()
+        self.definitions_for_mode_shared(mode).as_ref().to_vec()
     }
 
     pub fn execute(
@@ -544,7 +718,7 @@ impl ToolRegistry {
         mut on_progress: impl FnMut(ToolExecutionProgress),
     ) -> ToolExecutionOutcome {
         if let Some(outcome) = self.lookup_cached_evidence(prepared) {
-            return outcome;
+            return with_admission_feedback(outcome, &prepared.admission_notes);
         }
         let revision_before = self.workspace_revision();
         let started = Instant::now();
@@ -567,8 +741,8 @@ impl ToolRegistry {
                 "read" => self.execute_read(prepared, cancellation),
                 "list" => self.execute_list(prepared, cancellation),
                 "search" => self.execute_search(prepared, cancellation),
-                "write" => self.execute_write(prepared, cancellation),
-                "patch" => self.execute_patch(prepared, cancellation),
+                "write" => self.execute_write(prepared, cancellation, &mut on_progress),
+                "patch" => self.execute_patch(prepared, cancellation, &mut on_progress),
                 "shell" => self.execute_shell(prepared, cancellation, &mut on_progress),
                 // code_intel is executed by the agent loop (async, server-backed).
                 "code_intel" => Err(ToolExecutionError::from(ToolError::InvalidInput {
@@ -583,33 +757,50 @@ impl ToolRegistry {
         };
         let execution_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let finalization_started = Instant::now();
-        let (result, dependencies, mutations, bytes_read, synced_text) = match result {
-            Ok(executed) => (
-                ToolResult {
-                    name: prepared.name.clone(),
-                    success: true,
-                    output: executed.output,
-                    artifact: None,
-                },
-                executed.dependencies,
-                executed.mutations,
-                executed.bytes_read,
-                executed.synced_text,
-            ),
-            Err(failure) => (
-                ToolResult {
-                    name: prepared.name.clone(),
-                    success: false,
-                    output: tool_error_message(failure.error),
-                    artifact: None,
-                },
-                failure.dependencies,
-                failure.mutations,
-                failure.bytes_read,
-                None,
-            ),
-        };
-        let changed = result.success && mutations.iter().any(MutationObservation::changed);
+        let effects_uncertain = result
+            .as_ref()
+            .err()
+            .is_some_and(|failure| failure.effects_uncertain);
+        let (result, dependencies, mutations, bytes_read, synced_text, process, presentation) =
+            match result {
+                Ok(executed) => (
+                    ToolResult {
+                        name: prepared.name.clone(),
+                        success: executed.success,
+                        output: executed.output,
+                        artifact: None,
+                    },
+                    executed.dependencies,
+                    executed.mutations,
+                    executed.bytes_read,
+                    executed.synced_text,
+                    executed.process,
+                    executed.presentation,
+                ),
+                Err(failure) => {
+                    let mut output = tool_error_message(failure.error);
+                    if let Some(context) = failure.context {
+                        output.push('\n');
+                        output.push_str(&context);
+                    }
+                    (
+                        ToolResult {
+                            name: prepared.name.clone(),
+                            success: false,
+                            output,
+                            artifact: None,
+                        },
+                        failure.dependencies,
+                        failure.mutations,
+                        failure.bytes_read,
+                        None,
+                        None,
+                        None,
+                    )
+                }
+            };
+        let changed = effects_uncertain
+            || (result.success && mutations.iter().any(MutationObservation::changed));
         let revision_after = if changed {
             self.services
                 .workspace_revision
@@ -618,15 +809,19 @@ impl ToolRegistry {
         } else {
             self.services.workspace_revision.load(Ordering::Acquire)
         };
-        let modified_paths = mutations
+        let mut modified_paths: Vec<_> = mutations
             .iter()
             .map(|mutation| mutation.path.clone())
             .collect();
+        if effects_uncertain {
+            modified_paths.extend(prepared.target_paths.iter().cloned());
+        }
         let finalization_us =
             u64::try_from(finalization_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let outcome = ToolExecutionOutcome {
             result,
             receipt: ToolExecutionReceipt {
+                effects_uncertain,
                 dependencies,
                 mutations,
                 modified_paths,
@@ -637,13 +832,17 @@ impl ToolRegistry {
                 execution_us,
                 finalization_us,
                 synced_text,
+                process,
+                presentation,
             },
         };
-        if outcome.result.success && !outcome.receipt.modified_paths.is_empty() {
+        if (outcome.result.success || effects_uncertain)
+            && !outcome.receipt.modified_paths.is_empty()
+        {
             self.invalidate_cached_evidence_for_paths(&outcome.receipt.modified_paths);
         }
         self.store_cached_evidence(prepared, &outcome);
-        outcome
+        with_admission_feedback(outcome, &prepared.admission_notes)
     }
 
     fn lookup_cached_evidence(
@@ -659,12 +858,19 @@ impl ToolRegistry {
         {
             return None;
         }
-        let cache = lock_mutex(&self.services.evidence_cache);
-        let entry = cache
-            .iter()
-            .find(|entry| entry.fingerprint == prepared.canonical_fingerprint)?;
-        if !entry
-            .outcome
+        // Retain the candidate, then release the shared cache before filesystem
+        // validation and copying the output. Independent reads must not serialize
+        // their I/O behind this mutex. This is still a fresh validation per hit.
+        let outcome = {
+            let cache = lock_mutex(&self.services.evidence_cache);
+            Arc::clone(
+                &cache
+                    .iter()
+                    .find(|entry| entry.fingerprint == prepared.canonical_fingerprint)?
+                    .outcome,
+            )
+        };
+        if !outcome
             .receipt
             .dependencies
             .iter()
@@ -672,7 +878,7 @@ impl ToolRegistry {
         {
             return None;
         }
-        Some(reused_evidence(entry.outcome.clone()))
+        Some(reused_evidence((*outcome).clone()))
     }
 
     fn store_cached_evidence(
@@ -689,15 +895,16 @@ impl ToolRegistry {
         {
             return;
         }
+        let entry = CachedEvidence {
+            fingerprint: prepared.canonical_fingerprint.clone(),
+            outcome: Arc::new(outcome.clone()),
+        };
         let mut cache = lock_mutex(&self.services.evidence_cache);
         cache.retain(|entry| entry.fingerprint != prepared.canonical_fingerprint);
         if cache.len() >= MAX_EVIDENCE_CACHE {
             cache.pop_front();
         }
-        cache.push_back(CachedEvidence {
-            fingerprint: prepared.canonical_fingerprint.clone(),
-            outcome: outcome.clone(),
-        });
+        cache.push_back(entry);
     }
 
     fn invalidate_cached_evidence_for_paths(&self, paths: &[PathBuf]) {
@@ -734,14 +941,25 @@ impl ToolRegistry {
             &path,
             *offset,
             *max_lines,
+            false,
             cancellation,
         )?;
+        let presentation = Some(ToolPresentationSource::Read {
+            prefix: String::new(),
+            full: page.output.clone(),
+            first: page.first_line,
+            records: page.records.clone(),
+            next_offset: page.next_offset,
+        });
         Ok(ExecutedTool {
+            success: true,
             output: page.output,
             dependencies: vec![page.dependency],
             mutations: Vec::new(),
             bytes_read: page.bytes_read,
             synced_text: None,
+            process: None,
+            presentation,
         })
     }
 
@@ -769,11 +987,20 @@ impl ToolRegistry {
             cursor.as_deref(),
             cancellation,
         )?;
+        let presentation = Some(ToolPresentationSource::List {
+            prefix: String::new(),
+            page: page.clone(),
+            display_root: prepared.canonical_workspace.clone(),
+        });
         let page_len = page.entries.len();
         let mut output = page
             .entries
             .iter()
-            .map(|entry| entry.display().to_string())
+            .map(|entry| {
+                search::display_path(&prepared.canonical_workspace, entry)
+                    .display()
+                    .to_string()
+            })
             .collect::<Vec<_>>()
             .join("\n");
         if let Some(cursor) = page.next_cursor {
@@ -787,11 +1014,14 @@ impl ToolRegistry {
             ));
         }
         Ok(ExecutedTool {
+            success: true,
             output,
             dependencies: vec![page.dependency],
             mutations: Vec::new(),
             bytes_read: page.bytes_read,
             synced_text: None,
+            process: None,
+            presentation,
         })
     }
 
@@ -801,6 +1031,7 @@ impl ToolRegistry {
         cancellation: Option<&CancellationToken>,
     ) -> Result<ExecutedTool, ToolExecutionError> {
         let PreparedToolArguments::Search {
+            context_lines,
             patterns,
             offset,
             max_hits,
@@ -816,18 +1047,29 @@ impl ToolRegistry {
         let page = self.services.search.page(
             &path,
             patterns.clone(),
-            *offset,
-            *max_hits,
+            search::SearchPageOptions {
+                offset: *offset,
+                max_hits: *max_hits,
+                context_lines: *context_lines,
+            },
             cursor.as_deref(),
             cancellation,
         )?;
         let output = search::format_search_batch_page(&page, &prepared.canonical_workspace);
+        let presentation = Some(ToolPresentationSource::Search {
+            prefix: String::new(),
+            page: page.clone(),
+            display_root: prepared.canonical_workspace.clone(),
+        });
         Ok(ExecutedTool {
+            success: true,
             output,
             dependencies: vec![page.dependency],
             mutations: Vec::new(),
             bytes_read: page.bytes_read,
             synced_text: None,
+            process: None,
+            presentation,
         })
     }
 
@@ -835,6 +1077,7 @@ impl ToolRegistry {
         &self,
         prepared: &PreparedToolInvocation,
         cancellation: Option<&CancellationToken>,
+        on_progress: &mut impl FnMut(ToolExecutionProgress),
     ) -> Result<ExecutedTool, ToolExecutionError> {
         let PreparedToolArguments::Write { content, expected } = &prepared.arguments else {
             return Err(ToolError::InvalidInput {
@@ -843,25 +1086,87 @@ impl ToolRegistry {
             .into());
         };
         let path = prepared_path(prepared)?;
-        let precondition = expected.clone().map(FilePrecondition::ExactText);
+        if expected.is_none()
+            && fs::metadata(&path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            self.services.read.invalidate(&path);
+            self.invalidate_cached_evidence_for_paths(std::slice::from_ref(&path));
+        }
+        let precondition = expected
+            .clone()
+            .map(FilePrecondition::ExactText)
+            .or_else(|| {
+                self.services
+                    .read
+                    .complete_digest(&path)
+                    .map(FilePrecondition::ObservedDigest)
+            });
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Err(ToolError::Cancelled.into());
         }
-        let written = write::write_file_with_receipt(&path, content, precondition)?;
-        self.services.read.invalidate(&path);
+        let written = match write::write_file_with_receipt(
+            &path,
+            content,
+            precondition,
+            cancellation,
+            &mut || {
+                on_progress(ToolExecutionProgress {
+                    preview: "Waiting for file lock".into(),
+                })
+            },
+        ) {
+            Ok(written) => written,
+            Err(failure) => {
+                if matches!(
+                    &failure.error,
+                    ToolError::StaleRead { .. } | ToolError::PreconditionRequired { .. }
+                ) {
+                    self.services.read.invalidate(&path);
+                    self.invalidate_cached_evidence_for_paths(std::slice::from_ref(&path));
+                }
+                return Err(failure);
+            }
+        };
+        if written.before.is_some() {
+            self.services
+                .read
+                .remember_complete_digest(&path, written.written_digest);
+        } else {
+            self.services.read.invalidate(&path);
+        }
+        let display = path
+            .strip_prefix(&prepared.canonical_workspace)
+            .unwrap_or(&path);
         Ok(ExecutedTool {
-            output: "written".into(),
+            success: true,
+            output: format!(
+                "written {}; bytes={}; sha256={}; exists=true; do not re-read{}",
+                display.display(),
+                written.after.len,
+                written.written_sha256_12,
+                written
+                    .recovery_note
+                    .as_ref()
+                    .map(|note| format!("; {note}"))
+                    .unwrap_or_default()
+            ),
             dependencies: written.dependency.into_iter().collect(),
             mutations: vec![MutationObservation {
                 path,
-                before_content_digest: written
-                    .before
-                    .as_deref()
-                    .map(|value| digest_bytes(b"slim-written-content-v1", value.as_bytes())),
+                before_content_digest: if written.recovery_note.is_some() {
+                    None
+                } else {
+                    written
+                        .before
+                        .as_deref()
+                        .map(|value| digest_bytes(b"slim-written-content-v1", value.as_bytes()))
+                },
                 after: written.after,
             }],
             bytes_read: written.bytes_read,
             synced_text: None,
+            process: None,
+            presentation: None,
         })
     }
 
@@ -869,12 +1174,9 @@ impl ToolRegistry {
         &self,
         prepared: &PreparedToolInvocation,
         cancellation: Option<&CancellationToken>,
+        on_progress: &mut impl FnMut(ToolExecutionProgress),
     ) -> Result<ExecutedTool, ToolExecutionError> {
-        let PreparedToolArguments::Patch {
-            expected,
-            replacement,
-        } = &prepared.arguments
-        else {
+        let PreparedToolArguments::Patch { edits } = &prepared.arguments else {
             return Err(ToolError::InvalidInput {
                 message: "prepared arguments do not match patch".into(),
             }
@@ -884,19 +1186,36 @@ impl ToolRegistry {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Err(ToolError::Cancelled.into());
         }
-        let content = patch::apply_exact_patch_with_content(&path, expected, replacement)?;
-        self.services.read.invalidate(&path);
+        let content =
+            patch::apply_exact_patches_with_content(&path, edits, cancellation, &mut || {
+                on_progress(ToolExecutionProgress {
+                    preview: "Waiting for file lock".into(),
+                })
+            })?;
+        self.services
+            .read
+            .remember_complete_digest(&path, write::content_sha256(content.text.as_bytes()));
         let before_digest = content.before_digest;
         Ok(ExecutedTool {
-            output: "patched".into(),
+            success: true,
+            output: content.summary,
             dependencies: vec![content.dependency],
             mutations: vec![MutationObservation {
                 path,
-                before_content_digest: Some(before_digest),
+                before_content_digest: (!content.displaced_version_preserved)
+                    .then(|| before_digest.clone()),
                 after: content.stamp,
             }],
             bytes_read: content.bytes_read,
-            synced_text: Some(content.text),
+            synced_text: Some(crate::codeintel::CodeIntelFileUpdate {
+                text: content.text,
+                patch: content.edits.map(|edits| crate::codeintel::CodeIntelPatch {
+                    before_digest,
+                    edits,
+                }),
+            }),
+            process: None,
+            presentation: None,
         })
     }
 
@@ -908,6 +1227,7 @@ impl ToolRegistry {
     ) -> Result<ExecutedTool, ToolExecutionError> {
         let PreparedToolArguments::Shell {
             command,
+            args,
             timeout_ms,
         } = &prepared.arguments
         else {
@@ -916,12 +1236,19 @@ impl ToolRegistry {
             }
             .into());
         };
-        let result = shell::run_shell_timeout_cancellable_with_progress_and_runner(
+        let result = shell::run_shell_timeout_cancellable_with_progress_and_runner_with_budget(
             &self.services.process_runner,
             &prepared.canonical_workspace,
-            command,
+            match args {
+                Some(args) => shell::ShellInvocation::Program {
+                    executable: command,
+                    args,
+                },
+                None => shell::ShellInvocation::Script(command),
+            },
             std::time::Duration::from_millis(*timeout_ms),
             cancellation,
+            ProcessOutputBudget::per_stream(SHELL_STREAM_CAP_BYTES),
             |progress| {
                 let line = if progress.last_line.is_empty() {
                     "no output yet"
@@ -936,7 +1263,8 @@ impl ToolRegistry {
                 });
             },
         )?;
-        Ok(ExecutedTool::output(format!(
+        let success = result.output.status.success() && !result.timed_out && !result.cancelled;
+        let mut output = format!(
             "{}\nstdout:\n{}stderr:\n{}",
             format_shell_status_header(
                 result.output.status.code(),
@@ -945,7 +1273,25 @@ impl ToolRegistry {
             ),
             cap_shell_stream(&result.output.stdout, result.stdout_discarded_bytes),
             cap_shell_stream(&result.output.stderr, result.stderr_discarded_bytes),
-        )))
+        );
+        if result.output.status.code().is_some_and(|code| code != 0)
+            && !result.timed_out
+            && !result.cancelled
+            && result
+                .output
+                .stderr
+                .iter()
+                .all(|byte| byte.is_ascii_whitespace())
+        {
+            output.push_str(
+                "\n[note: nonzero exit with empty stderr — empty stderr does not imply success; \
+                 if this was a grep/diff/--check-style command, its nonzero status may mean \
+                 \"no match\"/\"diffs exist\"; otherwise this remains a failed process; \
+                 judge by stdout and documented status semantics]",
+            );
+        }
+        let process = Some(result.execution_facts());
+        Ok(ExecutedTool::output(output, success).with_process(process))
     }
 }
 
@@ -1017,29 +1363,30 @@ fn cap_shell_stream(raw: &[u8], previously_discarded_bytes: usize) -> String {
 fn tool_definition(name: &str) -> Value {
     let (description, properties, required) = match name {
         "read" => (
-            "Read a UTF-8 text file",
-            json!({"path": {"type": "string", "description": "Workspace-relative path."}, "max_lines": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LINES_CAP}, "offset": {"type": "integer", "minimum": 1}}),
+            "Read unchanged UTF-8 text. Omit `offset` for the first page (line 1): when both `max_lines` and its `lines` alias are omitted, a file whose metadata length is at most 1 MiB minus 128 bytes gets up to 4096 lines; otherwise the omitted limit is 200 lines. Pages starting later default to 200 lines. Pass either `max_lines` or `lines` (1..4096) for an explicit page size. Example: `{\"path\":\"src/lib.rs\",\"max_lines\":20}`. Prefer search+patch for a local edit; a complete read authorizes write without repeating expected. A successful overwrite or patch of that path does too.",
+            json!({"path": {"type": "string", "description": "Workspace-relative path."}, "max_lines": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LINES_CAP, "description": "Canonical page-size field; omit to use the default for this offset."}, "lines": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LINES_CAP, "description": "Alias for `max_lines`."}, "offset": {"type": "integer", "minimum": 1, "description": "First line (1-based); omit for line 1."}}),
             json!(["path"]),
         ),
         "list" => (
-            "List directory entries with bounded pagination",
+            "List directory pages. Inspect .slim runtime/config files only when relevant.",
             json!({
-                "path": {"type": "string", "description": "Workspace-relative path. Omit, leave empty, or use \".\" for the workspace root."},
+                "path": {"type": "string", "description": "Workspace-relative; default root."},
                 "max_entries": {"type": "integer", "minimum": 1, "maximum": MAX_ENTRIES_CAP},
                 "offset": {"type": "integer", "minimum": 1},
-                "cursor": {"type": "string", "description": "Opaque cursor from the previous page. Omit or leave empty to start a new list."}
+                "cursor": {"type": "string", "description": "Resume cursor; omit/empty to start."}
             }),
             json!([]),
         ),
         "search" => (
-            "Search UTF-8 files for literal text; pass exactly one of query or patterns. Multiple patterns share one scan and each hit identifies its pattern. Results use snapshot cursors.",
+            "Literal UTF-8 search: query or patterns, exclusively. Patterns share a scan; hits group under a [path] header, `N:` marks a hit line and `N-` context. A unique hit line is enough for patch.expected—copy only the text after `N: `, never line numbers, [path] headers or [pattern] labels. Raise context_lines when that line is not unique; values above 3 saturate at 3 and report an admission note. Omit or pass 0 to locate; join context lines with \\n and omit the N:/N- prefixes. A hit that contains [truncated] is not expected—narrow path or query. Cursors preserve historical snapshots; repeat path/query/context_lines.",
             json!({
                 "path": {"type": "string", "description": "Workspace-relative path."},
                 "query": {"type": "string"},
                 "patterns": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 32},
+                "context_lines": {"type": "integer", "minimum": 0, "default": 0, "description": "Lines before/after each hit in the same scan when the hit line is not unique. Omit or 0 to locate; values above 3 saturate at 3 with an admission note. Does not count as a full-file read for write."},
                 "max_hits": {"type": "integer", "minimum": 1, "maximum": MAX_HITS_CAP},
                 "offset": {"type": "integer", "minimum": 1},
-                "cursor": {"type": "string", "description": "Opaque cursor returned by the previous page."}
+                "cursor": {"type": "string", "description": "Previous page cursor."}
             }),
             json!([]),
         ),
@@ -1053,31 +1400,51 @@ fn tool_definition(name: &str) -> Value {
             });
         }
         "write" => (
-            "Write a UTF-8 text file",
-            json!({"path": {"type": "string", "description": "Workspace-relative path."}, "content": {"type": "string"}, "expected": {"type": "string"}}),
+            "Write a whole UTF-8 file; create parents. Prefer patch for a local edit. Create: omit expected. Overwrite: pass expected as the current full file, or omit it after a complete read or a successful overwrite/patch of that path. A failed overwrite includes the current file when it fits; retry with that expected or patch—do not re-read. A successful write needs no confirmation read; a successful overwrite authorizes the next write to omit expected. Create does not. Independent writes to different paths may share one turn. Do not send a large expected for a local change. Changes since expected/read reject the write.",
+            json!({
+                "path": {"type": "string", "description": "Workspace-relative path."},
+                "content": {"type": "string"},
+                "expected": {
+                    "type": ["string", "null"],
+                    "description": "Current full-file text for an optimistic overwrite. Omit or null to create, or after a complete read or a successful overwrite/patch of that path. LF matches uniform CRLF."
+                }
+            }),
             json!(["path", "content"]),
         ),
         "patch" => (
-            "Replace one exact text occurrence in a file",
-            json!({"path": {"type": "string", "description": "Workspace-relative path."}, "expected": {"type": "string"}, "replacement": {"type": "string"}}),
-            json!(["path", "expected", "replacement"]),
+            "Preferred for local code edits. Atomic ordered edits. Use either the `edits` array or the legacy top-level `expected` + `replacement` pair, never both. Each expected is a unique raw file substring—copy search hit/context TEXT only, never line numbers (`N:`/`N-`), [path] headers, [pattern] labels, or [truncated] markers. A unique context_lines=0 line is enough. Search with context_lines is enough—no complete read. A failed patch with no match includes the current file when it fits; retry with a unique excerpt—do not re-read. A successful patch needs no confirmation read and authorizes a later write to omit expected. Independent patches to different paths may share one turn. LF matches uniform CRLF. Failure leaves the file unchanged.",
+            json!({"path": {"type": "string", "description": "Workspace-relative path."}, "edits": {"type": "array", "minItems": 1, "maxItems": patch::MAX_PATCH_EDITS, "items": {"type": "object", "properties": {"expected": {"type": "string", "minLength": 1, "description": "Unique raw file substring. Copy the text after `N: `/`N- ` in search output, or verbatim from a read; join context lines with \\n."}, "replacement": {"type": "string"}}, "required": ["expected", "replacement"], "additionalProperties": false}}, "expected": {"type": "string", "minLength": 1, "description": "Legacy unique raw file substring."}, "replacement": {"type": "string", "description": "Legacy replacement text."}}),
+            json!(["path"]),
         ),
         "shell" => (
-            "Run a shell command in the workspace. Default timeout is 30000 ms; use longer values only for deliberate builds or tests.",
-            json!({"command": {"type": "string"}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_MS, "default": 30000, "description": "Maximum runtime in milliseconds."}}),
+            "Run in workspace. Script form (`args` omitted or null) always executes through PowerShell without a profile, preserving native exit codes; pass the command text in `command`, never a JSON tool payload. Program form (`args` supplied, including an empty array) runs the executable directly with literal arguments; `.bat` and `.cmd` keep their own interpreter semantics. Direct example: `{\"command\":\"git\",\"args\":[\"status\",\"--short\"]}`. Exit status describes the process, not every suboperation or task verification. Use workspace metadata before git status/diff; they need a Git repository unless using explicit --no-index. Do not use git status/diff as code validation. Use file tools for code edits. `timeout_ms` must be 1..120000; invalid values are rejected. Raise timeout only for deliberate builds/tests.",
+            json!({"command": {"type": "string"}, "args": {"type": ["array", "null"], "items": {"type": "string"}}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_MS, "default": 30000}}),
             json!(["command"]),
         ),
         _ => ("Slim tool", json!({}), json!([])),
     };
+    let mut input_schema = json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false
+    });
+    if name == "patch" {
+        input_schema["oneOf"] = json!([
+            {
+                "required": ["edits"],
+                "not": {"anyOf": [{"required": ["expected"]}, {"required": ["replacement"]}]}
+            },
+            {
+                "required": ["expected", "replacement"],
+                "not": {"required": ["edits"]}
+            }
+        ]);
+    }
     json!({
         "name": name,
         "description": description,
-        "input_schema": {
-            "type": "object",
-            "properties": properties,
-            "required": required,
-            "additionalProperties": false
-        }
+        "input_schema": input_schema
     })
 }
 
@@ -1171,8 +1538,8 @@ fn tool_error_message(error: ToolError) -> String {
     match error {
         ToolError::Io { message } => format!("io error: {message}"),
         ToolError::Cancelled => "tool cancelled before side effect".into(),
-        ToolError::StaleRead { path } => format!("stale read: {path}"),
-        ToolError::PreconditionRequired { path } => format!("precondition required: {path}"),
+        ToolError::StaleRead { path } => format!("stale read: {path}; the precondition differs from current bytes. Retry write with expected set to the current file below, or patch an exact current excerpt. No write applied."),
+        ToolError::PreconditionRequired { path } => format!("precondition required: {path}; pass expected as the current full file below, or use patch with a unique excerpt. No write applied."),
         ToolError::MatchCount { count } => format!("expected exactly one match, got {count}"),
         ToolError::InvalidInput { message } => message,
     }
@@ -1180,23 +1547,129 @@ fn tool_error_message(error: ToolError) -> String {
 
 #[cfg(test)]
 mod timeout_bound_tests {
-    use super::{bounded_shell_timeout_ms, tool_definition, MAX_SHELL_TIMEOUT_MS};
+    use super::{
+        admission_output_prefix, summarize_tool_arguments_for, tool_definition,
+        ADMISSION_OUTPUT_PREFIX_BYTES, MAX_SHELL_TIMEOUT_MS,
+    };
+    use serde_json::json;
 
     #[test]
-    fn shell_timeout_is_clamped_and_advertised() {
-        assert_eq!(bounded_shell_timeout_ms(1), 1);
-        assert_eq!(
-            bounded_shell_timeout_ms(MAX_SHELL_TIMEOUT_MS),
-            MAX_SHELL_TIMEOUT_MS
-        );
-        assert_eq!(
-            bounded_shell_timeout_ms(MAX_SHELL_TIMEOUT_MS + 1),
-            MAX_SHELL_TIMEOUT_MS
-        );
-        assert_eq!(bounded_shell_timeout_ms(u64::MAX), MAX_SHELL_TIMEOUT_MS);
+    fn shell_timeout_is_bounded_and_advertised() {
         assert_eq!(
             tool_definition("shell")["input_schema"]["properties"]["timeout_ms"]["maximum"],
             MAX_SHELL_TIMEOUT_MS
+        );
+        assert!(
+            summarize_tool_arguments_for("shell", r#"{"command":"echo","timeout_ms":1}"#)
+                .contains("limit 1ms")
+        );
+        assert!(
+            summarize_tool_arguments_for("shell", r#"{"command":"echo","timeout_ms":120001}"#)
+                .contains("command=echo")
+        );
+        assert!(!summarize_tool_arguments_for(
+            "shell",
+            r#"{"command":"echo","timeout_ms":120001}"#
+        )
+        .contains("limit 120s"));
+    }
+
+    #[test]
+    fn admission_feedback_is_bounded_in_bytes() {
+        let notes = vec!["ação ".repeat(256)];
+        let prefix = admission_output_prefix(&notes).expect("feedback");
+        assert!(prefix.len() <= ADMISSION_OUTPUT_PREFIX_BYTES);
+        assert!(prefix.starts_with("[admission: "));
+        assert!(prefix.ends_with("]\n"));
+    }
+
+    #[test]
+    fn shell_consumer_budget_preserves_rendered_bytes_and_discard_counts() {
+        let bytes = (0..9 * 1024 * 1024 + 3)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        // This composition exercises the real renderer, including invalid
+        // UTF-8 at the cut. The manual runner test checks actual pipe capture.
+        let retain = |source: &[u8], budget: usize| {
+            let size = source.len().min(budget);
+            let head = size.div_ceil(2);
+            let tail = size - head;
+            let mut retained = source[..head].to_vec();
+            retained.extend_from_slice(&source[source.len() - tail..]);
+            (retained, source.len() - size)
+        };
+        for size in [
+            0, 1, 4095, 4096, 4097, 8191, 8192, 8193, 16383, 16384, 16385, 1_048_576, 8_388_607,
+            8_388_608, 8_388_609, 9_437_187,
+        ] {
+            let source = &bytes[..size];
+            let (old, old_discarded) = retain(source, 8 * 1024 * 1024);
+            let (native, native_discarded) = retain(source, super::SHELL_STREAM_CAP_BYTES);
+            assert_eq!(
+                super::cap_shell_stream(&old, old_discarded),
+                super::cap_shell_stream(&native, native_discarded),
+                "presentation differs at {size} source bytes",
+            );
+        }
+    }
+
+    #[test]
+    fn search_and_patch_schemas_teach_raw_expected_without_a_safety_read() {
+        let search = tool_definition("search");
+        let context = search["input_schema"]["properties"]["context_lines"]["description"]
+            .as_str()
+            .expect("context_lines description");
+        assert!(context.contains("hit line is not unique"), "{context}");
+        assert!(
+            !context.to_ascii_lowercase().contains("use read"),
+            "{context}"
+        );
+        assert_eq!(
+            search["input_schema"]["properties"]["context_lines"]["default"],
+            0
+        );
+        assert!(
+            search["input_schema"]["properties"]["context_lines"]
+                .get("maximum")
+                .is_none(),
+            "context_lines schema should describe saturation instead of rejecting values"
+        );
+        let search_description = search["description"].as_str().expect("search description");
+        assert!(
+            search_description.contains("copy only the text after `N: `"),
+            "{search_description}"
+        );
+        assert!(
+            !search_description.to_ascii_lowercase().contains("use read"),
+            "{search_description}"
+        );
+
+        let patch = tool_definition("patch");
+        let expected = patch["input_schema"]["properties"]["edits"]["items"]["properties"]
+            ["expected"]["description"]
+            .as_str()
+            .expect("patch.expected description");
+        assert!(expected.contains("raw file substring"), "{expected}");
+        assert!(expected.contains("`N: `"), "{expected}");
+        let patch_description = patch["description"].as_str().expect("patch description");
+        assert!(
+            patch_description.contains("never line numbers"),
+            "{patch_description}"
+        );
+        assert!(
+            patch_description.contains("[truncated]"),
+            "{patch_description}"
+        );
+        assert!(
+            patch_description.contains("no complete read"),
+            "{patch_description}"
+        );
+        assert_eq!(patch["input_schema"]["required"], json!(["path"]));
+        assert_eq!(
+            patch["input_schema"]["oneOf"]
+                .as_array()
+                .map(|branches| branches.len()),
+            Some(2)
         );
     }
 }
@@ -1205,6 +1678,50 @@ mod timeout_bound_tests {
 mod evidence_cache_tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn replacing_a_file_with_equal_size_and_mtime_invalidates_read_evidence() {
+        let root = std::env::temp_dir().join(format!(
+            "slim-evidence-replacement-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("mkdir");
+        let path = root.join("data.txt");
+        fs::write(&path, "alpha\n").expect("write");
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let registry = ToolRegistry::default();
+        let read = || {
+            registry.execute(
+                OperatingMode::ReadOnly,
+                &root,
+                "read",
+                r#"{"path":"data.txt"}"#,
+            )
+        };
+        assert_eq!(read().output, "alpha\n");
+        fs::rename(&path, root.join("old.txt")).expect("retain original inode");
+        fs::write(&path, "bravo\n").expect("replace");
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        let result = read();
+        assert!(result.success, "{}", result.output);
+        assert_eq!(result.output, "bravo\n");
+        fs::remove_file(&path).unwrap();
+        assert!(
+            !read().success,
+            "removed files must not replay cached evidence"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn matching_read_reuses_cached_evidence_until_stamp_changes() {

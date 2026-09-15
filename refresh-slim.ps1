@@ -7,7 +7,7 @@
     O comando `slim` disponivel no terminal aponta para
     C:\Users\User\bin\Slim.exe — uma COPIA ESTATICA do binario, que NAO
     acompanha o codigo automaticamente. Este script e a unica forma
-    suportada de build+deploy (regra obrigatoria em AGENTS.md):
+    suportada de build+deploy quando o deploy estiver autorizado (AGENTS.md):
 
         .\refresh-slim.ps1          build release + copia + smoke test
         .\refresh-slim.ps1 -Test    idem, rodando cargo test --workspace antes

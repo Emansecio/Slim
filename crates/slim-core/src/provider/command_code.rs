@@ -9,7 +9,7 @@ use super::{
 
 pub const COMMANDCODE_BASE_URL: &str = "https://api.commandcode.ai/provider/v1";
 pub const COMMANDCODE_MODELS_URL: &str = "https://api.commandcode.ai/provider/v1/models";
-pub const COMMANDCODE_DEFAULT_MODEL: &str = "deepseek/deepseek-v4-flash";
+pub const COMMANDCODE_DEFAULT_MODEL: &str = "deepseek/deepseek-v4.1-flash";
 
 const MAX_CATALOG_BYTES: usize = 1024 * 1024;
 const MAX_CATALOG_ENTRIES: usize = 256;
@@ -35,19 +35,128 @@ pub struct CommandCodeCatalogEntry {
     pub context_window: u64,
 }
 
+// Fallback registry mirrored from GET /provider/v1/models on 2026-09-12
+// (69 entries, live order). The live catalog and its on-disk cache are the
+// sources of truth at runtime; this list keeps offline startup and
+// context-window lookups honest when neither is available.
 const MODELS: &[CommandCodeModel] = &[
+    model("claude-sonnet-5", "Claude Sonnet 5", 1_000_000),
     model("claude-sonnet-4-6", "Claude Sonnet 4.6", 1_000_000),
+    model("claude-fable-5-1", "Claude Fable 5.1", 1_000_000),
+    model("claude-fable-5", "Claude Fable 5", 1_000_000),
+    model("claude-opus-5", "Claude Opus 5", 1_000_000),
+    model("claude-opus-4-8", "Claude Opus 4.8", 1_000_000),
     model("claude-opus-4-7", "Claude Opus 4.7", 1_000_000),
+    model("claude-haiku-4-5-20251001", "Claude Haiku 4.5", 200_000),
     model("gpt-5.6-sol", "GPT-5.6 Sol", 1_050_000),
-    model("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", 1_000_000),
-    model("deepseek/deepseek-v4-pro", "DeepSeek V4 Pro", 1_000_000),
+    model("gpt-5.6-terra", "GPT-5.6 Terra", 1_050_000),
+    model("gpt-5.6-luna", "GPT-5.6 Luna", 1_050_000),
+    model("gpt-5.5", "GPT-5.5", 400_000),
+    model("gpt-5.4", "GPT-5.4", 400_000),
+    model("gpt-5.3-codex", "GPT-5.3 Codex", 400_000),
+    model("gpt-5.4-mini", "GPT-5.4 Mini", 400_000),
+    model(
+        "deepseek/deepseek-v4-pro",
+        "DeepSeek V4 Pro (latest)",
+        1_000_000,
+    ),
+    model(
+        "deepseek/deepseek-v4-flash",
+        "DeepSeek V4 Flash (latest)",
+        1_000_000,
+    ),
+    model(
+        "deepseek/deepseek-v4-flash-vision-exp",
+        "DeepSeek V4 Flash Vision (exp)",
+        1_000_000,
+    ),
+    model(
+        "deepseek/deepseek-v4-flash-fast",
+        "DeepSeek V4 Flash Fast",
+        1_000_000,
+    ),
+    model(
+        "deepseek/deepseek-v4.1-flash",
+        "DeepSeek V4.1 Flash",
+        1_000_000,
+    ),
+    model("moonshotai/Kimi-K3", "Kimi K3", 1_000_000),
     model("moonshotai/Kimi-K2.7-Code", "Kimi K2.7 Code", 256_000),
+    model(
+        "moonshotai/Kimi-K2.7-Code-Highspeed",
+        "Kimi K2.7 Code HighSpeed",
+        262_000,
+    ),
+    model("moonshotai/Kimi-K2.6", "Kimi K2.6", 256_000),
+    model("moonshotai/Kimi-K2.5", "Kimi K2.5", 256_000),
+    model("z-ai/glm-5.3-flash", "GLM-5.3 Flash", 1_048_576),
     model("zai-org/GLM-5.3", "GLM-5.3", 1_000_000),
+    model("zai-org/GLM-5.2", "GLM-5.2", 1_000_000),
+    model("zai-org/GLM-5.2-Fast", "GLM-5.2 Fast", 1_000_000),
+    model("zai-org/GLM-5.1", "GLM-5.1", 200_000),
+    model("zai-org/GLM-5", "GLM-5", 200_000),
     model("MiniMaxAI/MiniMax-M3", "MiniMax M3", 1_000_000),
+    model("MiniMaxAI/MiniMax-M2.7", "MiniMax M2.7", 200_000),
+    model("MiniMaxAI/MiniMax-M2.5", "MiniMax M2.5", 200_000),
+    model("xiaomi/mimo-v2.5-pro", "MiMo V2.5 Pro", 1_000_000),
     model("xiaomi/mimo-v2.5", "MiMo V2.5", 1_000_000),
+    model("Qwen/Qwen3.8-Max-0902", "Qwen 3.8 Max 0902", 1_000_000),
+    model("Qwen/Qwen3.8-Max", "Qwen 3.8 Max", 1_000_000),
+    model("Qwen/Qwen3.8-27B", "Qwen 3.8 27B", 262_144),
+    model("Qwen/Qwen3.8-Flash", "Qwen 3.8 Flash", 1_000_000),
     model("Qwen/Qwen3.7-Max", "Qwen 3.7 Max", 1_000_000),
+    model("Qwen/Qwen3.7-Plus", "Qwen 3.7 Plus", 1_000_000),
+    model("Qwen/Qwen3.7-Flash", "Qwen 3.7 Flash", 1_000_000),
+    model("Qwen/Qwen3.6-Max-Preview", "Qwen 3.6 Max Preview", 200_000),
+    model("Qwen/Qwen3.6-Plus", "Qwen 3.6 Plus", 200_000),
+    model("meituan/LongCat-2.0:free", "LongCat 2.0", 1_048_576),
+    model("stepfun/Step-3.7-Flash", "Step 3.7 Flash", 256_000),
+    model("stepfun/Step-3.5-Flash", "Step 3.5 Flash", 1_000_000),
+    model("tencent/hy3-paid", "Tencent Hy3", 262_144),
+    model("tencent/hy4-preview", "Tencent Hy4 Preview", 1_048_576),
+    model("google/gemini-3.8-flash", "Gemini 3.8 Flash", 1_000_000),
     model("google/gemini-3.7-flash", "Gemini 3.7 Flash", 1_048_576),
-    model("stealth/ox-alpha", "Ox Alpha", 1_048_576),
+    model("google/gemini-3.6-flash", "Gemini 3.6 Flash", 1_000_000),
+    model("google/gemini-3.5-flash", "Gemini 3.5 Flash", 1_000_000),
+    model(
+        "google/gemini-3.5-flash-lite",
+        "Gemini 3.5 Flash Lite",
+        1_000_000,
+    ),
+    model(
+        "google/gemini-3.1-flash-lite",
+        "Gemini 3.1 Flash Lite",
+        1_000_000,
+    ),
+    model("sakana/fugu-ultra", "Fugu Ultra", 1_000_000),
+    model(
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "Nemotron 3 Ultra",
+        1_000_000,
+    ),
+    model("thinkingmachines/inkling", "Inkling", 256_000),
+    model("thinkingmachines/inkling-small", "Inkling Small", 1_000_000),
+    model("poolside/laguna-s-2.1-free", "Laguna S 2.1", 256_000),
+    model(
+        "inclusionai/ling-3.0-flash-sante:free",
+        "Ling 3.0 Flash Sante",
+        262_144,
+    ),
+    model("meta/muse-spark-1.1", "Muse Spark 1.1", 1_048_576),
+    model("meta/muse-spark-1.2", "Muse Spark 1.2", 1_048_576),
+    model(
+        "meta/muse-spark-1.2-contributor",
+        "Muse Spark 1.2 Contributor",
+        1_048_576,
+    ),
+    model("meta/muse-spark-1.3", "Muse Spark 1.3", 1_048_576),
+    model(
+        "meta/muse-spark-1.3-contributor",
+        "Muse Spark 1.3 Contributor",
+        1_048_576,
+    ),
+    model("xai/grok-4.5", "Grok 4.5", 500_000),
+    model("xai/grok-4.6", "Grok 4.6", 500_000),
 ];
 
 const fn model(id: &'static str, name: &'static str, context_window: u64) -> CommandCodeModel {
@@ -134,9 +243,9 @@ pub fn parse_command_code_catalog(
 fn validate_model_id(id: &str) -> Result<(), ()> {
     if id.is_empty()
         || id.len() > MAX_MODEL_ID_BYTES
-        || !id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-'))
+        || !id.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-' | b':')
+        })
     {
         Err(())
     } else {
@@ -209,11 +318,15 @@ impl CommandCodeAdapter {
                 WireAdapter::Chat(OpenAiCompatibleAdapter::new(config)?)
             }
             CommandCodeApi::AnthropicMessages => {
-                WireAdapter::Messages(AnthropicAdapter::new(ProviderConfig::anthropic_bearer(
+                let mut config = ProviderConfig::anthropic_bearer(
                     protocol_url(endpoint, "messages"),
                     model,
                     api_key,
-                ))?)
+                );
+                if let Some(effort) = reasoning_effort {
+                    config = config.with_reasoning_effort(effort);
+                }
+                WireAdapter::Messages(AnthropicAdapter::new(config)?)
             }
         };
         Ok(Self {
@@ -228,6 +341,38 @@ impl CommandCodeAdapter {
         match &mut self.wire {
             WireAdapter::Chat(adapter) => adapter.set_system_prompt(prompt),
             WireAdapter::Messages(adapter) => adapter.set_system_prompt(prompt),
+        }
+        self
+    }
+
+    pub fn with_response_cache_scope_id(mut self, id: u64) -> Self {
+        match &mut self.wire {
+            WireAdapter::Chat(adapter) => adapter.set_response_cache_scope_id(id),
+            WireAdapter::Messages(adapter) => adapter.set_response_cache_scope_id(id),
+        }
+        self
+    }
+
+    pub fn with_max_output_tokens(mut self, tokens: u32) -> Self {
+        match &mut self.wire {
+            WireAdapter::Chat(adapter) => adapter.config.max_output_tokens = tokens.max(1),
+            WireAdapter::Messages(adapter) => adapter.config.max_output_tokens = tokens.max(1),
+        }
+        self
+    }
+
+    /// Sends `x-cmd-zdr: 1` on every request, opting into Command Code's
+    /// zero-data-retention routing. Upstreams without ZDR capacity answer 422
+    /// (`cmd_zdr_no_providers`) instead of falling back — the failure is
+    /// intentional and surfaces as an ordinary provider error.
+    pub fn with_zero_data_retention(mut self, enabled: bool) -> Self {
+        if enabled {
+            match &mut self.wire {
+                WireAdapter::Chat(adapter) => adapter.config.push_extra_header("x-cmd-zdr", "1"),
+                WireAdapter::Messages(adapter) => {
+                    adapter.config.push_extra_header("x-cmd-zdr", "1")
+                }
+            }
         }
         self
     }

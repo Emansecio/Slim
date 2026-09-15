@@ -150,6 +150,17 @@ pub enum EventKind {
         name: String,
         preview: String,
     },
+    /// Facts from the native process backing a tool call. These describe the
+    /// process boundary only; they do not determine the surrounding task's
+    /// semantic success.
+    ToolProcessFinished {
+        #[serde(default)]
+        batch_id: String,
+        #[serde(default)]
+        call_id: String,
+        name: String,
+        process: crate::process::ProcessExecutionFacts,
+    },
     ToolFinished {
         #[serde(default)]
         batch_id: String,
@@ -167,6 +178,14 @@ pub enum EventKind {
         emitted_bytes: u64,
         #[serde(default)]
         post_compaction: bool,
+    },
+    ToolEvidenceElided {
+        #[serde(default)]
+        count: u64,
+        #[serde(default)]
+        original_bytes: u64,
+        #[serde(default)]
+        emitted_bytes: u64,
     },
     ToolCallsSuppressed {
         #[serde(default)]

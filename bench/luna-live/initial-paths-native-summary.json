@@ -1,0 +1,526 @@
+{
+  "rows": [
+    {
+      "round": 1,
+      "scenario": "merge_ranges",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-135459Z",
+      "model_label": "luna",
+      "family": "native",
+      "passed": true,
+      "slim": 7665,
+      "pi": 8410,
+      "slim_calls": 4,
+      "pi_calls": 4
+    },
+    {
+      "round": 1,
+      "scenario": "repair_catalog",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-135551Z-repair_catalog",
+      "model_label": "luna",
+      "family": "native",
+      "passed": true,
+      "slim": 7793,
+      "pi": 10993,
+      "slim_calls": 4,
+      "pi_calls": 6
+    },
+    {
+      "round": 1,
+      "scenario": "json_cli",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-135644Z-json_cli",
+      "model_label": "luna",
+      "family": "native",
+      "passed": true,
+      "slim": 13301,
+      "pi": 12360,
+      "slim_calls": 5,
+      "pi_calls": 5
+    },
+    {
+      "round": 1,
+      "scenario": "js_pagination",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-135822Z-js_pagination",
+      "model_label": "luna",
+      "family": "native",
+      "passed": true,
+      "slim": 8035,
+      "pi": 12132,
+      "slim_calls": 4,
+      "pi_calls": 6
+    },
+    {
+      "round": 1,
+      "scenario": "ledger_audit",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-135916Z-ledger_audit",
+      "model_label": "luna",
+      "family": "native",
+      "passed": true,
+      "slim": 30437,
+      "pi": 17691,
+      "slim_calls": 8,
+      "pi_calls": 6
+    },
+    {
+      "round": 1,
+      "scenario": "config_migration",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-140030Z-config_migration",
+      "model_label": "luna",
+      "family": "native",
+      "passed": true,
+      "slim": 8322,
+      "pi": 9434,
+      "slim_calls": 4,
+      "pi_calls": 5
+    },
+    {
+      "round": 2,
+      "scenario": "merge_ranges",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-140126Z",
+      "model_label": "luna",
+      "family": "native",
+      "passed": true,
+      "slim": 8228,
+      "pi": 8710,
+      "slim_calls": 4,
+      "pi_calls": 4
+    },
+    {
+      "round": 2,
+      "scenario": "repair_catalog",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-140223Z-repair_catalog",
+      "model_label": "luna",
+      "family": "native",
+      "passed": true,
+      "slim": 7257,
+      "pi": 9850,
+      "slim_calls": 4,
+      "pi_calls": 5
+    },
+    {
+      "round": 2,
+      "scenario": "json_cli",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-140307Z-json_cli",
+      "model_label": "luna",
+      "family": "native",
+      "passed": true,
+      "slim": 46244,
+      "pi": 17003,
+      "slim_calls": 10,
+      "pi_calls": 6
+    },
+    {
+      "round": 2,
+      "scenario": "js_pagination",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-140540Z-js_pagination",
+      "model_label": "luna",
+      "family": "native",
+      "passed": true,
+      "slim": 7807,
+      "pi": 10428,
+      "slim_calls": 4,
+      "pi_calls": 5
+    },
+    {
+      "round": 2,
+      "scenario": "ledger_audit",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-140628Z-ledger_audit",
+      "model_label": "luna",
+      "family": "native",
+      "passed": true,
+      "slim": 16260,
+      "pi": 13860,
+      "slim_calls": 5,
+      "pi_calls": 5
+    },
+    {
+      "round": 2,
+      "scenario": "config_migration",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-140736Z-config_migration",
+      "model_label": "luna",
+      "family": "native",
+      "passed": true,
+      "slim": 8246,
+      "pi": 15133,
+      "slim_calls": 4,
+      "pi_calls": 6
+    },
+    {
+      "round": 1,
+      "scenario": "merge_ranges",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-135459Z-opencode-go",
+      "model_label": "deepseek",
+      "family": "native",
+      "passed": true,
+      "slim": 17926,
+      "pi": 19769,
+      "slim_calls": 5,
+      "pi_calls": 6
+    },
+    {
+      "round": 1,
+      "scenario": "repair_catalog",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-135537Z-opencode-go-repair_catalog",
+      "model_label": "deepseek",
+      "family": "native",
+      "passed": true,
+      "slim": 12573,
+      "pi": 14962,
+      "slim_calls": 4,
+      "pi_calls": 5
+    },
+    {
+      "round": 1,
+      "scenario": "json_cli",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-135616Z-opencode-go-json_cli",
+      "model_label": "deepseek",
+      "family": "native",
+      "passed": true,
+      "slim": 30436,
+      "pi": 19127,
+      "slim_calls": 7,
+      "pi_calls": 6
+    },
+    {
+      "round": 1,
+      "scenario": "js_pagination",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-135819Z-opencode-go-js_pagination",
+      "model_label": "deepseek",
+      "family": "native",
+      "passed": true,
+      "slim": 14816,
+      "pi": 16728,
+      "slim_calls": 4,
+      "pi_calls": 5
+    },
+    {
+      "round": 1,
+      "scenario": "ledger_audit",
+      "error": "Benchmark arm failed; inspect timing, native events and validation records.",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-135906Z-opencode-go-ledger_audit",
+      "model_label": "deepseek",
+      "family": "native",
+      "passed": false
+    },
+    {
+      "round": 1,
+      "scenario": "config_migration",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-135950Z-opencode-go-config_migration",
+      "model_label": "deepseek",
+      "family": "native",
+      "passed": true,
+      "slim": 16738,
+      "pi": 14471,
+      "slim_calls": 5,
+      "pi_calls": 5
+    },
+    {
+      "round": 2,
+      "scenario": "merge_ranges",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-140034Z-opencode-go",
+      "model_label": "deepseek",
+      "family": "native",
+      "passed": true,
+      "slim": 15071,
+      "pi": 21626,
+      "slim_calls": 4,
+      "pi_calls": 5
+    },
+    {
+      "round": 2,
+      "scenario": "repair_catalog",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-140143Z-opencode-go-repair_catalog",
+      "model_label": "deepseek",
+      "family": "native",
+      "passed": true,
+      "slim": 13206,
+      "pi": 14636,
+      "slim_calls": 4,
+      "pi_calls": 5
+    },
+    {
+      "round": 2,
+      "scenario": "json_cli",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-140215Z-opencode-go-json_cli",
+      "model_label": "deepseek",
+      "family": "native",
+      "passed": true,
+      "slim": 19067,
+      "pi": 24063,
+      "slim_calls": 5,
+      "pi_calls": 6
+    },
+    {
+      "round": 2,
+      "scenario": "js_pagination",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-140325Z-opencode-go-js_pagination",
+      "model_label": "deepseek",
+      "family": "native",
+      "passed": true,
+      "slim": 12385,
+      "pi": 14981,
+      "slim_calls": 4,
+      "pi_calls": 5
+    },
+    {
+      "round": 2,
+      "scenario": "ledger_audit",
+      "error": "Benchmark arm failed; inspect timing, native events and validation records.",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-140443Z-opencode-go-ledger_audit",
+      "model_label": "deepseek",
+      "family": "native",
+      "passed": false
+    },
+    {
+      "round": 2,
+      "scenario": "config_migration",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-140516Z-opencode-go-config_migration",
+      "model_label": "deepseek",
+      "family": "native",
+      "passed": true,
+      "slim": 15687,
+      "pi": 17533,
+      "slim_calls": 5,
+      "pi_calls": 6
+    },
+    {
+      "round": 1,
+      "scenario": "repo_wide_repair",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-140830Z-repo_wide_repair",
+      "model_label": "luna",
+      "family": "holdouts",
+      "passed": true,
+      "slim": 15359,
+      "pi": 15026,
+      "slim_calls": 5,
+      "pi_calls": 5
+    },
+    {
+      "round": 1,
+      "scenario": "sqlite_balances",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-140944Z-sqlite_balances",
+      "model_label": "luna",
+      "family": "holdouts",
+      "passed": true,
+      "slim": 9666,
+      "pi": 12662,
+      "slim_calls": 4,
+      "pi_calls": 5
+    },
+    {
+      "round": 2,
+      "scenario": "repo_wide_repair",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-141039Z-repo_wide_repair",
+      "model_label": "luna",
+      "family": "holdouts",
+      "passed": true,
+      "slim": 17569,
+      "pi": 16007,
+      "slim_calls": 5,
+      "pi_calls": 5
+    },
+    {
+      "round": 2,
+      "scenario": "sqlite_balances",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-141156Z-sqlite_balances",
+      "model_label": "luna",
+      "family": "holdouts",
+      "passed": true,
+      "slim": 13705,
+      "pi": 12527,
+      "slim_calls": 5,
+      "pi_calls": 5
+    },
+    {
+      "round": 1,
+      "scenario": "repo_wide_repair",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-140617Z-opencode-go-repo_wide_repair",
+      "model_label": "deepseek",
+      "family": "holdouts",
+      "passed": true,
+      "slim": 32810,
+      "pi": 28448,
+      "slim_calls": 6,
+      "pi_calls": 6
+    },
+    {
+      "round": 1,
+      "scenario": "sqlite_balances",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-140725Z-opencode-go-sqlite_balances",
+      "model_label": "deepseek",
+      "family": "holdouts",
+      "passed": true,
+      "slim": 17175,
+      "pi": 42959,
+      "slim_calls": 4,
+      "pi_calls": 8
+    },
+    {
+      "round": 2,
+      "scenario": "repo_wide_repair",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-140920Z-opencode-go-repo_wide_repair",
+      "model_label": "deepseek",
+      "family": "holdouts",
+      "passed": true,
+      "slim": 34416,
+      "pi": 27955,
+      "slim_calls": 6,
+      "pi_calls": 6
+    },
+    {
+      "round": 2,
+      "scenario": "sqlite_balances",
+      "campaign": "D:\\Slim\\bench\\luna-live\\20260905-141029Z-opencode-go-sqlite_balances",
+      "model_label": "deepseek",
+      "family": "holdouts",
+      "passed": true,
+      "slim": 20571,
+      "pi": 21045,
+      "slim_calls": 4,
+      "pi_calls": 5
+    }
+  ],
+  "planned_pairs": 32,
+  "complete": true,
+  "summaries": [
+    {
+      "model": "luna",
+      "planned_pairs": 16,
+      "complete_pairs": 16,
+      "slim": 225894,
+      "pi": 202226,
+      "delta_percent": 11.703737402707869,
+      "median_pair_delta": -7.196185449774817,
+      "wins": 9,
+      "slim_calls": 79,
+      "pi_calls": 83,
+      "scenarios": [
+        {
+          "scenario": "config_migration",
+          "complete_pairs": 2,
+          "slim": 16568,
+          "pi": 24567,
+          "delta_percent": -32.55993812838361
+        },
+        {
+          "scenario": "js_pagination",
+          "complete_pairs": 2,
+          "slim": 15842,
+          "pi": 22560,
+          "delta_percent": -29.778368794326237
+        },
+        {
+          "scenario": "json_cli",
+          "complete_pairs": 2,
+          "slim": 59545,
+          "pi": 29363,
+          "delta_percent": 102.7892245342778
+        },
+        {
+          "scenario": "ledger_audit",
+          "complete_pairs": 2,
+          "slim": 46697,
+          "pi": 31551,
+          "delta_percent": 48.004817596906605
+        },
+        {
+          "scenario": "merge_ranges",
+          "complete_pairs": 2,
+          "slim": 15893,
+          "pi": 17120,
+          "delta_percent": -7.167056074766354
+        },
+        {
+          "scenario": "repair_catalog",
+          "complete_pairs": 2,
+          "slim": 15050,
+          "pi": 20843,
+          "delta_percent": -27.793503814230203
+        },
+        {
+          "scenario": "repo_wide_repair",
+          "complete_pairs": 2,
+          "slim": 32928,
+          "pi": 31033,
+          "delta_percent": 6.106402861470039
+        },
+        {
+          "scenario": "sqlite_balances",
+          "complete_pairs": 2,
+          "slim": 23371,
+          "pi": 25189,
+          "delta_percent": -7.2174361824606015
+        }
+      ]
+    },
+    {
+      "model": "deepseek",
+      "planned_pairs": 16,
+      "complete_pairs": 14,
+      "slim": 272877,
+      "pi": 298303,
+      "delta_percent": -8.523548204342568,
+      "median_pair_delta": -10.149573177488586,
+      "wins": 10,
+      "slim_calls": 67,
+      "pi_calls": 79,
+      "scenarios": [
+        {
+          "scenario": "config_migration",
+          "complete_pairs": 2,
+          "slim": 32425,
+          "pi": 32004,
+          "delta_percent": 1.315460567429061
+        },
+        {
+          "scenario": "js_pagination",
+          "complete_pairs": 2,
+          "slim": 27201,
+          "pi": 31709,
+          "delta_percent": -14.216783878394146
+        },
+        {
+          "scenario": "json_cli",
+          "complete_pairs": 2,
+          "slim": 49503,
+          "pi": 43190,
+          "delta_percent": 14.616809446631173
+        },
+        {
+          "scenario": "ledger_audit",
+          "complete_pairs": 0,
+          "slim": null,
+          "pi": null,
+          "delta_percent": null
+        },
+        {
+          "scenario": "merge_ranges",
+          "complete_pairs": 2,
+          "slim": 32997,
+          "pi": 41395,
+          "delta_percent": -20.28747433264887
+        },
+        {
+          "scenario": "repair_catalog",
+          "complete_pairs": 2,
+          "slim": 25779,
+          "pi": 29598,
+          "delta_percent": -12.90289884451652
+        },
+        {
+          "scenario": "repo_wide_repair",
+          "complete_pairs": 2,
+          "slim": 67226,
+          "pi": 56403,
+          "delta_percent": 19.188695636756915
+        },
+        {
+          "scenario": "sqlite_balances",
+          "complete_pairs": 2,
+          "slim": 37746,
+          "pi": 64004,
+          "delta_percent": -41.025560902443594
+        }
+      ]
+    }
+  ]
+}

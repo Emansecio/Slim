@@ -1,0 +1,95 @@
+{
+  "method": "Classificação manual dos argumentos, resultados, ordem e mudanças observáveis. Sem raciocínio privado; sem classificador por repetição textual. Índices 1-based de metrics.json. Grupos cobrem todas as chamadas; validação legítima não conta automaticamente como redundância.",
+  "runs": {
+    "A-1": [
+      {"calls": [1,2,3,4,5], "class": "leitura necessária", "reason": "Resolver alias, obter trecho editável, distinguir legado e identificar módulos/build."},
+      {"calls": [6], "class": "leitura meramente informativa", "reason": "Configuração de retry/recibo não participa da taxa; resultado não usado na edição nem teste."},
+      {"calls": [7,8], "class": "exploração pertinente", "reason": "Busca amplia consumidores conhecidos; list identifica testes/estrutura. Não é fallback LSP."},
+      {"calls": [9,10], "class": "mutação necessária", "reason": "Alteração localizada e resposta exigida."},
+      {"calls": [11,12,13,14,15], "class": "reconsulta/validação justificada", "reason": "Verificação posterior à mutação; cargo test sem casos leva a teste comportamental. Comando 15 falha por glob de rlib incorreto."},
+      {"calls": [16,17], "class": "fallback após erro", "reason": "Inspeção encontra libroute_fixture; correção do glob permite executar asserts. Não redundante."}
+    ],
+    "B-1": [
+      {"calls": [1], "class": "exploração pertinente", "reason": "Busca textual encontra usos e falsos positivos; classificação posterior do modelo preservou strings e legado."},
+      {"calls": [2,3,4,5,6,7], "class": "leitura necessária", "reason": "Build/módulos, trechos editáveis e separação semântica manual; mesmo batch da busca, não uma rodada adicional de read após search."},
+      {"calls": [8,10,11], "class": "exploração pertinente", "reason": "Verificar estrutura, alias potencial em delivery e texto histórico a preservar."},
+      {"calls": [9,12], "class": "leitura meramente informativa", "reason": "Busca completa em src já não encontrou charge_total em catalog; catálogo de funções aritméticas e config não participam da mudança."},
+      {"calls": [13,14,15,22], "class": "mutação necessária", "reason": "Renomeação e resposta exigida."},
+      {"calls": [16,17,18,19,20,21,24], "class": "reconsulta/validação justificada", "reason": "Compilação e inspeção após mudança; buscas têm estado novo. Validador JSON 24 falha porque usa variável especial $null."},
+      {"calls": [23], "class": "chamada realmente dispensável", "reason": "Segundo cargo check após apenas criar answer.json; Rust/manifest intactos desde check 16 aprovado."},
+      {"calls": [25], "class": "validação inviável na fixture", "reason": "git diff assume repositório inexistente; erro externo, não LSP."},
+      {"calls": [26], "class": "fallback após erro", "reason": "Corrige $null para $answer; valida JSON com sucesso."}
+    ],
+    "C-1": [
+      {"calls": [1], "class": "leitura necessária, escopo excessivo", "reason": "Única aquisição da assinatura; correta mas retorna também 160 funções irrelevantes. Alternativa semântica não exercitada; não declarar chamada eliminável."},
+      {"calls": [2], "class": "mutação necessária", "reason": "Resposta estruturada exigida."},
+      {"calls": [3], "class": "reconsulta/validação justificada", "reason": "Confere artefato final criado. Pode ser substituída por validação melhor, mas não é read informativo do catálogo."}
+    ],
+    "D-1": [
+      {"calls": [1,2], "class": "leitura necessária", "reason": "Estado editável de JSON e texto histórico protegido."},
+      {"calls": [3], "class": "exploração pertinente", "reason": "Busca literal apropriada para mensagem; confirma localização e ocorrências protegidas."},
+      {"calls": [4], "class": "leitura meramente informativa", "reason": "List raiz após localização completa não altera escolha de arquivo nem validação."},
+      {"calls": [5,6], "class": "mutação necessária", "reason": "Mensagem e resposta exigida."},
+      {"calls": [7,8,9], "class": "reconsulta/validação justificada", "reason": "Confirma configuração e preservação após patch, e resposta criada."},
+      {"calls": [10], "class": "search repetido sem mudança de estado pertinente", "reason": "Busca global 3 já cobriu src sem hits; apenas JSON e answer mudaram. Novo search em src confirma negativo já conhecido."}
+    ],
+    "E-1": [
+      {"calls": [1,2,3,4,5,7,9], "class": "leitura necessária", "reason": "Alias, função efetiva, chave editável, build e legado/documentação protegidos."},
+      {"calls": [6,8], "class": "exploração pertinente", "reason": "Estrutura e busca combinada de símbolos/strings para consumidores e ocorrências."},
+      {"calls": [10], "class": "leitura meramente informativa", "reason": "checkout é caminho de cobrança sem uso da chave; resultado não usado na mudança."},
+      {"calls": [11,12,13], "class": "mutação necessária", "reason": "Migração localizada e resposta."},
+      {"calls": [14,15,16], "class": "reconsulta/validação justificada", "reason": "Compilação e strings após mudança; cargo test tem zero casos, não comprova comportamento isoladamente. Oracle externo cobre comportamento."}
+    ],
+    "A-2": [
+      {"calls": [1,2,3,4,5,9], "class": "leitura necessária", "reason": "Alias, implementação, legado, consumidor e build."},
+      {"calls": [6,10,11], "class": "leitura meramente informativa", "reason": "Config, catálogo aritmético e delivery não participam da taxa; buscas cobrem o alvo. Não usados em patch/teste."},
+      {"calls": [7,8], "class": "exploração pertinente", "reason": "Cobertura de consumidores/textos e estrutura."},
+      {"calls": [12,13], "class": "mutação necessária", "reason": "Taxa e resposta."},
+      {"calls": [14,15,16], "class": "reconsulta/validação justificada", "reason": "Teste comportamental novo e verificação de saída após mudança."},
+      {"calls": [17], "class": "validação inviável na fixture", "reason": "git sem repo; diff compara dois arquivos via no-index e status falha. Não prova diff do projeto."}
+    ],
+    "B-2": [
+      {"calls": [1,3,4], "class": "exploração pertinente", "reason": "Buscar referências e testes; tests ausente retorna erro real de filesystem, não redundância semântica."},
+      {"calls": [2,5,6,7,8,9,11,12], "class": "leitura necessária", "reason": "Assinaturas, aliases, trechos editáveis e texto protegido. Reads depois de search são justificáveis pela distinção de usos/preservação; não classificados mecanicamente como desperdício."},
+      {"calls": [10], "class": "leitura meramente informativa", "reason": "Catálogo sem hits no search completo; só 100 linhas irrelevantes retornam e página seguinte não é necessária ao objetivo."},
+      {"calls": [13,14,15,20], "class": "mutação necessária", "reason": "Renomeação e resposta."},
+      {"calls": [16,17,18,21], "class": "reconsulta/validação justificada", "reason": "Compilação/buscas pós-mudança e resposta final."},
+      {"calls": [19], "class": "verificação defensiva de existência", "reason": "answer ainda não existe; erro de read informa criação por write. Não repetir após erro. Nenhum snapshot completo anterior para esse arquivo."}
+    ],
+    "C-2": [
+      {"calls": [1], "class": "exploração pertinente", "reason": "Busca com contexto fornece assinatura completa, contêiner e retorno; resultado não truncado."},
+      {"calls": [2], "class": "leitura meramente informativa redundante", "reason": "Mesmo arquivo sem mutação; search 1 já inclui linhas 161–167 completas. Read traz apenas seis funções noise adicionais. Sem edição do catálogo nem precondição de write nele."},
+      {"calls": [3], "class": "mutação necessária", "reason": "Somente answer.json criado."}
+    ],
+    "D-2": [
+      {"calls": [1,2], "class": "leitura necessária", "reason": "JSON editável e documento protegido; LSP não ajudaria."},
+      {"calls": [3], "class": "leitura meramente informativa", "reason": "Raiz não muda objetivo já localizado."},
+      {"calls": [4,5], "class": "mutação necessária", "reason": "Mensagem e resposta."},
+      {"calls": [6,7,8], "class": "reconsulta/validação justificada", "reason": "Verificação posterior a mutação."},
+      {"calls": [9], "class": "validação inviável na fixture", "reason": "git diff exige repositório ou dois caminhos; fixture não possui Git."}
+    ],
+    "E-2": [
+      {"calls": [1,2,3,4,5,6,10], "class": "leitura necessária", "reason": "Alias, implementação, configuração, build e legados a preservar."},
+      {"calls": [7], "class": "busca parcialmente sobreposta", "reason": "Mesmo batch de 8; padrões retry_limit/max_attempts/setting_name em src repetem subconjunto da busca global. transport é padrão adicional, portanto não é repetição exata; não somado à contagem estrita de chamadas dispensáveis."},
+      {"calls": [8,9], "class": "exploração pertinente", "reason": "Busca global de chaves e estrutura de config."},
+      {"calls": [11,12,13,23], "class": "leitura meramente informativa", "reason": "Checkout, catálogo e reports não usam chave; list tardio não muda arquivos/validação. Edição já concluída antes de 23."},
+      {"calls": [14,15,24], "class": "mutação necessária", "reason": "Migração e resposta."},
+      {"calls": [16], "class": "chamada realmente dispensável", "reason": "Tenta corrigir vírgula que já constava em replacement da chamada 15 bem-sucedida. Expected inventado; proteção rejeita sem mutação."},
+      {"calls": [17], "class": "fallback após erro", "reason": "Read solicitado pelo erro de precondição; confirma vírgula correta. Recuperação legítima, não eliminá-la isoladamente."},
+      {"calls": [18,19,21,22,25,26,27,28], "class": "reconsulta/validação justificada", "reason": "Build, inspeção pós-migração e JSON parse. Shell 26 faz regex no alias, não chamada semântica; oracle externo testa execução real da função."},
+      {"calls": [20], "class": "leitura meramente informativa redundante", "reason": "Read 17 já trouxe JSON inteiro atual; nenhuma mutação entre 17 e 20. Cargo não muda config."}
+    ]
+  },
+  "errors": [
+    {"run":"A-1","call":15,"category":"shell: glob rlib incorreto","recovery_calls":[16,17]},
+    {"run":"A-2","call":17,"category":"shell: fixture sem Git","recovery_calls":[]},
+    {"run":"B-1","call":24,"category":"shell: uso de $null como variável de resultado","recovery_calls":[26]},
+    {"run":"B-1","call":25,"category":"shell: fixture sem Git","recovery_calls":[]},
+    {"run":"B-2","call":4,"category":"filesystem: diretório tests ausente","recovery_calls":[]},
+    {"run":"B-2","call":19,"category":"filesystem: answer ainda ausente","recovery_calls":[20]},
+    {"run":"D-2","call":9,"category":"shell: fixture sem Git","recovery_calls":[]},
+    {"run":"E-2","call":16,"category":"patch: expected inexistente; zero matches; arquivo intacto","recovery_calls":[17]}
+  ],
+  "lsp_errors": "Não exercitados: nenhuma chamada code_intel na amostra real. Ausência de chamadas não comprova zero requests/processos internos. Probe local confirma ferramenta anunciada, não execução saudável do servidor.",
+  "decision": "Nenhuma intervenção no produto. Schema já explica preview e context_lines; navegação por posição exigiria descoberta de linha/coluna nestes arquivos pequenos. Escolha do modelo e fixtures são explicações plausíveis, não causalidade demonstrada. Não mudar system prompt global nem converter search em definition. Próximo experimento deve isolar uma descrição específica e preservar correção; ganho não demonstrado nesta rodada."
+}

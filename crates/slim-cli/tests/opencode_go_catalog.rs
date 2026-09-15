@@ -39,14 +39,17 @@ fn catalog_server(body: &'static [u8]) -> (String, thread::JoinHandle<()>) {
 
 #[test]
 fn catalog_intersects_live_ids_with_documented_registry() {
-    let body =
-        br#"{"object":"list","data":[{"id":"deepseek-v4-flash"},{"id":"unknown-new-model"},{"id":"muse-spark-1.3-contributor"}]}"#;
+    let body = br#"{"object":"list","data":[{"id":"deepseek-v4-flash"},{"id":"unknown-new-model"},{"id":"deepseek-flash"},{"id":"muse-spark-1.3-contributor"}]}"#;
 
     let models = parse_catalog(body).expect("catalog");
 
     assert_eq!(
         models,
-        vec!["deepseek-v4-flash", "muse-spark-1.3-contributor"]
+        vec![
+            "deepseek-flash",
+            "deepseek-v4-flash",
+            "muse-spark-1.3-contributor"
+        ]
     );
 }
 
@@ -91,7 +94,7 @@ fn oversized_body_fails_closed() {
 
 #[tokio::test]
 async fn refresh_fetches_public_catalog_and_publishes_cache() {
-    let body = br#"{"object":"list","data":[{"id":"deepseek-v4-flash"},{"id":"glm-5.3"}]}"#;
+    let body = br#"{"object":"list","data":[{"id":"deepseek-flash"},{"id":"glm-5.3"}]}"#;
     let (url, server) = catalog_server(body);
     let root = temp_path("refresh");
     let cache = root.join("models.json");
@@ -101,8 +104,11 @@ async fn refresh_fetches_public_catalog_and_publishes_cache() {
     server.join().expect("server");
 
     assert_eq!(snapshot.source, CatalogSource::Live);
-    assert_eq!(snapshot.model_ids, vec!["glm-5.3", "deepseek-v4-flash"]);
+    assert_eq!(snapshot.model_ids, vec!["glm-5.3", "deepseek-flash"]);
     assert!(cache.is_file());
+    let cached = catalog.load_or_fallback();
+    assert_eq!(cached.source, CatalogSource::Cache);
+    assert_eq!(cached.model_ids, snapshot.model_ids);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -146,7 +152,7 @@ fn missing_cache_uses_documented_fallback() {
     let snapshot = catalog.load_or_fallback();
 
     assert_eq!(snapshot.source, CatalogSource::Fallback);
-    assert_eq!(snapshot.model_ids.len(), 24);
+    assert_eq!(snapshot.model_ids.len(), 25);
 }
 
 #[test]

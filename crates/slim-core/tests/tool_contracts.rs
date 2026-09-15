@@ -60,7 +60,88 @@ fn exact_patch_rejects_ambiguous_matches_without_writing() {
         "same\nsame\n"
     );
 
+    let registry = ToolRegistry::default();
+    let rejected = registry.execute(
+        OperatingMode::Auto,
+        path.parent().expect("parent"),
+        "patch",
+        &serde_json::json!({"path":"patch.txt", "expected":"same\n", "replacement":"new\n"})
+            .to_string(),
+    );
+    assert!(!rejected.success);
+    assert!(
+        rejected.output.contains("lines 1, 2"),
+        "{}",
+        rejected.output
+    );
+    assert!(rejected.output.contains("unchanged"), "{}", rejected.output);
+    let recovered = registry.execute(
+        OperatingMode::Auto,
+        path.parent().expect("parent"),
+        "patch",
+        &serde_json::json!({"path":"patch.txt", "expected":"same\nsame\n", "replacement":"same\nnew\n"}).to_string(),
+    );
+    assert!(recovered.success, "{}", recovered.output);
+    assert_eq!(fs::read_to_string(&path).expect("recovered"), "same\nnew\n");
+
     let _ = fs::remove_dir_all(path.parent().expect("parent"));
+}
+
+#[test]
+fn patch_accepts_lf_excerpt_from_crlf_read_and_preserves_other_bytes() {
+    let path = temp_path("patch-crlf.txt");
+    let root = path.parent().expect("parent");
+    fs::create_dir_all(root).expect("mkdir");
+    fs::write(&path, "// ação\r\nfn old() {\r\n    old();\r\n}\r\n// tail").expect("fixture");
+    let registry = ToolRegistry::default();
+    let read = registry.execute(
+        OperatingMode::Auto,
+        root,
+        "read",
+        &serde_json::json!({"path":"patch-crlf.txt", "offset":2, "max_lines":2}).to_string(),
+    );
+    assert!(read.success, "{}", read.output);
+    let expected = read.output.lines().take(2).collect::<Vec<_>>().join("\n");
+    let patched = registry.execute(
+        OperatingMode::Auto,
+        root,
+        "patch",
+        &serde_json::json!({"path":"patch-crlf.txt", "expected":expected,
+            "replacement":"fn new() {\n    first();\n    second();"})
+        .to_string(),
+    );
+    assert!(patched.success, "{}", patched.output);
+    assert!(
+        patched.output.contains("patch-crlf.txt:2"),
+        "{}",
+        patched.output
+    );
+    assert!(patched.output.contains("CRLF"), "{}", patched.output);
+    assert_eq!(
+        fs::read(&path).expect("patched bytes"),
+        "// ação\r\nfn new() {\r\n    first();\r\n    second();\r\n}\r\n// tail".as_bytes()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn patch_crlf_matching_still_rejects_ambiguity_and_different_content() {
+    let path = temp_path("strict-crlf.txt");
+    let root = path.parent().expect("parent");
+    fs::create_dir_all(root).expect("mkdir");
+    for (body, expected, count) in [
+        ("same\r\nsame\r\n", "same\n", 2),
+        ("start\r\n  same\r\n", "start\n same\n", 0),
+        ("a\r\nb\nc\r\n", "a\nb\nc\n", 0),
+    ] {
+        fs::write(&path, body).expect("fixture");
+        assert_eq!(
+            apply_exact_patch(&path, expected, "new\n"),
+            Err(ToolError::MatchCount { count })
+        );
+        assert_eq!(fs::read_to_string(&path).expect("unchanged"), body);
+    }
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -90,6 +171,23 @@ fn write_rejects_content_above_the_mutation_budget() {
 
     assert!(matches!(result, Err(ToolError::InvalidInput { .. })));
     assert!(!path.exists());
+
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    fs::write(&path, "before\r\n").expect("write CRLF target");
+    let result = write_file(
+        &path,
+        &"x\n".repeat(4 * 1024 * 1024),
+        Some(FilePrecondition::ExactText("before\n".into())),
+    );
+    assert!(matches!(result, Err(ToolError::InvalidInput { .. })));
+    assert_eq!(fs::read_to_string(&path).expect("unchanged"), "before\r\n");
+    assert_eq!(
+        fs::read_dir(path.parent().expect("parent"))
+            .expect("entries")
+            .count(),
+        1
+    );
+    let _ = fs::remove_dir_all(path.parent().expect("parent"));
 }
 
 #[cfg(windows)]
@@ -168,6 +266,7 @@ fn list_tool_paginates_directory_entries() {
     );
 
     assert!(result.success);
+    assert_eq!(result.output.lines().next(), Some("file-00.txt"));
     assert_eq!(
         result
             .output
@@ -238,6 +337,23 @@ fn list_tool_paginates_directory_entries() {
     );
     assert!(refreshed.success, "{}", refreshed.output);
     assert!(refreshed.output.contains("added.txt"));
+    fs::write(root.join("other/ação.txt"), "nested evidence\n").expect("nested file");
+    let nested = registry.execute(
+        OperatingMode::ReadOnly,
+        &root,
+        "list",
+        r#"{"path":"other"}"#,
+    );
+    let relative = std::path::Path::new("other").join("ação.txt");
+    assert_eq!(nested.output, relative.display().to_string());
+    let read = registry.execute(
+        OperatingMode::ReadOnly,
+        &root,
+        "read",
+        &serde_json::json!({"path": nested.output}).to_string(),
+    );
+    assert!(read.success, "{}", read.output);
+    assert_eq!(read.output, "nested evidence\n");
     let _ = fs::remove_dir_all(root.parent().expect("parent"));
 }
 
@@ -278,6 +394,37 @@ fn search_coerces_empty_or_duplicate_query_fields() {
             .contains("search requires exactly one of query or patterns"),
         "{}",
         neither.output
+    );
+
+    // Different terms across query and patterns are ambiguous: reject instead
+    // of silently discarding one side.
+    let ambiguous = registry.execute(
+        OperatingMode::ReadOnly,
+        &root,
+        "search",
+        r#"{"path":".","query":"alpha","patterns":["beta","gamma"]}"#,
+    );
+    assert!(!ambiguous.success, "{}", ambiguous.output);
+    assert!(
+        ambiguous
+            .output
+            .contains("search requires exactly one of query or patterns"),
+        "{}",
+        ambiguous.output
+    );
+
+    // A path of the wrong type must not widen the search to the workspace.
+    let bad_path = registry.execute(
+        OperatingMode::ReadOnly,
+        &root,
+        "search",
+        r#"{"path":["src"],"query":"needle"}"#,
+    );
+    assert!(!bad_path.success, "{}", bad_path.output);
+    assert!(
+        bad_path.output.contains("argument `path` must be a string"),
+        "{}",
+        bad_path.output
     );
     let _ = fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -630,6 +777,231 @@ fn shell_result_header_is_humanized_for_model_context() {
     assert!(result.output.starts_with("exit 0\nstdout:"));
     assert!(!result.output.contains("exit_code="));
     assert!(!result.output.contains("Some(0)"));
+    let failed = registry.execute(
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        "shell",
+        &serde_json::json!({"command":"Write-Output 'failure-output'; exit 7"}).to_string(),
+    );
+    assert!(
+        !failed.success,
+        "a nonzero process exit must be a failed tool: {}",
+        failed.output
+    );
+    assert!(failed.output.starts_with("exit 7\nstdout:"));
+    assert!(failed.output.contains("failure-output"));
+}
+
+#[test]
+fn shell_nonzero_exit_with_quiet_stderr_is_annotated() {
+    let registry = ToolRegistry::default();
+    let quiet = registry.execute(
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        "shell",
+        &serde_json::json!({"command":"exit 7"}).to_string(),
+    );
+    assert!(!quiet.success);
+    assert!(
+        quiet.output.contains("nonzero exit with empty stderr"),
+        "{}",
+        quiet.output
+    );
+    assert!(
+        quiet.output.contains("empty stderr does not imply success"),
+        "{}",
+        quiet.output
+    );
+    assert!(
+        quiet
+            .output
+            .contains("if this was a grep/diff/--check-style command"),
+        "{}",
+        quiet.output
+    );
+    assert!(
+        quiet
+            .output
+            .contains("otherwise this remains a failed process"),
+        "{}",
+        quiet.output
+    );
+    assert!(!quiet.output.contains("not failure"), "{}", quiet.output);
+
+    let loud = registry.execute(
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        "shell",
+        &serde_json::json!({"command":"[Console]::Error.Write('boom'); exit 7"}).to_string(),
+    );
+    assert!(!loud.success);
+    assert!(
+        !loud.output.contains("nonzero exit with empty stderr"),
+        "{}",
+        loud.output
+    );
+}
+
+#[test]
+fn shell_program_arguments_remain_literal_and_script_form_uses_powershell() {
+    #[cfg(windows)]
+    {
+        use std::process::Command;
+
+        let powershell = ["pwsh", "powershell"]
+            .into_iter()
+            .find(|program| {
+                Command::new(program)
+                    .args([
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        "exit 0",
+                    ])
+                    .status()
+                    .is_ok_and(|status| status.success())
+            })
+            .expect("PowerShell");
+        let root = temp_path("shell-program-arguments");
+        fs::create_dir_all(&root).expect("mkdir");
+        let script = root.join("print-args.ps1");
+        fs::write(
+            &script,
+            "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $i = 0; foreach ($arg in $args) { Write-Output (\"arg$i=[\" + $arg + \"]\"); $i++ }",
+        )
+        .expect("script");
+        let registry = ToolRegistry::default();
+        let result = registry.execute(
+            OperatingMode::Auto,
+            &root,
+            "shell",
+            &serde_json::json!({
+                "command": powershell,
+                "args": [
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-File",
+                    script.to_string_lossy(),
+                    "C:\\absolute value",
+                    ".\\relative value",
+                    "quoted \"value\"",
+                    "",
+                    "ação"
+                ]
+            })
+            .to_string(),
+        );
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("arg0=[C:\\absolute value]"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("arg1=[.\\relative value]"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("arg2=[quoted \"value\"]"),
+            "{}",
+            result.output
+        );
+        assert!(result.output.contains("arg3=[]"), "{}", result.output);
+        assert!(result.output.contains("arg4=[ação]"), "{}", result.output);
+
+        let script_result = registry.execute(
+            OperatingMode::Auto,
+            &root,
+            "shell",
+            r#"{"command":"Write-Output 'script form'; exit 7"}"#,
+        );
+        assert!(!script_result.success, "{}", script_result.output);
+        assert!(
+            script_result.output.starts_with("exit 7\nstdout:"),
+            "{}",
+            script_result.output
+        );
+        assert!(
+            script_result.output.contains("script form"),
+            "{}",
+            script_result.output
+        );
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+}
+
+#[test]
+fn admission_notes_are_bounded_per_call_and_do_not_enter_evidence_cache() {
+    let root = temp_path("admission-feedback");
+    fs::create_dir_all(&root).expect("mkdir");
+    fs::write(root.join("text.txt"), "needle\ncontext\n").expect("fixture");
+    let registry = ToolRegistry::default();
+
+    let alias = registry.execute(
+        OperatingMode::ReadOnly,
+        &root,
+        "read",
+        r#"{"path":"text.txt","lines":1}"#,
+    );
+    assert!(alias.success, "{}", alias.output);
+    assert!(alias
+        .output
+        .starts_with("[admission: lines -> max_lines; limit 1]\n"));
+    assert_eq!(alias.output.matches("[admission:").count(), 1);
+
+    let alias_replay = registry.execute(
+        OperatingMode::ReadOnly,
+        &root,
+        "read",
+        r#"{"path":"text.txt","lines":1}"#,
+    );
+    assert!(alias_replay.success, "{}", alias_replay.output);
+    assert!(alias_replay
+        .output
+        .starts_with("[admission: lines -> max_lines; limit 1]\n"));
+    assert_eq!(alias_replay.output.matches("[admission:").count(), 1);
+
+    let canonical = registry.execute(
+        OperatingMode::ReadOnly,
+        &root,
+        "read",
+        r#"{"path":"text.txt","max_lines":1}"#,
+    );
+    assert!(canonical.success, "{}", canonical.output);
+    assert!(
+        !canonical.output.contains("[admission:"),
+        "{}",
+        canonical.output
+    );
+
+    let capped = registry.execute(
+        OperatingMode::ReadOnly,
+        &root,
+        "search",
+        r#"{"path":"text.txt","query":"needle","context_lines":10}"#,
+    );
+    assert!(capped.success, "{}", capped.output);
+    assert!(capped
+        .output
+        .starts_with("[admission: context_lines 10 -> 3; maximum]\n"));
+    assert_eq!(capped.output.matches("[admission:").count(), 1);
+
+    let capped_replay = registry.execute(
+        OperatingMode::ReadOnly,
+        &root,
+        "search",
+        r#"{"path":"text.txt","query":"needle","context_lines":3}"#,
+    );
+    assert!(capped_replay.success, "{}", capped_replay.output);
+    assert!(
+        !capped_replay.output.contains("[admission:"),
+        "{}",
+        capped_replay.output
+    );
+    let _ = fs::remove_dir_all(root.parent().expect("parent"));
 }
 
 #[test]
@@ -647,7 +1019,7 @@ fn registry_executes_json_tools_and_blocks_mutations_outside_auto() {
         r#"{"path":"file.txt","max_lines":10}"#,
     );
     assert!(read.success);
-    assert_eq!(read.output, "1: before\n");
+    assert_eq!(read.output, "before\n");
 
     let blocked = registry.execute(
         OperatingMode::ReadOnly,
@@ -697,7 +1069,7 @@ fn registry_write_invalidates_read_checkpoints_when_metadata_version_repeats() {
         "read",
         r#"{"path":"fixture.txt","offset":300,"max_lines":1}"#,
     );
-    assert!(first.output.starts_with("300: aaaa"));
+    assert!(first.output.starts_with("aaaa\n\n[showing lines 300-300;"));
     let write = registry.execute(
         OperatingMode::Auto,
         &root,
@@ -723,7 +1095,11 @@ fn registry_write_invalidates_read_checkpoints_when_metadata_version_repeats() {
         "read",
         r#"{"path":"fixture.txt","offset":300,"max_lines":1}"#,
     );
-    assert!(second.output.starts_with("300: 043"), "{}", second.output);
+    assert!(
+        second.output.starts_with("043\n\n[showing lines 300-300;"),
+        "{}",
+        second.output
+    );
 
     let _ = fs::remove_dir_all(root.parent().expect("parent"));
 }

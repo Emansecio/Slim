@@ -1,0 +1,1 @@
+Trabalhe somente neste workspace descartável. Preserve arquivos fora do objetivo. Grave resposta estruturada em answer.json, sem Markdown. Troque mensagem de recibo ativa de Payment pending para Payment queued na configuração runtime. Preserve comentário e documentação histórica com texto semelhante. Não altere Rust. Em answer.json informe path e key da configuração alterada.

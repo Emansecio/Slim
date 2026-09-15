@@ -1,5 +1,13 @@
 # MISSION BRIEF — Slim Performance & Token-Economy Evolution Agent
 
+> **2026-09-04:** investigação de **velocidade local** (CHAMADAS/TOOLS/LEITURAS)
+> em `analysis_outputs/AUDIT-SPEED-CALLS-TOOLS-READS-2026-09-04.md`.
+> Não reabrir PERF-01..07. **SPD-READ-01 feito** (página 4096: 1,738 ms →
+> 0,299 ms, 5,81×). Não reabrir sem regressão medida. Este brief continua a
+> descrever a missão original (tokens + PERF históricos); números de micros
+> em `RESULTS.md` §2 estão stale (7 tools / 3469 B no bench atual).
+
+
 You are a senior Rust performance engineer assigned to make **Slim** faster and
 cheaper to run **without changing what it does**. This is an evolution mandate,
 not a refactor mandate. The current behavior is the contract.

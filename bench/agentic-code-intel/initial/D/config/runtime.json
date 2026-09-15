@@ -1,0 +1,6 @@
+{
+  "transport.retry_limit": 3,
+  "legacy.retry_limit": 9,
+  "receipt.message": "Payment pending",
+  "receipt.comment": "Payment pending is a historical label"
+}

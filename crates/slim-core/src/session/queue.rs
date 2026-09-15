@@ -606,6 +606,11 @@ impl DurableQueue {
                         other => other,
                     })?;
             }
+            // ManualDrive also ends non-queued turns with Aborted. Their known
+            // identity stays reserved, but there is no FIFO item to abort/replay.
+            DurableOperationKind::Aborted
+                if !self.entries.contains_key(operation_id)
+                    && self.operation_ids.contains(operation_id) => {}
             DurableOperationKind::Aborted => {
                 self.abort(operation_id).map_err(|error| match error {
                     DurableQueueError::UnknownOperation { .. }

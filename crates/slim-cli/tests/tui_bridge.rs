@@ -463,20 +463,29 @@ fn list_cursor_survives_the_next_tui_prompt() {
 #[test]
 fn new_tui_emits_workspace_before_other_startup_state() {
     let workspace = std::path::PathBuf::from(r"D:\Slim");
+    let mut initial = request("http://127.0.0.1:9".into());
+    initial.mode = OperatingMode::ReadOnly;
     let (runtime, channels) = spawn_tui_runtime(
-        request("http://127.0.0.1:9".into()),
+        initial,
         ProviderRunOptions::default().with_workspace_root(workspace),
     )
     .expect("bridge");
 
-    assert_eq!(
+    assert!(matches!(
         channels
             .events
             .recv_timeout(Duration::from_secs(2))
             .expect("workspace event"),
-        UiEvent::WorkspaceChanged {
-            cwd: r"D:\Slim".into(),
-        }
+        UiEvent::WorkspaceChanged { ref cwd, .. } if cwd == r"D:\Slim"
+    ));
+    assert_eq!(
+        channels
+            .events
+            .recv_timeout(Duration::from_secs(2))
+            .expect("initial mode"),
+        UiEvent::ModeChanged {
+            mode: OperatingMode::ReadOnly,
+        },
     );
 
     channels
@@ -523,7 +532,13 @@ fn unbound_interaction_response_is_visibly_rejected() {
 fn create_v2(path: &std::path::Path) {
     let mut repo = JsonlRepo::create(
         path,
-        DurableSessionHeader::new("tui-resume", "now", "D:\\Slim", None, None),
+        DurableSessionHeader::new(
+            "tui-resume",
+            "now",
+            path.parent().unwrap().to_str().unwrap(),
+            None,
+            None,
+        ),
     )
     .expect("v2 session");
     repo.append(DurableRecord::Entry {
@@ -535,6 +550,8 @@ fn create_v2(path: &std::path::Path) {
             parent_entry_id: None,
             operation_id: "seed-op".into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            content_blocks: Vec::new(),
         },
     })
     .expect("seed entry");
@@ -963,22 +980,23 @@ fn model_alias_updates_next_codex_request_without_restarting_tui() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let address = listener.local_addr().expect("address");
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut request = [0_u8; 16 * 1024];
-        let size = stream.read(&mut request).expect("request");
-        let request = String::from_utf8_lossy(&request[..size]);
-        assert!(request.contains("gpt-5.6-terra"));
-        assert!(request.contains("\"effort\":\"max\""));
-        let body = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
-        stream
-            .write_all(
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .as_bytes(),
-            )
-            .expect("response");
+        for fast in [true, false] {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let request = read_complete_http_request(&mut stream);
+            assert!(request.starts_with("POST /codex/responses "));
+            let body: serde_json::Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").expect("headers").1)
+                    .expect("request JSON");
+            assert_eq!(body["model"], "gpt-6-astra");
+            assert_eq!(body["reasoning"]["effort"], "max");
+            assert_eq!(body.get("service_tier"), fast.then_some(&json!("priority")));
+            assert!(!body["tools"].as_array().expect("tools").is_empty());
+            let body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+            stream.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ).as_bytes()).expect("response");
+        }
     });
     let mut model_request = request(format!("http://{address}"));
     model_request.kind = ProviderKind::OpenAiCodex;
@@ -986,37 +1004,49 @@ fn model_alias_updates_next_codex_request_without_restarting_tui() {
     model_request.account_id = Some("account-1".into());
     let (runtime, channels) =
         spawn_tui_runtime(model_request, ProviderRunOptions::default()).expect("bridge");
-    channels
-        .commands
-        .send(UiCommand::SetModel {
-            model: ModelAlias::Terra,
-            effort: ReasoningEffort::Max,
-        })
-        .expect("model");
-    loop {
-        if channels
-            .events
-            .recv_timeout(Duration::from_secs(1))
-            .expect("model event")
-            == (UiEvent::ModelChanged {
-                model: "gpt-5.6-terra".into(),
+    for (index, fast) in [true, false].into_iter().enumerate() {
+        channels
+            .commands
+            .send(UiCommand::SetModel {
+                model: ModelAlias::Astra,
+                effort: ReasoningEffort::Max,
+                fast,
             })
-        {
-            break;
+            .expect("model");
+        loop {
+            if channels
+                .events
+                .recv_timeout(Duration::from_secs(2))
+                .expect("model event")
+                == (UiEvent::ModelChanged {
+                    model: "gpt-6-astra".into(),
+                })
+            {
+                break;
+            }
         }
-    }
-    channels
-        .commands
-        .send(UiCommand::SendPrompt("hello".into()))
-        .expect("prompt");
-    loop {
-        if channels
-            .events_data
-            .recv_timeout(Duration::from_secs(2))
-            .expect("completion")
-            == (UiEvent::RunCompleted { run_id: 1 })
-        {
-            break;
+        let saved: toml::Value = fs::read_to_string(&config_path)
+            .expect("persisted config")
+            .parse()
+            .expect("config TOML");
+        assert_eq!(saved["model"].as_str(), Some("gpt-6-astra"));
+        assert_eq!(saved["effort"].as_str(), Some("max"));
+        assert_eq!(saved["codex_fast"].as_bool(), Some(fast));
+        channels
+            .commands
+            .send(UiCommand::SendPrompt("hello".into()))
+            .expect("prompt");
+        loop {
+            if channels
+                .events_data
+                .recv_timeout(Duration::from_secs(3))
+                .expect("completion")
+                == (UiEvent::RunCompleted {
+                    run_id: index as u64 + 1,
+                })
+            {
+                break;
+            }
         }
     }
     channels
@@ -1103,7 +1133,7 @@ fn known_provider_models_use_their_catalog_context_windows() {
         (ProviderKind::ClinePass, "cline-pass/qwen3.7-max", 1_000_000),
         (
             ProviderKind::CommandCode,
-            "deepseek/deepseek-v4-flash",
+            "deepseek/deepseek-v4.1-flash",
             1_000_000,
         ),
     ] {
@@ -1273,6 +1303,101 @@ fn cancel_run_kills_active_shell_before_late_workspace_mutation() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(windows)]
+#[test]
+fn cancel_locked_write_and_patch_preserves_file_and_durable_result() {
+    for name in ["write", "patch"] {
+        let session = resume_path(&format!("locked-{name}"));
+        let root = session.parent().unwrap();
+        fs::create_dir_all(root).unwrap();
+        create_v2(&session);
+        let target = root.join("state.txt");
+        fs::write(&target, "before").unwrap();
+        let locked = fs::File::open(&target).unwrap();
+        locked.lock().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_complete_http_request(&mut stream);
+            let arguments = if name == "write" {
+                json!({"path":"state.txt","expected":"before","content":"after"})
+            } else {
+                json!({"path":"state.txt","expected":"before","replacement":"after"})
+            };
+            let chunk = json!({"choices":[{"delta":{"tool_calls":[{
+                "index":0,"id":"locked-mutation","function":{"name":name,"arguments":arguments.to_string()}
+            }]},"finish_reason":"tool_calls"}]});
+            let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let (runtime, channels) = spawn_tui_runtime_with_resume(
+            request(format!("http://{address}")),
+            &session,
+            ProviderRunOptions::default().with_workspace_root(root),
+        )
+        .unwrap();
+        channels
+            .commands
+            .send(UiCommand::SendPrompt("mutate state".into()))
+            .unwrap();
+        // The progress signal is emitted only after try_lock observes the
+        // external lock; unlike a sharing probe it cannot interfere with open.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let reached_lock = loop {
+            match channels
+                .events_data
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(UiEvent::ToolProgress { preview, .. }) if preview == "Waiting for file lock" => {
+                    break true
+                }
+                Ok(_) => {}
+                Err(_) => break false,
+            }
+        };
+        channels.commands.send(UiCommand::CancelRun).unwrap();
+        let cancelled = loop {
+            match channels.events.recv_timeout(Duration::from_secs(5)) {
+                Ok(UiEvent::RunCancelled { .. }) => break true,
+                Ok(_) => {}
+                Err(_) => break false,
+            }
+        };
+        // Keep the external lock until cancellation is acknowledged, exactly
+        // as in the regression: a detached writer used to mutate after unlock.
+        locked.unlock().unwrap();
+        drop(locked);
+        runtime.finish().unwrap();
+        server.join().unwrap();
+        assert!(reached_lock, "tool did not signal its lock wait");
+        assert!(
+            cancelled,
+            "tool did not acknowledge cancellation while locked"
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "before");
+        let report = preflight_session(&session).unwrap();
+        assert_eq!(report.summary.pending_count(), 0);
+        let messages = slim_core::session::provider_messages_from_entries(
+            report.records.iter().filter_map(|record| match record {
+                DurableRecord::Entry { entry, .. } => Some(entry),
+                _ => None,
+            }),
+        )
+        .unwrap();
+        let result = messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("locked-mutation"))
+            .unwrap();
+        assert!(
+            result.content.contains("cancelled before side effect"),
+            "{}",
+            result.content
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[test]
 fn cancel_run_closes_provider_connection_and_returns_idle() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1392,10 +1517,7 @@ fn ordinary_tui_second_turn_sends_prior_user_and_assistant() {
         .recv_timeout(Duration::from_secs(5))
         .expect("first provider request");
     assert!(first.contains("turn-skill-body-marker"), "{first}");
-    assert!(
-        first.contains("Explicitly invoked skill: review-code"),
-        "{first}"
-    );
+    assert!(first.contains("[Skill: review-code]"), "{first}");
     let mut completed_first = false;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && !completed_first {
@@ -1431,8 +1553,7 @@ fn ordinary_tui_second_turn_sends_prior_user_and_assistant() {
         "follow-up must include the new prompt: {second}"
     );
     assert!(
-        !second.contains("turn-skill-body-marker")
-            && !second.contains("Explicitly invoked skill: review-code"),
+        !second.contains("turn-skill-body-marker") && !second.contains("[Skill: review-code]"),
         "skill instructions must be one-turn only: {second}"
     );
     channels
@@ -1442,6 +1563,76 @@ fn ordinary_tui_second_turn_sends_prior_user_and_assistant() {
     drop(runtime);
     server.join().expect("server");
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn failed_nonpersistent_turn_keeps_completed_tool_evidence() {
+    let root = resume_path("failed-history").with_extension("workspace");
+    fs::create_dir_all(&root).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (request_tx, request_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        for step in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let body = read_complete_http_request(&mut stream);
+            if step == 2 {
+                request_tx.send(body).unwrap();
+            }
+            if step == 1 {
+                stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{\"error\":\"rejected\"}").unwrap();
+            } else {
+                let payload = if step == 0 {
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"write-once","function":{
+                        "name":"write","arguments":"{\"path\":\"done.txt\",\"content\":\"effect-marker\"}"}}]},"finish_reason":"tool_calls"}]})
+                } else {
+                    json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]})
+                };
+                let events = format!("data: {payload}\n\ndata: [DONE]\n\n");
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}", events.len()).as_bytes()).unwrap();
+            }
+        }
+    });
+    let (runtime, channels) = spawn_tui_runtime(
+        request(format!("http://{address}")),
+        ProviderRunOptions::default().with_workspace_root(&root),
+    )
+    .unwrap();
+    channels
+        .commands
+        .send(UiCommand::SendPrompt("write once".into()))
+        .unwrap();
+    let mut failed = false;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline && !failed {
+        if let Ok(event) = channels
+            .events_data
+            .recv_timeout(Duration::from_millis(100))
+        {
+            failed |= matches!(event, UiEvent::RunFailed { .. });
+        }
+        while let Ok(event) = channels.events.try_recv() {
+            failed |= matches!(event, UiEvent::RunFailed { .. });
+        }
+    }
+    assert!(failed, "first turn must fail after its tool completed");
+    assert_eq!(
+        fs::read_to_string(root.join("done.txt")).unwrap(),
+        "effect-marker"
+    );
+    channels
+        .commands
+        .send(UiCommand::SendPrompt("continue".into()))
+        .unwrap();
+    let next = request_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        next.contains("write-once") && next.contains("written done.txt"),
+        "{next}"
+    );
+    channels.commands.send(UiCommand::Shutdown).unwrap();
+    drop(runtime);
+    server.join().unwrap();
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

@@ -1,5 +1,12 @@
 # Auditoria da TUI Slim
 
+> **Auditoria histórica, já citada como desatualizada no incidente I4 de
+> 2026-08-21 (RULES.md).** A data exata e a revisão de origem não constam
+> deste relatório. As afirmações abaixo descrevem aquela base e não o checkout
+> atual; não use a lista de lacunas como backlog sem revalidar o fluxo no código.
+> Consulte o [checkpoint do checkout](../README.md#checkpoint-do-checkout) e a
+> [matriz de integração](../Documentações%20-%20Projeto/README.md).
+
 ## Conclusão
 
 Implementação avançou bastante como **fatia vertical utilizável**: binário abre fullscreen real, aceita composer, autentica, troca modelo/modo, conecta provider/agent loop/tools, recebe SSE incremental, usage e cancelamento, e restaura terminal.

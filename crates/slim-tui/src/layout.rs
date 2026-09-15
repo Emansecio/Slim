@@ -40,7 +40,16 @@ pub fn composer_height_for_lines(viewport_height: u16, content_lines: usize) -> 
     }
 }
 
-/// Todo dock height (§14.3): compact 2 rows, expanded up to 6, 0 when closed.
+/// Keep metadata close to the draft without taking editing space on short screens.
+pub fn operational_height(viewport_height: u16) -> u16 {
+    if viewport_height >= 12 {
+        2
+    } else {
+        u16::from(viewport_height > 0)
+    }
+}
+
+/// Todo dock height (§14.3): compact 1 row, expanded up to 6, 0 when empty.
 /// The in-progress item shares the header row, so it needs no row of its own.
 pub fn todo_height(expanded: bool, item_count: usize, has_active: bool) -> u16 {
     if item_count == 0 {
@@ -54,7 +63,7 @@ pub fn todo_height(expanded: bool, item_count: usize, has_active: bool) -> u16 {
         };
         (rows as u16).clamp(2, 6)
     } else {
-        2
+        1
     }
 }
 
@@ -82,18 +91,21 @@ fn plan_checked_internal(
     }
     let mut session = u16::from(show_session_rail && width >= 80 && height >= 12);
     let mut activity = u16::from(working);
+    let mut operational = operational_height(height);
     let composer = composer_height_for_lines(height, composer_lines);
     let mut todo = todo_rows;
     let mut use_dividers = true;
     let mut todo_div;
     loop {
         todo_div = u16::from(use_dividers && todo > 0);
-        let fixed = session + activity + 1 + composer + todo + todo_div;
+        let fixed = session + activity + operational + composer + todo + todo_div;
         if height > fixed {
             break;
         }
         // Degradation order (§14.4): SessionRail, ActivityRail, Todo; never composer.
-        if session > 0 {
+        if operational > 1 {
+            operational -= 1;
+        } else if session > 0 {
             session = 0;
         } else if activity > 0 {
             activity = 0;
@@ -107,7 +119,7 @@ fn plan_checked_internal(
             return Err(LayoutError::InsufficientHeight);
         }
     }
-    let scrollback_height = height - session - activity - 1 - composer - todo - todo_div;
+    let scrollback_height = height - session - activity - operational - composer - todo - todo_div;
     let mut y = 0;
     let session_rail = Rect {
         x: 0,
@@ -167,9 +179,9 @@ fn plan_checked_internal(
         op_divider,
         operational: Rect {
             x: 0,
-            y: height - 1,
+            y: height - operational,
             width,
-            height: 1,
+            height: operational,
         },
     })
 }

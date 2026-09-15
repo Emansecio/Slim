@@ -128,6 +128,82 @@ fn task_request(
 }
 
 #[test]
+fn targeted_todos_reopen_with_initial_status_and_legacy_records() {
+    let runtime = Runtime::new();
+    let discovery = slim_core::skills::DiscoveryResult::default();
+    let repo = MemoryRepo::new(DurableSessionHeader::new(
+        "todos",
+        "now",
+        "workspace",
+        None,
+        None,
+    ));
+    let mut bridge = runtime
+        .open_capability_bridge(repo, &discovery, &[])
+        .unwrap();
+    let legacy_add = serde_json::json!({"TodoAdd":{"title":"first"}});
+    let mutations = [
+        serde_json::from_value(legacy_add.clone()).unwrap(),
+        TaskMutation::TodoAdd {
+            title: "second".into(),
+            status: None,
+        },
+        serde_json::from_value(serde_json::json!({"TodoSetStatus":{"status":"in_progress"}}))
+            .unwrap(),
+        TaskMutation::TodoAdd {
+            title: "third".into(),
+            status: None,
+        },
+        TaskMutation::TodoSetStatus {
+            id: Some(0),
+            status: TaskTodoStatus::Completed,
+        },
+        TaskMutation::TodoSetStatus {
+            id: Some(2),
+            status: TaskTodoStatus::InProgress,
+        },
+        TaskMutation::TodoSetStatus {
+            id: Some(1),
+            status: TaskTodoStatus::Completed,
+        },
+        TaskMutation::TodoAdd {
+            title: "already done".into(),
+            status: Some(TaskTodoStatus::Completed),
+        },
+    ];
+    assert_eq!(serde_json::to_value(&mutations[0]).unwrap(), legacy_add);
+    for (index, mutation) in mutations.into_iter().enumerate() {
+        bridge
+            .apply_task_mutation(
+                task_request(
+                    &format!("todo-{index}"),
+                    "session",
+                    index as u64 + 1,
+                    mutation,
+                ),
+                OperatingMode::Auto,
+                AuthorizationGrant::Explicit,
+            )
+            .unwrap();
+    }
+    let before = bridge.todo("session").unwrap().items().to_vec();
+    assert_eq!(
+        before.iter().map(|item| item.status).collect::<Vec<_>>(),
+        vec![
+            slim_core::task::TodoStatus::Completed,
+            slim_core::task::TodoStatus::Completed,
+            slim_core::task::TodoStatus::InProgress,
+            slim_core::task::TodoStatus::Completed,
+        ]
+    );
+    let repo = bridge.into_service().into_repo();
+    let restored = runtime
+        .open_capability_bridge(repo, &discovery, &[])
+        .unwrap();
+    assert_eq!(restored.todo("session").unwrap().items(), before);
+}
+
+#[test]
 fn runtime_bridge_runs_skill_selected_mcp_child_tasks_and_reopens_without_replay() {
     let (root, discovery) = fixture_root();
     let mcp = mcp_fixture();
@@ -266,6 +342,7 @@ fn runtime_bridge_runs_skill_selected_mcp_child_tasks_and_reopens_without_replay
             "todo",
             1,
             TaskMutation::TodoAdd {
+                status: None,
                 title: "offline todo".into(),
             },
         ),
@@ -274,6 +351,7 @@ fn runtime_bridge_runs_skill_selected_mcp_child_tasks_and_reopens_without_replay
             "todo",
             2,
             TaskMutation::TodoSetStatus {
+                id: None,
                 status: TaskTodoStatus::InProgress,
             },
         ),
@@ -321,6 +399,7 @@ fn runtime_bridge_runs_skill_selected_mcp_child_tasks_and_reopens_without_replay
         "todo",
         1,
         TaskMutation::TodoAdd {
+            status: None,
             title: "offline todo".into(),
         },
     );

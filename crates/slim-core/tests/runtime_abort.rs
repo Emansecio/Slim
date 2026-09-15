@@ -37,6 +37,31 @@ fn accept_with_deadline(listener: &TcpListener) -> TcpStream {
 }
 
 #[test]
+fn dropping_a_pending_provider_future_preserves_app_state() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{}", listener.local_addr().expect("address")),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+    let mut runtime = Runtime::new();
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(async {
+            let future = runtime.run_provider(&client, "pending request", 1);
+            tokio::pin!(future);
+            assert!(futures_util::poll!(future).is_pending());
+        });
+    assert!(runtime
+        .app
+        .events()
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::ContextSnapshot { .. })));
+}
+
+#[test]
 fn cancellation_observed_before_the_first_provider_call_stops_without_new_effects() {
     let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
         "http://127.0.0.1:1",
@@ -528,5 +553,13 @@ fn cancellation_during_tool_closes_the_tool_lifecycle_and_preserves_next_seq() {
         })
         .collect::<Vec<_>>();
     assert_eq!(kinds, ["started", "output", "finished"]);
+    assert_eq!(
+        runtime
+            .conversation()
+            .iter()
+            .filter(|m| m.role == "tool")
+            .count(),
+        1
+    );
     std::fs::remove_dir_all(root).expect("cleanup");
 }

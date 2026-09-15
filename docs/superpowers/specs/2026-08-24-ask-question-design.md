@@ -122,16 +122,21 @@ Sem sugestões, o composer aceita texto imediatamente. Enquanto a resposta aguar
 
 ### 4.4 Renderização
 
-O bloco inline mostra a pergunta e as alternativas verticalmente:
+A pergunta pendente ocupa um painel dockado acima do composer, com a pergunta como corpo e as alternativas em lista vertical. O bloco inline no transcript permanece o registro compacto.
 
 ```text
-? Qual abordagem devo usar?
-  > 1. Incremental — Menor mudança e risco.
-    2. Reescrita — Maior escopo e prazo.
-    3. Outro...
+  ╭ Question ──────────────── ↑↓ Enter ╮
+  │ Qual abordagem devo usar?          │
+  │                                    │
+  │ [x] Incremental                    │
+  │     Menor mudança e risco.         │
+  │ [ ] Reescrita                      │
+  │     Maior escopo e prazo.          │
+  │ [ ] Outro...                       │
+  ╰────────────────────────────────────╯
 ```
 
-Em terminais estreitos, descrições quebram linha sob a própria alternativa; o indicador de seleção continua visível. Após confirmação, o bloco mostra a resposta escolhida e o estado final, sem simular sucesso antes do acknowledgement do runtime.
+O painel é um cartão contido (máx. 72 colunas, inset 2), não full-bleed. Em terminais estreitos, a prosa quebra no limite de palavra e a descrição cai sob a própria alternativa; a seleção é o checkbox `[x]`, sem barra de highlight. `Up`/`Down`, `1`–`5` e `Enter` continuam válidos; o título só mostra `↑↓ Enter` ou `answer · Enter`, nunca Y/N de aprovação. Após confirmação, o painel some e o bloco mostra a resposta escolhida e o estado final, sem simular sucesso antes do acknowledgement do runtime.
 
 ## 5. Erros e invariantes
 

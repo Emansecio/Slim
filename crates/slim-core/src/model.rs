@@ -253,6 +253,17 @@ fn try_coalesce_tail(events: &mut VecDeque<SessionEvent>, pending: &SessionEvent
     let Some(tail) = events.back_mut() else {
         return false;
     };
+    try_coalesce_event(tail, pending)
+}
+
+fn try_coalesce_event_vec(events: &mut [SessionEvent], pending: &SessionEvent) -> bool {
+    let Some(tail) = events.last_mut() else {
+        return false;
+    };
+    try_coalesce_event(tail, pending)
+}
+
+fn try_coalesce_event(tail: &mut SessionEvent, pending: &SessionEvent) -> bool {
     let merged = match (&mut tail.kind, &pending.kind) {
         (
             crate::EventKind::AssistantTextDelta { text: current },
@@ -350,6 +361,7 @@ pub struct AppHandle {
     events: Vec<SessionEvent>,
     last_event_seq: Option<u64>,
     event_sender: Option<SessionEventSender>,
+    pub(crate) run_journal: Option<Arc<Mutex<crate::session::ManualRunJournal>>>,
 }
 
 impl PartialEq for AppHandle {
@@ -369,6 +381,7 @@ impl AppHandle {
             events: Vec::new(),
             last_event_seq: None,
             event_sender: None,
+            run_journal: None,
         }
     }
 
@@ -384,6 +397,10 @@ impl AppHandle {
         self.event_sender = Some(sender);
     }
 
+    pub fn set_run_journal(&mut self, journal: Arc<Mutex<crate::session::ManualRunJournal>>) {
+        self.run_journal = Some(journal);
+    }
+
     pub fn clear_event_sender(&mut self) {
         self.event_sender = None;
     }
@@ -396,16 +413,13 @@ impl AppHandle {
             return Err("event sequence must increase");
         }
         self.last_event_seq = Some(event.seq);
-        let skip_backpressure = matches!(event.kind, EventKind::ToolOutput { .. });
-        self.events.push(event.clone());
-        if skip_backpressure {
-            if let Some(sender) = &self.event_sender {
-                match sender.try_send(event) {
-                    Ok(()) | Err(TrySendError::Full(_)) => {}
-                    Err(TrySendError::Disconnected(_)) => self.event_sender = None,
-                }
-            }
-        } else if self
+        if !try_coalesce_event_vec(&mut self.events, &event) {
+            self.events.push(event.clone());
+        }
+        // ToolOutput is the only carrier of a tool's full result: it must wait
+        // for queue space like every other event instead of being dropped on a
+        // full queue. It stays cancel-droppable inside `send_interruptible`.
+        if self
             .event_sender
             .as_ref()
             .is_some_and(|sender| sender.send_interruptible(event) == SendOutcome::Disconnected)
@@ -423,7 +437,9 @@ impl AppHandle {
             return Err("event sequence must increase");
         }
         self.last_event_seq = Some(event.seq);
-        self.events.push(event.clone());
+        if !try_coalesce_event_vec(&mut self.events, &event) {
+            self.events.push(event.clone());
+        }
         if let Some(sender) = &self.event_sender {
             match sender.try_send(event) {
                 Ok(()) | Err(TrySendError::Full(_)) => {}
@@ -450,9 +466,7 @@ impl AppHandle {
                 }
                 EventKind::ToolStarted { arguments, .. }
                 | EventKind::ToolCall { arguments, .. }
-                | EventKind::ProviderToolCall { arguments, .. } => {
-                    *arguments = String::new()
-                }
+                | EventKind::ProviderToolCall { arguments, .. } => *arguments = String::new(),
                 EventKind::ToolOutput { output, .. } => *output = String::new(),
                 EventKind::ToolProgress { preview, .. } => *preview = String::new(),
                 EventKind::QuestionRequired { question, .. } => *question = String::new(),
@@ -641,9 +655,109 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_keeps_process_facts_before_tool_terminal() {
+        let cancellation = CancellationToken::new();
+        let (sender, receiver) = SessionEventSender::bounded(1, cancellation.clone());
+        let mut app = AppHandle::fake();
+        app.set_event_sender(sender);
+        app.push_event(SessionEvent::new(
+            1,
+            EventKind::ToolProgress {
+                batch_id: "batch".into(),
+                call_id: "call".into(),
+                name: "shell".into(),
+                preview: "running".into(),
+            },
+        ))
+        .expect("visual progress");
+
+        cancellation.cancel();
+        app.push_event(SessionEvent::new(
+            2,
+            EventKind::ToolProcessFinished {
+                batch_id: "batch".into(),
+                call_id: "call".into(),
+                name: "shell".into(),
+                process: crate::process::ProcessExecutionFacts {
+                    exit_code: Some(1),
+                    timed_out: false,
+                    cancelled: true,
+                    stdout_bytes: 0,
+                    stderr_bytes: 0,
+                    stdout_discarded_bytes: 0,
+                    stderr_discarded_bytes: 0,
+                },
+            },
+        ))
+        .expect("causal process fact");
+        assert!(matches!(
+            receiver
+                .try_recv()
+                .expect("process fact survives cancellation")
+                .kind,
+            EventKind::ToolProcessFinished { .. }
+        ));
+
+        app.push_event(SessionEvent::new(
+            3,
+            EventKind::ToolFinished {
+                batch_id: "batch".into(),
+                call_id: "call".into(),
+                name: "shell".into(),
+                success: false,
+                duration_ms: 1,
+            },
+        ))
+        .expect("terminal event follows process fact");
+        assert!(matches!(
+            receiver.try_recv().expect("terminal event").kind,
+            EventKind::ToolFinished { .. }
+        ));
+    }
+
+    #[test]
+    fn tool_output_waits_for_space_instead_of_dropping() {
+        let cancellation = CancellationToken::new();
+        let (sender, receiver) = SessionEventSender::bounded(1, cancellation);
+        let mut app = AppHandle::fake();
+        app.set_event_sender(sender);
+        app.push_event(SessionEvent::new(
+            1,
+            EventKind::Usage {
+                input_tokens: 1,
+                output_tokens: 0,
+            },
+        ))
+        .expect("fill the single queue slot");
+        let producer = std::thread::spawn(move || {
+            app.push_event(SessionEvent::new(
+                2,
+                EventKind::ToolOutput {
+                    batch_id: "batch".into(),
+                    call_id: "call".into(),
+                    name: "read".into(),
+                    output: "complete result".into(),
+                },
+            ))
+            .expect("tool output delivery");
+        });
+        assert!(matches!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("queued event")
+                .kind,
+            EventKind::Usage { .. }
+        ));
+        producer.join().expect("producer finishes once space frees");
+        assert!(matches!(
+            receiver.try_recv().expect("tool output kept").kind,
+            EventKind::ToolOutput { output, .. } if output == "complete result"
+        ));
+    }
+
+    #[test]
     fn discard_projected_payloads_releases_retained_buffers() {
-        let (sender, _receiver) =
-            SessionEventSender::bounded(16, CancellationToken::new());
+        let (sender, _receiver) = SessionEventSender::bounded(16, CancellationToken::new());
         let mut app = AppHandle::fake();
         app.set_event_sender(sender);
         app.push_event(SessionEvent::new(
@@ -670,5 +784,107 @@ mod tests {
             output.capacity() < 1024,
             "cleared payload must not retain a 16 KiB buffer"
         );
+    }
+
+    #[test]
+    fn ledger_coalesces_adjacent_stream_deltas() {
+        let mut app = AppHandle::fake();
+        for seq in 1..=1_000 {
+            app.push_event(SessionEvent::new(
+                seq,
+                EventKind::AssistantTextDelta { text: "x".into() },
+            ))
+            .expect("delta");
+        }
+        assert_eq!(app.events().len(), 1);
+        let event = &app.events()[0];
+        assert_eq!(event.seq, 1_000);
+        assert!(matches!(
+            &event.kind,
+            EventKind::AssistantTextDelta { text } if text == &"x".repeat(1_000)
+        ));
+    }
+
+    #[test]
+    fn ledger_coalescing_stops_at_any_boundary_event() {
+        let mut app = AppHandle::fake();
+        app.push_event(SessionEvent::new(
+            1,
+            EventKind::AssistantTextDelta { text: "a".into() },
+        ))
+        .expect("first delta");
+        app.push_event(SessionEvent::new(
+            2,
+            EventKind::Usage {
+                input_tokens: 1,
+                output_tokens: 0,
+            },
+        ))
+        .expect("boundary");
+        app.push_event(SessionEvent::new(
+            3,
+            EventKind::AssistantTextDelta { text: "b".into() },
+        ))
+        .expect("second delta");
+        app.push_event(SessionEvent::new(
+            4,
+            EventKind::ReasoningDelta { text: "r".into() },
+        ))
+        .expect("other delta kind");
+        app.push_event(SessionEvent::new(
+            5,
+            EventKind::ReasoningDelta { text: "2".into() },
+        ))
+        .expect("same-kind delta");
+        assert_eq!(app.events().len(), 4);
+        assert!(matches!(
+            &app.events()[0].kind,
+            EventKind::AssistantTextDelta { text } if text == "a"
+        ));
+        assert!(matches!(
+            &app.events()[2].kind,
+            EventKind::AssistantTextDelta { text } if text == "b"
+        ));
+        assert!(matches!(
+            &app.events()[3].kind,
+            EventKind::ReasoningDelta { text } if text == "r2"
+        ));
+        assert_eq!(app.events()[3].seq, 5);
+    }
+
+    #[test]
+    fn ledger_tool_progress_coalesces_only_matching_identity() {
+        let mut app = AppHandle::fake();
+        let progress = |seq: u64, call_id: &str, name: &str, preview: &str| {
+            SessionEvent::new(
+                seq,
+                EventKind::ToolProgress {
+                    batch_id: "batch".into(),
+                    call_id: call_id.into(),
+                    name: name.into(),
+                    preview: preview.into(),
+                },
+            )
+        };
+        app.push_event(progress(1, "call", "read", "first"))
+            .expect("p1");
+        app.push_event(progress(2, "call", "write", "latest"))
+            .expect("p2");
+        app.push_event(progress(3, "other", "list", "other first"))
+            .expect("different call");
+        app.push_event(progress(4, "other", "list", "other latest"))
+            .expect("same call");
+        assert_eq!(app.events().len(), 2);
+        assert!(matches!(
+            &app.events()[0].kind,
+            EventKind::ToolProgress { preview, name, .. }
+                if preview == "latest" && name == "write"
+        ));
+        assert_eq!(app.events()[0].seq, 2);
+        assert!(matches!(
+            &app.events()[1].kind,
+            EventKind::ToolProgress { preview, .. } if preview == "other latest"
+        ));
+        assert_eq!(app.events()[1].seq, 4);
     }
 }

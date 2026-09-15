@@ -19,6 +19,146 @@
 
 ## 1. Veredito geral
 
+**14/09/2026 — seleção textual por área e retorno de cópia:** o arrasto usa
+regiões da conversa/inspetor registradas no último frame, sem refazer layout
+no handler. Bordas dos painéis, scrollbar, rodapé, composer e menus sobrepostos
+ficam fora. Extração e realce compartilham os mesmos intervalos, preservando
+indentação, espaços internos, quebras de linha e glyphs largos, sem selecionar
+preenchimento à direita ou linhas vazias nas extremidades. Drag invertido,
+saída vertical da área e região de uma célula têm cobertura. Resize, scroll,
+teclas de edição/navegação e novos eventos de conteúdo invalidam seleção por
+coordenadas; Escape limpa a seleção antes de cancelar execução.
+
+Drag e clique direito/Ctrl+C no mesmo lote materializam a seleção atual antes
+do efeito de cópia. Arrasto sem texto não causa paste nem cancelamento. O
+clipboard mantém seu worker existente; somente o retorno de sucesso emite
+`Copiado`, sem acumular confirmações idênticas e com a expiração discreta já
+existente. Falha permanece explícita, sem falso sucesso.
+
+Validação desta mudança:
+
+- `cargo test -q --offline --locked -p slim-tui`: **458 aprovados, 0 falhas,
+  4 ignorados** — 221 unitários, 219 integrações, 7 propriedades, 11 Windows,
+  0 doc-tests. Ignorados: 2 clipboard interativo e 2 medições manuais.
+- `cargo test -q --offline --locked -p slim-cli --test tui_bridge`:
+  **22 aprovados, 0 falhas**.
+- Clippy em todos os targets da TUI com `-D warnings`, rustfmt/check e
+  diff/check dos arquivos alterados: aprovados.
+- Configuração Cargo: `--config 'build.rustc-wrapper=""'`,
+  `--target-dir target/review-native-check-serial`, jobs 1, incremental 0,
+  `RUSTFLAGS=-C debuginfo=0`.
+
+As primeiras verificações identificaram duas expectativas incorretas nos novos
+testes de largura e um clamp vertical que anulava arrasto fora de área de uma
+linha; os testes foram alinhados à geometria real, o clamp foi corrigido e a
+suíte completa passou. As provas são unitárias/integradas com TestBackend e
+resultados simulados de clipboard; não houve manipulação do clipboard pessoal,
+execução em console físico ou medição de performance nova. A cópia cobre texto
+renderizado visível, não restaura Markdown original nem conteúdo fora da viewport.
+README e contrato DESIGN atualizados. Deploy local concluído às 21:05 com
+`refresh-slim.ps1`, `OK:`/exit 0, smoke pelo PATH e hashes idênticos;
+[identidade instalada](../release/README.md). Suíte não repetida no deploy.
+
+**14/09/2026 — polimento complementar e custo de renderização:**
+roda do mouse direcionada ao inspetor sob o ponteiro, sem mover a conversa;
+modais bloqueiam rolagem por trás. Navegação reutiliza as métricas do inspetor
+sem substituir a projeção colorida por NoColor. Desenhos por evento consomem
+os marcos de animação/status já pintados. O Thinking mantém as linhas estáveis
+no cache e atualiza somente o indicador visível. Menus de modelo, esforço,
+login e comandos têm seleção contínua com contraste, inclusive em ANSI16.
+Espera/conexão com provider não aparece como raciocínio; a ActivityRail não
+repete Thinking quando o cabeçalho está visível, preservando altura, tempo e
+orçamentos. Outras fases mantêm seu nome real e apenas um indicador animado.
+
+Validação deste complemento, com a mesma configuração Cargo descrita abaixo:
+
+- `cargo test -q --offline --locked -p slim-tui`: **446 aprovados, 0 falhas,
+  4 ignorados** — 209 unitários, 219 integrações, 7 propriedades, 11 Windows,
+  0 doc-tests; ignorados: 2 clipboard interativo e 2 medições manuais.
+- `cargo test -q --offline --locked -p slim-cli --test tui_bridge`:
+  **22 aprovados, 0 falhas**, com fixtures locais.
+- `cargo clippy -p slim-tui --all-targets --offline --locked -- -D warnings`:
+  aprovado, sem permissões adicionais de lint. Rustfmt/check e diff/check
+  aprovados nos arquivos alterados neste complemento.
+- A primeira suíte completa identificou quatro expectativas antigas que
+  chamavam conexão/espera de Thinking. Foram ajustadas ao contrato autorizado,
+  mantendo checks de lifecycle, cancelamento, retry e ausência de fase no
+  SessionRail; a suíte completa foi repetida com sucesso. O lint apontou um
+  padrão de string de um caractere em teste novo, corrigido antes do gate final.
+
+Medição local com o mesmo probe otimizado, 25 amostras por cenário, cache quente
+e relógio controlado (`target/tui-review-probe.rs`, backend sintético):
+
+| Cenário | Mediana anterior | Mediana após |
+|---|---:|---:|
+| Inspetor, 100 ferramentas, tecla + reducer + draw | 0,1099 ms | 0,0743 ms |
+| Inspetor, 5.000 ferramentas, tecla + reducer + draw | 2,4403 ms | 0,0867 ms |
+| Thinking expandido, 1.000 linhas, frame animado | 0,2563 ms | 0,1362 ms |
+| Thinking expandido, 4.000 linhas, frame animado | 0,5820 ms | 0,5801 ms |
+
+O cenário de 4.000 linhas permanece acima do limite de 256 KiB por projeção
+no memo de linhas; o limite de memória não foi aumentado e essas projeções
+ainda podem ser reconstruídas. Não há promessa de ganho nesse caso. A roda
+passou a alterar somente o inspetor nos dois tamanhos de histórico. A prevenção
+de deadline duplicado foi validada por testes do agendador e inspeção do wiring,
+não por medição de wakeups em console físico.
+
+O probe visual existente gerou 14 frames em `target/tui-polish-followup-preview`:
+uma célula alterada entre frames Thinking + TODO, reduced-motion estável,
+seleções de comandos/login visíveis e navegação/consulta estreita preservadas.
+Prévias de menus e Thinking foram inspecionadas. Build otimizado de `slim-tui`
+aprovado para o probe; não é deploy do CLI. Sem provider real, console físico
+ou suíte do workspace inteiro neste escopo. README e DESIGN atualizados.
+Deploy local autorizado e concluído posteriormente em 14/09 às 20:29, com
+`refresh-slim.ps1`, smoke e hashes conferidos; identidade no
+[registro de deploy](../release/README.md). A suíte não foi repetida no deploy.
+
+**14/09/2026 — revisão de hierarquia e navegação da TUI (checkout):** fundo
+preto e superfícies neutras, composer com quebra visual sem alterar o prompt,
+rodapé comum de duas linhas, seleções visíveis em paleta/login e indicador de
+modelo ativo separado do cursor. Inspetores têm rolagem própria com limites;
+a busca estreita preserva a consulta antes dos atalhos. O TODO usa marcador
+estático e confirmações recebem realce de 249 ms, desativado com movimento
+reduzido. Contratos atualizados no [DESIGN](DESIGN-SLIM-TUI.md).
+Não inclui nova visão de diffs por arquivo ou certificação em console físico.
+Deploy local autorizado e concluído posteriormente em 14/09/2026 às 19:41;
+identidade e smoke registrados no [registro de deploy](../release/README.md).
+
+Validação da revisão inicial (14/09/2026, antes do complemento acima):
+
+- `cargo test -q --offline --locked -p slim-tui`: **438 aprovados, 0 falhas,
+  4 ignorados** (2 de clipboard interativo e 2 medições manuais de performance);
+  inclui 203 unitários, 217 de integração, 7 propriedades e 11 testes Windows,
+  além de 0 doc-tests.
+- `cargo test -q --offline --locked -p slim-cli --test tui_bridge`:
+  **22 aprovados, 0 falhas** com fixtures locais, sem provider real.
+- `cargo clippy -p slim-tui --all-targets --offline --locked -- -D warnings`:
+  aprovado, sem supressões adicionais na linha de comando.
+- `rustfmt --edition 2021 --check --config skip_children=true` nos arquivos Rust
+  alterados nesta revisão: aprovado.
+
+Todos os comandos Cargo usaram `--config 'build.rustc-wrapper=""'`,
+`--target-dir target/review-native-check-serial`, `CARGO_BUILD_JOBS=1`,
+`CARGO_INCREMENTAL=0` e `RUSTFLAGS=-C debuginfo=0`. A primeira execução integrada
+revelou duas expectativas antigas do rodapé; elas foram ajustadas à nova
+projeção de duas linhas/atalho compacto, preservando a verificação de fase e
+cancelamento, e a suíte inteira foi executada novamente com sucesso.
+
+O probe visual existente gerou 14 frames sintéticos em
+`target/tui-polish-preview`, sem sobrescrever a auditoria original. Confirmou
+seleção final visível em comandos/login, consulta visível em 40x16, apenas uma
+célula animada no cenário Thinking + TODO, frames estáveis com movimento
+reduzido, `End latest` + novas mensagens durante execução e último item do
+inspector acessível com End. Prévias de conversa, composer longo, menus, busca
+e execução com histórico fixado foram inspecionadas. São renderizações de
+fixtures, não capturas de um terminal físico nem evidência de deploy.
+
+**12/09/2026 — contratos nativos:** fatos de término de processo alimentam a
+prévia de shell, preservando os detalhes no inspector. O escopo não altera o
+layout nem certifica a matriz física de terminais. Evidência desta mudança
+registrada uma vez no [README do checkout](../README.md#admissão-e-resultados-nativos);
+deploy anterior permanece separado.
+
 O diagnóstico pré-execução de 2026-02 foi superado pelos gates registrados no
 §7. A TUI atual tem reducer único, lanes bounded/coalescer lossless, superfícies
 estratificadas, scroll virtualizado, tools tipadas, Markdown sanitizado e gates
@@ -486,6 +626,8 @@ Legenda: âœ… implementado Â· ðŸŸ¡ parcial Â· âŒ ausente Â· â�
 | G362 | média | Linha de tool ativa excedia a largura útil e o Paragraph quebrava o último byte em uma row órfã | **RESOLVIDO 2026-08-29:** summary usa budget cell-aware de uma row; comando/argumentos cedem espaço primeiro e nome, limite, status e progresso permanecem prioritários |
 | G363 | média | Markdown de prosa usava wrap estritamente por grapheme e quebrava palavras comuns entre rows | **RESOLVIDO 2026-08-29:** render e medição compartilham soft-wrap por palavras em prosa; código e tokens indivisíveis preservam hard-wrap por grapheme |
 | G364 | média | Tool falha colapsada mostrava apenas `failed` e `0ms`, ocultando a causa curta já disponível no preview | **RESOLVIDO 2026-08-29:** falha colapsada mostra a primeira razão redigida e limitada, usa `<1ms` para duração zero e mantém falhas distintas sem agregação |
+| G365 | média | DeepSeek V4.1 Flash não era detectado no OpenCode Go: o gateway lista `deepseek-flash`, ausente do registro embutido, então o filtro do catálogo o descartava e a string digitada `deepseek-v4.1-flash` era rejeitada localmente | **RESOLVIDO 2026-09-10:** registro ganha `deepseek-flash` (Chat Completions, 1M/384K, imagem, esforço low/high/max; fontes: tabela de endpoints OpenCode Go, docs de modelos DeepSeek e models.dev) e a entrada digitada `deepseek-v4.1-flash` normaliza para o id roteável, distinta da entrada 4.0 `deepseek-v4-flash`; thinking Chat habilitado para o novo id; sonda no gateway: `deepseek-v4.1-flash` retorna 401 ModelError e `deepseek-flash` passa da validação de modelo; regressões em `opencode_go_provider` e `opencode_go_catalog` |
+| G366 | média | Ctrl+V no composer colava apenas texto: um bitmap no clipboard (screenshot, imagem copiada do browser) era descartado, embora a §20 prometesse chip de anexo vindo do clipboard | **RESOLVIDO 2026-09-10:** `clipboard::pull` lê o clipboard uma vez (formato `PNG` reutilizado byte a byte e aparado no `IEND`; `CF_DIB`/`CF_DIBV5` 24/32 bpp convertidos por encoder PNG sem dependência: filtro 0 + DEFLATE fixed-Huffman com LZ77), grava `%TEMP%\slim-paste-<pid>\clipboard-N.png` e poda pastes com mais de 1h; o reducer decide — imagem vira `UiCommand::AttachImage` (chip `image · clipboard-N.png` acima do composer), sem imagem segue colando texto (campo de API key do login continua alvo de texto), modal aberto/interaction pendente ignoram e falha de conversão vira notificação explícita; `/image PATH` permanece o caminho de arquivo; regressões: unidade do encoder (24/32 bpp, bottom-up/top-down, alfa, round-trip do fluxo DEFLATE, compressão de rows repetidas), reducer (precedência, gates, notificação) e integração `#[ignore]` contra o clipboard real |
 
 
 ## 6. Workflow de execuÃ§Ã£o
@@ -559,8 +701,108 @@ reducer Ãºnico, render puro, Windows-only.
 
 ## 7. Log de execuÃ§Ã£o
 
+### 2026-09-10 - Pensamento refinado e pulso contextual
+
+- Cabeçalho Thinking recebe o único pulso `○`/`●` quando visível; o indicador
+  da ActivityRail fica estático. Se o cabeçalho sair da viewport, a rail mantém
+  o pulso. Pensamento concluído usa disclosure `▸`/`▾`; Enter expand/collapse
+  aparece apenas na seleção. Cancelled/Failed conservam rótulos explícitos.
+- Preview e corpo expandido alinham sob o cabeçalho, em quatro células;
+  `thinking_body_width` é compartilhado entre renderer, medição e cache.
+  Nenhum timer, estado de domínio ou duração de pensamento foi acrescentado.
+- `RUSTC_WRAPPER='' cargo test -q -p slim-tui`: **391 passed, 0 failed,
+  4 ignored**, Doc-tests 0. Teste novo confirma mudança de uma célula, migração
+  do pulso para a rail quando fora da viewport, reduced motion, no-color e
+  conclusão estática. Expansão, grupos, Unicode e âncoras continuam cobertos.
+- `cargo test -q -p slim-cli --test tui_runtime --test tui_bridge` com o
+  mesmo override: **24 passed, 0 failed**. Revisão independente sem achados
+  materiais. Prévia animada obtida de frames TestBackend do renderer real.
+  Console físico e a matriz ConPTY não foram reexecutados; a limitação do
+  harness registrada abaixo continua aberta. Não houve nova medição de latência.
+- Rustfmt e diff-check passaram. `refresh-slim.ps1`: `OK:` e exit 0;
+  `--version` passou e hash do PATH igual ao target release.
+  [Identidade do executável](../release/README.md).
+
+### 2026-09-10 - Autoria clara e faixa do usuário suave
+
+- Após o print do usuário: respostas agora mostram `Slim` em verde/negrito,
+  precedido por uma linha de respiro. Autoria permanece no streaming, na
+  conclusão e sem cores; cancelamento preserva `interrupted · partial`.
+  `user_prompt_bg` foi suavizado para `#242319`. Altura e cache continuam
+  consistentes com as duas rows de abertura da resposta.
+- `RUSTC_WRAPPER='' cargo test -q -p slim-tui`: **390 passed, 0 failed,
+  4 ignored**, Doc-tests 0. Regressões de autoria, espaçamento, lifecycles,
+  cor desativada e altura; fixtures de ausência de label atualizadas para
+  o contrato solicitado. A fixture com duas mensagens foi ampliada para
+  continuar testando a separação entre turnos com ambos inteiros visíveis.
+- `cargo test -q -p slim-cli --test tui_runtime --test tui_bridge` com o
+  mesmo override: **24 passed, 0 failed**. Rustfmt e diff-check passaram.
+- Revisão independente dos deltas: sem achados materiais. Validação pelo
+  TestBackend e bridge; a limitação do gate ConPTY descrita abaixo permanece.
+  Não houve nova medição de desempenho nem nova execução da matriz ConPTY.
+- `refresh-slim.ps1`: `OK:` e exit 0; `--version` aprovado e hash do PATH
+  igual ao release. [Identidade do build implantado](../release/README.md).
+
+### 2026-09-10 - TUI minimalista no checkout
+
+- Implementado: coluna central de até 100 células, welcome e conversa curta
+  próximos ao composer, paleta quente com verde funcional, footer de 3/2/1 rows,
+  perguntas alinhadas e compactas com opção focada visível, tabelas largas em
+  campos completos e um único pulso de atividade. Motion reduzido e idle ficam
+  estáticos. Resumos contam operações, sem inferir arquivos distintos.
+- Contrato vigente: DESIGN §1.2, §14.1, §15 e §21.3. Código principal:
+  `runtime.rs`, `layout.rs`, `view_model.rs`, `markdown.rs`, `theme.rs` e
+  medição de detalhes em `render.rs`. Preservado o WIP preexistente.
+- `RUSTC_WRAPPER='' cargo test -q -p slim-tui`: **389 passed, 0 failed,
+  4 ignored**, Doc-tests 0. Inclui Unicode/cursor, reflow/âncora, perguntas,
+  tabelas sem perda, footer degradável e mudança de uma célula no pulso.
+- `cargo test -q -p slim-cli --test tui_bridge --test tui_runtime --test
+  ask_question_tui --test tui_pty` com o mesmo override: **32 passed,
+  0 failed, 1 ignored**. Total dos testes não ignorados selecionados: **421**.
+- `cargo bench -p slim-tui --bench long_session`: 3.200 blocos, 4.968.694
+  bytes; p95 scroll/locate **0,369 ms**, input-to-frame **1,216 ms** (limite
+  interno 16 ms). Medição warm do pipeline; não mede provider/rede nem prova
+  ganho relativo à versão anterior.
+- ConPTY explícito: **gate ainda falha**. A primeira execução só recebeu
+  `ESC[6n`. O harness agora responde à consulta de cursor exigida pelo
+  INHERIT_CURSOR, conforme [Microsoft](https://learn.microsoft.com/en-us/windows/console/createpseudoconsole).
+  A segunda execução alcançou welcome, eco do composer e FINAL_ANSWER_MARKER
+  com provider loopback e chave sentinela. Falhou em THINK_BEFORE_TOOLS:
+  `normalized_vt` concatena deltas, não reconstrói células; o assert também
+  exige os dois outputs antes da expansão das tools. Não se encurtaram
+  marcadores nem se retiraram assertions para obter PASS. A matriz parou no
+  primeiro caso 120×30; os outros cinco não foram executados pela ConPTY.
+  [Captura e identidade do binário](../analysis_outputs/streaming-thinking-tools-tui/conpty/1789033275736-63192/matrix.md).
+  Há teste novo da resposta DSR sem fabricar frame. A causalidade e os dois
+  resultados completos continuam verificados pelo teste direto do bridge.
+- Revisão independente: corrigida a perda da cauda do enunciado em perguntas
+  compactas, com regressão 48×13. Perguntas maiores que todo o viewport ainda
+  exigem tratamento futuro de navegação do enunciado; não houve promessa de
+  conteúdo ilimitado. Prévia visual gerada com TestBackend, sem validação em
+  janela física. O gate ConPTY completo continua pendente; este registro não
+  encerra o marco M3 nem os gates históricos abertos.
+- Na entrega inicial, a mudança ficou somente no checkout. Após autorização
+  explícita, `refresh-slim.ps1` concluiu o deploy local com `OK:`; versão e
+  hash do PATH foram conferidos. [Identidade do build implantado](../release/README.md).
+  Nenhum commit ou push; o gate ConPTY acima continua pendente.
+
+
 | Data | Slice | Resultado | ObservaÃ§Ãµes |
 |---|---|---|---|
+| 2026-09-10 | Ctrl+V com imagem no clipboard — somente checkout | Ctrl+V/Shift+Insert e o paste do botão direito leem o clipboard uma vez: imagem (formato `PNG` do clipboard ou `CF_DIB`/`CF_DIBV5` convertido) vira anexo e aparece como chip `image · clipboard-N.png` acima do composer antes do envio; sem imagem o texto continua colando e o campo de API key do login nunca recebe imagem. | `cargo test -p slim-tui` verde (lib 158 + integração 199 + pty 6 + thinking 11 + demais alvos; ignorados: 2 clipboard + 2 pty); `cargo test -p slim-tui --test clipboard_image -- --ignored` verde contra o clipboard real do host (DIB 2×2 → PNG e `PNG` reaproveitado byte a byte, com texto restaurado ao final); PNGs conferidos por decoder independente (System.Drawing): 2×2 RGB/RGBA por pixel e 256×256 plano corretos; latência de encode release medida: 1080p plano 17,8 ms/55 KiB, 1080p ruidoso 140,8 ms/6,4 MiB, 4K ruidoso 561,5 ms/25,6 MiB (acima do teto de 20 MiB do loader, rejeitado com notificação da CLI); `cargo fmt -p slim-tui -- --check` e `git diff --check` verdes. Sem deploy: mudança somente no checkout, `Slim.exe` do PATH continua o build anterior. Clippy `-p slim-tui --all-targets --no-deps` ainda falha por 12 achados preexistentes fora do escopo (`runtime.rs`, `reducer.rs`, `theme.rs`, `selection.rs`) e `slim-core` também falha no clippy do workspace. |
+| 2026-09-07 | Polimento de estados da TUI — somente checkout | Resposta interrompida mantém indicação de parcial na TUI aberta; cancelamento não reclassifica resposta de turno anterior. Activity/Changes identificam ferramentas históricas sem sucesso presumido. Retry conserva tentativa/espera, e footer sem ActivityRail conserva fase/cancelamento. | 46 testes offline distintos passaram: motion_activity_golden (29), inspectors_golden (11), fault_injection (4), projeção de fases (1) e recuperação transitória com HTTP loopback (1). Clippy slim-tui all-targets com `-D warnings`, formatação focada e diff-check passaram. Sem deploy, provider comercial ou console físico. O rótulo de resposta parcial não acrescenta metadados duráveis de cancelamento. |
+| 2026-09-07 | Encerramento, validação e compactação — somente checkout | Validações falhas não resolvidas impedem conclusão validada; checkpoints consecutivos são persistidos em ordem, sem usar resumo sintético como âncora; encerramento normal explicita Todo pendente no headless, histórico durável e TUI. | 62 testes offline distintos passaram: `session_continuation`, `m2_integration`, governor, compaction e filtros de agent_loop/headless_resume. Clippy core/CLI/TUI all-targets com `-D warnings`, rustfmt dos arquivos alterados e diff-check passaram. Teste integrado executou Cargo check verde seguido de Cargo test vermelho em workspace temporário; wrappers de compilador foram desativados apenas nesse subprocesso de teste. Sem deploy, provider comercial ou console físico. |
+| 2026-09-06 | Nove correções de confiabilidade e recuperação | Revisão/implementação/teste sequenciais: histórico parcial e lote concluído; prazo de processo incluindo pipes; Todo persistido/restaurado; Retry-After; reparo limitado de JSON de tools sem executar lote rejeitado; retry seguro de compactação; diagnóstico local de paradas/finalização; decisão --abandon-pending sem replay; erro em desconexão do worker. | `refresh-slim.ps1 -Test`: **1211 passed / 0 failed / 3 ignored / 74 suítes / 0 warnings**, EXIT=0. Clippy core/CLI/TUI all-targets `-D warnings`, diff-check, version/help verdes. Um ConPTY físico ignorado; duas fixtures de subprocesso executadas pelo teste de pipes. `OK: Slim slim 0.1.0 implantado em C:\Users\User\bin\Slim.exe (build de 09/06/2026 06:39:39)`. Target/PATH 15.143.936 bytes, SHA-256 0D1CC3690B410B0DA945629AC11DC39569D1244683929E7A51216322F90C52E1. Sem provider comercial nem console físico. Descendentes órfãos no Windows e fases incompletas de logs externos recebem incerteza explícita, sem inventar resultado. Fixture HTTP preexistente teve um ConnectionReset intermediário; isolada e gate completo verdes sem relaxar assertion. |
+| 2026-09-06 | Resume após cancelamento manual | Corrigida a rejeição de Aborted de operação manual conhecida sem entrada na fila. Identidade continua reservada, sem enfileirar/reexecutar trabalho; abort órfão e transições inválidas continuam rejeitados. | RED reproduziu unknown durable queue operation na seleção. GREEN: seleção após cancelamento, respostas final/parcial no frame, arquivo intacto e duas respostas finais junto das ferramentas na fixture de continuação. `refresh-slim.ps1 -Test`: **1192 passed / 0 failed / 1 ignored / 74 suítes / 0 warnings**, EXIT=0 e OK. Clippy core/CLI all-targets `-D warnings`, rustfmt e diff-check verdes. Target/PATH 14.756.352 bytes, build 04:56:41, SHA-256 BD783530713A8711CB06B67DE386955F283E8D8BBDF586AEFFD03409093DDC68. Sem provider comercial ou console físico; conversa real apenas lida. |
+| 2026-09-06 | Provider: recuperação limitada e falha persistente | Até duas novas tentativas por execução para conexão segura, HTTP 429/500/502/503/504 ou EOF sem marcador terminal antes de resposta/ferramenta; espera cancelável, orçamento respeitado e tools anteriores preservadas. Conclusão normal vazia/reasoning-only vira erro; RunFailed persiste na TUI e razão com segredos removidos fica salva após tools. | Sete regressões novas; cinco fixtures antigas de sucesso vazio ajustadas sem reduzir as verificações de tools/contexto/artefatos. Gate inicial rejeitou essas fixtures; gate final `refresh-slim.ps1 -Test`: **1190 passed / 0 failed / 1 ignored / 74 suítes / 0 warnings**, EXIT=0 e OK. Clippy core/CLI all-targets `-D warnings`, rustfmt e diff-check verdes. Target/PATH 14.755.840 bytes, build 04:16:18, SHA-256 B8345005E0F83A07F42D5841B7E26DD0FED60244589092358EAE8514A5A19674. Sem provider comercial ou console físico; causa exata do incidente antigo não foi persistida. |
+| 2026-09-06 | TUI: conversa em foco | Removida abertura automática do painel Run; contexto compacto sem status duplicado; totais/velocidade movidos para Diagnostics; Todo completo recolhe e Ctrl+T expande; prévias de todo/shell mostram rejeição/saída de erro e mantêm detalhes integrais. | TestBackend e bridge: casos de 40 a 200 colunas, inspectors por atalho e falha parcial. `refresh-slim.ps1 -Test`: testes 1183 passed / 0 failed / 1 ignored / 74 suítes / 0 warnings, release compilado. Após fechar a sessão antiga, refresh imprimiu OK e instalou o build 03:34:14 (14.725.120 bytes; SHA-256 F2D51787534389F1CFA7EE1860DAEBC2A6C646A9574910BE03C8381E5C86297A idêntico ao target). Clippy TUI/CLI all-targets, rustfmt e diff-check verdes. Console físico não exercitado. |
+| 2026-09-06 | Muse: teste real e deploy autorizado | Muse 1.3/xhigh respondeu OK em duas chamadas sintéticas sem ferramentas, via debug e via Slim instalado; exit 0 e stderr vazio. HTTP 500 não ocorreu. | `refresh-slim.ps1` imprimiu `OK:`; build 2026-09-06 02:26:15. Target release/PATH: 14.745.088 bytes, SHA-256 `6580CC0170219B12DDB89BF58DBA1244DDA512E03E241E53BB95895F9358E25A`. `slim --version`: slim 0.1.0, exit 0. Gate anterior ao deploy: 1180 passed / 0 failed / 1 ignored / 74 suítes / 0 warnings; não repetido pelo script. ZIP não regenerado; sem teste de tarefa completa no Go. |
+| 2026-09-06 | OpenCode Go: Muse Responses e xhigh | Muse Spark 1.2/1.3 usam /responses; seletor e adapter aceitam low/medium/high/xhigh. Regressões reproduziram rota incorreta e rejeição local de xhigh; verificam request com ferramentas/histórico, compactação, eventos, finalização e opções TUI. | `cargo test --offline --locked --workspace`: 1180 passed / 0 failed / 1 ignored / 74 suítes / 0 compiler warnings, EXIT=0. Clippy core/cli `--all-targets -- -D warnings` verde. Sem refresh/deploy ou geração comercial. O HTTP 500 informado pelo usuário não foi reproduzido no Go real; não se afirma causa única ou resolução remota. |
+| 2026-09-06 | Read: checkpoint da próxima página | Offset capturado antes do lookahead, reutilizando índice limitado e invalidação existentes. Regressão RED/GREEN: segunda página de 4303 para 2211 bytes consumidos; saída e digest preservados com Unicode, LF/CRLF e EOF sem quebra. | `cargo test --offline --locked --workspace`: 1178 passed / 0 failed / 1 ignored / 74 suítes / 0 compiler warnings, EXIT=0. Clippy slim-core `--all-targets -- -D warnings` verde. Sem refresh/deploy; I/O físico, latência e tokens não medidos. |
+| 2026-09-06 | Cache: identidade, cursor e deduplicação | Identidade do arquivo revalidada pelo handle; cursor sem snapshot exige nova busca; omissão depende do original integral no histórico ativo, incluindo retomadas e compactação. Quatro regressões novas e fixtures ampliadas. | `cargo test --offline --locked --workspace`: 1177 passed / 0 failed / 1 ignored / 74 suítes / 0 compiler warnings, EXIT=0. Fixtures locais verificam substituição com tamanho/mtime iguais, expiração/perda de snapshot e requests retomados. Sem refresh/deploy, provider comercial ou medição de economia total. |
+| 2026-09-06 | Quick win LSP: truncamento com lookahead | Prefixo e detecção de excesso usam um iterador; retirada a contagem integral do texto. Um teste novo cobre fronteiras e Unicode, preservando a saída. | `cargo test --offline --locked --workspace`: 1173 passed / 0 failed / 1 ignored / 74 suítes / 0 compiler warnings, EXIT=0. Clippy slim-lsp `--all-targets -- -D warnings`, EXIT=0. Sem refresh/deploy nem medição de latência. |
+| 2026-09-06 | Quick win LSP: leitura limitada durante o I/O | `read_capped` usa no máximo limite + 1 byte, preservando revalidação de stamp e rejeição de UTF-8 inválido. RED/GREEN com reader determinístico: limite 8, antes consumia 4096 bytes, agora 9; dois testes novos. | `cargo test --offline --locked --workspace`: 1172 passed / 0 failed / 1 ignored / 74 suítes / 0 compiler warnings, EXIT=0. LSP 48 unitários + 28 subprocesso mock; Clippy slim-lsp `--all-targets -- -D warnings`, EXIT=0. Sem refresh/deploy, provider comercial ou medição de latência. |
+| 2026-09-05 | Sete melhorias LSP — revisão sequencial | Cada sugestão foi reconfirmada por regressão, implementada e revisada antes da seguinte. Transporte com prazos de escrita/cancel/exit e fechamento de frame parcial; publicação ausente/vazia/versionless distinta; configuração individual respeitada; null separado de payload inválido; definição sem 1:1 inventado; contagens/cortes explícitos; cache atualiza LRU. | 19 testes adicionados. `cargo test --offline --locked --workspace`: **1170 passed / 0 failed / 1 ignored / 74 suítes / 0 compiler warnings**, EXIT=0. Clippy slim-lsp/core/cli `--all-targets -- -D warnings`, EXIT=0. LSP: 46 unitários + 28 subprocesso mock. Sem refresh/deploy por restrição do pedido; binário instalado anterior. Sem provider comercial, instalação de ferramentas, medição de ganhos ou rust-analyzer real. |
 | â€” | â€” | auditoria registrada | tracker criado |
 | exec | A1 | reducer.rs reescrito: Action::Key/Paste/Resize/Scroll/RequestShutdown; runtime sÃ³ executa Effects; 12 testes reducer verdes | V1 resolvida |
 | exec | A2 | ScrollState{pinned,offset_from_end,unseen} em AppState; Paragraph scroll; unseen hint na op bar; tests/scroll_golden.rs 4 goldens via TestBackend | B1 resolvido |
@@ -739,7 +981,54 @@ reducer Ãºnico, render puro, Windows-only.
 | 2026-09-01 | Paralelismo causal em lotes mistos — P1 | Focados verdes: agent loop 40, core lib/governor 50, runtime abort 7 e contratos de tools 21. A primeira revisão corrigiu `code_intel` para permanecer barreira volátil; a segunda não encontrou defeitos. Gate integral fresco: 87 suítes / **1029 passed** / 0 failed / 1 ConPTY físico ignored / 0 warnings; fmt/check/Clippy workspace e diff-check verdes; `refresh-slim.ps1 -Test` imprimiu `OK:` | O executor divide o lote em segmentos contíguos e só paraleliza `SnapshotRead` pelo limite existente; mutation, interaction, volatile, shell não classificado e tools externas são barreiras sequenciais. Preparo, preflight e commit do governor ocorrem por segmento, resultados preservam a ordem do provider e nenhum read posterior cruza uma barreira. Target/PATH 18.272.768 B, SHA-256 `32D629C3B4B98D73ABFAACD4EA0A41F371BD7A36E2F88DCAB32E0FA15C3294FE`; `slim --version` = `slim 0.1.0`; build 2026-09-01 00:44:00; zero provider comercial. |
 | 2026-09-01 | Prompt cache nativo por capability — P1 | Focados verdes: adapters 31, cache multimodal 11, provider HTTP 55, OpenCode 11, CommandCode 8 e provider CLI 10; o loop corretivo eliminou materialização genérica indevida, classificação errada de cache write e fixture Anthropic obsoleta. Gate integral fresco: 87 suítes / **1030 passed** / 0 failed / 1 ConPTY físico ignored / 0 warnings; fmt/Clippy workspace `-D warnings` e diff-check verdes; `refresh-slim.ps1 -Test` imprimiu `OK:` | OpenAI oficial e Codex recebem uma chave bounded derivada apenas do protocolo/modelo e dos fingerprints versionados de system/tools/política; Anthropic recebe cache automático top-level e breakpoints explícitos estáveis em tools/system. Adapters declaram capabilities e materializam somente campos suportados; TTL estendido e replay local de respostas continuam desligados. PATH 18.270.720 B, SHA-256 `A28119903C7F06808FB603D7F673058920F36A5D6FD896223157C5B58B0E9012`; `slim --version` = `slim 0.1.0`; build 2026-09-01 01:11:46 -03:00; zero provider comercial. |
 | 2026-09-03 | Polish UX da auditoria TUI (7 achados) | Implementados 5 + 1 parcial + 1 conforme-sem-mudança, sem nova superfície/dependência: (1) slash usa o token sob o cursor + hint `Tab complete · Enter run · Esc` no popup; (2) palette busca por substring + descrições por comando (viewport morto declarado intencional); (3) `--verbose` inclui 1ª linha do output em rows `✕` (contrato §15.1 atualizado); (4) `/model`/`/image`/`/compact` rejeitados localmente preservam o draft; (5) `Home`/`End` navegam quando pinned com draft (contrato §17.2 atualizado); (6) busca Ctrl+F com filtro `all/errors/tools` via Tab (contrato §17.2 atualizado); (7) rails conformes, sem colapso (exigiria spec). Revisão item-a-item corrigiu 4 bugs próprios (expectativa de cursor, `keep_draft`, linha duplicada no popup, clippy `obfuscated_if_else`). Gate: 87 suítes / **1085 passed** / 0 failed / 1 ConPTY ignored / 0 warnings, com 1 teste preexistente quebrado filtrado via `--skip` (`tui_bridge ordinary_tui_second_turn_sends_prior_user_and_assistant`: espera `Explicitly invoked skill`, string sem nenhuma ocorrência em `crates/` — RED sem implementação, fora deste escopo); Clippy workspace `-D warnings` verde; diff-check dos arquivos tocados verde; fmt limpo nos trechos novos (`cargo fmt --check` acusa somente drift preexistente do rustfmt 1.98). Deploy por via manual equivalente (build release + cópia + smoke): `refresh-slim.ps1` aborta sob `ErrorActionPreference=Stop` do harness (stderr do cargo vira erro fatal na linha 40; incidente de ambiente, sem mudança no script) | PATH 18.706.944 B, SHA-256 `096B2F645FCDF639CC143AB1CC1CAF6979162E3452AFDD545E6EB9B78CCBB6B1`; `slim --version` = `slim 0.1.0`; build 2026-09-03 02:54:05; smoke `slim --headless --fake` exit 0; zero provider comercial. |
+| 2026-09-03 | Artifact content-addressed dedup (slop #2) | `ArtifactStore::put` com id `{label}-{sha256}` reaproveita arquivo byte-idêntico em vez de gravar duplicata timestamped; 1 teste novo (`identical_content_reuses_the_same_artifact_file`); revisão item-a-item dos 7 achados marcou #1 (reuso read/list já existe via evidence cache), #3 (cache hints Anthropic/chave OpenAI oficial já enviados + testados), #4 (wall 600 s é backstop de dribble; stalls já limitados pelo idle), #5 (governor ~µs/call vs I/O em ms; trocar formato persistido não paga), #6 (hot paths já batelados; fsync é contrato de durabilidade; locks 0 B by-design) e #7 (narrow-first mudaria scrollbar no caso borderline; WrapCache já reduz rebuild a O(n) lookups) como sem-mudança. Gate: 87 suítes / **1088 passed** / 0 failed / 1 ConPTY ignored / 0 warnings, com o mesmo teste preexistente quebrado filtrado via `--skip`; Clippy `slim-core --all-targets -D warnings` verde; fmt limpo no arquivo tocado (drift preexistente só em `model.rs`); `refresh-slim.ps1` imprimiu `OK:` | PATH 18.747.904 B, SHA-256 `71417BB8D5A22CA0CB4444DCA41B185FF94CDB45631194D34172025A4710ADDE`; `slim --version` = `slim 0.1.0`; build 2026-09-03 06:01:34; smoke `slim --headless --fake` exit 0; zero provider comercial. |
 | 2026-09-03 | OpenCode Go: registrar `muse-spark-1.3-contributor` | Bundle tinha só o 1.2 e `parse_catalog`/cache/`/model` textual intersectam o ao vivo com o bundle, então o 1.3 (presente no catálogo público, verificado via GET) nunca ficava selecionável. GREEN: `opencode_go_provider` 11/11, `opencode_go_catalog` 10/10; Clippy `-D warnings` e diff-check dos tocados verdes; gate integral com o `--skip` documentado sem novas falhas. Metadados espelham o 1.2-contributor no mesmo gateway (1M contexto, teto 131072, multimodal, reasoning high), cf. Meta docs + notas de lançamento. Smoke no binário: sem `SLIM_EFFORT` o headless barra esforço igual ao 1.2 (comportamento preexistente do path); com `SLIM_EFFORT=high` monta e envia Chat Completions ao gateway (erro 500 sem credencial, como esperado offline) | PATH 18.706.944 B, SHA-256 `3586F8F4B080C0E540073B404742254F3D56513C51D0EA90281C9864A3D62A76`; `slim --version` = `slim 0.1.0`; build 2026-09-03 03:40:52; zero provider comercial. |
+| 2026-09-04 | Auditoria de velocidade CHAMADAS/TOOLS/LEITURAS (só investigação) | Zero patch de produto. Documento canônico: `analysis_outputs/AUDIT-SPEED-CALLS-TOOLS-READS-2026-09-04.md`. Benches desta sessão: `tool_setup` 7 tools / 3469 B / 23,8 µs vs cache 1,12 ns; selector 10k p95 1,694 ms / 20k 3,200 ms (1,89×); TUI long_session p95 input→frame 1,106 ms (98% WrapCache hit). Única fatia candidata: SPD-READ-01 (`read.rs` `format!`+`stream_position` por linha; página 4096 1,72 ms → ~0,34 ms na réplica, 5,2×). Search offset=1 no registry 8,10 ms; offset=2 snapshot 0,111 ms (73×) — não mudar rescan. Finalize extra roundtrip / TOK-07 / WrapCache 4096 descartados ou adiados. | Sem `refresh-slim`; irmão curto `analysis_outputs/SUGESTOES-PERFORMANCE-2026-09-04.md`. Implementar SPD-READ-01 só com aprovação humana. |
+| 2026-09-04 | SPD-READ-01 — `read` sem `format!`/`stream_position` por linha | GREEN: harness `%TEMP%\slim-hot-paths-20260903 --read`: página 4096 **1,738 ms → 0,299 ms (5,81×)**; default 80 **92,5 → 63,4 µs**; skip offset 10000 **2,811 → 0,391 ms**. Testes existentes de checkpoint/footer/CRLF/cap verdes; 0 teste novo. `cargo test --workspace` EXIT=0: 87 suítes / **1093 passed** / 0 failed / 1 ConPTY ignored; Clippy `slim-core --all-targets -D warnings` verde; `refresh-slim.ps1` imprimiu `OK:` | Só `crates/slim-core/src/tools/read.rs`. Footer/`offset`/API intactos. PATH 14.556.672 B, SHA-256 `437C08158A86B7BCB30A472E64E712D3F28CA471E2BFB67B630D4DFC9A43FEEB`; `slim --version` = `slim 0.1.0`; build 2026-09-04 01:35:27. Demais SPD-* da tabela permanecem adiar/descartar. |
+| 2026-09-04 | CALLS por tarefa real (só investigação, zero patch) | BLOQUEIO declarado: ouro (event log com `ContextSnapshot`) N=0 em disco; TUI v2 `D:\Slim\.slim\sessions\` 8 arquivos / 9 ops single-attempt, 0 ToolPhase, 0 Compaction, `C_total`=1 em 9/9, `C_extra` desconhecido (schema sem `request_kind`). N<10, sem prevalência. Canônico: `analysis_outputs/AUDIT-CALLS-PER-TASK-2026-09-04.md`. | Sem `cargo test`, sem `refresh-slim`, zero `crates/`; receita de captura + parser `%TEMP%` no doc. |
+| 2026-09-04 | Provider xAI (Grok) + OAuth device flow | `ProviderKind::Xai` (responses em `api.x.ai/v1`, bundle grok-4.3/4.5/4.6/build-0.1, default 4.5) + `OAuthProvider::Xai` (device code `auth.x.ai`, scope pi, skew 300 s) + slot `xai` no `auth.json` + `XAI_API_KEY` + `/login xai` + `/model <id>`. GREEN: `cargo test --workspace` EXIT=0, 88 suítes / **1096 passed** / 0 failed / 1 ConPTY ignored; Clippy `-D warnings` verde; +3 testes (device login, denied, bundle). Grupo xAI no `/models` adiado. | Referência opencode/pi extraída de binários locais; `refresh-slim.ps1` pendente; validação live pendente de aprovação do device code pelo humano. |
+
+| 2026-09-04 | Correções nativas de loops, esforço e ferramentas | Releitura pós-compactação RED→GREEN; 49 testes focados verdes; 1 teste novo de finalização por capacidade. Fixture de summary/overflow estabilizada pela calibração de usage existente, sem sleeps novos. Gate final `refresh-slim.ps1 -Test`: **1097 passed** / 0 failed / 1 ConPTY ignored / 88 suítes / 0 warnings; Clippy workspace `--all-targets -D warnings`, rustfmt dos arquivos tocados e reprodução HTTP localhost no binário instalado verdes. | Limite total TOML repassado no headless; env vence arquivos nos sete limites numéricos; LoopGuard usa identidade causal existente e argumentos normalizados, invalida falhas após mutação; aviso causal específico no orçamento existente; finalização distingue NoProgress e limita saída existente a 2048, com low apenas se suportado. Muse high-only preservado. `refresh-slim.ps1 -Test` imprimiu `OK:`; target/PATH 14.930.432 B, SHA-256 `668EB85D16388B8615BA34AFCF3252E96BB69D3FC9A272C12072103203EFEFF3`; build 2026-09-04 18:21:14; smoke fake e version exit 0; sem provider comercial. Relatório: `analysis_outputs/AUDIT-AGENT-LOOPS-THINKING-TOOLS-2026-09-04.md`. |
+
+| 2026-09-04 | Harness Slim etapa 1 — simplicidade interna | RED/GREEN do descarte de future; estado AppHandle direto, gestão única do LSP local, ToolLoopLimits reutilizado, histórico movido e remoção de telemetria exclusiva de testes. Gate integral: **1096 passed** / 0 failed / 1 ConPTY ignored / 88 suítes / 0 warnings; Clippy verde; rustfmt e diff da etapa verdes. Drift global de fmt e EOF preexistente em layout_golden.rs declarados no relatório. | `refresh-slim.ps1 -Test` imprimiu `OK:`; target/PATH 14.926.848 B, SHA-256 `9F439A59BD121A2F3402965FC94268D02226B440469352CE2E75A23ABB1FB37A`; build 2026-09-04 18:51:23; version/fake exit 0; sem provider pago. [Decisões e continuidade](../analysis_outputs/HARNESS-SLIM-ETAPA-1.md). |
+| 2026-09-04 | Harness Slim etapa 2 — loop e ferramentas | RED/GREEN: status de shell, histórico de lote, prefixo de orçamento, progresso posterior e barreira --fix; retries após estado observado/efeitos parciais; invalidação pós-compactação, dedup somente se menor, cancelamento na finalização. `cargo test --workspace`: **1099 passed** / 0 failed / 1 ConPTY ignored / 88 suítes / 0 compiler warnings; Clippy verde; rustfmt dos oito arquivos e diff global verdes, fmt global com drift fora do escopo. | `refresh-slim.ps1 -Test` imprimiu `OK:`; target/PATH 14.943.232 B, SHA-256 `0F201CE29C30E59F3DC921CF58978EBF5B4522B13E6EFE5D058CD867620F0E82`; build 2026-09-04 19:16:08; version/fake exit 0. Alteração concorrente em layout_golden.rs preservada e não atribuída a esta etapa. Sem provider pago. [Relatório e passagem à etapa 3](../analysis_outputs/HARNESS-SLIM-ETAPA-2.md). |
+
+
+| 2026-09-04 | Correção do indicador tok/s | RED: footer 4 passed / 2 failed; GREEN: layout 28/28. `refresh-slim.ps1 -Test`: **1100 passed** / 0 failed / 1 ConPTY ignored / 88 suítes / 0 warnings; Clippy workspace `--all-targets -D warnings`, rustfmt dos quatro arquivos e diff global verdes. | Taxa por request usa o tempo do runtime desde FirstSemantic; elimina relógios da UI e duração herdada; fallback estimado mostra `~`; tempo ausente/inválido não produz taxa. `OK: Slim slim 0.1.0 implantado em C:\Users\User\bin\Slim.exe (build de 09/04/2026 19:19:01)`; target/PATH 14.942.720 B, SHA-256 `18FFF12EE3D45FE4D6DF95D8EA67ECE4B65321CA359F7F3239C5A6E9830C7695`; version/fake exit 0. Sem provider pago. [Registro da correção](../analysis_outputs/HARNESS-SLIM-ETAPA-1.md#correção-posterior--indicador-toks). |
+
+| 2026-09-04 | Harness Slim etapa 3 - contexto e historico | Argumentos completos e reasoning Responses opaco no ciclo de tools; pedido recente/autoridade preservados; checkpoint unico, extrato com inicio/fim e recuperacao por artefato. Gate: **1101 passed** / 0 failed / 1 ConPTY ignored / 88 suites / 0 compiler warnings; Clippy, rustfmt dos sete fontes e diff verdes. | `refresh-slim.ps1 -Test` imprimiu `OK:`; target/PATH 15.156.224 B, SHA-256 `3EE4CC87AEAE7731E05DCC4D354E5C2AA43392D5725ED57DF5FD80E30AFE8637`, build 2026-09-04 19:43:26; version/fake exit 0. Sem provider pago. Fmt global preexistente fora do escopo. [Evidencia, decisoes e limites de transporte/retomada](../analysis_outputs/HARNESS-SLIM-ETAPA-3.md). |
+| 2026-09-04 | Harness Slim etapa 4 — transporte | RED/GREEN: término nativo Responses/Messages sem aguardar EOF, retry conservador após envio e retenção de usage em falha; busca SSE incremental e cancelamento prioritário. Gate: **1103 passed** / 0 failed / 1 ConPTY ignored / 88 suítes / 0 compiler warnings; Clippy, rustfmt dos dois fontes e diff verdes. | `OK: Slim slim 0.1.0 implantado em C:\Users\User\bin\Slim.exe (build de 09/04/2026 20:13:32)`; target/PATH 15.003.648 B, SHA-256 `D33AFD02D6A1E45813F10C911507DCBC31E53D14BD992E7A2329CBC71634E7F2`; version/fake exit 0. Sem provider pago. Medições somente locais; fmt global preexistente preservado. [Relatório, decisões e limites](../analysis_outputs/HARNESS-SLIM-ETAPA-4.md). |
+
+| 2026-09-04 | Harness Slim etapa 5 — configuração e providers | Limites ClinePass/Command Code, esforço Anthropic/TUI, controles OpenAI Chat, aliases/modelo explícito, compactação compatível, validação Go/xAI e scope de catálogo Codex. Gate: **1107 passed** / 0 failed / 1 ConPTY ignored / 88 suítes / 0 warnings; Clippy, rustfmt dos 18 fontes e diff verdes; drift global preexistente preservado. | `OK: Slim slim 0.1.0 implantado em C:\Users\User\bin\Slim.exe (build de 09/04/2026 20:56:45)`; target/PATH 15.011.840 B, SHA-256 `363882A70F8AEE420012EF85519B22072BFF20D2DB97011929B45571CE0FA30C`; version/fake exit 0. Sem inferência live ou chamada paga. [Matriz de contratos, evidências e síntese das cinco etapas](../analysis_outputs/HARNESS-SLIM-ETAPA-5.md). |
+| 2026-09-04 | Otimização de testes e build | Fixtures de budget completas com falha HTTP explícita; 17 módulos TUI em um executável; dois testes exclusivos de std removidos. Medianas: workspace 18,735 → 10,183 s; recompilação TUI com linking 6,144 → 2,716 s. Gate: **1105 passed** / 0 failed / 1 ConPTY ignored / 72 suítes / 0 warnings; Clippy e checks dos arquivos editados verdes; fmt global preexistente preservado. | `refresh-slim.ps1 -Test` EXIT=0, `OK:`; target/PATH 15.011.840 B, SHA-256 `E6036EA7D78DB06C90BA709E7C78058254D6F997E7161AEFD83E95228A61E909`, build 21:24:01; version/fake EXIT=0. Fontes de produção e melhorias das cinco etapas preservados. [Relatório com condições, limites e cobertura](../analysis_outputs/OTIMIZACAO-TESTES-E-BUILD-SLIM.md). |
+| 2026-09-04 | Gate combinado após mudanças concorrentes da TUI | Após a otimização, outro trabalho alterou theme/runtime/golden_matrix e acrescentou uma regressão do composer. Tudo preservado; bloqueio transitório de slim.exe abortou uma tentativa, sem exclusão ou encerramento de processos. Repetição final: **1106 passed** / 0 failed / 1 ConPTY ignored / 72 suítes / 0 warnings; Clippy EXIT=0; fontes sem drift durante o gate. | `refresh-slim.ps1 -Test` EXIT=0; `OK: Slim slim 0.1.0 implantado em C:\Users\User\bin\Slim.exe (build de 09/04/2026 21:32:54)`; target/PATH 15.014.912 B, SHA-256 `21F77F9D7C828F6D2A5E69731DAF465F1261961A5873CC842AF265F210B2E562`; version/fake EXIT=0. Os tempos da otimização pertencem ao snapshot anterior, sem atribuição dos ajustes visuais. [Condições e autoria](../analysis_outputs/OTIMIZACAO-TESTES-E-BUILD-SLIM.md). |
+| 2026-09-04 | Revisão visual da TUI | Metadados com maior contraste, sessão neutra, atividade sem zeros/cancel duplicado, output expandido legível, modelo longo abreviado, ANSI16 sem confundir aviso/erro e modo inicial projetado. Gate final: **1106 passed** / 0 failed / 1 ConPTY ignored / 72 suítes / 0 warnings; Clippy verde; benchmark renderer p95 1,934 ms. | `refresh-slim.ps1 -Test` EXIT=0; `OK:` build 21:41:28; target/PATH 15.014.912 B, SHA-256 `407598446856B288086EB9B78CADC39B6F2495E5C37ED198909287B3CDBC6F6C`. PTY local em 80×24, 60×16, 40×12 e 32×10; sem captura física ou chamada paga. [Relatório visual e limitações](../analysis_outputs/REVISAO-VISUAL-TUI-SLIM.md). |
+| 2026-09-04 | Quick wins de agilidade nativa | Trecho LF de read funciona em patch CRLF uniforme; ambiguidade retorna localizações, sucesso retorna arquivo/linha/bytes; schemas explicitam precondições. Regressões RED/GREEN e loop HTTP localhost preservam IDs/argumentos e bytes. Gate: **1109 passed** / 0 failed / 1 ConPTY ignored / 72 suítes / 0 warnings; Clippy e diff verdes; fmt global preexistente preservado. | `OK: Slim slim 0.1.0 implantado em C:\Users\User\bin\Slim.exe (build de 09/04/2026 22:11:31)`; target/PATH 15.030.784 B, SHA-256 `897C2BDCAEC5769AD3BA89E3455D1A556753CEC8426CE1DC2A155DB1ABC48FFE`; version/fake EXIT=0. Sem modelo comercial ou credenciais reais. [Atritos, mudanças e limites](../analysis_outputs/QUICK-WINS-AGILIDADE-NATIVA-SLIM.md). |
+| 2026-09-04 | Revisão de economia de tokens nativa | Listagem relativa, legenda de padrões na mesma página somente quando menor e correção de LF. Fixture de quatro requests/três tools; dez combinações dos sete providers com 6.100 bytes evitados na soma dos corpos, sem alterar schemas/IDs/controles. Gate: **1111 passed** / 0 failed / 1 ConPTY ignored / 72 suítes / 0 compiler warnings; Clippy e diff verdes. | `OK: Slim slim 0.1.0 implantado em C:\Users\User\bin\Slim.exe (build de 09/04/2026 22:51:24)`; target/PATH 15.032.832 B, SHA-256 `D9DB8BA293C80F4E0EC728D6FF2C0123A44513B7303BF151791326C92C82CE04`; version/fake EXIT=0. Fmt global preexistente preservado; sem credenciais reais ou modelo comercial. [Diagnóstico, medições e limites](../analysis_outputs/REVISAO-ECONOMIA-TOKENS-NATIVA-SLIM.md). |
+| 2026-09-05 | Codex: Astra e Normal/Fast | `astra`/`gpt-6-astra` no catálogo e picker, reasoning low/medium/high/xhigh/max e Tab Normal/Fast. Persistência e flags `--effort`, `--fast`, `--normal`; Fast envia `service_tier=priority` somente ao Codex. Testes capturam HTTP local na CLI e TUI, incluindo volta a Normal, tools e rejeição de esforço inválido. Gate: **1114 passed** / 0 failed / 1 ConPTY ignored / 72 suítes / 0 compiler warnings; Clippy e diff verdes. | `OK: Slim slim 0.1.0 implantado em C:\Users\User\bin\Slim.exe (build de 09/05/2026 00:32:56)`; target/PATH 15.036.928 B, SHA-256 `E1190EBDD9BE240BA51E8EFFFC12BDFE283EADDD3830F0232B191FCECE21BD2F`; version/help/fake EXIT=0. Help golden atualizado para os novos argumentos. Fmt global com diferenças preexistentes; formatter dos fontes Codex/API/App/runtime verde. Sem provider real, credenciais reais ou validação de latência/disponibilidade da conta; Ultra Astra não exposto. [Uso, fontes oficiais e limites](../README.md#openai-codex--gpt-6-astra). |
+| 2026-09-05 | Recuperação nativa e latência do agente | Escrita nova com null/omissão, erro acionável sem relaxar overwrite; PowerShell determinístico com exit codes; leitura ausente orienta recuperação; artefatos lazy; workflow proporcional. Opcionais preservados em Responses e verbosidade low somente em GPT suportado. Contratos em sete rotas/dez variantes; **1119 passed / 0 failed / 1 ignored / 73 suítes / 0 compiler warnings**; Clippy verde. | `OK: Slim slim 0.1.0 implantado em C:\Users\User\bin\Slim.exe (build de 09/05/2026 04:32:01)`; target/PATH 15.038.464 B, SHA-256 `C115056FD460771B32775392DA812E2CFA80B455EB8874D1CA6C759F3D87E16C`. [Campanhas reais, causas, resultados e limites](../bench/luna-live/README.md#correções-e-validação-ampliada); sem alegação de ganho universal entre providers. |
+| 2026-09-05 | IDs e status de todo | Parser, ledger e bridge preservam ID e status inicial; retorno informa IDs reais, erro parcial publica o estado e registros antigos continuam legíveis. Reprodução RED no handler real; regressões, HTTP e retomada da bridge GREEN. **1122 passed / 0 failed / 1 ignored / 73 suítes / 0 compiler warnings**; Clippy verde. | `OK: Slim slim 0.1.0 implantado em C:\Users\User\bin\Slim.exe (build de 09/05/2026 05:05:32)`; target/PATH 15.046.656 B, SHA-256 `E9DC086A42F658850B4718A9A70DDEBD88042650B8B65CB2AB5D9FC260E7C590`. [Evidência e limites](../bench/luna-live/README.md#correção-dos-ids-e-status-de-todo). |
+| 2026-09-05 | Economia: prefixo compartilhado | Instruções e descrições consolidadas; todo anuncia um lote canônico e mantém parser anterior. Contratos estendidos a todo/skill nos sete providers/dez variantes. **1122 passed / 0 failed / 1 ignored / 73 suítes / 0 compiler warnings**; Clippy verde. | `OK: Slim slim 0.1.0 implantado em C:\Users\User\bin\Slim.exe (build de 09/05/2026 05:35:33)`; target/PATH 15.041.024 B, SHA-256 `3DA704675A3615F23BA0097EDC259BA5945CE32CA53B2AAFB0B482E3ED5D8D2C`. [Medição comercial e limites](../bench/luna-live/README.md#economia-transversal--prefixo-compartilhado). |
+| 2026-09-05 | Streaming Chat: ID null | Fragmentos seguintes com id:null passam como ID ausente; índice mantém a chamada original. Captura DeepSeek nativa e regressão HTTP RED/GREEN. **1122 passed / 0 failed / 1 ignored / 73 suítes / 0 compiler warnings**; Clippy verde. | `OK: Slim slim 0.1.0 implantado em C:\Users\User\bin\Slim.exe (build de 09/05/2026 05:56:49)`; target/PATH 15.041.024 B, SHA-256 `FF652E7CFC09D8B334A1AC9222EBAAF139319A1A2357F3503B638DCF83E68CA4`. [Causa e validação](../bench/luna-live/README.md#deepseekopencode-go-falha-real-de-streaming). |
+| 2026-09-05 | Guarda de escrita após read | Digest dos bytes lidos; verificação antes de sobrescrever; CRLF e rejeição de alterações externas. 1124 passed / 0 failed / 1 ignored / 73 suítes; Clippy verde. | Deploy 06:26:16; 15048192 B; SHA-256 DF12417AECA59556430A439B2D1D4DEAA71015E7EEC532F110B6F6A8AC77CB64. [Evidência](../bench/luna-live/README.md#guarda-de-escrita-baseada-na-leitura). |
+| 2026-09-05 | Catálogo por workspace | Disponibilidade reavaliada entre requests, sem iniciar servidor. 1126 passed / 0 failed / 1 ignored / 73 suítes; Clippy verde. | Deploy 06:35:59; 15052288 B; SHA-256 3FBFA600337A8F29744DB3292DABBB675CF1C195C8C39EE47C611E6EBED58400. [Evidência e resultados](../bench/luna-live/README.md#catálogo-por-disponibilidade-do-workspace). |
+| 2026-09-05 | Thinking DeepSeek V4 | Ativação e replay exato de estado restrito ao mesmo modelo/credencial/endpoint; orçamento e continuação protegidos. 1127 passed / 0 failed / 1 ignored / 73 suítes; Clippy verde. | Deploy 06:47:23; 15073280 B; SHA-256 2CF32F6631AE51FCB926F779480AD8499D9BD655265CD520FAD0436B2F60E1D0. [Comparabilidade e bateria](../bench/luna-live/README.md#deepseek-thinking-ativado-e-continuação-preservada). |
+| 2026-09-05 | Read bruto e patch em lote | Texto nativo preserva CRLF/EOF, sem prefixos. Até 64 edições ordenadas com uma gravação atômica; falha tardia não altera arquivo; cache/receipt/LSP mantêm estado final. 1129 passed / 0 failed / 1 ignored / 73 suítes / 0 compiler warnings; Clippy verde. | `OK: Slim slim 0.1.0 implantado em C:\Users\User\bin\Slim.exe (build de 09/05/2026 07:08:25)`; 15084544 B; SHA-256 B3CE3A4D0F95807AD5DEF509207EFE8E412971B1066D349A0505F0DC36C8F9CC. [Evidência e bateria](../bench/luna-live/README.md#leitura-sem-prefixos-e-patches-em-lote). |
+| 2026-09-05 | Leitura média e cálculo executável | Padrão read 200 linhas; EOF/paginação/trecho explícito cobertos. Prompt v1.5 orienta scripts para dados e gravação direta. 1130 passed / 0 failed / 1 ignored / 73 suítes / 0 compiler warnings. | Deploy 07:31:33; 15084544 B; SHA-256 37497B720F8DCFEC9211F45EA5DD7B5254D159E544B1B0D31EA31D1A85082F0A. [Bateria e limitações](../bench/luna-live/README.md#leitura-padrão-de-200-linhas-e-cálculo-executável). |
+| 2026-09-05 | Patch CRLF em inserções | RED/GREEN: substituição de trecho sem newline por múltiplas linhas preserva CRLF uniforme; trecho LF seguinte continua aplicável; arquivo já misturado e limite pós-expansão cobertos. 1131 passed / 0 failed / 1 ignored / 73 suítes / 0 compiler warnings; Clippy verde. | Deploy 07:52:48; 15085568 B; SHA-256 2BBC54B0321065E7CCD303B62FD5922D0934DA8123728F0A5691AC414F4FAEB2. [Evidência](../bench/luna-live/README.md#patch-inserção-de-linhas-sem-criar-finais-misturados). |
+| 2026-09-05 | Execução direta com args | Tool shell aceita lista literal de argumentos e reutiliza ProcessRunner; modo PowerShell preservado. Resumo mostra programa/args; classificação causal preserva cargo e --fix. 1132 passed / 0 failed / 1 ignored / 73 suítes / 0 compiler warnings; Clippy verde. | Deploy 08:21:37; 15096832 B; SHA-256 D85CE4DFE51FDED4330408AE6865DDAB0B8AE5833D485682D5CF6FAFD71F5879. [Evidência](../bench/luna-live/README.md#execução-direta-com-argumentos-estruturados). |
+| 2026-09-05 | Identidade Responses e prefixo v1.6 | RED/GREEN: chamadas iguais com IDs distintos e conclusão sem deltas; conflitos continuam rejeitados. Prompt/descrições concisos. 1134 passed / 0 failed / 1 ignored / 73 suítes / 0 compiler warnings; Clippy verde. | Deploy 09:03:43; 15096320 B; SHA-256 8FB0E5F59FFA668033B5439C20968AEEB73D3F2A53191C978E2D467FBAE7BFA0. [Evidência](../bench/luna-live/README.md#identidade-na-conclusão-de-chamadas-responses-e-prefixo-v16). |
+| 2026-09-05 | Escrita observada e stdio UTF-8 | Schema write path/content com SHA-256 da leitura completa; API explícita preservada. Stdio Python UTF-8 no filho sem alterar override/global. Prompt v1.7: dados via parsers. 1135 passed / 0 failed / 1 ignored / 73 suítes / 0 compiler warnings; Clippy verde. | Deploy 09:33:06; 15102976 B; SHA-256 899EA9AFD74471218B50624FECF4E3F4EBA1C831C38407E845615A980F819339. [Evidência](../bench/luna-live/README.md#escrita-protegida-sem-recópia-e-stdio-utf-8). |
+| 2026-09-05 | Bateria nativa v1.7 concluída | 48/48 pares / 96 braços passaram; fixtures preservados e uso completo. Luna -3,53% agregado, DeepSeek -7,68%; 14/24 vitórias por modelo. | Ganhos desiguais por cenário; mediana DeepSeek -0,39%. Meta ampla não demonstrada. [Resultados](../bench/luna-live/README.md#resultado-completo-da-bateria-v17). |
+| 2026-09-05 | Contexto inicial do workspace | Lista limitada de caminhos, ignore e junctions, orçamento, redação, anexos/retomada preservados; nomes não autorizam sobrescrita. 1140 passed / 0 failed / 1 ignored / 73 suítes / 0 compiler warnings; Clippy verde. | Deploy 10:51:43; 15132160 B; SHA-256 016046F6570E6684E9AEF7F3613E901ECC57BE2107A42C1084A682C8D60D1DB7. Bateria nativa de 32 pares concluída; inclui dois cenários inéditos. [Evidência](../bench/luna-live/README.md#contexto-inicial-integrado-ao-runtime--comparação-nativa). |
+| 2026-09-05 | Bateria do contexto inicial concluída | 30/32 pares aprovados; 62/64 braços. Luna +11,70% tokens, DeepSeek -8,52% nos 14 pares completos. Duas falhas de transporte DeepSeek/ledger, sem uso completo; Pi passou. | Repositório maior: +6,11% Luna / +19,19% DeepSeek. Meta ampla permanece aberta. [Resultados e limites](../bench/luna-live/README.md#resultado-completo-do-contexto-inicial-integrado). |
+| 2026-09-05 | Contexto equilibrado e prazos HTTP | Reprodução de cabeçalhos interrompidos pelo prazo connect e raiz oculta por pasta grande; corrigidos no transporte e descoberta em largura. 1142 passed / 0 failed / 1 ignored / 73 suítes / 0 compiler warnings; Clippy verde. | Deploy 11:51:29, 15136768 B, SHA-256 6E671C9628029DB0154B67F0E7420534E7D4FCAE290B62D31F78176F90BA5E4E. 32/32 pares aprovados; Luna -10,76%, DeepSeek -21,31% tokens. [Evidência](../bench/luna-live/README.md#contexto-equilibrado-e-prazos-http). |
+| 2026-09-05 | Bateria equilibrada concluída | 32/32 pares, 64/64 braços aprovados, uso completo. Slim: Luna -10,76% e DeepSeek -21,31% tokens; 27/32 vitórias por par, 6/8 e 7/8 cenários. | 148 requests sem falha/retry; cabeçalhos após 28,114 s e 54,374 s concluíram. Perdas por cenário e limites preservados. [Resultados](../bench/luna-live/README.md#resultado-completo-da-bateria-equilibrada). |
+| 2026-09-05 | Leitura numerada descartada após benchmark | Seis pares completos/aprovados: Luna +11,63% tokens, DeepSeek +27,18%; parâmetro experimental retirado. Conversa excluída por ferramentas desabilitadas no resume headless; interrupções preservadas. Caminho da extensão Pi corrigido no runner. | `refresh-slim.ps1 -Test` EXIT=0: 1142 passed / 0 failed / 1 ignored / 73 suítes / 0 compiler warnings; `OK:` deploy 20:37:33. Diff check verde. [Resultados, exclusões e Pi](../bench/economy-next/numbered/README.md#resultado-final). |
+| 2026-09-05 | Continuação de sessões com ferramentas | Novas sessões v2; chamadas/resultados/blocos persistidos; raiz salva e guardas renovadas; compactação preserva correlação. CLI em processos separados e bridge TUI editam após reabrir; ReadOnly respeitado; interrupção após shell fica pendente, sem replay. `RUST_TEST_THREADS=1` + `refresh-slim.ps1 -Test`: **1148 passed / 0 failed / 1 ignored / 74 suítes / 0 compiler warnings**; Clippy `-D warnings` e diff verdes. | `OK: Slim slim 0.1.0 implantado em C:\Users\User\bin\Slim.exe (build de 09/05/2026 21:12:08)`; target/PATH 14709760 B, SHA-256 `405BA6401366434948C43AEEFE5F7F6EA0AAF46C3D620F2B05F5E149D95197D7`. Duas execuções paralelas falharam no teste existente `complete_read_guards_native_overwrite_without_repeating_the_file` com arquivo temporário ausente; isolado e serial verdes, causa exata não isolada. Sem provider real, ConPTY físico, migração v1, recuperação automática de turno interrompido ou promessa de economia. [Uso e limites](../README.md#continuação-de-sessões-com-ferramentas). |
+| 2026-09-05 | Histórico visual das ferramentas | `/resume` e abertura com sessão restauram tools salvas em blocos individuais recolhidos `history`; Enter consulta argumentos/resultados sem replay. Histórico visual independe da compactação do contexto; IDs reutilizados ficam separados por batch. Status neutro, sem inventar sucesso/duração ou incrementar contagens atuais. | `RUST_TEST_THREADS=1` + `refresh-slim.ps1 -Test`: **1150 passed / 0 failed / 1 ignored / 74 suítes / 0 compiler warnings**. Clippy `-D warnings`, diff e render fullscreen em 44/100 colunas verdes; bridge restaura/expande sem alterar sessão ou repetir shell e continua com nova edição. `OK: Slim slim 0.1.0 implantado em C:\Users\User\bin\Slim.exe (build de 09/05/2026 22:37:18)`; target/PATH 14732800 B, SHA-256 `C519F255C91D9E858EBA1C1F51192C6CC82B3D3B4E36C450654EDE06D7283D87`. Sem provider real ou console físico. [Uso](../README.md#continuação-de-sessões-com-ferramentas). |
+| 2026-09-05 | Isolamento exclusivo das fixtures | Reprodução RED: mesmo timestamp compartilha pasta e Drop apaga arquivo da outra fixture. `native_tool_recovery` e `session_continuation` usam `create_dir` exclusivo e outro sufixo quando existente, sem alterar assertions ou dependências. Regressão GREEN; três repetições da suíte afetada com 16 threads: 13/13 em cada. | `cargo test --workspace` em paralelo: **1151 passed / 0 failed / 1 ignored / 74 suítes / 0 warnings**, EXIT=0, 16,04 s incluindo 2,54 s de preparação/compilação. Clippy `-D warnings` e diff verdes; `refresh-slim.ps1`: `OK: Slim slim 0.1.0 implantado em C:\Users\User\bin\Slim.exe (build de 09/05/2026 22:37:18)`. Mudança apenas nas fixtures: binário de produção preservado. Sem A/B de desempenho nem garantia de ausência de outros testes intermitentes; colisões antigas não instrumentadas. |
+
 
 ---
 
@@ -752,11 +1041,9 @@ com o toolchain correto (`stable-x86_64-pc-windows-msvc`, rustc **1.98.0**,
 `RUSTUP_HOME` do scoop persist):
 
 Este bloco registrava uma contagem histórica anterior. A contagem autoritativa
-atual está no fim do §7: 87 suítes / 1085 passed / 0 failed /
-1 ignored / 0 compiler warnings (com 1 teste preexistente quebrado filtrado via
-`--skip`: `tui_bridge ordinary_tui_second_turn_sends_prior_user_and_assistant`,
-cuja expectativa `Explicitly invoked skill` não tem implementação em `crates/`). O gate ignorado é o ConPTY físico, dependente
-do ambiente. Os totais históricos permanecem nas linhas de seus respectivos gates e
+atual está na linha mais recente do §7: 74 suítes / 1211 passed / 0 failed /
+3 ignored / 0 compiler warnings. Um ignorado é o ConPTY físico; dois são fixtures
+de subprocesso chamadas pelo teste de pipes herdados. Os totais históricos permanecem nas linhas de seus respectivos gates e
 não devem ser interpretados como estado atual.
 
 ### 8.2 CorreÃ§Ãµes aplicadas nesta verificaÃ§Ã£o
