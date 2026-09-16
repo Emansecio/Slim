@@ -148,6 +148,11 @@ Reduzir timeout_secs da fail-fast em rede lenta; reduzir max_turns/max_*_tool_ca
 
 ## Admissão e resultados nativos
 
+A ferramenta `skill` exige `list` booleano e `script` string quando fornecidos;
+tipos inválidos, inclusive `null`, são rejeitados antes do despacho. Campos
+omitidos mantêm os padrões existentes. Essa validação não acrescenta chamadas
+ao modelo.
+
 Revisão de 12/09/2026:
 
 - `shell` com `args` ausente ou `null` executa um script PowerShell. Com um array

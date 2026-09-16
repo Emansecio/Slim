@@ -6186,7 +6186,31 @@ fn run_skill_dispatch(
             }
         }
     };
-    if args.get("list").and_then(Value::as_bool).unwrap_or(false) {
+    let list = match args.get("list") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return ToolResult {
+                name: "skill".into(),
+                success: false,
+                output: "invalid skill arguments: list must be a boolean".into(),
+                artifact: None,
+            }
+        }
+    };
+    let script = match args.get("script") {
+        None => None,
+        Some(Value::String(value)) => Some(value.as_str()),
+        Some(_) => {
+            return ToolResult {
+                name: "skill".into(),
+                success: false,
+                output: "invalid skill arguments: script must be a string".into(),
+                artifact: None,
+            }
+        }
+    };
+    if list {
         return skill_list_output(cwd, cached.as_ref());
     }
     let Some(name) = args
@@ -6223,7 +6247,7 @@ fn run_skill_dispatch(
             artifact: None,
         };
     };
-    let script = crate::skills::default_skill_script(args.get("script").and_then(Value::as_str));
+    let script = crate::skills::default_skill_script(script);
     if let Some(body) = crate::skills::fallback_skill_body(&entry.path, script) {
         return ToolResult {
             name: "skill".into(),
@@ -10286,6 +10310,92 @@ mod tests {
             .expect("other cwd discovery");
         assert!(other.active("first").is_none());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_dispatch_validates_list_and_script_types_before_dispatch() {
+        let root = std::env::temp_dir().join(format!(
+            "slim-skill-dispatch-types-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let skill_dir = root.join(".slim").join("skills").join("fixture");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: fixture\ndescription: dispatch fixture\n---\nfallback body\n",
+        )
+        .expect("skill metadata");
+        let discovery = discover_workspace(&root).expect("skill discovery");
+        let runner = crate::process::ProcessRunner::default();
+        let dispatch = |arguments: Value| {
+            run_skill_dispatch(
+                crate::OperatingMode::Auto,
+                &root,
+                &arguments.to_string(),
+                None,
+                &runner,
+                Some(discovery.clone()),
+            )
+        };
+
+        for value in [json!("true"), Value::Null, json!(1), json!([]), json!({})] {
+            let result = dispatch(json!({"list": value, "name": "fixture"}));
+            assert!(
+                !result.success,
+                "invalid list value was dispatched: {result:?}"
+            );
+            assert_eq!(
+                result.output,
+                "invalid skill arguments: list must be a boolean"
+            );
+        }
+
+        for value in [json!(true), Value::Null, json!(1), json!([]), json!({})] {
+            let result = dispatch(json!({"list": true, "script": value}));
+            assert!(
+                !result.success,
+                "invalid script value was dispatched: {result:?}"
+            );
+            assert_eq!(
+                result.output,
+                "invalid skill arguments: script must be a string"
+            );
+        }
+
+        for value in [json!(true), Value::Null, json!(1), json!([]), json!({})] {
+            let result = dispatch(json!({"name": "fixture", "script": value}));
+            assert!(
+                !result.success,
+                "invalid script value was dispatched: {result:?}"
+            );
+            assert_eq!(
+                result.output,
+                "invalid skill arguments: script must be a string"
+            );
+        }
+
+        let listed = dispatch(json!({"list": true}));
+        assert!(listed.success, "list:true failed: {listed:?}");
+        assert!(listed.output.contains("fixture: dispatch fixture"));
+        assert!(!listed.output.contains("fallback body"));
+
+        for arguments in [
+            json!({"name": "fixture"}),
+            json!({"list": false, "name": "fixture"}),
+            json!({"name": "fixture", "script": ""}),
+            json!({"name": "fixture", "script": "run.ps1"}),
+            json!({"name": "fixture", "script": "./run.ps1"}),
+        ] {
+            let result = dispatch(arguments);
+            assert!(result.success, "valid skill arguments failed: {result:?}");
+            assert!(result.output.contains("fallback body"));
+        }
+
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

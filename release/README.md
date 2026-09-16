@@ -1,6 +1,27 @@
 # Release do Slim
 
-## Deploy local atual — Seleção textual e confirmação de cópia (2026-09-14)
+## Deploy local atual — Tipos dos argumentos de skill (2026-09-16)
+
+`refresh-slim.ps1` concluiu com `OK:` e exit 0; build release em **5m06s**.
+PATH resolvido: `C:\Users\User\bin\Slim.exe`, build **2026-09-16 04:14:37**,
+`slim 0.1.0`, **17.875.456 bytes**. SHA-256 do instalado e de
+`target/release/slim.exe`, conferidos após a cópia e idênticos:
+`1C5C0E13C08F2CD42817F1FA2B9BF3267B7B472EDEDDE84AC835EE6B07050CA1`.
+
+`skill.list` e `skill.script` rejeitam tipos inválidos, inclusive `null`,
+antes de escolher listagem, fallback ou execução. Campos omitidos e strings
+vazias preservam os padrões existentes; nenhuma chamada adicional ao modelo.
+
+Validação: **8 testes pertinentes aprovados** (2 unitários, 2 do fluxo do agente
+e 4 de invocação de skills), incluindo cancelamento de processos; formatação
+e diff aprovados. Smoke do executável resolvido no PATH: `--version`, exit 0.
+Não foi executada a suíte completa nem teste com provider real ou TUI física.
+
+O binário foi construído do checkout atual, incluindo trabalho preexistente
+não commitado. O commit desta tarefa contém somente a correção, seu teste e
+a documentação; não representa sozinho todo o código usado neste binário.
+
+## Deploy anterior — Seleção textual e confirmação de cópia (2026-09-14)
 
 `refresh-slim.ps1` concluiu com `OK:` e exit 0; build release em **2m40s**.
 PATH: `C:\Users\User\bin\Slim.exe`, build **2026-09-14 21:05:57**,
