@@ -138,7 +138,7 @@ fn repeated_search_patterns_use_a_self_contained_legend_on_each_page() {
         assert!(result.output.starts_with(&expected), "{}", result.output);
         before.push_str(&result.output[expected.len()..]);
         assert!(result.output.len() < before.len());
-        assert!(result.output.ends_with("[skipped: node_modules, target, dist, .git, .slim, .pi — use list/shell in those trees]"));
+        assert!(result.output.ends_with("[skipped: node_modules, target, dist, .git, .slim, .pi, .venv — use read/list/shell in those trees]"));
         println!(
             "search legend only page {}: before={} bytes after={} bytes",
             page + 1,

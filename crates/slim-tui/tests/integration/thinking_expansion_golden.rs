@@ -98,15 +98,22 @@ fn consecutive_collapsed_thoughts_render_as_one_row() {
     }
     let frame = render_at(&state, 80, 24);
     assert!(
-        frame.contains("Thought ×5"),
-        "consecutive collapsed thoughts must collapse\n{frame}"
+        frame.contains("Pensamento ×4"),
+        "prior completed thoughts must collapse\n{frame}"
     );
     assert_eq!(
-        frame.matches("Thought").count(),
-        1,
-        "only one thought header\n{frame}"
+        frame.matches("Pensamento").count(),
+        2,
+        "the last close frame keeps a preview row\n{frame}"
     );
-    assert!(!frame.contains("scratch"), "{frame}");
+    assert!(
+        frame.contains("scratch 4"),
+        "latest preview stays visible\n{frame}"
+    );
+    assert!(
+        !frame.contains("scratch 0"),
+        "released previews stay hidden\n{frame}"
+    );
 }
 
 #[test]
@@ -121,10 +128,10 @@ fn keyboard_expands_and_collapses_thinking_inline_at_normative_sizes() {
 
         let collapsed = render_at(&state, width, height);
         assert!(
-            collapsed.contains("> ▸ Thought"),
+            collapsed.contains("> ▸ Pensamento"),
             "{width}x{height}\n{collapsed}"
         );
-        assert!(collapsed.contains("Enter expand"), "{collapsed}");
+        assert!(collapsed.contains("Enter expandir"), "{collapsed}");
         for hidden in ["alpha", "beta", "gamma", "delta"] {
             assert!(
                 !collapsed.contains(hidden),
@@ -142,8 +149,8 @@ fn keyboard_expands_and_collapses_thinking_inline_at_normative_sizes() {
             Some(FoldState::Expanded)
         ));
         let expanded = render_at(&state, width, height);
-        assert!(expanded.contains("> ▾ Thought"), "{expanded}");
-        assert!(expanded.contains("Enter collapse"), "{expanded}");
+        assert!(expanded.contains("> ▾ Pensamento"), "{expanded}");
+        assert!(expanded.contains("Enter recolher"), "{expanded}");
         assert!(expanded.contains("delta"), "{width}x{height}\n{expanded}");
         assert!(
             !expanded.contains('┌') && !expanded.contains('┐'),
@@ -171,6 +178,48 @@ fn keyboard_expands_and_collapses_thinking_inline_at_normative_sizes() {
             Some(FoldState::Collapsed)
         ));
     }
+}
+
+#[test]
+fn completed_thinking_retains_preview_until_the_next_content_boundary() {
+    let mut state = AppState::new();
+    state.authenticated = true;
+    state.apply_event(UiEvent::run_started(1));
+    state.apply_event(UiEvent::ThinkingStarted);
+    state.apply_event(UiEvent::ThinkingDelta {
+        text: "first hidden line\nsecond live line\nfinal live line".into(),
+    });
+    state.apply_event(UiEvent::ThinkingEnded);
+
+    let thinking = state
+        .blocks()
+        .iter()
+        .find(|block| matches!(block.kind(), BlockKind::Thinking(_)))
+        .expect("completed thinking block");
+    assert_eq!(thinking.lifecycle, BlockLifecycle::Complete);
+    assert!(
+        thinking.preview_retained,
+        "the close frame keeps the latest preview"
+    );
+    let retained = render_at(&state, 48, 16);
+    assert!(retained.contains("… second live line"), "{retained}");
+    assert!(retained.contains("final live line"), "{retained}");
+
+    state.apply_event(UiEvent::AssistantDelta {
+        text: "final answer".into(),
+    });
+    let thinking = state
+        .blocks()
+        .iter()
+        .find(|block| matches!(block.kind(), BlockKind::Thinking(_)))
+        .expect("thinking block after boundary");
+    assert!(
+        !thinking.preview_retained,
+        "next semantic content releases the preview"
+    );
+    let released = render_at(&state, 48, 16);
+    assert!(!released.contains("second live line"), "{released}");
+    assert!(!released.contains("final live line"), "{released}");
 }
 
 #[test]
@@ -353,6 +402,6 @@ fn auto_fold_thinking_hides_body_until_expanded() {
     assert!(state.append_block(block));
 
     let collapsed = render_at(&state, 80, 24);
-    assert!(collapsed.contains("Thought"), "{collapsed}");
+    assert!(collapsed.contains("Pensamento"), "{collapsed}");
     assert!(!collapsed.contains("secret body"), "{collapsed}");
 }

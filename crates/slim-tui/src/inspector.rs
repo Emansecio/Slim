@@ -117,9 +117,9 @@ impl SearchFilter {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::All => "all",
-            Self::Errors => "errors",
-            Self::Tools => "tools",
+            Self::All => "tudo",
+            Self::Errors => "erros",
+            Self::Tools => "ferramentas",
         }
     }
 

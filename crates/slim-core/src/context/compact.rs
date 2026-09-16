@@ -1107,16 +1107,79 @@ fn group_carries_file_recovery(messages: &[ProviderMessage]) -> bool {
         message.role == "tool"
             && (message.content.contains("Current file is below")
                 || message.content.contains("Current file edges are below")
+                || message
+                    .content
+                    .contains("Example context only for the first match")
                 || message.content.contains("Suggested unique expected:"))
     })
 }
 
 pub(crate) fn recovery_transcript(messages: &[ProviderMessage]) -> String {
-    messages
+    if messages.is_empty() {
+        return String::new();
+    }
+
+    let bodies = messages
         .iter()
         .map(|message| format_provider_message(message, false))
-        .collect::<Vec<_>>()
-        .join("\n\n")
+        .collect::<Vec<_>>();
+    let index_header = [
+        "[Recovery transcript index]",
+        "offset is one-based; max_lines is a read page count and total_lines is the whole-message line count; follow read offsets for pagination",
+        "checkpoint bodies may link to earlier context-history archives; follow those links as needed",
+    ];
+    // Header and entries are followed by one blank separator; offsets are
+    // one-based line numbers.
+    let body_start = index_header.len() + messages.len() + 2;
+    let mut offset = body_start;
+    let mut index_entries = Vec::with_capacity(messages.len());
+    for (index, (message, body)) in messages.iter().zip(&bodies).enumerate() {
+        let total_lines = body.split_inclusive('\n').count().max(1);
+        let max_lines = total_lines.min(crate::tools::MAX_READ_LINES_CAP);
+        let kind = if message.role == "tool" {
+            "tool"
+        } else if message.role == "user" && message.content.starts_with("[Compacted context]\n") {
+            "checkpoint"
+        } else if message.role == "user" {
+            "user_message"
+        } else {
+            "other"
+        };
+        let mut entry = format!(
+            "{{\"role\":{},\"kind\":{}",
+            serde_json::to_string(&message.role).expect("message role serializes"),
+            serde_json::to_string(kind).expect("message kind serializes"),
+        );
+        if let Some(name) = message.name.as_deref() {
+            entry.push_str(&format!(
+                ",\"name\":{}",
+                serde_json::to_string(name).expect("message name serializes")
+            ));
+        }
+        if let Some(call_id) = message.tool_call_id.as_deref() {
+            entry.push_str(&format!(
+                ",\"call_id\":{}",
+                serde_json::to_string(call_id).expect("tool call id serializes")
+            ));
+        }
+        entry.push_str(&format!(
+            ",\"offset\":{offset},\"max_lines\":{max_lines},\"total_lines\":{total_lines}}}"
+        ));
+        index_entries.push(entry);
+        offset = offset.saturating_add(body.bytes().filter(|byte| *byte == b'\n').count());
+        if index + 1 < messages.len() {
+            // The existing body join contributes two newline records between
+            // messages, including when the preceding body already ends one.
+            offset = offset.saturating_add(2);
+        }
+    }
+
+    let mut artifact = index_header.join("\n");
+    artifact.push('\n');
+    artifact.push_str(&index_entries.join("\n"));
+    artifact.push_str("\n\n");
+    artifact.push_str(&bodies.join("\n\n"));
+    artifact
 }
 
 fn bounded_transcript(transcript: &str, max_chars: usize) -> String {
@@ -1139,4 +1202,124 @@ fn bounded_transcript(transcript: &str, max_chars: usize) -> String {
         .rev()
         .collect::<String>();
     format!("{head}{marker}{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_provider_message, recovery_transcript};
+    use crate::provider::ProviderMessage;
+    use serde_json::Value;
+
+    fn indexed_read(artifact: &str, offset: usize, max_lines: usize) -> String {
+        artifact
+            .split_inclusive('\n')
+            .skip(offset.saturating_sub(1))
+            .take(max_lines)
+            .collect()
+    }
+
+    #[test]
+    fn compaction_recovery_index_reads_unicode_messages_and_preserves_trailing_newlines() {
+        let messages = vec![
+            ProviderMessage::user("Preserve café 🦀 exactly.\n第二行\n"),
+            ProviderMessage::user(
+                "[Compacted context]\nprior checkpoint\n[Prior visible transcript: context-history-old]",
+            ),
+            ProviderMessage::tool(
+                "tool \"name\"",
+                "call\\id-β\"",
+                "resultado α\nlinha final\n",
+            ),
+        ];
+        let artifact = recovery_transcript(&messages);
+        assert!(artifact.starts_with("[Recovery transcript index]\n"));
+        assert_eq!(artifact, recovery_transcript(&messages));
+        let lines = artifact.split_inclusive('\n').collect::<Vec<_>>();
+        let entries = artifact
+            .lines()
+            .take_while(|line| !line.is_empty())
+            .filter(|line| line.starts_with('{'))
+            .map(|line| serde_json::from_str::<Value>(line).expect("valid index JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), messages.len());
+
+        let expected_kinds = ["user_message", "checkpoint", "tool"];
+        let mut next_offset = entries[0]["offset"].as_u64().unwrap() as usize;
+        for (index, ((entry, message), expected_kind)) in entries
+            .iter()
+            .zip(&messages)
+            .zip(expected_kinds)
+            .enumerate()
+        {
+            let body = format_provider_message(message, false);
+            let offset = entry["offset"].as_u64().unwrap() as usize;
+            let max_lines = entry["max_lines"].as_u64().unwrap() as usize;
+            let total_lines = entry["total_lines"].as_u64().unwrap() as usize;
+            assert_eq!(offset, next_offset);
+            assert_eq!(total_lines, body.split_inclusive('\n').count());
+            assert_eq!(max_lines, total_lines.min(crate::tools::MAX_READ_LINES_CAP));
+            let recovered = indexed_read(&artifact, offset, max_lines);
+            if body.ends_with('\n') || index + 1 == messages.len() {
+                assert_eq!(recovered, body);
+            } else {
+                // A line-oriented read must consume the first separator LF
+                // after a body whose final line had no terminator.
+                assert_eq!(recovered, format!("{body}\n"));
+            }
+            assert!(recovered.starts_with(&body));
+            assert_eq!(entry["role"].as_str(), Some(message.role.as_str()));
+            assert_eq!(entry["kind"].as_str(), Some(expected_kind));
+            if let Some(name) = message.name.as_deref() {
+                assert_eq!(entry["name"].as_str(), Some(name));
+            }
+            if let Some(call_id) = message.tool_call_id.as_deref() {
+                assert_eq!(entry["call_id"].as_str(), Some(call_id));
+            }
+            if index + 1 < messages.len() {
+                let newlines = body.bytes().filter(|byte| *byte == b'\n').count();
+                next_offset = offset + newlines + 2;
+            }
+        }
+
+        assert!(lines
+            .get(next_offset.saturating_sub(1))
+            .is_some_and(|line| line.starts_with("tool: ")));
+        assert!(artifact.contains("Preserve café 🦀 exactly.\n第二行\n"));
+        assert!(artifact.contains("resultado α\nlinha final\n"));
+    }
+
+    #[test]
+    fn compaction_recovery_index_caps_large_message_pages_and_keeps_following_offset() {
+        let large_content = (0..=crate::tools::MAX_READ_LINES_CAP)
+            .map(|line| format!("linha {line}\n"))
+            .collect::<String>();
+        let messages = vec![
+            ProviderMessage::user(large_content),
+            ProviderMessage::assistant("after", Vec::new()),
+        ];
+        let artifact = recovery_transcript(&messages);
+        let entries = artifact
+            .lines()
+            .take_while(|line| !line.is_empty())
+            .filter(|line| line.starts_with('{'))
+            .map(|line| serde_json::from_str::<Value>(line).expect("valid index JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), messages.len());
+
+        let first_body = format_provider_message(&messages[0], false);
+        let first_offset = entries[0]["offset"].as_u64().unwrap() as usize;
+        let first_max_lines = entries[0]["max_lines"].as_u64().unwrap() as usize;
+        let first_total_lines = entries[0]["total_lines"].as_u64().unwrap() as usize;
+        assert_eq!(first_total_lines, first_body.split_inclusive('\n').count());
+        assert!(first_total_lines > crate::tools::MAX_READ_LINES_CAP);
+        assert_eq!(first_max_lines, crate::tools::MAX_READ_LINES_CAP);
+        assert!(indexed_read(&artifact, first_offset, first_max_lines)
+            .starts_with("user: linha 0\nlinha 1\n"));
+
+        let second_offset = entries[1]["offset"].as_u64().unwrap() as usize;
+        let newlines = first_body.bytes().filter(|byte| *byte == b'\n').count();
+        assert_eq!(second_offset, first_offset + newlines + 2);
+        assert_eq!(entries[1]["role"].as_str(), Some("assistant"));
+        assert_eq!(entries[1]["kind"].as_str(), Some("other"));
+    }
 }

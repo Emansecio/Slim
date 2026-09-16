@@ -850,7 +850,7 @@ fn is_horizontal_rule(line: &LogicalLine) -> bool {
             .all(|piece| !piece.text.is_empty() && piece.text.chars().all(|glyph| glyph == '─'))
 }
 
-fn normalized_grapheme(grapheme: &str, width: usize) -> (&str, usize) {
+pub(crate) fn normalized_grapheme(grapheme: &str, width: usize) -> (&str, usize) {
     let cells = grapheme.width();
     if cells > width {
         ("�", 1)

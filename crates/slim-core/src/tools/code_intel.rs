@@ -56,6 +56,17 @@ pub fn code_intel_definition() -> Value {
                 "revision": {"type": "integer", "minimum": 0, "description": "continuation token from a previous page's \"revision\" field; rejected when the workspace or server changed since"}
             },
             "required": ["action"],
+            "oneOf": [
+                {
+                    "properties": {"action": {"enum": ["definition", "references", "hover"]}},
+                    "required": ["path", "line", "column"]
+                },
+                {
+                    "properties": {"action": {"enum": ["symbol"]}},
+                    "anyOf": [{"required": ["path"]}, {"required": ["query"]}]
+                },
+                {"properties": {"action": {"enum": ["diagnostics", "status"]}}}
+            ],
             "additionalProperties": false
         }
     })
@@ -144,6 +155,21 @@ fn optional_prepared_string(args: &Value, name: &str) -> Result<Option<String>, 
 
 fn safe_resolve_path(cwd: &Path, path: &str) -> Result<PathBuf, String> {
     super::resolve_workspace_path(cwd, path)
+}
+
+fn prepared_optional_path(
+    args: &Value,
+    resolved_path: Option<&Path>,
+) -> Result<Option<PathBuf>, String> {
+    match args.get("path") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(path)) if path.is_empty() => Ok(None),
+        Some(Value::String(_)) => resolved_path
+            .map(Path::to_path_buf)
+            .map(Some)
+            .ok_or_else(|| "path was not resolved".to_owned()),
+        Some(_) => Err("path must be a string".to_owned()),
+    }
 }
 
 /// Parses the tool arguments into a typed request. Paths are resolved
@@ -242,6 +268,7 @@ pub(crate) fn parse_prepared_code_intel_request(
     args: &Value,
     resolved_path: Option<&Path>,
 ) -> Result<CodeIntelRequest, String> {
+    let path = prepared_optional_path(args, resolved_path)?;
     let action = required_str(args, "action")?;
     let max_results = prepared_max_results(args)?;
     match action.as_str() {
@@ -249,9 +276,7 @@ pub(crate) fn parse_prepared_code_intel_request(
             workspace: workspace.to_path_buf(),
         }),
         "definition" | "references" | "hover" => {
-            let path = resolved_path
-                .ok_or_else(|| "missing string argument: path".to_owned())?
-                .to_path_buf();
+            let path = path.ok_or_else(|| "missing string argument: path".to_owned())?;
             let line = optional_u32(args, "line")?;
             if line == 0 {
                 return Err("line is required for this action".into());
@@ -280,14 +305,14 @@ pub(crate) fn parse_prepared_code_intel_request(
         "symbol" => {
             let query =
                 optional_prepared_string(args, "query")?.filter(|value| !value.trim().is_empty());
-            if resolved_path.is_none() && query.is_none() {
+            if path.is_none() && query.is_none() {
                 return Err(
                     "symbol needs a path (document outline) or a query (workspace search)".into(),
                 );
             }
             Ok(CodeIntelRequest::Symbols(CodeIntelSymbolQuery {
                 workspace: workspace.to_path_buf(),
-                path: resolved_path.map(Path::to_path_buf),
+                path,
                 query,
                 max_results,
                 offset: prepared_offset(args)?,
@@ -302,7 +327,7 @@ pub(crate) fn parse_prepared_code_intel_request(
                 .ok_or_else(|| "include_info must be a boolean".to_owned())?;
             Ok(CodeIntelRequest::Diagnostics(CodeIntelDiagnosticsQuery {
                 workspace: workspace.to_path_buf(),
-                path: resolved_path.map(Path::to_path_buf),
+                path,
                 include_info,
                 max_results,
                 cancellation: None,
@@ -1547,6 +1572,97 @@ mod tests {
         let value = json!({ "action": "symbol", "query": " execute ", "max_results": 20 });
         assert!(parse_prepared_code_intel_request(&dir, &value, None).is_ok());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prepared_path_absent_spellings_remain_equivalent() {
+        let workspace = Path::new("workspace");
+        for value in [
+            json!({ "action": "symbol", "query": "execute", "max_results": 20 }),
+            json!({ "action": "symbol", "path": null, "query": "execute", "max_results": 20 }),
+            json!({ "action": "symbol", "path": "", "query": "execute", "max_results": 20 }),
+        ] {
+            let request = parse_prepared_code_intel_request(workspace, &value, None)
+                .expect("path omission spelling should be accepted");
+            let CodeIntelRequest::Symbols(query) = request else {
+                panic!("expected symbols request");
+            };
+            assert!(query.path.is_none());
+            assert_eq!(query.query.as_deref(), Some("execute"));
+        }
+
+        for value in [
+            json!({ "action": "diagnostics", "include_info": false, "max_results": 20 }),
+            json!({ "action": "diagnostics", "path": null, "include_info": false, "max_results": 20 }),
+            json!({ "action": "diagnostics", "path": "", "include_info": false, "max_results": 20 }),
+        ] {
+            let request = parse_prepared_code_intel_request(workspace, &value, None)
+                .expect("path omission spelling should be accepted");
+            let CodeIntelRequest::Diagnostics(query) = request else {
+                panic!("expected diagnostics request");
+            };
+            assert!(query.path.is_none());
+        }
+    }
+
+    #[test]
+    fn prepared_path_types_are_rejected_before_broad_queries() {
+        let workspace = Path::new("workspace");
+        let invalid_paths = [
+            json!(7),
+            json!(true),
+            json!(["src/lib.rs"]),
+            json!({ "file": "src/lib.rs" }),
+        ];
+        for invalid_path in &invalid_paths {
+            let symbol = json!({
+                "action": "symbol",
+                "path": invalid_path,
+                "query": "execute",
+                "max_results": 20,
+            });
+            let error = parse_prepared_code_intel_request(workspace, &symbol, None)
+                .expect_err("invalid path must not become a workspace query");
+            assert!(error.contains("path must be a string"), "error: {error}");
+
+            let diagnostics = json!({
+                "action": "diagnostics",
+                "path": invalid_path,
+                "include_info": false,
+                "max_results": 20,
+            });
+            let error = parse_prepared_code_intel_request(workspace, &diagnostics, None)
+                .expect_err("invalid path must not become an unscoped diagnostics query");
+            assert!(error.contains("path must be a string"), "error: {error}");
+
+            let status = json!({ "action": "status", "path": invalid_path, "max_results": 20 });
+            let error = parse_prepared_code_intel_request(workspace, &status, None)
+                .expect_err("path type validation should precede action dispatch");
+            assert!(error.contains("path must be a string"), "error: {error}");
+        }
+    }
+
+    #[test]
+    fn prepared_path_preserves_unicode_and_spaces_and_requires_resolution() {
+        let workspace = Path::new("workspace");
+        let path_text = " src/arquivo ü.rs ";
+        let resolved = workspace.join(path_text);
+        let value = json!({
+            "action": "symbol",
+            "path": path_text,
+            "query": "execute",
+            "max_results": 20,
+        });
+        let request = parse_prepared_code_intel_request(workspace, &value, Some(&resolved))
+            .expect("resolved nonempty path should be accepted");
+        let CodeIntelRequest::Symbols(query) = request else {
+            panic!("expected symbols request");
+        };
+        assert_eq!(query.path.as_deref(), Some(resolved.as_path()));
+
+        let error = parse_prepared_code_intel_request(workspace, &value, None)
+            .expect_err("nonempty path without a resolved target must not broaden the query");
+        assert_eq!(error, "path was not resolved");
     }
 
     #[test]

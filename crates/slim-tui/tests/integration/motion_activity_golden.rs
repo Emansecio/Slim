@@ -65,7 +65,7 @@ fn cancelled_answer_keeps_its_partial_label_after_toast_expiry_and_late_delta() 
         text: " tail".into(),
     });
     let frame = render_state(&state, caps(false)).join("\n");
-    assert!(frame.contains("Slim · interrupted · partial"), "{frame}");
+    assert!(frame.contains("Slim · interrompido · parcial"), "{frame}");
     assert!(frame.contains("partial answer tail"), "{frame}");
     assert!(!frame.contains('▌'), "{frame}");
     assert!(!state.working);
@@ -81,7 +81,7 @@ fn cancelled_answer_keeps_its_partial_label_after_toast_expiry_and_late_delta() 
     let plain = slim_tui::view_model::ViewModel::derive(&state)
         .lines
         .join("\n");
-    assert!(plain.contains("Slim · interrupted · partial"), "{plain}");
+    assert!(plain.contains("Slim · interrompido · parcial"), "{plain}");
 }
 
 #[test]
@@ -104,7 +104,7 @@ fn cancellation_does_not_relabel_an_answer_from_a_completed_turn() {
         assert_eq!(state.blocks()[0].lifecycle, BlockLifecycle::Complete);
         let frame = render_state(&state, caps(false)).join("\n");
         assert_eq!(
-            frame.matches("interrupted · partial").count(),
+            frame.matches("interrompido · parcial").count(),
             usize::from(has_current_output),
             "{frame}"
         );
@@ -151,9 +151,9 @@ fn retry_detail_is_visible_until_the_next_provider_phase() {
         .expect("next phase"),
     );
     let frame = render_state(&state, caps(false)).join("\n");
-    assert!(frame.contains("Connecting to provider"), "{frame}");
+    assert!(frame.contains("Conectando ao provedor"), "{frame}");
     assert!(
-        !frame.contains("Thinking"),
+        !frame.contains("Pensando"),
         "provider plumbing is not reasoning\n{frame}"
     );
     assert!(!frame.contains("Retrying"), "{frame}");
@@ -175,7 +175,7 @@ fn hidden_activity_rail_keeps_phase_and_cancel_in_footer() {
         });
         state.context_tokens = 500;
         state.context_window_tokens = 1000;
-        for label in ["Thinking", "Waiting for input"] {
+        for label in ["Pensando", "Aguardando resposta"] {
             state.apply_event(UiEvent::ActivityChanged {
                 label: label.into(),
             });
@@ -186,7 +186,7 @@ fn hidden_activity_rail_keeps_phase_and_cancel_in_footer() {
                 footer.contains("Ctrl+C"),
                 "the compact footer keeps the semantic cancellation shortcut: {footer}"
             );
-            assert!(!footer.contains("Working"), "{footer}");
+            assert!(!footer.contains("Em atividade"), "{footer}");
         }
     }
 }
@@ -221,7 +221,7 @@ fn activity_projects_known_phase_and_elapsed() {
     );
 
     let frame = render_state(&state, caps(false)).join("\n");
-    assert!(frame.contains("Thinking"), "{frame}");
+    assert!(frame.contains("Pensando"), "{frame}");
     assert!(frame.contains("2s"), "{frame}");
 }
 
@@ -244,9 +244,9 @@ fn explicit_thinking_end_completes_the_block_and_waits_for_provider() {
         Some((BlockLifecycle::Complete, BlockKind::Thinking(text))) if text == "inspect first"
     ));
     let frame = render_state(&state, caps(false)).join("\n");
-    assert!(frame.contains("Waiting for provider"), "{frame}");
+    assert!(frame.contains("Aguardando provedor"), "{frame}");
     assert!(
-        !frame.contains("Thinking"),
+        !frame.contains("Pensando"),
         "awaiting provider is not reasoning\n{frame}"
     );
 }
@@ -274,9 +274,9 @@ fn mid_run_connect_shows_provider_phase_without_fake_reasoning() {
         elapsed_ms: 0,
     });
     let frame = render_state(&state, caps(false)).join("\n");
-    assert!(frame.contains("Connecting to provider"), "{frame}");
+    assert!(frame.contains("Conectando ao provedor"), "{frame}");
     assert!(
-        !frame.contains("Thinking"),
+        !frame.contains("Pensando"),
         "provider plumbing is not reasoning\n{frame}"
     );
 }
@@ -299,8 +299,168 @@ fn in_flight_tools_use_a_quiet_verb_summary() {
         });
     }
     let frame = render_state(&state, caps(false)).join("\n");
-    assert!(frame.contains("Reading · 3 calls, Searching"), "{frame}");
+    assert!(frame.contains("Lendo · 3 chamadas, Buscando"), "{frame}");
     assert!(!frame.contains("Running read"), "{frame}");
+}
+
+#[test]
+fn parallel_tool_completion_keeps_the_remaining_call_running() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::run_started(1));
+    let batch_id = ToolBatchId("parallel-batch".into());
+    for call_id in ["call-a", "call-b"] {
+        state.apply_event(UiEvent::ToolStarted {
+            batch_id: batch_id.clone(),
+            call_id: ToolCallId(call_id.into()),
+            name: "read".into(),
+            arguments_summary: format!("path={call_id}.rs"),
+        });
+    }
+
+    let frame = render_state(&state, caps(false)).join("\n");
+    assert!(frame.contains("Lendo · 2 chamadas"), "{frame}");
+
+    // Calls can finish out of order. Completing one must leave the other in
+    // the running phase and keep its activity rail visible.
+    state.apply_event(UiEvent::ToolEnded {
+        batch_id: batch_id.clone(),
+        call_id: ToolCallId("call-b".into()),
+        name: "read".into(),
+        success: true,
+        duration_ms: 21,
+    });
+    assert!(matches!(
+        state.activity.as_ref().map(|activity| &activity.phase),
+        Some(ActivityPhase::RunningTool(name)) if name == "read"
+    ));
+    let frame = render_state(&state, caps(false)).join("\n");
+    assert!(
+        frame.contains("Lendo"),
+        "remaining call must stay active\n{frame}"
+    );
+
+    state.apply_event(UiEvent::ToolEnded {
+        batch_id,
+        call_id: ToolCallId("call-a".into()),
+        name: "read".into(),
+        success: true,
+        duration_ms: 13,
+    });
+    assert!(matches!(
+        state.activity.as_ref().map(|activity| &activity.phase),
+        Some(ActivityPhase::AwaitingProvider)
+    ));
+}
+
+#[test]
+fn tool_lifecycle_phases_are_distinct_before_execution_starts() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::run_started(1));
+    let batch_id = ToolBatchId("phase-batch".into());
+    let call_id = ToolCallId("phase-call".into());
+
+    state.apply_event(UiEvent::ToolPrepared {
+        batch_id: batch_id.clone(),
+        call_id: call_id.clone(),
+        name: "write".into(),
+    });
+    assert!(matches!(
+        state.activity.as_ref().map(|activity| &activity.phase),
+        Some(ActivityPhase::PreparingTool(name)) if name == "write"
+    ));
+    assert!(render_state(&state, caps(false))
+        .join("\n")
+        .contains("Preparando edição"));
+
+    state.apply_event(UiEvent::ToolAdmitted {
+        batch_id: batch_id.clone(),
+        call_id: call_id.clone(),
+        name: "write".into(),
+    });
+    assert!(matches!(
+        state.activity.as_ref().map(|activity| &activity.phase),
+        Some(ActivityPhase::QueuedTool(name)) if name == "write"
+    ));
+    assert!(render_state(&state, caps(false))
+        .join("\n")
+        .contains("Aguardando execução · write"));
+
+    state.apply_event(UiEvent::ToolStarted {
+        batch_id,
+        call_id,
+        name: "write".into(),
+        arguments_summary: "path=out.txt".into(),
+    });
+    assert!(matches!(
+        state.activity.as_ref().map(|activity| &activity.phase),
+        Some(ActivityPhase::RunningTool(name)) if name == "write"
+    ));
+    assert!(render_state(&state, caps(false))
+        .join("\n")
+        .contains("Editando"));
+}
+
+#[test]
+fn retry_and_cancellation_keep_typed_state_and_priority() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::run_started(1));
+    state.clock.elapsed_ms = 1_000;
+    state.apply_event(UiEvent::RetryScheduled {
+        attempt: 2,
+        limit: 4,
+        wait_ms: 30_000,
+        reason: Some("429 rate limit".into()),
+    });
+    assert_eq!(
+        state.retry.as_ref().map(|retry| (
+            retry.attempt,
+            retry.limit,
+            retry.wait_ms,
+            retry.scheduled_ms,
+            retry.reason.as_deref(),
+        )),
+        Some((2, 4, 30_000, 1_000, Some("429 rate limit")))
+    );
+    let frame = render_state(&state, caps(false)).join("\n");
+    assert!(frame.contains("Nova tentativa · 2/4 · em 30 s"), "{frame}");
+
+    state.apply_event(UiEvent::CancellationRequested { run_id: 1 });
+    assert!(matches!(
+        state.cancellation,
+        Some(cancellation)
+            if cancellation.run_id == 1
+                && cancellation.phase == slim_tui::app::CancellationPhase::Requested
+    ));
+    let frame = render_state(&state, caps(false)).join("\n");
+    assert!(frame.contains("Interrupção solicitada"), "{frame}");
+
+    state.apply_event(UiEvent::CancellationStarted { run_id: 1 });
+    assert!(matches!(
+        state.cancellation,
+        Some(cancellation)
+            if cancellation.run_id == 1
+                && cancellation.phase == slim_tui::app::CancellationPhase::InProgress
+    ));
+    let frame = render_state(&state, caps(false)).join("\n");
+    assert!(frame.contains("Interrompendo"), "{frame}");
+}
+
+#[test]
+fn stale_activity_reports_age_since_last_semantic_update() {
+    let mut state = AppState::new();
+    state.clock.elapsed_ms = 1_000;
+    state.apply_event(UiEvent::run_started(1));
+    state.apply_event(UiEvent::ThinkingStarted);
+    state.apply_event(UiEvent::ThinkingDelta {
+        text: "plan".into(),
+    });
+    assert_eq!(state.last_provider_content_ms, Some(1_000));
+    state.clock.elapsed_ms = 7_000;
+    let frame = render_state(&state, caps(false)).join("\n");
+    assert!(
+        frame.contains("sem novo conteúdo há 6.0s"),
+        "clock-only redraw must expose semantic staleness\n{frame}"
+    );
 }
 
 #[test]
@@ -333,7 +493,7 @@ fn thinking_delta_without_start_is_diagnostic_and_requests_resync() {
         .all(|block| !matches!(block.kind(), BlockKind::Thinking(_))));
     assert!(matches!(
         state.blocks().last().map(|block| block.kind()),
-        Some(BlockKind::Error(message)) if message.contains("reasoning stream gap")
+        Some(BlockKind::Error(message)) if message.contains("Lacuna no fluxo de raciocínio")
     ));
 }
 
@@ -570,8 +730,8 @@ fn visible_activity_rail_prevents_working_footer_duplication() {
     state.authenticated = true;
     state.apply_event(UiEvent::run_started(1));
     let frame = render_state(&state, caps(false)).join("\n");
-    assert_eq!(frame.matches("Working").count(), 1, "{frame}");
-    assert!(frame.contains("Ctrl+C cancel"), "{frame}");
+    assert_eq!(frame.matches("Em atividade").count(), 1, "{frame}");
+    assert!(frame.contains("Ctrl+C cancelar"), "{frame}");
     let footer = frame.lines().last().expect("footer");
     assert!(
         !footer.contains("Shift+Tab"),
@@ -640,7 +800,7 @@ fn working_elapsed_is_anchored_to_run_start() {
     );
 
     let buffer = render_state(&state, caps(false)).join("\n");
-    assert!(buffer.contains("Working · 3s"));
+    assert!(buffer.contains("Em atividade · 3s"));
 }
 
 #[test]
@@ -888,7 +1048,7 @@ fn turn_budget_warns_once_at_eighty_percent() {
     let warnings: Vec<_> = state
         .notifications
         .iter()
-        .filter(|notice| notice.message.starts_with("Turn budget:"))
+        .filter(|notice| notice.message.starts_with("Limite de turnos:"))
         .collect();
     assert_eq!(warnings.len(), 1, "{:?}", state.notifications);
     assert!(warnings[0].message.contains("4/5"));
@@ -902,7 +1062,7 @@ fn turn_budget_warns_once_at_eighty_percent() {
         state
             .notifications
             .iter()
-            .filter(|notice| notice.message.starts_with("Turn budget:"))
+            .filter(|notice| notice.message.starts_with("Limite de turnos:"))
             .count(),
         1
     );
@@ -937,10 +1097,10 @@ fn this_turn_tool_budget_warns_at_eighty_percent_and_resets_on_next_turn() {
     let warnings: Vec<_> = state
         .notifications
         .iter()
-        .filter(|notice| notice.message.starts_with("Tool budget:"))
+        .filter(|notice| notice.message.starts_with("Limite de ferramentas:"))
         .collect();
     assert_eq!(warnings.len(), 1, "{:?}", state.notifications);
-    assert!(warnings[0].message.contains("read 4/5"));
+    assert!(warnings[0].message.contains("leitura 4/5"));
     state.apply_event(UiEvent::UsageEstimateForRun {
         run_id: 1,
         request_id: 2,
@@ -967,7 +1127,7 @@ fn this_turn_tool_budget_warns_at_eighty_percent_and_resets_on_next_turn() {
         state
             .notifications
             .iter()
-            .filter(|notice| notice.message.starts_with("Tool budget:"))
+            .filter(|notice| notice.message.starts_with("Limite de ferramentas:"))
             .count(),
         1,
         "next turn must not warn until 80% of this-turn batch"

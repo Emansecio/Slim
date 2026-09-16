@@ -321,7 +321,7 @@ fn assistant_body_uses_role_label_and_foreground() {
                 }
             }
             assert_eq!(
-                rendered.text().contains("interrupted · partial"),
+                rendered.text().contains("interrompido · parcial"),
                 lifecycle == BlockLifecycle::Cancelled
             );
         }
@@ -342,8 +342,8 @@ fn user_band_is_followed_by_one_blank_row() {
     let you = rendered
         .rows
         .iter()
-        .position(|row| row.contains("You"))
-        .expect("You");
+        .position(|row| row.contains("Você"))
+        .expect("Você");
     let question = rendered
         .rows
         .iter()
@@ -356,7 +356,7 @@ fn user_band_is_followed_by_one_blank_row() {
         .expect("answer");
     assert_eq!(
         question, you,
-        "You prefixes the prompt on the same band row"
+        "Você prefixes the prompt on the same band row"
     );
     assert!(rendered.rows[you + 1].trim().is_empty());
     assert!(
@@ -384,7 +384,7 @@ fn agent_response_is_separated_from_thinking_and_explicitly_attributed() {
     let thought = rendered
         .rows
         .iter()
-        .position(|row| row.contains("Thought"))
+        .position(|row| row.contains("Pensamento"))
         .expect("thought");
     assert!(rendered.rows[thought + 1].trim().is_empty());
     assert_eq!(rendered.rows[thought + 2].trim(), "Slim");
@@ -396,16 +396,20 @@ fn collapsed_thinking_is_single_muted_metadata_row() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::ThinkingStarted);
     state.apply_event(UiEvent::ThinkingDelta {
-        text: "secret plan\nmore".into(),
+        text: "secret plan\nmore\nlast line".into(),
     });
     state.apply_event(UiEvent::ThinkingEnded);
+    // The completed header returns to its muted style after the brief
+    // confirmation emphasis; the retained preview keeps the same geometry.
+    state.clock.elapsed_ms = 249;
     let rendered = render_state(&state, 80);
     let text = rendered.text();
-    assert!(text.contains("Thought"), "{text}");
+    assert!(text.contains("Pensamento"), "{text}");
     assert!(!text.contains("secret plan"), "{text}");
-    assert!(!text.contains("more"), "{text}");
+    assert!(text.contains("… more"), "{text}");
+    assert!(text.contains("last line"), "{text}");
     assert_eq!(
-        rendered.word_style("Thought").0,
+        rendered.word_style("Pensamento").0,
         Color::Rgb(0x99, 0x97, 0x8E)
     );
 }
@@ -419,16 +423,17 @@ fn streaming_thinking_shows_only_the_latest_two_physical_rows() {
     });
 
     let streaming = render_state(&state, 48).text();
-    assert!(streaming.contains("Thinking"), "{streaming}");
+    assert!(streaming.contains("Pensando"), "{streaming}");
     assert!(!streaming.contains("first hidden line"), "{streaming}");
     assert!(streaming.contains("… second live line"), "{streaming}");
     assert!(streaming.contains("final live line"), "{streaming}");
 
     state.apply_event(UiEvent::ThinkingEnded);
     let complete = render_state(&state, 48).text();
-    assert!(complete.contains("Thought"), "{complete}");
-    assert!(!complete.contains("second live line"), "{complete}");
-    assert!(!complete.contains("final live line"), "{complete}");
+    assert!(complete.contains("Pensamento"), "{complete}");
+    assert!(!complete.contains("first hidden line"), "{complete}");
+    assert!(complete.contains("… second live line"), "{complete}");
+    assert!(complete.contains("final live line"), "{complete}");
 }
 
 #[test]
@@ -442,7 +447,7 @@ fn user_prompt_label_stays_distinct_from_the_transcript_surface() {
     });
     state.apply_event(UiEvent::AssistantEnded);
     let rendered = render_state(&state, 80);
-    assert_eq!(rendered.word_bg("You"), Color::Rgb(0x10, 0x10, 0x10));
+    assert_eq!(rendered.word_bg("Você"), Color::Rgb(0x10, 0x10, 0x10));
     assert_eq!(rendered.word_bg("question"), Color::Rgb(0x10, 0x10, 0x10));
     assert_ne!(rendered.word_bg("answer"), Color::Rgb(0x10, 0x10, 0x10));
 }
@@ -694,8 +699,8 @@ fn command_palette_groups_session_and_runtime() {
     let mut state = AppState::new();
     state.palette_query = Some(String::new());
     let text = render_state(&state, 80).text();
-    assert!(text.contains("session"), "{text}");
-    assert!(text.contains("runtime"), "{text}");
+    assert!(text.contains("sessão"), "{text}");
+    assert!(text.contains("execução"), "{text}");
     assert!(text.contains("/login"), "{text}");
     assert!(text.contains("/mode"), "{text}");
 }
@@ -783,7 +788,7 @@ fn restored_tool_is_neutral_collapsed_and_inspectable_in_fullscreen() {
         assert_eq!(block.fold, FoldState::Collapsed);
         let id = block.id.clone();
         let frame = render_state(&state, width).text();
-        assert!(frame.contains("shell · history"), "{frame}");
+        assert!(frame.contains("shell · histórico"), "{frame}");
         assert!(
             !frame.contains("✓ shell") && !frame.contains("cargo test"),
             "{frame}"

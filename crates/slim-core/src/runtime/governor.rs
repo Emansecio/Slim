@@ -12,6 +12,10 @@ use std::fmt::Write as _;
 
 const MAX_OBSERVED_DEPENDENCIES: usize = 256;
 const MAX_EVENT_IDENTIFIER_BYTES: usize = 256;
+const MAX_COMPACTION_FAILURES: usize = 256;
+const MAX_COMPACTION_MUTATIONS: usize = 256;
+const MAX_COMPACTION_SNAPSHOT_BYTES: usize = 4096;
+const COMPACTION_OMISSION_RESERVE_BYTES: usize = 128;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum GovernorObservation {
@@ -59,6 +63,7 @@ pub(super) struct PendingCall {
     confidence: CausalConfidence,
     diagnostics: bool,
     admission_prefix: Option<String>,
+    structural_rejection: bool,
 }
 
 impl PendingCall {
@@ -85,6 +90,10 @@ struct ProgressLedger {
     evidence: HashMap<String, EvidenceRecord>,
     seen_evidence: HashSet<String>,
     validations: HashMap<String, ValidationResult>,
+    pending_failures: BTreeMap<String, PendingFailure>,
+    pending_failure_omitted: usize,
+    mutations: BTreeMap<String, u64>,
+    mutation_omitted: usize,
     stagnant_turns: u32,
     turn: TurnState,
 }
@@ -137,8 +146,18 @@ struct EvidenceRecord {
 
 struct ValidationResult {
     success: bool,
+    tool_name: String,
+    call_id: String,
     workspace_revision: u64,
     uncertainty_epoch: u64,
+}
+
+struct PendingFailure {
+    tool_name: String,
+    call_id: String,
+    workspace_revision: u64,
+    uncertainty_epoch: u64,
+    validation: bool,
 }
 
 impl CausalGovernor {
@@ -159,11 +178,159 @@ impl CausalGovernor {
             })
     }
 
+    pub(super) fn compaction_snapshot(&self, run_start_seq: u64) -> String {
+        if self.ledger.workspace_revision == 0
+            && self.ledger.uncertainty_epoch == 0
+            && self.ledger.validations.is_empty()
+            && self.ledger.pending_failures.is_empty()
+            && self.ledger.pending_failure_omitted == 0
+            && self.ledger.mutations.is_empty()
+            && self.ledger.mutation_omitted == 0
+        {
+            return String::new();
+        }
+
+        let header = format!(
+            "execution_facts scope=compaction run_start_seq={run_start_seq} workspace_revision={} uncertainty_epoch={}\n",
+            self.ledger.workspace_revision, self.ledger.uncertainty_epoch,
+        );
+        let mut snapshot = header;
+        let mut omitted_failures = self.ledger.pending_failure_omitted;
+        let mut omitted_validations = 0usize;
+        let mut omitted_mutations = self.ledger.mutation_omitted;
+        let bytes = snapshot.len();
+        let reserve = COMPACTION_OMISSION_RESERVE_BYTES;
+        let available = MAX_COMPACTION_SNAPSHOT_BYTES
+            .saturating_sub(reserve)
+            .saturating_sub(bytes);
+        let mut fact_bytes = 0usize;
+
+        for failure in self.ledger.pending_failures.values() {
+            if failure.validation {
+                continue;
+            }
+            let current = failure.workspace_revision == self.ledger.workspace_revision
+                && failure.uncertainty_epoch == self.ledger.uncertainty_epoch;
+            append_compaction_line(
+                &mut snapshot,
+                format!(
+                    "failure tool={} call_id={} revision={} epoch={} current={} pending=true\n",
+                    json_string(&failure.tool_name),
+                    json_string(&failure.call_id),
+                    failure.workspace_revision,
+                    failure.uncertainty_epoch,
+                    current,
+                ),
+                available,
+                &mut fact_bytes,
+                &mut omitted_failures,
+            );
+        }
+
+        let mut validations = self.ledger.validations.iter().collect::<Vec<_>>();
+        validations.sort_by(|(left_key, left), (right_key, right)| {
+            validation_snapshot_priority(
+                left,
+                self.ledger.workspace_revision,
+                self.ledger.uncertainty_epoch,
+            )
+            .cmp(&validation_snapshot_priority(
+                right,
+                self.ledger.workspace_revision,
+                self.ledger.uncertainty_epoch,
+            ))
+            .then_with(|| left_key.cmp(right_key))
+        });
+        for (_, validation) in validations {
+            let current = validation.workspace_revision == self.ledger.workspace_revision
+                && validation.uncertainty_epoch == self.ledger.uncertainty_epoch;
+            append_compaction_line(
+                &mut snapshot,
+                format!(
+                    "validation tool={} call_id={} success={} validation_revision={} validation_epoch={} current={}\n",
+                    json_string(&validation.tool_name),
+                    json_string(&validation.call_id),
+                    validation.success,
+                    validation.workspace_revision,
+                    validation.uncertainty_epoch,
+                    current,
+                ),
+                available,
+                &mut fact_bytes,
+                &mut omitted_validations,
+            );
+        }
+
+        for (path, revision) in &self.ledger.mutations {
+            append_compaction_line(
+                &mut snapshot,
+                format!("mutation path={} revision={revision}\n", json_string(path)),
+                available,
+                &mut fact_bytes,
+                &mut omitted_mutations,
+            );
+        }
+
+        if omitted_failures > 0 || omitted_validations > 0 || omitted_mutations > 0 {
+            snapshot.push_str(&compaction_omission_line(
+                omitted_failures,
+                omitted_validations,
+                omitted_mutations,
+            ));
+        }
+        debug_assert!(snapshot.len() <= MAX_COMPACTION_SNAPSHOT_BYTES);
+        snapshot
+    }
+
     pub(super) fn forget_compacted_evidence(&mut self) {
         self.ledger.evidence.clear();
         self.ledger.seen_evidence.clear();
         self.ledger.stagnant_turns = 0;
         self.stop_requested = false;
+    }
+
+    fn remember_failure(&mut self, pending: &PendingCall, result: &ToolResult) {
+        let key = pending.canonical_fingerprint.clone();
+        if result.success {
+            self.ledger.pending_failures.remove(&key);
+            return;
+        }
+        let fact = PendingFailure {
+            tool_name: pending.tool_name.clone(),
+            call_id: pending.call_id.clone(),
+            workspace_revision: self.ledger.workspace_revision,
+            uncertainty_epoch: self.ledger.uncertainty_epoch,
+            validation: !pending.structural_rejection
+                && pending
+                    .spec
+                    .is_some_and(|spec| spec.effect_class == ToolEffectClass::Validation),
+        };
+        if let Some(existing) = self.ledger.pending_failures.get_mut(&key) {
+            *existing = fact;
+        } else if self.ledger.pending_failures.len() < MAX_COMPACTION_FAILURES {
+            self.ledger.pending_failures.insert(key, fact);
+        } else {
+            self.ledger.pending_failure_omitted =
+                self.ledger.pending_failure_omitted.saturating_add(1);
+        }
+    }
+
+    fn remember_mutations(&mut self, receipt: &ToolExecutionReceipt) {
+        let governor_revision = self.ledger.workspace_revision;
+        for mutation in receipt
+            .mutations
+            .iter()
+            .filter(|mutation| mutation.changed())
+        {
+            let path = path_identity(&mutation.path);
+            if let Some(revision) = self.ledger.mutations.get_mut(&path) {
+                *revision = (*revision).max(governor_revision);
+            } else if self.ledger.mutations.len() < MAX_COMPACTION_MUTATIONS {
+                self.ledger.mutations.insert(path, governor_revision);
+            } else {
+                self.ledger.mutation_omitted = self.ledger.mutation_omitted.saturating_add(1);
+            }
+        }
     }
 
     fn note_stop(&mut self, action: CausalShadowAction) {
@@ -181,6 +348,41 @@ impl CausalGovernor {
         let batch_id = bounded_identifier(batch_id);
         let call_id = bounded_identifier(call_id);
         let tool_name = bounded_identifier(&prepared.name);
+        if prepared.structural_rejection {
+            if let Some(spec) = prepared.spec {
+                let call_fingerprint = prepared.canonical_fingerprint.clone();
+                let confidence = confidence_for(spec);
+                self.begin_call(
+                    &batch_id,
+                    &call_id,
+                    &tool_name,
+                    &call_fingerprint,
+                    confidence,
+                );
+                return (
+                    PendingCall {
+                        batch_id,
+                        call_id,
+                        tool_name,
+                        canonical_fingerprint: prepared.canonical_fingerprint.clone(),
+                        call_fingerprint: call_fingerprint.clone(),
+                        // The prepared fingerprint is already canonical. Reuse
+                        // it directly so a rejected alias has one evidence key
+                        // without another state hash or uncertainty epoch.
+                        evidence_scope: call_fingerprint,
+                        workspace_revision_at_start: self.ledger.workspace_revision,
+                        spec: Some(spec),
+                        confidence,
+                        diagnostics: false,
+                        admission_prefix: crate::tools::admission_output_prefix(
+                            &prepared.admission_notes,
+                        ),
+                        structural_rejection: true,
+                    },
+                    Vec::new(),
+                );
+            }
+        }
         let Some(spec) = prepared.spec.filter(|_| prepared.error.is_none()) else {
             return self.unclassifiable_call(
                 batch_id,
@@ -224,6 +426,7 @@ impl CausalGovernor {
                 confidence,
                 diagnostics: prepared.name == "code_intel" && prepared.arguments.is_diagnostics(),
                 admission_prefix: crate::tools::admission_output_prefix(&prepared.admission_notes),
+                structural_rejection: false,
             },
             Vec::new(),
         )
@@ -255,6 +458,10 @@ impl CausalGovernor {
             receipt.execution_us,
             receipt.finalization_us,
         );
+        if pending.structural_rejection {
+            self.remember_failure(&pending, result);
+            return self.observe_evidence(pending, result, EvidenceOutcome::Failure);
+        }
         let source_revision = receipt.revision_before.max(receipt.revision_after);
         if source_revision > self.ledger.source_workspace_revision {
             self.ledger.workspace_revision = self.ledger.workspace_revision.saturating_add(
@@ -262,6 +469,8 @@ impl CausalGovernor {
             );
             self.ledger.source_workspace_revision = source_revision;
         }
+        self.remember_mutations(receipt);
+        self.remember_failure(&pending, result);
         let Some(spec) = pending.spec else {
             return Vec::new();
         };
@@ -477,6 +686,8 @@ impl CausalGovernor {
             pending.canonical_fingerprint.clone(),
             ValidationResult {
                 success,
+                tool_name: pending.tool_name.clone(),
+                call_id: pending.call_id.clone(),
                 workspace_revision: self.ledger.workspace_revision,
                 uncertainty_epoch: self.ledger.uncertainty_epoch,
             },
@@ -640,6 +851,7 @@ impl CausalGovernor {
                 confidence: CausalConfidence::Low,
                 diagnostics: false,
                 admission_prefix: None,
+                structural_rejection: false,
             },
             vec![GovernorObservation::Boundary {
                 batch_id,
@@ -981,6 +1193,52 @@ fn path_identity(path: &std::path::Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+fn validation_snapshot_priority(
+    validation: &ValidationResult,
+    workspace_revision: u64,
+    uncertainty_epoch: u64,
+) -> (u8, u64, u64) {
+    let current = validation.workspace_revision == workspace_revision
+        && validation.uncertainty_epoch == uncertainty_epoch;
+    let status = if !validation.success {
+        0
+    } else if current {
+        1
+    } else {
+        2
+    };
+    (
+        status,
+        validation.workspace_revision,
+        validation.uncertainty_epoch,
+    )
+}
+
+fn json_string(value: &str) -> String {
+    serde_json::to_string(value).expect("serializing a string cannot fail")
+}
+
+fn append_compaction_line(
+    snapshot: &mut String,
+    line: String,
+    available: usize,
+    fact_bytes: &mut usize,
+    omitted: &mut usize,
+) {
+    if fact_bytes.saturating_add(line.len()) <= available {
+        *fact_bytes = fact_bytes.saturating_add(line.len());
+        snapshot.push_str(&line);
+    } else {
+        *omitted = omitted.saturating_add(1);
+    }
+}
+
+fn compaction_omission_line(failures: usize, validations: usize, mutations: usize) -> String {
+    format!(
+        "omitted_observations failures={failures} validations={validations} mutations={mutations}\n"
+    )
+}
+
 fn hash_fields(fields: &[&[u8]]) -> String {
     let mut hasher = Sha256::new();
     for field in fields {
@@ -997,7 +1255,9 @@ fn hash_fields(fields: &[&[u8]]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CausalGovernor, GovernorObservation};
+    use super::{
+        CausalGovernor, GovernorObservation, ValidationResult, MAX_COMPACTION_SNAPSHOT_BYTES,
+    };
     use crate::runtime::CancellationToken;
     use crate::tools::{ToolExecutionReceipt, ToolRegistry, ToolResult};
     use crate::{CausalAnomalyKind, CausalProgressKind, CausalShadowAction, OperatingMode};
@@ -1029,6 +1289,86 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn structural_rejections_are_distinct_failures_without_uncertainty() {
+        let temp = TestRoot::new("structural-rejection");
+        fs::write(temp.path().join("sample.txt"), "stable\n").expect("fixture");
+        let registry = ToolRegistry::default();
+        let mut governor = CausalGovernor::default();
+        let invalid = [
+            r#"{"path":"sample.txt","offset":0}"#,
+            r#"{"path":"./sample.txt","offset":0}"#,
+        ];
+        let mut invalid_fingerprint = None;
+        for (index, arguments) in invalid.into_iter().enumerate() {
+            let prepared =
+                registry.prepare_invocation(OperatingMode::Auto, temp.path(), "read", arguments);
+            assert!(prepared.structural_rejection);
+            if let Some(expected) = &invalid_fingerprint {
+                assert_eq!(&prepared.canonical_fingerprint, expected);
+            } else {
+                invalid_fingerprint = Some(prepared.canonical_fingerprint.clone());
+            }
+            let (pending, before) =
+                governor.observe_before_identified(&prepared, "batch", &format!("invalid-{index}"));
+            assert!(before.is_empty(), "structural rejection is not uncertain");
+            let outcome =
+                registry.execute_prepared_with_cancellation_and_progress(&prepared, None, |_| {});
+            assert!(!outcome.result.success);
+            let observations = governor.observe_after(pending, &outcome.result, &outcome.receipt);
+            if index == 0 {
+                assert!(observations.iter().any(|observation| matches!(
+                    observation,
+                    GovernorObservation::Progress {
+                        kind: CausalProgressKind::DistinctFailure,
+                        ..
+                    }
+                )));
+            } else {
+                assert!(observations.iter().any(|observation| matches!(
+                    observation,
+                    GovernorObservation::Anomaly {
+                        kind: CausalAnomalyKind::RepeatedFailure,
+                        ..
+                    }
+                )));
+            }
+            assert_eq!(governor.ledger.uncertainty_epoch, 0);
+        }
+
+        let valid = registry.prepare_invocation(
+            OperatingMode::Auto,
+            temp.path(),
+            "read",
+            r#"{"path":"sample.txt","offset":1}"#,
+        );
+        assert!(!valid.structural_rejection);
+        assert!(valid.error.is_none());
+
+        // Path containment and workspace-root failures depend on filesystem
+        // state, so they retain the conservative unclassifiable boundary.
+        let escape = registry.prepare_invocation(
+            OperatingMode::Auto,
+            temp.path(),
+            "read",
+            r#"{"path":"../sample.txt","offset":1}"#,
+        );
+        assert!(!escape.structural_rejection);
+        assert_eq!(escape.error.as_deref(), Some("path escapes the workspace"));
+        let missing_root = temp.path().join("missing-root");
+        let unresolved = registry.prepare_invocation(
+            OperatingMode::Auto,
+            &missing_root,
+            "read",
+            r#"{"path":"sample.txt","offset":1}"#,
+        );
+        assert!(!unresolved.structural_rejection);
+        assert!(unresolved
+            .error
+            .as_deref()
+            .is_some_and(|message| message.starts_with("workspace root cannot be resolved:")));
     }
 
     #[test]
@@ -1433,6 +1773,291 @@ mod tests {
             !governor.validations_satisfied(),
             "volatile effects invalidate old evidence"
         );
+    }
+
+    #[test]
+    fn compaction_snapshot_marks_validation_stale_after_mutation() {
+        let temp = TestRoot::new("compaction-validation-stale");
+        fs::write(temp.path().join("changed.txt"), "before").expect("write fixture");
+        let registry = ToolRegistry::default();
+        let prepared = registry.prepare_invocation(
+            OperatingMode::Auto,
+            temp.path(),
+            "shell",
+            r#"{"command":"cargo","args":["check"]}"#,
+        );
+        let result = ToolResult {
+            name: "shell".into(),
+            output: "exit 0\n".into(),
+            success: true,
+            artifact: None,
+        };
+        let receipt = ToolExecutionReceipt::unobserved(&prepared, 0, 0, 1);
+        let mut governor = CausalGovernor::default();
+        let (pending, _) = governor.observe_before_identified(&prepared, "batch", "validation-1");
+        governor.observe_after(pending, &result, &receipt);
+
+        let fresh = governor.compaction_snapshot(41);
+        assert!(fresh.contains("scope=compaction run_start_seq=41"));
+        assert!(fresh.contains("call_id=\"validation-1\""));
+        assert!(fresh.contains("success=true"));
+        assert!(fresh.contains("validation_revision=0"));
+        assert!(fresh.contains("validation_epoch=0"));
+        assert!(fresh.contains("current=true"));
+
+        let mutation = registry.prepare_invocation(
+            OperatingMode::Auto,
+            temp.path(),
+            "write",
+            r#"{"path":"changed.txt","content":"after","expected":"before"}"#,
+        );
+        let (mutation_pending, _) =
+            governor.observe_before_identified(&mutation, "batch", "mutation-1");
+        let mutation_outcome =
+            registry.execute_prepared_with_cancellation_and_progress(&mutation, None, |_| {});
+        assert!(mutation_outcome.result.success);
+        governor.observe_after(
+            mutation_pending,
+            &mutation_outcome.result,
+            &mutation_outcome.receipt,
+        );
+
+        let stale = governor.compaction_snapshot(42);
+        assert!(stale.contains("call_id=\"validation-1\""));
+        assert!(stale.contains("validation_revision=0"));
+        assert!(stale.contains("current=false"));
+        assert!(stale.contains("mutation path="));
+        assert!(stale.contains("changed.txt"));
+        assert!(stale.contains(&format!(
+            "revision={}",
+            mutation_outcome.receipt.revision_after
+        )));
+
+        governor.forget_compacted_evidence();
+        let after_forget = governor.compaction_snapshot(43);
+        assert!(after_forget.contains("success=true"));
+        assert!(after_forget.contains("current=false"));
+        assert!(after_forget.contains("changed.txt"));
+
+        let (resolved_pending, _) =
+            governor.observe_before_identified(&prepared, "batch", "validation-2");
+        let revision = registry.workspace_revision();
+        let resolved_receipt = ToolExecutionReceipt::unobserved(&prepared, revision, revision, 1);
+        governor.observe_after(resolved_pending, &result, &resolved_receipt);
+        let resolved = governor.compaction_snapshot(44);
+        assert!(resolved.contains("call_id=\"validation-2\""));
+        assert!(resolved.contains(&format!("validation_revision={revision}")));
+        assert!(resolved.contains("current=true"));
+    }
+
+    #[test]
+    fn compaction_snapshot_keeps_failed_validation_until_exact_success() {
+        let temp = TestRoot::new("compaction-validation-failure");
+        let registry = ToolRegistry::default();
+        let failed = registry.prepare_invocation(
+            OperatingMode::Auto,
+            temp.path(),
+            "shell",
+            r#"{"command":"cargo","args":["check"]}"#,
+        );
+        let failed_result = ToolResult {
+            name: "shell".into(),
+            output: "exit 1\nfailed".into(),
+            success: false,
+            artifact: None,
+        };
+        let failed_receipt = ToolExecutionReceipt::unobserved(&failed, 0, 0, 1);
+        let mut governor = CausalGovernor::default();
+        let (pending, _) = governor.observe_before_identified(&failed, "batch", "check-failed");
+        governor.observe_after(pending, &failed_result, &failed_receipt);
+        let initial = governor.compaction_snapshot(50);
+        assert!(initial.contains("call_id=\"check-failed\""));
+        assert!(initial.contains("success=false"));
+        assert!(initial.contains("current=true"));
+
+        governor.forget_compacted_evidence();
+        let retained = governor.compaction_snapshot(51);
+        assert!(retained.contains("call_id=\"check-failed\""));
+        assert!(retained.contains("success=false"));
+
+        let different = registry.prepare_invocation(
+            OperatingMode::Auto,
+            temp.path(),
+            "shell",
+            r#"{"command":"cargo","args":["test"]}"#,
+        );
+        let success_result = ToolResult {
+            name: "shell".into(),
+            output: "exit 0\n".into(),
+            success: true,
+            artifact: None,
+        };
+        let (different_pending, _) =
+            governor.observe_before_identified(&different, "batch", "other-success");
+        let different_receipt = ToolExecutionReceipt::unobserved(&different, 0, 0, 1);
+        governor.observe_after(different_pending, &success_result, &different_receipt);
+        let unresolved = governor.compaction_snapshot(52);
+        assert!(unresolved.contains("call_id=\"check-failed\""));
+        assert!(unresolved.contains("success=false"));
+
+        let (resolved_pending, _) =
+            governor.observe_before_identified(&failed, "batch", "check-fixed");
+        governor.observe_after(resolved_pending, &success_result, &failed_receipt);
+        let resolved = governor.compaction_snapshot(53);
+        assert!(resolved.contains("call_id=\"check-fixed\""));
+        assert!(resolved.contains("success=true"));
+        assert!(!resolved.contains("call_id=\"check-failed\""));
+        assert!(governor.validations_satisfied());
+    }
+
+    #[test]
+    fn compaction_snapshot_keeps_non_validation_failure_until_exact_success() {
+        let temp = TestRoot::new("compaction-failure");
+        let path = temp.path().join("large-line.txt");
+        fs::write(&path, "x".repeat(1024 * 1024 + 1)).expect("large fixture");
+        let registry = ToolRegistry::default();
+        let prepared = registry.prepare_invocation(
+            OperatingMode::Auto,
+            temp.path(),
+            "read",
+            r#"{"path":"large-line.txt","max_lines":1}"#,
+        );
+        let mut governor = CausalGovernor::default();
+        let (pending, _) = governor.observe_before_identified(&prepared, "batch", "read-failed");
+        let failed =
+            registry.execute_prepared_with_cancellation_and_progress(&prepared, None, |_| {});
+        assert!(!failed.result.success);
+        governor.observe_after(pending, &failed.result, &failed.receipt);
+        assert!(governor
+            .compaction_snapshot(55)
+            .contains("failure tool=\"read\" call_id=\"read-failed\""));
+
+        governor.forget_compacted_evidence();
+        assert!(governor.compaction_snapshot(56).contains("pending=true"));
+
+        fs::write(&path, "small\n").expect("repair fixture");
+        let (resolved_pending, _) =
+            governor.observe_before_identified(&prepared, "batch", "read-fixed");
+        let resolved =
+            registry.execute_prepared_with_cancellation_and_progress(&prepared, None, |_| {});
+        assert!(resolved.result.success);
+        governor.observe_after(resolved_pending, &resolved.result, &resolved.receipt);
+        assert!(governor.compaction_snapshot(57).is_empty());
+
+        // A rejected validation never reaches the validation ledger, so its
+        // failure must remain visible in the generic failure records.
+        let rejected = registry.prepare_invocation(
+            OperatingMode::Auto,
+            temp.path(),
+            "shell",
+            r#"{"command":"cargo test","bogus":true}"#,
+        );
+        let (pending, _) = governor.observe_before_identified(&rejected, "batch", "rejected-test");
+        assert!(pending.structural_rejection);
+        let outcome =
+            registry.execute_prepared_with_cancellation_and_progress(&rejected, None, |_| {});
+        governor.observe_after(pending, &outcome.result, &outcome.receipt);
+        assert!(governor
+            .compaction_snapshot(57)
+            .contains("failure tool=\"shell\" call_id=\"rejected-test\""));
+    }
+
+    #[test]
+    fn compaction_snapshot_records_only_changed_mutation_paths() {
+        let temp = TestRoot::new("compaction-mutations");
+        fs::write(temp.path().join("same.txt"), "same").expect("same fixture");
+        fs::write(temp.path().join("changed.txt"), "before").expect("changed fixture");
+        let registry = ToolRegistry::default();
+        let mut governor = CausalGovernor::default();
+
+        let unchanged = registry.prepare_invocation(
+            OperatingMode::Auto,
+            temp.path(),
+            "write",
+            r#"{"path":"same.txt","content":"same","expected":"same"}"#,
+        );
+        let (unchanged_pending, _) =
+            governor.observe_before_identified(&unchanged, "batch", "same");
+        let unchanged_outcome =
+            registry.execute_prepared_with_cancellation_and_progress(&unchanged, None, |_| {});
+        assert!(unchanged_outcome.result.success);
+        assert!(unchanged_outcome
+            .receipt
+            .mutations
+            .iter()
+            .all(|mutation| !mutation.changed()));
+        governor.observe_after(
+            unchanged_pending,
+            &unchanged_outcome.result,
+            &unchanged_outcome.receipt,
+        );
+
+        let changed = registry.prepare_invocation(
+            OperatingMode::Auto,
+            temp.path(),
+            "write",
+            r#"{"path":"changed.txt","content":"after","expected":"before"}"#,
+        );
+        let (changed_pending, _) = governor.observe_before_identified(&changed, "batch", "changed");
+        let changed_outcome =
+            registry.execute_prepared_with_cancellation_and_progress(&changed, None, |_| {});
+        assert!(changed_outcome.result.success);
+        assert!(changed_outcome
+            .receipt
+            .mutations
+            .iter()
+            .any(|mutation| mutation.changed()));
+        governor.observe_after(
+            changed_pending,
+            &changed_outcome.result,
+            &changed_outcome.receipt,
+        );
+
+        let snapshot = governor.compaction_snapshot(60);
+        assert!(snapshot.contains("changed.txt"));
+        assert!(!snapshot.contains("same.txt"));
+    }
+
+    #[test]
+    fn compaction_snapshot_is_deterministic_bounded_and_epoch_aware() {
+        let mut governor = CausalGovernor::default();
+        governor.ledger.workspace_revision = 7;
+        governor.ledger.validations.insert(
+            "validation-key".into(),
+            ValidationResult {
+                success: true,
+                tool_name: "tool\nname".into(),
+                call_id: "call\"id".into(),
+                workspace_revision: 7,
+                uncertainty_epoch: 0,
+            },
+        );
+        let fresh = governor.compaction_snapshot(70);
+        assert!(fresh.contains("tool\\nname"));
+        assert!(fresh.contains("call\\\"id"));
+        assert!(fresh.contains("current=true"));
+        assert_eq!(fresh, governor.compaction_snapshot(70));
+
+        governor.ledger.uncertainty_epoch = 1;
+        let stale = governor.compaction_snapshot(70);
+        assert!(stale.contains("uncertainty_epoch=1"));
+        assert!(stale.contains("current=false"));
+
+        for index in 0..64 {
+            governor.ledger.validations.insert(
+                format!("{index:064x}"),
+                ValidationResult {
+                    success: index % 2 == 0,
+                    tool_name: "shell".into(),
+                    call_id: format!("call-{index}"),
+                    workspace_revision: 7,
+                    uncertainty_epoch: 1,
+                },
+            );
+        }
+        let bounded = governor.compaction_snapshot(71);
+        assert!(bounded.len() <= MAX_COMPACTION_SNAPSHOT_BYTES);
+        assert!(bounded.contains("omitted_observations failures=0 validations="));
     }
 
     #[test]

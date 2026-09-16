@@ -21,6 +21,77 @@ O binário foi construído do checkout atual, incluindo trabalho preexistente
 não commitado. O commit desta tarefa contém somente a correção, seu teste e
 a documentação; não representa sozinho todo o código usado neste binário.
 
+## Deploy anterior — Feedback e leitura da TUI (2026-09-15)
+
+`refresh-slim.ps1` concluiu com `OK:` e exit 0; build release em **3m14s**.
+PATH resolvido: `C:\Users\User\bin\Slim.exe`, build **2026-09-15 22:00:08**,
+`slim 0.1.0`, **17.772.544 bytes**. SHA-256 do instalado e de
+`target/release/slim.exe`, conferidos após a cópia e idênticos:
+`6F9D3E30E3413A266BBE473B3AA8B1DBB830F65B8A7DEAFED5B5271EE93780B9`.
+
+Inclui estados precisos de ferramentas/retry/cancelamento, fila controlável,
+prévia incremental de pensamento, seleção estável, coluna de leitura compartilhada,
+TODO/notificações/aprovações revistos, interface em português e confirmações
+visuais breves. Preserva as alterações preexistentes do checkout.
+[Validação completa, medições e limitações](../Documentações%20-%20Projeto/AUDIT-SLIM-TUI-TRACKER.md#1-veredito-geral).
+A suíte completa foi executada antes do script sem `-Test`; não foi repetida
+durante o deploy. O aviso preexistente que o Clippy dos testes do core mantinha
+foi corrigido em 16/09/2026 no checkout: `cargo clippy --workspace
+--all-targets --offline -- -D warnings` passa com exit 0. O binário instalado
+segue sendo o build de 15/09, anterior a essa correção e ao decodificador de
+colagem do Windows — a mudança existe apenas no checkout e exige um novo
+deploy para valer no PATH.
+
+Smoke do instalado: `--version`, exit 0. Inicialização da TUI em PTY também
+confirmada: welcome, Ctrl+P abre a paleta em português, Esc fecha a paleta e
+Ctrl+C encerra/restaura o terminal com exit 0. Nenhum prompt foi enviado ao
+modelo. Isso não substitui avaliação humana de fluidez em console físico nem
+validação com provider comercial. Sem commit, push ou novo ZIP.
+
+## Deploy anterior — Ferramentas, contexto e diagnóstico JSON (2026-09-15)
+
+`refresh-slim.ps1` concluiu com `OK:` e exit 0; build release em **3m07s**.
+PATH: `C:\Users\User\bin\Slim.exe`, build **2026-09-15 19:53:38**,
+`slim 0.1.0`, **17.593.856 bytes**. SHA-256 do instalado e de
+`target/release/slim.exe` conferidos após a cópia, idênticos:
+`90FE805ACD12496B9703E2E03804AB68F7121052003AB4BA7036716583735488`.
+Smoke pelo executável resolvido no PATH: `--version`, exit 0.
+
+Inclui descrições nativas menores, exclusão de `.venv` na busca/descoberta e
+diagnósticos de sintaxe de JSON nos resultados de escrita e patch. Preserva o
+trabalho preexistente do checkout e os contratos de chamada. O diagnóstico usa
+o conteúdo já em memória, após todas as edições do arquivo, sem rollback; aplica-se
+a `.json` de até 1 MiB e não reinterpreta templates previamente inválidos. Não é
+validação semântica ou comprovação de conclusão da tarefa.
+
+Validação atual: `cargo test --workspace --no-fail-fast`, **1.613 aprovados,
+zero falhas e 33 ignorados**, incluindo Doc-tests; exit 0. Antes disso, 135
+testes focados passaram. A primeira execução completa detectou duas expectativas
+afetadas pelas descrições/rodapé; foram corrigidas e passaram. A tentativa seguinte
+e uma execução isolada falharam em
+`aborting_startup_leader_does_not_strand_followers_or_shutdown` (2 inicializações
+observadas, 1 esperada). Esse teste passou na execução completa final, sem mudança
+no LSP: intermitência registrada, não corrigida nesta tarefa. Os avisos de testes
+ignorados são preservados nos logs. Formatação dos arquivos Rust alterados e
+`git diff --check` passaram. Toolchain pareado: rustc/rustdoc 1.98.0; um job.
+
+Evidência local: `bench/luna-live/native-improvements-20260915/`, incluindo
+`focused-tests.log`, `deploy.log`, `deploy-retry.log`, `lsp-recheck.log`,
+`full-tests.log` e `deploy-final.log`. A suíte final antecedeu o script sem
+`-Test`, sem repetição da suíte aprovada. [Protocolo do A/B](../bench/luna-live/README.md).
+Sem teste manual de TUI/clipboard (não aplicável às alterações), commit ou push.
+
+Validação live posterior: [A/B antes/depois](../bench/luna-live/README.md#resultado-do-ab-nativo),
+oito pares, 16/16 aprovações externas, redução agregada de 20,3% em tokens e
+21,4% em tempo; regressões individuais e limites documentados. A segunda migração
+demonstrou a entrega dos diagnósticos dos dois JSONs ao modelo real.
+
+Limpeza autorizada concluída: removidos `bench/economy-next/slim-before.exe`,
+`bench/economy-next/slim-after.exe`, `bench/economy-next/numbered/slim-numbered.exe`
+e o baseline temporário `bench/luna-live/native-improvements-20260915/slim-before.exe`.
+**4 executáveis, 63.001.600 bytes**; ausência conferida, hashes anteriores retidos
+em `removed-builds.json`. Mantidos o release atual, a cópia no PATH e as evidências.
+
 ## Deploy anterior — Seleção textual e confirmação de cópia (2026-09-14)
 
 `refresh-slim.ps1` concluiu com `OK:` e exit 0; build release em **2m40s**.

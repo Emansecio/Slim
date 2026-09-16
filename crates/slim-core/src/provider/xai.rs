@@ -165,6 +165,10 @@ impl ProviderAdapter for XaiAdapter {
         self.model.id
     }
 
+    fn reasoning_classification(&self) -> Option<crate::ReasoningClassification> {
+        Some(crate::ReasoningClassification::Text)
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         self.parser.capabilities()
     }

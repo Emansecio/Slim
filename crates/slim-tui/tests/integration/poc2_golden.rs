@@ -29,7 +29,7 @@ fn approved_surface_sizes_keep_fixed_rows_and_deterministic_status() {
         );
         assert_eq!(
             render(&state, width, height).lines.last(),
-            Some(&"signed out · /login".to_string()),
+            Some(&"desconectado · /login".to_string()),
             "size={width}x{height}"
         );
     }

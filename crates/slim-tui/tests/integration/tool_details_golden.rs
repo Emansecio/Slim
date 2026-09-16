@@ -349,12 +349,12 @@ fn orphan_tool_suffix_requests_snapshot_resync() {
         assert!(state
             .notifications
             .iter()
-            .any(|message| message.contains("tool lifecycle")));
+            .any(|message| message.contains("ciclo de vida da ferramenta")));
     }
 }
 
 #[test]
-fn collapsed_single_tool_omits_arguments_and_preview() {
+fn collapsed_single_tool_keeps_compact_target_and_result() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::ToolStarted {
         batch_id: batch("batch-1"),
@@ -378,9 +378,16 @@ fn collapsed_single_tool_omits_arguments_and_preview() {
     });
 
     let collapsed = render_at(&state);
-    assert!(collapsed.contains("✓ shell · 854ms"), "{collapsed}");
-    assert!(!collapsed.contains("command="), "{collapsed}");
-    assert!(!collapsed.contains("exit 0"), "{collapsed}");
+    assert!(collapsed.contains("✓ shell"), "{collapsed}");
+    assert!(collapsed.contains("854ms"), "{collapsed}");
+    assert!(
+        collapsed.contains("command=Get-ChildItem"),
+        "collapsed row keeps the target summary\n{collapsed}"
+    );
+    assert!(
+        collapsed.contains("exit 0"),
+        "collapsed row keeps the short result\n{collapsed}"
+    );
 
     let tool_id = state.blocks()[0].id.clone();
     let (changed, _) = state.activate_block(&tool_id);

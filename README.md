@@ -1,5 +1,35 @@
 # Slim
 
+**Checkout — composer, colagem e fila, 16/09/2026:** a colagem do Windows passa
+por um decodificador no fluxo de eventos (`input.rs`): marcadores `ESC [200~` /
+`ESC [201~` viram um payload atômico e um paste sem marcadores tem os `Enter`
+convertidos em texto, então colar várias linhas nunca envia o prompt. As
+posições da fila começam em 1 e o composer informa a ação de Enter. Este é o
+estado do checkout; [validação](Documentações%20-%20Projeto/AUDIT-SLIM-TUI-TRACKER.md)
+registra os gates.
+
+**Checkout — feedback e leitura da TUI, 15/09/2026:** atividade acompanha as
+chamadas paralelas por identidade; preparação, admissão, execução, retry e
+cancelamento têm estados distintos. A fila fica pausada após interrupção
+solicitada e oferece `/queue status|pause|resume|edit N|remove N`. O pensamento
+usa uma prévia incremental de duas linhas; seleção, aprovações, TODO,
+notificações e encerramento têm comportamento explícito. Coluna central de
+100 células (workspace de até 144 com inspetor), interface em português e
+ênfases breves respeitam movimento reduzido. [Contrato](Documentações%20-%20Projeto/DESIGN-SLIM-TUI.md#12-direção-visual-revisada),
+[validação](Documentações%20-%20Projeto/AUDIT-SLIM-TUI-TRACKER.md) e
+[registro de deploy](release/README.md).
+Instalado no PATH em 15/09 às 22:00, com hashes release/PATH iguais e smoke
+de inicialização, paleta e encerramento da TUI em PTY aprovado.
+
+**Checkout — ferramentas e contexto, 15/09/2026:** descrições nativas mais
+curtas, preservando parâmetros, aliases e formatos de chamada. Busca e descoberta
+inicial ignoram `.venv`; acesso explícito continua disponível por `read`, `list`
+e `shell`. A descrição de leitura orienta calcular agregados localmente.
+Escrita e patch acrescentam diagnóstico de sintaxe quando introduzem JSON inválido
+em arquivos `.json` de até 1 MiB. O aviso acompanha a escrita bem-sucedida, não
+desfaz alterações nem comprova conclusão da tarefa. Templates previamente
+inválidos e outros formatos ficam fora dessa verificação. [Evidência e limites](release/README.md).
+
 **Checkout — seleção textual e confirmação de cópia, 14/09/2026:** o arrasto
 fica no conteúdo da conversa ou do inspetor, sem alcançar os controles e sem
 pintar espaços vazios à direita. Clique direito copia a seleção atual; `Copiado`
@@ -153,6 +183,37 @@ tipos inválidos, inclusive `null`, são rejeitados antes do despacho. Campos
 omitidos mantêm os padrões existentes. Essa validação não acrescenta chamadas
 ao modelo.
 
+Revisão de 15/09/2026 (checkout, sem deploy):
+
+- `code_intel.path` com tipo inválido falha antes de consultar o backend; omitido,
+  `null` e string vazia preservam o significado anterior de ausência de caminho.
+- Schemas compartilhados anunciam `query` ou `patterns` em `search` e os campos
+  exigidos por ação em `code_intel`. A admissão continua rejeitando combinações
+  ambíguas. Nomes desconhecidos recebem uma lista das ferramentas nativas
+  registradas e permitidas no modo atual, sem correção automática do nome nem
+  alteração de permissões.
+- Rejeições estruturais anteriores à execução usam a identidade preparada no
+  controle de repetição. Falhas de resolução dependentes do filesystem continuam
+  sem ser classificadas como rejeições puramente estruturais. Não há retry
+  automático de operações com efeitos iniciados ou resultado incerto.
+- Em patch ambíguo, o contexto da primeira ocorrência é apresentado como exemplo,
+  com sua linha e pedido de escolha explícita. O exemplo não seleciona a ocorrência
+  a editar. Compactação e histórico reconhecem também o marcador antigo.
+- O histórico de chamadas deve conter argumentos JSON do tipo objeto antes de
+  reconstruir uma sessão ou preparar uma requisição validada, inclusive de
+  compactação. Argumentos válidos são preservados; JSON inválido não vira `{}`
+  silenciosamente na serialização Anthropic.
+
+Validação local desta revisão: `cargo test --workspace --offline
+--config=profile.dev.debug=0 --config=profile.test.debug=0 -- --test-threads=2`,
+com `CARGO_BUILD_JOBS=1` e `CARGO_INCREMENTAL=0`: 1.608 testes passaram, zero falhas,
+33 ignorados; Doc-tests incluídos. `rustfmt --check` nos arquivos alterados e
+`git diff --check` passaram. As primeiras compilações sofreram falta de memória
+comprometida; o build serial final concluiu sem alterações globais do ambiente.
+Não houve teste com provider real nem deploy. Na fixture de contratos sem backend
+semântico, o prompt permaneceu em 1.545 bytes e os schemas passaram de 7.782 para
+7.841 bytes. Isto mede bytes serializados, não tokens nem taxa de acerto do modelo.
+
 Revisão de 12/09/2026:
 
 - `shell` com `args` ausente ou `null` executa um script PowerShell. Com um array
@@ -203,6 +264,15 @@ Integridade de ferramentas e streaming (13/09/2026):
 - Falhas na coleta de lotes cancelam e aguardam o trabalho nativo iniciado.
   Se o diário falhar, os resultados coletados continuam no histórico em memória;
   persistência incompleta permanece um erro, sem promessa de ausência de efeitos.
+- Falhas de pré-condição de `write` e de correspondência de `patch` apresentam
+  causa, efeito e orientação de recuperação sem repetir instruções entre o
+  cabeçalho e o contexto. A orientação fixa é
+  limitada a 256 bytes, excluindo caminhos e evidência; o resultado completo
+  continua sujeito aos orçamentos de saída existentes. O conteúdo necessário à
+  correção e os marcadores usados pela compactação são preservados.
+  Não há chamada adicional ao modelo para gerar
+  essas orientações, nem repetição automática; respostas de sucesso permanecem
+  iguais. O limite em bytes não garante redução de tokens por tarefa.
 - A recuperação de `write`/`patch` respeita fronteiras UTF-8. O texto canônico
   e o adaptador Chat preservam whitespace recebido em chunks separados,
   incluindo conteúdo de raciocínio. SSE agrega campos `data`
@@ -473,7 +543,16 @@ resumo somente após validação. A última instrução de usuário é preservad
 separadamente do sufixo recente, inclusive na retomada de checkpoints; trabalho
 encerrado posterior à instrução pode ser resumido. A seleção preserva grupos assistant/tool, o
 checkpoint durável usa fingerprint do prefixo, e usage/duração do resumo são
-contabilizados mesmo quando uma preparação inválida é descartada. Cada valor de API key fornecido é redigido exatamente antes
+contabilizados mesmo quando uma preparação inválida é descartada. Na aplicação da
+compactação, o runtime anexa até 4 KiB de fatos observados: mutações de arquivos,
+validações com revisão/época de incerteza e falhas sem sucesso posterior da mesma
+chamada. O registro é limitado, informa omissões e mantém o escopo da execução;
+não comprova o estado atual após novas ações ou retomada. Com armazenamento de
+artefatos, o histórico preserva o texto visível e inclui um índice por linhas para
+recuperar mensagens e resultados pelo `read` quando o arquivo está dentro do
+workspace; checkpoints anteriores mantêm os
+links para arquivos anteriores. Não há chamada adicional de modelo para esses
+registros. Cada valor de API key fornecido é redigido exatamente antes
 de tool output, follow-up ao provider, renderização e sessão; isso não promete
 encontrar qualquer segredo arbitrário que não tenha sido registrado.
 

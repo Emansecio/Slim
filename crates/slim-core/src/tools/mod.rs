@@ -727,10 +727,19 @@ impl ToolRegistry {
             .contains(&prepared.name.as_str())
         {
             Err(ToolExecutionError::from(ToolError::InvalidInput {
-                message: format!(
-                    "tool unavailable in {} mode",
-                    crate::runtime::mode_name(prepared.mode)
-                ),
+                message: if prepared.spec.is_none() {
+                    format!(
+                        "unknown tool: {}; registered native tools allowed in {} mode: {}",
+                        prepared.name.chars().take(64).collect::<String>(),
+                        crate::runtime::mode_name(prepared.mode),
+                        self.names_for_mode(prepared.mode).join(", ")
+                    )
+                } else {
+                    format!(
+                        "tool unavailable in {} mode",
+                        crate::runtime::mode_name(prepared.mode)
+                    )
+                },
             }))
         } else if let Some(error) = &prepared.error {
             Err(ToolExecutionError::from(ToolError::InvalidInput {
@@ -1140,7 +1149,7 @@ impl ToolRegistry {
         Ok(ExecutedTool {
             success: true,
             output: format!(
-                "written {}; bytes={}; sha256={}; exists=true; do not re-read{}",
+                "written {}; bytes={}; sha256={}; exists=true; do not re-read{}{}",
                 display.display(),
                 written.after.len,
                 written.written_sha256_12,
@@ -1148,6 +1157,11 @@ impl ToolRegistry {
                     .recovery_note
                     .as_ref()
                     .map(|note| format!("; {note}"))
+                    .unwrap_or_default(),
+                written
+                    .syntax_diagnostic
+                    .as_ref()
+                    .map(|diagnostic| format!("\n{diagnostic}"))
                     .unwrap_or_default()
             ),
             dependencies: written.dependency.into_iter().collect(),
@@ -1363,7 +1377,7 @@ fn cap_shell_stream(raw: &[u8], previously_discarded_bytes: usize) -> String {
 fn tool_definition(name: &str) -> Value {
     let (description, properties, required) = match name {
         "read" => (
-            "Read unchanged UTF-8 text. Omit `offset` for the first page (line 1): when both `max_lines` and its `lines` alias are omitted, a file whose metadata length is at most 1 MiB minus 128 bytes gets up to 4096 lines; otherwise the omitted limit is 200 lines. Pages starting later default to 200 lines. Pass either `max_lines` or `lines` (1..4096) for an explicit page size. Example: `{\"path\":\"src/lib.rs\",\"max_lines\":20}`. Prefer search+patch for a local edit; a complete read authorizes write without repeating expected. A successful overwrite or patch of that path does too.",
+            "Read exact UTF-8 text. offset is 1-based. Explicit max_lines/lines: 1..4096. With no limit, the first page expands up to 4096 lines for files at most 1 MiB minus 128 bytes; other pages default to 200. Follow the returned offset for more. A complete read authorizes later overwrite; prefer search+patch for local edits. For data calculations, use shell and return aggregates instead of dumping input.",
             json!({"path": {"type": "string", "description": "Workspace-relative path."}, "max_lines": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LINES_CAP, "description": "Canonical page-size field; omit to use the default for this offset."}, "lines": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LINES_CAP, "description": "Alias for `max_lines`."}, "offset": {"type": "integer", "minimum": 1, "description": "First line (1-based); omit for line 1."}}),
             json!(["path"]),
         ),
@@ -1378,7 +1392,7 @@ fn tool_definition(name: &str) -> Value {
             json!([]),
         ),
         "search" => (
-            "Literal UTF-8 search: query or patterns, exclusively. Patterns share a scan; hits group under a [path] header, `N:` marks a hit line and `N-` context. A unique hit line is enough for patch.expected—copy only the text after `N: `, never line numbers, [path] headers or [pattern] labels. Raise context_lines when that line is not unique; values above 3 saturate at 3 and report an admission note. Omit or pass 0 to locate; join context lines with \\n and omit the N:/N- prefixes. A hit that contains [truncated] is not expected—narrow path or query. Cursors preserve historical snapshots; repeat path/query/context_lines.",
+            "Search literal UTF-8 text with query or patterns. Results group by path; N: marks hits and N- context. For patch.expected, copy only the text after `N: ` or `N- `, without headers. A unique hit suffices; otherwise increase context_lines (capped at 3). Never patch [truncated] text. Cursors preserve snapshots; repeat path/query/context_lines.",
             json!({
                 "path": {"type": "string", "description": "Workspace-relative path."},
                 "query": {"type": "string"},
@@ -1400,7 +1414,7 @@ fn tool_definition(name: &str) -> Value {
             });
         }
         "write" => (
-            "Write a whole UTF-8 file; create parents. Prefer patch for a local edit. Create: omit expected. Overwrite: pass expected as the current full file, or omit it after a complete read or a successful overwrite/patch of that path. A failed overwrite includes the current file when it fits; retry with that expected or patch—do not re-read. A successful write needs no confirmation read; a successful overwrite authorizes the next write to omit expected. Create does not. Independent writes to different paths may share one turn. Do not send a large expected for a local change. Changes since expected/read reject the write.",
+            "Write a complete UTF-8 file; create parents. Omit expected to create. Overwrite requires current full text in expected, a complete read, or a successful overwrite/patch of the path. Stale content is rejected. Prefer patch for local edits. Failure may include current text for retry. Success needs no confirmation read. Independent paths may share a turn.",
             json!({
                 "path": {"type": "string", "description": "Workspace-relative path."},
                 "content": {"type": "string"},
@@ -1412,12 +1426,12 @@ fn tool_definition(name: &str) -> Value {
             json!(["path", "content"]),
         ),
         "patch" => (
-            "Preferred for local code edits. Atomic ordered edits. Use either the `edits` array or the legacy top-level `expected` + `replacement` pair, never both. Each expected is a unique raw file substring—copy search hit/context TEXT only, never line numbers (`N:`/`N-`), [path] headers, [pattern] labels, or [truncated] markers. A unique context_lines=0 line is enough. Search with context_lines is enough—no complete read. A failed patch with no match includes the current file when it fits; retry with a unique excerpt—do not re-read. A successful patch needs no confirmation read and authorizes a later write to omit expected. Independent patches to different paths may share one turn. LF matches uniform CRLF. Failure leaves the file unchanged.",
+            "Apply atomic ordered edits to one file. Use edits OR the top-level expected/replacement pair. Each expected must uniquely match raw file text, never line numbers, headers or [truncated] markers. Unique search text needs no complete read. LF excerpts match uniform CRLF. Failure leaves the file unchanged and may include recovery text. Success authorizes later overwrite and needs no confirmation read. Independent paths may share a turn.",
             json!({"path": {"type": "string", "description": "Workspace-relative path."}, "edits": {"type": "array", "minItems": 1, "maxItems": patch::MAX_PATCH_EDITS, "items": {"type": "object", "properties": {"expected": {"type": "string", "minLength": 1, "description": "Unique raw file substring. Copy the text after `N: `/`N- ` in search output, or verbatim from a read; join context lines with \\n."}, "replacement": {"type": "string"}}, "required": ["expected", "replacement"], "additionalProperties": false}}, "expected": {"type": "string", "minLength": 1, "description": "Legacy unique raw file substring."}, "replacement": {"type": "string", "description": "Legacy replacement text."}}),
             json!(["path"]),
         ),
         "shell" => (
-            "Run in workspace. Script form (`args` omitted or null) always executes through PowerShell without a profile, preserving native exit codes; pass the command text in `command`, never a JSON tool payload. Program form (`args` supplied, including an empty array) runs the executable directly with literal arguments; `.bat` and `.cmd` keep their own interpreter semantics. Direct example: `{\"command\":\"git\",\"args\":[\"status\",\"--short\"]}`. Exit status describes the process, not every suboperation or task verification. Use workspace metadata before git status/diff; they need a Git repository unless using explicit --no-index. Do not use git status/diff as code validation. Use file tools for code edits. `timeout_ms` must be 1..120000; invalid values are rejected. Raise timeout only for deliberate builds/tests.",
+            "Run in workspace. Without args (or null), command is a PowerShell script. With args (even []), command is an executable with literal arguments; .bat/.cmd keep their interpreter. Example: {\"command\":\"git\",\"args\":[\"status\",\"--short\"]}. Inspect workspace metadata before Git commands. Exit status is process status, not task validation. Use file tools for edits. timeout_ms: 1..120000; raise only for deliberate builds/tests.",
             json!({"command": {"type": "string"}, "args": {"type": ["array", "null"], "items": {"type": "string"}}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_MS, "default": 30000}}),
             json!(["command"]),
         ),
@@ -1439,6 +1453,14 @@ fn tool_definition(name: &str) -> Value {
                 "required": ["expected", "replacement"],
                 "not": {"required": ["edits"]}
             }
+        ]);
+    }
+    if name == "search" {
+        // Native admission accepts both fields only when they describe the
+        // same literal term. Do not exclude that spelling with oneOf.
+        input_schema["anyOf"] = json!([
+            {"required": ["query"]},
+            {"required": ["patterns"]}
         ]);
     }
     json!({
@@ -1538,9 +1560,15 @@ fn tool_error_message(error: ToolError) -> String {
     match error {
         ToolError::Io { message } => format!("io error: {message}"),
         ToolError::Cancelled => "tool cancelled before side effect".into(),
-        ToolError::StaleRead { path } => format!("stale read: {path}; the precondition differs from current bytes. Retry write with expected set to the current file below, or patch an exact current excerpt. No write applied."),
-        ToolError::PreconditionRequired { path } => format!("precondition required: {path}; pass expected as the current full file below, or use patch with a unique excerpt. No write applied."),
-        ToolError::MatchCount { count } => format!("expected exactly one match, got {count}"),
+        ToolError::StaleRead { path } => {
+            format!(
+                "stale read: {path}; precondition differs from current bytes; no write applied."
+            )
+        }
+        ToolError::PreconditionRequired { path } => {
+            format!("precondition required: {path}; no write applied.")
+        }
+        ToolError::MatchCount { count } => format!("expected one match; got {count}"),
         ToolError::InvalidInput { message } => message,
     }
 }

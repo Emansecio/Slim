@@ -11,6 +11,16 @@ fn identical_failed_tool_call_is_blocked_on_second_attempt() {
 }
 
 #[test]
+fn canonical_prepared_fingerprint_blocks_path_aliases() {
+    let mut guard = LoopGuard::default();
+    let fingerprint = "prepared-read-fingerprint";
+    assert!(guard.accept("read", fingerprint, "invalid read offset"));
+    // The runtime supplies the prepared canonical fingerprint after admission;
+    // raw JSON path spellings cannot split this identity.
+    assert!(!guard.accept("read", fingerprint, "invalid read offset"));
+}
+
+#[test]
 fn repeated_failed_shell_command_is_blocked_even_with_differing_output() {
     let mut guard = LoopGuard::default();
     assert!(guard.accept(

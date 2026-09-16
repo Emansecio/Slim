@@ -19,6 +19,103 @@
 
 ## 1. Veredito geral
 
+**15/09/2026 — feedback operacional e estabilidade de leitura:** esta revisão
+substitui a invalidação global de seleção descrita no registro de 14/09 abaixo.
+Chamadas paralelas mantêm atividade por lote/ID; o início real vem da execução
+admitida no pool. Retry, cancelamento e idade do último conteúdo/progresso usam
+eventos próprios. Cancelar pausa a fila inclusive se o resultado terminal de
+sucesso vencer a corrida; `/queue` permite consultar, pausar, retomar, editar e
+remover por posição humana. O encerramento conserva duração e resultado da
+execução no rodapé e no inspetor, sem comprovar resolução do objetivo.
+
+A prévia de pensamento mantém duas linhas alinhadas ao wrap compartilhado,
+com cache incremental e retenção até uma fronteira visual. Classificação de
+raciocínio só aparece quando fornecida pelo adapter. Seleção fixa a posição
+de leitura e compara as células selecionadas; mudanças externas à seleção
+não a descartam, e uma cópia invalidada não vira cancelamento ou colagem.
+Coluna central, rodapé discreto, TODO com preferência manual, notificação
+principal com histórico, aprovações roláveis, textos em português e ênfase
+de 249 ms compartilham o renderer existente. Movimento reduzido omite a ênfase.
+
+Falhas adicionais encontradas e corrigidas na integração: posição zero em
+`/queue`; edição da fila pelo Enter; duração de execução cancelada; corrida
+cancelamento/conclusão; limite vertical ao selecionar conversa curta; cópia
+após invalidação/redimensionamento; aprovação após reduzir a janela no mesmo
+lote de entrada. Todas têm regressões direcionadas.
+
+Medição local atual: `cargo test -p slim-tui --test thinking_performance
+expanded_thinking_frames --offline -- --ignored --nocapture` passou. Em debug,
+TestBackend 140×40, 11 frames com cache por cenário: mediana **1,590 ms** no
+histórico e **5,057 ms** no grupo visível; primeiros frames **107,655 ms** e
+**229,000 ms**. Não é medição de terminal físico, provider ou percepção humana.
+
+Validação final desta revisão:
+
+- `cargo test --workspace --no-fail-fast --offline -- --test-threads=1`:
+  **1.648 aprovados, zero falhas, 33 ignorados, 84 suítes**, incluindo doc-tests;
+  exit 0. Os ignorados existentes incluem fixtures auxiliares e medições manuais.
+- `cargo clippy -p slim-tui -p slim-cli --all-targets --offline -- -D warnings`:
+  aprovado. O comando incluindo todos os testes de `slim-core` encontrou um
+  `redundant_clone` preexistente em `session/transcript.rs:333`.
+- `cargo clippy -p slim-core --all-targets --offline -- -D warnings` (16/09/2026):
+  aprovado, exit 0. Acompanha a correção `explicit_auto_deref` em
+  `runtime/governor.rs` e a remoção do clone redundante em `transcript.rs`; o
+  lint completo do core passa a estar certificado.
+
+Revalidação de 16/09/2026 (continuação da mesma revisão, em `CARGO_INCREMENTAL=0`):
+
+- `cargo test --workspace --no-fail-fast --offline`: **1.667 aprovados, zero
+  falhas, 34 ignorados, 85 suítes**, exit 0. O total inclui as 8 regressões novas
+  do decodificador de paste (`pty_windows` 18/18) e não inclui Doc-tests, que o
+  filtro de contagem desta execução não somou.
+- `cargo clippy --workspace --all-targets --offline -- -D warnings`: exit 0, sem
+  avisos. Este gate é mais amplo que o registrado acima e não encontrou achados.
+- `cargo fmt --all -- --check` e `git diff --check`: exit 0.
+- A primeira tentativa desta sessão falhou dentro do `rustc`
+  (`STATUS_STACK_BUFFER_OVERRUN`) ao compilar `slim-core` com cache incremental
+  reaproveitado de um processo interrompido; o mesmo comando com
+  `CARGO_INCREMENTAL=0` compilou em 5,5 s. Artefatos de 0 byte também foram
+  removidos de `target/debug/deps`. São arquivos de cache regeneráveis; nenhum
+  fonte foi revertido.
+
+Evidência de console físico (parcial) — sonda `paste_conpty_probe`, 16/09/2026:
+
+- `cargo test -p slim-tui --test paste_conpty_probe -- --ignored --nocapture`,
+  exit 0, 25,20 s. O filho reexecuta o próprio binário sob ConPTY e registra os
+  eventos crus de `crossterm::event::read()`.
+- Resultado medido: ao escrever `\x1b[200~…\x1b[201~` no console, **nenhum**
+  evento `Esc`, `[`, `200~` ou `Event::Paste` chegou ao aplicativo — o console
+  Windows absorve os marcadores. A colagem chega como texto comum e o `Enter`
+  interno vem com `more_input=true`, que é o caminho que o decodificador usa para
+  convertê-lo em texto. O paste sem marcadores termina o burst com
+  `more_input=false`.
+- Consequência registrada: a máquina de estados dos marcadores em `input.rs`
+  não é o caminho exercitado no Windows; ela permanece para terminais que
+  encaminhem os marcadores. Isso corrige a suposição anterior do comentário do
+  módulo e relativiza a linha "Bracketed paste ✅" da tabela de capacidades
+  acima, que se apoiava em teste unitário, não em captura de console.
+- O `TestBackend` e os testes unitários seguem válidos; a sonda cobre apenas a
+  entrega de eventos de colagem, não renderização, provider ou percepção humana.
+- Rustfmt dos arquivos alterados da TUI e `git diff --check`: aprovados.
+- Toolchain pareado rustc/rustdoc 1.98.0, um job de compilação.
+
+Os primeiros gates encontraram expectativas antigas de idioma e uma expectativa
+de estilo anterior ao fim dos 249 ms; foram alinhadas ao contrato, preservando
+as verificações. Na rodada paralela posterior, `search_bounded` perdeu sua pasta
+temporária (`workspace root cannot be resolved`). Os oito testes de busca e o
+workspace completo passaram em modo serial, sem alterar a busca. A interferência
+entre fixtures temporárias é hipótese; a falha paralela permanece registrada,
+não foi declarada corrigida. Logs desta sessão estão em `%TEMP%`:
+`slim-tui-workspace-20260915.log`, `slim-tui-workspace-final-20260915.log` e
+`slim-tui-workspace-serial-20260915.log`.
+
+O deploy autorizado e a identidade do executável estão registrados em
+[`release/README.md`](../release/README.md). O instalado iniciou em PTY: welcome,
+Ctrl+P para abrir a paleta, Esc para fechar e Ctrl+C para encerrar/restaurar o
+terminal; exit 0, sem prompt ao modelo. Não houve avaliação humana da fluidez
+em terminal físico, operação do clipboard pessoal ou chamada a provider comercial.
+Os demais cenários visuais usam TestBackend e eventos controlados.
+
 **14/09/2026 — seleção textual por área e retorno de cópia:** o arrasto usa
 regiões da conversa/inspetor registradas no último frame, sem refazer layout
 no handler. Bordas dos painéis, scrollbar, rodapé, composer e menus sobrepostos

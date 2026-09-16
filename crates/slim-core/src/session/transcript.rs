@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::provider::ProviderMessage;
+use crate::provider::{validate_tool_call_arguments, ProviderMessage};
 
 use super::{DurableEntry, DurableEntryRole, DurableRecord};
 
@@ -210,6 +210,10 @@ fn decode_entries<'a>(
                 ProviderMessage::tool(name, id, entry.content.clone())
             }
         };
+        for call in &message.tool_calls {
+            validate_tool_call_arguments(call, messages.len())
+                .map_err(|_| "invalid durable tool-call arguments: expected a valid JSON object")?;
+        }
         message.content_blocks.clone_from(&entry.content_blocks);
         messages.push(message);
     }
@@ -285,6 +289,54 @@ mod tests {
         ]);
         crossed[1].operation_id = "other".into();
         assert!(provider_messages_from_entries(&crossed).is_err());
+    }
+
+    #[test]
+    fn tool_arguments_must_be_valid_json_objects_before_reconstruction() {
+        for (arguments, expected) in [
+            (
+                "{",
+                "invalid durable tool-call arguments: expected a valid JSON object",
+            ),
+            (
+                "null",
+                "invalid durable tool-call arguments: expected a valid JSON object",
+            ),
+            (
+                "[]",
+                "invalid durable tool-call arguments: expected a valid JSON object",
+            ),
+            (
+                r#""text""#,
+                "invalid durable tool-call arguments: expected a valid JSON object",
+            ),
+        ] {
+            let mut invalid = call("invalid-call");
+            invalid.arguments = arguments.into();
+            let error = provider_messages_from_entries(&entries(vec![ProviderMessage::assistant(
+                "",
+                vec![invalid],
+            )]))
+            .expect_err("invalid tool arguments must block reconstruction");
+            assert_eq!(error, expected);
+        }
+
+        let expected = ProviderMessage::assistant(
+            "",
+            vec![ProviderToolCall {
+                id: "unicode-call".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"á😀"}"#.into(),
+            }],
+        );
+        let messages = vec![
+            expected,
+            ProviderMessage::tool("read", "unicode-call", "ok"),
+        ];
+        assert_eq!(
+            provider_messages_from_entries(&entries(messages.clone())).unwrap(),
+            messages
+        );
     }
 
     #[test]

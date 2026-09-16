@@ -82,35 +82,30 @@ impl InteractionRequestState {
         let (request, hint) = match &self.kind {
             InteractionRequestKind::Input { prompt, options } => {
                 let hint = if options.is_empty() {
-                    "Enter answer".into()
+                    "Enter responder".into()
                 } else {
-                    format!("options: {}", options.join(" · "))
+                    format!("opções: {}", options.join(" · "))
                 };
                 (prompt.clone(), hint)
             }
             InteractionRequestKind::Approval { summary } => {
-                (summary.clone(), "Y approve · N reject".into())
+                (summary.clone(), "Y aprovar · N rejeitar".into())
             }
             InteractionRequestKind::Question { .. } => (String::new(), String::new()),
-        };
-        let persistence = if self.persisted {
-            "persisted"
-        } else {
-            "ephemeral"
         };
         let status = match &self.acknowledgement {
             Some(acknowledgement) if acknowledgement.message.is_empty() => {
                 if acknowledgement.accepted {
-                    "accepted".into()
+                    "confirmada".into()
                 } else {
-                    "rejected".into()
+                    "rejeitada".into()
                 }
             }
             Some(acknowledgement) => acknowledgement.message.clone(),
-            None if self.response_pending => "response sent · awaiting acknowledgement".into(),
-            None => "waiting for response".into(),
+            None if self.response_pending => "resposta enviada · aguardando confirmação".into(),
+            None => "aguardando resposta".into(),
         };
-        format!("{request}\n{hint}\n{persistence} · {status}")
+        format!("{request}\n{hint}\n{status}")
     }
 
     pub fn layout_lines(&self, width: usize) -> Vec<String> {
@@ -136,9 +131,9 @@ impl InteractionRequestState {
                         .as_ref()
                         .is_some_and(|ack| ack.accepted)
                     {
-                        "accepted"
+                        "confirmada"
                     } else {
-                        "rejected"
+                        "rejeitada"
                     },
                 );
             lines.extend(wrap_hanging("  · ", answer, width));
@@ -164,9 +159,13 @@ impl InteractionRequestState {
             ));
         }
         if self.response_pending {
-            lines.extend(wrap_hanging("  · ", "sent", width));
+            lines.extend(wrap_hanging(
+                "  · ",
+                "enviada · aguardando confirmação",
+                width,
+            ));
         } else if self.custom_question_answer {
-            lines.extend(wrap_hanging("  · ", "type answer below", width));
+            lines.extend(wrap_hanging("  · ", "digite a resposta abaixo", width));
         }
         lines
     }
@@ -232,9 +231,9 @@ fn hard_wrap_token(token: &str, width: usize) -> Vec<String> {
 
 pub(crate) fn question_option_marker(selected: bool) -> &'static str {
     if selected {
-        "[x] "
+        ">   "
     } else {
-        "[ ] "
+        "    "
     }
 }
 
@@ -291,6 +290,7 @@ pub fn is_complete_tool(block: &Block) -> bool {
 
 pub fn is_collapsed_complete_thinking(block: &Block) -> bool {
     block.lifecycle == BlockLifecycle::Complete
+        && !block.preview_retained
         && matches!(block.kind(), BlockKind::Thinking(_))
         && block.fold != FoldState::Expanded
 }
@@ -349,7 +349,9 @@ fn failed_tool_signature(block: &Block) -> Option<(&str, &str)> {
 
 /// Consecutive failed tools that share name and reason, for one error row.
 pub fn is_complete_thinking(block: &Block) -> bool {
-    block.lifecycle == BlockLifecycle::Complete && matches!(block.kind(), BlockKind::Thinking(_))
+    block.lifecycle == BlockLifecycle::Complete
+        && !block.preview_retained
+        && matches!(block.kind(), BlockKind::Thinking(_))
 }
 
 pub fn consecutive_complete_thinking_span(
@@ -392,6 +394,11 @@ pub struct Block {
     kind: BlockKind,
     pub lifecycle: BlockLifecycle,
     pub fold: FoldState,
+    /// Monotonic presentation timestamps; historical blocks may not have them.
+    pub started_ms: Option<u64>,
+    pub ended_ms: Option<u64>,
+    pub preview_retained: bool,
+    pub reasoning_classification: Option<slim_core::events::ReasoningClassification>,
     turn_boundary_before: bool,
     content_generation: u64,
     cache_identity: u64,
@@ -404,6 +411,10 @@ impl Clone for Block {
             kind: self.kind.clone(),
             lifecycle: self.lifecycle,
             fold: self.fold,
+            started_ms: self.started_ms,
+            ended_ms: self.ended_ms,
+            preview_retained: self.preview_retained,
+            reasoning_classification: self.reasoning_classification,
             turn_boundary_before: self.turn_boundary_before,
             content_generation: self.content_generation,
             cache_identity: fresh_cache_identity(),
@@ -417,6 +428,10 @@ impl PartialEq for Block {
             && self.kind == other.kind
             && self.lifecycle == other.lifecycle
             && self.fold == other.fold
+            && self.started_ms == other.started_ms
+            && self.ended_ms == other.ended_ms
+            && self.preview_retained == other.preview_retained
+            && self.reasoning_classification == other.reasoning_classification
             && self.turn_boundary_before == other.turn_boundary_before
             && self.content_generation == other.content_generation
     }
@@ -431,6 +446,10 @@ impl Block {
             kind,
             lifecycle,
             fold: FoldState::Auto,
+            started_ms: None,
+            ended_ms: None,
+            preview_retained: false,
+            reasoning_classification: None,
             turn_boundary_before: false,
             content_generation: 0,
             cache_identity: fresh_cache_identity(),
@@ -439,6 +458,10 @@ impl Block {
 
     pub fn kind(&self) -> &BlockKind {
         &self.kind
+    }
+
+    pub(crate) fn shows_thinking_preview(&self) -> bool {
+        self.lifecycle == BlockLifecycle::Streaming || self.preview_retained
     }
 
     pub(crate) fn tool_state_mut(&mut self) -> Option<&mut ToolState> {
@@ -556,13 +579,14 @@ impl Block {
     /// Compact key for caches: `lifecycle` is assigned directly (bypassing
     /// `touch_content`), so presentation caches must key on it separately.
     pub(crate) fn lifecycle_tag(&self) -> u8 {
-        match self.lifecycle {
+        let tag = match self.lifecycle {
             BlockLifecycle::Pending => 0,
             BlockLifecycle::Streaming => 1,
             BlockLifecycle::Complete => 2,
             BlockLifecycle::Failed => 3,
             BlockLifecycle::Cancelled => 4,
-        }
+        };
+        tag | (u8::from(self.preview_retained) << 4)
     }
 
     /// Compact key for caches: `fold` is likewise assigned directly.
@@ -682,11 +706,11 @@ mod tests {
         let lines = state.layout_lines(36);
         let joined = lines.join("\n");
         assert!(joined.contains("? Which crate should change?"), "{joined}");
-        assert!(joined.contains("[x] core"), "{joined}");
+        assert!(joined.contains(">   core"), "{joined}");
         assert!(joined.contains("Runtime and protocol"), "{joined}");
         let core = lines
             .iter()
-            .position(|line| line.contains("[x] core"))
+            .position(|line| line.contains(">   core"))
             .unwrap();
         assert!(
             !lines[core].contains("Runtime"),

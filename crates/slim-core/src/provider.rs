@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::context::{AdaptiveTokenEstimator, COMPACTION_SYSTEM_PROMPT};
+use crate::events::ReasoningClassification;
 
 mod clinepass;
 mod codex;
@@ -980,6 +981,12 @@ pub trait ProviderAdapter {
     }
     fn materialize_prompt_cache_intent(&self, _body: &mut Value) {}
     fn model(&self) -> &str;
+    /// Meaning of streamed reasoning text when the adapter's wire protocol
+    /// identifies it. Generic adapters leave this unknown rather than
+    /// guessing from a field name.
+    fn reasoning_classification(&self) -> Option<ReasoningClassification> {
+        None
+    }
     fn system_prompt_for_budget(&self) -> Option<&str> {
         None
     }
@@ -1238,7 +1245,8 @@ pub async fn run_http_provider_messages<A: ProviderAdapter>(
         client.adapter().wire_kind(),
         request_next_seq,
         request.sensitive_values().to_vec(),
-    );
+    )
+    .with_reasoning_classification(client.adapter().reasoning_classification());
     let request_started = Instant::now();
     let stream_result = client
         .stream_prepared_cancellable(request, std::future::pending(), |event| {
@@ -3585,12 +3593,58 @@ fn normalized_blocks_for_request(blocks: &[ProviderContentBlock]) -> Vec<Normali
 }
 
 fn normalize_messages(messages: &[ProviderMessage]) -> Result<(), ProviderError> {
-    for message in messages {
+    for (position, message) in messages.iter().enumerate() {
+        for call in &message.tool_calls {
+            validate_tool_call_arguments(call, position)?;
+        }
         for block in &message.content_blocks {
             normalize_block(block)?;
         }
     }
     Ok(())
+}
+
+pub(crate) fn validate_tool_call_arguments(
+    call: &ProviderToolCall,
+    position: usize,
+) -> Result<(), ProviderError> {
+    let value = match serde_json::from_str::<Value>(&call.arguments) {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(ProviderError::InvalidResponse {
+                message: format!(
+                    "{} arguments are invalid JSON: {error}",
+                    tool_call_identity(call, position)
+                ),
+            })
+        }
+    };
+    if !value.is_object() {
+        return Err(ProviderError::InvalidResponse {
+            message: format!(
+                "{} arguments must be a JSON object",
+                tool_call_identity(call, position)
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn tool_call_identity(call: &ProviderToolCall, position: usize) -> String {
+    let call_id = bounded_tool_call_label(&call.id);
+    let call_name = bounded_tool_call_label(&call.name);
+    match (call_name.is_empty(), call_id.is_empty()) {
+        (true, true) => format!("tool call at message position {position}"),
+        (false, true) => format!("tool call at message position {position} ({call_name})"),
+        (true, false) => format!("tool call at message position {position} ({call_id})"),
+        (false, false) => {
+            format!("tool call at message position {position} ({call_name}/{call_id})")
+        }
+    }
+}
+
+fn bounded_tool_call_label(value: &str) -> String {
+    value.chars().take(64).collect()
 }
 
 fn openai_file_placeholder(media_type: &str, data: &str) -> Value {
@@ -4726,7 +4780,7 @@ impl AnthropicAdapter {
                     let mut content = anthropic_content_values(message);
                     for call in &message.tool_calls {
                         let input = serde_json::from_str::<Value>(&call.arguments)
-                            .unwrap_or_else(|_| json!({}));
+                            .unwrap_or_else(|_| Value::String(call.arguments.clone()));
                         content.push(json!({
                             "type": "tool_use",
                             "id": call.id,
@@ -4779,6 +4833,10 @@ impl ProviderAdapter for AnthropicAdapter {
 
     fn model(&self) -> &str {
         &self.config.model
+    }
+
+    fn reasoning_classification(&self) -> Option<ReasoningClassification> {
+        Some(ReasoningClassification::Text)
     }
 
     fn capabilities(&self) -> ProviderCapabilities {

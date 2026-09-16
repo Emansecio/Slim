@@ -15,18 +15,82 @@ use ratatui::style::Style;
 use ratatui::text::Line as RatatuiLine;
 use unicode_segmentation::UnicodeSegmentation;
 
-pub(crate) const THINKING_PREVIEW_GRAPHEMES: usize = 256;
+/// Retain a visual-row boundary rather than a sliding character suffix. Revisit
+/// the last few rows so an appended combining mark/ZWJ can complete a grapheme.
+/// Width changes rebuild once; appends only wrap the retained suffix and delta.
+#[derive(Default)]
+struct ThinkingPreview {
+    generation: u64,
+    source_len: usize,
+    restart: usize,
+    logical_column: usize,
+    hidden: bool,
+    rows: Vec<String>,
+}
 
-pub(crate) fn thinking_preview_tail(text: &str) -> (&str, bool) {
-    let text = text.trim_end();
-    let Some((start, _)) = text
-        .grapheme_indices(true)
-        .rev()
-        .nth(THINKING_PREVIEW_GRAPHEMES - 1)
-    else {
-        return (text, false);
-    };
-    (&text[start..], start > 0)
+impl ThinkingPreview {
+    fn update(&mut self, text: &str, generation: u64, width: u16) {
+        if self.generation == generation && self.source_len == text.len() {
+            return;
+        }
+        if text.len() < self.source_len || !text.is_char_boundary(self.restart) {
+            *self = Self::default();
+        }
+        let prefix = " ".repeat(self.logical_column % 4);
+        let source = format!("{prefix}{}", &text[self.restart..]);
+        let raw_offsets: Vec<_> = source.char_indices().map(|(offset, _)| offset).collect();
+        let (safe, mapped) =
+            crate::markdown::sanitize_terminal_text_with_offsets(&source, &raw_offsets);
+        let safe = safe[prefix.len()..].trim_end();
+        let width = usize::from(width.max(1));
+        let mut rows = Vec::new();
+        let mut boundaries = vec![(0usize, self.logical_column)];
+        let mut row = String::new();
+        let mut used = 0usize;
+        let mut column = self.logical_column;
+        for (offset, grapheme) in safe.grapheme_indices(true) {
+            if grapheme == "\n" {
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+                column = 0;
+                boundaries.push((offset + 1, column));
+                continue;
+            }
+            let (display, cells) = crate::markdown::normalized_grapheme(grapheme, width);
+            if used > 0 && used.saturating_add(cells) > width {
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+                boundaries.push((offset, column));
+            }
+            row.push_str(display);
+            used = used.saturating_add(cells);
+            column = column.saturating_add(unicode_width::UnicodeWidthStr::width(grapheme));
+        }
+        if !safe.is_empty() {
+            rows.push(row);
+        }
+        // Only restart on a real raw boundary. A tab expansion can cross a row
+        // boundary; in that case retain the preceding row as well.
+        for &(offset, column) in boundaries.iter().take(rows.len().saturating_sub(2)).rev() {
+            if let Some(index) = mapped
+                .iter()
+                .position(|mapped| *mapped == offset + prefix.len())
+            {
+                let raw = raw_offsets[index].saturating_sub(prefix.len());
+                if raw > 0 {
+                    self.restart += raw;
+                    self.logical_column = column;
+                    self.hidden = true;
+                    break;
+                }
+            }
+        }
+        self.hidden |= rows.len() > 2;
+        self.rows = rows.into_iter().rev().take(2).collect();
+        self.rows.reverse();
+        self.source_len = text.len();
+        self.generation = generation;
+    }
 }
 
 #[derive(Debug)]
@@ -185,7 +249,7 @@ impl EventCoalescer {
 mod coalescer_tests {
     use std::time::Duration;
 
-    use super::{thinking_preview_tail, EventCoalescer, THINKING_PREVIEW_GRAPHEMES};
+    use super::EventCoalescer;
     use crate::api::{ContentHandle, ToolBatchId, ToolCallId, UiEvent};
     use slim_core::{EventKind, SessionEvent};
 
@@ -221,12 +285,6 @@ mod coalescer_tests {
 
     #[test]
     fn thinking_and_tool_progress_coalesce_only_with_matching_identity() {
-        let suffix = "👩‍💻".repeat(THINKING_PREVIEW_GRAPHEMES);
-        let text = format!("hidden{suffix}");
-        let (preview, hidden) = thinking_preview_tail(&text);
-        assert!(hidden);
-        assert_eq!(preview, suffix);
-
         let mut coalescer = EventCoalescer::new(16, Duration::from_millis(16));
         for text in ["reason ", "continued"] {
             coalescer.push_data(UiEvent::ThinkingDelta { text: text.into() });
@@ -395,14 +453,11 @@ fn block_height(block: &Block, width: u16, cache: &mut WrapCache) -> usize {
                     || wrapped_row_count(text, thinking_body_width(width) as usize),
                 )
             }
-            _ if block.lifecycle == crate::block::BlockLifecycle::Streaming => {
-                let (preview, _) = thinking_preview_tail(text);
-                let rows = if preview.is_empty() {
-                    0
-                } else {
-                    crate::markdown::plain_row_count(preview, thinking_body_width(width)).min(2)
-                };
-                1 + rows
+            _ if block.shows_thinking_preview() => {
+                1 + cache
+                    .thinking_preview(block, text, thinking_body_width(width))
+                    .0
+                    .len()
             }
             _ => 1,
         },
@@ -847,6 +902,10 @@ fn inspector_memo_base_key(
 /// block generation, width and layout kind (folded/full/grouped body).
 /// Eviction only drops derivations.
 pub struct WrapCache {
+    pub(crate) painted_selection: Option<crate::selection::PaintedSelection>,
+    pub(crate) selection_scroll_anchor: Option<ScrollAnchor>,
+    thinking_previews: Vec<((u64, u16), ThinkingPreview)>,
+    finished_previews: WeightedCache<(u64, u64, u16), (Vec<String>, bool)>,
     /// Content hit regions from the last painted frame: transcript, inspector.
     pub(crate) selection_regions: [Option<ratatui::layout::Rect>; 2],
     heights: BoundedCache<HeightKey, usize>,
@@ -926,6 +985,10 @@ struct FooterKey {
     unseen: u32,
     authenticated: bool,
     activity: Option<crate::app::ActivityPhase>,
+    retry: Option<crate::app::RetryState>,
+    cancellation: Option<crate::app::CancellationState>,
+    last_execution: Option<crate::app::ExecutionSummary>,
+    retry_second: u64,
     context_tokens: u64,
     context_window_tokens: u64,
     content_rev: u64,
@@ -952,6 +1015,55 @@ fn memoized<K: PartialEq, V>(slot: &mut Option<(K, V)>, key: K, produce: impl Fn
 }
 
 impl WrapCache {
+    pub(crate) fn thinking_preview(
+        &mut self,
+        block: &Block,
+        text: &str,
+        width: u16,
+    ) -> (Vec<String>, bool) {
+        let finished_key = (block.cache_identity(), block.content_generation(), width);
+        let stable = block.lifecycle != crate::block::BlockLifecycle::Streaming;
+        if stable {
+            if let Some(preview) = self.finished_previews.get(&finished_key) {
+                return preview.clone();
+            }
+        }
+        let key = (block.cache_identity(), width);
+        if !self
+            .thinking_previews
+            .iter()
+            .any(|(stored, _)| *stored == key)
+        {
+            if self.thinking_previews.len() == 4 {
+                self.thinking_previews.remove(0);
+            }
+            self.thinking_previews.push((
+                key,
+                ThinkingPreview {
+                    generation: u64::MAX,
+                    ..Default::default()
+                },
+            ));
+        }
+        let (_, preview) = self
+            .thinking_previews
+            .iter_mut()
+            .find(|(stored, _)| *stored == key)
+            .expect("preview inserted");
+        preview.update(text, block.content_generation(), width);
+        let result = (preview.rows.clone(), preview.hidden);
+        if stable {
+            let bytes = result
+                .0
+                .iter()
+                .map(|row| row.len() + std::mem::size_of::<String>())
+                .sum();
+            self.finished_previews
+                .insert(finished_key, result.clone(), bytes);
+        }
+        result
+    }
+
     /// Height index for the current frame: shares the memoized index content
     /// when (content, fold, width) are unchanged, built and memoized otherwise.
     pub(crate) fn height_index<'a>(
@@ -1241,6 +1353,14 @@ impl WrapCache {
                 .activity
                 .as_ref()
                 .map(|activity| activity.phase.clone()),
+            retry: state.retry.clone(),
+            cancellation: state.cancellation,
+            last_execution: state.last_execution.clone(),
+            retry_second: if !activity_visible && state.retry.is_some() {
+                state.clock.elapsed_ms / 1_000
+            } else {
+                0
+            },
             context_tokens: state.context_tokens,
             context_window_tokens: state.context_window_tokens,
             content_rev: state.revisions.content,
@@ -1416,6 +1536,10 @@ pub(crate) fn cached_lines_bytes(lines: &[RatatuiLine<'static>]) -> usize {
 impl Default for WrapCache {
     fn default() -> Self {
         Self {
+            painted_selection: None,
+            selection_scroll_anchor: None,
+            thinking_previews: Vec::new(),
+            finished_previews: WeightedCache::new(256, 1024 * 1024),
             selection_regions: [None, None],
             heights: BoundedCache::new(16_384),
             height_misses: 0,
@@ -1446,6 +1570,123 @@ impl Default for WrapCache {
 mod height_cache_tests {
     use super::*;
     use crate::block::{Block, BlockKind, BlockLifecycle};
+
+    #[test]
+    fn thinking_preview_appends_match_full_wrap_without_a_moving_origin() {
+        for width in [1, 7, 19, 96] {
+            let mut cache = WrapCache::default();
+            let mut block = Block::new(
+                "preview",
+                BlockKind::Thinking(String::new()),
+                BlockLifecycle::Streaming,
+            );
+            for part in [
+                "prefix ",
+                "a".repeat(600).as_str(),
+                " 日",
+                "本語\n",
+                "👩",
+                "\u{200d}",
+                "💻",
+                "a",
+                "\u{301}",
+                "\tX\n",
+                "\u{1b}[",
+                "31mcolor\u{1b}[0m",
+                "z".repeat(400).as_str(),
+            ] {
+                block.append_text(part);
+                let BlockKind::Thinking(text) = block.kind() else {
+                    unreachable!()
+                };
+                let (actual, _) = cache.thinking_preview(&block, text, width);
+                let safe = crate::markdown::sanitize_terminal_text(text);
+                let expected = crate::markdown::render_plain(safe.trim_end(), width);
+                let start = expected.len().saturating_sub(2);
+                assert_eq!(actual, expected[start..], "width={width} part={part:?}");
+            }
+            let preview = &cache.thinking_previews.last().unwrap().1;
+            assert!(preview.restart > 600, "must retain a bounded visual suffix");
+            let BlockKind::Thinking(text) = block.kind() else {
+                unreachable!()
+            };
+            let resized = cache.thinking_preview(&block, text, 13).0;
+            let expected = crate::markdown::render_plain(text.trim_end(), 13);
+            assert_eq!(resized, expected[expected.len().saturating_sub(2)..]);
+        }
+    }
+
+    #[test]
+    fn finished_previews_survive_more_than_four_visible_blocks() {
+        let blocks: Vec<_> = (0..5)
+            .map(|id| {
+                Block::new(
+                    format!("preview-{id}"),
+                    BlockKind::Thinking("conteúdo estável 日本語 ".repeat(2_000)),
+                    BlockLifecycle::Complete,
+                )
+            })
+            .collect();
+        let mut cache = WrapCache::default();
+        for block in &blocks {
+            let BlockKind::Thinking(text) = block.kind() else {
+                unreachable!()
+            };
+            cache.thinking_preview(block, text, 76);
+        }
+        let retained: Vec<_> = cache
+            .thinking_previews
+            .iter()
+            .map(|(key, _)| *key)
+            .collect();
+        for block in &blocks {
+            let BlockKind::Thinking(text) = block.kind() else {
+                unreachable!()
+            };
+            let expected = crate::markdown::render_plain(text.trim_end(), 76);
+            assert_eq!(
+                cache.thinking_preview(block, text, 76).0,
+                expected[expected.len() - 2..]
+            );
+        }
+        assert_eq!(
+            retained,
+            cache
+                .thinking_previews
+                .iter()
+                .map(|(key, _)| *key)
+                .collect::<Vec<_>>(),
+            "warm finished previews must not evict/rebuild incremental slots"
+        );
+    }
+
+    #[test]
+    fn preview_stays_aligned_for_small_unicode_and_control_fragments() {
+        for width in [7, 53] {
+            let mut cache = WrapCache::default();
+            let mut block = Block::new(
+                "fragments",
+                BlockKind::Thinking(String::new()),
+                BlockLifecycle::Streaming,
+            );
+            let corpus = "abc 日本語 👩‍💻 a\u{301}\txyz\n\u{1b}[31mtexto\u{1b}[0m ".repeat(12);
+            for character in corpus.chars() {
+                block.append_text(&character.to_string());
+                let BlockKind::Thinking(text) = block.kind() else {
+                    unreachable!()
+                };
+                let safe = crate::markdown::sanitize_terminal_text(text);
+                let expected = crate::markdown::render_plain(safe.trim_end(), width);
+                let actual = cache.thinking_preview(&block, text, width).0;
+                assert_eq!(
+                    actual,
+                    expected[expected.len().saturating_sub(2)..],
+                    "width={width} at={}",
+                    text.len()
+                );
+            }
+        }
+    }
 
     #[test]
     fn grouped_thinking_heights_reuse_and_invalidate_per_member() {

@@ -729,6 +729,42 @@ real, com degradação explícita e testes golden (G340–G341).
 
 ### 1.2 Direção visual revisada
 
+**Revisão autorizada em 15/09/2026 — feedback e estabilidade:** as regras abaixo
+substituem prescrições conflitantes das seções históricas deste documento.
+Atividade considera todas as chamadas ainda abertas por lote e ID; preparação,
+admissão e execução são estados distintos quando o evento os comprova. Retry
+usa campos tipados e contagem regressiva; silêncio é idade de conteúdo/progresso
+observado, nunca diagnóstico automático de travamento. Cancelamento distingue
+pedido, procedimento iniciado e desfecho terminal. A fila pausa após interrupção
+explícita, preserva mensagens e oferece retomada, edição e remoção deliberadas.
+O composer informa a ação de Enter; posições da fila começam em 1.
+
+Pensamento recolhido acompanha as duas últimas linhas visuais com origem estável,
+cache incremental por bloco/largura e segmentação Unicode. O fim muda o marcador
+imediatamente; a prévia pode permanecer até a próxima fronteira visual, sem
+simular atividade nem animar altura. Tempos de bloco são observados por eventos;
+histórico sem timestamps não ganha duração estimada. Com o cabeçalho visível,
+ele recebe o tempo do pensamento, e a barra reserva o tempo total/idade de dados.
+A classificação do raciocínio é preservada somente quando conhecida pelo adapter.
+
+Mantêm-se a coluna compartilhada de 100 células (workspace com inspetor até 144),
+o composer contornado e a paleta preta/marfim/verde. Rodapé usa tons secundários;
+ferramentas recolhidas conservam alvo e resultado disponíveis. Soma de tempos
+de chamadas é identificada como acumulada, nunca como duração real do lote.
+TODO respeita recolhimento manual e prioriza bloqueadas/pendentes. Só uma
+notificação transitória ocupa o viewport; histórico conserva o texto completo.
+Seleção antiga sobrevive a conteúdo alheio quando suas células não mudam.
+Perguntas distinguem foco único e resposta; aprovações só permitem decidir com
+conteúdo acessível. Inspetores guardam cronologia limitada e operações de alteração.
+
+A interface usa português, preservando comandos, modelos e conteúdo do agente.
+Confirmações de estado podem receber 249 ms de ênfase localizada: estado e controles
+mudam imediatamente, sem animação de geometria, texto artificial ou novo loop.
+Movimento reduzido mostra o estilo final; permanece o agendamento orientado a
+eventos com indicador nominal de 83 ms e coalescimento de deltas em 16 ms.
+Resumo de execução registra duração/desfecho observado, sem afirmar que o objetivo
+do usuário foi comprovadamente resolvido.
+
 **Revisão autorizada em 10/09/2026, refinada em 14/09/2026 — referência Cursor CLI:** a superfície passa
 a usar uma coluna de leitura central de até 100 células, compartilhada por
 conversa, atividade, composer e footer. Com inspector docked, preserva-se o

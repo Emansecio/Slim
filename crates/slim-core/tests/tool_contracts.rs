@@ -24,6 +24,44 @@ fn temp_path(name: &str) -> PathBuf {
 }
 
 #[test]
+fn unknown_tool_is_distinct_from_mode_denial_and_correct_name_preserves_execution() {
+    let path = temp_path("source.txt");
+    let root = path.parent().unwrap();
+    fs::create_dir_all(root).unwrap();
+    fs::write(&path, "intact\n").unwrap();
+    let registry = ToolRegistry::default();
+    let unknown = registry.execute(
+        OperatingMode::ReadOnly,
+        root,
+        "read_file",
+        r#"{"path":"source.txt"}"#,
+    );
+    assert!(!unknown.success);
+    assert!(unknown.output.contains("unknown tool: read_file"));
+    assert!(unknown.output.contains("registered native tools allowed"));
+    assert!(!unknown.output.contains("tool unavailable"));
+    let denied = registry.execute(
+        OperatingMode::ReadOnly,
+        root,
+        "write",
+        r#"{"path":"source.txt","content":"changed"}"#,
+    );
+    assert!(!denied.success);
+    assert!(denied.output.contains("tool unavailable"));
+    assert!(!denied.output.contains("unknown tool"));
+    let valid = registry.execute(
+        OperatingMode::ReadOnly,
+        root,
+        "read",
+        r#"{"path":"source.txt"}"#,
+    );
+    assert!(valid.success);
+    assert!(valid.output.contains("intact"));
+    assert_eq!(fs::read_to_string(&path).unwrap(), "intact\n");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn read_is_numbered_and_stale_write_never_mutates() {
     let path = temp_path("file.txt");
     fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");

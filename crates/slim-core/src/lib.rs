@@ -23,7 +23,8 @@ pub use codeintel::{
 };
 pub use events::{
     CausalAnomalyKind, CausalBoundaryKind, CausalConfidence, CausalProgressKind,
-    CausalShadowAction, EventKind, RequestKind, SessionEvent, TodoChangedItem,
+    CausalShadowAction, EventKind, ReasoningClassification, RequestKind, SessionEvent,
+    TodoChangedItem,
 };
 pub use interaction::{
     ask_question_definition, interaction_route, AskQuestion, InteractionError,

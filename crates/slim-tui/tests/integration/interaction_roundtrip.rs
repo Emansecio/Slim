@@ -38,7 +38,14 @@ fn question_options_support_selection_and_custom_answer_without_sending_a_prompt
         assert!(frame.contains(expected), "missing {expected}\n{frame}");
     }
     assert!(frame.contains("Which crate"), "{frame}");
-    assert!(frame.contains("[x] core"), "{frame}");
+    assert!(
+        frame.contains(">   core"),
+        "selected option marker changed\n{frame}"
+    );
+    assert!(
+        frame.contains("    tui"),
+        "unselected option keeps a blank marker\n{frame}"
+    );
     assert!(!frame.contains("? >"), "{frame}");
     assert!(!frame.contains("Type your answer"), "{frame}");
     reduce(&mut state, Action::Key(key(KeyCode::Down)));
@@ -89,6 +96,50 @@ fn question_options_support_selection_and_custom_answer_without_sending_a_prompt
 }
 
 #[test]
+fn explicit_cancellation_pauses_queue_until_resume_command() {
+    let mut state = AppState::new();
+    state.authenticated = true;
+    state.apply_event(UiEvent::run_started(1));
+
+    for prompt in ["first queued prompt", "second queued prompt"] {
+        state.composer.insert_text(prompt);
+        let effects = reduce(&mut state, Action::Key(key(KeyCode::Enter)));
+        assert!(effects
+            .iter()
+            .all(|effect| !matches!(effect, Effect::Send(UiCommand::SendPrompt(_)))));
+    }
+    assert_eq!(state.queue_len(), 2);
+    assert_eq!(state.queued_prompt(0), Some("first queued prompt"));
+    assert_eq!(state.queued_prompt(1), Some("second queued prompt"));
+
+    state.apply_event(UiEvent::CancellationRequested { run_id: 1 });
+    let terminal_effects = reduce(
+        &mut state,
+        Action::UiEventReceived(UiEvent::RunCancelled { run_id: 1 }),
+    );
+    assert!(!state.working);
+    assert!(state.queue_paused);
+    assert_eq!(state.queue_len(), 2);
+    assert!(
+        terminal_effects
+            .iter()
+            .all(|effect| !matches!(effect, Effect::Send(UiCommand::SendPrompt(_)))),
+        "cancellation must not auto-start the next queued prompt"
+    );
+    let frame = render_terminal_text(&state, 80, 24);
+    assert!(frame.contains("fila pausada"), "{frame}");
+
+    state.composer.insert_text("/queue resume");
+    let effects = reduce(&mut state, Action::Key(key(KeyCode::Enter)));
+    assert!(effects.contains(&Effect::Send(UiCommand::SendPrompt(
+        "first queued prompt".into(),
+    ))));
+    assert!(!state.queue_paused);
+    assert_eq!(state.queue_len(), 1);
+    assert_eq!(state.queued_prompt(0), Some("second queued prompt"));
+}
+
+#[test]
 fn open_question_uses_the_composer_and_blocks_duplicate_submission() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::QuestionRequired {
@@ -121,7 +172,7 @@ fn input_request_renders_answers_and_completes_only_after_matching_ack() {
     state.apply_event(request.clone());
 
     let frame = render_terminal_text(&state, 80, 24);
-    for expected in ["Choose a target", "core", "tui", "persisted"] {
+    for expected in ["Choose a target", "core", "tui"] {
         assert!(frame.contains(expected), "missing {expected}\n{frame}");
     }
     assert_eq!(state.blocks().len(), 1);
@@ -183,8 +234,12 @@ fn approval_uses_y_n_and_rejected_ack_is_visible() {
 
     let frame = render_terminal_text(&state, 80, 24);
     assert!(frame.contains("Apply the proposed plan"), "{frame}");
-    assert!(frame.contains("Y approve"), "{frame}");
-    assert!(frame.contains("ephemeral"), "{frame}");
+    assert!(frame.contains("Y aprovar"), "{frame}");
+
+    // The runtime marks the overlay content accessible after measuring a
+    // legible viewport.  Model that hand-off before exercising the decision
+    // shortcut so this test covers the Y/N command path itself.
+    reduce(&mut state, Action::SetApprovalContentAccessible(true));
 
     let release = KeyEvent::new_with_kind(
         KeyCode::Char('n'),
@@ -283,7 +338,7 @@ fn question_overlay_wraps_on_words_and_does_not_use_approval_chrome() {
         persisted: false,
     });
     let frame = render_terminal_text(&state, 40, 12);
-    assert!(frame.contains("Question"), "{frame}");
+    assert!(frame.contains("Pergunta"), "{frame}");
     assert!(frame.contains("download"), "{frame}");
     assert!(
         !frame.contains("downlo\n")
@@ -294,11 +349,11 @@ fn question_overlay_wraps_on_words_and_does_not_use_approval_chrome() {
     );
     assert!(!frame.contains("Ask a question"), "{frame}");
     assert!(
-        !frame.contains("Esc/Y/N") && !frame.contains("Y approve"),
+        !frame.contains("Esc/Y/N") && !frame.contains("Y aprovar"),
         "open questions must not reuse approval shortcuts\n{frame}"
     );
     assert!(
-        frame.contains("answer") && frame.contains("Enter"),
+        frame.contains("resposta") && frame.contains("Enter"),
         "{frame}"
     );
 }
@@ -322,14 +377,14 @@ fn question_overlay_lists_options_with_selection_chrome() {
         persisted: false,
     });
     let frame = render_terminal_text(&state, 48, 16);
-    assert!(frame.contains("Question"), "{frame}");
+    assert!(frame.contains("Pergunta"), "{frame}");
     assert!(frame.contains("Which crate should change?"), "{frame}");
-    assert!(frame.contains("[x] core"), "{frame}");
+    assert!(frame.contains(">   core"), "{frame}");
     assert!(frame.contains("Runtime and protocol"), "{frame}");
-    assert!(frame.contains("[ ] tui"), "{frame}");
+    assert!(frame.contains("    tui"), "{frame}");
     assert!(frame.contains("Outro"), "{frame}");
     assert!(frame.contains("↑↓"), "{frame}");
-    assert!(!frame.contains("Y approve"), "{frame}");
+    assert!(!frame.contains("Y aprovar"), "{frame}");
     assert!(!frame.contains("1-5"), "{frame}");
 }
 
@@ -354,7 +409,7 @@ fn question_card_stays_contained_on_a_wide_terminal() {
     let frame = render_terminal_text(&state, 100, 24);
     let title = frame
         .lines()
-        .find(|line| line.contains("Question"))
+        .find(|line| line.contains("Pergunta"))
         .expect("question title");
     assert!(
         title.starts_with(" ╭"),
@@ -362,8 +417,8 @@ fn question_card_stays_contained_on_a_wide_terminal() {
     );
     let border = title.chars().filter(|glyph| *glyph == '─').count();
     assert!(border <= 72, "question card must stay contained\n{title}");
-    assert!(frame.contains("[x] core"), "{frame}");
-    assert!(frame.contains("[ ] tui"), "{frame}");
+    assert!(frame.contains(">   core"), "{frame}");
+    assert!(frame.contains("    tui"), "{frame}");
 }
 
 #[test]
@@ -392,7 +447,7 @@ fn compact_question_keeps_long_tail_and_focused_option_visible() {
         "question tail must survive compact wrapping\n{frame}"
     );
     assert!(
-        frame.contains("[x] tui"),
+        frame.contains(">   tui"),
         "focused option must stay visible\n{frame}"
     );
     assert!(

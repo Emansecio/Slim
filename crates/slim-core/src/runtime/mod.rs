@@ -744,6 +744,14 @@ struct ReadOnlyToolOutcome {
     duration_ms: u64,
 }
 
+/// Notification sent by a pool future immediately before it dispatches tool
+/// work. The outer runtime owns the event journal and assigns the monotonic
+/// sequence when it receives this notice.
+struct ToolStartedNotice {
+    index: usize,
+    arguments: String,
+}
+
 #[derive(Default)]
 struct SensitiveValues(Vec<String>);
 
@@ -1263,7 +1271,8 @@ impl Runtime {
         sensitive_values.extend_from_slice(request.sensitive_values());
         crate::provider::normalize_sensitive_values(&mut sensitive_values);
         let mut normalizer =
-            ProviderStreamNormalizer::new(client.adapter().wire_kind(), next_seq, sensitive_values);
+            ProviderStreamNormalizer::new(client.adapter().wire_kind(), next_seq, sensitive_values)
+                .with_reasoning_classification(client.adapter().reasoning_classification());
         let output_start = self.app.events().len();
         let request_started = Instant::now();
         let cancellation = self.cancellation.clone();
@@ -1535,6 +1544,7 @@ impl Runtime {
             });
         }
         let loop_event_start = self.app.events().len();
+        let run_start_seq = next_seq;
         let cwd = cwd.as_ref();
         self.prepare_loop_capabilities(cwd)?;
         let mut messages = self.redact_messages(initial_messages);
@@ -1722,7 +1732,15 @@ impl Runtime {
                         .saturating_add(estimate_provider_message_tokens(&prepared.pinned)),
                     };
                     let summary = self.redact_sensitive(&prepared.summary);
-                    let summary = self.archive_compaction_summary(&selection, summary).await?;
+                    let summary = self
+                        .archive_compaction_summary(
+                            &selection,
+                            summary,
+                            &governor.compaction_snapshot(run_start_seq),
+                            initial_messages,
+                            cwd,
+                        )
+                        .await?;
                     messages = apply_compaction_selection(&messages, &selection, summary.clone())
                         .map_err(|message| ProviderError::InvalidResponse {
                         message: message.into(),
@@ -1783,6 +1801,9 @@ impl Runtime {
                             .compact_before_send(
                                 client,
                                 &messages,
+                                initial_messages,
+                                cwd,
+                                &governor.compaction_snapshot(run_start_seq),
                                 &tools,
                                 mode,
                                 preflight_tokens,
@@ -1813,10 +1834,22 @@ impl Runtime {
                                 };
                                 compaction_recoveries += 1;
                                 provider_recovery_wait += delay;
+                                let reason = self.redact_sensitive(&provider_retry_reason(&error));
                                 push_runtime_event(&mut self.app, &mut next_seq, crate::EventKind::ProviderPhase {
                                     phase: ProviderPhase::Compacting, elapsed_ms: 0,
                                     detail: Some(format!("Retrying foreground compaction ({compaction_recoveries}/{MAX_PROVIDER_RECOVERIES}); waiting {} ms", delay.as_millis())),
                                 })?;
+                                push_runtime_event(
+                                    &mut self.app,
+                                    &mut next_seq,
+                                    crate::EventKind::RetryScheduled {
+                                        attempt: compaction_recoveries,
+                                        limit: MAX_PROVIDER_RECOVERIES,
+                                        wait_ms: u64::try_from(delay.as_millis())
+                                            .unwrap_or(u64::MAX),
+                                        reason: Some(reason),
+                                    },
+                                )?;
                                 let cancellation = self.cancellation.clone();
                                 tokio::select! {
                                     _ = tokio::time::sleep(delay) => {},
@@ -1871,7 +1904,15 @@ impl Runtime {
                         message: message.into(),
                     })?;
                     let summary = self.redact_sensitive(&local_emergency_summary(&selection));
-                    let summary = self.archive_compaction_summary(&selection, summary).await?;
+                    let summary = self
+                        .archive_compaction_summary(
+                            &selection,
+                            summary,
+                            &governor.compaction_snapshot(run_start_seq),
+                            initial_messages,
+                            cwd,
+                        )
+                        .await?;
                     let tokens_before = preflight_tokens;
                     let prefix_fingerprint = compaction_prefix_fingerprint(&selection.summarized);
                     messages = apply_compaction_selection(&messages, &selection, summary.clone())
@@ -2201,6 +2242,7 @@ impl Runtime {
                     };
                     provider_recovery_wait += delay;
                     provider_recoveries += 1;
+                    let reason = self.redact_sensitive(&provider_retry_reason(&error));
                     let partial = self.app.events()[event_start..]
                         .iter()
                         .filter_map(|event| match &event.kind {
@@ -2243,6 +2285,16 @@ impl Runtime {
                                 "Retrying provider ({provider_recoveries}/{MAX_PROVIDER_RECOVERIES}); waiting {} ms",
                                 delay.as_millis()
                             )),
+                        },
+                    )?;
+                    push_runtime_event(
+                        &mut self.app,
+                        &mut next_seq,
+                        crate::EventKind::RetryScheduled {
+                            attempt: provider_recoveries,
+                            limit: MAX_PROVIDER_RECOVERIES,
+                            wait_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                            reason: Some(reason),
                         },
                     )?;
                     let cancellation = self.cancellation.clone();
@@ -2658,14 +2710,21 @@ impl Runtime {
                                     call_fingerprint,
                                     ..
                                 } if call_id.as_ref() == call.id => Some(call_fingerprint.as_ref()),
+                                crate::EventKind::CausalBoundaryObserved {
+                                    call_id,
+                                    call_fingerprint,
+                                    ..
+                                } if call_id.as_ref() == call.id => Some(call_fingerprint.as_ref()),
                                 _ => None,
                             }
                         });
-                    !guard.accept(
-                        &call.name,
-                        causal_identity.unwrap_or(&call.arguments),
-                        &result.output,
-                    )
+                    let accepted = match causal_identity {
+                        Some(fingerprint) => {
+                            guard.accept_canonical(&call.name, fingerprint, &result.output)
+                        }
+                        None => guard.accept(&call.name, &call.arguments, &result.output),
+                    };
+                    !accepted
                 };
                 repeated_failure_in_batch |= repeated_failure;
             }
@@ -2797,6 +2856,15 @@ impl Runtime {
                     ),
                 ) {
                     let summary = self.redact_sensitive(&local_emergency_summary(&selection));
+                    let summary = self
+                        .archive_compaction_summary(
+                            &selection,
+                            summary,
+                            &governor.compaction_snapshot(run_start_seq),
+                            initial_messages,
+                            cwd,
+                        )
+                        .await?;
                     if let Ok(compacted) =
                         apply_compaction_selection(&final_messages, &selection, summary)
                     {
@@ -3424,6 +3492,17 @@ impl Runtime {
         let prepared_all = self
             .prepare_provider_tool_invocations(mode, cwd, calls)
             .await?;
+        for call in calls {
+            push_runtime_event(
+                &mut self.app,
+                &mut next_seq,
+                crate::EventKind::ToolPrepared {
+                    batch_id: batch_id.into(),
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                },
+            )?;
+        }
         let mut results: Vec<Option<ToolResult>> = vec![None; calls.len()];
         let phase1 = phase1_snapshot_indices(&self.tools, &prepared_all);
         next_seq = self
@@ -3530,6 +3609,15 @@ impl Runtime {
             let (pending, observations) =
                 governor.observe_before_identified(&prepared, batch_id, &call.id);
             self.emit_governor_observations(observations, &mut next_seq)?;
+            push_runtime_event(
+                &mut self.app,
+                &mut next_seq,
+                crate::EventKind::ToolAdmitted {
+                    batch_id: batch_id.into(),
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                },
+            )?;
             let execution = self
                 .execute_provider_tool_call(
                     mode,
@@ -3637,26 +3725,47 @@ impl Runtime {
         if self.is_cancelled() {
             return Ok((Vec::new(), next_seq));
         }
+        let (started_tx, mut started_rx) =
+            tokio::sync::mpsc::channel::<ToolStartedNotice>(calls.len().max(1));
         let mut pending_calls = Vec::with_capacity(calls.len());
-        for (call, (pending, observations)) in calls.iter().zip(preflights) {
+        for (index, (call, (pending, observations))) in calls.iter().zip(preflights).enumerate() {
             self.emit_governor_observations(observations, &mut next_seq)?;
             pending_calls.push(pending);
-            let arguments = self.redact_sensitive(&call.arguments);
             push_runtime_event(
                 &mut self.app,
                 &mut next_seq,
-                crate::EventKind::ToolStarted {
+                crate::EventKind::ToolAdmitted {
                     batch_id: batch_id.into(),
                     call_id: call.id.clone(),
                     name: call.name.clone(),
-                    arguments,
                 },
             )?;
+            // Evidence aliases have no executor future. Keep a lifecycle
+            // block for those synthetic results; real leaders announce
+            // ToolStarted from their pool future below.
+            if alias_of[index] != index {
+                let arguments = self.redact_sensitive(&call.arguments);
+                push_runtime_event(
+                    &mut self.app,
+                    &mut next_seq,
+                    crate::EventKind::ToolStarted {
+                        batch_id: batch_id.into(),
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments,
+                    },
+                )?;
+            }
         }
 
         let tools = self.tools.clone();
         let code_intel = self.code_intel.clone();
         let cancellation = self.cancellation.clone();
+        let started_arguments = calls
+            .iter()
+            .map(|call| self.redact_sensitive(&call.arguments))
+            .collect::<Vec<_>>();
+        let started_tx_for_futures = started_tx.clone();
         let futures = calls
             .iter()
             .cloned()
@@ -3669,7 +3778,12 @@ impl Runtime {
                 let tools = tools.clone();
                 let code_intel = code_intel.clone();
                 let cancellation = cancellation.clone();
+                let started_tx = started_tx_for_futures.clone();
+                let arguments = started_arguments[index].clone();
                 Some(async move {
+                    let _ = started_tx
+                        .send(ToolStartedNotice { index, arguments })
+                        .await;
                     let started_at = Instant::now();
                     let revision_before = tools.workspace_revision();
                     let mut outcome = if call.name == "code_intel" {
@@ -3756,12 +3870,47 @@ impl Runtime {
                     )
                 })
             });
+        drop(started_tx);
         let mut outcomes =
             futures_util::stream::iter(futures).buffer_unordered(READ_ONLY_BATCH_CONCURRENCY);
         let mut completed = std::iter::repeat_with(|| None)
             .take(calls.len())
             .collect::<Vec<Option<ToolExecutionOutcome>>>();
-        while let Some((index, outcome)) = outcomes.next().await {
+        let mut started_open = true;
+        loop {
+            let next = tokio::select! {
+                notice = started_rx.recv(), if started_open => {
+                    match notice {
+                        Some(notice) => push_tool_started_notice(
+                            &mut self.app,
+                            &mut next_seq,
+                            batch_id,
+                            calls,
+                            notice,
+                        )?,
+                        None => started_open = false,
+                    }
+                    continue;
+                }
+                next = outcomes.next() => next,
+            };
+            let Some((index, outcome)) = next else {
+                drain_tool_started_notices(
+                    &mut self.app,
+                    &mut next_seq,
+                    batch_id,
+                    calls,
+                    &mut started_rx,
+                )?;
+                break;
+            };
+            drain_tool_started_notices(
+                &mut self.app,
+                &mut next_seq,
+                batch_id,
+                calls,
+                &mut started_rx,
+            )?;
             let call = &calls[index];
             let mut outcome = outcome;
             outcome.outcome.result.output = self.redact_sensitive(&outcome.outcome.result.output);
@@ -3796,6 +3945,13 @@ impl Runtime {
             )?;
             completed[index] = Some(outcome.outcome);
         }
+        drain_tool_started_notices(
+            &mut self.app,
+            &mut next_seq,
+            batch_id,
+            calls,
+            &mut started_rx,
+        )?;
         for index in 0..calls.len() {
             let leader = alias_of[index];
             if leader == index {
@@ -3889,25 +4045,30 @@ impl Runtime {
         if self.is_cancelled() {
             return Ok((Vec::new(), next_seq));
         }
+        let (started_tx, mut started_rx) =
+            tokio::sync::mpsc::channel::<ToolStartedNotice>(calls.len().max(1));
         let mut pending_calls = Vec::with_capacity(calls.len());
         for (call, (pending, observations)) in calls.iter().zip(preflights) {
             self.emit_governor_observations(observations, &mut next_seq)?;
             pending_calls.push(pending);
-            let arguments = self.redact_sensitive(&call.arguments);
             push_runtime_event(
                 &mut self.app,
                 &mut next_seq,
-                crate::EventKind::ToolStarted {
+                crate::EventKind::ToolAdmitted {
                     batch_id: batch_id.into(),
                     call_id: call.id.clone(),
                     name: call.name.clone(),
-                    arguments,
                 },
             )?;
         }
 
         let tools = self.tools.clone();
         let cancellation = self.cancellation.clone();
+        let started_arguments = calls
+            .iter()
+            .map(|call| self.redact_sensitive(&call.arguments))
+            .collect::<Vec<_>>();
+        let started_tx_for_futures = started_tx.clone();
         let futures = calls
             .iter()
             .cloned()
@@ -3916,7 +4077,12 @@ impl Runtime {
             .map(|(index, (call, prepared))| {
                 let tools = tools.clone();
                 let cancellation = cancellation.clone();
+                let started_tx = started_tx_for_futures.clone();
+                let arguments = started_arguments[index].clone();
                 async move {
+                    let _ = started_tx
+                        .send(ToolStartedNotice { index, arguments })
+                        .await;
                     let started_at = Instant::now();
                     let revision_before = tools.workspace_revision();
                     let result_name = call.name.clone();
@@ -3968,13 +4134,48 @@ impl Runtime {
                     )
                 }
             });
+        drop(started_tx);
         let mut outcomes =
             futures_util::stream::iter(futures).buffer_unordered(READ_ONLY_BATCH_CONCURRENCY);
         let mut completed = std::iter::repeat_with(|| None)
             .take(calls.len())
             .collect::<Vec<Option<ToolExecutionOutcome>>>();
         let mut first_error = None;
-        while let Some((index, outcome)) = outcomes.next().await {
+        let mut started_open = true;
+        loop {
+            let next = tokio::select! {
+                notice = started_rx.recv(), if started_open => {
+                    match notice {
+                        Some(notice) => push_tool_started_notice(
+                            &mut self.app,
+                            &mut next_seq,
+                            batch_id,
+                            calls,
+                            notice,
+                        )?,
+                        None => started_open = false,
+                    }
+                    continue;
+                }
+                next = outcomes.next() => next,
+            };
+            let Some((index, outcome)) = next else {
+                drain_tool_started_notices(
+                    &mut self.app,
+                    &mut next_seq,
+                    batch_id,
+                    calls,
+                    &mut started_rx,
+                )?;
+                break;
+            };
+            drain_tool_started_notices(
+                &mut self.app,
+                &mut next_seq,
+                batch_id,
+                calls,
+                &mut started_rx,
+            )?;
             let call = &calls[index];
             let mut outcome = outcome;
             outcome.outcome.result.output = self.redact_sensitive(&outcome.outcome.result.output);
@@ -4019,6 +4220,13 @@ impl Runtime {
             }
             completed[index] = Some(outcome.outcome);
         }
+        drain_tool_started_notices(
+            &mut self.app,
+            &mut next_seq,
+            batch_id,
+            calls,
+            &mut started_rx,
+        )?;
         let completed = completed
             .into_iter()
             .map(|outcome| outcome.expect("every independent mutation yields one result"))
@@ -5228,23 +5436,120 @@ impl Runtime {
     async fn archive_compaction_summary(
         &self,
         selection: &CompactionSelection,
-        summary: String,
+        mut summary: String,
+        execution_facts: &str,
+        initial_messages: &[ProviderMessage],
+        cwd: &Path,
     ) -> Result<String, ProviderError> {
-        let Some(store) = self.artifact_store.clone() else {
-            return Ok(summary);
-        };
-        let transcript = crate::context::recovery_transcript(&selection.summarized);
-        let artifact = tokio::task::spawn_blocking(move || {
-            store.put("context-history", transcript.as_bytes())
-        })
-        .await
-        .map_err(|_| ProviderError::InvalidResponse {
-            message: "context artifact worker failed".into(),
-        })?
-        .map_err(|_| ProviderError::InvalidResponse {
-            message: "context artifact could not be stored".into(),
-        })?;
-        Ok(format!("{summary}\n\n[Prior visible transcript: use read on {}. Opaque reasoning and binary attachments are not included.]", artifact.path.display()))
+        let mut retained = String::new();
+        if !execution_facts.is_empty() {
+            retained.push_str("\n\n[Runtime facts at compaction; subsequent actions may invalidate them. Prior-run facts remain historical, not proof of current state.]\n");
+            retained.push_str(&self.redact_sensitive(execution_facts));
+        }
+        if let Some(store) = self.artifact_store.clone() {
+            // Elision changes only the active view. Restore uniquely identified
+            // original outputs before archiving; never reread a mutated file.
+            let mut originals = std::collections::HashMap::new();
+            let historical = initial_messages.iter().filter_map(|message| {
+                (message.role == "tool").then_some((
+                    message.name.as_deref()?,
+                    message.tool_call_id.as_deref()?,
+                    message.content.as_str(),
+                ))
+            });
+            let observed = self
+                .app
+                .events()
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    crate::EventKind::ToolOutput {
+                        name,
+                        call_id,
+                        output,
+                        ..
+                    } => Some((name.as_str(), call_id.as_str(), output.as_str())),
+                    _ => None,
+                });
+            for (name, id, output) in historical.chain(observed) {
+                if output.starts_with("[superseded ") {
+                    continue;
+                }
+                originals
+                    .entry((name, id))
+                    .and_modify(|value| {
+                        if *value != Some(output) {
+                            *value = None;
+                        }
+                    })
+                    .or_insert(Some(output));
+            }
+            let mut recovered = selection.summarized.clone();
+            for message in &mut recovered {
+                if message.role == "tool" && message.content.starts_with("[superseded ") {
+                    if let Some(Some(original)) = originals.get(&(
+                        message.name.as_deref().unwrap_or_default(),
+                        message.tool_call_id.as_deref().unwrap_or_default(),
+                    )) {
+                        message.content = (*original).to_owned();
+                    }
+                }
+            }
+            let transcript = crate::context::recovery_transcript(&self.redact_messages(&recovered));
+            let workspace = cwd.to_owned();
+            let (artifact, read_path) = tokio::task::spawn_blocking(move || {
+                let artifact = store.put("context-history", transcript.as_bytes())?;
+                let workspace = std::fs::canonicalize(workspace)?;
+                let canonical = std::fs::canonicalize(&artifact.path)?;
+                let read_path = canonical
+                    .strip_prefix(workspace)
+                    .ok()
+                    .map(|path| path.to_string_lossy().replace('\\', "/"));
+                Ok::<_, std::io::Error>((artifact, read_path))
+            })
+            .await
+            .map_err(|_| ProviderError::InvalidResponse {
+                message: "context artifact worker failed".into(),
+            })?
+            .map_err(|_| ProviderError::InvalidResponse {
+                message: "context artifact could not be stored".into(),
+            })?;
+            if let Some(path) = read_path {
+                let path = serde_json::to_string(&path).expect("path serializes");
+                retained.push_str(&format!("\n\n[Prior visible transcript: use read on {path} with offset=1 for an index of user-role messages (including runtime notices), checkpoints and tool_call_id evidence. Follow indexed offset/max_lines and pagination to recover historical text; earlier checkpoints link earlier archives. Apply later user corrections. Opaque reasoning and binary attachments are not included.]"));
+            } else {
+                retained.push_str(&format!("\n\n[Prior visible transcript archived at {}; native read cannot access this artifact outside the workspace.]", artifact.path.display()));
+            }
+        }
+        // Reserve space for deterministic facts and recovery, rather than
+        // letting a maximum-sized model summary crowd them out of the checkpoint.
+        let max_bytes = self
+            .compaction_handle
+            .as_ref()
+            .map(|handle| handle.policy().summary_max_bytes)
+            .unwrap_or_else(|| CompactionPolicy::default().summary_max_bytes);
+        const MARKER: &str = "\n[summary truncated to retain runtime facts and recovery]";
+        let retained = self.redact_sensitive(&retained);
+        if retained.len() > max_bytes {
+            return Err(ProviderError::InvalidResponse {
+                message: "compaction recovery metadata exceeds checkpoint limit".into(),
+            });
+        }
+        let remaining = max_bytes - retained.len();
+        if summary.len() > remaining {
+            let marker = if remaining >= MARKER.len() {
+                MARKER
+            } else {
+                ""
+            };
+            let mut end = remaining - marker.len();
+            while !summary.is_char_boundary(end) {
+                end -= 1;
+            }
+            summary.truncate(end);
+            summary.push_str(marker);
+        }
+        summary.push_str(&retained);
+        Ok(summary)
     }
 
     fn redact_message(&self, mut message: ProviderMessage) -> ProviderMessage {
@@ -5534,6 +5839,9 @@ impl Runtime {
         &mut self,
         client: &HttpProviderClient<A>,
         messages: &[ProviderMessage],
+        initial_messages: &[ProviderMessage],
+        cwd: &Path,
+        execution_facts: &str,
         tools: &[Value],
         mode: crate::OperatingMode,
         tokens_before: u64,
@@ -5705,7 +6013,9 @@ impl Runtime {
         validation_result?;
 
         let summary = self.redact_sensitive(&collected.text);
-        let summary = self.archive_compaction_summary(&selection, summary).await?;
+        let summary = self
+            .archive_compaction_summary(&selection, summary, execution_facts, initial_messages, cwd)
+            .await?;
         let prefix_fingerprint = compaction_prefix_fingerprint(&selection.summarized);
         let compacted = apply_compaction_selection(messages, &selection, summary.clone()).map_err(
             |message| ProviderError::InvalidResponse {
@@ -6323,6 +6633,43 @@ fn push_runtime_event(
     Ok(())
 }
 
+fn push_tool_started_notice(
+    app: &mut AppHandle,
+    next_seq: &mut u64,
+    batch_id: &str,
+    calls: &[ProviderToolCall],
+    notice: ToolStartedNotice,
+) -> Result<(), ProviderError> {
+    let Some(call) = calls.get(notice.index) else {
+        return Err(ProviderError::InvalidResponse {
+            message: format!("tool start notice index {} is out of range", notice.index),
+        });
+    };
+    push_runtime_event(
+        app,
+        next_seq,
+        crate::EventKind::ToolStarted {
+            batch_id: batch_id.to_owned(),
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            arguments: notice.arguments,
+        },
+    )
+}
+
+fn drain_tool_started_notices(
+    app: &mut AppHandle,
+    next_seq: &mut u64,
+    batch_id: &str,
+    calls: &[ProviderToolCall],
+    started_rx: &mut tokio::sync::mpsc::Receiver<ToolStartedNotice>,
+) -> Result<(), ProviderError> {
+    while let Ok(notice) = started_rx.try_recv() {
+        push_tool_started_notice(app, next_seq, batch_id, calls, notice)?;
+    }
+    Ok(())
+}
+
 /// Persist and publish process execution facts immediately before the
 /// terminal `ToolFinished` boundary. A missing receipt is expected for
 /// non-native or synthetic tools and produces no event.
@@ -6652,6 +6999,19 @@ fn provider_recovery_delay(
         return Err(retry_wait_budget_exceeded(error, requested, remaining));
     }
     Ok(requested.min(remaining))
+}
+
+fn provider_retry_reason(error: &ProviderError) -> String {
+    match error {
+        ProviderError::Transport { message, .. }
+        | ProviderError::TransientRemote { message }
+        | ProviderError::Remote { message }
+        | ProviderError::Http { message, .. }
+        | ProviderError::Api { message, .. }
+        | ProviderError::InvalidResponse { message } => message.clone(),
+        ProviderError::MalformedToolCall => "malformed tool call".into(),
+        ProviderError::Cancelled => "cancelled".into(),
+    }
 }
 
 fn retry_wait_budget_exceeded(
@@ -7079,6 +7439,7 @@ fn write_output_is_recovery(output: &str) -> bool {
     output.contains("Current file is below")
         || output.contains("Current file edges are below")
         || output.contains("Suggested unique expected:")
+        || output.contains("Example context only for the first match at line ")
 }
 
 fn redact_task_value(value: &mut Value, sensitive_values: &[String]) {
@@ -7145,6 +7506,7 @@ pub(crate) struct ProviderStreamNormalizer {
     text_pending: String,
     reasoning_pending: String,
     reasoning_open: bool,
+    reasoning_classification: Option<crate::ReasoningClassification>,
     responses_reasoning: Vec<crate::provider::ResponsesReasoning>,
     chat_reasoning: Option<crate::provider::ChatReasoning>,
     stopped: bool,
@@ -7169,6 +7531,7 @@ impl ProviderStreamNormalizer {
             text_pending: String::new(),
             reasoning_pending: String::new(),
             reasoning_open: false,
+            reasoning_classification: None,
             responses_reasoning: Vec::new(),
             chat_reasoning: None,
             stopped: false,
@@ -7180,6 +7543,14 @@ impl ProviderStreamNormalizer {
             published_tool_calls: 0,
             preparing_tool_announced: false,
         }
+    }
+
+    pub(crate) fn with_reasoning_classification(
+        mut self,
+        classification: Option<crate::ReasoningClassification>,
+    ) -> Self {
+        self.reasoning_classification = classification;
+        self
     }
 
     fn next_seq(&self) -> u64 {
@@ -7706,6 +8077,13 @@ impl ProviderStreamNormalizer {
         if self.reasoning_open {
             return Ok(());
         }
+        if let Some(classification) = self.reasoning_classification.take() {
+            push_runtime_event(
+                app,
+                &mut self.next_seq,
+                crate::EventKind::ReasoningClassification { classification },
+            )?;
+        }
         push_runtime_event(app, &mut self.next_seq, crate::EventKind::ThinkingStarted)?;
         self.reasoning_open = true;
         Ok(())
@@ -8114,6 +8492,158 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[tokio::test]
+    async fn compaction_archive_recovers_original_outputs_and_chains_checkpoints() {
+        let root = std::env::temp_dir().join(format!(
+            "slim-indexed-compaction-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut runtime = Runtime::with_artifact_store(&root).unwrap();
+        runtime.register_sensitive_value("private-fixture-token");
+        let original = ProviderMessage::tool(
+            "read",
+            "old-read",
+            "original versão\nprivate-fixture-token\n",
+        );
+        let initial = vec![
+            ProviderMessage::user("Preserve a interface pública."),
+            original.clone(),
+        ];
+        let mut selection = CompactionSelection {
+            root_instruction: initial[0].content.clone(),
+            summarized: vec![
+                initial[0].clone(),
+                ProviderMessage::tool(
+                    "read",
+                    "old-read",
+                    "[superseded read output elided; file was overwritten]",
+                ),
+            ],
+            pinned: Vec::new(),
+            kept: Vec::new(),
+            first_kept_index: 2,
+            recent_tokens: 0,
+        };
+        let summary = runtime
+            .archive_compaction_summary(
+                &selection,
+                "model interpretation".into(),
+                "run_start_seq=7 validation_revision=1 current=false private-fixture-token",
+                &initial,
+                &root,
+            )
+            .await
+            .unwrap();
+        assert!(summary.contains("validation_revision=1 current=false"));
+        assert!(!summary.contains("private-fixture-token"));
+        let first_path = std::fs::read_dir(&root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let archived = std::fs::read_to_string(&first_path).unwrap();
+        assert!(archived.contains("original versão\n"));
+        assert!(archived.contains("Preserve a interface pública."));
+        assert!(!archived.contains("private-fixture-token"));
+        assert!(!archived.contains("[superseded read"));
+        assert!(archived.contains("\"offset\""));
+
+        selection.summarized = vec![
+            initial[0].clone(),
+            ProviderMessage::user(format!("[Compacted context]\n{summary}")),
+        ];
+        let second = runtime
+            .archive_compaction_summary(
+                &selection,
+                "new interpretation".into(),
+                "",
+                &initial,
+                &root,
+            )
+            .await
+            .unwrap();
+        let second_path = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path != &first_path)
+            .unwrap();
+        let previous = std::fs::read_to_string(&second_path).unwrap();
+        assert!(second.contains(
+            &serde_json::to_string(&second_path.file_name().unwrap().to_str().unwrap()).unwrap()
+        ));
+        assert!(previous.contains(
+            &serde_json::to_string(&first_path.file_name().unwrap().to_str().unwrap()).unwrap()
+        ));
+        assert!(previous.contains("validation_revision=1 current=false"));
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let outside = runtime
+            .archive_compaction_summary(&selection, "summary".into(), "", &initial, &workspace)
+            .await
+            .unwrap();
+        assert!(outside.contains("native read cannot access this artifact outside the workspace"));
+        assert!(!outside.contains("use read on"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn compaction_archive_reserves_bounded_facts_without_an_artifact_store() {
+        let mut runtime = Runtime::new();
+        let max_bytes = 1024;
+        runtime.set_compaction_handle(CompactionHandle::new(CompactionPolicy {
+            summary_max_bytes: max_bytes,
+            ..CompactionPolicy::default()
+        }));
+        let selection = CompactionSelection {
+            root_instruction: "root".into(),
+            summarized: Vec::new(),
+            pinned: Vec::new(),
+            kept: Vec::new(),
+            first_kept_index: 0,
+            recent_tokens: 0,
+        };
+        let summary = runtime
+            .archive_compaction_summary(
+                &selection,
+                "😀".repeat(max_bytes / 4),
+                "run_start_seq=11 failure call_id=failed-write",
+                &[],
+                Path::new("."),
+            )
+            .await
+            .unwrap();
+        assert!(summary.len() <= max_bytes);
+        assert!(summary.contains("summary truncated"));
+        assert!(summary.ends_with("failure call_id=failed-write"));
+        assert!(!summary.contains("Prior visible transcript"));
+        assert!(runtime
+            .archive_compaction_summary(
+                &selection,
+                "summary".into(),
+                &"x".repeat(max_bytes),
+                &[],
+                Path::new(".")
+            )
+            .await
+            .is_err());
+        runtime.set_compaction_handle(CompactionHandle::new(CompactionPolicy {
+            summary_max_bytes: 4,
+            ..CompactionPolicy::default()
+        }));
+        assert_eq!(
+            runtime
+                .archive_compaction_summary(&selection, "😀😀".into(), "", &[], Path::new("."))
+                .await
+                .unwrap(),
+            "😀"
+        );
+    }
+
     #[test]
     fn secret_gate_uses_call_identity_and_decoded_arguments() {
         let events = [
@@ -8194,6 +8724,46 @@ mod tests {
             })
             .collect::<String>();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn reasoning_classification_is_emitted_before_public_reasoning_text() {
+        let mut app = AppHandle::fake();
+        let mut normalizer = ProviderStreamNormalizer::new(ProviderKind::OpenAiCodex, 1, vec![])
+            .with_reasoning_classification(Some(crate::ReasoningClassification::Summary));
+        normalizer.push(&mut app, ProviderEvent::ReasoningDelta("summary".into()));
+        let kinds = app
+            .events()
+            .iter()
+            .map(|event| match &event.kind {
+                crate::EventKind::ReasoningClassification { classification } => {
+                    format!("classification:{classification:?}")
+                }
+                crate::EventKind::ThinkingStarted => "thinking_started".into(),
+                crate::EventKind::ReasoningDelta { .. } => "reasoning_delta".into(),
+                _ => "other".into(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                "classification:Summary",
+                "thinking_started",
+                "reasoning_delta"
+            ]
+        );
+    }
+
+    #[test]
+    fn generic_reasoning_stream_does_not_invent_a_classification() {
+        let mut app = AppHandle::fake();
+        let mut normalizer =
+            ProviderStreamNormalizer::new(ProviderKind::OpenAiCompatible, 1, vec![]);
+        normalizer.push(&mut app, ProviderEvent::ReasoningDelta("opaque".into()));
+        assert!(!app
+            .events()
+            .iter()
+            .any(|event| matches!(event.kind, crate::EventKind::ReasoningClassification { .. })));
     }
 
     #[tokio::test]
@@ -9250,6 +9820,28 @@ mod tests {
     }
 
     #[test]
+    fn elision_recognizes_current_and_legacy_ambiguous_patch_context() {
+        for marker in [
+            "Suggested unique expected:",
+            "Example context only for the first match at line 2; choose the intended occurrence explicitly:",
+        ] {
+            let recovery = format!("file unchanged.\n{marker}\n{}", "context\n".repeat(80));
+            let mut messages = vec![
+                ProviderMessage::assistant("", vec![call("p1", "patch", "a.txt")]),
+                ProviderMessage::tool("patch", "p1", &recovery),
+                ProviderMessage::assistant("", vec![call("p2", "patch", "a.txt")]),
+                ProviderMessage::tool(
+                    "patch", "p2",
+                    "patched a.txt; 1 edits applied atomically; bytes=9; sha256=def; do not re-read",
+                ),
+            ];
+            assert_eq!(elide_superseded_tool_outputs(&mut messages).elided, 1);
+            assert!(messages[1].content.starts_with("[superseded patch failure output elided;"));
+            assert!(messages[3].content.starts_with("patched a.txt;"));
+        }
+    }
+
+    #[test]
     fn elision_keeps_the_read_taken_after_the_last_write() {
         let stale = "first version ".repeat(30);
         let current = "second version ".repeat(30);
@@ -9359,6 +9951,7 @@ mod tests {
     struct FixtureCodeIntel {
         fail: bool,
         rejects_workspace: bool,
+        scoped_queries: std::sync::Mutex<Vec<Option<std::path::PathBuf>>>,
         updates: std::sync::Mutex<Vec<crate::codeintel::CodeIntelFileUpdate>>,
         sync_blocked: bool,
         sync_started: tokio::sync::Notify,
@@ -9429,15 +10022,17 @@ mod tests {
 
         async fn symbols(
             &self,
-            _query: &crate::codeintel::CodeIntelSymbolQuery,
+            query: &crate::codeintel::CodeIntelSymbolQuery,
         ) -> crate::codeintel::CodeIntelOutcome {
+            self.scoped_queries.lock().unwrap().push(query.path.clone());
             crate::codeintel::CodeIntelOutcome::unavailable("fixture", "unused")
         }
 
         async fn diagnostics(
             &self,
-            _query: &crate::codeintel::CodeIntelDiagnosticsQuery,
+            query: &crate::codeintel::CodeIntelDiagnosticsQuery,
         ) -> crate::codeintel::CodeIntelOutcome {
+            self.scoped_queries.lock().unwrap().push(query.path.clone());
             crate::codeintel::CodeIntelOutcome::unavailable("fixture", "unused")
         }
 
@@ -9612,6 +10207,71 @@ mod tests {
                 .await;
         assert!(result.success);
         assert!(result.output.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn code_intel_invalid_path_never_reaches_backend_and_valid_scope_is_preserved() {
+        let root = batch_fixture_root("code-intel-path-types");
+        let path = root.join("ação com espaço.rs");
+        std::fs::write(&path, "fn target() {}\n").unwrap();
+        let backend = Arc::new(FixtureCodeIntel::default());
+        let mut runtime = Runtime::new();
+        runtime.set_code_intelligence(backend.clone());
+        let mut calls = Vec::new();
+        for action in ["symbol", "diagnostics"] {
+            for (index, invalid) in [json!(42), json!(true), json!([]), json!({})]
+                .into_iter()
+                .enumerate()
+            {
+                calls.push(provider_call(
+                    &format!("{action}-{index}"),
+                    "code_intel",
+                    json!({"action":action,"path":invalid,"query":"target"}),
+                ));
+            }
+        }
+        let (results, next) = runtime
+            .execute_provider_tool_batch(
+                crate::OperatingMode::Auto,
+                &root,
+                "invalid-paths",
+                &calls,
+                1,
+                &mut CausalGovernor::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), calls.len());
+        assert!(results
+            .iter()
+            .all(|result| !result.success && result.output.contains("path must be a string")));
+        assert!(backend.scoped_queries.lock().unwrap().is_empty());
+
+        let mut valid_calls = Vec::new();
+        for action in ["symbol", "diagnostics"] {
+            valid_calls.push(provider_call(
+                &format!("valid-{action}"),
+                "code_intel",
+                json!({"action":action,"path":"ação com espaço.rs","query":"target"}),
+            ));
+        }
+        runtime
+            .execute_provider_tool_batch(
+                crate::OperatingMode::Auto,
+                &root,
+                "valid-paths",
+                &valid_calls,
+                next,
+                &mut CausalGovernor::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *backend.scoped_queries.lock().unwrap(),
+            vec![Some(std::fs::canonicalize(&path).unwrap()); 2]
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn target() {}\n");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

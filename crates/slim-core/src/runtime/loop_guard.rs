@@ -24,12 +24,20 @@ fn canonical_arguments(tool: &str, arguments: &str) -> String {
 impl LoopGuard {
     pub fn accept(&mut self, tool: &str, arguments: &str, error: &str) -> bool {
         let arguments = canonical_arguments(tool, arguments);
+        self.accept_key(tool, &arguments, error)
+    }
+
+    pub(crate) fn accept_canonical(&mut self, tool: &str, fingerprint: &str, error: &str) -> bool {
+        self.accept_key(tool, fingerprint, error)
+    }
+
+    fn accept_key(&mut self, tool: &str, arguments: &str, error: &str) -> bool {
         if tool == "shell" {
             self.last_failed_mutation = None;
-            if self.last_failed_shell.as_ref() == Some(&arguments) {
+            if self.last_failed_shell.as_deref() == Some(arguments) {
                 return false;
             }
-            self.last_failed_shell = Some(arguments);
+            self.last_failed_shell = Some(arguments.to_owned());
             true
         } else if matches!(tool, "write" | "patch") {
             self.last_failed_shell = None;

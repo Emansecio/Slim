@@ -120,7 +120,7 @@ fn codex_alias_filters_and_enter_opens_effort() {
     type_text(&mut state, "lu");
 
     let frame_text = render_to_string(&state);
-    assert!(frame_text.contains("Filter: lu"), "filter is visible");
+    assert!(frame_text.contains("Filtro: lu"), "filter is visible");
     assert!(frame_text.contains("Luna"), "match stays visible");
     assert!(
         !frame_text.contains("(gpt-5.6-sol)"),
@@ -163,12 +163,12 @@ fn astra_picker_selects_reasoning_and_speed_and_cancel_does_not_apply_speed() {
     reduce(&mut state, Action::Key(press(KeyCode::Down)));
     reduce(&mut state, Action::Key(press(KeyCode::Enter)));
     let normal = render_to_string(&state);
-    assert!(normal.contains("Speed: Normal"));
+    assert!(normal.contains("Velocidade: Normal"));
     assert!(!normal.contains("Ultra"));
     reduce(&mut state, Action::Key(press(KeyCode::Tab)));
     let fast = render_to_string(&state);
-    assert!(fast.contains("Fast (higher usage)"));
-    assert!(fast.contains("Tab toggle"));
+    assert!(fast.contains("Rápida (maior uso)"));
+    assert!(fast.contains("Tab alternar"));
     reduce(&mut state, Action::Key(press(KeyCode::Esc)));
     assert!(
         !state.codex_fast,
@@ -258,7 +258,7 @@ fn overlay_box_fits_content_with_rounded_corners() {
     let lines: Vec<&str> = frame.lines().collect();
     let top = lines
         .iter()
-        .position(|line| line.contains("╭ Select model"))
+        .position(|line| line.contains("╭ Selecionar modelo"))
         .unwrap_or_else(|| panic!("rounded title row missing:\n{frame}"));
     let bottom = top
         + lines[top..]
@@ -270,7 +270,7 @@ fn overlay_box_fits_content_with_rounded_corners() {
         "square corners must be gone:\n{frame}"
     );
     assert!(
-        lines[bottom - 1].contains("Enter select"),
+        lines[bottom - 1].contains("Enter selecionar"),
         "footer must sit on the last inner row:\n{frame}"
     );
     assert!(

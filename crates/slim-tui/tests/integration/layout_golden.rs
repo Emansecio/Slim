@@ -123,14 +123,14 @@ fn session_rail_keeps_provider_phase_out_of_session_header() {
         !header.contains("Connecting to provider"),
         "phase belongs on the activity rail\n{header}"
     );
-    assert!(frame.contains("Connecting to provider"), "{frame}");
+    assert!(frame.contains("Conectando ao provedor"), "{frame}");
     assert_eq!(
-        frame.matches("Connecting to provider").count(),
+        frame.matches("Conectando ao provedor").count(),
         1,
         "phase must appear once on the activity rail\n{frame}"
     );
     assert!(
-        !frame.contains("Thinking"),
+        !frame.contains("Pensando"),
         "provider plumbing is not reasoning\n{frame}"
     );
 }
@@ -312,7 +312,7 @@ fn composer_multiline_expands_and_reports_total_lines_in_the_label() {
         "{frame}"
     );
     assert!(
-        frame.contains("2 lines"),
+        frame.contains("2 linhas"),
         "line count label missing\n{frame}"
     );
 }
@@ -476,8 +476,8 @@ fn grok_footer_keeps_aligned_inset_box_and_adjacent_status() {
         let bottom = corner_columns(lines[bottom_index], '╰', '╯');
 
         assert_eq!(top, bottom, "symmetric corners at width={width}");
-        let band_width = width as usize;
-        let band_x = 0;
+        let band_width = usize::from(width.min(100));
+        let band_x = (usize::from(width) - band_width) / 2;
         assert_eq!(
             top,
             (band_x + 1, band_x + band_width - 2),
@@ -593,13 +593,13 @@ fn working_activity_is_immediately_above_inset_composer() {
         .position(|line| line.contains('╭'))
         .expect("top border");
     assert!(top_index > 0);
-    assert!(lines[top_index - 1].contains("Working"));
+    assert!(lines[top_index - 1].contains("Em atividade"));
     let footer = lines.last().expect("footer");
     assert!(
-        !footer.contains("Working"),
+        !footer.contains("Em atividade"),
         "activity label must not duplicate"
     );
-    assert!(footer.contains("Ctrl+C cancel"));
+    assert!(footer.contains("Ctrl+C cancelar"));
 }
 
 #[test]
@@ -623,11 +623,11 @@ fn constrained_working_state_moves_from_activity_to_footer() {
     let frame = render_to_string(&state, 40, 8);
     let footer = frame.lines().last().expect("footer");
     assert!(
-        footer.contains("Working"),
+        footer.contains("Em atividade"),
         "active state migrates to footer"
     );
     assert!(
-        footer.contains("Ctrl+C cancel"),
+        footer.contains("Ctrl+C cancelar"),
         "the actionable cancellation shortcut remains visible: {footer}"
     );
 }
@@ -650,7 +650,7 @@ fn empty_session_footer_hides_unknown_context_and_zero_usage() {
     let state = AppState::new();
     let frame = render_to_string(&state, 80, 24);
     let footer = frame.lines().last().unwrap_or_default();
-    assert!(footer.contains("signed out · /login"), "{footer}");
+    assert!(footer.contains("desconectado · /login"), "{footer}");
     assert!(!footer.contains("ctx --"), "{footer}");
     assert!(!footer.contains("↑0 ↓0"), "{footer}");
 }
@@ -662,8 +662,8 @@ fn pending_images_render_as_honest_composer_chips() {
         labels: vec!["screen.png".into()],
     });
     let frame = render_to_string(&state, 80, 24);
-    assert!(frame.contains("image · screen.png"), "{frame}");
-    assert!(frame.contains("1 image"), "{frame}");
+    assert!(frame.contains("imagem · screen.png"), "{frame}");
+    assert!(frame.contains("1 imagem"), "{frame}");
 }
 
 #[test]
@@ -843,4 +843,55 @@ fn completed_todos_collapse_and_can_be_expanded_on_demand() {
     let expanded = render_to_string(&state, 140, 30);
     assert!(expanded.contains("mapear fluxo"), "{expanded}");
     assert!(expanded.contains("revisar diff"), "{expanded}");
+}
+
+#[test]
+fn manual_todo_collapse_survives_subsequent_updates() {
+    let mut state = todo_state();
+    assert!(
+        state.todo_dock_open,
+        "pending work opens the dock initially"
+    );
+    reduce(&mut state, slim_tui::reducer::Action::ToggleTodoDock);
+    assert!(!state.todo_dock_open);
+    assert_eq!(state.todo_dock_user_preference, Some(false));
+
+    state.apply_event(UiEvent::TodoChanged {
+        items: vec![
+            TodoItemView {
+                title: "mapear fluxo".into(),
+                status: TodoItemStatus::Completed,
+            },
+            TodoItemView {
+                title: "rodar testes".into(),
+                status: TodoItemStatus::InProgress,
+            },
+            TodoItemView {
+                title: "revisar diff".into(),
+                status: TodoItemStatus::Pending,
+            },
+        ],
+    });
+
+    assert!(
+        !state.todo_dock_open,
+        "content updates must preserve manual collapse"
+    );
+    let frame = render_to_string(&state, 100, 24);
+    assert!(
+        frame.contains("TODO 1/3"),
+        "collapsed dock keeps progress\n{frame}"
+    );
+    assert!(
+        frame.contains("rodar testes"),
+        "collapsed dock keeps active item\n{frame}"
+    );
+    assert!(
+        !frame.contains("mapear fluxo"),
+        "completed rows stay hidden\n{frame}"
+    );
+    assert!(
+        !frame.contains("revisar diff"),
+        "pending rows stay hidden\n{frame}"
+    );
 }

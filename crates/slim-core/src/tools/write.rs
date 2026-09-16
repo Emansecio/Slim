@@ -27,6 +27,7 @@ pub enum FilePrecondition {
 
 pub(crate) struct WriteReceipt {
     pub(crate) recovery_note: Option<String>,
+    pub(crate) syntax_diagnostic: Option<String>,
     pub(crate) before: Option<String>,
     pub(crate) dependency: Option<DependencyObservation>,
     pub(crate) after: FastStamp,
@@ -141,6 +142,7 @@ pub(crate) fn write_file_with_receipt(
     }
     Ok(WriteReceipt {
         recovery_note: None,
+        syntax_diagnostic: json_syntax_diagnostic(path, None, &content),
         before: None,
         dependency: None,
         after,
@@ -268,8 +270,10 @@ fn replace_observed_file_with_publisher(
         return Err(failure);
     }
     let (recovery_note, verification_bytes) = cleanup_displaced_if_unchanged(&backup, &before);
+    let syntax_diagnostic = json_syntax_diagnostic(path, Some(&before), content);
     Ok(WriteReceipt {
         recovery_note,
+        syntax_diagnostic,
         before: Some(before),
         dependency: Some(dependency),
         after,
@@ -277,6 +281,34 @@ fn replace_observed_file_with_publisher(
         written_digest: content_sha256(content.as_bytes()),
         written_sha256_12: content_sha256_prefix(content.as_bytes()),
     })
+}
+
+// Advisory on the exact committed revision, never a write failure or evidence
+// of task completion. Existing non-JSON templates are left to their own parser.
+// IgnoredAny validates syntax without allocating values or restricting JSON
+// numbers to the machine's floating-point range. Bound work even on large files.
+fn json_syntax_diagnostic(path: &Path, before: Option<&str>, after: &str) -> Option<String> {
+    const MAX_DIAGNOSTIC_BYTES: usize = 1024 * 1024;
+    if !path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        || after.len() > MAX_DIAGNOSTIC_BYTES
+        || before.is_some_and(|text| text.len() > MAX_DIAGNOSTIC_BYTES || text == after)
+    {
+        return None;
+    }
+    let check = |text: &str| {
+        let mut parser = serde_json::Deserializer::from_str(text);
+        <serde::de::IgnoredAny as serde::Deserialize>::deserialize(&mut parser)
+            .and_then(|_| parser.end())
+    };
+    let error = check(after).err()?;
+    if before.is_some_and(|text| check(text).is_err()) {
+        return None;
+    }
+    let detail: String = error.to_string().chars().take(200).collect();
+    Some(format!("JSON syntax diagnostic for written content: {detail}. Writing succeeded; this is not task validation."))
 }
 
 fn prepare_replacement(
@@ -393,14 +425,21 @@ pub(super) fn read_existing_file_observed(
 
 pub(super) const CURRENT_FILE_RECOVERY_BYTES: usize = 64 * 1024;
 
+const WRITE_COMPLETE_RECOVERY_GUIDANCE: &str =
+    "Use full text as expected, or patch a unique excerpt. Do not read again.";
+const WRITE_PARTIAL_RECOVERY_GUIDANCE: &str =
+    "Patch a unique excerpt, or read the complete file before write. Do not use these edges as expected or pass offset.";
+const PATCH_COMPLETE_RECOVERY_GUIDANCE: &str =
+    "Retry patch with one unique exact excerpt; preserve whitespace and line endings. Do not read again.";
+const PATCH_PARTIAL_RECOVERY_GUIDANCE: &str =
+    "Search or read a unique excerpt, then patch. No edges as expected; no offset.";
+
 pub(super) fn current_file_recovery_context(content: &str) -> String {
     if content.len() <= CURRENT_FILE_RECOVERY_BYTES {
-        format!(
-            "Current file is below; retry write with expected set to this full text, or patch a unique excerpt. Do not read again.\n{content}"
-        )
+        format!("Current file is below; {WRITE_COMPLETE_RECOVERY_GUIDANCE}\n{content}")
     } else {
         format!(
-            "Current file edges are below; middle omitted. Do not pass these edges as expected. Patch a unique excerpt, or read the complete file and then write. Do not pass offset.\n{}",
+            "Current file edges are below; middle omitted. {WRITE_PARTIAL_RECOVERY_GUIDANCE}\n{}",
             recovery_head_tail(content, 16 * 1024)
         )
     }
@@ -408,12 +447,10 @@ pub(super) fn current_file_recovery_context(content: &str) -> String {
 
 pub(super) fn patch_file_recovery_context(content: &str) -> String {
     if content.len() <= CURRENT_FILE_RECOVERY_BYTES {
-        format!(
-            "Current file is below; retry patch with a unique exact excerpt from this text, including whitespace and line endings. Do not read again.\n{content}"
-        )
+        format!("Current file is below; {PATCH_COMPLETE_RECOVERY_GUIDANCE}\n{content}")
     } else {
         format!(
-            "Current file edges are below; middle omitted. Do not pass these edges as expected. Search with context_lines or read the complete file, then patch. Do not pass offset.\n{}",
+            "Current file edges are below; middle omitted. {PATCH_PARTIAL_RECOVERY_GUIDANCE}\n{}",
             recovery_head_tail(content, 16 * 1024)
         )
     }
@@ -629,6 +666,27 @@ fn temp_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod lock_tests {
     use super::*;
+
+    #[test]
+    fn json_diagnostics_are_bounded_and_do_not_reinterpret_other_formats() {
+        let json_path = Path::new("data.JSON");
+        for invalid in ["{\"x\":1,}", "{} trailing", "[1 2]", "\"bad\\q\""] {
+            assert!(json_syntax_diagnostic(json_path, Some("{}"), invalid).is_some());
+        }
+        for valid in [
+            "{\"x\":1e9999}",
+            "[true,null,123456789012345678901234567890]",
+        ] {
+            assert!(json_syntax_diagnostic(json_path, None, valid).is_none());
+        }
+        let too_large = format!("{}{{", " ".repeat(1024 * 1024));
+        assert!(json_syntax_diagnostic(json_path, None, &too_large).is_none());
+        assert!(json_syntax_diagnostic(json_path, Some("{{template}}"), "{{other}}").is_none());
+        assert!(
+            json_syntax_diagnostic(Path::new("data.jsonc"), Some("{}"), "{//comment\n}").is_none()
+        );
+        assert!(json_syntax_diagnostic(json_path, Some("{"), "{").is_none());
+    }
 
     fn publication_workspace() -> PathBuf {
         let root = std::env::temp_dir().join(format!(

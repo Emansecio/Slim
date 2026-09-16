@@ -44,16 +44,16 @@ fn fake_session_materializes_deterministic_frame_without_io() {
     assert_eq!(
         surface.frames[0].lines,
         vec![
-            "You",
+            "Você",
             "> hello",
             "",
             "Slim",
             "world",
-            "activity: Responding",
-            "todo: 0/0 no active item",
+            "activity: Respondendo",
+            "todo: 0/0 sem tarefa ativa",
             "composer: ",
             "Read-only",
-            "signed out · /login",
+            "desconectado · /login",
         ]
     );
 }
@@ -91,7 +91,7 @@ fn signed_out_login_progress_and_success_are_projected_without_history_leaks() {
         .lines
         .last()
         .unwrap()
-        .contains("signed out"));
+        .contains("desconectado"));
 
     state.login_overlay = Some(Default::default());
     state.login_overlay.as_mut().unwrap().in_progress = true;
@@ -122,7 +122,7 @@ fn signed_out_login_progress_and_success_are_projected_without_history_leaks() {
     assert!(state.login_overlay.is_none());
     let lines = ViewModel::derive(&state).lines;
     let footer = &lines[lines.len().saturating_sub(2)..];
-    assert!(footer.iter().all(|line| !line.contains("signed out")));
+    assert!(footer.iter().all(|line| !line.contains("desconectado")));
     assert!(footer.first().is_some_and(|line| line.starts_with("Auto")));
     assert!(footer
         .iter()
@@ -177,7 +177,7 @@ fn compaction_completed_becomes_collapsed_system_block() {
     assert_eq!(state.blocks().len(), 1);
     assert!(matches!(
         state.blocks()[0].kind(),
-        BlockKind::System(text) if text == "compaction completed"
+        BlockKind::System(text) if text == "compactação concluída"
     ));
     assert_eq!(state.blocks()[0].lifecycle, BlockLifecycle::Complete);
     assert_eq!(state.blocks()[0].fold, FoldState::Collapsed);

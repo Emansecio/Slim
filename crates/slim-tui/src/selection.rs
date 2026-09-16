@@ -48,6 +48,37 @@ struct TextSpan {
     x1: u16,
 }
 
+/// Frozen cells from the version the user selected. Coordinates are included
+/// so moving identical text into another column cannot silently retarget it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PaintedSelection {
+    pub selection: ScreenSelection,
+    pub area: Rect,
+    pub cells: Vec<(u16, u16, String)>,
+    pub text: String,
+    pub valid: bool,
+}
+
+pub(crate) fn capture_selection(
+    buffer: &Buffer,
+    selection: ScreenSelection,
+    area: Rect,
+) -> PaintedSelection {
+    let cells = selected_spans(buffer, selection, area)
+        .into_iter()
+        .flat_map(|span| {
+            (span.x0..=span.x1).map(move |x| (x, span.y, buffer[(x, span.y)].symbol().to_owned()))
+        })
+        .collect();
+    PaintedSelection {
+        selection,
+        area,
+        cells,
+        text: extract_selected_text(buffer, selection, area),
+        valid: true,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GlyphSpan {
     start: u16,

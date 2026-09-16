@@ -1,0 +1,4118 @@
+{
+  "generated_utc": "2026-09-15 19:47:02Z",
+  "manifests": {
+    "20260915-193525Z": {
+      "model": "gpt-5.6-luna",
+      "provider": "openai-codex",
+      "effort": "high",
+      "speed": "normal",
+      "order": [
+        "pi",
+        "slim"
+      ],
+      "workspace": "C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-kpvo6lzc",
+      "prompt": "Read SPEC.md and implement ranges.py. Run python check.py and fix any failures. Do not change SPEC.md or check.py. Do not install dependencies. Finish with a brief summary of the result.",
+      "scenario": "merge_ranges",
+      "executables": {
+        "pi": {
+          "path": "C:\\nvm4w\\nodejs\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js",
+          "sha256": "e6d7fcf36a239cf3746e67ddf4222081ac01a601b85a3ee688bdfe9c161d754c",
+          "version": "0.85.1"
+        },
+        "slim": {
+          "path": "C:\\Users\\User\\bin\\Slim.exe",
+          "sha256": "5e04cb23c16cf0fadb585c2d2dc517fa7dee91a1ecba5dc130207fd67f15f925",
+          "version": "slim 0.1.0"
+        }
+      },
+      "oracle_python": "C:\\Users\\User\\AppData\\Local\\Programs\\Python\\Python312\\python.EXE",
+      "fixtures": {
+        "SPEC.md": {
+          "sha256": "bc64e7939d8359773418b1251dd30a1d068ded10b1802e788caee24caa232863",
+          "bytes": 591
+        },
+        "check.py": {
+          "sha256": "76c1220bc7124af738ea4c104b65141078adc6e6bb2942e012f36f91effb3b4e",
+          "bytes": 895
+        }
+      },
+      "harness": {
+        "python": "3.12.10",
+        "platform": "win32",
+        "files": {
+          "run.py": "2faf11334a04605072e6d9006f375a21d4c38fcf2e700a2acd08ac5bf4138d59",
+          "daily.py": "747693f4bf8d48abc667a402cd42bc2fee8aafe29194bf6f3daaa5ccf62726cf",
+          "analyze.py": "c0d004246f855e5347257ce798d5d2327a308fc3663a089531c7d2472d697262",
+          "report.py": "ab1ad481105e29ff1e458a9c6b79eb07079997f0082d1eddab8cbe4a0f92e09e",
+          "pi-audit.ts": "638253e75867f87ebc76b97e54e6f5283a2a6cb1787198a85472f9490fb96389",
+          "process_runner.py": "5a39d338349a00aab4e56aec7db2ad2955b3747d6b3e90319ca7450254f14396"
+        }
+      },
+      "route": "native openai-codex; each CLI uses its own configured authentication"
+    },
+    "20260915-193920Z": {
+      "model": "gpt-5.6-luna",
+      "provider": "openai-codex",
+      "effort": "high",
+      "speed": "normal",
+      "order": [
+        "slim",
+        "pi"
+      ],
+      "workspace": "C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-0y_pji68",
+      "prompt": "Read SPEC.md and implement ranges.py. Run python check.py and fix any failures. Do not change SPEC.md or check.py. Do not install dependencies. Finish with a brief summary of the result.",
+      "scenario": "merge_ranges",
+      "executables": {
+        "pi": {
+          "path": "C:\\nvm4w\\nodejs\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js",
+          "sha256": "e6d7fcf36a239cf3746e67ddf4222081ac01a601b85a3ee688bdfe9c161d754c",
+          "version": "0.85.1"
+        },
+        "slim": {
+          "path": "C:\\Users\\User\\bin\\Slim.exe",
+          "sha256": "5e04cb23c16cf0fadb585c2d2dc517fa7dee91a1ecba5dc130207fd67f15f925",
+          "version": "slim 0.1.0"
+        }
+      },
+      "oracle_python": "C:\\Users\\User\\AppData\\Local\\Programs\\Python\\Python312\\python.EXE",
+      "fixtures": {
+        "SPEC.md": {
+          "sha256": "bc64e7939d8359773418b1251dd30a1d068ded10b1802e788caee24caa232863",
+          "bytes": 591
+        },
+        "check.py": {
+          "sha256": "76c1220bc7124af738ea4c104b65141078adc6e6bb2942e012f36f91effb3b4e",
+          "bytes": 895
+        }
+      },
+      "harness": {
+        "python": "3.12.10",
+        "platform": "win32",
+        "files": {
+          "run.py": "2faf11334a04605072e6d9006f375a21d4c38fcf2e700a2acd08ac5bf4138d59",
+          "daily.py": "747693f4bf8d48abc667a402cd42bc2fee8aafe29194bf6f3daaa5ccf62726cf",
+          "analyze.py": "7ae12c28d4446029efb82c624e1da65ab8422e5a93df78e268f1746003b8738d",
+          "report.py": "2feeadd66ffdf4336d523c1f0a9bc01d163ec87d5dbc642c158c56722928518b",
+          "pi-audit.ts": "638253e75867f87ebc76b97e54e6f5283a2a6cb1787198a85472f9490fb96389",
+          "process_runner.py": "5a39d338349a00aab4e56aec7db2ad2955b3747d6b3e90319ca7450254f14396"
+        }
+      },
+      "route": "native openai-codex; each CLI uses its own configured authentication"
+    },
+    "20260915-194013Z-repair_catalog": {
+      "model": "gpt-5.6-luna",
+      "provider": "openai-codex",
+      "effort": "high",
+      "speed": "normal",
+      "order": [
+        "pi",
+        "slim"
+      ],
+      "workspace": "C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-77ct_m2v",
+      "prompt": "Read SPEC.md, fix the existing implementation, and run python check.py. Do not change SPEC.md or check.py. Do not install dependencies. Finish with a brief summary.",
+      "scenario": "repair_catalog",
+      "executables": {
+        "pi": {
+          "path": "C:\\nvm4w\\nodejs\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js",
+          "sha256": "e6d7fcf36a239cf3746e67ddf4222081ac01a601b85a3ee688bdfe9c161d754c",
+          "version": "0.85.1"
+        },
+        "slim": {
+          "path": "C:\\Users\\User\\bin\\Slim.exe",
+          "sha256": "5e04cb23c16cf0fadb585c2d2dc517fa7dee91a1ecba5dc130207fd67f15f925",
+          "version": "slim 0.1.0"
+        }
+      },
+      "oracle_python": "C:\\Users\\User\\AppData\\Local\\Programs\\Python\\Python312\\python.EXE",
+      "fixtures": {
+        "SPEC.md": {
+          "sha256": "bfd582fbcec1e0f3774897f820fd3fbf1d80662c6bcc7ebb6fc5a13ccf23e176",
+          "bytes": 417
+        },
+        "check.py": {
+          "sha256": "824ee9a914b705f0c913928f350d26327985eeb9d70e598705e3b761897ba55c",
+          "bytes": 959
+        },
+        "catalog.py": {
+          "sha256": "e5fd31062c3e7f745a259981167a40c8b0287b59fc9f835c56876b98eb7a8f86",
+          "bytes": 351
+        },
+        "formatting.py": {
+          "sha256": "688842ac01e093eae6c473164e4d0f0370474e7c95b2ac1d56d2ccbc453e777d",
+          "bytes": 51
+        }
+      },
+      "harness": {
+        "python": "3.12.10",
+        "platform": "win32",
+        "files": {
+          "run.py": "2faf11334a04605072e6d9006f375a21d4c38fcf2e700a2acd08ac5bf4138d59",
+          "daily.py": "747693f4bf8d48abc667a402cd42bc2fee8aafe29194bf6f3daaa5ccf62726cf",
+          "analyze.py": "7ae12c28d4446029efb82c624e1da65ab8422e5a93df78e268f1746003b8738d",
+          "report.py": "2feeadd66ffdf4336d523c1f0a9bc01d163ec87d5dbc642c158c56722928518b",
+          "pi-audit.ts": "638253e75867f87ebc76b97e54e6f5283a2a6cb1787198a85472f9490fb96389",
+          "process_runner.py": "5a39d338349a00aab4e56aec7db2ad2955b3747d6b3e90319ca7450254f14396"
+        }
+      },
+      "route": "native openai-codex; each CLI uses its own configured authentication"
+    },
+    "20260915-194056Z-json_cli": {
+      "model": "gpt-5.6-luna",
+      "provider": "openai-codex",
+      "effort": "high",
+      "speed": "normal",
+      "order": [
+        "slim",
+        "pi"
+      ],
+      "workspace": "C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-y9rqa24e",
+      "prompt": "Read SPEC.md and implement the requested CLI. Run python check.py and fix failures. Do not change SPEC.md, check.py or data. Do not install dependencies. Finish with a brief summary.",
+      "scenario": "json_cli",
+      "executables": {
+        "pi": {
+          "path": "C:\\nvm4w\\nodejs\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js",
+          "sha256": "e6d7fcf36a239cf3746e67ddf4222081ac01a601b85a3ee688bdfe9c161d754c",
+          "version": "0.85.1"
+        },
+        "slim": {
+          "path": "C:\\Users\\User\\bin\\Slim.exe",
+          "sha256": "5e04cb23c16cf0fadb585c2d2dc517fa7dee91a1ecba5dc130207fd67f15f925",
+          "version": "slim 0.1.0"
+        }
+      },
+      "oracle_python": "C:\\Users\\User\\AppData\\Local\\Programs\\Python\\Python312\\python.EXE",
+      "fixtures": {
+        "SPEC.md": {
+          "sha256": "a1ba5d633ea1a6012dd11fee2312ae89023966d0837d23f94c87a0f3f0443ed1",
+          "bytes": 627
+        },
+        "check.py": {
+          "sha256": "9b972379a1be9284a9e91d5578b3bf6419804f566408f95762c52eae7513fac5",
+          "bytes": 1557
+        },
+        "data/itens de ação.json": {
+          "sha256": "f89c4b4f94887efac83fb6964d491e91905192e4de890fb34320a1e2d8dba887",
+          "bytes": 208
+        }
+      },
+      "harness": {
+        "python": "3.12.10",
+        "platform": "win32",
+        "files": {
+          "run.py": "2faf11334a04605072e6d9006f375a21d4c38fcf2e700a2acd08ac5bf4138d59",
+          "daily.py": "747693f4bf8d48abc667a402cd42bc2fee8aafe29194bf6f3daaa5ccf62726cf",
+          "analyze.py": "7ae12c28d4446029efb82c624e1da65ab8422e5a93df78e268f1746003b8738d",
+          "report.py": "2feeadd66ffdf4336d523c1f0a9bc01d163ec87d5dbc642c158c56722928518b",
+          "pi-audit.ts": "638253e75867f87ebc76b97e54e6f5283a2a6cb1787198a85472f9490fb96389",
+          "process_runner.py": "5a39d338349a00aab4e56aec7db2ad2955b3747d6b3e90319ca7450254f14396"
+        }
+      },
+      "route": "native openai-codex; each CLI uses its own configured authentication"
+    },
+    "20260915-194323Z-js_pagination": {
+      "model": "gpt-5.6-luna",
+      "provider": "openai-codex",
+      "effort": "high",
+      "speed": "normal",
+      "order": [
+        "pi",
+        "slim"
+      ],
+      "workspace": "C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-ft44wn2y",
+      "prompt": "Read SPEC.md, fix the existing JavaScript module, and run python check.py. Do not change SPEC.md or check.py. Do not install dependencies. Finish with a brief summary.",
+      "scenario": "js_pagination",
+      "executables": {
+        "pi": {
+          "path": "C:\\nvm4w\\nodejs\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js",
+          "sha256": "e6d7fcf36a239cf3746e67ddf4222081ac01a601b85a3ee688bdfe9c161d754c",
+          "version": "0.85.1"
+        },
+        "slim": {
+          "path": "C:\\Users\\User\\bin\\Slim.exe",
+          "sha256": "5e04cb23c16cf0fadb585c2d2dc517fa7dee91a1ecba5dc130207fd67f15f925",
+          "version": "slim 0.1.0"
+        }
+      },
+      "oracle_python": "C:\\Users\\User\\AppData\\Local\\Programs\\Python\\Python312\\python.EXE",
+      "fixtures": {
+        "SPEC.md": {
+          "sha256": "7976e19be4b10c52d392bf35ff723c69e99ef96e3cfff167a84cfe57caec9060",
+          "bytes": 461
+        },
+        "check.py": {
+          "sha256": "a977b6aac925846230b92882f7a505ae84d98e1e01ac4e47e536c4bd676d53e6",
+          "bytes": 1165
+        },
+        "pager.cjs": {
+          "sha256": "0a12ec02c1aa3349b033944fb111c6eaa4b6628010d0234a60fa62aa140c485e",
+          "bytes": 252
+        },
+        "listing.cjs": {
+          "sha256": "5f85d9a82f7003b1f83ad4c70ccfbd1ec2d75c3b922d3e88e9c15d3dac2432d7",
+          "bytes": 105
+        }
+      },
+      "harness": {
+        "python": "3.12.10",
+        "platform": "win32",
+        "files": {
+          "run.py": "2faf11334a04605072e6d9006f375a21d4c38fcf2e700a2acd08ac5bf4138d59",
+          "daily.py": "747693f4bf8d48abc667a402cd42bc2fee8aafe29194bf6f3daaa5ccf62726cf",
+          "analyze.py": "7ae12c28d4446029efb82c624e1da65ab8422e5a93df78e268f1746003b8738d",
+          "report.py": "2feeadd66ffdf4336d523c1f0a9bc01d163ec87d5dbc642c158c56722928518b",
+          "pi-audit.ts": "638253e75867f87ebc76b97e54e6f5283a2a6cb1787198a85472f9490fb96389",
+          "process_runner.py": "5a39d338349a00aab4e56aec7db2ad2955b3747d6b3e90319ca7450254f14396"
+        }
+      },
+      "route": "native openai-codex; each CLI uses its own configured authentication"
+    },
+    "20260915-194416Z-ledger_audit": {
+      "model": "gpt-5.6-luna",
+      "provider": "openai-codex",
+      "effort": "high",
+      "speed": "normal",
+      "order": [
+        "slim",
+        "pi"
+      ],
+      "workspace": "C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-um73rfi7",
+      "prompt": "Read SPEC.md and audit the ledger. Write audit.json, then run python check.py. Do not change the input CSV, SPEC.md or check.py. Do not install dependencies. Finish with a brief summary.",
+      "scenario": "ledger_audit",
+      "executables": {
+        "pi": {
+          "path": "C:\\nvm4w\\nodejs\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js",
+          "sha256": "e6d7fcf36a239cf3746e67ddf4222081ac01a601b85a3ee688bdfe9c161d754c",
+          "version": "0.85.1"
+        },
+        "slim": {
+          "path": "C:\\Users\\User\\bin\\Slim.exe",
+          "sha256": "5e04cb23c16cf0fadb585c2d2dc517fa7dee91a1ecba5dc130207fd67f15f925",
+          "version": "slim 0.1.0"
+        }
+      },
+      "oracle_python": "C:\\Users\\User\\AppData\\Local\\Programs\\Python\\Python312\\python.EXE",
+      "fixtures": {
+        "SPEC.md": {
+          "sha256": "5cedf3aeecb92a8c36c911fdd0c5691f1008f205495b3c6945310a9d8441340a",
+          "bytes": 459
+        },
+        "check.py": {
+          "sha256": "83636fcbb221c413b1b5139fef5f414994ec27d55b64ce893644f4fc44f2680e",
+          "bytes": 1093
+        },
+        "ledger.csv": {
+          "sha256": "e925e863ec2fa34cbca320596c120fc422100aa649ce1f576be16e524aa46064",
+          "bytes": 3169
+        }
+      },
+      "harness": {
+        "python": "3.12.10",
+        "platform": "win32",
+        "files": {
+          "run.py": "2faf11334a04605072e6d9006f375a21d4c38fcf2e700a2acd08ac5bf4138d59",
+          "daily.py": "747693f4bf8d48abc667a402cd42bc2fee8aafe29194bf6f3daaa5ccf62726cf",
+          "analyze.py": "7ae12c28d4446029efb82c624e1da65ab8422e5a93df78e268f1746003b8738d",
+          "report.py": "2feeadd66ffdf4336d523c1f0a9bc01d163ec87d5dbc642c158c56722928518b",
+          "pi-audit.ts": "638253e75867f87ebc76b97e54e6f5283a2a6cb1787198a85472f9490fb96389",
+          "process_runner.py": "5a39d338349a00aab4e56aec7db2ad2955b3747d6b3e90319ca7450254f14396"
+        }
+      },
+      "route": "native openai-codex; each CLI uses its own configured authentication"
+    },
+    "20260915-194520Z-config_migration": {
+      "model": "gpt-5.6-luna",
+      "provider": "openai-codex",
+      "effort": "high",
+      "speed": "normal",
+      "order": [
+        "pi",
+        "slim"
+      ],
+      "workspace": "C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-91qirkyc",
+      "prompt": "Read SPEC.md and migrate the configuration files. Run python check.py. Do not change SPEC.md or check.py. Do not install dependencies. Finish with a brief summary.",
+      "scenario": "config_migration",
+      "executables": {
+        "pi": {
+          "path": "C:\\nvm4w\\nodejs\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js",
+          "sha256": "e6d7fcf36a239cf3746e67ddf4222081ac01a601b85a3ee688bdfe9c161d754c",
+          "version": "0.85.1"
+        },
+        "slim": {
+          "path": "C:\\Users\\User\\bin\\Slim.exe",
+          "sha256": "5e04cb23c16cf0fadb585c2d2dc517fa7dee91a1ecba5dc130207fd67f15f925",
+          "version": "slim 0.1.0"
+        }
+      },
+      "oracle_python": "C:\\Users\\User\\AppData\\Local\\Programs\\Python\\Python312\\python.EXE",
+      "fixtures": {
+        "SPEC.md": {
+          "sha256": "ce6fdb470ab21ea06aff874750a36a6b887b254a5d84675f7f55c6e91461ec25",
+          "bytes": 456
+        },
+        "check.py": {
+          "sha256": "8071bee7037bb2fb9feda1f6804f6ea63e68fcf475ad0f4aac8e486f199066e2",
+          "bytes": 940
+        },
+        "config/development.json": {
+          "sha256": "bb50bd08b83201c33072836cdf9d63cdd3f0736fba092d7364aa7a7dc13982ae",
+          "bytes": 305
+        },
+        "config/production.json": {
+          "sha256": "534537082cdfe7d9359425e24a6239a95806529a6ea73fbab2e56e92659d393d",
+          "bytes": 186
+        },
+        "config/current.json": {
+          "sha256": "a1d616da31bcc7e5c12366835b9077ae04d721eb6190e7c7c8eef85ee2bf6ece",
+          "bytes": 82
+        }
+      },
+      "harness": {
+        "python": "3.12.10",
+        "platform": "win32",
+        "files": {
+          "run.py": "2faf11334a04605072e6d9006f375a21d4c38fcf2e700a2acd08ac5bf4138d59",
+          "daily.py": "747693f4bf8d48abc667a402cd42bc2fee8aafe29194bf6f3daaa5ccf62726cf",
+          "analyze.py": "7ae12c28d4446029efb82c624e1da65ab8422e5a93df78e268f1746003b8738d",
+          "report.py": "2feeadd66ffdf4336d523c1f0a9bc01d163ec87d5dbc642c158c56722928518b",
+          "pi-audit.ts": "638253e75867f87ebc76b97e54e6f5283a2a6cb1787198a85472f9490fb96389",
+          "process_runner.py": "5a39d338349a00aab4e56aec7db2ad2955b3747d6b3e90319ca7450254f14396"
+        }
+      },
+      "route": "native openai-codex; each CLI uses its own configured authentication"
+    }
+  },
+  "aggregate": {
+    "pi": {
+      "total": {
+        "wall_ms": 213341,
+        "model_calls": 35,
+        "tool_calls": 48,
+        "tool_failures": 3,
+        "tool_ms_sum": 17875,
+        "provider_ms_sum": 169642,
+        "residual_ms": 25824,
+        "total_tokens": 83300,
+        "input": 76659,
+        "uncached": 56179,
+        "cache": 20480,
+        "output": 6641,
+        "reasoning": 2853,
+        "files_modified": 8,
+        "files_added": 4
+      },
+      "errors": {
+        "read-missing": 1,
+        "other-error": 1,
+        "patch-reject": 1
+      },
+      "pairs": 7,
+      "by_tool": {
+        "read": {
+          "calls": 25,
+          "failures": 1,
+          "ms": 163
+        },
+        "bash": {
+          "calls": 16,
+          "failures": 2,
+          "ms": 17692
+        },
+        "write": {
+          "calls": 3,
+          "failures": 0,
+          "ms": 8
+        },
+        "edit": {
+          "calls": 4,
+          "failures": 0,
+          "ms": 12
+        }
+      }
+    },
+    "slim": {
+      "total": {
+        "wall_ms": 238790,
+        "model_calls": 32,
+        "tool_calls": 46,
+        "tool_failures": 1,
+        "tool_ms_sum": 22882,
+        "provider_ms_sum": 212285,
+        "residual_ms": 3623,
+        "total_tokens": 108612,
+        "input": 101249,
+        "uncached": 85377,
+        "cache": 15872,
+        "output": 7363,
+        "reasoning": 3483,
+        "files_modified": 8,
+        "files_added": 4
+      },
+      "errors": {
+        "shell-syntax": 1
+      },
+      "pairs": 7,
+      "by_tool": {
+        "read": {
+          "calls": 23,
+          "failures": 0,
+          "ms": 147
+        },
+        "list": {
+          "calls": 4,
+          "failures": 0,
+          "ms": 1
+        },
+        "write": {
+          "calls": 3,
+          "failures": 0,
+          "ms": 3
+        },
+        "shell": {
+          "calls": 9,
+          "failures": 1,
+          "ms": 22674
+        },
+        "patch": {
+          "calls": 7,
+          "failures": 0,
+          "ms": 57
+        }
+      }
+    }
+  },
+  "paired": {
+    "stats": {
+      "pairs": 7,
+      "slim_token_wins": 2,
+      "median_token_ratio": 1.1872101055955788,
+      "median_wall_ratio": 1.169148035652044,
+      "per_scenario": {
+        "merge_ranges": {
+          "pairs": 2,
+          "slim_tokens": 23790,
+          "pi_tokens": 18836,
+          "ratios": [
+            1.1872101055955788,
+            1.351258186832127
+          ]
+        },
+        "repair_catalog": {
+          "pairs": 1,
+          "slim_tokens": 11201,
+          "pi_tokens": 9865,
+          "ratios": [
+            1.1354282818043588
+          ]
+        },
+        "json_cli": {
+          "pairs": 1,
+          "slim_tokens": 28259,
+          "pi_tokens": 14323,
+          "ratios": [
+            1.972980520840606
+          ]
+        },
+        "js_pagination": {
+          "pairs": 1,
+          "slim_tokens": 11687,
+          "pi_tokens": 13342,
+          "ratios": [
+            0.8759556288412532
+          ]
+        },
+        "ledger_audit": {
+          "pairs": 1,
+          "slim_tokens": 11971,
+          "pi_tokens": 14103,
+          "ratios": [
+            0.8488264908175566
+          ]
+        },
+        "config_migration": {
+          "pairs": 1,
+          "slim_tokens": 21704,
+          "pi_tokens": 12831,
+          "ratios": [
+            1.6915283298262023
+          ]
+        }
+      }
+    },
+    "pairs": [
+      {
+        "campaign": "20260915-193525Z",
+        "scenario": "merge_ranges",
+        "slim_tokens": 12030,
+        "pi_tokens": 10133,
+        "token_ratio": 1.1872101055955788,
+        "wall_ratio": 1.216543864106566,
+        "slim_calls": 4,
+        "pi_calls": 5,
+        "turns": [
+          {
+            "turn": 1,
+            "slim": {
+              "in": 2006,
+              "out": 99,
+              "hist_bytes": 924,
+              "tools": [
+                "read",
+                "read",
+                "list"
+              ]
+            },
+            "pi": {
+              "in": 1152,
+              "out": 92,
+              "hist_bytes": 247,
+              "tools": [
+                "read",
+                "bash"
+              ]
+            }
+          },
+          {
+            "turn": 2,
+            "slim": {
+              "in": 2567,
+              "out": 644,
+              "hist_bytes": 3022,
+              "tools": [
+                "write"
+              ]
+            },
+            "pi": {
+              "in": 1513,
+              "out": 31,
+              "hist_bytes": 3204,
+              "tools": [
+                "read"
+              ]
+            }
+          },
+          {
+            "turn": 3,
+            "slim": {
+              "in": 3255,
+              "out": 25,
+              "hist_bytes": 8262,
+              "tools": [
+                "shell"
+              ]
+            },
+            "pi": {
+              "in": 1841,
+              "out": 562,
+              "hist_bytes": 5969,
+              "tools": [
+                "write"
+              ]
+            }
+          },
+          {
+            "turn": 4,
+            "slim": {
+              "in": 3324,
+              "out": 110,
+              "hist_bytes": 8478,
+              "tools": []
+            },
+            "pi": {
+              "in": 2418,
+              "out": 24,
+              "hist_bytes": 10637,
+              "tools": [
+                "bash"
+              ]
+            }
+          },
+          {
+            "turn": 5,
+            "slim": {
+              "in": null,
+              "out": null,
+              "hist_bytes": null,
+              "tools": null
+            },
+            "pi": {
+              "in": 2472,
+              "out": 28,
+              "hist_bytes": 11005,
+              "tools": []
+            }
+          }
+        ]
+      },
+      {
+        "campaign": "20260915-193920Z",
+        "scenario": "merge_ranges",
+        "slim_tokens": 11760,
+        "pi_tokens": 8703,
+        "token_ratio": 1.351258186832127,
+        "wall_ratio": 0.8123446113933629,
+        "slim_calls": 4,
+        "pi_calls": 4,
+        "turns": [
+          {
+            "turn": 1,
+            "slim": {
+              "in": 2006,
+              "out": 93,
+              "hist_bytes": 924,
+              "tools": [
+                "read",
+                "read",
+                "list"
+              ]
+            },
+            "pi": {
+              "in": 1152,
+              "out": 93,
+              "hist_bytes": 247,
+              "tools": [
+                "read",
+                "read",
+                "read",
+                "bash"
+              ]
+            }
+          },
+          {
+            "turn": 2,
+            "slim": {
+              "in": 2561,
+              "out": 577,
+              "hist_bytes": 2972,
+              "tools": [
+                "write"
+              ]
+            },
+            "pi": {
+              "in": 1846,
+              "out": 591,
+              "hist_bytes": 4769,
+              "tools": [
+                "write"
+              ]
+            }
+          },
+          {
+            "turn": 3,
+            "slim": {
+              "in": 3185,
+              "out": 37,
+              "hist_bytes": 7543,
+              "tools": [
+                "shell"
+              ]
+            },
+            "pi": {
+              "in": 2452,
+              "out": 24,
+              "hist_bytes": 9615,
+              "tools": [
+                "bash"
+              ]
+            }
+          },
+          {
+            "turn": 4,
+            "slim": {
+              "in": 3266,
+              "out": 35,
+              "hist_bytes": 9283,
+              "tools": []
+            },
+            "pi": {
+              "in": 2506,
+              "out": 39,
+              "hist_bytes": 9983,
+              "tools": []
+            }
+          }
+        ]
+      },
+      {
+        "campaign": "20260915-194013Z-repair_catalog",
+        "scenario": "repair_catalog",
+        "slim_tokens": 11201,
+        "pi_tokens": 9865,
+        "token_ratio": 1.1354282818043588,
+        "wall_ratio": 0.9894364467154719,
+        "slim_calls": 4,
+        "pi_calls": 5,
+        "turns": [
+          {
+            "turn": 1,
+            "slim": {
+              "in": 2008,
+              "out": 102,
+              "hist_bytes": 935,
+              "tools": [
+                "read",
+                "read",
+                "read",
+                "read"
+              ]
+            },
+            "pi": {
+              "in": 1147,
+              "out": 100,
+              "hist_bytes": 225,
+              "tools": [
+                "read",
+                "bash",
+                "bash"
+              ]
+            }
+          },
+          {
+            "turn": 2,
+            "slim": {
+              "in": 2573,
+              "out": 330,
+              "hist_bytes": 3125,
+              "tools": [
+                "patch"
+              ]
+            },
+            "pi": {
+              "in": 1551,
+              "out": 80,
+              "hist_bytes": 3537,
+              "tools": [
+                "read",
+                "read",
+                "read"
+              ]
+            }
+          },
+          {
+            "turn": 3,
+            "slim": {
+              "in": 3002,
+              "out": 37,
+              "hist_bytes": 6528,
+              "tools": [
+                "shell"
+              ]
+            },
+            "pi": {
+              "in": 1996,
+              "out": 265,
+              "hist_bytes": 7401,
+              "tools": [
+                "edit"
+              ]
+            }
+          },
+          {
+            "turn": 4,
+            "slim": {
+              "in": 3077,
+              "out": 72,
+              "hist_bytes": 8274,
+              "tools": []
+            },
+            "pi": {
+              "in": 2282,
+              "out": 33,
+              "hist_bytes": 10414,
+              "tools": [
+                "bash"
+              ]
+            }
+          },
+          {
+            "turn": 5,
+            "slim": {
+              "in": null,
+              "out": null,
+              "hist_bytes": null,
+              "tools": null
+            },
+            "pi": {
+              "in": 2339,
+              "out": 72,
+              "hist_bytes": 12223,
+              "tools": []
+            }
+          }
+        ]
+      },
+      {
+        "campaign": "20260915-194056Z-json_cli",
+        "scenario": "json_cli",
+        "slim_tokens": 28259,
+        "pi_tokens": 14323,
+        "token_ratio": 1.972980520840606,
+        "wall_ratio": 1.169148035652044,
+        "slim_calls": 7,
+        "pi_calls": 5,
+        "turns": [
+          {
+            "turn": 1,
+            "slim": {
+              "in": 2016,
+              "out": 106,
+              "hist_bytes": 960,
+              "tools": [
+                "read",
+                "read",
+                "list",
+                "list"
+              ]
+            },
+            "pi": {
+              "in": 1151,
+              "out": 87,
+              "hist_bytes": 243,
+              "tools": [
+                "read",
+                "bash"
+              ]
+            }
+          },
+          {
+            "turn": 2,
+            "slim": {
+              "in": 2697,
+              "out": 40,
+              "hist_bytes": 3154,
+              "tools": [
+                "read"
+              ]
+            },
+            "pi": {
+              "in": 1530,
+              "out": 76,
+              "hist_bytes": 3354,
+              "tools": [
+                "read",
+                "read"
+              ]
+            }
+          },
+          {
+            "turn": 3,
+            "slim": {
+              "in": 2829,
+              "out": 1268,
+              "hist_bytes": 4919,
+              "tools": [
+                "write"
+              ]
+            },
+            "pi": {
+              "in": 2092,
+              "out": 1546,
+              "hist_bytes": 7433,
+              "tools": [
+                "write"
+              ]
+            }
+          },
+          {
+            "turn": 4,
+            "slim": {
+              "in": 4143,
+              "out": 41,
+              "hist_bytes": 13314,
+              "tools": [
+                "shell"
+              ]
+            },
+            "pi": {
+              "in": 3654,
+              "out": 35,
+              "hist_bytes": 19338,
+              "tools": [
+                "bash"
+              ]
+            }
+          },
+          {
+            "turn": 5,
+            "slim": {
+              "in": 4223,
+              "out": 690,
+              "hist_bytes": 15079,
+              "tools": [
+                "patch"
+              ]
+            },
+            "pi": {
+              "in": 3714,
+              "out": 438,
+              "hist_bytes": 21231,
+              "tools": []
+            }
+          },
+          {
+            "turn": 6,
+            "slim": {
+              "in": 5006,
+              "out": 42,
+              "hist_bytes": 22979,
+              "tools": [
+                "shell"
+              ]
+            },
+            "pi": {
+              "in": null,
+              "out": null,
+              "hist_bytes": null,
+              "tools": null
+            }
+          },
+          {
+            "turn": 7,
+            "slim": {
+              "in": 5077,
+              "out": 81,
+              "hist_bytes": 24760,
+              "tools": []
+            },
+            "pi": {
+              "in": null,
+              "out": null,
+              "hist_bytes": null,
+              "tools": null
+            }
+          }
+        ]
+      },
+      {
+        "campaign": "20260915-194323Z-js_pagination",
+        "scenario": "js_pagination",
+        "slim_tokens": 11687,
+        "pi_tokens": 13342,
+        "token_ratio": 0.8759556288412532,
+        "wall_ratio": 0.739198210715375,
+        "slim_calls": 4,
+        "pi_calls": 5,
+        "turns": [
+          {
+            "turn": 1,
+            "slim": {
+              "in": 2011,
+              "out": 129,
+              "hist_bytes": 935,
+              "tools": [
+                "read",
+                "read",
+                "read",
+                "read"
+              ]
+            },
+            "pi": {
+              "in": 1148,
+              "out": 118,
+              "hist_bytes": 228,
+              "tools": [
+                "bash",
+                "read",
+                "read"
+              ]
+            }
+          },
+          {
+            "turn": 2,
+            "slim": {
+              "in": 2732,
+              "out": 327,
+              "hist_bytes": 3208,
+              "tools": [
+                "patch"
+              ]
+            },
+            "pi": {
+              "in": 1930,
+              "out": 60,
+              "hist_bytes": 4858,
+              "tools": [
+                "read",
+                "read"
+              ]
+            }
+          },
+          {
+            "turn": 3,
+            "slim": {
+              "in": 3157,
+              "out": 41,
+              "hist_bytes": 6181,
+              "tools": [
+                "shell"
+              ]
+            },
+            "pi": {
+              "in": 2098,
+              "out": 535,
+              "hist_bytes": 7285,
+              "tools": [
+                "edit"
+              ]
+            }
+          },
+          {
+            "turn": 4,
+            "slim": {
+              "in": 3235,
+              "out": 55,
+              "hist_bytes": 7942,
+              "tools": []
+            },
+            "pi": {
+              "in": 2655,
+              "out": 85,
+              "hist_bytes": 11737,
+              "tools": [
+                "bash",
+                "bash"
+              ]
+            }
+          },
+          {
+            "turn": 5,
+            "slim": {
+              "in": null,
+              "out": null,
+              "hist_bytes": null,
+              "tools": null
+            },
+            "pi": {
+              "in": 4448,
+              "out": 265,
+              "hist_bytes": 21614,
+              "tools": []
+            }
+          }
+        ]
+      },
+      {
+        "campaign": "20260915-194416Z-ledger_audit",
+        "scenario": "ledger_audit",
+        "slim_tokens": 11971,
+        "pi_tokens": 14103,
+        "token_ratio": 0.8488264908175566,
+        "wall_ratio": 1.42943807116469,
+        "slim_calls": 3,
+        "pi_calls": 5,
+        "turns": [
+          {
+            "turn": 1,
+            "slim": {
+              "in": 2011,
+              "out": 114,
+              "hist_bytes": 939,
+              "tools": [
+                "read",
+                "read",
+                "read"
+              ]
+            },
+            "pi": {
+              "in": 1154,
+              "out": 91,
+              "hist_bytes": 247,
+              "tools": [
+                "bash",
+                "read"
+              ]
+            }
+          },
+          {
+            "turn": 2,
+            "slim": {
+              "in": 3847,
+              "out": 977,
+              "hist_bytes": 3112,
+              "tools": [
+                "shell"
+              ]
+            },
+            "pi": {
+              "in": 1516,
+              "out": 65,
+              "hist_bytes": 3255,
+              "tools": [
+                "read",
+                "read"
+              ]
+            }
+          },
+          {
+            "turn": 3,
+            "slim": {
+              "in": 4909,
+              "out": 113,
+              "hist_bytes": 11734,
+              "tools": []
+            },
+            "pi": {
+              "in": 3193,
+              "out": 430,
+              "hist_bytes": 10351,
+              "tools": [
+                "bash"
+              ]
+            }
+          },
+          {
+            "turn": 4,
+            "slim": {
+              "in": null,
+              "out": null,
+              "hist_bytes": null,
+              "tools": null
+            },
+            "pi": {
+              "in": 3695,
+              "out": 60,
+              "hist_bytes": 14387,
+              "tools": [
+                "read"
+              ]
+            }
+          },
+          {
+            "turn": 5,
+            "slim": {
+              "in": null,
+              "out": null,
+              "hist_bytes": null,
+              "tools": null
+            },
+            "pi": {
+              "in": 3818,
+              "out": 81,
+              "hist_bytes": 16600,
+              "tools": []
+            }
+          }
+        ]
+      },
+      {
+        "campaign": "20260915-194520Z-config_migration",
+        "scenario": "config_migration",
+        "slim_tokens": 21704,
+        "pi_tokens": 12831,
+        "token_ratio": 1.6915283298262023,
+        "wall_ratio": 1.5118184683265048,
+        "slim_calls": 6,
+        "pi_calls": 6,
+        "turns": [
+          {
+            "turn": 1,
+            "slim": {
+              "in": 2017,
+              "out": 155,
+              "hist_bytes": 992,
+              "tools": [
+                "read",
+                "read",
+                "read",
+                "read",
+                "read"
+              ]
+            },
+            "pi": {
+              "in": 1146,
+              "out": 98,
+              "hist_bytes": 224,
+              "tools": [
+                "read",
+                "bash"
+              ]
+            }
+          },
+          {
+            "turn": 2,
+            "slim": {
+              "in": 2770,
+              "out": 519,
+              "hist_bytes": 3452,
+              "tools": [
+                "patch",
+                "patch"
+              ]
+            },
+            "pi": {
+              "in": 1509,
+              "out": 99,
+              "hist_bytes": 3266,
+              "tools": [
+                "read",
+                "read",
+                "read",
+                "read"
+              ]
+            }
+          },
+          {
+            "turn": 3,
+            "slim": {
+              "in": 3436,
+              "out": 53,
+              "hist_bytes": 7761,
+              "tools": [
+                "shell"
+              ]
+            },
+            "pi": {
+              "in": 2097,
+              "out": 250,
+              "hist_bytes": 7691,
+              "tools": [
+                "edit"
+              ]
+            }
+          },
+          {
+            "turn": 4,
+            "slim": {
+              "in": 3784,
+              "out": 271,
+              "hist_bytes": 9630,
+              "tools": [
+                "patch",
+                "patch"
+              ]
+            },
+            "pi": {
+              "in": 2370,
+              "out": 111,
+              "hist_bytes": 10732,
+              "tools": [
+                "edit"
+              ]
+            }
+          },
+          {
+            "turn": 5,
+            "slim": {
+              "in": 4206,
+              "out": 63,
+              "hist_bytes": 12599,
+              "tools": [
+                "shell"
+              ]
+            },
+            "pi": {
+              "in": 2504,
+              "out": 36,
+              "hist_bytes": 11391,
+              "tools": [
+                "bash"
+              ]
+            }
+          },
+          {
+            "turn": 6,
+            "slim": {
+              "in": 4313,
+              "out": 117,
+              "hist_bytes": 14518,
+              "tools": []
+            },
+            "pi": {
+              "in": 2570,
+              "out": 41,
+              "hist_bytes": 13310,
+              "tools": []
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "arms": [
+    {
+      "campaign": "20260915-193525Z",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-193525Z",
+      "wall_ms": 27551,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 0,
+      "fixtures_unchanged": true,
+      "model_calls": 5,
+      "tool_calls": 5,
+      "tool_failures": 0,
+      "tool_ms_sum": 2157,
+      "provider_ms_sum": 20701,
+      "residual_ms": 4693,
+      "total_tokens": 10133,
+      "input": 9396,
+      "uncached": 7860,
+      "cache": 1536,
+      "output": 737,
+      "reasoning": 287,
+      "provider_ms": 20701,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [
+          "ranges.py"
+        ]
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "input": 1152,
+          "uncached": 1152,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 92,
+          "reasoning": 8,
+          "provider_ms": 3865,
+          "tools": [
+            "read",
+            "bash"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 247
+        },
+        {
+          "turn": 2,
+          "input": 1513,
+          "uncached": 1513,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 31,
+          "reasoning": 11,
+          "provider_ms": 1928,
+          "tools": [
+            "read"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 3204
+        },
+        {
+          "turn": 3,
+          "input": 1841,
+          "uncached": 1841,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 562,
+          "reasoning": 268,
+          "provider_ms": 11356,
+          "tools": [
+            "write"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 5969
+        },
+        {
+          "turn": 4,
+          "input": 2418,
+          "uncached": 882,
+          "cache": 1536,
+          "cache_write": 0,
+          "output": 24,
+          "reasoning": 0,
+          "provider_ms": 1897,
+          "tools": [
+            "bash"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 10637
+        },
+        {
+          "turn": 5,
+          "input": 2472,
+          "uncached": 2472,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 28,
+          "reasoning": 0,
+          "provider_ms": 1655,
+          "tools": [],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 11005
+        }
+      ],
+      "tools": [
+        {
+          "call_id": "call_RYsjDl2PLuUH73xMvdOZOlWr|fc_0b1bb069d0825550016aa99e102e2887d2a085475c365cc33a",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 12,
+          "args": "{\"path\": \"SPEC.md\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:475c365cc33a"
+        },
+        {
+          "call_id": "call_2RIQp0vwnLqLRTy0kZOEjO1x|fc_0b1bb069d0825550016aa99e102e4487d298e2709e75387ad9",
+          "name": "bash",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 471,
+          "args": "{\"command\": \"ls -la && printf '\\\\n--- files ---\\\\n' && find . -maxdepth 2 -type f -not -path './.git/*' -print\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:709e75387ad9"
+        },
+        {
+          "call_id": "call_gdf7X0QH3Bg9YUQHYGl5HAJ9|fc_0b1bb069d0825550016aa99e128cc487d28de995841f9354ca",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 1,
+          "args": "{\"path\": \"check.py\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:95841f9354ca"
+        },
+        {
+          "call_id": "call_Kn6AbY7FEQOrD4KhFI1hXsUl|fc_0b1bb069d0825550016aa99e19696487d2be0546423de04e1d",
+          "name": "write",
+          "turn": 4,
+          "success": true,
+          "duration_ms": 2,
+          "args": "{\"path\": \"ranges.py\", \"content\": \"\\\"\\\"\\\"Utilities for merging closed integer ranges.\\\"\\\"\\\"\\n\\n\\ndef merge_ranges(ranges)...",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:46423de04e1d"
+        },
+        {
+          "call_id": "call_6cscpuTAEehK9tlMoKbJqVJV|fc_0b1bb069d0825550016aa99e1f76c087d2a1ce8d9850f489ea",
+          "name": "bash",
+          "turn": 4,
+          "success": true,
+          "duration_ms": 1671,
+          "args": "{\"command\": \"python check.py\", \"timeout\": 120}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:8d9850f489ea"
+        }
+      ],
+      "scenario": "merge_ranges",
+      "order": [
+        "pi",
+        "slim"
+      ]
+    },
+    {
+      "campaign": "20260915-193525Z",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-193525Z",
+      "wall_ms": 33517,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 0,
+      "fixtures_unchanged": true,
+      "model_calls": 4,
+      "tool_calls": 5,
+      "tool_failures": 0,
+      "tool_ms_sum": 995,
+      "provider_ms_sum": 30455,
+      "residual_ms": 2067,
+      "total_tokens": 12030,
+      "input": 11152,
+      "uncached": 11152,
+      "cache": 0,
+      "output": 878,
+      "reasoning": 430,
+      "provider_ms": 30455,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [
+          "ranges.py"
+        ]
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "seq": null,
+          "input": 2006,
+          "uncached": 2006,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 99,
+          "reasoning": 21,
+          "provider_ms": 7989,
+          "tools": [
+            "read",
+            "read",
+            "list"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 924
+        },
+        {
+          "turn": 2,
+          "seq": null,
+          "input": 2567,
+          "uncached": 2567,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 644,
+          "reasoning": 335,
+          "provider_ms": 15652,
+          "tools": [
+            "write"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 3022
+        },
+        {
+          "turn": 3,
+          "seq": null,
+          "input": 3255,
+          "uncached": 3255,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 25,
+          "reasoning": 0,
+          "provider_ms": 2009,
+          "tools": [
+            "shell"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 8262
+        },
+        {
+          "turn": 4,
+          "seq": null,
+          "input": 3324,
+          "uncached": 3324,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 110,
+          "reasoning": 74,
+          "provider_ms": 4805,
+          "tools": [],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 8478
+        }
+      ],
+      "tools": [
+        {
+          "call_id": "call_F3ba1iUopzW2HVtlq6g52FM1",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 4,
+          "args": "{\"path\":\"SPEC.md\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...q6g52FM1"
+        },
+        {
+          "call_id": "call_sngh1Pagh3P5goBUBHtw2sXl",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 8,
+          "args": "{\"path\":\"check.py\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...BHtw2sXl"
+        },
+        {
+          "call_id": "call_4SWIXc6kB2bccdMcpBJhDZB6",
+          "name": "list",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 0,
+          "args": "{\"path\":\"\",\"max_entries\":100}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...pBJhDZB6"
+        },
+        {
+          "call_id": "call_6kmmMy6V6f6bWDJqdAGke2K0",
+          "name": "write",
+          "turn": 2,
+          "seq": null,
+          "success": true,
+          "duration_ms": 1,
+          "args": "{\"path\":\"ranges.py\",\"content\":\"\\\"\\\"\\\"Utilities for validating and merging closed integer ranges.\\\"\\\"\\\"\\n\\n\\ndef merge_ra...",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...dAGke2K0"
+        },
+        {
+          "call_id": "call_UY11FuQeRXpPksQuMl1luYdk",
+          "name": "shell",
+          "turn": 3,
+          "seq": null,
+          "success": true,
+          "duration_ms": 982,
+          "args": "{\"command\":\"python check.py\",\"timeout_ms\":120000}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...Ml1luYdk"
+        }
+      ],
+      "scenario": "merge_ranges",
+      "order": [
+        "pi",
+        "slim"
+      ]
+    },
+    {
+      "campaign": "20260915-193920Z",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-193920Z",
+      "wall_ms": 27753,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 0,
+      "fixtures_unchanged": true,
+      "model_calls": 4,
+      "tool_calls": 6,
+      "tool_failures": 1,
+      "tool_ms_sum": 1016,
+      "provider_ms_sum": 22293,
+      "residual_ms": 4444,
+      "total_tokens": 8703,
+      "input": 7956,
+      "uncached": 6420,
+      "cache": 1536,
+      "output": 747,
+      "reasoning": 229,
+      "provider_ms": 22293,
+      "error_breakdown": {
+        "read-missing": 1
+      },
+      "workspace_diff": {
+        "modified": [],
+        "added": [
+          "ranges.py"
+        ]
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "input": 1152,
+          "uncached": 1152,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 93,
+          "reasoning": 13,
+          "provider_ms": 4487,
+          "tools": [
+            "read",
+            "read",
+            "read",
+            "bash"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 247
+        },
+        {
+          "turn": 2,
+          "input": 1846,
+          "uncached": 1846,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 591,
+          "reasoning": 216,
+          "provider_ms": 12489,
+          "tools": [
+            "write"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 4769
+        },
+        {
+          "turn": 3,
+          "input": 2452,
+          "uncached": 2452,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 24,
+          "reasoning": 0,
+          "provider_ms": 2940,
+          "tools": [
+            "bash"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 9615
+        },
+        {
+          "turn": 4,
+          "input": 2506,
+          "uncached": 970,
+          "cache": 1536,
+          "cache_write": 0,
+          "output": 39,
+          "reasoning": 0,
+          "provider_ms": 2377,
+          "tools": [],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 9983
+        }
+      ],
+      "tools": [
+        {
+          "call_id": "call_jyQQOQbyenVL95V2IQ5QOPwl|fc_09d8efcfce78f25c016aa99f12c93087d2b2fddc0dac3e7c4a",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 10,
+          "args": "{\"path\": \"SPEC.md\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:dc0dac3e7c4a"
+        },
+        {
+          "call_id": "call_gNKAVvw2g5Ih4p8lDSLkEuJp|fc_09d8efcfce78f25c016aa99f12c94087d29b30ee03803345fc",
+          "name": "read",
+          "turn": 2,
+          "success": false,
+          "duration_ms": 8,
+          "args": "{\"path\": \"ranges.py\"}",
+          "error_kind": "read-missing",
+          "error": "ENOENT: no such file or directory, access 'C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-0y_pji68\\pi\\ranges.py'",
+          "trace": "pi.audit.jsonl:ee03803345fc"
+        },
+        {
+          "call_id": "call_SniyuZv61dsbJVh7CJKLJv4U|fc_09d8efcfce78f25c016aa99f12c94887d2b70658bc257c2ef4",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 10,
+          "args": "{\"path\": \"check.py\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:58bc257c2ef4"
+        },
+        {
+          "call_id": "call_o5stmIXNeLmSEhoI0VjEeP1z|fc_09d8efcfce78f25c016aa99f12c94c87d29dcf1f38f98b4639",
+          "name": "bash",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 284,
+          "args": "{\"command\": \"ls -la\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:1f38f98b4639"
+        },
+        {
+          "call_id": "call_LsjxrvIRmkDV4L6xYDdtMmLW|fc_09d8efcfce78f25c016aa99f196cf087d29ade2afb3c8efdbb",
+          "name": "write",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 3,
+          "args": "{\"path\": \"ranges.py\", \"content\": \"\\\"\\\"\\\"Utilities for validating and merging closed integer ranges.\\\"\\\"\\\"\\n\\n\\ndef merge...",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:2afb3c8efdbb"
+        },
+        {
+          "call_id": "call_DifKucgTcmKNMppPJcrxYsH3|fc_09d8efcfce78f25c016aa99f22417087d2b27dfb246a6d70c6",
+          "name": "bash",
+          "turn": 3,
+          "success": true,
+          "duration_ms": 701,
+          "args": "{\"command\": \"python check.py\", \"timeout\": 120}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:fb246a6d70c6"
+        }
+      ],
+      "scenario": "merge_ranges",
+      "order": [
+        "slim",
+        "pi"
+      ]
+    },
+    {
+      "campaign": "20260915-193920Z",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-193920Z",
+      "wall_ms": 22545,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 0,
+      "fixtures_unchanged": true,
+      "model_calls": 4,
+      "tool_calls": 5,
+      "tool_failures": 0,
+      "tool_ms_sum": 1030,
+      "provider_ms_sum": 21370,
+      "residual_ms": 145,
+      "total_tokens": 11760,
+      "input": 11018,
+      "uncached": 9482,
+      "cache": 1536,
+      "output": 742,
+      "reasoning": 286,
+      "provider_ms": 21370,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [
+          "ranges.py"
+        ]
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "seq": null,
+          "input": 2006,
+          "uncached": 2006,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 93,
+          "reasoning": 15,
+          "provider_ms": 4565,
+          "tools": [
+            "read",
+            "read",
+            "list"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 924
+        },
+        {
+          "turn": 2,
+          "seq": null,
+          "input": 2561,
+          "uncached": 1025,
+          "cache": 1536,
+          "cache_write": 0,
+          "output": 577,
+          "reasoning": 261,
+          "provider_ms": 12592,
+          "tools": [
+            "write"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 2972
+        },
+        {
+          "turn": 3,
+          "seq": null,
+          "input": 3185,
+          "uncached": 3185,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 37,
+          "reasoning": 10,
+          "provider_ms": 2168,
+          "tools": [
+            "shell"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 7543
+        },
+        {
+          "turn": 4,
+          "seq": null,
+          "input": 3266,
+          "uncached": 3266,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 35,
+          "reasoning": 0,
+          "provider_ms": 2045,
+          "tools": [],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 9283
+        }
+      ],
+      "tools": [
+        {
+          "call_id": "call_rzP8HuQt7pjPiefXogSF2CSe",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 4,
+          "args": "{\"path\":\"SPEC.md\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...ogSF2CSe"
+        },
+        {
+          "call_id": "call_FUcAn6y1HIzoU3kdnojS0WYR",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 8,
+          "args": "{\"path\":\"check.py\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...nojS0WYR"
+        },
+        {
+          "call_id": "call_ECoq5BM4ZKiWI1qkwIVT7HLa",
+          "name": "list",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 0,
+          "args": "{\"path\":\"\",\"max_entries\":200}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...wIVT7HLa"
+        },
+        {
+          "call_id": "call_u7B1w5Eh5jUGbx0O3ii74nTA",
+          "name": "write",
+          "turn": 2,
+          "seq": null,
+          "success": true,
+          "duration_ms": 1,
+          "args": "{\"path\":\"ranges.py\",\"content\":\"\\\"\\\"\\\"Utilities for working with integer ranges.\\\"\\\"\\\"\\n\\n\\ndef merge_ranges(ranges):\\n \\...",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...3ii74nTA"
+        },
+        {
+          "call_id": "call_aELq5ClKI44hEsAR2Y3GFiNS",
+          "name": "shell",
+          "turn": 3,
+          "seq": null,
+          "success": true,
+          "duration_ms": 1017,
+          "args": "{\"command\":\"python check.py\",\"timeout_ms\":120000}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...2Y3GFiNS"
+        }
+      ],
+      "scenario": "merge_ranges",
+      "order": [
+        "slim",
+        "pi"
+      ]
+    },
+    {
+      "campaign": "20260915-194013Z-repair_catalog",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-194013Z-repair_catalog",
+      "wall_ms": 20353,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 0,
+      "fixtures_unchanged": true,
+      "model_calls": 5,
+      "tool_calls": 8,
+      "tool_failures": 1,
+      "tool_ms_sum": 2408,
+      "provider_ms_sum": 15380,
+      "residual_ms": 2565,
+      "total_tokens": 9865,
+      "input": 9315,
+      "uncached": 6243,
+      "cache": 3072,
+      "output": 550,
+      "reasoning": 116,
+      "provider_ms": 15380,
+      "error_breakdown": {
+        "other-error": 1
+      },
+      "workspace_diff": {
+        "modified": [
+          "catalog.py",
+          "formatting.py"
+        ],
+        "added": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "input": 1147,
+          "uncached": 1147,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 100,
+          "reasoning": 9,
+          "provider_ms": 3272,
+          "tools": [
+            "read",
+            "bash",
+            "bash"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 225
+        },
+        {
+          "turn": 2,
+          "input": 1551,
+          "uncached": 1551,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 80,
+          "reasoning": 15,
+          "provider_ms": 2331,
+          "tools": [
+            "read",
+            "read",
+            "read"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 3537
+        },
+        {
+          "turn": 3,
+          "input": 1996,
+          "uncached": 1996,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 265,
+          "reasoning": 85,
+          "provider_ms": 6029,
+          "tools": [
+            "edit"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 7401
+        },
+        {
+          "turn": 4,
+          "input": 2282,
+          "uncached": 746,
+          "cache": 1536,
+          "cache_write": 0,
+          "output": 33,
+          "reasoning": 7,
+          "provider_ms": 1604,
+          "tools": [
+            "bash"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 10414
+        },
+        {
+          "turn": 5,
+          "input": 2339,
+          "uncached": 803,
+          "cache": 1536,
+          "cache_write": 0,
+          "output": 72,
+          "reasoning": 0,
+          "provider_ms": 2144,
+          "tools": [],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 12223
+        }
+      ],
+      "tools": [
+        {
+          "call_id": "call_p7AevPLpBpdP27Uz3Ym3hmYw|fc_0e1aae94d9e6bc0d016aa99f2e70fc87d286cb60dcc5f5d175",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 59,
+          "args": "{\"path\": \"SPEC.md\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:60dcc5f5d175"
+        },
+        {
+          "call_id": "call_WzXBAjBsrfMZLxCcuDybz5FI|fc_0e1aae94d9e6bc0d016aa99f2e711087d2b1e6d63efd1b83d7",
+          "name": "bash",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 825,
+          "args": "{\"command\": \"ls -la && find . -maxdepth 2 -type f -not -path './.git/*' -print\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:d63efd1b83d7"
+        },
+        {
+          "call_id": "call_oxb8A5QY2lXr6ym3z8AsRSLD|fc_0e1aae94d9e6bc0d016aa99f2e712087d289d47e6e8c4f0c50",
+          "name": "bash",
+          "turn": 2,
+          "success": false,
+          "duration_ms": 823,
+          "args": "{\"command\": \"git status --short\"}",
+          "error_kind": "other-error",
+          "error": "fatal: not a git repository (or any of the parent directories): .git Command exited with code 128",
+          "trace": "pi.audit.jsonl:7e6e8c4f0c50"
+        },
+        {
+          "call_id": "call_kasDfyBuAAh0UOVxO9XjcDcK|fc_0e1aae94d9e6bc0d016aa99f31999487d2bca1f72ad872760b",
+          "name": "read",
+          "turn": 3,
+          "success": true,
+          "duration_ms": 2,
+          "args": "{\"path\": \"catalog.py\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:f72ad872760b"
+        },
+        {
+          "call_id": "call_dalO9S7m9xCO0UucvdPctYWT|fc_0e1aae94d9e6bc0d016aa99f3199a487d29c850c1e0545d7d1",
+          "name": "read",
+          "turn": 3,
+          "success": true,
+          "duration_ms": 2,
+          "args": "{\"path\": \"formatting.py\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:0c1e0545d7d1"
+        },
+        {
+          "call_id": "call_EnFCLMF4UJ60pAH3ldrqk2Wm|fc_0e1aae94d9e6bc0d016aa99f3199ac87d2849226d43b061ba0",
+          "name": "read",
+          "turn": 3,
+          "success": true,
+          "duration_ms": 1,
+          "args": "{\"path\": \"check.py\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:26d43b061ba0"
+        },
+        {
+          "call_id": "call_BKaGBevHRF7KYtGKdqpWdpXH|fc_0e1aae94d9e6bc0d016aa99f353fcc87d2bcb7ddb5dda81d7a",
+          "name": "edit",
+          "turn": 3,
+          "success": true,
+          "duration_ms": 4,
+          "args": "{\"path\": \"catalog.py\", \"edits\": [{\"oldText\": \"def visible_products(products, query):\\n products.sort(key=lambda product:...",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:ddb5dda81d7a"
+        },
+        {
+          "call_id": "call_WNlMz1c67sPfv4cFMknG9rKO|fc_0e1aae94d9e6bc0d016aa99f3937c087d2a822790b23e0cf13",
+          "name": "bash",
+          "turn": 5,
+          "success": true,
+          "duration_ms": 692,
+          "args": "{\"command\": \"python check.py\", \"timeout\": 120}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:790b23e0cf13"
+        }
+      ],
+      "scenario": "repair_catalog",
+      "order": [
+        "pi",
+        "slim"
+      ]
+    },
+    {
+      "campaign": "20260915-194013Z-repair_catalog",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-194013Z-repair_catalog",
+      "wall_ms": 20138,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 0,
+      "fixtures_unchanged": true,
+      "model_calls": 4,
+      "tool_calls": 6,
+      "tool_failures": 0,
+      "tool_ms_sum": 1053,
+      "provider_ms_sum": 17941,
+      "residual_ms": 1144,
+      "total_tokens": 11201,
+      "input": 10660,
+      "uncached": 10660,
+      "cache": 0,
+      "output": 541,
+      "reasoning": 188,
+      "provider_ms": 17941,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [
+          "catalog.py",
+          "formatting.py"
+        ],
+        "added": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "seq": null,
+          "input": 2008,
+          "uncached": 2008,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 102,
+          "reasoning": 23,
+          "provider_ms": 4945,
+          "tools": [
+            "read",
+            "read",
+            "read",
+            "read"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 935
+        },
+        {
+          "turn": 2,
+          "seq": null,
+          "input": 2573,
+          "uncached": 2573,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 330,
+          "reasoning": 155,
+          "provider_ms": 7550,
+          "tools": [
+            "patch"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 3125
+        },
+        {
+          "turn": 3,
+          "seq": null,
+          "input": 3002,
+          "uncached": 3002,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 37,
+          "reasoning": 10,
+          "provider_ms": 2892,
+          "tools": [
+            "shell"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 6528
+        },
+        {
+          "turn": 4,
+          "seq": null,
+          "input": 3077,
+          "uncached": 3077,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 72,
+          "reasoning": 0,
+          "provider_ms": 2554,
+          "tools": [],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 8274
+        }
+      ],
+      "tools": [
+        {
+          "call_id": "call_YVeWlTXs07X2awT6IsXyk8uG",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 1,
+          "args": "{\"path\":\"SPEC.md\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...IsXyk8uG"
+        },
+        {
+          "call_id": "call_WUMpQrbiFQbwScxXCTfsnwdR",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 5,
+          "args": "{\"path\":\"catalog.py\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...CTfsnwdR"
+        },
+        {
+          "call_id": "call_mOYbZIcRiiWohS4c1csCoPkV",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 9,
+          "args": "{\"path\":\"formatting.py\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...1csCoPkV"
+        },
+        {
+          "call_id": "call_wCVJyd6oCTzLqXsrRVIspHBM",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 13,
+          "args": "{\"path\":\"check.py\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...RVIspHBM"
+        },
+        {
+          "call_id": "call_Ey46OUlA6ZxMIFb1yWynTIeJ",
+          "name": "patch",
+          "turn": 2,
+          "seq": null,
+          "success": true,
+          "duration_ms": 6,
+          "args": "{\"path\":\"catalog.py\",\"expected\":\"from formatting import format_price\\n\\ndef visible_products(products, query):\\n product...",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...yWynTIeJ"
+        },
+        {
+          "call_id": "call_IV9kIlOKNmmry8svXkhsuX2S",
+          "name": "shell",
+          "turn": 3,
+          "seq": null,
+          "success": true,
+          "duration_ms": 1019,
+          "args": "{\"command\":\"python check.py\",\"timeout_ms\":120000}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...XkhsuX2S"
+        }
+      ],
+      "scenario": "repair_catalog",
+      "order": [
+        "pi",
+        "slim"
+      ]
+    },
+    {
+      "campaign": "20260915-194056Z-json_cli",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-194056Z-json_cli",
+      "wall_ms": 60249,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 0,
+      "fixtures_unchanged": true,
+      "model_calls": 5,
+      "tool_calls": 6,
+      "tool_failures": 0,
+      "tool_ms_sum": 8738,
+      "provider_ms_sum": 47068,
+      "residual_ms": 4443,
+      "total_tokens": 14323,
+      "input": 12141,
+      "uncached": 10605,
+      "cache": 1536,
+      "output": 2182,
+      "reasoning": 1179,
+      "provider_ms": 47068,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [
+          "tools/report.py"
+        ]
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "input": 1151,
+          "uncached": 1151,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 87,
+          "reasoning": 13,
+          "provider_ms": 3388,
+          "tools": [
+            "read",
+            "bash"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 243
+        },
+        {
+          "turn": 2,
+          "input": 1530,
+          "uncached": 1530,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 76,
+          "reasoning": 21,
+          "provider_ms": 2575,
+          "tools": [
+            "read",
+            "read"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 3354
+        },
+        {
+          "turn": 3,
+          "input": 2092,
+          "uncached": 2092,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 1546,
+          "reasoning": 738,
+          "provider_ms": 29951,
+          "tools": [
+            "write"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 7433
+        },
+        {
+          "turn": 4,
+          "input": 3654,
+          "uncached": 3654,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 35,
+          "reasoning": 9,
+          "provider_ms": 1961,
+          "tools": [
+            "bash"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 19338
+        },
+        {
+          "turn": 5,
+          "input": 3714,
+          "uncached": 2178,
+          "cache": 1536,
+          "cache_write": 0,
+          "output": 438,
+          "reasoning": 398,
+          "provider_ms": 9193,
+          "tools": [],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 21231
+        }
+      ],
+      "tools": [
+        {
+          "call_id": "call_omW0CtKB7j0i0Hv1AcmHKVm1|fc_0c9f89d6ed4a66d8016aa99fa8ca2087d2a1904d376d73dd03",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 10,
+          "args": "{\"path\": \"SPEC.md\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:4d376d73dd03"
+        },
+        {
+          "call_id": "call_1Mo9ZWwmYbMd9icX3zLkZEwJ|fc_0c9f89d6ed4a66d8016aa99fa8ca3887d2a6d066546171b5db",
+          "name": "bash",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 453,
+          "args": "{\"command\": \"ls -la && find . -maxdepth 2 -type f -not -path './.git/*' -print\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:66546171b5db"
+        },
+        {
+          "call_id": "call_kzmDuplx1SFluKUYj3O79C6P|fc_0c9f89d6ed4a66d8016aa99fabdbc087d2b784ab3f64380bee",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 1,
+          "args": "{\"path\": \"check.py\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:ab3f64380bee"
+        },
+        {
+          "call_id": "call_KoJ0j8Y26RgZYipe8Q3xlV9g|fc_0c9f89d6ed4a66d8016aa99fabdbd087d2965aca602aa2bb66",
+          "name": "read",
+          "turn": 3,
+          "success": true,
+          "duration_ms": 1,
+          "args": "{\"path\": \"data/itens de ação.json\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:ca602aa2bb66"
+        },
+        {
+          "call_id": "call_kIyW1NgKC190rMv2z2bnDcSp|fc_0c9f89d6ed4a66d8016aa99fbba65c87d28af284d80017bf8c",
+          "name": "write",
+          "turn": 3,
+          "success": true,
+          "duration_ms": 3,
+          "args": "{\"path\": \"tools/report.py\", \"content\": \"#!/usr/bin/env python3\\n\\\"\\\"\\\"Summarize paid entries by category.\\\"\\\"\\\"\\n\\nimpor...",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:84d80017bf8c"
+        },
+        {
+          "call_id": "call_epDvZ1Zf7MmZq1Pj4aLwJns1|fc_0c9f89d6ed4a66d8016aa99fcbbcc087d29c4c147e1ec188fa",
+          "name": "bash",
+          "turn": 4,
+          "success": true,
+          "duration_ms": 8270,
+          "args": "{\"command\": \"python check.py\", \"timeout\": 10}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:147e1ec188fa"
+        }
+      ],
+      "scenario": "json_cli",
+      "order": [
+        "slim",
+        "pi"
+      ]
+    },
+    {
+      "campaign": "20260915-194056Z-json_cli",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-194056Z-json_cli",
+      "wall_ms": 70440,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 0,
+      "fixtures_unchanged": true,
+      "model_calls": 7,
+      "tool_calls": 9,
+      "tool_failures": 0,
+      "tool_ms_sum": 15812,
+      "provider_ms_sum": 54459,
+      "residual_ms": 169,
+      "total_tokens": 28259,
+      "input": 25991,
+      "uncached": 21895,
+      "cache": 4096,
+      "output": 2268,
+      "reasoning": 1170,
+      "provider_ms": 54459,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [
+          "tools/report.py"
+        ]
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "seq": null,
+          "input": 2016,
+          "uncached": 2016,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 106,
+          "reasoning": 22,
+          "provider_ms": 5017,
+          "tools": [
+            "read",
+            "read",
+            "list",
+            "list"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 960
+        },
+        {
+          "turn": 2,
+          "seq": null,
+          "input": 2697,
+          "uncached": 1161,
+          "cache": 1536,
+          "cache_write": 0,
+          "output": 40,
+          "reasoning": 10,
+          "provider_ms": 2050,
+          "tools": [
+            "read"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 3154
+        },
+        {
+          "turn": 3,
+          "seq": null,
+          "input": 2829,
+          "uncached": 269,
+          "cache": 2560,
+          "cache_write": 0,
+          "output": 1268,
+          "reasoning": 497,
+          "provider_ms": 24139,
+          "tools": [
+            "write"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 4919
+        },
+        {
+          "turn": 4,
+          "seq": null,
+          "input": 4143,
+          "uncached": 4143,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 41,
+          "reasoning": 10,
+          "provider_ms": 3553,
+          "tools": [
+            "shell"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 13314
+        },
+        {
+          "turn": 5,
+          "seq": null,
+          "input": 4223,
+          "uncached": 4223,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 690,
+          "reasoning": 606,
+          "provider_ms": 13997,
+          "tools": [
+            "patch"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 15079
+        },
+        {
+          "turn": 6,
+          "seq": null,
+          "input": 5006,
+          "uncached": 5006,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 42,
+          "reasoning": 11,
+          "provider_ms": 2389,
+          "tools": [
+            "shell"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 22979
+        },
+        {
+          "turn": 7,
+          "seq": null,
+          "input": 5077,
+          "uncached": 5077,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 81,
+          "reasoning": 14,
+          "provider_ms": 3314,
+          "tools": [],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 24760
+        }
+      ],
+      "tools": [
+        {
+          "call_id": "call_N1LHN4USApMoR7NQLghkJbUi",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 5,
+          "args": "{\"path\":\"SPEC.md\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...LghkJbUi"
+        },
+        {
+          "call_id": "call_XsNMRUjdTSpYBis0gbTwsRUe",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 5,
+          "args": "{\"path\":\"check.py\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...gbTwsRUe"
+        },
+        {
+          "call_id": "call_MhkbA6JiakIJ0OjZG9Ud2nUm",
+          "name": "list",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 1,
+          "args": "{\"path\":\"\",\"max_entries\":100}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...G9Ud2nUm"
+        },
+        {
+          "call_id": "call_YUtelyDi1bPbKIHsAYVprppx",
+          "name": "list",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 0,
+          "args": "{\"path\":\"data\",\"max_entries\":100}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...AYVprppx"
+        },
+        {
+          "call_id": "call_lxmoNDRNFbb4vxSfDk0mlRbJ",
+          "name": "read",
+          "turn": 2,
+          "seq": null,
+          "success": true,
+          "duration_ms": 4,
+          "args": "{\"path\":\"data/itens de ação.json\",\"max_lines\":200}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...Dk0mlRbJ"
+        },
+        {
+          "call_id": "call_bZkIeePY9gzP9JspskDtN53Z",
+          "name": "write",
+          "turn": 3,
+          "seq": null,
+          "success": true,
+          "duration_ms": 1,
+          "args": "{\"path\":\"tools/report.py\",\"content\":\"#!/usr/bin/env python3\\n\\\"\\\"\\\"Group paid action items by category.\\\"\\\"\\\"\\n\\nimport ...",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...skDtN53Z"
+        },
+        {
+          "call_id": "call_c4Oyiahd4exx4rVpiZCcxJjW",
+          "name": "shell",
+          "turn": 4,
+          "seq": null,
+          "success": true,
+          "duration_ms": 7961,
+          "args": "{\"command\":\"python\",\"args\":[\"check.py\"],\"timeout_ms\":120000}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...iZCcxJjW"
+        },
+        {
+          "call_id": "call_dl5guCYF6Y5Re1s6m3C5tB6Q",
+          "name": "patch",
+          "turn": 5,
+          "seq": null,
+          "success": true,
+          "duration_ms": 8,
+          "args": "{\"path\":\"tools/report.py\",\"expected\":\" except (OSError, ValueError) as exc:\\n print(f\\\"error: {exc}\\\", file=sys.stderr)\"...",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...m3C5tB6Q"
+        },
+        {
+          "call_id": "call_5Xvyx0L6iqtMvpH7zUt0jSFX",
+          "name": "shell",
+          "turn": 6,
+          "seq": null,
+          "success": true,
+          "duration_ms": 7827,
+          "args": "{\"command\":\"python\",\"args\":[\"check.py\"],\"timeout_ms\":120000}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...zUt0jSFX"
+        }
+      ],
+      "scenario": "json_cli",
+      "order": [
+        "slim",
+        "pi"
+      ]
+    },
+    {
+      "campaign": "20260915-194323Z-js_pagination",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-194323Z-js_pagination",
+      "wall_ms": 29509,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 0,
+      "fixtures_unchanged": true,
+      "model_calls": 5,
+      "tool_calls": 8,
+      "tool_failures": 1,
+      "tool_ms_sum": 1210,
+      "provider_ms_sum": 25385,
+      "residual_ms": 2914,
+      "total_tokens": 13342,
+      "input": 12279,
+      "uncached": 6647,
+      "cache": 5632,
+      "output": 1063,
+      "reasoning": 548,
+      "provider_ms": 25385,
+      "error_breakdown": {
+        "patch-reject": 1
+      },
+      "workspace_diff": {
+        "modified": [
+          "listing.cjs",
+          "pager.cjs"
+        ],
+        "added": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "input": 1148,
+          "uncached": 1148,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 118,
+          "reasoning": 30,
+          "provider_ms": 3591,
+          "tools": [
+            "bash",
+            "read",
+            "read"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 228
+        },
+        {
+          "turn": 2,
+          "input": 1930,
+          "uncached": 1930,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 60,
+          "reasoning": 8,
+          "provider_ms": 2027,
+          "tools": [
+            "read",
+            "read"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 4858
+        },
+        {
+          "turn": 3,
+          "input": 2098,
+          "uncached": 562,
+          "cache": 1536,
+          "cache_write": 0,
+          "output": 535,
+          "reasoning": 271,
+          "provider_ms": 11220,
+          "tools": [
+            "edit"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 7285
+        },
+        {
+          "turn": 4,
+          "input": 2655,
+          "uncached": 1119,
+          "cache": 1536,
+          "cache_write": 0,
+          "output": 85,
+          "reasoning": 20,
+          "provider_ms": 2778,
+          "tools": [
+            "bash",
+            "bash"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 11737
+        },
+        {
+          "turn": 5,
+          "input": 4448,
+          "uncached": 1888,
+          "cache": 2560,
+          "cache_write": 0,
+          "output": 265,
+          "reasoning": 219,
+          "provider_ms": 5769,
+          "tools": [],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 21614
+        }
+      ],
+      "tools": [
+        {
+          "call_id": "call_3dxejGgTbhHqqbmrFVHd7cNC|fc_0ccdc0311ac40aea016aa99fec554c87d29f140304f79b3d0f",
+          "name": "bash",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 100,
+          "args": "{\"command\": \"ls -la && find . -maxdepth 2 -type f -not -path './.git/*' -print\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:0304f79b3d0f"
+        },
+        {
+          "call_id": "call_V2dcvExiAsfYVfVjTu0g9HvS|fc_0ccdc0311ac40aea016aa99fec556487d2b2513706ac84e151",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 8,
+          "args": "{\"path\": \"SPEC.md\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:3706ac84e151"
+        },
+        {
+          "call_id": "call_Tlo78AVXhRwWBGj4JdvCfcZR|fc_0ccdc0311ac40aea016aa99fec556c87d28156599407afb2fa",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 8,
+          "args": "{\"path\": \"check.py\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:599407afb2fa"
+        },
+        {
+          "call_id": "call_yoAi32gmELTrXUKk5DCiBf7k|fc_0ccdc0311ac40aea016aa99fee739c87d286a5288c952c68c7",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 1,
+          "args": "{\"path\": \"pager.cjs\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:288c952c68c7"
+        },
+        {
+          "call_id": "call_pmqIy8phkOGlyMxvT7Hopc6M|fc_0ccdc0311ac40aea016aa99fee73b887d28bcf49e782ffb216",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 2,
+          "args": "{\"path\": \"listing.cjs\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:49e782ffb216"
+        },
+        {
+          "call_id": "call_w8Stbn5Tku9XspKtVuN8sjt2|fc_0ccdc0311ac40aea016aa99ff4d9d087d2ae2d4b5951242dbe",
+          "name": "edit",
+          "turn": 4,
+          "success": true,
+          "duration_ms": 3,
+          "args": "{\"path\": \"pager.cjs\", \"edits\": [{\"oldText\": \"function paginate(items, page, pageSize) {\\n const start = page * pageSize;...",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:4b5951242dbe"
+        },
+        {
+          "call_id": "call_yhpI3o2CMPh3biR4ZVQFHI9w|fc_0ccdc0311ac40aea016aa99ffc73bc87d2840457b2c98cbf50",
+          "name": "bash",
+          "turn": 4,
+          "success": true,
+          "duration_ms": 656,
+          "args": "{\"command\": \"python check.py\", \"timeout\": 10}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:57b2c98cbf50"
+        },
+        {
+          "call_id": "call_QXW3zvp6qYTW4XGYJxQQt4iU|fc_0ccdc0311ac40aea016aa99ffc73d487d2be7d6049b7af59ba",
+          "name": "bash",
+          "turn": 5,
+          "success": false,
+          "duration_ms": 432,
+          "args": "{\"command\": \"git diff -- pager.cjs SPEC.md check.py\"}",
+          "error_kind": "patch-reject",
+          "error": "warning: Limiting comparison with pathspecs is only supported if both paths are directories. usage: git diff --no-index [<options>] <path> <path> [<pathspec>...] Diff output format options -p, --patch...",
+          "trace": "pi.audit.jsonl:6049b7af59ba"
+        }
+      ],
+      "scenario": "js_pagination",
+      "order": [
+        "pi",
+        "slim"
+      ]
+    },
+    {
+      "campaign": "20260915-194323Z-js_pagination",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-194323Z-js_pagination",
+      "wall_ms": 21813,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 0,
+      "fixtures_unchanged": true,
+      "model_calls": 4,
+      "tool_calls": 6,
+      "tool_failures": 0,
+      "tool_ms_sum": 809,
+      "provider_ms_sum": 20946,
+      "residual_ms": 58,
+      "total_tokens": 11687,
+      "input": 11135,
+      "uncached": 8063,
+      "cache": 3072,
+      "output": 552,
+      "reasoning": 105,
+      "provider_ms": 20946,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [
+          "listing.cjs",
+          "pager.cjs"
+        ],
+        "added": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "seq": null,
+          "input": 2011,
+          "uncached": 475,
+          "cache": 1536,
+          "cache_write": 0,
+          "output": 129,
+          "reasoning": 25,
+          "provider_ms": 7601,
+          "tools": [
+            "read",
+            "read",
+            "read",
+            "read"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 935
+        },
+        {
+          "turn": 2,
+          "seq": null,
+          "input": 2732,
+          "uncached": 2732,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 327,
+          "reasoning": 70,
+          "provider_ms": 7041,
+          "tools": [
+            "patch"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 3208
+        },
+        {
+          "turn": 3,
+          "seq": null,
+          "input": 3157,
+          "uncached": 1621,
+          "cache": 1536,
+          "cache_write": 0,
+          "output": 41,
+          "reasoning": 10,
+          "provider_ms": 2576,
+          "tools": [
+            "shell"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 6181
+        },
+        {
+          "turn": 4,
+          "seq": null,
+          "input": 3235,
+          "uncached": 3235,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 55,
+          "reasoning": 0,
+          "provider_ms": 3728,
+          "tools": [],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 7942
+        }
+      ],
+      "tools": [
+        {
+          "call_id": "call_Pqz8ik5NOMdGc1KahGeK6Gr2",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 1,
+          "args": "{\"path\":\"SPEC.md\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...hGeK6Gr2"
+        },
+        {
+          "call_id": "call_pKe314BJmyFsy29bL3ZEXTVf",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 0,
+          "args": "{\"path\":\"check.py\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...L3ZEXTVf"
+        },
+        {
+          "call_id": "call_uAJJipzV0qOAfAEPGTPDVeMN",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 3,
+          "args": "{\"path\":\"listing.cjs\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...GTPDVeMN"
+        },
+        {
+          "call_id": "call_wNA3VtYu5SBNLLHYG4pcRf6u",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 2,
+          "args": "{\"path\":\"pager.cjs\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...G4pcRf6u"
+        },
+        {
+          "call_id": "call_OsThPljIZloG3cBWIz2wceyn",
+          "name": "patch",
+          "turn": 2,
+          "seq": null,
+          "success": true,
+          "duration_ms": 11,
+          "args": "{\"path\":\"pager.cjs\",\"expected\":\"function paginate(items, page, pageSize) {\\n const start = page * pageSize;\\n return { i...",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...Iz2wceyn"
+        },
+        {
+          "call_id": "call_NNsaYDutJXuSnoMRL7QYIYKq",
+          "name": "shell",
+          "turn": 3,
+          "seq": null,
+          "success": true,
+          "duration_ms": 792,
+          "args": "{\"command\":\"python\",\"args\":[\"check.py\"],\"timeout_ms\":120000}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...L7QYIYKq"
+        }
+      ],
+      "scenario": "js_pagination",
+      "order": [
+        "pi",
+        "slim"
+      ]
+    },
+    {
+      "campaign": "20260915-194416Z-ledger_audit",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-194416Z-ledger_audit",
+      "wall_ms": 25715,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 0,
+      "fixtures_unchanged": true,
+      "model_calls": 5,
+      "tool_calls": 6,
+      "tool_failures": 0,
+      "tool_ms_sum": 1732,
+      "provider_ms_sum": 20587,
+      "residual_ms": 3396,
+      "total_tokens": 14103,
+      "input": 13376,
+      "uncached": 10816,
+      "cache": 2560,
+      "output": 727,
+      "reasoning": 333,
+      "provider_ms": 20587,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [
+          "ledger.csv"
+        ],
+        "added": [
+          "audit.json"
+        ]
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "input": 1154,
+          "uncached": 1154,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 91,
+          "reasoning": 19,
+          "provider_ms": 3209,
+          "tools": [
+            "bash",
+            "read"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 247
+        },
+        {
+          "turn": 2,
+          "input": 1516,
+          "uncached": 1516,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 65,
+          "reasoning": 15,
+          "provider_ms": 2308,
+          "tools": [
+            "read",
+            "read"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 3255
+        },
+        {
+          "turn": 3,
+          "input": 3193,
+          "uncached": 3193,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 430,
+          "reasoning": 223,
+          "provider_ms": 9079,
+          "tools": [
+            "bash"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 10351
+        },
+        {
+          "turn": 4,
+          "input": 3695,
+          "uncached": 1135,
+          "cache": 2560,
+          "cache_write": 0,
+          "output": 60,
+          "reasoning": 40,
+          "provider_ms": 3337,
+          "tools": [
+            "read"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 14387
+        },
+        {
+          "turn": 5,
+          "input": 3818,
+          "uncached": 3818,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 81,
+          "reasoning": 36,
+          "provider_ms": 2654,
+          "tools": [],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 16600
+        }
+      ],
+      "tools": [
+        {
+          "call_id": "call_3ahZzki2lJVKx9Q3ZArsdMV1|fc_052bf91478345ec0016aa9a046350087d299e6bd925fb2dbe1",
+          "name": "bash",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 89,
+          "args": "{\"command\": \"pwd && ls -la && find . -maxdepth 2 -type f -printf '%p\\\\n'\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:bd925fb2dbe1"
+        },
+        {
+          "call_id": "call_jKNbnUoAgd5BE6wBzSpIE9Te|fc_052bf91478345ec0016aa9a046352087d29bcad5bdba58d37f",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 9,
+          "args": "{\"path\": \"SPEC.md\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:d5bdba58d37f"
+        },
+        {
+          "call_id": "call_iqx4MAsRXQNxRkUB3FAYMB2D|fc_052bf91478345ec0016aa9a048a13487d2a108250d6f86d6c1",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 2,
+          "args": "{\"path\": \"ledger.csv\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:250d6f86d6c1"
+        },
+        {
+          "call_id": "call_Xmb4kcHh99Nf4p73RgyopZil|fc_052bf91478345ec0016aa9a048a14887d291de10104bf39b5b",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 1,
+          "args": "{\"path\": \"check.py\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:10104bf39b5b"
+        },
+        {
+          "call_id": "call_ZeZq7wMPjIEeRVx07lMYf1kC|fc_052bf91478345ec0016aa9a04ea5a887d29d46557c886d8e4e",
+          "name": "bash",
+          "turn": 3,
+          "success": true,
+          "duration_ms": 1631,
+          "args": "{\"command\": \"python -c \\\"import csv,json; from collections import OrderedDict; rows=list(csv.DictReader(open('ledger.csv...",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:557c886d8e4e"
+        },
+        {
+          "call_id": "call_mBhUb8dXuF6AlSTzBCIlpZT7|fc_052bf91478345ec0016aa9a05698a487d28fb968ae55799394",
+          "name": "read",
+          "turn": 5,
+          "success": true,
+          "duration_ms": 0,
+          "args": "{\"path\": \"audit.json\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:68ae55799394"
+        }
+      ],
+      "scenario": "ledger_audit",
+      "order": [
+        "slim",
+        "pi"
+      ]
+    },
+    {
+      "campaign": "20260915-194416Z-ledger_audit",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-194416Z-ledger_audit",
+      "wall_ms": 36758,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 0,
+      "fixtures_unchanged": true,
+      "model_calls": 3,
+      "tool_calls": 4,
+      "tool_failures": 0,
+      "tool_ms_sum": 1872,
+      "provider_ms_sum": 34854,
+      "residual_ms": 32,
+      "total_tokens": 11971,
+      "input": 10767,
+      "uncached": 10767,
+      "cache": 0,
+      "output": 1204,
+      "reasoning": 794,
+      "provider_ms": 34854,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [
+          "ledger.csv"
+        ],
+        "added": [
+          "audit.json"
+        ]
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "seq": null,
+          "input": 2011,
+          "uncached": 2011,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 114,
+          "reasoning": 32,
+          "provider_ms": 3142,
+          "tools": [
+            "read",
+            "read",
+            "read"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 939
+        },
+        {
+          "turn": 2,
+          "seq": null,
+          "input": 3847,
+          "uncached": 3847,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 977,
+          "reasoning": 717,
+          "provider_ms": 19835,
+          "tools": [
+            "shell"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 3112
+        },
+        {
+          "turn": 3,
+          "seq": null,
+          "input": 4909,
+          "uncached": 4909,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 113,
+          "reasoning": 45,
+          "provider_ms": 11877,
+          "tools": [],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 11734
+        }
+      ],
+      "tools": [
+        {
+          "call_id": "call_LUgpyetsv47KJOErl2thSi6x",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 3,
+          "args": "{\"path\":\"SPEC.md\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...l2thSi6x"
+        },
+        {
+          "call_id": "call_9Rcxp18Ll0YVx3BhQ291CSZd",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 6,
+          "args": "{\"path\":\"check.py\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...Q291CSZd"
+        },
+        {
+          "call_id": "call_dSckSOcFD457qshlB0ygG0J7",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 4,
+          "args": "{\"path\":\"ledger.csv\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...B0ygG0J7"
+        },
+        {
+          "call_id": "call_B6sHvyFp5mSjI3vN16NZjoic",
+          "name": "shell",
+          "turn": 2,
+          "seq": null,
+          "success": true,
+          "duration_ms": 1859,
+          "args": "{\"command\":\"@'\\nimport csv\\nimport json\\nfrom pathlib import Path\\n\\nwith Path('ledger.csv').open(encoding='utf-8', newl...",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...16NZjoic"
+        }
+      ],
+      "scenario": "ledger_audit",
+      "order": [
+        "slim",
+        "pi"
+      ]
+    },
+    {
+      "campaign": "20260915-194520Z-config_migration",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-194520Z-config_migration",
+      "wall_ms": 22211,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 0,
+      "fixtures_unchanged": true,
+      "model_calls": 6,
+      "tool_calls": 9,
+      "tool_failures": 0,
+      "tool_ms_sum": 614,
+      "provider_ms_sum": 18228,
+      "residual_ms": 3369,
+      "total_tokens": 12831,
+      "input": 12196,
+      "uncached": 7588,
+      "cache": 4608,
+      "output": 635,
+      "reasoning": 161,
+      "provider_ms": 18228,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [
+          "config/current.json",
+          "config/development.json",
+          "config/production.json"
+        ],
+        "added": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "input": 1146,
+          "uncached": 1146,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 98,
+          "reasoning": 24,
+          "provider_ms": 3175,
+          "tools": [
+            "read",
+            "bash"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 224
+        },
+        {
+          "turn": 2,
+          "input": 1509,
+          "uncached": 1509,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 99,
+          "reasoning": 16,
+          "provider_ms": 2581,
+          "tools": [
+            "read",
+            "read",
+            "read",
+            "read"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 3266
+        },
+        {
+          "turn": 3,
+          "input": 2097,
+          "uncached": 2097,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 250,
+          "reasoning": 111,
+          "provider_ms": 5404,
+          "tools": [
+            "edit"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 7691
+        },
+        {
+          "turn": 4,
+          "input": 2370,
+          "uncached": 834,
+          "cache": 1536,
+          "cache_write": 0,
+          "output": 111,
+          "reasoning": 0,
+          "provider_ms": 2869,
+          "tools": [
+            "edit"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 10732
+        },
+        {
+          "turn": 5,
+          "input": 2504,
+          "uncached": 968,
+          "cache": 1536,
+          "cache_write": 0,
+          "output": 36,
+          "reasoning": 10,
+          "provider_ms": 2540,
+          "tools": [
+            "bash"
+          ],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 11391
+        },
+        {
+          "turn": 6,
+          "input": 2570,
+          "uncached": 1034,
+          "cache": 1536,
+          "cache_write": 0,
+          "output": 41,
+          "reasoning": 0,
+          "provider_ms": 1659,
+          "tools": [],
+          "model": "gpt-5.6-luna",
+          "system_bytes": 2695,
+          "schema_bytes": 2845,
+          "history_bytes": 13310
+        }
+      ],
+      "tools": [
+        {
+          "call_id": "call_Cs4U5rj138PQGLSFaDPEBbZw|fc_09f94ce2f6aff178016aa9a060c80887d2a38a7a666eb2e105",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 9,
+          "args": "{\"path\": \"SPEC.md\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:7a666eb2e105"
+        },
+        {
+          "call_id": "call_XHLphRdxnAvh2xGyPhhyjx13|fc_09f94ce2f6aff178016aa9a060c81c87d2856225169ff33625",
+          "name": "bash",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 91,
+          "args": "{\"command\": \"ls -la && find . -maxdepth 2 -type f -not -path './.git/*' -print\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:25169ff33625"
+        },
+        {
+          "call_id": "call_ToV7brQ96i9YBAqoKRw4ozhH|fc_09f94ce2f6aff178016aa9a0636e2487d29b33dde4d3c839c0",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 2,
+          "args": "{\"path\": \"config/current.json\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:dde4d3c839c0"
+        },
+        {
+          "call_id": "call_kQfKuLtJNKJ3WSlQz7ZE63hO|fc_09f94ce2f6aff178016aa9a0636e3c87d2ad02261bcfa62738",
+          "name": "read",
+          "turn": 2,
+          "success": true,
+          "duration_ms": 2,
+          "args": "{\"path\": \"config/development.json\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:261bcfa62738"
+        },
+        {
+          "call_id": "call_c2dY5cjkCduvZc0eqUtdxhbf|fc_09f94ce2f6aff178016aa9a0636e4887d2b8a330f6c9fc4633",
+          "name": "read",
+          "turn": 3,
+          "success": true,
+          "duration_ms": 1,
+          "args": "{\"path\": \"config/production.json\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:30f6c9fc4633"
+        },
+        {
+          "call_id": "call_43pNVRw9Jlj0IsDhoEUdI67I|fc_09f94ce2f6aff178016aa9a0636e5487d28bd538da7bd23d47",
+          "name": "read",
+          "turn": 3,
+          "success": true,
+          "duration_ms": 1,
+          "args": "{\"path\": \"check.py\"}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:38da7bd23d47"
+        },
+        {
+          "call_id": "call_us3Tui6K9amqxp2d22PNyB8V|fc_09f94ce2f6aff178016aa9a066febc87d2af88236498fed22c",
+          "name": "edit",
+          "turn": 3,
+          "success": true,
+          "duration_ms": 4,
+          "args": "{\"path\": \"config/development.json\", \"edits\": [{\"oldText\": \" \\\"schema_version\\\": 1,\\n \\\"retry\\\": 3,\", \"newText\": \" \\\"sche...",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:236498fed22c"
+        },
+        {
+          "call_id": "call_YbklrQ5rh8Bk7rJ9YTJvEe6l|fc_09f94ce2f6aff178016aa9a069e63487d2886545fd5e58f762",
+          "name": "edit",
+          "turn": 4,
+          "success": true,
+          "duration_ms": 1,
+          "args": "{\"path\": \"config/production.json\", \"edits\": [{\"oldText\": \" \\\"schema_version\\\": 1,\\n \\\"retry\\\": 0,\", \"newText\": \" \\\"schem...",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:45fd5e58f762"
+        },
+        {
+          "call_id": "call_v6GoIZajNgLfJlxJ5GK7qaeR|fc_09f94ce2f6aff178016aa9a06e3e2887d288a2e362c166cb47",
+          "name": "bash",
+          "turn": 5,
+          "success": true,
+          "duration_ms": 503,
+          "args": "{\"command\": \"python check.py\", \"timeout\": 120}",
+          "error_kind": "",
+          "error": "",
+          "trace": "pi.audit.jsonl:e362c166cb47"
+        }
+      ],
+      "scenario": "config_migration",
+      "order": [
+        "pi",
+        "slim"
+      ]
+    },
+    {
+      "campaign": "20260915-194520Z-config_migration",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-194520Z-config_migration",
+      "wall_ms": 33579,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 0,
+      "fixtures_unchanged": true,
+      "model_calls": 6,
+      "tool_calls": 11,
+      "tool_failures": 1,
+      "tool_ms_sum": 1311,
+      "provider_ms_sum": 32260,
+      "residual_ms": 8,
+      "total_tokens": 21704,
+      "input": 20526,
+      "uncached": 13358,
+      "cache": 7168,
+      "output": 1178,
+      "reasoning": 510,
+      "provider_ms": 32260,
+      "error_breakdown": {
+        "shell-syntax": 1
+      },
+      "workspace_diff": {
+        "modified": [
+          "config/current.json",
+          "config/development.json",
+          "config/production.json"
+        ],
+        "added": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "seq": null,
+          "input": 2017,
+          "uncached": 2017,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 155,
+          "reasoning": 28,
+          "provider_ms": 5076,
+          "tools": [
+            "read",
+            "read",
+            "read",
+            "read",
+            "read"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 992
+        },
+        {
+          "turn": 2,
+          "seq": null,
+          "input": 2770,
+          "uncached": 2770,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 519,
+          "reasoning": 260,
+          "provider_ms": 11987,
+          "tools": [
+            "patch",
+            "patch"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 3452
+        },
+        {
+          "turn": 3,
+          "seq": null,
+          "input": 3436,
+          "uncached": 1900,
+          "cache": 1536,
+          "cache_write": 0,
+          "output": 53,
+          "reasoning": 22,
+          "provider_ms": 2863,
+          "tools": [
+            "shell"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 7761
+        },
+        {
+          "turn": 4,
+          "seq": null,
+          "input": 3784,
+          "uncached": 2248,
+          "cache": 1536,
+          "cache_write": 0,
+          "output": 271,
+          "reasoning": 101,
+          "provider_ms": 6494,
+          "tools": [
+            "patch",
+            "patch"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 9630
+        },
+        {
+          "turn": 5,
+          "seq": null,
+          "input": 4206,
+          "uncached": 2670,
+          "cache": 1536,
+          "cache_write": 0,
+          "output": 63,
+          "reasoning": 32,
+          "provider_ms": 2587,
+          "tools": [
+            "shell"
+          ],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 12599
+        },
+        {
+          "turn": 6,
+          "seq": null,
+          "input": 4313,
+          "uncached": 1753,
+          "cache": 2560,
+          "cache_write": 0,
+          "output": 117,
+          "reasoning": 67,
+          "provider_ms": 3253,
+          "tools": [],
+          "system_bytes": 1556,
+          "schema_bytes": 8030,
+          "history_bytes": 14518
+        }
+      ],
+      "tools": [
+        {
+          "call_id": "call_uzIwFOjtivTAJgENR1qEM7Q0",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 8,
+          "args": "{\"path\":\"SPEC.md\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...R1qEM7Q0"
+        },
+        {
+          "call_id": "call_sJrSsDgvqpFNyf8ZNhhPcYYh",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 1,
+          "args": "{\"path\":\"check.py\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...NhhPcYYh"
+        },
+        {
+          "call_id": "call_ZcXNxgLlbRtGZT5rXGbyCFwS",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 13,
+          "args": "{\"path\":\"config/current.json\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...XGbyCFwS"
+        },
+        {
+          "call_id": "call_YDe4DWz3DbJGsCyeXLS62zcf",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 18,
+          "args": "{\"path\":\"config/development.json\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...XLS62zcf"
+        },
+        {
+          "call_id": "call_EsAsyyKYtMeHbHA7GtbAhCdm",
+          "name": "read",
+          "turn": 1,
+          "seq": null,
+          "success": true,
+          "duration_ms": 22,
+          "args": "{\"path\":\"config/production.json\",\"max_lines\":4096}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...GtbAhCdm"
+        },
+        {
+          "call_id": "call_LEuOlkkC6qDNypKpVpxZRF71",
+          "name": "patch",
+          "turn": 2,
+          "seq": null,
+          "success": true,
+          "duration_ms": 8,
+          "args": "{\"path\":\"config/development.json\",\"edits\":[{\"expected\":\" \\\"schema_version\\\": 1,\",\"replacement\":\" \\\"schema_version\\\": 2,\"...",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...VpxZRF71"
+        },
+        {
+          "call_id": "call_XzjHZ0Qjq5zFHXWlqeLN8k4T",
+          "name": "patch",
+          "turn": 2,
+          "seq": null,
+          "success": true,
+          "duration_ms": 7,
+          "args": "{\"path\":\"config/production.json\",\"edits\":[{\"expected\":\" \\\"schema_version\\\": 1,\",\"replacement\":\" \\\"schema_version\\\": 2,\"}...",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...qeLN8k4T"
+        },
+        {
+          "call_id": "call_EOq42WZWpHvNVQYw96TsfWEK",
+          "name": "shell",
+          "turn": 3,
+          "seq": null,
+          "success": false,
+          "duration_ms": 612,
+          "args": "{\"command\":\"python\",\"args\":[\"check.py\"],\"timeout_ms\":120000}",
+          "error_kind": "shell-syntax",
+          "error": "exit 1 stdout: stderr: Traceback (most recent call last): File \"C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-91qirkyc\\slim\\check.py\", line 4, in <module> dev = json.loads(Path('config/development.jso...",
+          "trace": "slim.session.jsonl:call=...96TsfWEK"
+        },
+        {
+          "call_id": "call_Xezi6VJRgOfnNw5ekY1vJuD0",
+          "name": "patch",
+          "turn": 4,
+          "seq": null,
+          "success": true,
+          "duration_ms": 8,
+          "args": "{\"path\":\"config/development.json\",\"edits\":[{\"expected\":\" \\\"timeout_ms\\\": 1500,\",\"replacement\":\" \\\"timeout_ms\\\": 1500,\"},...",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...kY1vJuD0"
+        },
+        {
+          "call_id": "call_1vudapk48jjPbnITmzSzAax9",
+          "name": "patch",
+          "turn": 4,
+          "seq": null,
+          "success": true,
+          "duration_ms": 9,
+          "args": "{\"path\":\"config/production.json\",\"edits\":[{\"expected\":\" \\\"timeout_ms\\\": 12000\\n\",\"replacement\":\" \\\"timeout_ms\\\": 12000,\"...",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...mzSzAax9"
+        },
+        {
+          "call_id": "call_iZNgwuvbj0MAx4PcQowG4VqI",
+          "name": "shell",
+          "turn": 5,
+          "seq": null,
+          "success": true,
+          "duration_ms": 605,
+          "args": "{\"command\":\"python\",\"args\":[\"check.py\"],\"timeout_ms\":120000}",
+          "error_kind": "",
+          "error": "",
+          "trace": "slim.session.jsonl:call=...QowG4VqI"
+        }
+      ],
+      "scenario": "config_migration",
+      "order": [
+        "pi",
+        "slim"
+      ]
+    }
+  ],
+  "problems": [],
+  "failure_causes": {}
+}

@@ -58,6 +58,16 @@ pub enum RequestKind {
     Compaction,
 }
 
+/// Provider-declared meaning of the reasoning stream.  Adapters only emit a
+/// classification when their wire protocol identifies the exposed content;
+/// an absent event intentionally leaves the UI unclassified.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningClassification {
+    Summary,
+    Text,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionEvent {
     pub seq: u64,
@@ -85,6 +95,10 @@ pub enum EventKind {
     ReasoningDelta {
         text: String,
     },
+    /// Adapter-known classification for the following reasoning stream.
+    ReasoningClassification {
+        classification: ReasoningClassification,
+    },
     ThinkingStarted,
     ThinkingEnded,
     ProviderPhase {
@@ -93,6 +107,14 @@ pub enum EventKind {
         elapsed_ms: u64,
         #[serde(default)]
         detail: Option<String>,
+    },
+    /// A retry has been scheduled; the wait is a delay, not work progress.
+    RetryScheduled {
+        attempt: u32,
+        limit: u32,
+        wait_ms: u64,
+        #[serde(default)]
+        reason: Option<String>,
     },
     AssistantEnded {
         reason: String,
@@ -124,6 +146,22 @@ pub enum EventKind {
         name: String,
         #[serde(default)]
         arguments: String,
+    },
+    /// Tool arguments and policy checks completed, before executor admission.
+    ToolPrepared {
+        #[serde(default)]
+        batch_id: String,
+        #[serde(default)]
+        call_id: String,
+        name: String,
+    },
+    /// The call was admitted to an execution segment/pool.
+    ToolAdmitted {
+        #[serde(default)]
+        batch_id: String,
+        #[serde(default)]
+        call_id: String,
+        name: String,
     },
     ToolCall {
         name: String,

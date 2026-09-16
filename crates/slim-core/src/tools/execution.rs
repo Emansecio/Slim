@@ -638,6 +638,10 @@ pub(crate) struct PreparedToolInvocation {
     pub(crate) canonical_fingerprint: String,
     pub(crate) preparation_us: u64,
     pub(crate) error: Option<String>,
+    /// The call was rejected by deterministic argument admission before any
+    /// executor could run. Workspace/path resolution failures intentionally do
+    /// not set this bit because their effects remain unclassified.
+    pub(crate) structural_rejection: bool,
 }
 
 impl PreparedToolInvocation {
@@ -692,6 +696,7 @@ impl PreparedToolInvocation {
                 Some(format!("invalid tool arguments: {error}")),
             ),
         };
+        let mut structural_rejection = error.is_some();
         if error.is_none() {
             error = workspace_error;
         }
@@ -706,6 +711,8 @@ impl PreparedToolInvocation {
                 &mut admission_notes,
             ) {
                 error = Some(message);
+                structural_rejection =
+                    !is_unclassifiable_preparation_error(error.as_deref().unwrap_or_default());
             }
         }
         let typed_arguments = if error.is_none() {
@@ -719,6 +726,7 @@ impl PreparedToolInvocation {
                 Ok(arguments) => arguments,
                 Err(message) => {
                     error = Some(message);
+                    structural_rejection = true;
                     PreparedToolArguments::External
                 }
             }
@@ -751,6 +759,10 @@ impl PreparedToolInvocation {
                 ])
             },
         );
+        // Only calls with a known operational contract can be classified as a
+        // deterministic rejection. Unknown/external envelopes retain the
+        // existing unclassifiable path even when their JSON is malformed.
+        structural_rejection &= spec.is_some();
         Self {
             mode,
             name: name.to_owned(),
@@ -762,6 +774,7 @@ impl PreparedToolInvocation {
             canonical_fingerprint,
             preparation_us: workspace_preparation_us.saturating_add(elapsed_us(started)),
             error,
+            structural_rejection,
         }
     }
 }
@@ -894,6 +907,12 @@ fn absolute_fallback(cwd: &Path) -> PathBuf {
     } else {
         std::env::current_dir().map_or_else(|_| cwd.to_path_buf(), |root| root.join(cwd))
     }
+}
+
+fn is_unclassifiable_preparation_error(message: &str) -> bool {
+    message.starts_with("workspace root cannot be resolved:")
+        || message.starts_with("path cannot be resolved:")
+        || message == "path escapes the workspace"
 }
 
 fn materialize_defaults_and_paths(

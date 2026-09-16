@@ -1,0 +1,2087 @@
+{
+  "generated_utc": "2026-09-15 21:37:02Z",
+  "manifests": {
+    "20260915-213509Z-opencode-go-config_migration": {
+      "model": "deepseek-v4-flash",
+      "provider": "opencode-go",
+      "effort": "high",
+      "speed": "normal",
+      "order": [
+        "pi",
+        "slim"
+      ],
+      "round": 1,
+      "fixture_hash_kind": "materialized-bytes-v1",
+      "workspace": "C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-94cpazsc",
+      "prompt": "Read SPEC.md and migrate the configuration files. Run python check.py. Do not change SPEC.md or check.py. Do not install dependencies. Finish with a brief summary.",
+      "scenario": "config_migration",
+      "executables": {
+        "pi": {
+          "path": "C:\\nvm4w\\nodejs\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js",
+          "sha256": "e6d7fcf36a239cf3746e67ddf4222081ac01a601b85a3ee688bdfe9c161d754c",
+          "version": "0.85.1"
+        },
+        "slim": {
+          "path": "C:\\Users\\User\\bin\\Slim.exe",
+          "sha256": "5e04cb23c16cf0fadb585c2d2dc517fa7dee91a1ecba5dc130207fd67f15f925",
+          "version": "slim 0.1.0"
+        }
+      },
+      "oracle_python": "C:\\Users\\User\\AppData\\Local\\Programs\\Python\\Python312\\python.EXE",
+      "fixtures": {
+        "SPEC.md": {
+          "sha256": "5744917830ce5b47dac4e87d58b0bdcb12ecd913bb67530a52ededc940636bfe",
+          "bytes": 462
+        },
+        "check.py": {
+          "sha256": "459ec0ad67bfb210ca315adec5735808429285ed6a99df1032375fa5d9908504",
+          "bytes": 952
+        },
+        "config/development.json": {
+          "sha256": "37eb1369cfa552b33a65aa51cd164e446f1172b3e86d4c06c5a9e20a2d1e7e7e",
+          "bytes": 325
+        },
+        "config/production.json": {
+          "sha256": "0aaee09212ece971270d35b2423cc8c50bd3337a7b185ac3ed9afa877047cbb4",
+          "bytes": 197
+        },
+        "config/current.json": {
+          "sha256": "b046b856360672cbc3dbefe3b8f23eb4d15a00afdb43495ed4b85d3d3a1d02df",
+          "bytes": 83
+        }
+      },
+      "harness": {
+        "python": "3.12.10",
+        "platform": "win32",
+        "files": {
+          "run.py": "c9b2cd05870bf358bf50729113f693ef47464398b124e4205106c72af5c62304",
+          "daily.py": "db2df5aa5ec132ab981eb8759a2fd5c5174c129355a7303004c752a082c7453d",
+          "analyze.py": "084feec1aa27dbdc0256e425d96f6f5467ab91501ee7c173d76aa731609f3fd8",
+          "report.py": "51aac3a135bb1b4c800b2e6d069fdac3d93f391333b914293fea9aa31662899a",
+          "pi-audit.ts": "e0292e35650afee5d791b619d75e05d978af29c2654b16a1a65faaedf31b462c",
+          "process_runner.py": "5a39d338349a00aab4e56aec7db2ad2955b3747d6b3e90319ca7450254f14396"
+        }
+      },
+      "route": "native opencode-go; each CLI uses its own configured authentication"
+    },
+    "20260915-213515Z-opencode-go-sqlite_balances": {
+      "model": "deepseek-v4-flash",
+      "provider": "opencode-go",
+      "effort": "high",
+      "speed": "normal",
+      "order": [
+        "pi",
+        "slim"
+      ],
+      "round": 1,
+      "fixture_hash_kind": "materialized-bytes-v1",
+      "workspace": "C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-ofvjg8al",
+      "prompt": "Read SPEC.md, repair the SQL query and run python check.py. Do not change schema.sql, SPEC.md or check.py. Do not install dependencies. Finish with a brief summary.",
+      "scenario": "sqlite_balances",
+      "executables": {
+        "pi": {
+          "path": "C:\\nvm4w\\nodejs\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js",
+          "sha256": "e6d7fcf36a239cf3746e67ddf4222081ac01a601b85a3ee688bdfe9c161d754c",
+          "version": "0.85.1"
+        },
+        "slim": {
+          "path": "C:\\Users\\User\\bin\\Slim.exe",
+          "sha256": "5e04cb23c16cf0fadb585c2d2dc517fa7dee91a1ecba5dc130207fd67f15f925",
+          "version": "slim 0.1.0"
+        }
+      },
+      "oracle_python": "C:\\Users\\User\\AppData\\Local\\Programs\\Python\\Python312\\python.EXE",
+      "fixtures": {
+        "SPEC.md": {
+          "sha256": "40be2e81b9416f2e04dc64f3bfadf25f835ecda727671351338de3284fb3ecb8",
+          "bytes": 795
+        },
+        "check.py": {
+          "sha256": "48f13c384405747307382fbe1ff617149ba03a263ba2bae3ddf400787649214b",
+          "bytes": 1947
+        },
+        "schema.sql": {
+          "sha256": "3ce00461b68d955ce57529a840ee6040c9f2adde1181ab831d454e4031acb8c3",
+          "bytes": 346
+        },
+        "queries/customer_balances.sql": {
+          "sha256": "a6820887b377736fb066a9f0970d05165d3f3b3b8deabc2e3d023ecea3445294",
+          "bytes": 312
+        }
+      },
+      "harness": {
+        "python": "3.12.10",
+        "platform": "win32",
+        "files": {
+          "run.py": "c9b2cd05870bf358bf50729113f693ef47464398b124e4205106c72af5c62304",
+          "daily.py": "db2df5aa5ec132ab981eb8759a2fd5c5174c129355a7303004c752a082c7453d",
+          "analyze.py": "084feec1aa27dbdc0256e425d96f6f5467ab91501ee7c173d76aa731609f3fd8",
+          "report.py": "51aac3a135bb1b4c800b2e6d069fdac3d93f391333b914293fea9aa31662899a",
+          "pi-audit.ts": "e0292e35650afee5d791b619d75e05d978af29c2654b16a1a65faaedf31b462c",
+          "process_runner.py": "5a39d338349a00aab4e56aec7db2ad2955b3747d6b3e90319ca7450254f14396"
+        }
+      },
+      "route": "native opencode-go; each CLI uses its own configured authentication"
+    },
+    "20260915-213521Z-opencode-go-repo_wide_repair": {
+      "model": "deepseek-v4-flash",
+      "provider": "opencode-go",
+      "effort": "high",
+      "speed": "normal",
+      "order": [
+        "slim",
+        "pi"
+      ],
+      "round": 1,
+      "fixture_hash_kind": "materialized-bytes-v1",
+      "workspace": "C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-il3ytuqy",
+      "prompt": "Read SPEC.md, fix the implementation in this repository and run python check.py. Preserve unrelated files, SPEC.md and check.py. Do not install dependencies. Finish with a brief summary.",
+      "scenario": "repo_wide_repair",
+      "executables": {
+        "pi": {
+          "path": "C:\\nvm4w\\nodejs\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js",
+          "sha256": "e6d7fcf36a239cf3746e67ddf4222081ac01a601b85a3ee688bdfe9c161d754c",
+          "version": "0.85.1"
+        },
+        "slim": {
+          "path": "C:\\Users\\User\\bin\\Slim.exe",
+          "sha256": "5e04cb23c16cf0fadb585c2d2dc517fa7dee91a1ecba5dc130207fd67f15f925",
+          "version": "slim 0.1.0"
+        }
+      },
+      "oracle_python": "C:\\Users\\User\\AppData\\Local\\Programs\\Python\\Python312\\python.EXE",
+      "fixtures": {
+        "SPEC.md": {
+          "sha256": "2c1d22301ed4f0f73d58cdc9f2582bafe14c4c1f99d4b54c2100ded4718a4422",
+          "bytes": 808
+        },
+        "check.py": {
+          "sha256": "f43752374127a5543f4a2960b628949bc32a3d89065ce668b2b578679d753fe1",
+          "bytes": 2314
+        },
+        "shop/__init__.py": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "bytes": 0
+        },
+        "shop/orders/__init__.py": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "bytes": 0
+        },
+        "shop/orders/money.py": {
+          "sha256": "1cde471426f876974b1f7970816ef4c75d440c9853cc2768f80b5df77e0edf73",
+          "bytes": 128
+        },
+        "shop/api.py": {
+          "sha256": "eda2207350cb70320a617ff8cdcade702e314a02c560e1463dabc2e766b2ce4a",
+          "bytes": 140
+        },
+        "shop/orders/totals.py": {
+          "sha256": "57fbda2e696e0b7512d1b53674c27b804f48e031d6bc8461f54b09fb43b64ad1",
+          "bytes": 407
+        },
+        "archives/component_000.py": {
+          "sha256": "94b5aff144c70a20377479c9f57e2393a5940a6402aef3a4ac52ff1ead37243d",
+          "bytes": 1488
+        },
+        "archives/component_001.py": {
+          "sha256": "9771f0617e5e1bf1d0683faaaf091da211d0d9557079c3998049bcbc7847278c",
+          "bytes": 1488
+        },
+        "archives/component_002.py": {
+          "sha256": "065b9aa1f377fd810b5bc1f7e9ec5c7e196c4aa7126eaff6aa52071b1d234cf9",
+          "bytes": 1488
+        },
+        "archives/component_003.py": {
+          "sha256": "bf0c529a6ab1a3615ded6403804a980b9be0f7a2ab940b0c8e1957b6cd78b4dc",
+          "bytes": 1488
+        },
+        "archives/component_004.py": {
+          "sha256": "67b58f6599348c2c0aec4430a7e08f4cb65b968c80f06c9dcc20efab31601c61",
+          "bytes": 1488
+        },
+        "archives/component_005.py": {
+          "sha256": "384e6016707eb2a912427f56abaa4957e5ac5ce293f83c96fccc049816e50512",
+          "bytes": 1488
+        },
+        "archives/component_006.py": {
+          "sha256": "bae1a2f53f8dbece33e4036e6ffa50983007d8aa2d8838f9e0e94b847464780b",
+          "bytes": 1488
+        },
+        "archives/component_007.py": {
+          "sha256": "3d0e7d97660eb665328d041292800ad40412f46d61a46eaefe020030d3fd1ab3",
+          "bytes": 1488
+        },
+        "archives/component_008.py": {
+          "sha256": "703e50d82c6c9b4d509e8c07fe9b4071fc4bec09e66b215c1b2c91801cb10ec9",
+          "bytes": 1488
+        },
+        "archives/component_009.py": {
+          "sha256": "62ded524eba57bf8b85f54f7d485003f2fec1c55ae5503a7b6fd205548594909",
+          "bytes": 1488
+        },
+        "archives/component_010.py": {
+          "sha256": "fc2e4d8384e0025bf3689983a614b5f413c9e3e1426809e255ed33b080ca44f5",
+          "bytes": 1489
+        },
+        "archives/component_011.py": {
+          "sha256": "80307099c322f9265ad6d756379c693cfdd61ba36a230e72bc6da2292a36b5b8",
+          "bytes": 1489
+        },
+        "archives/component_012.py": {
+          "sha256": "c5d8cb886810bb910ec5926aeff4f962949c2591a3488889d14f21d701f6793c",
+          "bytes": 1489
+        },
+        "archives/component_013.py": {
+          "sha256": "a1c1971ac210084b521feb99c1176c9a9c3811fe7a6ef98e71494f59f14bedd9",
+          "bytes": 1489
+        },
+        "archives/component_014.py": {
+          "sha256": "9a9d01ac6e9e1c974fc220435b8d87dbbe04b618d45f9ee585b101d0ee91bcda",
+          "bytes": 1489
+        },
+        "archives/component_015.py": {
+          "sha256": "e783c37577e8f996d4cac123c639a517cbdf6f1374384bc45a02dfac77715707",
+          "bytes": 1489
+        },
+        "archives/component_016.py": {
+          "sha256": "4cc45676b1f1ba492c12366dde8b27529f413a380c3e94aff17ccd3bcb82e6a5",
+          "bytes": 1489
+        },
+        "archives/component_017.py": {
+          "sha256": "97259fa53cba439fa2ebf288120734121c31acd00b0049bd46ff26b10f908197",
+          "bytes": 1489
+        },
+        "archives/component_018.py": {
+          "sha256": "57670c6d9ff54866604865db3107c2eb0f9b23280a25a038ea49c65b8bff3949",
+          "bytes": 1489
+        },
+        "archives/component_019.py": {
+          "sha256": "52d1042c5059bd016f4a6c405a9f296646d9598377fc269b367383efb9e8e9ab",
+          "bytes": 1489
+        },
+        "archives/component_020.py": {
+          "sha256": "2b761e4c080263559b4a3524dcc830c4847022266404c33d960f6a68ecaf4a90",
+          "bytes": 1489
+        },
+        "archives/component_021.py": {
+          "sha256": "790e6acc8be601a9c24da3255905933f8e4333321065419d9dcf10f96f28f96b",
+          "bytes": 1489
+        },
+        "archives/component_022.py": {
+          "sha256": "0ad708c412d4f8df08abdc821bbd69d7441d9a83ce459d2471ba93211550b2b9",
+          "bytes": 1489
+        },
+        "archives/component_023.py": {
+          "sha256": "154310ac1eee2f016b9b58cb0275ad045914d83d6216f6cba4cb7a51a334296a",
+          "bytes": 1489
+        },
+        "archives/component_024.py": {
+          "sha256": "d6f192da2acb62eb56b00837d9c729280027d3eadd1c56afbb396d6060dc0465",
+          "bytes": 1489
+        },
+        "archives/component_025.py": {
+          "sha256": "8b4ace23757c9209bfd92150449a049d14b955a5a4322c0ff44697c22ca95536",
+          "bytes": 1489
+        },
+        "archives/component_026.py": {
+          "sha256": "259fda479cbddb33de5f79f1121a6ed7890cb42e4d3becef2e550dc172129e4e",
+          "bytes": 1489
+        },
+        "archives/component_027.py": {
+          "sha256": "cb82bebd2d26df48bf2514cd124ee911aaf4fe2dae195a5608cb17f5402ea1a6",
+          "bytes": 1489
+        },
+        "archives/component_028.py": {
+          "sha256": "613d184aa471e58123afad878421dcd2de87ce324c4c267ef79f3fc9cbc47112",
+          "bytes": 1489
+        },
+        "archives/component_029.py": {
+          "sha256": "df6579b775bceedfec20035a89fe83435cb589d0a10160c34c65f889758221da",
+          "bytes": 1489
+        },
+        "archives/component_030.py": {
+          "sha256": "bc1b7ecc1f12afb195cfd58d784a78a6fe626f4c9895be86fa629ba65db7ad99",
+          "bytes": 1489
+        },
+        "archives/component_031.py": {
+          "sha256": "a163962a926902ff6eda5abf6e71c1618c4a5724c0a93f709f729766e543fb85",
+          "bytes": 1489
+        },
+        "archives/component_032.py": {
+          "sha256": "117c83584377fc5af413b0db0d7322944e964ec56336764cae338a58c609aa09",
+          "bytes": 1489
+        },
+        "archives/component_033.py": {
+          "sha256": "5c44035c07afdc72548e2581fb40e704e724a4149c90567b211374cb957c8ff9",
+          "bytes": 1489
+        },
+        "archives/component_034.py": {
+          "sha256": "c2f8e02a924b3b16684aaa32b76f1ad56599793e498929d96b907426b98f4306",
+          "bytes": 1489
+        },
+        "archives/component_035.py": {
+          "sha256": "ddef9c3f2a55fdae78c49cf4b03f44bb3a7be9665dcba8e8b806ab8586bbd62c",
+          "bytes": 1489
+        },
+        "archives/component_036.py": {
+          "sha256": "1c0d0b4e967a4992ec191ca58de9e509e3031c6ebff3f3f467e0c315444999cb",
+          "bytes": 1489
+        },
+        "archives/component_037.py": {
+          "sha256": "93f06be294f41163c78050bef058d89d2ea83eea09a886dabe8760946ad7f8c8",
+          "bytes": 1489
+        },
+        "archives/component_038.py": {
+          "sha256": "bf042819a385f5d6b292129f8a7f3ed545b0e98f05e7eb0e882176940c361850",
+          "bytes": 1489
+        },
+        "archives/component_039.py": {
+          "sha256": "58bf5dcebedce55fb0fb74bb42020b44251c426b599d8971b7f84c1ef8357648",
+          "bytes": 1489
+        },
+        "archives/component_040.py": {
+          "sha256": "3f9b6ce4bb93e01d902a4f66bbc918849014a15ce49da0d6d1bd29013885f4a1",
+          "bytes": 1489
+        },
+        "archives/component_041.py": {
+          "sha256": "cf23ac94357567bcd6d9060d700243193f342f641f0adcd478852faf5e1c6640",
+          "bytes": 1489
+        },
+        "archives/component_042.py": {
+          "sha256": "9a71d93c468f306ce5f987d4feea7fc82f88a75866792166856195d319beb15f",
+          "bytes": 1489
+        },
+        "archives/component_043.py": {
+          "sha256": "093a1bb584d9928ce436d3f90a01d78c660c60ecb80acc4ab5234d19b1eec54a",
+          "bytes": 1489
+        },
+        "archives/component_044.py": {
+          "sha256": "d5d354c1cf0dc99fe34fef6e6d183e54c6dc68e56112f21c278b47eb55db84b1",
+          "bytes": 1489
+        },
+        "archives/component_045.py": {
+          "sha256": "3f10ae3a0a32c7649afb1dae12b56996a5164c39859b6e1cf3347516dfaccbec",
+          "bytes": 1489
+        },
+        "archives/component_046.py": {
+          "sha256": "e17fb084323f95503276fb5ad0e029e8a03abd068a05bfc621435ea55e820ac0",
+          "bytes": 1489
+        },
+        "archives/component_047.py": {
+          "sha256": "980354864595be03e94719f3ca89af39670d6cc9c33ae7817c98a61c01b9156e",
+          "bytes": 1489
+        },
+        "archives/component_048.py": {
+          "sha256": "e69949225e8ff60188d45023a0c7da3b91ed11aa2e1663890d64d323c6d28805",
+          "bytes": 1489
+        },
+        "archives/component_049.py": {
+          "sha256": "d32eb5e7bf6d3f123343c960b728695c1a986f390f75e47c0715f95139181c7f",
+          "bytes": 1489
+        },
+        "archives/component_050.py": {
+          "sha256": "d4a8fabf537a13ac160fcd15d150495d2facb678c99e5bfa6176bb05e7841307",
+          "bytes": 1489
+        },
+        "archives/component_051.py": {
+          "sha256": "6bdea5447685c340bb68eeefcd4094ff013a7bbbd1110050dc14ae7c58d7852b",
+          "bytes": 1489
+        },
+        "archives/component_052.py": {
+          "sha256": "0c41d11bae71d7a294843d154a192a0fa2edda3b6b43e4154a544269a7d0c9b9",
+          "bytes": 1489
+        },
+        "archives/component_053.py": {
+          "sha256": "b99f94363b4f111d60a1adad6c9dfe92125e782a0e2758bd574be645ae926da6",
+          "bytes": 1489
+        },
+        "archives/component_054.py": {
+          "sha256": "57246948d93337399941ebe04a87b1ad762e61471963d7f380e9f098dea85af0",
+          "bytes": 1489
+        },
+        "archives/component_055.py": {
+          "sha256": "4198758eecc356194884013f17a7bf0446f40d10b8bfc4d52308c79a08806621",
+          "bytes": 1489
+        },
+        "archives/component_056.py": {
+          "sha256": "1fc91379a289d4ac00dad2fe72e506b21c3812683aa13ee722f7dbdb909c5e0d",
+          "bytes": 1489
+        },
+        "archives/component_057.py": {
+          "sha256": "5c84059ff226107921a73820223e680befa54044e751372edb9c1b8629adbb76",
+          "bytes": 1489
+        },
+        "archives/component_058.py": {
+          "sha256": "a8e3599422dba0090c6fe159354e54bc41a358fc1d6936c60c5e201b31dc82cc",
+          "bytes": 1489
+        },
+        "archives/component_059.py": {
+          "sha256": "b911d57ed9d307a962fceb4ebbc05ca024c80f9f1bff612de854fb55d193b0a2",
+          "bytes": 1489
+        },
+        "archives/component_060.py": {
+          "sha256": "a97db5f1e5f91cec32469d0a869ff3a24e47eaedcded348bbc6e445aa8a8a2e3",
+          "bytes": 1489
+        },
+        "archives/component_061.py": {
+          "sha256": "3cf6dcf867ee930241ffa06b435f776883f6d4803ccccfa49369b436c7e6d4d6",
+          "bytes": 1489
+        },
+        "archives/component_062.py": {
+          "sha256": "65be5d1c68a5c71da2b056cab7467367e642924187815b7952c0c3cf61cbe9d4",
+          "bytes": 1489
+        },
+        "archives/component_063.py": {
+          "sha256": "c4f0ac6066188f01205734802ac4da950b0adfb6cd38fa3e029d6ffbd24105ac",
+          "bytes": 1489
+        },
+        "archives/component_064.py": {
+          "sha256": "578ad8ed302a379492bf92eefca78c2b68b9f2b3ce168c5dc9378ddc9c0293f8",
+          "bytes": 1489
+        },
+        "archives/component_065.py": {
+          "sha256": "cc8857fd28899680e37c4cbe55e5b41fc57077983ae877bd8524f7d332d91a7f",
+          "bytes": 1489
+        },
+        "archives/component_066.py": {
+          "sha256": "39ec8608c0503293f0863efdda2cba709c15aee0efc1f6dd75b58e63513484f0",
+          "bytes": 1489
+        },
+        "archives/component_067.py": {
+          "sha256": "3d47d07671e1080ad9e99a204f4d0c068b10c9f16f6edd6cc662eb5d485987a4",
+          "bytes": 1489
+        },
+        "archives/component_068.py": {
+          "sha256": "7e9f2752454a95b3acc845becbcf3285a24a19ba75e85afbaf97d3a94ae6ddee",
+          "bytes": 1489
+        },
+        "archives/component_069.py": {
+          "sha256": "d22840e5ed619e0379b809c988b437b5ceff29dde2652e4647b09a85a9802bc3",
+          "bytes": 1489
+        },
+        "archives/component_070.py": {
+          "sha256": "deb067433a5e22c2a6f569ea1f86144f03af87bae2c58c96f7a020a0e5a2375a",
+          "bytes": 1489
+        },
+        "archives/component_071.py": {
+          "sha256": "eac258d285418f81d619f060dfa7f19a5f8602851bd6b99c4406e2ac734bbe3d",
+          "bytes": 1489
+        },
+        "archives/component_072.py": {
+          "sha256": "b062edb85378ddc76b735f11a6bdd5326721b01a2dcd3fdbc8d953bc789fa663",
+          "bytes": 1489
+        },
+        "archives/component_073.py": {
+          "sha256": "3d625e7b328e74dfceaeba21fed140d13f7999ed8c1dc042ad464dfd1dcb3d90",
+          "bytes": 1489
+        },
+        "archives/component_074.py": {
+          "sha256": "45d824ac48f21a444da4183c318a3af25213f5d59d1544e2411fd95f874d8ae3",
+          "bytes": 1489
+        },
+        "archives/component_075.py": {
+          "sha256": "b3854ef31a6efc40d8a12e8bf7939efe237beeb419f7dd3c68b28c429cc5726d",
+          "bytes": 1489
+        },
+        "archives/component_076.py": {
+          "sha256": "b79ff6911b88795db58ef5cdea50189e8ea001e391d93cd38c1562d2f293b5a2",
+          "bytes": 1489
+        },
+        "archives/component_077.py": {
+          "sha256": "73377abfcd0f5bd3413d5fadb21be0462efe030b90b7486d81889f012c02ddee",
+          "bytes": 1489
+        },
+        "archives/component_078.py": {
+          "sha256": "d013384bac6b3a4598a064f0a519c8be4ab8fb277fe3041c69cb6c4a31b72ec4",
+          "bytes": 1489
+        },
+        "archives/component_079.py": {
+          "sha256": "5da929a10ded4ad64dd7f05373f362c2c7a5a614ced65df8ead60e97981ce077",
+          "bytes": 1489
+        }
+      },
+      "harness": {
+        "python": "3.12.10",
+        "platform": "win32",
+        "files": {
+          "run.py": "c9b2cd05870bf358bf50729113f693ef47464398b124e4205106c72af5c62304",
+          "daily.py": "db2df5aa5ec132ab981eb8759a2fd5c5174c129355a7303004c752a082c7453d",
+          "analyze.py": "084feec1aa27dbdc0256e425d96f6f5467ab91501ee7c173d76aa731609f3fd8",
+          "report.py": "51aac3a135bb1b4c800b2e6d069fdac3d93f391333b914293fea9aa31662899a",
+          "pi-audit.ts": "e0292e35650afee5d791b619d75e05d978af29c2654b16a1a65faaedf31b462c",
+          "process_runner.py": "5a39d338349a00aab4e56aec7db2ad2955b3747d6b3e90319ca7450254f14396"
+        }
+      },
+      "route": "native opencode-go; each CLI uses its own configured authentication"
+    },
+    "20260915-213527Z-opencode-go-json_cli": {
+      "model": "deepseek-v4-flash",
+      "provider": "opencode-go",
+      "effort": "high",
+      "speed": "normal",
+      "order": [
+        "slim",
+        "pi"
+      ],
+      "round": 1,
+      "fixture_hash_kind": "materialized-bytes-v1",
+      "workspace": "C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-t8boiqhp",
+      "prompt": "Read SPEC.md and implement the requested CLI. Run python check.py and fix failures. Do not change SPEC.md, check.py or data. Do not install dependencies. Finish with a brief summary.",
+      "scenario": "json_cli",
+      "executables": {
+        "pi": {
+          "path": "C:\\nvm4w\\nodejs\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js",
+          "sha256": "e6d7fcf36a239cf3746e67ddf4222081ac01a601b85a3ee688bdfe9c161d754c",
+          "version": "0.85.1"
+        },
+        "slim": {
+          "path": "C:\\Users\\User\\bin\\Slim.exe",
+          "sha256": "5e04cb23c16cf0fadb585c2d2dc517fa7dee91a1ecba5dc130207fd67f15f925",
+          "version": "slim 0.1.0"
+        }
+      },
+      "oracle_python": "C:\\Users\\User\\AppData\\Local\\Programs\\Python\\Python312\\python.EXE",
+      "fixtures": {
+        "SPEC.md": {
+          "sha256": "e0f7f939f8c75e11754eeb7e91b5cc80762e1ebe1acb40d39252c0f97f2cc378",
+          "bytes": 635
+        },
+        "check.py": {
+          "sha256": "afde2d407934888cc3908636faca4f66792e0506194673aac81ae2d7f95aec9e",
+          "bytes": 1591
+        },
+        "data/itens de ação.json": {
+          "sha256": "f89c4b4f94887efac83fb6964d491e91905192e4de890fb34320a1e2d8dba887",
+          "bytes": 208
+        }
+      },
+      "harness": {
+        "python": "3.12.10",
+        "platform": "win32",
+        "files": {
+          "run.py": "c9b2cd05870bf358bf50729113f693ef47464398b124e4205106c72af5c62304",
+          "daily.py": "db2df5aa5ec132ab981eb8759a2fd5c5174c129355a7303004c752a082c7453d",
+          "analyze.py": "084feec1aa27dbdc0256e425d96f6f5467ab91501ee7c173d76aa731609f3fd8",
+          "report.py": "51aac3a135bb1b4c800b2e6d069fdac3d93f391333b914293fea9aa31662899a",
+          "pi-audit.ts": "e0292e35650afee5d791b619d75e05d978af29c2654b16a1a65faaedf31b462c",
+          "process_runner.py": "5a39d338349a00aab4e56aec7db2ad2955b3747d6b3e90319ca7450254f14396"
+        }
+      },
+      "route": "native opencode-go; each CLI uses its own configured authentication"
+    },
+    "20260915-213535Z-opencode-go-repo_wide_repair": {
+      "model": "deepseek-v4-flash",
+      "provider": "opencode-go",
+      "effort": "high",
+      "speed": "normal",
+      "order": [
+        "pi",
+        "slim"
+      ],
+      "round": 2,
+      "fixture_hash_kind": "materialized-bytes-v1",
+      "workspace": "C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-4nmukqns",
+      "prompt": "Read SPEC.md, fix the implementation in this repository and run python check.py. Preserve unrelated files, SPEC.md and check.py. Do not install dependencies. Finish with a brief summary.",
+      "scenario": "repo_wide_repair",
+      "executables": {
+        "pi": {
+          "path": "C:\\nvm4w\\nodejs\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js",
+          "sha256": "e6d7fcf36a239cf3746e67ddf4222081ac01a601b85a3ee688bdfe9c161d754c",
+          "version": "0.85.1"
+        },
+        "slim": {
+          "path": "C:\\Users\\User\\bin\\Slim.exe",
+          "sha256": "5e04cb23c16cf0fadb585c2d2dc517fa7dee91a1ecba5dc130207fd67f15f925",
+          "version": "slim 0.1.0"
+        }
+      },
+      "oracle_python": "C:\\Users\\User\\AppData\\Local\\Programs\\Python\\Python312\\python.EXE",
+      "fixtures": {
+        "SPEC.md": {
+          "sha256": "2c1d22301ed4f0f73d58cdc9f2582bafe14c4c1f99d4b54c2100ded4718a4422",
+          "bytes": 808
+        },
+        "check.py": {
+          "sha256": "f43752374127a5543f4a2960b628949bc32a3d89065ce668b2b578679d753fe1",
+          "bytes": 2314
+        },
+        "shop/__init__.py": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "bytes": 0
+        },
+        "shop/orders/__init__.py": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "bytes": 0
+        },
+        "shop/orders/money.py": {
+          "sha256": "1cde471426f876974b1f7970816ef4c75d440c9853cc2768f80b5df77e0edf73",
+          "bytes": 128
+        },
+        "shop/api.py": {
+          "sha256": "eda2207350cb70320a617ff8cdcade702e314a02c560e1463dabc2e766b2ce4a",
+          "bytes": 140
+        },
+        "shop/orders/totals.py": {
+          "sha256": "57fbda2e696e0b7512d1b53674c27b804f48e031d6bc8461f54b09fb43b64ad1",
+          "bytes": 407
+        },
+        "archives/component_000.py": {
+          "sha256": "94b5aff144c70a20377479c9f57e2393a5940a6402aef3a4ac52ff1ead37243d",
+          "bytes": 1488
+        },
+        "archives/component_001.py": {
+          "sha256": "9771f0617e5e1bf1d0683faaaf091da211d0d9557079c3998049bcbc7847278c",
+          "bytes": 1488
+        },
+        "archives/component_002.py": {
+          "sha256": "065b9aa1f377fd810b5bc1f7e9ec5c7e196c4aa7126eaff6aa52071b1d234cf9",
+          "bytes": 1488
+        },
+        "archives/component_003.py": {
+          "sha256": "bf0c529a6ab1a3615ded6403804a980b9be0f7a2ab940b0c8e1957b6cd78b4dc",
+          "bytes": 1488
+        },
+        "archives/component_004.py": {
+          "sha256": "67b58f6599348c2c0aec4430a7e08f4cb65b968c80f06c9dcc20efab31601c61",
+          "bytes": 1488
+        },
+        "archives/component_005.py": {
+          "sha256": "384e6016707eb2a912427f56abaa4957e5ac5ce293f83c96fccc049816e50512",
+          "bytes": 1488
+        },
+        "archives/component_006.py": {
+          "sha256": "bae1a2f53f8dbece33e4036e6ffa50983007d8aa2d8838f9e0e94b847464780b",
+          "bytes": 1488
+        },
+        "archives/component_007.py": {
+          "sha256": "3d0e7d97660eb665328d041292800ad40412f46d61a46eaefe020030d3fd1ab3",
+          "bytes": 1488
+        },
+        "archives/component_008.py": {
+          "sha256": "703e50d82c6c9b4d509e8c07fe9b4071fc4bec09e66b215c1b2c91801cb10ec9",
+          "bytes": 1488
+        },
+        "archives/component_009.py": {
+          "sha256": "62ded524eba57bf8b85f54f7d485003f2fec1c55ae5503a7b6fd205548594909",
+          "bytes": 1488
+        },
+        "archives/component_010.py": {
+          "sha256": "fc2e4d8384e0025bf3689983a614b5f413c9e3e1426809e255ed33b080ca44f5",
+          "bytes": 1489
+        },
+        "archives/component_011.py": {
+          "sha256": "80307099c322f9265ad6d756379c693cfdd61ba36a230e72bc6da2292a36b5b8",
+          "bytes": 1489
+        },
+        "archives/component_012.py": {
+          "sha256": "c5d8cb886810bb910ec5926aeff4f962949c2591a3488889d14f21d701f6793c",
+          "bytes": 1489
+        },
+        "archives/component_013.py": {
+          "sha256": "a1c1971ac210084b521feb99c1176c9a9c3811fe7a6ef98e71494f59f14bedd9",
+          "bytes": 1489
+        },
+        "archives/component_014.py": {
+          "sha256": "9a9d01ac6e9e1c974fc220435b8d87dbbe04b618d45f9ee585b101d0ee91bcda",
+          "bytes": 1489
+        },
+        "archives/component_015.py": {
+          "sha256": "e783c37577e8f996d4cac123c639a517cbdf6f1374384bc45a02dfac77715707",
+          "bytes": 1489
+        },
+        "archives/component_016.py": {
+          "sha256": "4cc45676b1f1ba492c12366dde8b27529f413a380c3e94aff17ccd3bcb82e6a5",
+          "bytes": 1489
+        },
+        "archives/component_017.py": {
+          "sha256": "97259fa53cba439fa2ebf288120734121c31acd00b0049bd46ff26b10f908197",
+          "bytes": 1489
+        },
+        "archives/component_018.py": {
+          "sha256": "57670c6d9ff54866604865db3107c2eb0f9b23280a25a038ea49c65b8bff3949",
+          "bytes": 1489
+        },
+        "archives/component_019.py": {
+          "sha256": "52d1042c5059bd016f4a6c405a9f296646d9598377fc269b367383efb9e8e9ab",
+          "bytes": 1489
+        },
+        "archives/component_020.py": {
+          "sha256": "2b761e4c080263559b4a3524dcc830c4847022266404c33d960f6a68ecaf4a90",
+          "bytes": 1489
+        },
+        "archives/component_021.py": {
+          "sha256": "790e6acc8be601a9c24da3255905933f8e4333321065419d9dcf10f96f28f96b",
+          "bytes": 1489
+        },
+        "archives/component_022.py": {
+          "sha256": "0ad708c412d4f8df08abdc821bbd69d7441d9a83ce459d2471ba93211550b2b9",
+          "bytes": 1489
+        },
+        "archives/component_023.py": {
+          "sha256": "154310ac1eee2f016b9b58cb0275ad045914d83d6216f6cba4cb7a51a334296a",
+          "bytes": 1489
+        },
+        "archives/component_024.py": {
+          "sha256": "d6f192da2acb62eb56b00837d9c729280027d3eadd1c56afbb396d6060dc0465",
+          "bytes": 1489
+        },
+        "archives/component_025.py": {
+          "sha256": "8b4ace23757c9209bfd92150449a049d14b955a5a4322c0ff44697c22ca95536",
+          "bytes": 1489
+        },
+        "archives/component_026.py": {
+          "sha256": "259fda479cbddb33de5f79f1121a6ed7890cb42e4d3becef2e550dc172129e4e",
+          "bytes": 1489
+        },
+        "archives/component_027.py": {
+          "sha256": "cb82bebd2d26df48bf2514cd124ee911aaf4fe2dae195a5608cb17f5402ea1a6",
+          "bytes": 1489
+        },
+        "archives/component_028.py": {
+          "sha256": "613d184aa471e58123afad878421dcd2de87ce324c4c267ef79f3fc9cbc47112",
+          "bytes": 1489
+        },
+        "archives/component_029.py": {
+          "sha256": "df6579b775bceedfec20035a89fe83435cb589d0a10160c34c65f889758221da",
+          "bytes": 1489
+        },
+        "archives/component_030.py": {
+          "sha256": "bc1b7ecc1f12afb195cfd58d784a78a6fe626f4c9895be86fa629ba65db7ad99",
+          "bytes": 1489
+        },
+        "archives/component_031.py": {
+          "sha256": "a163962a926902ff6eda5abf6e71c1618c4a5724c0a93f709f729766e543fb85",
+          "bytes": 1489
+        },
+        "archives/component_032.py": {
+          "sha256": "117c83584377fc5af413b0db0d7322944e964ec56336764cae338a58c609aa09",
+          "bytes": 1489
+        },
+        "archives/component_033.py": {
+          "sha256": "5c44035c07afdc72548e2581fb40e704e724a4149c90567b211374cb957c8ff9",
+          "bytes": 1489
+        },
+        "archives/component_034.py": {
+          "sha256": "c2f8e02a924b3b16684aaa32b76f1ad56599793e498929d96b907426b98f4306",
+          "bytes": 1489
+        },
+        "archives/component_035.py": {
+          "sha256": "ddef9c3f2a55fdae78c49cf4b03f44bb3a7be9665dcba8e8b806ab8586bbd62c",
+          "bytes": 1489
+        },
+        "archives/component_036.py": {
+          "sha256": "1c0d0b4e967a4992ec191ca58de9e509e3031c6ebff3f3f467e0c315444999cb",
+          "bytes": 1489
+        },
+        "archives/component_037.py": {
+          "sha256": "93f06be294f41163c78050bef058d89d2ea83eea09a886dabe8760946ad7f8c8",
+          "bytes": 1489
+        },
+        "archives/component_038.py": {
+          "sha256": "bf042819a385f5d6b292129f8a7f3ed545b0e98f05e7eb0e882176940c361850",
+          "bytes": 1489
+        },
+        "archives/component_039.py": {
+          "sha256": "58bf5dcebedce55fb0fb74bb42020b44251c426b599d8971b7f84c1ef8357648",
+          "bytes": 1489
+        },
+        "archives/component_040.py": {
+          "sha256": "3f9b6ce4bb93e01d902a4f66bbc918849014a15ce49da0d6d1bd29013885f4a1",
+          "bytes": 1489
+        },
+        "archives/component_041.py": {
+          "sha256": "cf23ac94357567bcd6d9060d700243193f342f641f0adcd478852faf5e1c6640",
+          "bytes": 1489
+        },
+        "archives/component_042.py": {
+          "sha256": "9a71d93c468f306ce5f987d4feea7fc82f88a75866792166856195d319beb15f",
+          "bytes": 1489
+        },
+        "archives/component_043.py": {
+          "sha256": "093a1bb584d9928ce436d3f90a01d78c660c60ecb80acc4ab5234d19b1eec54a",
+          "bytes": 1489
+        },
+        "archives/component_044.py": {
+          "sha256": "d5d354c1cf0dc99fe34fef6e6d183e54c6dc68e56112f21c278b47eb55db84b1",
+          "bytes": 1489
+        },
+        "archives/component_045.py": {
+          "sha256": "3f10ae3a0a32c7649afb1dae12b56996a5164c39859b6e1cf3347516dfaccbec",
+          "bytes": 1489
+        },
+        "archives/component_046.py": {
+          "sha256": "e17fb084323f95503276fb5ad0e029e8a03abd068a05bfc621435ea55e820ac0",
+          "bytes": 1489
+        },
+        "archives/component_047.py": {
+          "sha256": "980354864595be03e94719f3ca89af39670d6cc9c33ae7817c98a61c01b9156e",
+          "bytes": 1489
+        },
+        "archives/component_048.py": {
+          "sha256": "e69949225e8ff60188d45023a0c7da3b91ed11aa2e1663890d64d323c6d28805",
+          "bytes": 1489
+        },
+        "archives/component_049.py": {
+          "sha256": "d32eb5e7bf6d3f123343c960b728695c1a986f390f75e47c0715f95139181c7f",
+          "bytes": 1489
+        },
+        "archives/component_050.py": {
+          "sha256": "d4a8fabf537a13ac160fcd15d150495d2facb678c99e5bfa6176bb05e7841307",
+          "bytes": 1489
+        },
+        "archives/component_051.py": {
+          "sha256": "6bdea5447685c340bb68eeefcd4094ff013a7bbbd1110050dc14ae7c58d7852b",
+          "bytes": 1489
+        },
+        "archives/component_052.py": {
+          "sha256": "0c41d11bae71d7a294843d154a192a0fa2edda3b6b43e4154a544269a7d0c9b9",
+          "bytes": 1489
+        },
+        "archives/component_053.py": {
+          "sha256": "b99f94363b4f111d60a1adad6c9dfe92125e782a0e2758bd574be645ae926da6",
+          "bytes": 1489
+        },
+        "archives/component_054.py": {
+          "sha256": "57246948d93337399941ebe04a87b1ad762e61471963d7f380e9f098dea85af0",
+          "bytes": 1489
+        },
+        "archives/component_055.py": {
+          "sha256": "4198758eecc356194884013f17a7bf0446f40d10b8bfc4d52308c79a08806621",
+          "bytes": 1489
+        },
+        "archives/component_056.py": {
+          "sha256": "1fc91379a289d4ac00dad2fe72e506b21c3812683aa13ee722f7dbdb909c5e0d",
+          "bytes": 1489
+        },
+        "archives/component_057.py": {
+          "sha256": "5c84059ff226107921a73820223e680befa54044e751372edb9c1b8629adbb76",
+          "bytes": 1489
+        },
+        "archives/component_058.py": {
+          "sha256": "a8e3599422dba0090c6fe159354e54bc41a358fc1d6936c60c5e201b31dc82cc",
+          "bytes": 1489
+        },
+        "archives/component_059.py": {
+          "sha256": "b911d57ed9d307a962fceb4ebbc05ca024c80f9f1bff612de854fb55d193b0a2",
+          "bytes": 1489
+        },
+        "archives/component_060.py": {
+          "sha256": "a97db5f1e5f91cec32469d0a869ff3a24e47eaedcded348bbc6e445aa8a8a2e3",
+          "bytes": 1489
+        },
+        "archives/component_061.py": {
+          "sha256": "3cf6dcf867ee930241ffa06b435f776883f6d4803ccccfa49369b436c7e6d4d6",
+          "bytes": 1489
+        },
+        "archives/component_062.py": {
+          "sha256": "65be5d1c68a5c71da2b056cab7467367e642924187815b7952c0c3cf61cbe9d4",
+          "bytes": 1489
+        },
+        "archives/component_063.py": {
+          "sha256": "c4f0ac6066188f01205734802ac4da950b0adfb6cd38fa3e029d6ffbd24105ac",
+          "bytes": 1489
+        },
+        "archives/component_064.py": {
+          "sha256": "578ad8ed302a379492bf92eefca78c2b68b9f2b3ce168c5dc9378ddc9c0293f8",
+          "bytes": 1489
+        },
+        "archives/component_065.py": {
+          "sha256": "cc8857fd28899680e37c4cbe55e5b41fc57077983ae877bd8524f7d332d91a7f",
+          "bytes": 1489
+        },
+        "archives/component_066.py": {
+          "sha256": "39ec8608c0503293f0863efdda2cba709c15aee0efc1f6dd75b58e63513484f0",
+          "bytes": 1489
+        },
+        "archives/component_067.py": {
+          "sha256": "3d47d07671e1080ad9e99a204f4d0c068b10c9f16f6edd6cc662eb5d485987a4",
+          "bytes": 1489
+        },
+        "archives/component_068.py": {
+          "sha256": "7e9f2752454a95b3acc845becbcf3285a24a19ba75e85afbaf97d3a94ae6ddee",
+          "bytes": 1489
+        },
+        "archives/component_069.py": {
+          "sha256": "d22840e5ed619e0379b809c988b437b5ceff29dde2652e4647b09a85a9802bc3",
+          "bytes": 1489
+        },
+        "archives/component_070.py": {
+          "sha256": "deb067433a5e22c2a6f569ea1f86144f03af87bae2c58c96f7a020a0e5a2375a",
+          "bytes": 1489
+        },
+        "archives/component_071.py": {
+          "sha256": "eac258d285418f81d619f060dfa7f19a5f8602851bd6b99c4406e2ac734bbe3d",
+          "bytes": 1489
+        },
+        "archives/component_072.py": {
+          "sha256": "b062edb85378ddc76b735f11a6bdd5326721b01a2dcd3fdbc8d953bc789fa663",
+          "bytes": 1489
+        },
+        "archives/component_073.py": {
+          "sha256": "3d625e7b328e74dfceaeba21fed140d13f7999ed8c1dc042ad464dfd1dcb3d90",
+          "bytes": 1489
+        },
+        "archives/component_074.py": {
+          "sha256": "45d824ac48f21a444da4183c318a3af25213f5d59d1544e2411fd95f874d8ae3",
+          "bytes": 1489
+        },
+        "archives/component_075.py": {
+          "sha256": "b3854ef31a6efc40d8a12e8bf7939efe237beeb419f7dd3c68b28c429cc5726d",
+          "bytes": 1489
+        },
+        "archives/component_076.py": {
+          "sha256": "b79ff6911b88795db58ef5cdea50189e8ea001e391d93cd38c1562d2f293b5a2",
+          "bytes": 1489
+        },
+        "archives/component_077.py": {
+          "sha256": "73377abfcd0f5bd3413d5fadb21be0462efe030b90b7486d81889f012c02ddee",
+          "bytes": 1489
+        },
+        "archives/component_078.py": {
+          "sha256": "d013384bac6b3a4598a064f0a519c8be4ab8fb277fe3041c69cb6c4a31b72ec4",
+          "bytes": 1489
+        },
+        "archives/component_079.py": {
+          "sha256": "5da929a10ded4ad64dd7f05373f362c2c7a5a614ced65df8ead60e97981ce077",
+          "bytes": 1489
+        }
+      },
+      "harness": {
+        "python": "3.12.10",
+        "platform": "win32",
+        "files": {
+          "run.py": "c9b2cd05870bf358bf50729113f693ef47464398b124e4205106c72af5c62304",
+          "daily.py": "db2df5aa5ec132ab981eb8759a2fd5c5174c129355a7303004c752a082c7453d",
+          "analyze.py": "084feec1aa27dbdc0256e425d96f6f5467ab91501ee7c173d76aa731609f3fd8",
+          "report.py": "51aac3a135bb1b4c800b2e6d069fdac3d93f391333b914293fea9aa31662899a",
+          "pi-audit.ts": "e0292e35650afee5d791b619d75e05d978af29c2654b16a1a65faaedf31b462c",
+          "process_runner.py": "5a39d338349a00aab4e56aec7db2ad2955b3747d6b3e90319ca7450254f14396"
+        }
+      },
+      "route": "native opencode-go; each CLI uses its own configured authentication"
+    },
+    "20260915-213538Z-opencode-go-sqlite_balances": {
+      "model": "deepseek-v4-flash",
+      "provider": "opencode-go",
+      "effort": "high",
+      "speed": "normal",
+      "order": [
+        "slim",
+        "pi"
+      ],
+      "round": 2,
+      "fixture_hash_kind": "materialized-bytes-v1",
+      "workspace": "C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-8_khdwkg",
+      "prompt": "Read SPEC.md, repair the SQL query and run python check.py. Do not change schema.sql, SPEC.md or check.py. Do not install dependencies. Finish with a brief summary.",
+      "scenario": "sqlite_balances",
+      "executables": {
+        "pi": {
+          "path": "C:\\nvm4w\\nodejs\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js",
+          "sha256": "e6d7fcf36a239cf3746e67ddf4222081ac01a601b85a3ee688bdfe9c161d754c",
+          "version": "0.85.1"
+        },
+        "slim": {
+          "path": "C:\\Users\\User\\bin\\Slim.exe",
+          "sha256": "5e04cb23c16cf0fadb585c2d2dc517fa7dee91a1ecba5dc130207fd67f15f925",
+          "version": "slim 0.1.0"
+        }
+      },
+      "oracle_python": "C:\\Users\\User\\AppData\\Local\\Programs\\Python\\Python312\\python.EXE",
+      "fixtures": {
+        "SPEC.md": {
+          "sha256": "40be2e81b9416f2e04dc64f3bfadf25f835ecda727671351338de3284fb3ecb8",
+          "bytes": 795
+        },
+        "check.py": {
+          "sha256": "48f13c384405747307382fbe1ff617149ba03a263ba2bae3ddf400787649214b",
+          "bytes": 1947
+        },
+        "schema.sql": {
+          "sha256": "3ce00461b68d955ce57529a840ee6040c9f2adde1181ab831d454e4031acb8c3",
+          "bytes": 346
+        },
+        "queries/customer_balances.sql": {
+          "sha256": "a6820887b377736fb066a9f0970d05165d3f3b3b8deabc2e3d023ecea3445294",
+          "bytes": 312
+        }
+      },
+      "harness": {
+        "python": "3.12.10",
+        "platform": "win32",
+        "files": {
+          "run.py": "c9b2cd05870bf358bf50729113f693ef47464398b124e4205106c72af5c62304",
+          "daily.py": "db2df5aa5ec132ab981eb8759a2fd5c5174c129355a7303004c752a082c7453d",
+          "analyze.py": "084feec1aa27dbdc0256e425d96f6f5467ab91501ee7c173d76aa731609f3fd8",
+          "report.py": "51aac3a135bb1b4c800b2e6d069fdac3d93f391333b914293fea9aa31662899a",
+          "pi-audit.ts": "e0292e35650afee5d791b619d75e05d978af29c2654b16a1a65faaedf31b462c",
+          "process_runner.py": "5a39d338349a00aab4e56aec7db2ad2955b3747d6b3e90319ca7450254f14396"
+        }
+      },
+      "route": "native opencode-go; each CLI uses its own configured authentication"
+    },
+    "20260915-213542Z-opencode-go-config_migration": {
+      "model": "deepseek-v4-flash",
+      "provider": "opencode-go",
+      "effort": "high",
+      "speed": "normal",
+      "order": [
+        "slim",
+        "pi"
+      ],
+      "round": 2,
+      "fixture_hash_kind": "materialized-bytes-v1",
+      "workspace": "C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-u_w38noo",
+      "prompt": "Read SPEC.md and migrate the configuration files. Run python check.py. Do not change SPEC.md or check.py. Do not install dependencies. Finish with a brief summary.",
+      "scenario": "config_migration",
+      "executables": {
+        "pi": {
+          "path": "C:\\nvm4w\\nodejs\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js",
+          "sha256": "e6d7fcf36a239cf3746e67ddf4222081ac01a601b85a3ee688bdfe9c161d754c",
+          "version": "0.85.1"
+        },
+        "slim": {
+          "path": "C:\\Users\\User\\bin\\Slim.exe",
+          "sha256": "5e04cb23c16cf0fadb585c2d2dc517fa7dee91a1ecba5dc130207fd67f15f925",
+          "version": "slim 0.1.0"
+        }
+      },
+      "oracle_python": "C:\\Users\\User\\AppData\\Local\\Programs\\Python\\Python312\\python.EXE",
+      "fixtures": {
+        "SPEC.md": {
+          "sha256": "5744917830ce5b47dac4e87d58b0bdcb12ecd913bb67530a52ededc940636bfe",
+          "bytes": 462
+        },
+        "check.py": {
+          "sha256": "459ec0ad67bfb210ca315adec5735808429285ed6a99df1032375fa5d9908504",
+          "bytes": 952
+        },
+        "config/development.json": {
+          "sha256": "37eb1369cfa552b33a65aa51cd164e446f1172b3e86d4c06c5a9e20a2d1e7e7e",
+          "bytes": 325
+        },
+        "config/production.json": {
+          "sha256": "0aaee09212ece971270d35b2423cc8c50bd3337a7b185ac3ed9afa877047cbb4",
+          "bytes": 197
+        },
+        "config/current.json": {
+          "sha256": "b046b856360672cbc3dbefe3b8f23eb4d15a00afdb43495ed4b85d3d3a1d02df",
+          "bytes": 83
+        }
+      },
+      "harness": {
+        "python": "3.12.10",
+        "platform": "win32",
+        "files": {
+          "run.py": "c9b2cd05870bf358bf50729113f693ef47464398b124e4205106c72af5c62304",
+          "daily.py": "db2df5aa5ec132ab981eb8759a2fd5c5174c129355a7303004c752a082c7453d",
+          "analyze.py": "084feec1aa27dbdc0256e425d96f6f5467ab91501ee7c173d76aa731609f3fd8",
+          "report.py": "51aac3a135bb1b4c800b2e6d069fdac3d93f391333b914293fea9aa31662899a",
+          "pi-audit.ts": "e0292e35650afee5d791b619d75e05d978af29c2654b16a1a65faaedf31b462c",
+          "process_runner.py": "5a39d338349a00aab4e56aec7db2ad2955b3747d6b3e90319ca7450254f14396"
+        }
+      },
+      "route": "native opencode-go; each CLI uses its own configured authentication"
+    },
+    "20260915-213545Z-opencode-go-json_cli": {
+      "model": "deepseek-v4-flash",
+      "provider": "opencode-go",
+      "effort": "high",
+      "speed": "normal",
+      "order": [
+        "pi",
+        "slim"
+      ],
+      "round": 2,
+      "fixture_hash_kind": "materialized-bytes-v1",
+      "workspace": "C:\\Users\\User\\AppData\\Local\\Temp\\slim-pi-luna-8u6dg8jt",
+      "prompt": "Read SPEC.md and implement the requested CLI. Run python check.py and fix failures. Do not change SPEC.md, check.py or data. Do not install dependencies. Finish with a brief summary.",
+      "scenario": "json_cli",
+      "executables": {
+        "pi": {
+          "path": "C:\\nvm4w\\nodejs\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js",
+          "sha256": "e6d7fcf36a239cf3746e67ddf4222081ac01a601b85a3ee688bdfe9c161d754c",
+          "version": "0.85.1"
+        },
+        "slim": {
+          "path": "C:\\Users\\User\\bin\\Slim.exe",
+          "sha256": "5e04cb23c16cf0fadb585c2d2dc517fa7dee91a1ecba5dc130207fd67f15f925",
+          "version": "slim 0.1.0"
+        }
+      },
+      "oracle_python": "C:\\Users\\User\\AppData\\Local\\Programs\\Python\\Python312\\python.EXE",
+      "fixtures": {
+        "SPEC.md": {
+          "sha256": "e0f7f939f8c75e11754eeb7e91b5cc80762e1ebe1acb40d39252c0f97f2cc378",
+          "bytes": 635
+        },
+        "check.py": {
+          "sha256": "afde2d407934888cc3908636faca4f66792e0506194673aac81ae2d7f95aec9e",
+          "bytes": 1591
+        },
+        "data/itens de ação.json": {
+          "sha256": "f89c4b4f94887efac83fb6964d491e91905192e4de890fb34320a1e2d8dba887",
+          "bytes": 208
+        }
+      },
+      "harness": {
+        "python": "3.12.10",
+        "platform": "win32",
+        "files": {
+          "run.py": "c9b2cd05870bf358bf50729113f693ef47464398b124e4205106c72af5c62304",
+          "daily.py": "db2df5aa5ec132ab981eb8759a2fd5c5174c129355a7303004c752a082c7453d",
+          "analyze.py": "084feec1aa27dbdc0256e425d96f6f5467ab91501ee7c173d76aa731609f3fd8",
+          "report.py": "51aac3a135bb1b4c800b2e6d069fdac3d93f391333b914293fea9aa31662899a",
+          "pi-audit.ts": "e0292e35650afee5d791b619d75e05d978af29c2654b16a1a65faaedf31b462c",
+          "process_runner.py": "5a39d338349a00aab4e56aec7db2ad2955b3747d6b3e90319ca7450254f14396"
+        }
+      },
+      "route": "native opencode-go; each CLI uses its own configured authentication"
+    }
+  },
+  "aggregate": {
+    "pi": {
+      "total": {
+        "wall_ms": 11279,
+        "model_calls": 8,
+        "tool_calls": 0,
+        "tool_failures": 0,
+        "tool_ms_sum": 0,
+        "provider_ms_sum": 4511,
+        "residual_ms": 6768,
+        "total_tokens": 0,
+        "input": 0,
+        "uncached": 0,
+        "cache": 0,
+        "output": 0,
+        "reasoning": 0,
+        "files_modified": 0,
+        "files_added": 0
+      },
+      "errors": {},
+      "pairs": 8,
+      "by_tool": {}
+    },
+    "slim": {
+      "total": {
+        "wall_ms": 6792,
+        "model_calls": 8,
+        "tool_calls": 0,
+        "tool_failures": 0,
+        "tool_ms_sum": 0,
+        "provider_ms_sum": 4184,
+        "residual_ms": 2608,
+        "total_tokens": 0,
+        "input": 0,
+        "uncached": 0,
+        "cache": 0,
+        "output": 0,
+        "reasoning": 0,
+        "files_modified": 0,
+        "files_added": 0
+      },
+      "errors": {},
+      "pairs": 8,
+      "by_tool": {}
+    }
+  },
+  "paired": {
+    "stats": {},
+    "pairs": []
+  },
+  "arms": [
+    {
+      "campaign": "20260915-213509Z-opencode-go-config_migration",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-213509Z-opencode-go-config_migration",
+      "wall_ms": 1064,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 1,
+      "fixtures_unchanged": true,
+      "metrics_complete": false,
+      "arm": "pi",
+      "model_calls": 1,
+      "tool_calls": 0,
+      "tool_failures": 0,
+      "tool_ms_sum": 0,
+      "provider_ms_sum": 578,
+      "residual_ms": 486,
+      "total_tokens": 0,
+      "input": 0,
+      "uncached": 0,
+      "cache": 0,
+      "output": 0,
+      "reasoning": 0,
+      "provider_ms": 578,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [],
+        "deleted": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "input": 0,
+          "uncached": 0,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 0,
+          "reasoning": 0,
+          "provider_ms": 578,
+          "tools": [],
+          "model": "deepseek-v4-flash",
+          "system_bytes": 2785,
+          "schema_bytes": 2901,
+          "history_bytes": 216,
+          "tool_result_bytes": 0,
+          "component_source": "wire"
+        }
+      ],
+      "tools": [],
+      "scenario": "config_migration",
+      "order": [
+        "pi",
+        "slim"
+      ]
+    },
+    {
+      "campaign": "20260915-213509Z-opencode-go-config_migration",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-213509Z-opencode-go-config_migration",
+      "wall_ms": 1677,
+      "exit_code": 21,
+      "timed_out": false,
+      "validation_exit": 1,
+      "fixtures_unchanged": true,
+      "metrics_complete": false,
+      "arm": "slim",
+      "model_calls": 1,
+      "tool_calls": 0,
+      "tool_failures": 0,
+      "tool_ms_sum": 0,
+      "provider_ms_sum": 548,
+      "residual_ms": 1129,
+      "total_tokens": 0,
+      "input": 0,
+      "uncached": 0,
+      "cache": 0,
+      "output": 0,
+      "reasoning": 0,
+      "provider_ms": 548,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [],
+        "deleted": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "seq": null,
+          "input": 0,
+          "uncached": 0,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 0,
+          "reasoning": 0,
+          "provider_ms": 548,
+          "tools": [],
+          "system_bytes": 1584,
+          "schema_bytes": 8014,
+          "history_bytes": 961,
+          "tool_result_bytes": 0
+        }
+      ],
+      "tools": [],
+      "scenario": "config_migration",
+      "order": [
+        "pi",
+        "slim"
+      ]
+    },
+    {
+      "campaign": "20260915-213515Z-opencode-go-sqlite_balances",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-213515Z-opencode-go-sqlite_balances",
+      "wall_ms": 1026,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 1,
+      "fixtures_unchanged": true,
+      "metrics_complete": false,
+      "arm": "pi",
+      "model_calls": 1,
+      "tool_calls": 0,
+      "tool_failures": 0,
+      "tool_ms_sum": 0,
+      "provider_ms_sum": 551,
+      "residual_ms": 475,
+      "total_tokens": 0,
+      "input": 0,
+      "uncached": 0,
+      "cache": 0,
+      "output": 0,
+      "reasoning": 0,
+      "provider_ms": 551,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [],
+        "deleted": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "input": 0,
+          "uncached": 0,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 0,
+          "reasoning": 0,
+          "provider_ms": 551,
+          "tools": [],
+          "model": "deepseek-v4-flash",
+          "system_bytes": 2785,
+          "schema_bytes": 2901,
+          "history_bytes": 217,
+          "tool_result_bytes": 0,
+          "component_source": "wire"
+        }
+      ],
+      "tools": [],
+      "scenario": "sqlite_balances",
+      "order": [
+        "pi",
+        "slim"
+      ]
+    },
+    {
+      "campaign": "20260915-213515Z-opencode-go-sqlite_balances",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-213515Z-opencode-go-sqlite_balances",
+      "wall_ms": 1651,
+      "exit_code": 21,
+      "timed_out": false,
+      "validation_exit": 1,
+      "fixtures_unchanged": true,
+      "metrics_complete": false,
+      "arm": "slim",
+      "model_calls": 1,
+      "tool_calls": 0,
+      "tool_failures": 0,
+      "tool_ms_sum": 0,
+      "provider_ms_sum": 514,
+      "residual_ms": 1137,
+      "total_tokens": 0,
+      "input": 0,
+      "uncached": 0,
+      "cache": 0,
+      "output": 0,
+      "reasoning": 0,
+      "provider_ms": 514,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [],
+        "deleted": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "seq": null,
+          "input": 0,
+          "uncached": 0,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 0,
+          "reasoning": 0,
+          "provider_ms": 514,
+          "tools": [],
+          "system_bytes": 1584,
+          "schema_bytes": 8014,
+          "history_bytes": 933,
+          "tool_result_bytes": 0
+        }
+      ],
+      "tools": [],
+      "scenario": "sqlite_balances",
+      "order": [
+        "pi",
+        "slim"
+      ]
+    },
+    {
+      "campaign": "20260915-213521Z-opencode-go-repo_wide_repair",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-213521Z-opencode-go-repo_wide_repair",
+      "wall_ms": 2167,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 1,
+      "fixtures_unchanged": true,
+      "metrics_complete": false,
+      "arm": "pi",
+      "model_calls": 1,
+      "tool_calls": 0,
+      "tool_failures": 0,
+      "tool_ms_sum": 0,
+      "provider_ms_sum": 567,
+      "residual_ms": 1600,
+      "total_tokens": 0,
+      "input": 0,
+      "uncached": 0,
+      "cache": 0,
+      "output": 0,
+      "reasoning": 0,
+      "provider_ms": 567,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [],
+        "deleted": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "input": 0,
+          "uncached": 0,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 0,
+          "reasoning": 0,
+          "provider_ms": 567,
+          "tools": [],
+          "model": "deepseek-v4-flash",
+          "system_bytes": 2785,
+          "schema_bytes": 2901,
+          "history_bytes": 239,
+          "tool_result_bytes": 0,
+          "component_source": "wire"
+        }
+      ],
+      "tools": [],
+      "scenario": "repo_wide_repair",
+      "order": [
+        "slim",
+        "pi"
+      ]
+    },
+    {
+      "campaign": "20260915-213521Z-opencode-go-repo_wide_repair",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-213521Z-opencode-go-repo_wide_repair",
+      "wall_ms": 647,
+      "exit_code": 21,
+      "timed_out": false,
+      "validation_exit": 1,
+      "fixtures_unchanged": true,
+      "metrics_complete": false,
+      "arm": "slim",
+      "model_calls": 1,
+      "tool_calls": 0,
+      "tool_failures": 0,
+      "tool_ms_sum": 0,
+      "provider_ms_sum": 546,
+      "residual_ms": 101,
+      "total_tokens": 0,
+      "input": 0,
+      "uncached": 0,
+      "cache": 0,
+      "output": 0,
+      "reasoning": 0,
+      "provider_ms": 546,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [],
+        "deleted": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "seq": null,
+          "input": 0,
+          "uncached": 0,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 0,
+          "reasoning": 0,
+          "provider_ms": 546,
+          "tools": [],
+          "system_bytes": 1584,
+          "schema_bytes": 8014,
+          "history_bytes": 1290,
+          "tool_result_bytes": 0
+        }
+      ],
+      "tools": [],
+      "scenario": "repo_wide_repair",
+      "order": [
+        "slim",
+        "pi"
+      ]
+    },
+    {
+      "campaign": "20260915-213527Z-opencode-go-json_cli",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-213527Z-opencode-go-json_cli",
+      "wall_ms": 3184,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 1,
+      "fixtures_unchanged": true,
+      "metrics_complete": false,
+      "arm": "pi",
+      "model_calls": 1,
+      "tool_calls": 0,
+      "tool_failures": 0,
+      "tool_ms_sum": 0,
+      "provider_ms_sum": 547,
+      "residual_ms": 2637,
+      "total_tokens": 0,
+      "input": 0,
+      "uncached": 0,
+      "cache": 0,
+      "output": 0,
+      "reasoning": 0,
+      "provider_ms": 547,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [],
+        "deleted": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "input": 0,
+          "uncached": 0,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 0,
+          "reasoning": 0,
+          "provider_ms": 547,
+          "tools": [],
+          "model": "deepseek-v4-flash",
+          "system_bytes": 2785,
+          "schema_bytes": 2901,
+          "history_bytes": 235,
+          "tool_result_bytes": 0,
+          "component_source": "wire"
+        }
+      ],
+      "tools": [],
+      "scenario": "json_cli",
+      "order": [
+        "slim",
+        "pi"
+      ]
+    },
+    {
+      "campaign": "20260915-213527Z-opencode-go-json_cli",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-213527Z-opencode-go-json_cli",
+      "wall_ms": 627,
+      "exit_code": 21,
+      "timed_out": false,
+      "validation_exit": 1,
+      "fixtures_unchanged": true,
+      "metrics_complete": false,
+      "arm": "slim",
+      "model_calls": 1,
+      "tool_calls": 0,
+      "tool_failures": 0,
+      "tool_ms_sum": 0,
+      "provider_ms_sum": 508,
+      "residual_ms": 119,
+      "total_tokens": 0,
+      "input": 0,
+      "uncached": 0,
+      "cache": 0,
+      "output": 0,
+      "reasoning": 0,
+      "provider_ms": 508,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [],
+        "deleted": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "seq": null,
+          "input": 0,
+          "uncached": 0,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 0,
+          "reasoning": 0,
+          "provider_ms": 508,
+          "tools": [],
+          "system_bytes": 1584,
+          "schema_bytes": 8014,
+          "history_bytes": 929,
+          "tool_result_bytes": 0
+        }
+      ],
+      "tools": [],
+      "scenario": "json_cli",
+      "order": [
+        "slim",
+        "pi"
+      ]
+    },
+    {
+      "campaign": "20260915-213535Z-opencode-go-repo_wide_repair",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-213535Z-opencode-go-repo_wide_repair",
+      "wall_ms": 955,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 1,
+      "fixtures_unchanged": true,
+      "metrics_complete": false,
+      "arm": "pi",
+      "model_calls": 1,
+      "tool_calls": 0,
+      "tool_failures": 0,
+      "tool_ms_sum": 0,
+      "provider_ms_sum": 571,
+      "residual_ms": 384,
+      "total_tokens": 0,
+      "input": 0,
+      "uncached": 0,
+      "cache": 0,
+      "output": 0,
+      "reasoning": 0,
+      "provider_ms": 571,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [],
+        "deleted": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "input": 0,
+          "uncached": 0,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 0,
+          "reasoning": 0,
+          "provider_ms": 571,
+          "tools": [],
+          "model": "deepseek-v4-flash",
+          "system_bytes": 2785,
+          "schema_bytes": 2901,
+          "history_bytes": 239,
+          "tool_result_bytes": 0,
+          "component_source": "wire"
+        }
+      ],
+      "tools": [],
+      "scenario": "repo_wide_repair",
+      "order": [
+        "pi",
+        "slim"
+      ]
+    },
+    {
+      "campaign": "20260915-213535Z-opencode-go-repo_wide_repair",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-213535Z-opencode-go-repo_wide_repair",
+      "wall_ms": 530,
+      "exit_code": 21,
+      "timed_out": false,
+      "validation_exit": 1,
+      "fixtures_unchanged": true,
+      "metrics_complete": false,
+      "arm": "slim",
+      "model_calls": 1,
+      "tool_calls": 0,
+      "tool_failures": 0,
+      "tool_ms_sum": 0,
+      "provider_ms_sum": 499,
+      "residual_ms": 31,
+      "total_tokens": 0,
+      "input": 0,
+      "uncached": 0,
+      "cache": 0,
+      "output": 0,
+      "reasoning": 0,
+      "provider_ms": 499,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [],
+        "deleted": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "seq": null,
+          "input": 0,
+          "uncached": 0,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 0,
+          "reasoning": 0,
+          "provider_ms": 499,
+          "tools": [],
+          "system_bytes": 1584,
+          "schema_bytes": 8014,
+          "history_bytes": 1290,
+          "tool_result_bytes": 0
+        }
+      ],
+      "tools": [],
+      "scenario": "repo_wide_repair",
+      "order": [
+        "pi",
+        "slim"
+      ]
+    },
+    {
+      "campaign": "20260915-213538Z-opencode-go-sqlite_balances",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-213538Z-opencode-go-sqlite_balances",
+      "wall_ms": 972,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 1,
+      "fixtures_unchanged": true,
+      "metrics_complete": false,
+      "arm": "pi",
+      "model_calls": 1,
+      "tool_calls": 0,
+      "tool_failures": 0,
+      "tool_ms_sum": 0,
+      "provider_ms_sum": 563,
+      "residual_ms": 409,
+      "total_tokens": 0,
+      "input": 0,
+      "uncached": 0,
+      "cache": 0,
+      "output": 0,
+      "reasoning": 0,
+      "provider_ms": 563,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [],
+        "deleted": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "input": 0,
+          "uncached": 0,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 0,
+          "reasoning": 0,
+          "provider_ms": 563,
+          "tools": [],
+          "model": "deepseek-v4-flash",
+          "system_bytes": 2785,
+          "schema_bytes": 2901,
+          "history_bytes": 217,
+          "tool_result_bytes": 0,
+          "component_source": "wire"
+        }
+      ],
+      "tools": [],
+      "scenario": "sqlite_balances",
+      "order": [
+        "slim",
+        "pi"
+      ]
+    },
+    {
+      "campaign": "20260915-213538Z-opencode-go-sqlite_balances",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-213538Z-opencode-go-sqlite_balances",
+      "wall_ms": 572,
+      "exit_code": 21,
+      "timed_out": false,
+      "validation_exit": 1,
+      "fixtures_unchanged": true,
+      "metrics_complete": false,
+      "arm": "slim",
+      "model_calls": 1,
+      "tool_calls": 0,
+      "tool_failures": 0,
+      "tool_ms_sum": 0,
+      "provider_ms_sum": 540,
+      "residual_ms": 32,
+      "total_tokens": 0,
+      "input": 0,
+      "uncached": 0,
+      "cache": 0,
+      "output": 0,
+      "reasoning": 0,
+      "provider_ms": 540,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [],
+        "deleted": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "seq": null,
+          "input": 0,
+          "uncached": 0,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 0,
+          "reasoning": 0,
+          "provider_ms": 540,
+          "tools": [],
+          "system_bytes": 1584,
+          "schema_bytes": 8014,
+          "history_bytes": 933,
+          "tool_result_bytes": 0
+        }
+      ],
+      "tools": [],
+      "scenario": "sqlite_balances",
+      "order": [
+        "slim",
+        "pi"
+      ]
+    },
+    {
+      "campaign": "20260915-213542Z-opencode-go-config_migration",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-213542Z-opencode-go-config_migration",
+      "wall_ms": 979,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 1,
+      "fixtures_unchanged": true,
+      "metrics_complete": false,
+      "arm": "pi",
+      "model_calls": 1,
+      "tool_calls": 0,
+      "tool_failures": 0,
+      "tool_ms_sum": 0,
+      "provider_ms_sum": 570,
+      "residual_ms": 409,
+      "total_tokens": 0,
+      "input": 0,
+      "uncached": 0,
+      "cache": 0,
+      "output": 0,
+      "reasoning": 0,
+      "provider_ms": 570,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [],
+        "deleted": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "input": 0,
+          "uncached": 0,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 0,
+          "reasoning": 0,
+          "provider_ms": 570,
+          "tools": [],
+          "model": "deepseek-v4-flash",
+          "system_bytes": 2785,
+          "schema_bytes": 2901,
+          "history_bytes": 216,
+          "tool_result_bytes": 0,
+          "component_source": "wire"
+        }
+      ],
+      "tools": [],
+      "scenario": "config_migration",
+      "order": [
+        "slim",
+        "pi"
+      ]
+    },
+    {
+      "campaign": "20260915-213542Z-opencode-go-config_migration",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-213542Z-opencode-go-config_migration",
+      "wall_ms": 533,
+      "exit_code": 21,
+      "timed_out": false,
+      "validation_exit": 1,
+      "fixtures_unchanged": true,
+      "metrics_complete": false,
+      "arm": "slim",
+      "model_calls": 1,
+      "tool_calls": 0,
+      "tool_failures": 0,
+      "tool_ms_sum": 0,
+      "provider_ms_sum": 502,
+      "residual_ms": 31,
+      "total_tokens": 0,
+      "input": 0,
+      "uncached": 0,
+      "cache": 0,
+      "output": 0,
+      "reasoning": 0,
+      "provider_ms": 502,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [],
+        "deleted": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "seq": null,
+          "input": 0,
+          "uncached": 0,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 0,
+          "reasoning": 0,
+          "provider_ms": 502,
+          "tools": [],
+          "system_bytes": 1584,
+          "schema_bytes": 8014,
+          "history_bytes": 961,
+          "tool_result_bytes": 0
+        }
+      ],
+      "tools": [],
+      "scenario": "config_migration",
+      "order": [
+        "slim",
+        "pi"
+      ]
+    },
+    {
+      "campaign": "20260915-213545Z-opencode-go-json_cli",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-213545Z-opencode-go-json_cli",
+      "wall_ms": 932,
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_exit": 1,
+      "fixtures_unchanged": true,
+      "metrics_complete": false,
+      "arm": "pi",
+      "model_calls": 1,
+      "tool_calls": 0,
+      "tool_failures": 0,
+      "tool_ms_sum": 0,
+      "provider_ms_sum": 564,
+      "residual_ms": 368,
+      "total_tokens": 0,
+      "input": 0,
+      "uncached": 0,
+      "cache": 0,
+      "output": 0,
+      "reasoning": 0,
+      "provider_ms": 564,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [],
+        "deleted": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "input": 0,
+          "uncached": 0,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 0,
+          "reasoning": 0,
+          "provider_ms": 564,
+          "tools": [],
+          "model": "deepseek-v4-flash",
+          "system_bytes": 2785,
+          "schema_bytes": 2901,
+          "history_bytes": 235,
+          "tool_result_bytes": 0,
+          "component_source": "wire"
+        }
+      ],
+      "tools": [],
+      "scenario": "json_cli",
+      "order": [
+        "pi",
+        "slim"
+      ]
+    },
+    {
+      "campaign": "20260915-213545Z-opencode-go-json_cli",
+      "campaign_path": "D:\\Slim\\bench\\luna-live\\20260915-213545Z-opencode-go-json_cli",
+      "wall_ms": 555,
+      "exit_code": 21,
+      "timed_out": false,
+      "validation_exit": 1,
+      "fixtures_unchanged": true,
+      "metrics_complete": false,
+      "arm": "slim",
+      "model_calls": 1,
+      "tool_calls": 0,
+      "tool_failures": 0,
+      "tool_ms_sum": 0,
+      "provider_ms_sum": 527,
+      "residual_ms": 28,
+      "total_tokens": 0,
+      "input": 0,
+      "uncached": 0,
+      "cache": 0,
+      "output": 0,
+      "reasoning": 0,
+      "provider_ms": 527,
+      "error_breakdown": {},
+      "workspace_diff": {
+        "modified": [],
+        "added": [],
+        "deleted": []
+      },
+      "rows": [
+        {
+          "turn": 1,
+          "seq": null,
+          "input": 0,
+          "uncached": 0,
+          "cache": 0,
+          "cache_write": 0,
+          "output": 0,
+          "reasoning": 0,
+          "provider_ms": 527,
+          "tools": [],
+          "system_bytes": 1584,
+          "schema_bytes": 8014,
+          "history_bytes": 929,
+          "tool_result_bytes": 0
+        }
+      ],
+      "tools": [],
+      "scenario": "json_cli",
+      "order": [
+        "pi",
+        "slim"
+      ]
+    }
+  ],
+  "problems": [
+    "20260915-213509Z-opencode-go-config_migration/pi: gate falhou (exit=0, valid=1, fixtures=True)",
+    "20260915-213509Z-opencode-go-config_migration/slim: gate falhou (exit=21, valid=1, fixtures=True)",
+    "20260915-213515Z-opencode-go-sqlite_balances/pi: gate falhou (exit=0, valid=1, fixtures=True)",
+    "20260915-213515Z-opencode-go-sqlite_balances/slim: gate falhou (exit=21, valid=1, fixtures=True)",
+    "20260915-213521Z-opencode-go-repo_wide_repair/pi: gate falhou (exit=0, valid=1, fixtures=True)",
+    "20260915-213521Z-opencode-go-repo_wide_repair/slim: gate falhou (exit=21, valid=1, fixtures=True)",
+    "20260915-213527Z-opencode-go-json_cli/pi: gate falhou (exit=0, valid=1, fixtures=True)",
+    "20260915-213527Z-opencode-go-json_cli/slim: gate falhou (exit=21, valid=1, fixtures=True)",
+    "20260915-213535Z-opencode-go-repo_wide_repair/pi: gate falhou (exit=0, valid=1, fixtures=True)",
+    "20260915-213535Z-opencode-go-repo_wide_repair/slim: gate falhou (exit=21, valid=1, fixtures=True)",
+    "20260915-213538Z-opencode-go-sqlite_balances/pi: gate falhou (exit=0, valid=1, fixtures=True)",
+    "20260915-213538Z-opencode-go-sqlite_balances/slim: gate falhou (exit=21, valid=1, fixtures=True)",
+    "20260915-213542Z-opencode-go-config_migration/pi: gate falhou (exit=0, valid=1, fixtures=True)",
+    "20260915-213542Z-opencode-go-config_migration/slim: gate falhou (exit=21, valid=1, fixtures=True)",
+    "20260915-213545Z-opencode-go-json_cli/pi: gate falhou (exit=0, valid=1, fixtures=True)",
+    "20260915-213545Z-opencode-go-json_cli/slim: gate falhou (exit=21, valid=1, fixtures=True)"
+  ],
+  "failure_causes": {
+    "usage-incompleto": 8,
+    "processo": 8
+  }
+}

@@ -1224,6 +1224,114 @@ fn repeated_failed_tool_call_stops_the_multi_turn_loop() {
 }
 
 #[test]
+fn structural_rejection_aliases_share_identity_and_valid_call_still_runs() {
+    let root =
+        std::env::temp_dir().join(format!("slim-structural-rejection-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("root");
+    std::fs::write(root.join("source.txt"), "stable\n").expect("source");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let mut stream = accept_with_deadline(&listener);
+        let _ = read_http_request(&mut stream);
+        let calls = json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [
+                        {"index": 0, "id": "invalid-a", "function": {"name": "read", "arguments": json!({"path":"source.txt", "offset":0}).to_string()}},
+                        {"index": 1, "id": "invalid-b", "function": {"name": "read", "arguments": json!({"path":"./source.txt", "offset":0}).to_string()}},
+                        {"index": 2, "id": "valid-read", "function": {"name": "read", "arguments": json!({"path":"source.txt", "offset":1}).to_string()}}
+                    ]
+                }
+            }]
+        });
+        let body = format!(
+            "data: {calls}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+        );
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .expect("tool calls");
+    });
+
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(3)).expect("client");
+    let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let mut runtime = Runtime::new();
+    let result = tokio_runtime
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "repair invalid reads",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig {
+                max_turns: 1,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .expect("loop");
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::RepeatedFailedTool);
+    assert_eq!(result.tool_results.len(), 3);
+    assert!(result.tool_results[0]
+        .output
+        .contains("read offset must be at least 1"));
+    assert!(result.tool_results[1]
+        .output
+        .contains("read offset must be at least 1"));
+    assert!(result.tool_results[2].output.contains("stable"));
+    assert_eq!(
+        std::fs::read_to_string(root.join("source.txt")).expect("source"),
+        "stable\n"
+    );
+
+    let invalid_fingerprints = runtime
+        .app
+        .events()
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::CausalProgressObserved {
+                call_id,
+                kind: slim_core::CausalProgressKind::DistinctFailure,
+                call_fingerprint,
+                ..
+            } if call_id.as_ref() == "invalid-a" => Some(call_fingerprint.as_ref()),
+            EventKind::CausalAnomalyDetected {
+                call_id,
+                kind: slim_core::CausalAnomalyKind::RepeatedFailure,
+                call_fingerprint,
+                ..
+            } if call_id.as_ref() == "invalid-b" => Some(call_fingerprint.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(invalid_fingerprints.len(), 2);
+    assert_eq!(invalid_fingerprints[0], invalid_fingerprints[1]);
+    assert!(!runtime.app.events().iter().any(|event| {
+        matches!(
+            &event.kind,
+            EventKind::CausalBoundaryObserved { call_id, .. }
+                if call_id.as_ref() == "invalid-a" || call_id.as_ref() == "invalid-b"
+        )
+    }));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn tool_limit_blocks_excess_mutating_calls_before_execution() {
     let root = std::env::temp_dir().join(format!("slim-tool-limit-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("root");
@@ -1486,6 +1594,87 @@ fn one_provider_batch_runs_disjoint_mutations_with_ordered_results() {
         .all(|(_, candidate_batch, _, _)| *candidate_batch == batch_id));
 
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn json_diagnostics_from_two_patches_reach_the_next_model_request_together() {
+    let root = std::env::temp_dir().join(format!(
+        "slim-json-batch-diagnostics-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    for name in ["development.json", "production.json"] {
+        std::fs::write(root.join(name), "{\r\n  \"a\": 1,\r\n  \"b\": 2\r\n}\r\n").unwrap();
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for turn in 0..2 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            let wire: Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            let delta = if turn == 0 {
+                json!({"tool_calls":[
+                    {"index":0,"id":"patch-dev","function":{"name":"patch","arguments":json!({"path":"development.json","expected":"\"a\": 1,","replacement":"\"a\": 1"}).to_string()}},
+                    {"index":1,"id":"patch-prod","function":{"name":"patch","arguments":json!({"path":"production.json","edits":[{"expected":"\"a\": 1,","replacement":"\"a\": 1"}]}).to_string()}}
+                ]})
+            } else {
+                let messages = wire["messages"].as_array().unwrap();
+                let results = messages
+                    .iter()
+                    .filter(|m| m["role"] == "tool")
+                    .collect::<Vec<_>>();
+                assert_eq!(results.len(), 2);
+                for (result, name) in results.iter().zip(["development.json", "production.json"]) {
+                    let content = result["content"].as_str().unwrap();
+                    assert!(
+                        content.contains(name) && content.contains("JSON syntax diagnostic"),
+                        "{content}"
+                    );
+                    assert!(content.contains("line 3"), "{content}");
+                }
+                json!({"content":"Both edited files need correction."})
+            };
+            let finish = if turn == 0 { "tool_calls" } else { "stop" };
+            let body = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"delta":delta}]}),
+                json!({"choices":[{"delta":{},"finish_reason":finish}]})
+            );
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).unwrap();
+        }
+    });
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .unwrap();
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(3)).unwrap();
+    let mut runtime = Runtime::new();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "Edit the two configurations.",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig::default(),
+        ))
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert!(result.tool_results.iter().all(|r| r.success));
+    assert!(!result.usage.validated_completion);
+    for name in ["development.json", "production.json"] {
+        let content = std::fs::read_to_string(root.join(name)).unwrap();
+        assert!(content.contains("\r\n"));
+        assert!(serde_json::from_str::<Value>(&content).is_err());
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -2616,6 +2805,241 @@ fn threshold_requests_summary_then_real_turn_with_same_provider_model() {
 }
 
 #[test]
+fn manual_compaction_retains_native_execution_facts_without_model_summary() {
+    let root = std::env::temp_dir().join(format!(
+        "slim-native-facts-compaction-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("workspace");
+    let mutation_path = std::fs::canonicalize(&root)
+        .expect("canonical workspace")
+        .join("written.txt")
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let handle = CompactionHandle::default();
+    let server_handle = handle.clone();
+    let server_mutation_path = mutation_path.clone();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for turn in 0..4 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            let wire: Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").expect("request body").1)
+                    .expect("request JSON");
+
+            let body = if turn == 0 {
+                let calls = json!({
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "id": "write-fact", "function": {"name": "write", "arguments": json!({"path": "written.txt", "content": "native fact\n"}).to_string()}},
+                                {"index": 1, "id": "validation-fact", "function": {"name": "shell", "arguments": json!({"command": "cargo", "args": ["check", "--offline"]}).to_string()}},
+                                {"index": 2, "id": "failure-fact", "function": {"name": "read", "arguments": json!({"path": "missing.txt"}).to_string()}}
+                            ]
+                        }
+                    }]
+                });
+                let terminal = json!({
+                    "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+                });
+                server_handle
+                    .request_manual("")
+                    .expect("manual compaction request");
+                format!("data: {calls}\n\ndata: {terminal}\n\ndata: [DONE]\n\n")
+            } else if turn == 1 {
+                assert_eq!(
+                    wire["messages"][0]["content"],
+                    slim_core::context::COMPACTION_SYSTEM_PROMPT,
+                    "the next iteration must consume the shared manual compaction request"
+                );
+                let summary = "## Goal\nRecord the requested change.\n## Constraints\nUse the existing workspace.\n## Progress\nThe transcript was compacted.\n## Blocked\nNone.\n## Decisions\nKeep going.\n## Next steps\nReturn the final result.\n## Critical context\nNo additional context.";
+                assert!(!summary.contains("execution_facts"));
+                assert!(!summary.contains("write-fact"));
+                let event = json!({
+                    "choices": [{"delta": {"content": summary}, "finish_reason": "stop"}]
+                });
+                format!("data: {event}\n\ndata: [DONE]\n\n")
+            } else if turn == 2 {
+                assert_ne!(
+                    wire["messages"][0]["content"],
+                    slim_core::context::COMPACTION_SYSTEM_PROMPT,
+                    "third request must be the resumed model turn"
+                );
+                let messages = wire["messages"].as_array().expect("messages");
+                let compacted = messages
+                    .iter()
+                    .find_map(|message| {
+                        (message["role"] == "user"
+                            && message["content"].as_str().is_some_and(|content| {
+                                content.starts_with("[Compacted context]\n")
+                            }))
+                        .then(|| message["content"].as_str().expect("compacted context"))
+                    })
+                    .expect("compacted context");
+                assert!(compacted.contains("[Runtime facts at compaction;"));
+                assert!(compacted.contains("execution_facts scope=compaction run_start_seq=1"));
+                assert!(compacted.contains(&format!(
+                    "mutation path=\"{server_mutation_path}\" revision=1"
+                )));
+                assert!(compacted.contains("failure "));
+                assert!(compacted.contains("call_id=\"failure-fact\""));
+                assert!(compacted.contains("pending=true"));
+                assert!(compacted.contains("validation "));
+                assert!(compacted.contains("call_id=\"validation-fact\""));
+                assert!(compacted.contains("success=false"));
+                assert!(compacted.contains("validation_revision=1"));
+                let read_path = compacted
+                    .split_once("[Prior visible transcript: use read on ")
+                    .and_then(|(_, suffix)| suffix.split_once(" with offset=1"))
+                    .map(|(path, _)| {
+                        serde_json::from_str::<String>(path).expect("quoted recovery path")
+                    })
+                    .expect("recovery read pointer");
+                assert!(
+                    !Path::new(&read_path).is_absolute(),
+                    "recovery pointer must stay workspace-relative: {read_path}"
+                );
+                assert!(
+                    read_path.starts_with("artifacts/context-history-"),
+                    "recovery pointer must target the indexed archive: {read_path}"
+                );
+                let call = json!({
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "recovery-read",
+                                "function": {
+                                    "name": "read",
+                                    "arguments": json!({
+                                        "path": read_path,
+                                        "offset": 1,
+                                        "max_lines": 20
+                                    }).to_string()
+                                }
+                            }]
+                        }
+                    }]
+                });
+                let terminal = json!({
+                    "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+                });
+                format!("data: {call}\n\ndata: {terminal}\n\ndata: [DONE]\n\n")
+            } else {
+                let messages = wire["messages"].as_array().expect("messages");
+                let read_result = messages
+                    .iter()
+                    .find(|message| {
+                        message["role"] == "tool" && message["tool_call_id"] == "recovery-read"
+                    })
+                    .expect("recovery read result");
+                assert!(
+                    read_result["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains("[Recovery transcript index]")),
+                    "native read should return the indexed archive"
+                );
+                let event = json!({
+                    "choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]
+                });
+                format!("data: {event}\n\ndata: [DONE]\n\n")
+            };
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .expect("fixture response");
+            requests.push(request);
+        }
+        requests
+    });
+
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(3)).expect("client");
+    let mut runtime = Runtime::with_artifact_store(root.join("artifacts")).expect("artifacts");
+    runtime.set_compaction_handle(handle.clone());
+    let result = tokio::runtime::Runtime::new()
+        .expect("tokio")
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "Record the requested change.",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig {
+                max_turns: 3,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .expect("loop");
+    let requests = server.join().expect("server");
+
+    assert_eq!(requests.len(), 4);
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(
+        std::fs::read_to_string(root.join("written.txt")).expect("written file"),
+        "native fact\n"
+    );
+    assert_eq!(result.tool_results.len(), 4);
+    assert_eq!(
+        result
+            .tool_results
+            .iter()
+            .map(|result| (result.name.as_str(), result.success))
+            .collect::<Vec<_>>(),
+        [
+            ("write", true),
+            ("shell", false),
+            ("read", false),
+            ("read", true),
+        ]
+    );
+
+    let commits = handle.take_commits();
+    assert_eq!(commits.len(), 1);
+    let checkpoint = &commits[0].summary;
+    assert!(checkpoint.contains("execution_facts scope=compaction run_start_seq=1"));
+    assert!(checkpoint.contains(&format!("mutation path=\"{mutation_path}\" revision=1")));
+    assert!(checkpoint.contains("call_id=\"failure-fact\""));
+    assert!(checkpoint.contains("call_id=\"validation-fact\""));
+    assert!(checkpoint.contains("success=false"));
+    assert!(checkpoint.contains("[Prior visible transcript: use read on "));
+
+    let archive = std::fs::read_dir(root.join("artifacts"))
+        .expect("archive directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("context-history-"))
+        })
+        .expect("indexed context-history archive");
+    let archive_text = std::fs::read_to_string(archive).expect("archive text");
+    assert!(archive_text.starts_with("[Recovery transcript index]\n"));
+    assert!(archive_text.contains("\"kind\":\"user_message\""));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn soft_threshold_final_response_does_not_start_background_compaction() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.set_nonblocking(true).expect("nonblocking");
@@ -3128,14 +3552,27 @@ fn volatile_code_intel_calls_remain_serial_barriers_in_provider_order() {
     let server = thread::spawn(move || {
         let mut first = accept_with_deadline(&listener);
         let _ = read_http_request(&mut first);
+        let labels = [
+            "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth",
+        ];
+        let tool_calls = labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| {
+                json!({
+                    "index": index,
+                    "id": format!("intel-{}", index + 1),
+                    "function": {
+                        "name": "code_intel",
+                        "arguments": json!({"action": "symbol", "query": label}).to_string()
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
         let calls = json!({
             "choices": [{
                 "delta": {
-                    "tool_calls": [
-                        {"index": 0, "id": "intel-1", "function": {"name": "code_intel", "arguments": json!({"action": "symbol", "query": "first"}).to_string()}},
-                        {"index": 1, "id": "intel-2", "function": {"name": "code_intel", "arguments": json!({"action": "symbol", "query": "second"}).to_string()}},
-                        {"index": 2, "id": "intel-3", "function": {"name": "code_intel", "arguments": json!({"action": "symbol", "query": "third"}).to_string()}}
-                    ]
+                    "tool_calls": tool_calls
                 }
             }]
         });
@@ -3154,10 +3591,15 @@ fn volatile_code_intel_calls_remain_serial_barriers_in_provider_order() {
 
         let mut second = accept_with_deadline(&listener);
         let request = read_http_request(&mut second);
-        let first_pos = request.find("first").expect("first result");
-        let second_pos = request.find("second").expect("second result");
-        let third_pos = request.find("third").expect("third result");
-        assert!(first_pos < second_pos && second_pos < third_pos);
+        let mut previous = 0;
+        for label in labels {
+            let position = request.find(label).expect("tool result");
+            assert!(
+                previous < position,
+                "provider result order changed for {label}"
+            );
+            previous = position;
+        }
         let body = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         second
             .write_all(
@@ -3196,7 +3638,7 @@ fn volatile_code_intel_calls_remain_serial_barriers_in_provider_order() {
     server.join().expect("server");
 
     assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
-    assert_eq!(result.tool_results.len(), 3);
+    assert_eq!(result.tool_results.len(), 9);
     assert!(result.tool_results[0].output.contains("first"));
     assert!(result.tool_results[1].output.contains("second"));
     assert!(result.tool_results[2].output.contains("third"));
@@ -3205,28 +3647,45 @@ fn volatile_code_intel_calls_remain_serial_barriers_in_provider_order() {
         .events()
         .iter()
         .filter_map(|event| match &event.kind {
+            EventKind::ToolPrepared { call_id, .. } => Some(("prepared", call_id.as_str())),
+            EventKind::ToolAdmitted { call_id, .. } => Some(("admitted", call_id.as_str())),
             EventKind::ToolStarted { call_id, .. } => Some(("start", call_id.as_str())),
             EventKind::ToolFinished { call_id, .. } => Some(("finish", call_id.as_str())),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        &lifecycle[..3],
-        [
-            ("start", "intel-1"),
-            ("start", "intel-2"),
-            ("start", "intel-3")
-        ],
-        "contiguous code_intel calls must all start before any finishes"
-    );
+    let position = |phase, call_id| {
+        lifecycle
+            .iter()
+            .position(|candidate| *candidate == (phase, call_id))
+            .expect("lifecycle event")
+    };
+    for call_id in [
+        "intel-1", "intel-2", "intel-3", "intel-4", "intel-5", "intel-6", "intel-7", "intel-8",
+        "intel-9",
+    ] {
+        assert!(
+            position("prepared", call_id) < position("admitted", call_id)
+                && position("admitted", call_id) < position("start", call_id)
+                && position("start", call_id) < position("finish", call_id),
+            "pool lifecycle must publish prepared→admitted→started→finished per call: {lifecycle:?}"
+        );
+    }
     let finished: Vec<_> = lifecycle
         .iter()
         .filter_map(|(phase, id)| (*phase == "finish").then_some(*id))
         .collect();
-    assert_eq!(finished.len(), 3);
-    assert!(finished.contains(&"intel-1"));
-    assert!(finished.contains(&"intel-2"));
-    assert!(finished.contains(&"intel-3"));
+    assert_eq!(finished.len(), 9);
+    for call_id in [
+        "intel-1", "intel-2", "intel-3", "intel-4", "intel-5", "intel-6", "intel-7", "intel-8",
+        "intel-9",
+    ] {
+        assert!(finished.contains(&call_id));
+    }
+    assert!(
+        position("finish", "intel-2") < position("start", "intel-9"),
+        "pool must not announce every call as started before admitting work: {lifecycle:?}"
+    );
 }
 
 #[test]
@@ -3298,27 +3757,28 @@ fn mixed_batch_hoists_independent_reads_and_preserves_result_order() {
         .events()
         .iter()
         .filter_map(|event| match &event.kind {
+            EventKind::ToolPrepared { call_id, .. } => Some(("prepared", call_id.as_str())),
+            EventKind::ToolAdmitted { call_id, .. } => Some(("admitted", call_id.as_str())),
             EventKind::ToolStarted { call_id, .. } => Some(("start", call_id.as_str())),
             EventKind::ToolOutput { call_id, .. } => Some(("output", call_id.as_str())),
             EventKind::ToolFinished { call_id, .. } => Some(("finish", call_id.as_str())),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        &lifecycle[..3],
-        [
-            ("start", "read-a"),
-            ("start", "read-b"),
-            ("start", "read-d")
-        ],
-        "independent snapshot reads start together before any completes"
-    );
     let position = |phase, call_id| {
         lifecycle
             .iter()
             .position(|candidate| *candidate == (phase, call_id))
             .expect("lifecycle event")
     };
+    for call_id in ["read-a", "read-b", "read-d"] {
+        assert!(
+            position("prepared", call_id) < position("admitted", call_id)
+                && position("admitted", call_id) < position("start", call_id)
+                && position("start", call_id) < position("finish", call_id),
+            "pool lifecycle must publish prepared→admitted→started→finished per call: {lifecycle:?}"
+        );
+    }
     let write_start = position("start", "write-barrier");
     // Snapshot reads are hoisted across mutations they cannot observe
     // (read-d targets a path disjoint from the write); the mutation itself
@@ -3552,9 +4012,20 @@ fn hard_threshold_without_prepared_compacts_locally_without_summary_post() {
     let transcript_path = artifacts[0].path();
     let restored = std::fs::read_to_string(&transcript_path).expect("full transcript");
     assert!(restored.contains(&initial[1].content));
-    assert!(runtime.conversation().iter().any(|message| message
-        .content
-        .contains(&transcript_path.display().to_string())));
+    let workspace = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp dir");
+    let read_path = std::fs::canonicalize(&transcript_path)
+        .expect("canonical transcript")
+        .strip_prefix(workspace)
+        .expect("transcript under workspace")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let read_pointer = serde_json::to_string(&read_path).expect("quoted transcript path");
+    assert!(runtime
+        .conversation()
+        .iter()
+        .any(|message| message.content.contains(&format!(
+            "[Prior visible transcript: use read on {read_pointer} with offset=1"
+        ))));
     assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
     assert_eq!(handle.status(), CompactionStatus::Applied);
     assert!(runtime

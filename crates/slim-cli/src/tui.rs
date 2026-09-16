@@ -1831,13 +1831,18 @@ fn run_worker(
                                 abort_active_with_grace(&mut active, Duration::ZERO).await;
                             last_esc_at = None;
                         } else if let Some(run) = active.as_mut() {
+                            let run_id = run.run_id;
                             run.cancellation.cancel();
                             last_esc_at = Some(now);
+                            let _ = sink.send_control(UiEvent::CancellationRequested { run_id });
+                            // The host has accepted the cancellation token and
+                            // started unwinding the active run. RunCancelled
+                            // remains the terminal confirmation.
+                            let _ = sink.send_control(UiEvent::CancellationStarted { run_id });
                             // Hint only: try_send so a full lane (backpressure)
                             // can never wedge the cancel path itself.
                             let _ = sink.try_send(UiEvent::Notification {
-                                message: "Stopping current command… press Esc again to interrupt the agent."
-                                    .into(),
+                                message: "Interrupção solicitada para a execução atual".into(),
                             });
                         }
                     }
@@ -3519,7 +3524,11 @@ fn dispatch_pending_command(
     mcp_manager: &Option<Arc<McpManager>>,
 ) -> bool {
     match command {
-        Some(UiCommand::CancelRun) => run.request_cancel(),
+        Some(UiCommand::CancelRun) => {
+            run.request_cancel();
+            let _ = sink.send_control(UiEvent::CancellationRequested { run_id: run.run_id });
+            let _ = sink.send_control(UiEvent::CancellationStarted { run_id: run.run_id });
+        }
         Some(UiCommand::RequestContentPage {
             handle,
             request_id,
@@ -5136,6 +5145,14 @@ mod cancel_tests {
         assert!(cancellation.is_cancelled());
         assert_eq!(
             control_rx.recv().expect("truthful terminal"),
+            UiEvent::CancellationRequested { run_id: 7 }
+        );
+        assert_eq!(
+            control_rx.recv().expect("cancellation started"),
+            UiEvent::CancellationStarted { run_id: 7 }
+        );
+        assert_eq!(
+            control_rx.recv().expect("truthful terminal"),
             UiEvent::RunCompleted { run_id: 7 }
         );
     }
@@ -5221,6 +5238,14 @@ mod cancel_tests {
         assert_eq!(
             advance_pending_delivery(&mut run, &mut command_rx, &sink, &mut false, &None),
             PendingDeliveryStep::Complete
+        );
+        assert_eq!(
+            control_rx.recv().expect("cancellation requested"),
+            UiEvent::CancellationRequested { run_id: 7 }
+        );
+        assert_eq!(
+            control_rx.recv().expect("cancellation started"),
+            UiEvent::CancellationStarted { run_id: 7 }
         );
         assert_eq!(
             control_rx.recv().expect("terminal remains authoritative"),

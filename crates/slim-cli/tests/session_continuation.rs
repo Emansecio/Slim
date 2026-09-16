@@ -533,7 +533,7 @@ fn new_session_reopens_in_another_process_with_tools_and_fresh_file_guards() {
     let shell = historical.iter().find(|block| matches!(block.kind(), slim_tui::block::BlockKind::Tool(tool) if tool.call_id.0.ends_with(":first-check"))).unwrap();
     let shell_id = shell.id.clone();
     let frame = slim_tui::render::render(&app, 140, 100).lines.join("\n");
-    assert!(frame.contains("shell · history"), "{frame}");
+    assert!(frame.contains("shell · histórico"), "{frame}");
     assert_eq!(
         frame.matches("completed turn").count(),
         2,

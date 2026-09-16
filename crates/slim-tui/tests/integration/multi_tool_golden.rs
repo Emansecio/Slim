@@ -30,6 +30,8 @@ fn complete(
         name: name.into(),
         arguments_summary: arguments.into(),
     });
+    // Grouped headers report lifecycle wall time when timestamps exist.
+    state.clock.elapsed_ms = state.clock.elapsed_ms.saturating_add(duration_ms);
     state.apply_event(UiEvent::ToolEnded {
         batch_id: batch(batch_id),
         call_id: call(call_id),
@@ -52,11 +54,11 @@ fn same_batch_groups_different_names_and_expands_in_provider_order() {
 
     let collapsed = render_terminal_text(&state, 120, 30);
     assert!(
-        collapsed.contains("✓ Read, Ran 1 command · 12ms"),
+        collapsed.contains("✓ Leu, Executou 1 comando · 12ms"),
         "{collapsed}"
     );
     assert!(
-        collapsed.contains("Enter details"),
+        collapsed.contains("Enter detalhes"),
         "collapsed group must hint expansion when it fits\n{collapsed}"
     );
     assert!(!collapsed.contains("call-1"));
@@ -74,11 +76,11 @@ fn same_batch_groups_different_names_and_expands_in_provider_order() {
     assert_eq!(state.blocks()[0].fold, FoldState::Expanded);
     let expanded = render_terminal_text(&state, 120, 30);
     assert!(
-        expanded.contains("✓ Read, Ran 1 command · 12ms"),
+        expanded.contains("✓ Leu, Executou 1 comando · 12ms"),
         "{expanded}"
     );
     assert!(
-        !expanded.contains("Enter details"),
+        !expanded.contains("Enter detalhes"),
         "expanded header must not keep the collapse-competing hint\n{expanded}"
     );
     let first = expanded.find("call-1").expect("first member");
@@ -117,7 +119,7 @@ fn same_batch_groups_equal_names_by_batch_identity() {
     complete(&mut state, "batch-a", "call-2", "read", "two", 4);
 
     let frame = render_terminal_text(&state, 80, 24);
-    assert!(frame.contains("✓ 2 reads · 7ms"), "{frame}");
+    assert!(frame.contains("✓ 2 chamadas de leitura · 7ms"), "{frame}");
     assert!(!frame.contains("✓ read"), "{frame}");
 }
 
@@ -130,11 +132,14 @@ fn grouped_header_summarizes_names_counts_and_total_duration() {
     complete(&mut state, "batch-a", "call-4", "shell", "four", 18);
 
     let wide = render_terminal_text(&state, 120, 30);
-    let expected = format!("3 reads, Ran 1 command {} 42ms", '\u{00b7}');
+    let expected = format!(
+        "3 chamadas de leitura, Executou 1 comando {} 42ms",
+        '\u{00b7}'
+    );
     assert!(wide.contains(&expected), "{wide}");
 
     let narrow = render_terminal_text(&state, 24, 12);
-    let compact = format!("4 tools {} 42ms", '\u{00b7}');
+    let compact = format!("4 ferramentas {} 42ms", '\u{00b7}');
     assert!(narrow.contains(&compact), "{narrow}");
     assert!(
         !narrow.contains("read"),
@@ -160,7 +165,7 @@ fn grouped_header_omits_duration_when_any_member_has_no_duration() {
     }
 
     let frame = render_terminal_text(&state, 80, 24);
-    assert!(frame.contains("Read, Ran 1 command"), "{frame}");
+    assert!(frame.contains("Leu, Executou 1 comando"), "{frame}");
     assert!(
         !frame.contains("3ms"),
         "partial duration must be omitted\n{frame}"
@@ -202,11 +207,11 @@ fn collapsed_thinking_does_not_split_complete_tool_groups() {
 
     let frame = render_terminal_text(&state, 80, 24);
     assert!(
-        frame.contains("✓ 4 reads · 7ms"),
+        frame.contains("✓ 4 chamadas de leitura · 7ms"),
         "collapsed thought must not split adjacent tool groups\n{frame}"
     );
     assert_eq!(
-        frame.matches("Thought").count(),
+        frame.matches("Pensamento").count(),
         0,
         "sandwiched collapsed thought is chrome, not a row\n{frame}"
     );
@@ -226,7 +231,7 @@ fn consecutive_complete_tools_group_across_batches() {
     complete(&mut state, "batch-d", "call-4", "shell", "four", 1559);
 
     let frame = render_terminal_text(&state, 80, 24);
-    assert!(frame.contains("✓ Ran 4 commands · 6.2s"), "{frame}");
+    assert!(frame.contains("✓ Executou 4 comandos · 6.2s"), "{frame}");
     assert_eq!(
         frame.matches("✓ shell").count(),
         0,
@@ -251,7 +256,7 @@ fn enter_details_only_on_selected_or_last_live_collapsed_group() {
     let live = render_terminal_text(&state, 120, 30);
     let hint_lines: Vec<_> = live
         .lines()
-        .filter(|line| line.contains("Enter details"))
+        .filter(|line| line.contains("Enter detalhes"))
         .collect();
     assert_eq!(
         hint_lines.len(),
@@ -259,14 +264,14 @@ fn enter_details_only_on_selected_or_last_live_collapsed_group() {
         "only the last live collapsed group may hint\n{live}"
     );
     assert!(
-        hint_lines[0].contains("Edited, Ran 1 command"),
+        hint_lines[0].contains("Editou, Executou 1 comando"),
         "{hint_lines:?}"
     );
 
     state.apply_event(UiEvent::RunCompleted { run_id: 1 });
     let completed = render_terminal_text(&state, 120, 30);
     assert!(
-        !completed.contains("Enter details"),
+        !completed.contains("Enter detalhes"),
         "completed run must not hint without selection\n{completed}"
     );
 
@@ -278,14 +283,17 @@ fn enter_details_only_on_selected_or_last_live_collapsed_group() {
     let selected = render_terminal_text(&state, 120, 30);
     let hint_lines: Vec<_> = selected
         .lines()
-        .filter(|line| line.contains("Enter details"))
+        .filter(|line| line.contains("Enter detalhes"))
         .collect();
     assert_eq!(
         hint_lines.len(),
         1,
         "selected collapsed group must regain the hint\n{selected}"
     );
-    assert!(hint_lines[0].contains("2 reads"), "{hint_lines:?}");
+    assert!(
+        hint_lines[0].contains("2 chamadas de leitura"),
+        "{hint_lines:?}"
+    );
 }
 
 #[test]
@@ -369,8 +377,14 @@ fn failed_and_cancelled_members_remain_individual_and_ordered() {
     assert_eq!(names, ["read", "shell", "write"]);
     let frame = render_terminal_text(&state, 80, 24);
     assert!(!frame.contains("tools ·"), "{frame}");
-    assert!(frame.contains("✕ shell · 4ms · failed"), "{frame}");
-    assert!(frame.contains("■ write · cancelled"), "{frame}");
+    assert!(frame.contains("✕ shell · 4ms · falhou"), "{frame}");
+    assert!(
+        frame.contains("■ write") && frame.contains("cancelada"),
+        "{frame}"
+    );
     assert!(!frame.contains("bad"), "{frame}");
-    assert!(!frame.contains("later"), "{frame}");
+    assert!(
+        frame.contains("later"),
+        "cancelled tools keep their target\n{frame}"
+    );
 }

@@ -81,16 +81,21 @@ pub(crate) fn apply_exact_patches_with_content(
         }
         if count != 1 {
             let context = if count == 0 {
-                let mut context = format!("{}: file unchanged. Use a unique exact excerpt, including its whitespace and line endings.", path.display());
+                let mut context = if edits.len() == 1 {
+                    format!("{}: file unchanged.", path.display())
+                } else {
+                    format!("{}:", path.display())
+                };
                 if expected.contains('\u{FFFD}') {
-                    context.push_str(" The excerpt contains U+FFFD replacement characters: non-ASCII text was corrupted before reaching patch. Read the file and copy the bytes verbatim.");
+                    context.push_str(" U+FFFD; copy current text verbatim.");
                 } else if !expected.is_ascii() {
-                    context.push_str(" The excerpt contains non-ASCII text; it must match the file byte-for-byte—copy it verbatim from a read or search hit.");
+                    context.push_str(" non-ASCII; copy current text verbatim.");
                 }
                 context
             } else {
                 let mut previous = 0;
                 let mut line = 1;
+                let mut first_match = None;
                 let lines = updated
                     .match_indices(expected.as_ref())
                     .take(8)
@@ -100,6 +105,7 @@ pub(crate) fn apply_exact_patches_with_content(
                             .filter(|byte| *byte == b'\n')
                             .count();
                         previous = offset;
+                        first_match.get_or_insert((offset, line));
                         line.to_string()
                     })
                     .collect::<Vec<_>>()
@@ -109,10 +115,26 @@ pub(crate) fn apply_exact_patches_with_content(
                 } else {
                     ""
                 };
-                let mut message = format!("{}: file unchanged. Matches start at lines {lines}{omitted}; include surrounding unchanged text in expected to select one occurrence.", path.display());
-                if let Some(excerpt) = suggested_unique_excerpt(&updated, expected.as_ref()) {
-                    message.push_str("\nSuggested unique expected:\n");
-                    message.push_str(&excerpt);
+                let mut message = if edits.len() == 1 {
+                    format!(
+                        "{}: file unchanged. Matches at lines {lines}{omitted}.",
+                        path.display()
+                    )
+                } else {
+                    format!("{}: Matches at lines {lines}{omitted}.", path.display())
+                };
+                if let Some((first_match_offset, first_match_line)) = first_match {
+                    if let Some(excerpt) =
+                        unique_context_excerpt(&updated, expected.as_ref(), first_match_offset)
+                    {
+                        message.push_str(&format!(
+                            "\nExample context only for the first match at line {first_match_line}; choose the intended occurrence explicitly:\n"
+                        ));
+                        message.push_str(&excerpt);
+                    } else {
+                        message.push('\n');
+                        message.push_str(&patch_file_recovery_context(&observed.content));
+                    }
                 } else {
                     message.push('\n');
                     message.push_str(&patch_file_recovery_context(&observed.content));
@@ -135,7 +157,10 @@ pub(crate) fn apply_exact_patches_with_content(
             failure.context = Some(if edits.len() == 1 {
                 context
             } else {
-                format!("Edit {} rejected in proposed content after earlier edits; entire batch left the original file unchanged. {context}", edit_index + 1)
+                format!(
+                    "Edit {} rejected in proposed content; no edits applied.\n{context}",
+                    edit_index + 1
+                )
             });
             return Err(failure);
         }
@@ -203,6 +228,10 @@ pub(crate) fn apply_exact_patches_with_content(
         summary.push_str("; ");
         summary.push_str(note);
     }
+    if let Some(diagnostic) = &written.syntax_diagnostic {
+        summary.push('\n');
+        summary.push_str(diagnostic);
+    }
     let dependency = written
         .dependency
         .take()
@@ -260,11 +289,10 @@ fn record_sync_edit(
 
 const MAX_UNIQUE_CONTEXT_LINES: usize = 8;
 
-fn suggested_unique_excerpt(text: &str, expected: &str) -> Option<String> {
+fn unique_context_excerpt(text: &str, expected: &str, first_match: usize) -> Option<String> {
     if expected.is_empty() {
         return None;
     }
-    let first = text.find(expected)?;
     let mut starts = vec![0];
     for (index, byte) in text.bytes().enumerate() {
         if byte == b'\n' {
@@ -275,8 +303,8 @@ fn suggested_unique_excerpt(text: &str, expected: &str) -> Option<String> {
         Ok(index) => index,
         Err(index) => index.saturating_sub(1),
     };
-    let start_line = line_at(first);
-    let last_matched = first.saturating_add(expected.len().saturating_sub(1));
+    let start_line = line_at(first_match);
+    let last_matched = first_match.saturating_add(expected.len().saturating_sub(1));
     let end_line = line_at(last_matched.min(text.len().saturating_sub(1)));
     for extra in 0..=MAX_UNIQUE_CONTEXT_LINES {
         let left = start_line.saturating_sub(extra);

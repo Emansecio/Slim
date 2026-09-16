@@ -66,8 +66,8 @@ fn wide_disconnected_welcome_has_only_name_state_and_action() {
     let frame = text(&buffer);
 
     assert!(frame.contains("SLIM"));
-    assert!(frame.contains("○  Not connected"));
-    assert!(frame.contains("Run /login to connect"));
+    assert!(frame.contains("○  Não conectado"));
+    assert!(frame.contains("Use /login para conectar"));
     assert!(!frame.contains("Native coding agent"));
     assert!(!frame
         .chars()
@@ -96,10 +96,10 @@ fn ansi16_connected_welcome_colors_only_the_status_dot() {
     let buffer = render(&state, 60, 16, caps(ColorDepth::Ansi16, false));
     let frame = text(&buffer);
 
-    assert!(frame.contains("Connected · OpenAI Codex — ChatGPT Plus/Pro"));
-    assert!(frame.contains("Describe a task to begin"));
+    assert!(frame.contains("Conectado · OpenAI Codex — ChatGPT Plus/Pro"));
+    assert!(frame.contains("Descreva uma tarefa para começar"));
     assert_eq!(cell_at_token(&buffer, "●").fg, Color::LightGreen);
-    assert_ne!(cell_at_token(&buffer, "Connected").fg, Color::LightGreen);
+    assert_ne!(cell_at_token(&buffer, "Conectado").fg, Color::LightGreen);
 }
 
 #[test]
@@ -128,7 +128,7 @@ fn welcome_keeps_path_and_leaves_shortcuts_to_the_footer() {
     let frame = text(&render(&state, 120, 30, caps(ColorDepth::TrueColor, false)));
     let lines: Vec<&str> = frame.lines().collect();
     let body = lines[..lines.len().saturating_sub(2)].join("\n");
-    assert!(body.contains("Describe a task to begin"), "{body}");
+    assert!(body.contains("Descreva uma tarefa para começar"), "{body}");
     assert!(body.contains(r"D:\Slim"), "{body}");
     assert!(
         !body.contains("Ctrl+P commands"),
@@ -154,7 +154,7 @@ fn very_short_welcome_removes_spacing_before_content() {
         caps(ColorDepth::TrueColor, false),
     ));
     assert!(two_rows.contains("SLIM"));
-    assert!(two_rows.contains("Not connected"));
+    assert!(two_rows.contains("Não conectado"));
     assert!(two_rows.contains("/login"));
 
     let one_row = text(&render(
@@ -164,5 +164,5 @@ fn very_short_welcome_removes_spacing_before_content() {
         caps(ColorDepth::TrueColor, false),
     ));
     assert!(one_row.contains("SLIM"));
-    assert!(one_row.contains("Not connected"));
+    assert!(one_row.contains("Não conectado"));
 }

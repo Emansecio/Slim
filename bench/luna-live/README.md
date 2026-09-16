@@ -1,5 +1,120 @@
 # Pi × Slim — uma tarefa real com GPT‑5.6 Luna
 
+## Implementações nativas — 15/09/2026
+
+O checkout reduz descrições das ferramentas sem mudar seus parâmetros, exclui
+`.venv` da descoberta/busca e acrescenta diagnóstico de sintaxe de JSON à saída
+de escrita e patch. Os avisos usam o conteúdo já em memória, após a operação
+completa; não fazem rollback nem substituem o verificador da tarefa. Limitam-se
+a `.json` de até 1 MiB, sem reinterpretar templates anteriormente inválidos.
+
+Comparação antes/depois delimitada antes das chamadas: `merge_ranges`, `json_cli`,
+`ledger_audit` e `config_migration`, duas rodadas, com a primeira versão alternada
+por cenário e invertida na segunda rodada. Luna high/normal, fixtures idênticas,
+execuções sequenciais e todos os resultados retidos. O baseline foi compilado do
+checkout com seu trabalho preexistente, antes destas três mudanças; não é o
+executável antigo instalado no PATH. A bateria mede o conjunto das mudanças,
+sem isolar a contribuição de cada uma e sem nova comparação com Pi.
+
+Logs e identidade do baseline ficam em `native-improvements-20260915/`;
+campanhas individuais usam os sufixos `-native-before` e `-native-after`.
+Os primeiros requests reais registraram **8.089 → 6.669 bytes de schemas
+de ferramentas (-17,6%)**. Essa medida de bytes não equivale à variação de tokens
+ou de tempo da tarefa completa.
+A [evidência de testes e instalação](../../release/README.md) distingue essa
+validação dos resultados históricos abaixo.
+
+### Resultado do A/B nativo
+
+**16/16 execuções aprovadas externamente, oito pares válidos.** Hashes das
+fixtures, modelos e binários conferidos por par. Tokens totais:
+**150.507 → 120.024 (-20,3%)**; tempo total **349,0s → 274,3s (-21,4%)**;
+chamadas ao modelo **41 → 38**. Mediana das variações pareadas: -15,7% em tokens
+e -23,8% em tempo. São duas rodadas por cenário: resultado exploratório, sem
+afirmação de significância estatística ou superioridade sobre Pi/outros agentes.
+
+| Cenário | Tokens, soma das duas rodadas | Tempo, soma das duas rodadas |
+|---|---:|---:|
+| merge_ranges | -12,7% | -27,0% |
+| json_cli | -38,6% | -24,6% |
+| ledger_audit | -10,8% | -27,2% |
+| config_migration | -9,2% | -6,0% |
+
+Os agregados não significam vitória em cada par: `ledger_audit` regrediu na
+segunda rodada e `config_migration` na primeira. Falhas de ferramenta:
+**2 → 3**; cache lido / tokens de entrada: **17,4% → 9,2%**. Tokens de entrada
+sem cache caíram **12,8%** no total. Na primeira migração nova, duas escritas
+foram rejeitadas por `expected` diferente dos bytes atuais, seguidas de recuperação
+por patch. O rótulo heurístico `timeout` em `ab-results.json` para esses dois
+eventos é incorreto: os outputs completos mostram `stale read`, sem timeout.
+
+Na segunda migração nova, os dois patches produziram JSON inválido: o runtime
+informou diretamente `production.json:11:7` e `development.json:18:7` nos resultados.
+O modelo recebeu ambos os diagnósticos e a tarefa terminou aprovada pelo oráculo.
+Isso valida a entrega live dos avisos; não isola quanto do ganho de tempo veio
+deles. Na primeira auditoria de dados, ambas as versões ainda leram o CSV:
+a orientação de usar agregados não garante que um modelo evite dados brutos.
+A exclusão de `.venv` e o acesso explícito foram verificados por teste local.
+
+Artefatos locais: `native-improvements-20260915/ab-protocol.json`, `ab-run.log`,
+`ab-results.json` (por execução), `ab-summary.json` (agregado) e campanhas
+`20260915-225405Z-native-before` até `20260915-230458Z-config_migration-native-after`.
+As quatro builds antigas/temporárias foram removidas após a comparação; seus
+caminhos, tamanhos e hashes permanecem em `removed-builds.json`. Logs, sessões,
+workspaces de evidência e relatórios foram preservados.
+
+## Bateria repetida — 15/09/2026
+
+**32 pares Luna válidos:** Slim consumiu 14,1% mais tokens, levou 23,8% menos
+tempo total e teve duas falhas de ferramenta contra onze do Pi. A mediana da
+razão de tempo por par favoreceu o Slim em 9,3%; ambos passaram em todos os
+verificadores. Oito pares adicionais com DeepSeek foram bloqueados pelo limite
+mensal do OpenCode Go e não permitem comparação de desempenho.
+
+[Diagnóstico, causas e próximos experimentos nativos](DIAGNOSTICO-SLIM-X-PI-2026-09-15.md),
+[relatório Luna completo](RELATORIO-SLIM-X-PI-2026-09-15-CONTROLADO-LUNA.md) e
+[registro do controle DeepSeek indisponível](RELATORIO-SLIM-X-PI-2026-09-15-CONTROLADO-DEEPSEEK.md).
+O executável Slim permaneceu igual ao da amostra original; esta etapa corrigiu
+o benchmark e investigou o comportamento, sem modificar ou instalar o produto.
+
+## Medidor normalizado — 15/09/2026
+
+O medidor distingue erro de JSON, falha de teste, erro de uso do Git e erro do
+interpretador; `exit 1` sozinho nao identifica sintaxe de shell. Ferramentas Pi
+sao associadas ao turno pelo identificador da chamada, sem deslocamento por horario.
+
+Novas campanhas calculam hashes dos bytes efetivamente materializados antes da
+execucao dos agentes. O diff registra modificados, criados e removidos, preservando
+a deteccao de mudancas reais de LF/CRLF. Campanhas antigas com hash de texto fonte
+podem reconstruir a materializacao Windows quando a fixture do registry confere
+com o hash original do manifesto.
+
+Os componentes de contexto usam conjuntos separados: sistema, schemas, historico
+sem resultados de ferramentas e resultados completos das ferramentas. O observador
+Pi mede antes de omitir reasoning opaco do payload salvo. Nos artefatos Pi antigos,
+a reconstituicao usa payload redigido e os bytes de historico sao parciais; nao
+equivalem aos bytes integrais da rede. Bytes nao sao estimativas de tokens.
+
+`daily.py --shuffle-seed N` sorteia a ordem dos cenarios de forma reproduzivel e
+mantem a alternancia dos bracos. Com um numero par de rodadas, cada CLI comeca o
+mesmo numero de vezes por cenario. A agenda completa e impressa antes das chamadas;
+os manifestos registram a rodada. Falhas de braco e de auditoria reprovam a campanha,
+preservam sua evidencia e nao interrompem as campanhas seguintes. O pareamento
+exige uso completo; o agregado de registros retidos pode incluir uso parcial e
+nao substitui a taxa de aprovacao.
+
+Verificacao local do medidor, sem chamadas ao provider:
+
+```powershell
+python -B -m unittest discover -s bench/luna-live -p test_measurement.py -v
+node --check bench/luna-live/pi-audit.ts
+```
+
+Protocolo da nova bateria: quatro rodadas dos seis cenarios `daily.py` e quatro
+dos dois cenarios `holdouts.py`, Luna high/normal, sequenciais, seed 20260915.
+Os binarios e suas configuracoes de produto permanecem os mesmos da bateria
+anterior. Os resultados historicos abaixo ficam preservados.
+
 > O resultado abaixo é o **baseline histórico**, anterior às correções desta
 > investigação. A seção [Correções e validação ampliada](#correções-e-validação-ampliada)
 > registra as mudanças e todas as rodadas posteriores, sem substituir o baseline.
@@ -1723,3 +1838,124 @@ Checklist RULES §4 desta etapa:
 - [x] Refresh imprimiu o OK acima; executável de release e PATH têm o SHA256 citado, e todos os manifests da bateria usam esse hash.
 - [x] Cinco documentos de status e tracker §7 atualizados; metadados anteriores ausentes dos status atuais, histórico preservado; git diff --check exit 0.
 - [x] Limitações declaradas: amostra finita, perdas por cenário, causalidade parcial, qualidade restrita aos oráculos; ConPTY físico e ZIP não aplicáveis.
+
+## Robustez do harness — 2026-09-15
+
+Endurecimento do medidor, sem mudança de produto e sem nova bateria. Modelo
+padrão permanece `gpt-5.6-luna` (high, normal, `openai-codex`); cenários,
+prompts, oráculos, ordem alternada e flags dos braços inalterados.
+
+- `run.py`: pré-voo resolve `node`/`pi`/`slim` por PATH e `npm root -g` com erro
+  claro antes de criar a campanha; `--version` com timeout. Nome de campanha
+  ganha sufixo `-2`, `-3`… em colisão de timestamp (baterias paralelas). Cada
+  braço roda sob try/except: falha inesperada grava `{arm}.error.json` com
+  traceback e não derruba o outro braço nem a bateria. Oráculo usa o `python`
+  do PATH (o mesmo que os agentes invocam), com `oracle_error` registrado em
+  vez de crash. Manifesto ganha `fixtures` (sha256/bytes de SPEC, check e
+  arquivos do cenário), `harness` (sha256 dos scripts do benchmark, Python,
+  plataforma) e `oracle_python`. Workspace temporário é removido após sucesso
+  (as cópias `{arm}.workspace/` permanecem na campanha); em falha, fica para
+  depuração. `timeout_seconds` (240) e `validation_timeout` (30) viraram
+  parâmetros.
+- `process_runner.py` (compartilhado): timeout passa a matar a árvore
+  (`taskkill /T /F` no Windows) em vez de só o processo direto; falha de
+  `Popen` grava `spawn_error` no timing em vez de deixar `timing.json`
+  ausente; `pid` registrado. Assinatura e demais campos inalterados.
+- `analyze.py`: virou `audit(pi_dir, slim_dir, output)` importável; o runner
+  grava `summary.json` na campanha automaticamente quando os dois timings
+  existem (falha de auditoria é impressa, não mascara a execução). Output
+  default da CLI agora é `<slim_dir>/summary.json` — antes era o diretório do
+  script, o que gerou o `summary.json` avulso aqui. Novas verificações:
+  manifests do par devem ter mesmo cenário/prompt, arquivos de evidência
+  exigidos listados por nome, eventos de ferramenta órfãos tolerados,
+  campos de usage ausentes tratados como zero, `timed_out` incluso no gate,
+  e todas as asserções com contexto de campanha/turno.
+- `daily.py`: qualquer exceção num cenário vira registro `error_type` em
+  `failures` e a bateria continua os pares planejados (antes só `SystemExit`
+  era capturado); `--timeout` repassa ao runner; `--no-audit` desativa a
+  auditoria automática.
+- `report.py`: passe único por braço (antes computava duas vezes); braço sem
+  `timing.json` ou sem registros auditáveis entra em `problems` em vez de
+  sumir em silêncio; nova seção "Pareamento" com razões Slim/Pi por par
+  aprovado — mediana de tokens e de wall, vitórias e agregado por cenário,
+  que antes eram calculados à mão para este relatório. Diagnóstico para
+  iterar o harness: Resumo ganha taxa de acerto de cache e arquivos
+  modificados/criados; cenário ganha dispersão (min/mediana/max da razão);
+  campanha ganha coluna de arquivos tocados; nova seção "Por ferramenta"
+  (calls/falhas/ms por nome); turnos lado a lado por par no JSON
+  (`paired.pairs[].turns`); falhas agregadas por causa
+  (`failure_causes`: timeout/processo/oráculo/fixtures/não-executado);
+  `--baseline <relatorio.json>` compara medianas e vitórias com a bateria
+  anterior. `workspace_diff` compara `{arm}.workspace/` com os fixtures
+  originais — sha256 do manifesto, ou o registry `daily`/`holdouts` para
+  campanhas antigas. JSON ganha `paired`, `by_tool` e `failure_causes`.
+- `pi-audit.ts`: observador nunca quebra o braço medido — sem
+  `LUNA_AUDIT_FILE` ou com erro de escrita/payload, registra nada em vez de
+  lançar exceção no handler. O auditor detecta a ausência pela contagem de
+  requests/messages.
+
+Verificação desta etapa (sem chamadas ao provider): `py_compile` em todos os
+scripts e `node --check` no observador; `process_runner` exercitado com
+executável inexistente (`spawn_error` gravado, `exit_code` nulo) e com
+timeout real (árvore morta, sem processo residual); campanhas sintéticas
+percorreram `analyze.audit` e `report.py` incluindo par com gate reprovado
+excluído do pareamento; `run.main` executou ponta a ponta com
+`run_process`/`resolve`/`version` stubados — sucesso gravou `summary.json` e
+limpou o workspace, falha de braço gravou validação/erro e propagou
+`SystemExit`. `economy-next/scenarios.py` (`daily.SCENARIOS`) e
+`run_cycle.py` (`process_runner.main`) continuam compatíveis. Nenhum
+benchmark live foi reexecutado; os números históricos acima permanecem como
+registrados. `cargo test`/deploy: não aplicável, nenhum código do produto
+alterado.
+
+## Bateria live de validação do harness — 2026-09-15 (~19:35–19:46 UTC)
+
+Primeira execução real após o endurecimento: `run.py` solo (`merge_ranges`) +
+`daily.py --rounds 1` (6 cenários), modelo `gpt-5.6-luna` high/normal via
+`openai-codex`, Pi `0.85.1`, Slim `0.1.0` (sha256 nos manifestos). 7 pares
+planejados, 7 executados, 0 falhas de transporte; oráculo externo PASS e
+fixtures intactos nos 14 braços. Relatório: `RELATORIO-SLIM-X-PI-2026-09-15.md`
++ `relatorio-2026-09-15.json`.
+
+**Resultado desta amostra:** Slim mais caro em tokens — 108.612 vs 83.300
+(+30,4%), mediana da razão Slim/Pi 1,19; vitórias Slim em 2/7 pares
+(`js_pagination` −12,4%, `ledger_audit` −15,1%). Pior em `json_cli` (+97,3%)
+e `config_migration` (+69,2%). Wall: Slim 238,8s vs Pi 213,3s (+11,9%);
+chamadas 32 vs 35; falhas de ferramenta 1 vs 3; arquivos tocados idênticos
+(8 mod + 4 novos cada). Diverge das baterias históricas acima — amostra de
+1 rodada por cenário, sem teste de significância; evidência de que o
+resultado depende do cenário e da rodada, não de direção fixa.
+
+**Diagnóstico novo já útil:** o input por turno do Slim é consistentemente
+maior mesmo com `history_bytes` menor — o custo está no envelope por request
+(system+schema) e no cache: taxa de acerto 15,7% vs 26,7% do Pi, com
+`cache_read` zero na campanha inaugural. Ferramentas com nomes distintos por
+braço (Slim `shell`/`patch`/`list`; Pi `bash`/`edit`), o que inviabiliza
+comparar chamada-a-chamada; `shell` concentra 22,7s do tempo de ferramenta
+Slim (oráculo `check.py`). A única falha Slim foi `shell-syntax`.
+
+**Bug de harness encontrado pela própria execução:** a sessão Slim atual
+grava `schema_version 2` (records `entry`/`fact`/`operation`), sem eventos
+`ContextSnapshot` — o auditor legado reportava "0 snapshots vs 4 turns" e a
+auditoria automática falhava sem mascarar a execução (comportamento correto:
+evidência preservada, `audit_failed` impresso). `analyze.py` agora entende os
+dois formatos: turnos = entries `assistant` alinhados 1:1 com
+`usage.requests`, outcomes via facts `tool.v1`; o assert de thinking
+DeepSeek usa `reasoning_tokens` quando não há eventos legados. Em
+`report.py`, o turno das tool calls no formato v2 passou a contar entries
+`assistant` (correto quando um turno não tem tools) e `duration_ms` por
+ferramenta vem do fact `tool.v1` (antes zerado).
+
+Checklist RULES §4 desta etapa:
+
+- [x] Comandos executados: `run.py`, `daily.py --rounds 1`, `analyze.py`,
+      `report.py` — saídas registradas acima e nos artefatos das campanhas.
+- [x] Números contados nesta execução: 7 pares, 14 braços aprovados,
+      32+35 chamadas, tokens e tempos conforme o relatório gerado.
+- [x] Evidência preservada: 7 diretórios de campanha com manifest, timings,
+      validações, sessões, workspaces e `summary.json` por campanha.
+- [x] `cargo test`/deploy: não aplicável — nenhum código de produto alterado;
+      mudanças confinadas a `bench/`.
+- [x] Limitações: amostra de 1 rodada/cenário; caches de servidor e
+      contenção do host não controlados; sem teste de significância;
+      instrumentação assimétrica permanece.

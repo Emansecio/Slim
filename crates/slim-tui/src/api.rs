@@ -408,6 +408,11 @@ pub enum UiEvent {
     ThinkingDelta {
         text: String,
     },
+    /// Adapter-declared meaning of the reasoning stream.  The event is
+    /// absent when the provider does not expose a trustworthy classification.
+    ThinkingClassificationChanged {
+        classification: slim_core::ReasoningClassification,
+    },
     ThinkingStarted,
     ThinkingEnded,
     ActivityChanged {
@@ -417,6 +422,18 @@ pub enum UiEvent {
         phase: slim_core::ProviderPhase,
         label: String,
         elapsed_ms: u64,
+    },
+    RetryScheduled {
+        attempt: u32,
+        limit: u32,
+        wait_ms: u64,
+        reason: Option<String>,
+    },
+    CancellationRequested {
+        run_id: u64,
+    },
+    CancellationStarted {
+        run_id: u64,
     },
     ApprovalRequired {
         request_id: InteractionRequestId,
@@ -445,6 +462,16 @@ pub enum UiEvent {
         call_id: ToolCallId,
         name: String,
         arguments_summary: String,
+    },
+    ToolPrepared {
+        batch_id: ToolBatchId,
+        call_id: ToolCallId,
+        name: String,
+    },
+    ToolAdmitted {
+        batch_id: ToolBatchId,
+        call_id: ToolCallId,
+        name: String,
     },
     ToolProgress {
         batch_id: ToolBatchId,
@@ -632,6 +659,8 @@ impl UiEvent {
             || matches!(
                 self,
                 Self::ToolStarted { .. }
+                    | Self::ToolPrepared { .. }
+                    | Self::ToolAdmitted { .. }
                     | Self::ToolEnded { .. }
                     | Self::ApprovalRequired { .. }
                     | Self::InputRequired { .. }
@@ -674,6 +703,9 @@ impl UiEvent {
                 Some(Self::AssistantDelta { text })
             }
             slim_core::EventKind::ReasoningDelta { text } => Some(Self::ThinkingDelta { text }),
+            slim_core::EventKind::ReasoningClassification { classification } => {
+                Some(Self::ThinkingClassificationChanged { classification })
+            }
             slim_core::EventKind::ThinkingStarted => Some(Self::ThinkingStarted),
             slim_core::EventKind::ThinkingEnded => Some(Self::ThinkingEnded),
             slim_core::EventKind::ProviderPhase {
@@ -706,6 +738,17 @@ impl UiEvent {
                     elapsed_ms,
                 })
             }
+            slim_core::EventKind::RetryScheduled {
+                attempt,
+                limit,
+                wait_ms,
+                reason,
+            } => Some(Self::RetryScheduled {
+                attempt,
+                limit,
+                wait_ms,
+                reason: reason.map(|value| bounded_first_line(&value, 4 * 1024)),
+            }),
             slim_core::EventKind::AssistantEnded { .. } => Some(Self::AssistantEnded),
             slim_core::EventKind::UsagePartial {
                 input_tokens,
@@ -736,6 +779,30 @@ impl UiEvent {
                     call_id,
                     name,
                     arguments_summary,
+                })
+            }
+            slim_core::EventKind::ToolPrepared {
+                batch_id,
+                call_id,
+                name,
+            } => {
+                let (batch_id, call_id) = projected_tool_identity(request_id, 0, batch_id, call_id);
+                Some(Self::ToolPrepared {
+                    batch_id,
+                    call_id,
+                    name,
+                })
+            }
+            slim_core::EventKind::ToolAdmitted {
+                batch_id,
+                call_id,
+                name,
+            } => {
+                let (batch_id, call_id) = projected_tool_identity(request_id, 1, batch_id, call_id);
+                Some(Self::ToolAdmitted {
+                    batch_id,
+                    call_id,
+                    name,
                 })
             }
             // Provider discovery/call events precede executor ToolStarted for
@@ -1390,6 +1457,7 @@ impl UiEvent {
                 | Self::AssistantEnded
                 | Self::ThinkingStarted
                 | Self::ThinkingDelta { .. }
+                | Self::ThinkingClassificationChanged { .. }
                 | Self::ThinkingEnded
                 | Self::UsagePartial { .. }
                 | Self::Usage { .. }
@@ -1397,14 +1465,19 @@ impl UiEvent {
                 | Self::UsageEstimateForRun { .. }
                 | Self::RequestCompleted { .. }
                 | Self::ToolStarted { .. }
+                | Self::ToolPrepared { .. }
+                | Self::ToolAdmitted { .. }
                 | Self::ToolProgress { .. }
                 | Self::ToolEnded { .. }
                 | Self::ActivityChanged { .. }
                 | Self::ProviderPhaseChanged { .. }
+                | Self::RetryScheduled { .. }
                 | Self::ApprovalRequired { .. }
                 | Self::InputRequired { .. }
                 | Self::QuestionRequired { .. }
                 | Self::InteractionAcknowledged { .. }
+                | Self::CancellationRequested { .. }
+                | Self::CancellationStarted { .. }
                 | Self::FatalError { .. }
                 | Self::Notification { .. }
                 | Self::CompactionCompleted
@@ -1449,6 +1522,74 @@ mod tests {
                 call_id: ToolCallId("call-1".into()),
                 name: "read".into(),
                 arguments_summary: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn typed_tool_lifecycle_and_retry_project_without_losing_identity() {
+        let prepared = UiEvent::from_core(SessionEvent::new(
+            2,
+            EventKind::ToolPrepared {
+                batch_id: "batch-1".into(),
+                call_id: "call-1".into(),
+                name: "read".into(),
+            },
+        ));
+        assert_eq!(
+            prepared,
+            Some(UiEvent::ToolPrepared {
+                batch_id: ToolBatchId("batch-1".into()),
+                call_id: ToolCallId("call-1".into()),
+                name: "read".into(),
+            })
+        );
+        let admitted = UiEvent::from_core(SessionEvent::new(
+            3,
+            EventKind::ToolAdmitted {
+                batch_id: "batch-1".into(),
+                call_id: "call-1".into(),
+                name: "read".into(),
+            },
+        ));
+        assert_eq!(
+            admitted,
+            Some(UiEvent::ToolAdmitted {
+                batch_id: ToolBatchId("batch-1".into()),
+                call_id: ToolCallId("call-1".into()),
+                name: "read".into(),
+            })
+        );
+        assert_eq!(
+            UiEvent::from_core(SessionEvent::new(
+                4,
+                EventKind::RetryScheduled {
+                    attempt: 1,
+                    limit: 2,
+                    wait_ms: 30_000,
+                    reason: Some("transient provider failure".into()),
+                },
+            )),
+            Some(UiEvent::RetryScheduled {
+                attempt: 1,
+                limit: 2,
+                wait_ms: 30_000,
+                reason: Some("transient provider failure".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn reasoning_classification_projects_only_the_adapter_claim() {
+        assert_eq!(
+            UiEvent::from_core(SessionEvent::new(
+                5,
+                EventKind::ReasoningClassification {
+                    classification: slim_core::ReasoningClassification::Summary,
+                },
+            )),
+            Some(UiEvent::ThinkingClassificationChanged {
+                classification: slim_core::ReasoningClassification::Summary,
             })
         );
     }

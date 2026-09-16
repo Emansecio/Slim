@@ -52,19 +52,39 @@ pub(crate) fn is_trivial_cwd(cwd: &str) -> bool {
 
 pub(crate) fn run_status_label(state: &AppState) -> &'static str {
     if state.working {
-        "RUNNING"
+        "EM EXECUÇÃO"
     } else if state.authenticated {
-        "READY"
+        "PRONTO"
     } else {
-        "SIGNED OUT"
+        "DESCONECTADO"
     }
 }
 
 pub(crate) fn activity_label(state: &AppState) -> String {
+    if let Some(cancel) = &state.cancellation {
+        return match cancel.phase {
+            crate::app::CancellationPhase::Requested => "Interrupção solicitada",
+            crate::app::CancellationPhase::InProgress => "Interrompendo",
+        }
+        .into();
+    }
+    if let Some(retry) = &state.retry {
+        let remaining = retry
+            .scheduled_ms
+            .saturating_add(retry.wait_ms)
+            .saturating_sub(state.clock.elapsed_ms)
+            .div_ceil(1_000);
+        return format!(
+            "Nova tentativa · {}/{} · em {remaining} s",
+            retry.attempt, retry.limit
+        );
+    }
     match state.activity.as_ref().map(|activity| &activity.phase) {
-        Some(ActivityPhase::Thinking) => "Thinking".into(),
-        Some(ActivityPhase::AwaitingProvider) => "Waiting for provider".into(),
-        Some(ActivityPhase::Responding) => "Responding".into(),
+        Some(ActivityPhase::Thinking) => "Pensando".into(),
+        Some(ActivityPhase::AwaitingProvider) => "Aguardando provedor".into(),
+        Some(ActivityPhase::Responding) => "Respondendo".into(),
+        Some(ActivityPhase::PreparingTool(name)) => preparation_label(name),
+        Some(ActivityPhase::QueuedTool(name)) => format!("Aguardando execução · {}", safe(name)),
         Some(ActivityPhase::RunningTool(name)) => {
             let live = live_tool_names(state);
             if live.is_empty() {
@@ -73,25 +93,33 @@ pub(crate) fn activity_label(state: &AppState) -> String {
                 tool_activity_phrase(&live)
             }
         }
-        Some(ActivityPhase::WaitingForInput) => "Waiting for input".into(),
-        Some(ActivityPhase::External(label)) => external_activity_label(state, label),
-        None => "Working".into(),
+        Some(ActivityPhase::WaitingForInput) => "Aguardando resposta".into(),
+        Some(ActivityPhase::External(label)) => external_activity_label(label),
+        None => "Em atividade".into(),
     }
 }
 
-fn external_activity_label(state: &AppState, label: &str) -> String {
+fn external_activity_label(label: &str) -> String {
     let label = label.trim();
+    let known = match label {
+        "Connecting to provider" => Some("Conectando ao provedor"),
+        "Waiting for first byte" => Some("Aguardando primeiro byte"),
+        "Stream open · waiting for content" => Some("Conexão aberta · aguardando conteúdo"),
+        "Provider responding" => Some("Provedor respondendo"),
+        "Preparing tool" => Some("Preparando ferramenta"),
+        "Compacting context" => Some("Compactando contexto"),
+        _ => None,
+    };
+    if let Some(known) = known {
+        return known.into();
+    }
     if label.starts_with("Retrying") || label.starts_with("Compacting") {
         return safe(label);
     }
     if let Some(name) = label.strip_prefix("Preparing tool · ") {
         let name = name.trim();
         if !name.is_empty() {
-            let live = live_tool_names(state);
-            if live.is_empty() {
-                return tool_activity_phrase(&[name]);
-            }
-            return tool_activity_phrase(&live);
+            return preparation_label(name);
         }
     }
     safe(label)
@@ -127,7 +155,7 @@ fn tool_phrase(names: &[&str], completed: bool) -> String {
         return if completed {
             String::new()
         } else {
-            "Thinking".into()
+            "Pensando".into()
         };
     }
     let mut reading = 0usize;
@@ -154,42 +182,42 @@ fn tool_phrase(names: &[&str], completed: bool) -> String {
     let mut parts = Vec::new();
     match reading {
         0 => {}
-        1 => parts.push(if completed { "Read" } else { "Reading" }.into()),
+        1 => parts.push(if completed { "Leu" } else { "Lendo" }.into()),
         n => parts.push(if completed {
-            format!("{n} reads")
+            format!("{n} chamadas de leitura")
         } else {
-            format!("Reading · {n} calls")
+            format!("Lendo · {n} chamadas")
         }),
     }
     match searching {
         0 => {}
         1 => parts.push(if completed {
-            "1 search".into()
+            "1 busca".into()
         } else {
-            "Searching".into()
+            "Buscando".into()
         }),
-        n => parts.push(format!("{n} searches")),
+        n => parts.push(format!("{n} chamadas de busca")),
     }
     match editing {
         0 => {}
-        1 => parts.push(if completed { "Edited" } else { "Editing" }.into()),
+        1 => parts.push(if completed { "Editou" } else { "Editando" }.into()),
         n => parts.push(if completed {
-            format!("{n} edits")
+            format!("{n} chamadas de edição")
         } else {
-            format!("Editing · {n} calls")
+            format!("Editando · {n} chamadas")
         }),
     }
     match shell {
         0 => {}
         1 => parts.push(if completed {
-            "Ran 1 command".into()
+            "Executou 1 comando".into()
         } else {
-            "Running command".into()
+            "Executando comando".into()
         }),
         n => parts.push(if completed {
-            format!("Ran {n} commands")
+            format!("Executou {n} comandos")
         } else {
-            format!("Running · {n} commands")
+            format!("Executando · {n} comandos")
         }),
     }
     for (name, count) in others {
@@ -209,7 +237,7 @@ pub(crate) fn budget_near_limit(used: usize, limit: usize) -> bool {
 
 pub(crate) fn assistant_label(lifecycle: BlockLifecycle) -> &'static str {
     if lifecycle == BlockLifecycle::Cancelled {
-        "Slim · interrupted · partial"
+        "Slim · interrompido · parcial"
     } else {
         "Slim"
     }
@@ -253,6 +281,63 @@ pub(crate) fn truncate_display_width(text: &str, max_width: usize) -> String {
         .collect()
 }
 
+fn preparation_label(name: &str) -> String {
+    let action = match name {
+        "read" => "leitura",
+        "search" => "busca",
+        "write" | "patch" => "edição",
+        "shell" => "comando",
+        other => other,
+    };
+    format!("Preparando {}", safe(action))
+}
+
+pub(crate) fn activity_phase_label(phase: &ActivityPhase) -> String {
+    match phase {
+        ActivityPhase::Thinking => "Pensando".into(),
+        ActivityPhase::Responding => "Respondendo".into(),
+        ActivityPhase::AwaitingProvider => "Aguardando provedor".into(),
+        ActivityPhase::PreparingTool(name) => preparation_label(name),
+        ActivityPhase::QueuedTool(name) => format!("Aguardando execução · {}", safe(name)),
+        ActivityPhase::RunningTool(name) => tool_activity_phrase(&[name]),
+        ActivityPhase::WaitingForInput => "Aguardando resposta".into(),
+        ActivityPhase::External(label) => external_activity_label(label),
+    }
+}
+
+pub(crate) fn truncate_middle(text: &str, max_width: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let basename = text.rsplit(['/', '\\']).next().unwrap_or(text);
+    let tail_budget = (max_width.saturating_sub(1) * 2 / 3)
+        .max(UnicodeWidthStr::width(basename).min(max_width.saturating_sub(1)));
+    let mut used = 0;
+    let tail: Vec<_> = text
+        .graphemes(true)
+        .rev()
+        .take_while(|g| {
+            let next = UnicodeWidthStr::width(*g);
+            if used + next > tail_budget {
+                false
+            } else {
+                used += next;
+                true
+            }
+        })
+        .collect();
+    format!(
+        "{}…{}",
+        truncate_display_width(text, max_width - 1 - used),
+        tail.into_iter().rev().collect::<String>()
+    )
+}
+
 pub(crate) fn session_rail_projection(
     state: &AppState,
     available: usize,
@@ -265,16 +350,7 @@ pub(crate) fn session_rail_projection(
         let prefix = "SLIM · ";
         let prefix_width = unicode_width::UnicodeWidthStr::width(prefix);
         let cwd_budget = available.saturating_sub(prefix_width);
-        let cwd = if unicode_width::UnicodeWidthStr::width(safe_cwd.as_str()) > cwd_budget
-            && cwd_budget > 0
-        {
-            format!(
-                "{}…",
-                truncate_display_width(&safe_cwd, cwd_budget.saturating_sub(1))
-            )
-        } else {
-            truncate_display_width(&safe_cwd, cwd_budget)
-        };
+        let cwd = truncate_middle(&safe_cwd, cwd_budget);
         truncate_display_width(&format!("{prefix}{cwd}"), available)
     };
     let gap = available.saturating_sub(unicode_width::UnicodeWidthStr::width(identity.as_str()));
@@ -307,7 +383,7 @@ impl ViewModel {
             }
             match block.kind() {
                 BlockKind::User(text) => {
-                    lines.push("You".into());
+                    lines.push("Você".into());
                     lines.push(format!("> {}", safe(text)));
                 }
                 BlockKind::Assistant(text) => {
@@ -320,9 +396,9 @@ impl ViewModel {
                 BlockKind::Thinking(text) if block.fold == FoldState::Collapsed => {
                     let text = safe(text);
                     let preview = text.lines().next().unwrap_or_default();
-                    lines.push(format!("Thinking: {preview}"));
+                    lines.push(format!("Pensamento: {preview}"));
                 }
-                BlockKind::Thinking(text) => lines.push(format!("Thinking: {}", safe(text))),
+                BlockKind::Thinking(text) => lines.push(format!("Pensamento: {}", safe(text))),
                 BlockKind::Tool(state) => {
                     let name = safe(&state.name);
                     let preview = safe(&state.preview);
@@ -330,12 +406,12 @@ impl ViewModel {
                         BlockLifecycle::Pending => format!("○ {name}: {preview}"),
                         BlockLifecycle::Streaming => format!("◌ {name}: {preview}"),
                         BlockLifecycle::Complete if state.historical => {
-                            format!("- {name} · history")
+                            format!("- {name} · histórico")
                         }
                         BlockLifecycle::Complete => format!("✓ {name}: {preview}"),
-                        BlockLifecycle::Failed => format!("✕ {name} (failed): {preview}"),
+                        BlockLifecycle::Failed => format!("✕ {name} (falhou): {preview}"),
                         BlockLifecycle::Cancelled => {
-                            format!("■ {name} (cancelled): {preview}")
+                            format!("■ {name} (interrompida): {preview}")
                         }
                     };
                     lines.push(line);
@@ -370,7 +446,7 @@ impl ViewModel {
                 .iter()
                 .find(|item| item.status == crate::api::TodoItemStatus::InProgress)
                 .map(|item| safe(&item.title))
-                .unwrap_or_else(|| "no active item".into());
+                .unwrap_or_else(|| "sem tarefa ativa".into());
             lines.push(format!("todo: {done}/{total} {active}"));
         }
         lines.push(format!(
@@ -424,8 +500,8 @@ pub fn format_context(state: &AppState, compact: bool) -> String {
     };
     let estimate = if state.context_exact { "" } else { "~" };
     let compaction = match state.compaction_status {
-        slim_core::context::CompactionStatus::Preparing => " preparing",
-        slim_core::context::CompactionStatus::Ready => " ready",
+        slim_core::context::CompactionStatus::Preparing => " preparando",
+        slim_core::context::CompactionStatus::Ready => " pronto",
         _ => "",
     };
     if compact {
@@ -560,24 +636,24 @@ pub(crate) fn footer_lines(
             format!("{} · ", activity_label(state))
         };
         let base_variants = vec![
-            format!("{phase}Esc stop · Esc×2 force · Ctrl+C cancel"),
-            format!("{phase}Esc stop · Ctrl+C cancel"),
-            format!("{phase}Ctrl+C cancel"),
+            format!("{phase}Esc parar · Esc×2 forçar · Ctrl+C cancelar"),
+            format!("{phase}Esc parar · Ctrl+C cancelar"),
+            format!("{phase}Ctrl+C cancelar"),
             format!("{phase}Ctrl+C"),
             format!("{phase}^C"),
-            "Ctrl+C cancel".into(),
+            "Ctrl+C cancelar".into(),
             "^C".into(),
         ];
         if state.scroll.is_pinned() {
             let edge_variants = if state.scroll.unseen > 0 {
                 vec![
-                    format!("{} new · End latest", state.scroll.unseen),
-                    format!("{} new · End", state.scroll.unseen),
-                    format!("{} new", state.scroll.unseen),
+                    format!("{} novas · End recentes", state.scroll.unseen),
+                    format!("{} novas · End", state.scroll.unseen),
+                    format!("{} novas", state.scroll.unseen),
                     format!("{}↑", state.scroll.unseen),
                 ]
             } else {
-                vec!["End latest".into(), "End".into()]
+                vec!["End recentes".into(), "End".into()]
             };
             let mut variants = Vec::with_capacity(
                 base_variants
@@ -597,36 +673,64 @@ pub(crate) fn footer_lines(
         }
     } else if state.scroll.is_pinned() {
         let unseen = if state.scroll.unseen > 0 {
-            format!("{} new · ", state.scroll.unseen)
+            format!("{} novas · ", state.scroll.unseen)
         } else {
             String::new()
         };
         fit(vec![
-            format!("{unseen}End latest"),
-            "End latest".into(),
+            format!("{unseen}End recentes"),
+            "End recentes".into(),
             "End".into(),
         ])
     } else if !state.authenticated {
-        fit(vec!["signed out · /login".into(), "/login".into()])
+        fit(vec!["desconectado · /login".into(), "/login".into()])
+    } else if let Some(execution) = &state.last_execution {
+        let outcome = match execution.outcome {
+            crate::app::RunOutcomeKind::Completed => "concluída",
+            crate::app::RunOutcomeKind::Interrupted => "interrompida",
+            crate::app::RunOutcomeKind::Failed => "falhou",
+        };
+        let duration = if execution.duration_ms < 1_000 {
+            "<1s".to_owned()
+        } else {
+            format!("{}s", execution.duration_ms / 1_000)
+        };
+        let pending = if execution.pending_count > 0 {
+            format!(" · {} pendente(s)", execution.pending_count)
+        } else {
+            String::new()
+        };
+        let summary = format!("Execução {outcome} · {duration}{pending}");
+        fit(vec![
+            format!("{summary} · Ctrl+J detalhes · F1 ajuda"),
+            format!("{summary} · Ctrl+J"),
+            summary,
+            format!("{outcome} · {duration}{pending}"),
+            truncate_display_width(&format!("{outcome}{pending}"), width),
+        ])
     } else {
         fit(vec![
-            "F1 help · / commands · Shift+Tab · Ctrl+P · Ctrl+C exit".into(),
-            "F1 help · / commands · Ctrl+P · Ctrl+C exit".into(),
-            "F1 help · Shift+Tab · Ctrl+P commands".into(),
-            "/ commands · Ctrl+P · Ctrl+C exit".into(),
-            "F1 help · Ctrl+P commands".into(),
-            "Ctrl+P commands".into(),
+            "F1 ajuda · / comandos · Shift+Tab · Ctrl+P · Ctrl+C sair".into(),
+            "F1 ajuda · / comandos · Ctrl+P · Ctrl+C sair".into(),
+            "F1 ajuda · Shift+Tab · Ctrl+P comandos".into(),
+            "/ comandos · Ctrl+P · Ctrl+C sair".into(),
+            "F1 ajuda · Ctrl+P comandos".into(),
+            "Ctrl+P comandos".into(),
             "^P".into(),
         ])
     };
     let mode_line = if state.authenticated && !state.working && !state.scroll.is_pinned() {
-        fit(vec![format!("{mode} · Shift+Tab mode"), mode.to_owned()])
+        fit(vec![format!("{mode} · Shift+Tab modo"), mode.to_owned()])
     } else {
         truncate_display_width(mode, width)
     };
     match rows {
         1 => {
-            let mut line = if state.working || state.scroll.is_pinned() || !state.authenticated {
+            let mut line = if state.working
+                || state.scroll.is_pinned()
+                || !state.authenticated
+                || state.last_execution.is_some()
+            {
                 controls
             } else {
                 fit(vec![
@@ -717,14 +821,49 @@ mod minimal_footer_tests {
     use crate::app::AppState;
     #[test]
     fn summaries_count_operations_without_claiming_unique_files() {
-        assert_eq!(completed_tool_phrase(&["read", "read"]), "2 reads");
+        assert_eq!(
+            completed_tool_phrase(&["read", "read"]),
+            "2 chamadas de leitura"
+        );
         assert_eq!(
             completed_tool_phrase(&["read", "list", "code_intel"]),
-            "Read, list, code_intel"
+            "Leu, list, code_intel"
         );
-        assert_eq!(completed_tool_phrase(&["patch", "patch"]), "2 edits");
-        assert_eq!(completed_tool_phrase(&["shell", "shell"]), "Ran 2 commands");
+        assert_eq!(
+            completed_tool_phrase(&["patch", "patch"]),
+            "2 chamadas de edição"
+        );
+        assert_eq!(
+            completed_tool_phrase(&["shell", "shell"]),
+            "Executou 2 comandos"
+        );
     }
+    #[test]
+    fn idle_footer_keeps_observed_run_result_without_claiming_task_success() {
+        let mut state = AppState::new();
+        state.authenticated = true;
+        state.last_execution = Some(crate::app::ExecutionSummary {
+            run_id: 1,
+            started_ms: 10,
+            ended_ms: 3210,
+            duration_ms: 3200,
+            outcome: crate::app::RunOutcomeKind::Completed,
+            pending_count: 2,
+        });
+        for rows in [1, 2, 3] {
+            let lines = footer_lines(&state, 98, rows, false).join("\n");
+            assert!(
+                lines.contains("Execução concluída · 3s · 2 pendente(s)"),
+                "{lines}"
+            );
+            assert!(lines.contains("Ctrl+J"));
+        }
+        state.working = true;
+        let active = footer_lines(&state, 98, 1, false).join("\n");
+        assert!(active.contains("Ctrl+C"));
+        assert!(!active.contains("Execução concluída"));
+    }
+
     #[test]
     fn footer_degrades_by_cells_and_preserves_critical_controls() {
         let mut state = AppState::new();
@@ -744,10 +883,7 @@ mod minimal_footer_tests {
         state.working = true;
         for rows in [1, 2, 3] {
             let lines = footer_lines(&state, 24, rows, false).join("\n");
-            assert!(
-                lines.contains("^C") || lines.contains("Ctrl+C cancel"),
-                "{lines}"
-            );
+            assert!(lines.contains("^C") || lines.contains("Ctrl+C"), "{lines}");
         }
     }
 
@@ -803,23 +939,57 @@ mod activity_label_tests {
 
     #[test]
     fn awaiting_provider_is_not_presented_as_reasoning() {
-        assert_eq!(label(ActivityPhase::Thinking), "Thinking");
+        assert_eq!(label(ActivityPhase::Thinking), "Pensando");
         assert_eq!(
             label(ActivityPhase::AwaitingProvider),
-            "Waiting for provider"
+            "Aguardando provedor"
         );
     }
 
     #[test]
     fn provider_phase_labels_do_not_fake_reasoning() {
-        for phase in [
-            "Connecting to provider",
-            "Waiting for first byte",
-            "Stream open · waiting for content",
-            "Provider responding",
-            "Preparing tool",
+        for (phase, expected) in [
+            ("Connecting to provider", "Conectando ao provedor"),
+            ("Waiting for first byte", "Aguardando primeiro byte"),
+            (
+                "Stream open · waiting for content",
+                "Conexão aberta · aguardando conteúdo",
+            ),
+            ("Provider responding", "Provedor respondendo"),
+            ("Preparing tool", "Preparando ferramenta"),
         ] {
-            assert_eq!(label(ActivityPhase::External(phase.into())), phase);
+            assert_eq!(label(ActivityPhase::External(phase.into())), expected);
         }
+    }
+
+    #[test]
+    fn shortened_path_preserves_workspace_and_cell_budget() {
+        let path = "C:\\muito-longo\\caminho\\workspace-日本語";
+        let short = super::truncate_middle(path, 24);
+        assert!(short.ends_with("workspace-日本語"));
+        assert!(unicode_width::UnicodeWidthStr::width(short.as_str()) <= 24);
+        assert_eq!(super::truncate_middle(path, 0), "");
+    }
+
+    #[test]
+    fn typed_retry_uses_deadline_and_cancellation_takes_priority() {
+        let mut state = AppState::new();
+        state.retry = Some(crate::app::RetryState {
+            attempt: 1,
+            limit: 2,
+            wait_ms: 30_000,
+            scheduled_ms: 1_000,
+            reason: None,
+        });
+        state.clock.elapsed_ms = 8_000;
+        assert_eq!(activity_label(&state), "Nova tentativa · 1/2 · em 23 s");
+        state.clock.elapsed_ms = 40_000;
+        assert_eq!(activity_label(&state), "Nova tentativa · 1/2 · em 0 s");
+        state.cancellation = Some(crate::app::CancellationState {
+            run_id: 1,
+            phase: crate::app::CancellationPhase::Requested,
+            requested_ms: 40_000,
+        });
+        assert_eq!(activity_label(&state), "Interrupção solicitada");
     }
 }

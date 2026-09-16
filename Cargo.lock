@@ -1705,6 +1705,7 @@ dependencies = [
  "crossterm",
  "libc",
  "lru",
+ "portable-pty",
  "proptest",
  "pulldown-cmark",
  "ratatui",

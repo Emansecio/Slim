@@ -1,6 +1,7 @@
 """Small varied native-agent comparison; fixed scenarios, alternating order, all runs retained."""
 import argparse
 import json
+import random
 import run
 
 SCENARIOS = {
@@ -234,24 +235,42 @@ def main():
     parser.add_argument('--scenario', choices=list(SCENARIOS))
     parser.add_argument('--provider', choices=['openai-codex', 'opencode-go'], default='openai-codex')
     parser.add_argument('--model', default=run.MODEL)
+    parser.add_argument('--timeout', type=int, default=240, help='seconds per arm process')
+    parser.add_argument('--no-audit', action='store_true', help='skip per-campaign summary.json audit')
+    parser.add_argument('--shuffle-seed', type=int, default=None, help='reproducible scenario order; arm order remains balanced')
     args = parser.parse_args()
     if args.rounds < 1 or args.start_round < 1:
         parser.error('--rounds and --start-round must be positive')
     selected = [args.scenario] if args.scenario else list(SCENARIOS)
     campaigns = []
     failures = []
+    rng = random.Random(args.shuffle_seed)
+    schedule = []
     for repeat in range(args.start_round - 1, args.start_round - 1 + args.rounds):
-        for scenario in selected:
+        order = list(selected)
+        if args.shuffle_seed is not None:
+            rng.shuffle(order)
+        for scenario in order:
             index = list(SCENARIOS).index(scenario)
             arms = ['slim', 'pi'] if (repeat + index) % 2 == 0 else ['pi', 'slim']
-            try:
-                campaign = run.main(arms, scenario=scenario, provider=args.provider, model=args.model, **SCENARIOS[scenario])
-            except SystemExit as error:
-                failures.append({'round': repeat + 1, 'scenario': scenario, 'error': str(error)})
-                print(json.dumps(failures[-1]), flush=True)
-                continue
-            campaigns.append(str(campaign))
-            print(json.dumps({'round': repeat + 1, 'scenario': scenario, 'campaign': str(campaign)}), flush=True)
+            schedule.append((repeat, scenario, arms))
+    print(json.dumps({'schedule': schedule, 'shuffle_seed': args.shuffle_seed, 'model': args.model,
+                      'provider': args.provider}), flush=True)
+    for repeat, scenario, arms in schedule:
+        try:
+            campaign = run.main(arms, scenario=scenario, provider=args.provider, model=args.model,
+                                timeout_seconds=args.timeout, audit=not args.no_audit,
+                                round_number=repeat + 1,
+                                **SCENARIOS[scenario])
+        except (Exception, SystemExit) as error:
+            if getattr(error, 'campaign', None):
+                campaigns.append(str(error.campaign))
+            failures.append({'round': repeat + 1, 'scenario': scenario,
+                             'error': str(error), 'error_type': type(error).__name__})
+            print(json.dumps(failures[-1]), flush=True)
+            continue
+        campaigns.append(str(campaign))
+        print(json.dumps({'round': repeat + 1, 'scenario': scenario, 'campaign': str(campaign)}), flush=True)
     print(json.dumps({'campaigns': campaigns, 'failures': failures}), flush=True)
     if failures:
         raise SystemExit(1)

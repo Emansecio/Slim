@@ -14,7 +14,7 @@ use crate::block::{
     PendingContentPage, ToolState,
 };
 use crate::composer::Composer;
-use crate::inspector::{InspectorState, SearchState};
+use crate::inspector::{InspectorScroll, InspectorState, SearchState};
 
 /// Populates a vec of `OpenCodeModelView` from the static ClinePass model catalog.
 fn default_clinepass_models() -> Vec<OpenCodeModelView> {
@@ -120,10 +120,30 @@ pub struct FrameClock {
 /// are not stored here.
 pub const INFO_TOAST_TTL_MS: u64 = 5_000;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NotificationPriority {
+    #[default]
+    Info,
+    Warning,
+    Error,
+}
+
+impl NotificationPriority {
+    fn rank(self) -> u8 {
+        match self {
+            Self::Info => 0,
+            Self::Warning => 1,
+            Self::Error => 2,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Notification {
     pub message: String,
     pub created_ms: u64,
+    pub repeat_count: u32,
+    pub priority: NotificationPriority,
 }
 
 impl Notification {
@@ -155,6 +175,8 @@ impl From<&str> for Notification {
         Self {
             message: message.to_owned(),
             created_ms: 0,
+            repeat_count: 1,
+            priority: NotificationPriority::Info,
         }
     }
 }
@@ -164,6 +186,8 @@ impl From<String> for Notification {
         Self {
             message,
             created_ms: 0,
+            repeat_count: 1,
+            priority: NotificationPriority::Info,
         }
     }
 }
@@ -185,6 +209,8 @@ pub enum ActivityPhase {
     Thinking,
     Responding,
     AwaitingProvider,
+    PreparingTool(String),
+    QueuedTool(String),
     RunningTool(String),
     WaitingForInput,
     External(String),
@@ -195,6 +221,61 @@ pub struct ActivityState {
     pub phase: ActivityPhase,
     pub started_ms: u64,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfirmedSetting {
+    Model,
+    Effort,
+    Mode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CancellationPhase {
+    Requested,
+    InProgress,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CancellationState {
+    pub run_id: u64,
+    pub phase: CancellationPhase,
+    pub requested_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetryState {
+    pub attempt: u32,
+    pub limit: u32,
+    pub wait_ms: u64,
+    pub scheduled_ms: u64,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivityTimelineEntry {
+    pub timestamp_ms: u64,
+    pub phase: ActivityPhase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunOutcomeKind {
+    Completed,
+    Interrupted,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionSummary {
+    pub run_id: u64,
+    pub started_ms: u64,
+    pub ended_ms: u64,
+    pub duration_ms: u64,
+    pub outcome: RunOutcomeKind,
+    pub pending_count: usize,
+}
+
+const MAX_ACTIVITY_TIMELINE: usize = 64;
+const MAX_EXECUTION_HISTORY: usize = 32;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProviderTimingState {
@@ -481,6 +562,9 @@ pub struct AppState {
     pub mode: OperatingMode,
     pub model: String,
     pub effort: ReasoningEffort,
+    /// Last effective model/effort/mode change and its semantic clock time.
+    /// Focus movement in an overlay never updates this value.
+    pub confirmed_setting: Option<(ConfirmedSetting, u64)>,
     pub codex_fast: bool,
     pub auth_provider: Option<LoginProvider>,
     pub authenticated: bool,
@@ -518,6 +602,8 @@ pub struct AppState {
     blocks: Vec<Block>,
     block_ids: HashSet<Arc<str>>,
     pub notifications: Vec<Notification>,
+    /// Bounded compact history; transient expiry only affects `notifications`.
+    pub notification_history: Vec<Notification>,
     pub composer: Composer,
     pub attachment_labels: Vec<String>,
     pub todo_items: Vec<crate::api::TodoItemView>,
@@ -545,13 +631,42 @@ pub struct AppState {
     snapshot_resync_needed: bool,
     pub(crate) run_started_ms: Option<u64>,
     pub todo_dock_open: bool,
+    /// `None` keeps the historical auto-open behavior until the user makes a
+    /// deliberate Ctrl+T choice; thereafter content updates preserve it.
+    pub todo_dock_user_preference: Option<bool>,
+    /// Scroll position for the currently pending approval/question block.
+    /// This is separate from the inspector scroll so a decision stays tied to
+    /// its own viewport while the transcript continues to move.
+    pub approval_scroll: InspectorScroll,
+    /// Runtime updates this before dispatching a decision key.  A tiny
+    /// approval viewport keeps the decision disabled until its content can be
+    /// read; the reducer never mutates terminal rendering state itself.
+    pub approval_content_accessible: bool,
     /// FIFO of prompts submitted (or steered) while a run is active (§7.4);
     /// drained one-per-turn at run boundaries.
     pub(crate) queued_prompts: VecDeque<String>,
+    /// Explicit cancellation pauses automatic queue draining until resumed.
+    pub queue_paused: bool,
+    /// Calls admitted by the scheduler but not yet announced as executor
+    /// blocks. The pair of opaque identities avoids collapsing parallel calls
+    /// that share a tool name.
+    admitted_tool_calls: Vec<(crate::api::ToolBatchId, crate::api::ToolCallId, String)>,
     pub scroll: ScrollState,
     pub clock: FrameClock,
     pub activity: Option<ActivityState>,
+    pub activity_timeline: VecDeque<ActivityTimelineEntry>,
     pub provider_timings: ProviderTimingState,
+    /// Timestamp of the last non-empty semantic payload received from the
+    /// provider (text or reasoning). Redraws and clock ticks never update it.
+    pub last_provider_content_ms: Option<u64>,
+    /// Timestamp of the last tool lifecycle/progress event observed for the
+    /// active run. It is independent from provider content timing.
+    pub last_tool_progress_ms: Option<u64>,
+    pub retry: Option<RetryState>,
+    pub cancellation: Option<CancellationState>,
+    pub last_execution: Option<ExecutionSummary>,
+    pub execution_history: VecDeque<ExecutionSummary>,
+    pub reasoning_classification: Option<slim_core::ReasoningClassification>,
     pub max_mutating_tool_calls: usize,
     pub max_read_tool_calls: usize,
     pub max_turns: usize,
@@ -580,6 +695,7 @@ impl Default for AppState {
             mode: OperatingMode::Auto,
             model: ModelAlias::Sol.id().into(),
             effort: ReasoningEffort::High,
+            confirmed_setting: None,
             codex_fast: false,
             auth_provider: None,
             authenticated: false,
@@ -609,6 +725,7 @@ impl Default for AppState {
             blocks: Vec::new(),
             block_ids: HashSet::new(),
             notifications: Vec::new(),
+            notification_history: Vec::new(),
             composer: Composer::default(),
             attachment_labels: Vec::new(),
             todo_items: Vec::new(),
@@ -630,6 +747,8 @@ impl Default for AppState {
             request_estimate_open: false,
             working: false,
             queued_prompts: VecDeque::new(),
+            queue_paused: false,
+            admitted_tool_calls: Vec::new(),
             active_run_id: None,
             latest_run_assistant: None,
             terminal_tail: None,
@@ -637,10 +756,21 @@ impl Default for AppState {
             snapshot_resync_needed: false,
             run_started_ms: None,
             todo_dock_open: false,
+            todo_dock_user_preference: None,
+            approval_scroll: InspectorScroll::default(),
+            approval_content_accessible: true,
             scroll: ScrollState::default(),
             clock: FrameClock::default(),
             activity: None,
+            activity_timeline: VecDeque::new(),
             provider_timings: ProviderTimingState::default(),
+            last_provider_content_ms: None,
+            last_tool_progress_ms: None,
+            retry: None,
+            cancellation: None,
+            last_execution: None,
+            execution_history: VecDeque::new(),
+            reasoning_classification: None,
             max_mutating_tool_calls: UiEvent::DEFAULT_MAX_MUTATING_TOOL_CALLS,
             max_read_tool_calls: UiEvent::DEFAULT_MAX_READ_TOOL_CALLS,
             max_turns: UiEvent::DEFAULT_MAX_TURNS,
@@ -698,6 +828,18 @@ impl AppState {
         self.set_workspace(cwd, skill_names);
         self.thinking_open = false;
         self.snapshot_resync_needed = false;
+        self.last_provider_content_ms = None;
+        self.last_tool_progress_ms = None;
+        self.retry = None;
+        self.cancellation = None;
+        self.reasoning_classification = None;
+        self.confirmed_setting = None;
+        self.activity_timeline.clear();
+        self.admitted_tool_calls.clear();
+        self.approval_scroll = InspectorScroll::default();
+        self.approval_content_accessible = true;
+        self.last_execution = None;
+        self.execution_history.clear();
         self.scroll = ScrollState::default();
         self.last_tok_per_sec = None;
         self.last_tok_per_sec_estimated = false;
@@ -716,9 +858,13 @@ impl AppState {
         self.set_workspace(cwd, skill_names);
         self.blocks.clear();
         self.block_ids.clear();
+        self.notifications.clear();
+        self.notification_history.clear();
         self.queued_prompts.clear();
+        self.queue_paused = false;
         self.todo_items.clear();
         self.todo_dock_open = false;
+        self.todo_dock_user_preference = None;
         self.inspector = InspectorState::default();
         self.search = None;
         self.slash_suggestions = None;
@@ -730,6 +876,18 @@ impl AppState {
         self.snapshot_resync_needed = false;
         self.run_started_ms = None;
         self.activity = None;
+        self.last_provider_content_ms = None;
+        self.last_tool_progress_ms = None;
+        self.retry = None;
+        self.cancellation = None;
+        self.reasoning_classification = None;
+        self.confirmed_setting = None;
+        self.activity_timeline.clear();
+        self.admitted_tool_calls.clear();
+        self.approval_scroll = InspectorScroll::default();
+        self.approval_content_accessible = true;
+        self.last_execution = None;
+        self.execution_history.clear();
         self.input_tokens = 0;
         self.output_tokens = 0;
         self.input_tokens_overflowed = false;
@@ -810,14 +968,58 @@ impl AppState {
     }
 
     pub fn push_notification(&mut self, message: String) {
+        self.push_notification_with_priority(message, NotificationPriority::Info);
+    }
+
+    pub(crate) fn push_notification_with_priority(
+        &mut self,
+        message: String,
+        priority: NotificationPriority,
+    ) {
         self.prune_notifications();
+        let now = self.clock.elapsed_ms;
+        if let Some(notification) = self.notifications.last_mut() {
+            if notification.message == message && notification.priority == priority {
+                notification.repeat_count = notification.repeat_count.saturating_add(1);
+                notification.created_ms = now;
+                if let Some(history) = self.notification_history.last_mut() {
+                    if history.message == message && history.priority == priority {
+                        history.repeat_count = history.repeat_count.saturating_add(1);
+                        history.created_ms = now;
+                    }
+                }
+                return;
+            }
+        }
         if self.notifications.len() == 100 {
             self.notifications.remove(0);
         }
-        self.notifications.push(Notification {
+        let repeat_count = if let Some(history) = self.notification_history.last_mut() {
+            if history.message == message && history.priority == priority {
+                history.repeat_count = history.repeat_count.saturating_add(1);
+                history.created_ms = now;
+                history.repeat_count
+            } else {
+                1
+            }
+        } else {
+            1
+        };
+        let notification = Notification {
             message,
-            created_ms: self.clock.elapsed_ms,
-        });
+            created_ms: now,
+            repeat_count,
+            priority,
+        };
+        self.notifications.push(notification.clone());
+        if self.notification_history.last().is_none_or(|history| {
+            history.message != notification.message || history.priority != notification.priority
+        }) {
+            if self.notification_history.len() == 100 {
+                self.notification_history.remove(0);
+            }
+            self.notification_history.push(notification);
+        }
     }
 
     fn maybe_warn_tool_budget(&mut self) {
@@ -831,13 +1033,16 @@ impl AppState {
             self.max_mutating_tool_calls > 0 && self.tools_used_mutating >= mutating_threshold;
         if read_hit || mutating_hit {
             self.tool_budget_warned = true;
-            self.push_notification(format!(
-                "Tool budget: read {}/{}, mutating {}/{} — approaching this-turn limit",
-                self.tools_used_read,
-                self.max_read_tool_calls,
-                self.tools_used_mutating,
-                self.max_mutating_tool_calls
-            ));
+            self.push_notification_with_priority(
+                format!(
+                    "Limite de ferramentas: leitura {}/{}, alteração {}/{} — perto do limite desta execução",
+                    self.tools_used_read,
+                    self.max_read_tool_calls,
+                    self.tools_used_mutating,
+                    self.max_mutating_tool_calls
+                ),
+                NotificationPriority::Warning,
+            );
         }
     }
 
@@ -848,10 +1053,13 @@ impl AppState {
         let threshold = ((self.max_turns as f64) * 0.8).ceil() as usize;
         if self.turns_used >= threshold {
             self.turn_budget_warned = true;
-            self.push_notification(format!(
-                "Turn budget: {}/{} — approaching run limit",
-                self.turns_used, self.max_turns
-            ));
+            self.push_notification_with_priority(
+                format!(
+                    "Limite de turnos: {}/{} — perto do limite da execução",
+                    self.turns_used, self.max_turns
+                ),
+                NotificationPriority::Warning,
+            );
         }
     }
 
@@ -875,15 +1083,31 @@ impl AppState {
     }
 
     pub fn visible_toast_tail(&self, limit: usize) -> Vec<&Notification> {
-        let mut notices: Vec<&Notification> = self.visible_notifications().collect();
-        let start = notices.len().saturating_sub(limit);
-        notices.drain(..start);
-        notices
+        if limit == 0 {
+            return Vec::new();
+        }
+        self.visible_notifications()
+            .max_by_key(|notification| (notification.priority.rank(), notification.created_ms))
+            .into_iter()
+            .collect()
+    }
+
+    pub fn notification_history(&self) -> &[Notification] {
+        &self.notification_history
     }
 
     fn dismiss_notifications_starting_with(&mut self, prefix: &str) {
         self.notifications
             .retain(|notification| !notification.message.starts_with(prefix));
+    }
+
+    fn dismiss_no_provider_notifications(&mut self) {
+        self.notifications.retain(|notification| {
+            !notification.message.starts_with("No provider connected")
+                && !notification
+                    .message
+                    .starts_with("Nenhum provedor conectado")
+        });
     }
 
     pub fn snapshot_resync_needed(&self) -> bool {
@@ -1112,7 +1336,10 @@ impl AppState {
         }
 
         let Some(next_request_id) = self.next_content_request_id.checked_add(1) else {
-            self.push_notification("Content request identity exhausted".into());
+            self.push_notification_with_priority(
+                "Identidade da solicitação de conteúdo esgotada".into(),
+                NotificationPriority::Error,
+            );
             self.revisions.status += 1;
             return (true, None);
         };
@@ -1178,17 +1405,49 @@ impl AppState {
     /// Enqueues a prompt while a run is active (§7.4): visible `QueuedUser`
     /// block in FIFO order; drained one-per-turn at run boundaries.
     pub(crate) fn enqueue_queued_prompt(&mut self, text: String) {
-        let position = self.queued_prompts.len();
         let id = self.fresh_id("queued");
-        let block = Block::new(
+        let mut block = Block::new(
             id,
-            BlockKind::QueuedUser(format!("queued[{position}] {text}")),
+            BlockKind::QueuedUser(text.clone()),
             BlockLifecycle::Complete,
         );
+        block.started_ms = Some(self.clock.elapsed_ms);
         self.blocks.push(block);
         self.queued_prompts.push_back(text);
         self.note_new_content();
         self.revisions.content += 1;
+    }
+
+    pub fn queue_len(&self) -> usize {
+        self.queued_prompts.len()
+    }
+
+    pub fn queued_prompt(&self, index: usize) -> Option<&str> {
+        self.queued_prompts.get(index).map(String::as_str)
+    }
+
+    /// Removes one queued prompt by its current FIFO position. The position
+    /// is zero-based internally; callers that show human positions should
+    /// convert at the boundary instead of persisting an index in the block.
+    pub(crate) fn remove_queued_prompt(&mut self, index: usize) -> Option<String> {
+        let prompt = self.queued_prompts.remove(index)?;
+        let block_index = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| matches!(block.kind(), BlockKind::QueuedUser(_)))
+            .nth(index)
+            .map(|(index, _)| index);
+        if let Some(block_index) = block_index {
+            let block = self.blocks.remove(block_index);
+            self.block_ids.remove(&block.id.0);
+        }
+        self.revisions.content += 1;
+        Some(prompt)
+    }
+
+    pub(crate) fn take_queued_prompt_for_edit(&mut self, index: usize) -> Option<String> {
+        self.remove_queued_prompt(index)
     }
 
     /// Pops the next queued prompt and removes its `QueuedUser` block.
@@ -1209,10 +1468,154 @@ impl AppState {
         Some(prompt)
     }
 
+    /// Returns names of admitted calls that have not reached executor blocks.
+    /// The pair of opaque identities prevents one parallel call from hiding
+    /// another; names are used only for the compact activity label.
+    fn queued_tool_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .admitted_tool_calls
+            .iter()
+            .map(|(_, _, name)| name.clone())
+            .collect();
+        names.extend(
+            self.blocks
+                .iter()
+                .filter(|block| block.lifecycle == BlockLifecycle::Pending)
+                .filter_map(|block| match block.kind() {
+                    BlockKind::Tool(tool) if !tool.historical => Some(tool.name.clone()),
+                    _ => None,
+                }),
+        );
+        names
+    }
+
+    fn running_tool_names(&self) -> Vec<String> {
+        self.blocks
+            .iter()
+            .filter(|block| block.lifecycle == BlockLifecycle::Streaming)
+            .filter_map(|block| match block.kind() {
+                BlockKind::Tool(tool) if !tool.historical => Some(tool.name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Re-derives the visible tool phase after a lifecycle terminal.  A
+    /// completed call must not hide another call that is still running.
+    fn refresh_tool_activity(&mut self) {
+        if self.terminal_tail.is_some() {
+            return;
+        }
+        if let Some(name) = self.running_tool_names().into_iter().next() {
+            self.transition_activity(ActivityPhase::RunningTool(name));
+        } else if let Some(name) = self.queued_tool_names().into_iter().next() {
+            self.transition_activity(ActivityPhase::QueuedTool(name));
+        } else if self.working {
+            self.transition_activity(ActivityPhase::AwaitingProvider);
+        }
+    }
+
+    /// Hides completed thinking previews at the next visual boundary while
+    /// preserving a block the user selected. Expanded blocks remain visible
+    /// through their fold state even after this retention flag is cleared.
+    fn release_thinking_previews(&mut self) {
+        let selected_id = self.selected_block_id().cloned();
+        let screen_selection_active = self.selection.is_some();
+        let mut changed = false;
+        for block in &mut self.blocks {
+            if !matches!(block.kind(), BlockKind::Thinking(_))
+                || !block.preview_retained
+                || screen_selection_active
+                || selected_id.as_ref() == Some(&block.id)
+            {
+                continue;
+            }
+            block.preview_retained = false;
+            changed = true;
+        }
+        if changed {
+            self.revisions.content += 1;
+        }
+    }
+
+    fn request_cancellation(&mut self, run_id: u64) {
+        if self.active_run_id != Some(run_id) || self.terminal_tail.is_some() {
+            return;
+        }
+        if self.cancellation.is_none() {
+            self.cancellation = Some(CancellationState {
+                run_id,
+                phase: CancellationPhase::Requested,
+                requested_ms: self.clock.elapsed_ms,
+            });
+            self.revisions.status += 1;
+        }
+    }
+
+    pub(crate) fn request_cancel_active_run(&mut self) {
+        if let Some(run_id) = self.active_run_id {
+            self.request_cancellation(run_id);
+        }
+    }
+
+    fn start_cancellation(&mut self, run_id: u64) {
+        if self.active_run_id != Some(run_id) || self.terminal_tail.is_some() {
+            return;
+        }
+        let requested_ms = self
+            .cancellation
+            .filter(|cancellation| cancellation.run_id == run_id)
+            .map(|cancellation| cancellation.requested_ms)
+            .unwrap_or(self.clock.elapsed_ms);
+        self.cancellation = Some(CancellationState {
+            run_id,
+            phase: CancellationPhase::InProgress,
+            requested_ms,
+        });
+        self.revisions.status += 1;
+    }
+
+    fn pending_todo_count(&self) -> usize {
+        self.todo_items
+            .iter()
+            .filter(|item| {
+                !matches!(
+                    item.status,
+                    crate::api::TodoItemStatus::Completed | crate::api::TodoItemStatus::Cancelled
+                )
+            })
+            .count()
+    }
+
+    fn finish_execution(&mut self, run_id: u64, outcome: RunOutcomeKind, pending_count: usize) {
+        let ended_ms = self.clock.elapsed_ms;
+        let started_ms = self.run_started_ms.unwrap_or(ended_ms);
+        let summary = ExecutionSummary {
+            run_id,
+            started_ms,
+            ended_ms,
+            duration_ms: ended_ms.saturating_sub(started_ms),
+            outcome,
+            pending_count,
+        };
+        self.last_execution = Some(summary.clone());
+        if self.execution_history.len() == MAX_EXECUTION_HISTORY {
+            self.execution_history.pop_front();
+        }
+        self.execution_history.push_back(summary);
+    }
+
     fn transition_activity(&mut self, phase: ActivityPhase) {
         if self.activity.as_ref().map(|activity| &activity.phase) == Some(&phase) {
             return;
         }
+        if self.activity_timeline.len() == MAX_ACTIVITY_TIMELINE {
+            self.activity_timeline.pop_front();
+        }
+        self.activity_timeline.push_back(ActivityTimelineEntry {
+            timestamp_ms: self.clock.elapsed_ms,
+            phase: phase.clone(),
+        });
         self.activity = Some(ActivityState {
             phase,
             started_ms: self.clock.elapsed_ms,
@@ -1233,17 +1636,24 @@ impl AppState {
                 return;
             }
             self.snapshot_resync_needed = true;
-            self.push_notification("Conflicting interaction request identity ignored".into());
+            self.push_notification_with_priority(
+                "Identidade conflitante da solicitação de interação ignorada".into(),
+                NotificationPriority::Error,
+            );
             self.revisions.status += 1;
             return;
         }
 
         let id = self.fresh_id("interaction");
-        self.blocks.push(Block::new(
+        let mut block = Block::new(
             id,
             BlockKind::InteractionRequest(request),
             BlockLifecycle::Pending,
-        ));
+        );
+        block.started_ms = Some(self.clock.elapsed_ms);
+        self.blocks.push(block);
+        self.approval_scroll = InspectorScroll::default();
+        self.approval_content_accessible = false;
         self.slash_suggestions = None;
         self.note_new_content();
         if self.terminal_tail.is_none() {
@@ -1281,6 +1691,8 @@ impl AppState {
         } else {
             self.activity = None;
         }
+        self.approval_scroll = InspectorScroll::default();
+        self.approval_content_accessible = true;
         self.revisions.content += 1;
         self.revisions.status += 1;
     }
@@ -1485,6 +1897,9 @@ impl AppState {
                 )
             {
                 block.lifecycle = lifecycle;
+                if lifecycle != BlockLifecycle::Streaming {
+                    block.ended_ms = Some(self.clock.elapsed_ms);
+                }
             }
         }
     }
@@ -1502,6 +1917,9 @@ impl AppState {
                 )
         }) {
             block.lifecycle = lifecycle;
+            if lifecycle != BlockLifecycle::Streaming {
+                block.ended_ms = Some(self.clock.elapsed_ms);
+            }
         }
     }
 
@@ -1571,6 +1989,7 @@ impl AppState {
                 } else {
                     // A genuine new run is an output boundary even if an
                     // upstream terminal was lost.
+                    self.release_thinking_previews();
                     self.terminalize_streaming(BlockLifecycle::Cancelled);
                     self.terminal_tail = None;
                     self.thinking_open = false;
@@ -1579,6 +1998,13 @@ impl AppState {
                     self.working = true;
                     self.run_started_ms = Some(self.clock.elapsed_ms);
                     self.activity = None;
+                    self.activity_timeline.clear();
+                    self.last_provider_content_ms = None;
+                    self.last_tool_progress_ms = None;
+                    self.retry = None;
+                    self.cancellation = None;
+                    self.reasoning_classification = None;
+                    self.admitted_tool_calls.clear();
                     self.last_tok_per_sec = None;
                     self.last_tok_per_sec_estimated = false;
                     self.max_mutating_tool_calls = max_mutating_tool_calls;
@@ -1618,26 +2044,21 @@ impl AppState {
             }
             UiEvent::RunCompleted { run_id } => {
                 if self.accept_terminal(run_id, BlockLifecycle::Complete) {
+                    let explicitly_cancelled = self
+                        .cancellation
+                        .is_some_and(|cancellation| cancellation.run_id == run_id);
+                    self.release_thinking_previews();
                     self.terminalize_streaming(BlockLifecycle::Complete);
                     self.latest_run_assistant = None;
                     self.close_request_usage(true);
-                    let pending = self
-                        .todo_items
-                        .iter()
-                        .filter(|item| {
-                            !matches!(
-                                item.status,
-                                crate::api::TodoItemStatus::Completed
-                                    | crate::api::TodoItemStatus::Cancelled
-                            )
-                        })
-                        .count();
+                    let pending = self.pending_todo_count();
+                    self.finish_execution(run_id, RunOutcomeKind::Completed, pending);
                     if pending > 0 {
                         let id = self.fresh_id("pending-tasks");
                         self.blocks.push(Block::new(
                             id,
                             BlockKind::System(format!(
-                                "Run ended; {pending} recorded task(s) remain pending."
+                                "Execução encerrada; {pending} tarefa(s) registrada(s) continuam pendentes."
                             )),
                             BlockLifecycle::Complete,
                         ));
@@ -1647,6 +2068,11 @@ impl AppState {
                     self.thinking_open = false;
                     self.run_started_ms = None;
                     self.activity = None;
+                    self.cancellation = None;
+                    self.retry = None;
+                    if explicitly_cancelled {
+                        self.queue_paused = true;
+                    }
                     self.request_estimate_open = false;
                     self.revisions.content += 1;
                     self.revisions.status += 1;
@@ -1654,13 +2080,24 @@ impl AppState {
             }
             UiEvent::RunStopped { run_id, message } => {
                 if self.accept_terminal(run_id, BlockLifecycle::Cancelled) {
+                    let explicitly_cancelled = self
+                        .cancellation
+                        .is_some_and(|cancellation| cancellation.run_id == run_id);
+                    self.release_thinking_previews();
                     self.terminalize_streaming(BlockLifecycle::Cancelled);
                     self.terminalize_latest_assistant(BlockLifecycle::Cancelled);
                     self.close_request_usage(false);
+                    let pending_count = self.pending_todo_count();
+                    self.finish_execution(run_id, RunOutcomeKind::Interrupted, pending_count);
                     self.working = false;
                     self.thinking_open = false;
                     self.run_started_ms = None;
                     self.activity = None;
+                    self.cancellation = None;
+                    self.retry = None;
+                    if explicitly_cancelled {
+                        self.queue_paused = true;
+                    }
                     self.request_estimate_open = false;
                     let id = self.fresh_id("stop");
                     let mut block =
@@ -1677,14 +2114,25 @@ impl AppState {
             }
             UiEvent::RunCancelled { run_id } => {
                 if self.accept_terminal(run_id, BlockLifecycle::Cancelled) {
+                    let explicitly_cancelled = self
+                        .cancellation
+                        .is_some_and(|cancellation| cancellation.run_id == run_id);
+                    let pending_count = self.pending_todo_count();
                     self.working = false;
                     self.thinking_open = false;
-                    self.run_started_ms = None;
                     self.activity = None;
+                    self.release_thinking_previews();
                     self.terminalize_streaming(BlockLifecycle::Cancelled);
                     self.terminalize_latest_assistant(BlockLifecycle::Cancelled);
                     self.close_request_usage(false);
-                    self.push_notification("run cancelled".into());
+                    self.finish_execution(run_id, RunOutcomeKind::Interrupted, pending_count);
+                    self.run_started_ms = None;
+                    self.cancellation = None;
+                    self.retry = None;
+                    if explicitly_cancelled {
+                        self.queue_paused = true;
+                    }
+                    self.push_notification("Execução cancelada".into());
                     self.revisions.content += 1;
                     self.revisions.status += 1;
                 }
@@ -1694,13 +2142,27 @@ impl AppState {
                 let accepted = terminal_run_id
                     .is_none_or(|run_id| self.accept_terminal(run_id, BlockLifecycle::Failed));
                 if accepted {
+                    let explicitly_cancelled = terminal_run_id.is_some_and(|run_id| {
+                        self.cancellation
+                            .is_some_and(|cancellation| cancellation.run_id == run_id)
+                    });
+                    self.release_thinking_previews();
                     self.terminalize_streaming(BlockLifecycle::Failed);
                     self.terminalize_latest_assistant(BlockLifecycle::Failed);
                     self.close_request_usage(false);
+                    if let Some(run_id) = terminal_run_id {
+                        let pending_count = self.pending_todo_count();
+                        self.finish_execution(run_id, RunOutcomeKind::Failed, pending_count);
+                    }
                     self.working = false;
                     self.thinking_open = false;
                     self.run_started_ms = None;
                     self.activity = None;
+                    self.cancellation = None;
+                    self.retry = None;
+                    if explicitly_cancelled {
+                        self.queue_paused = true;
+                    }
                     let id = self.fresh_id("error");
                     self.blocks.push(Block::new(
                         id,
@@ -1715,6 +2177,7 @@ impl AppState {
             UiEvent::UserMessageAdded { text } => {
                 let id = self.fresh_id("user");
                 let mut block = Block::new(id, BlockKind::User(text), BlockLifecycle::Complete);
+                block.started_ms = Some(self.clock.elapsed_ms);
                 if self
                     .blocks
                     .iter()
@@ -1745,6 +2208,11 @@ impl AppState {
                 // reviving activity or a streaming lifecycle.
                 let terminal_tail = self.terminal_tail_lifecycle();
                 if terminal_tail.is_none() {
+                    if !text.is_empty() {
+                        self.release_thinking_previews();
+                        self.last_provider_content_ms = Some(self.clock.elapsed_ms);
+                        self.retry = None;
+                    }
                     // The streaming redactor may retain a possible secret
                     // prefix until the provider closes the turn. If a tool has
                     // already been announced, that safe tail still belongs to
@@ -1752,9 +2220,11 @@ impl AppState {
                     // activity back from "Preparing tool" to "Responding".
                     let preparing_tool = matches!(
                         self.activity.as_ref().map(|activity| &activity.phase),
+                        Some(ActivityPhase::PreparingTool(_) | ActivityPhase::QueuedTool(_))
+                    ) || matches!(
+                        self.activity.as_ref().map(|activity| &activity.phase),
                         Some(ActivityPhase::External(label))
-                            if label == "Preparing tool"
-                                || label.starts_with("Preparing tool ·")
+                            if label == "Preparing tool" || label.starts_with("Preparing tool ·")
                     );
                     if !preparing_tool {
                         self.transition_activity(ActivityPhase::Responding);
@@ -1769,10 +2239,18 @@ impl AppState {
                 }) {
                     block.append_text(&text);
                     block.lifecycle = lifecycle;
+                    if lifecycle != BlockLifecycle::Streaming {
+                        block.ended_ms = Some(self.clock.elapsed_ms);
+                    }
                 } else {
                     let id = self.fresh_id("assistant");
-                    self.blocks
-                        .push(Block::new(id, BlockKind::Assistant(text), lifecycle));
+                    let mut block = Block::new(id, BlockKind::Assistant(text), lifecycle);
+                    if lifecycle == BlockLifecycle::Streaming {
+                        block.started_ms = Some(self.clock.elapsed_ms);
+                    } else {
+                        block.ended_ms = Some(self.clock.elapsed_ms);
+                    }
+                    self.blocks.push(block);
                 }
                 self.latest_run_assistant = self.blocks.last().map(|block| block.id.clone());
                 self.note_new_content();
@@ -1789,13 +2267,26 @@ impl AppState {
                         && matches!(block.kind(), BlockKind::Assistant(_))
                 }) {
                     block.lifecycle = BlockLifecycle::Complete;
+                    block.ended_ms = Some(self.clock.elapsed_ms);
                 }
                 self.revisions.content += 1;
             }
             UiEvent::ThinkingStarted => {
                 if self.terminal_tail.is_none() {
+                    self.release_thinking_previews();
                     self.thinking_open = true;
                     self.transition_activity(ActivityPhase::Thinking);
+                    let started_ms = self
+                        .activity
+                        .as_ref()
+                        .map(|activity| activity.started_ms)
+                        .unwrap_or(self.clock.elapsed_ms);
+                    if let Some(block) = self.blocks.iter_mut().rev().find(|block| {
+                        block.lifecycle == BlockLifecycle::Streaming
+                            && matches!(block.kind(), BlockKind::Thinking(_))
+                    }) {
+                        block.started_ms.get_or_insert(started_ms);
+                    }
                 }
             }
             UiEvent::ThinkingDelta { text } => {
@@ -1812,18 +2303,22 @@ impl AppState {
                 }
                 let output_chars = text.chars().count() as u64;
                 let terminal_tail = self.terminal_tail_lifecycle();
+                let classification = self.reasoning_classification;
                 if terminal_tail.is_none() && !self.thinking_open {
                     if !self.snapshot_resync_needed {
                         self.snapshot_resync_needed = true;
                         let message =
-                            "reasoning stream gap: delta arrived before start; snapshot resync required";
+                            "Lacuna no fluxo de raciocínio: o delta chegou antes do início; é necessária a ressincronização do snapshot";
                         let id = self.fresh_id("reasoning-gap");
                         self.blocks.push(Block::new(
                             id,
                             BlockKind::Error(message.into()),
                             BlockLifecycle::Failed,
                         ));
-                        self.push_notification(message.into());
+                        self.push_notification_with_priority(
+                            message.into(),
+                            NotificationPriority::Error,
+                        );
                         self.note_new_content();
                         self.revisions.content += 1;
                         self.revisions.status += 1;
@@ -1831,10 +2326,21 @@ impl AppState {
                     return;
                 }
                 if terminal_tail.is_none() {
+                    if !text.is_empty() {
+                        self.release_thinking_previews();
+                        self.last_provider_content_ms = Some(self.clock.elapsed_ms);
+                        self.retry = None;
+                    }
                     self.transition_activity(ActivityPhase::Thinking);
                     self.note_stream_output_chars(output_chars);
                 }
                 let lifecycle = terminal_tail.unwrap_or(BlockLifecycle::Streaming);
+                let thinking_started_ms = self
+                    .activity
+                    .as_ref()
+                    .filter(|activity| activity.phase == ActivityPhase::Thinking)
+                    .map(|activity| activity.started_ms)
+                    .unwrap_or(self.clock.elapsed_ms);
                 if let Some(block) = self.blocks.last_mut().filter(|block| {
                     (block.lifecycle == BlockLifecycle::Streaming
                         || terminal_tail == Some(block.lifecycle))
@@ -1842,6 +2348,14 @@ impl AppState {
                 }) {
                     block.append_text(&text);
                     block.lifecycle = lifecycle;
+                    if lifecycle == BlockLifecycle::Streaming {
+                        block.started_ms.get_or_insert(thinking_started_ms);
+                    } else {
+                        block.ended_ms = Some(self.clock.elapsed_ms);
+                    }
+                    if block.reasoning_classification.is_none() {
+                        block.reasoning_classification = classification;
+                    }
                 } else {
                     let mut block = Block::new(
                         self.fresh_id("thinking"),
@@ -1849,10 +2363,27 @@ impl AppState {
                         lifecycle,
                     );
                     block.fold = FoldState::Collapsed;
+                    if lifecycle == BlockLifecycle::Streaming {
+                        block.started_ms = Some(thinking_started_ms);
+                    } else {
+                        block.ended_ms = Some(self.clock.elapsed_ms);
+                    }
+                    block.reasoning_classification = classification;
                     self.blocks.push(block);
                 }
                 self.note_new_content();
                 self.revisions.content += 1;
+            }
+            UiEvent::ThinkingClassificationChanged { classification } => {
+                self.reasoning_classification = Some(classification);
+                if let Some(block) = self.blocks.iter_mut().rev().find(|block| {
+                    block.lifecycle == BlockLifecycle::Streaming
+                        && matches!(block.kind(), BlockKind::Thinking(_))
+                }) {
+                    block.reasoning_classification = Some(classification);
+                }
+                self.revisions.content += 1;
+                self.revisions.status += 1;
             }
             UiEvent::ThinkingEnded => {
                 let lifecycle_was_open = std::mem::take(&mut self.thinking_open);
@@ -1861,6 +2392,8 @@ impl AppState {
                         && matches!(block.kind(), BlockKind::Thinking(_))
                 }) {
                     block.lifecycle = BlockLifecycle::Complete;
+                    block.ended_ms = Some(self.clock.elapsed_ms);
+                    block.preview_retained = true;
                 }
                 self.blocks.retain(|block| {
                     if let BlockKind::Thinking(text) = block.kind() {
@@ -1910,11 +2443,17 @@ impl AppState {
                 provider_latency_ms,
             } => self.recalculate_tok_per_sec(provider_latency_ms),
             UiEvent::ModeChanged { mode } => {
-                self.mode = mode;
+                if self.mode != mode {
+                    self.mode = mode;
+                    self.confirmed_setting = Some((ConfirmedSetting::Mode, self.clock.elapsed_ms));
+                }
                 self.revisions.status += 1;
             }
             UiEvent::ModelChanged { model } => {
-                self.model = model;
+                if self.model != model {
+                    self.model = model;
+                    self.confirmed_setting = Some((ConfirmedSetting::Model, self.clock.elapsed_ms));
+                }
                 self.model_overlay = None;
                 self.revisions.status += 1;
             }
@@ -2016,7 +2555,11 @@ impl AppState {
                 self.revisions.status += 1;
             }
             UiEvent::EffortChanged { effort } => {
-                self.effort = effort;
+                if self.effort != effort {
+                    self.effort = effort;
+                    self.confirmed_setting =
+                        Some((ConfirmedSetting::Effort, self.clock.elapsed_ms));
+                }
                 self.effort_overlay = None;
                 self.revisions.status += 1;
             }
@@ -2028,7 +2571,7 @@ impl AppState {
                 self.authenticated = authenticated;
                 if authenticated {
                     self.login_overlay = None;
-                    self.dismiss_notifications_starting_with("No provider connected");
+                    self.dismiss_no_provider_notifications();
                 } else {
                     self.dismiss_notifications_starting_with("Connected:");
                 }
@@ -2065,12 +2608,22 @@ impl AppState {
                 name,
                 arguments_summary,
             } => {
+                if self.terminal_tail.is_none() {
+                    self.release_thinking_previews();
+                }
+                self.admitted_tool_calls
+                    .retain(|(active_batch, active_call, _)| {
+                        active_batch != &batch_id || active_call != &call_id
+                    });
                 if self.blocks.iter().any(|block| {
                     matches!(block.kind(), BlockKind::Tool(state)
                         if state.batch_id == batch_id && state.call_id == call_id)
                 }) {
                     self.snapshot_resync_needed = true;
-                    self.push_notification("Duplicate tool lifecycle identity ignored".into());
+                    self.push_notification_with_priority(
+                        "Identidade duplicada do ciclo de vida da ferramenta ignorada".into(),
+                        NotificationPriority::Error,
+                    );
                     self.revisions.status += 1;
                     return;
                 }
@@ -2078,10 +2631,7 @@ impl AppState {
                 let lifecycle = self
                     .terminal_tail_lifecycle()
                     .unwrap_or(BlockLifecycle::Streaming);
-                if lifecycle == BlockLifecycle::Streaming {
-                    self.transition_activity(ActivityPhase::RunningTool(name.clone()));
-                }
-                self.blocks.push(Block::new(
+                let mut block = Block::new(
                     id,
                     BlockKind::Tool(ToolState {
                         historical: false,
@@ -2097,9 +2647,56 @@ impl AppState {
                         pending_page: None,
                     }),
                     lifecycle,
-                ));
+                );
+                if lifecycle == BlockLifecycle::Streaming {
+                    block.started_ms = Some(self.clock.elapsed_ms);
+                }
+                self.blocks.push(block);
+                if lifecycle == BlockLifecycle::Streaming {
+                    self.retry = None;
+                    self.refresh_tool_activity();
+                    self.last_tool_progress_ms = Some(self.clock.elapsed_ms);
+                }
                 self.note_new_content();
                 self.revisions.content += 1;
+            }
+            UiEvent::ToolPrepared {
+                batch_id: _,
+                call_id: _,
+                name,
+            } => {
+                if self.terminal_tail.is_none() {
+                    if self.running_tool_names().is_empty() {
+                        self.transition_activity(ActivityPhase::PreparingTool(name));
+                    } else {
+                        self.refresh_tool_activity();
+                    }
+                }
+                self.last_tool_progress_ms = Some(self.clock.elapsed_ms);
+            }
+            UiEvent::ToolAdmitted {
+                batch_id,
+                call_id,
+                name,
+            } => {
+                if self.terminal_tail.is_none() {
+                    if !self
+                        .admitted_tool_calls
+                        .iter()
+                        .any(|(active_batch, active_call, _)| {
+                            active_batch == &batch_id && active_call == &call_id
+                        })
+                    {
+                        self.admitted_tool_calls
+                            .push((batch_id, call_id, name.clone()));
+                    }
+                    if self.running_tool_names().is_empty() {
+                        self.transition_activity(ActivityPhase::QueuedTool(name));
+                    } else {
+                        self.refresh_tool_activity();
+                    }
+                }
+                self.last_tool_progress_ms = Some(self.clock.elapsed_ms);
             }
             UiEvent::ToolProgress {
                 batch_id,
@@ -2128,8 +2725,13 @@ impl AppState {
                 };
                 if !found {
                     self.snapshot_resync_needed = true;
-                    self.push_notification("Orphan tool lifecycle progress ignored".into());
+                    self.push_notification_with_priority(
+                        "Progresso órfão do ciclo de vida da ferramenta ignorado".into(),
+                        NotificationPriority::Error,
+                    );
                     self.revisions.status += 1;
+                } else {
+                    self.last_tool_progress_ms = Some(self.clock.elapsed_ms);
                 }
                 self.revisions.content += 1;
             }
@@ -2140,7 +2742,10 @@ impl AppState {
                 success,
                 duration_ms,
             } => {
-                let mut ended_name = None;
+                self.admitted_tool_calls
+                    .retain(|(active_batch, active_call, _)| {
+                        active_batch != &batch_id || active_call != &call_id
+                    });
                 let mut duplicate_terminal = false;
                 let ended = if let Some(block) = self.blocks.iter_mut().find(|block| {
                     matches!(block.kind(), BlockKind::Tool(state)
@@ -2153,6 +2758,7 @@ impl AppState {
                         } else {
                             BlockLifecycle::Failed
                         };
+                        block.ended_ms = Some(self.clock.elapsed_ms);
                     }
                     if let Some(state) = block.tool_state_mut() {
                         if state.duration_ms.is_none() {
@@ -2160,29 +2766,30 @@ impl AppState {
                         } else {
                             duplicate_terminal = true;
                         }
-                        ended_name = Some(state.name.clone());
                     }
                     transitioned
                 } else {
                     self.snapshot_resync_needed = true;
-                    self.push_notification("Orphan tool lifecycle terminal ignored".into());
+                    self.push_notification_with_priority(
+                        "Finalização órfã do ciclo de vida da ferramenta ignorada".into(),
+                        NotificationPriority::Error,
+                    );
                     self.revisions.status += 1;
                     false
                 };
                 if duplicate_terminal {
                     self.snapshot_resync_needed = true;
-                    self.push_notification("Duplicate tool lifecycle terminal ignored".into());
+                    self.push_notification_with_priority(
+                        "Finalização duplicada do ciclo de vida da ferramenta ignorada".into(),
+                        NotificationPriority::Error,
+                    );
                     self.revisions.status += 1;
                 }
-                let was_current = matches!(
-                    self.activity.as_ref().map(|activity| &activity.phase),
-                    Some(ActivityPhase::RunningTool(current))
-                        if ended_name.as_ref().is_some_and(|ended| current == ended)
-                );
-                if ended && was_current && self.working && self.terminal_tail.is_none() {
-                    self.transition_activity(ActivityPhase::AwaitingProvider);
+                if ended && self.working {
+                    self.refresh_tool_activity();
                 }
                 if ended {
+                    self.last_tool_progress_ms = Some(self.clock.elapsed_ms);
                     if slim_core::tool_call_is_read_only(&name) {
                         self.tools_used_read += 1;
                     } else {
@@ -2202,6 +2809,10 @@ impl AppState {
                 label,
                 elapsed_ms,
             } => {
+                // A real provider phase supersedes any scheduled retry.  The
+                // retry event is emitted before the next phase, so clearing
+                // here also handles phases such as Compaction/Headers.
+                self.retry = None;
                 match phase {
                     slim_core::ProviderPhase::Connecting => {
                         self.provider_timings = ProviderTimingState::default();
@@ -2227,6 +2838,28 @@ impl AppState {
                     self.transition_activity(ActivityPhase::External(label));
                 }
             }
+            UiEvent::RetryScheduled {
+                attempt,
+                limit,
+                wait_ms,
+                reason,
+            } => {
+                if self.terminal_tail.is_none() {
+                    self.retry = Some(RetryState {
+                        attempt,
+                        limit,
+                        wait_ms,
+                        scheduled_ms: self.clock.elapsed_ms,
+                        reason,
+                    });
+                    self.transition_activity(ActivityPhase::External(
+                        "Nova tentativa agendada".into(),
+                    ));
+                    self.revisions.status += 1;
+                }
+            }
+            UiEvent::CancellationRequested { run_id } => self.request_cancellation(run_id),
+            UiEvent::CancellationStarted { run_id } => self.start_cancellation(run_id),
             UiEvent::ApprovalRequired {
                 request_id,
                 summary,
@@ -2277,24 +2910,26 @@ impl AppState {
                 message,
             } => self.acknowledge_interaction(&request_id, accepted, message),
             UiEvent::QueuedUserAdded { text, position } => {
+                let _ = position;
                 let id = self.fresh_id("queued");
-                self.blocks.push(Block::new(
+                let mut block = Block::new(
                     id,
-                    BlockKind::QueuedUser(format!("queued[{position}] {text}")),
+                    BlockKind::QueuedUser(text.clone()),
                     BlockLifecycle::Pending,
-                ));
+                );
+                block.started_ms = Some(self.clock.elapsed_ms);
+                self.blocks.push(block);
+                self.queued_prompts.push_back(text);
                 self.note_new_content();
                 self.revisions.content += 1;
             }
             UiEvent::TodoChanged { items } => {
                 self.todo_items = items;
-                self.todo_dock_open = self.todo_items.iter().any(|item| {
-                    !matches!(
-                        item.status,
-                        crate::api::TodoItemStatus::Completed
-                            | crate::api::TodoItemStatus::Cancelled
-                    )
-                });
+                if let Some(preference) = self.todo_dock_user_preference {
+                    self.todo_dock_open = preference;
+                } else {
+                    self.todo_dock_open = self.pending_todo_count() > 0;
+                }
                 self.revisions.status += 1;
             }
             UiEvent::ContentPageLoaded {
@@ -2324,7 +2959,10 @@ impl AppState {
                     if let Some(state) = block.tool_state_mut() {
                         state.pending_page = None;
                     }
-                    self.push_notification("Invalid content page boundary".into());
+                    self.push_notification_with_priority(
+                        "Limite da página de conteúdo inválido".into(),
+                        NotificationPriority::Error,
+                    );
                     self.revisions.status += 1;
                 } else if block.append_tool_page(&text, next_cursor) {
                     self.revisions.content += 1;
@@ -2332,7 +2970,10 @@ impl AppState {
                     if let Some(state) = block.tool_state_mut() {
                         state.pending_page = None;
                     }
-                    self.push_notification("Content page exceeds the 2 MiB block limit".into());
+                    self.push_notification_with_priority(
+                        "A página de conteúdo excede o limite de bloco de 2 MiB".into(),
+                        NotificationPriority::Error,
+                    );
                     self.revisions.status += 1;
                 }
             }
@@ -2353,12 +2994,12 @@ impl AppState {
                 if let Some(state) = block.tool_state_mut() {
                     state.pending_page = None;
                 }
-                self.push_notification(message);
+                self.push_notification_with_priority(message, NotificationPriority::Error);
                 self.revisions.status += 1;
             }
             UiEvent::Notification { message } => {
                 if message.starts_with("Connected:") {
-                    self.dismiss_notifications_starting_with("No provider connected");
+                    self.dismiss_no_provider_notifications();
                 }
                 self.push_notification(message);
                 self.revisions.status += 1;
@@ -2368,7 +3009,7 @@ impl AppState {
                 let id = self.fresh_id("compaction");
                 let mut block = Block::new(
                     id,
-                    BlockKind::System("compaction completed".into()),
+                    BlockKind::System("compactação concluída".into()),
                     BlockLifecycle::Complete,
                 );
                 block.fold = FoldState::Collapsed;
@@ -2382,15 +3023,29 @@ impl AppState {
             }
             UiEvent::FatalError { run_id, message } => {
                 let terminal_run_id = run_id.or(self.active_run_id);
+                let explicitly_cancelled = terminal_run_id.is_some_and(|run_id| {
+                    self.cancellation
+                        .is_some_and(|cancellation| cancellation.run_id == run_id)
+                });
                 let accepted = terminal_run_id
                     .is_none_or(|run_id| self.accept_terminal(run_id, BlockLifecycle::Failed));
                 if accepted {
+                    self.release_thinking_previews();
                     self.terminalize_streaming(BlockLifecycle::Failed);
                     self.terminalize_latest_assistant(BlockLifecycle::Failed);
                     self.close_request_usage(false);
+                    if let Some(run_id) = terminal_run_id {
+                        let pending_count = self.pending_todo_count();
+                        self.finish_execution(run_id, RunOutcomeKind::Failed, pending_count);
+                    }
                     self.working = false;
                     self.run_started_ms = None;
                     self.activity = None;
+                    self.cancellation = None;
+                    self.retry = None;
+                    if explicitly_cancelled {
+                        self.queue_paused = true;
+                    }
                     let id = self.fresh_id("error");
                     self.blocks.push(Block::new(
                         id,

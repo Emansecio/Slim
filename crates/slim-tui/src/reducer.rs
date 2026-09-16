@@ -3,7 +3,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::api::{BlockId, LoginProvider, ModelAlias, ReasoningEffort, UiCommand, UiEvent};
 use crate::app::{
     AppState, EffortOverlay, FollowMode, FrameClock, LoginOverlay, LoginStage, ModelOverlay,
-    ModelRow, ScrollAnchor,
+    ModelRow, NotificationPriority, ScrollAnchor,
 };
 use crate::block::{BlockKind, InteractionRequestKind};
 use crate::composer::ComposerError;
@@ -42,6 +42,19 @@ pub enum Action {
         total_rows: usize,
         capacity: usize,
     },
+    /// Scrolls the content of a pending approval/question before a decision
+    /// key is accepted. Runtime supplies the painted row geometry.
+    ScrollApproval {
+        intent: ScrollIntent,
+        total_rows: usize,
+        capacity: usize,
+    },
+    /// Updates the reducer's decision gate from the current painted viewport.
+    /// The runtime computes this boolean; the reducer only records it.
+    SetApprovalContentAccessible(bool),
+    /// Clears a mouse selection after runtime verifies that its painted
+    /// geometry no longer maps to the frozen text snapshot.
+    ClearScreenSelection,
     /// Synchronizes event timestamps without scheduling a frame.
     SyncClock(FrameClock),
     /// Motion clock (§10.3): the loop sends ticks only while animating.
@@ -55,6 +68,14 @@ pub enum Action {
         x: u16,
         y: u16,
         area: Option<ratatui::layout::Rect>,
+    },
+    /// Starts a transcript selection while pinning the viewport to the row
+    /// anchor captured by the runtime painter.
+    StartPinnedScreenSelection {
+        x: u16,
+        y: u16,
+        area: Option<ratatui::layout::Rect>,
+        anchor: ScrollAnchor,
     },
     UpdateScreenSelection {
         x: u16,
@@ -118,16 +139,12 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
                     | UiEvent::SessionSnapshot { .. }
                     | UiEvent::SessionRestored { .. }
             );
-            let content_before = state.revisions.content;
             state.apply_event(event);
-            if state.revisions.content != content_before {
-                clear_screen_selection(state);
-            }
             if skills_changed {
                 sync_slash_suggestions(state);
             }
             let mut effects = vec![Effect::RequestRender];
-            if prompt_boundary && !state.working {
+            if prompt_boundary && !state.working && !state.queue_paused {
                 if let Some(prompt) = state.pop_queued_prompt() {
                     effects.push(Effect::Send(UiCommand::SendPrompt(prompt)));
                 }
@@ -159,7 +176,10 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
                 .map(|overlay| &mut overlay.stage)
             {
                 if !api_key.push_str_bounded(&payload, 4_096) {
-                    state.push_notification("API key too large (limit 4096 characters).".into());
+                    state.push_notification_with_priority(
+                        "Chave de API grande demais (limite de 4096 caracteres).".into(),
+                        NotificationPriority::Warning,
+                    );
                 }
                 state.revisions.status += 1;
                 return vec![Effect::RequestRender];
@@ -173,7 +193,10 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
                     sync_slash_suggestions(state);
                 }
                 Err(ComposerError::DraftTooLarge) => {
-                    state.push_notification("Draft too large (limit 1 MiB).".into());
+                    state.push_notification_with_priority(
+                        "Rascunho grande demais (limite de 1 MiB).".into(),
+                        NotificationPriority::Warning,
+                    );
                     state.revisions.status += 1;
                 }
             }
@@ -200,7 +223,7 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
             }
         }
         Action::ClipboardImageFailed { message } => {
-            state.push_notification(message);
+            state.push_notification_with_priority(message, NotificationPriority::Error);
             state.revisions.status += 1;
             vec![Effect::RequestRender]
         }
@@ -210,6 +233,7 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
         }
         Action::ToggleTodoDock => {
             state.todo_dock_open = !state.todo_dock_open;
+            state.todo_dock_user_preference = Some(state.todo_dock_open);
             state.revisions.status += 1;
             vec![Effect::RequestRender]
         }
@@ -235,6 +259,25 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
             clear_screen_selection(state);
             reduce_inspector_scroll(state, intent, total_rows, capacity)
         }
+        Action::ScrollApproval {
+            intent,
+            total_rows,
+            capacity,
+        } => {
+            clear_screen_selection(state);
+            reduce_approval_scroll(state, intent, total_rows, capacity)
+        }
+        Action::SetApprovalContentAccessible(accessible) => {
+            if state.approval_content_accessible != accessible {
+                state.approval_content_accessible = accessible;
+                state.revisions.status += 1;
+            }
+            vec![Effect::RequestRender]
+        }
+        Action::ClearScreenSelection => {
+            clear_screen_selection(state);
+            vec![Effect::RequestRender]
+        }
         Action::SyncClock(clock) => {
             state.clock = clock;
             state.prune_notifications();
@@ -252,11 +295,14 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
                     .notifications
                     .retain(|notice| notice.message != "Copiado");
             }
-            state.push_notification(if success {
-                "Copiado".into()
+            if success {
+                state.push_notification("Copiado".into());
             } else {
-                "Clipboard unavailable".into()
-            });
+                state.push_notification_with_priority(
+                    "Área de transferência indisponível".into(),
+                    NotificationPriority::Error,
+                );
+            }
             state.revisions.status += 1;
             vec![Effect::RequestRender]
         }
@@ -269,6 +315,11 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
             state.selection_area = area;
             state.selection_text.clear();
             vec![Effect::RequestRender]
+        }
+        Action::StartPinnedScreenSelection { x, y, area, anchor } => {
+            state.scroll.mode = FollowMode::Pinned(anchor);
+            state.revisions.viewport += 1;
+            reduce(state, Action::StartScreenSelection { x, y, area })
         }
         Action::UpdateScreenSelection { x, y } => {
             if let Some(selection) = &mut state.selection {
@@ -308,11 +359,12 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
     }
 }
 
-const PALETTE_COMMANDS: [&str; 13] = [
+const PALETTE_COMMANDS: [&str; 14] = [
     "/help",
     "/login",
     "/logout",
     "/resume",
+    "/queue",
     "/model",
     "/mode",
     "/compact",
@@ -342,7 +394,10 @@ fn is_shift_insert(key: &KeyEvent) -> bool {
 /// commands only; headers are presentation.
 pub const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     ("help", &["/help"]),
-    ("session", &["/login", "/logout", "/resume", "/compact"]),
+    (
+        "session",
+        &["/login", "/logout", "/resume", "/queue", "/compact"],
+    ),
     ("runtime", &["/model", "/mode", "/image"]),
     ("integrations", &["/mcp"]),
     (
@@ -370,19 +425,20 @@ pub fn palette_matches(query: &str) -> Vec<&'static str> {
 /// overlay (`Select model`).
 pub fn palette_description(command: &str) -> &'static str {
     match command {
-        "/help" => "shortcuts & commands",
-        "/login" => "connect provider",
-        "/logout" => "sign out",
-        "/resume" => "resume session",
-        "/model" => "select model",
-        "/mode" => "cycle mode",
-        "/compact" => "summarize context",
-        "/image" => "attach image",
-        "/mcp" => "mcp servers",
-        "/diff" => "view changes",
-        "/activity" => "view activity",
-        "/session" => "session tree",
-        "/diagnostics" => "provider timings",
+        "/help" => "atalhos e comandos",
+        "/login" => "conectar provedor",
+        "/logout" => "sair",
+        "/resume" => "retomar sessão",
+        "/queue" => "gerenciar prompts pendentes",
+        "/model" => "selecionar modelo",
+        "/mode" => "alternar modo",
+        "/compact" => "resumir contexto",
+        "/image" => "anexar imagem",
+        "/mcp" => "servidores MCP",
+        "/diff" => "ver alterações",
+        "/activity" => "ver atividade",
+        "/session" => "árvore da sessão",
+        "/diagnostics" => "tempos do provedor",
         _ => "",
     }
 }
@@ -562,7 +618,9 @@ fn reduce_slash_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> 
                 return Some(enqueue_queued(state));
             }
             if state.working && state.composer.payload().trim() == "/resume" {
-                state.push_notification("A run is active; wait or cancel before resuming".into());
+                state.push_notification(
+                    "Há uma execução ativa; aguarde ou cancele antes de retomar".into(),
+                );
                 state.revisions.status += 1;
                 return Some(vec![Effect::RequestRender]);
             }
@@ -582,7 +640,10 @@ fn enqueue_queued(state: &mut AppState) -> Vec<Effect> {
         return vec![];
     }
     if state.queued_prompts.len() >= MAX_QUEUED_PROMPTS {
-        state.push_notification(format!("Prompt queue full ({MAX_QUEUED_PROMPTS})."));
+        state.push_notification_with_priority(
+            format!("Fila de prompts cheia ({MAX_QUEUED_PROMPTS})."),
+            NotificationPriority::Warning,
+        );
         return vec![Effect::RequestRender];
     }
     state.composer.clear();
@@ -629,6 +690,7 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             return reduce_login_key(state, key);
         }
         if state.working {
+            state.request_cancel_active_run();
             return vec![Effect::Send(UiCommand::CancelRun), Effect::RequestRender];
         }
         if state.composer.payload().is_empty() {
@@ -733,7 +795,7 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         });
         return text.map_or_else(
             || {
-                state.push_notification("Nothing to copy".into());
+                state.push_notification("Nada para copiar".into());
                 state.revisions.status += 1;
                 vec![Effect::RequestRender]
             },
@@ -756,6 +818,7 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         return reduce(state, Action::ToggleTodoDock);
     }
     if key.code == KeyCode::Esc && state.working {
+        state.request_cancel_active_run();
         return vec![Effect::Send(UiCommand::CancelRun), Effect::RequestRender];
     }
     if key.code == KeyCode::BackTab {
@@ -781,9 +844,17 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         && state.working
         && state.composer.payload().trim() == "/resume"
     {
-        state.push_notification("A run is active; wait or cancel before resuming".into());
+        state
+            .push_notification("Há uma execução ativa; aguarde ou cancele antes de retomar".into());
         state.revisions.status += 1;
         return vec![Effect::RequestRender];
+    }
+    if key.code == KeyCode::Enter
+        && key.kind == KeyEventKind::Press
+        && state.working
+        && state.composer.payload().trim().starts_with("/queue")
+    {
+        return submit_composer(state);
     }
     // Native slash commands that stay local or hit the worker's read-only
     // arms must not queue as prompt text mid-run: /compact defers to a safe
@@ -820,7 +891,10 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 .try_insert_text(character.to_string())
                 .is_err()
             {
-                state.push_notification("Draft too large (limit 1 MiB).".into());
+                state.push_notification_with_priority(
+                    "Rascunho grande demais (limite de 1 MiB).".into(),
+                    NotificationPriority::Warning,
+                );
                 state.revisions.status += 1;
             }
             state.revisions.content += 1;
@@ -921,6 +995,35 @@ fn reduce_inspector_scroll(
     vec![Effect::RequestRender]
 }
 
+fn reduce_approval_scroll(
+    state: &mut AppState,
+    intent: ScrollIntent,
+    total_rows: usize,
+    capacity: usize,
+) -> Vec<Effect> {
+    if state.pending_interaction().is_none() {
+        return Vec::new();
+    }
+    match intent {
+        ScrollIntent::Up => state.approval_scroll.up_bounded(1, total_rows, capacity),
+        ScrollIntent::Down => state.approval_scroll.down_bounded(1, total_rows, capacity),
+        ScrollIntent::PageUp => {
+            state
+                .approval_scroll
+                .up_bounded(PICKER_NOMINAL_CAPACITY, total_rows, capacity)
+        }
+        ScrollIntent::PageDown => {
+            state
+                .approval_scroll
+                .down_bounded(PICKER_NOMINAL_CAPACITY, total_rows, capacity)
+        }
+        ScrollIntent::Top => state.approval_scroll.top(),
+        ScrollIntent::LiveEdge => state.approval_scroll.end(),
+    }
+    state.revisions.focus += 1;
+    vec![Effect::RequestRender]
+}
+
 fn reduce_search_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     let mut search = state.search.take().unwrap_or_default();
     match key.code {
@@ -996,6 +1099,9 @@ fn reduce_interaction_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Eff
         {
             if key.kind != KeyEventKind::Press {
                 return Some(Vec::new());
+            }
+            if !state.approval_content_accessible {
+                return Some(vec![Effect::RequestRender]);
             }
             let approved = matches!(key.code, KeyCode::Char('y' | 'Y'));
             if !state.mark_interaction_response_pending(&interaction.request_id) {
@@ -1175,7 +1281,7 @@ fn parse_mcp_args(
     keep_draft: &mut bool,
 ) {
     const USAGE: &str =
-        "Usage: /mcp [add <name> <command..>|--url <url>] [--global] | remove <name> | reconnect <name> | disconnect <name> | reload";
+        "Uso: /mcp [add <nome> <comando..>|--url <url>] [--global] | remove <nome> | reconnect <nome> | disconnect <nome> | reload";
     let mut tokens = args.split_whitespace().peekable();
     match tokens.next() {
         Some("add") => {
@@ -1210,7 +1316,7 @@ fn parse_mcp_args(
                     .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
             if !valid_name {
                 state.push_notification(
-                    "Invalid server name (use letters, digits, _ and -).".into(),
+                    "Nome de servidor inválido (use letras, dígitos, _ e -).".into(),
                 );
                 *keep_draft = true;
                 return;
@@ -1291,7 +1397,7 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
         "" => {}
         "/help" => {
             state.push_notification(
-                "F1 / Ctrl+P commands · Shift+Tab mode · Ctrl+F find · Ctrl+T todo · Esc cancel"
+                "F1 / Ctrl+P comandos · Shift+Tab modo · Ctrl+F buscar · Ctrl+T tarefas · Esc cancelar"
                     .into(),
             );
             state.revisions.status += 1;
@@ -1370,19 +1476,29 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
             effects.push(Effect::Send(UiCommand::ResumePrevious));
             state.revisions.status += 1;
         }
+        _ if command == "/queue" || command.starts_with("/queue ") => {
+            if !reduce_queue_command(state, &command, &mut effects) {
+                keep_draft = true;
+            } else if command.starts_with("/queue edit ") {
+                // The selected queued text is deliberately returned to the
+                // composer for editing; do not clear that draft as a slash
+                // command side effect.
+                keep_draft = true;
+            }
+        }
         "/mode" => {
             effects.push(Effect::Send(UiCommand::SetMode(cycle_mode(state.mode))));
             state.revisions.status += 1;
         }
         "/image" => {
-            state.push_notification("Usage: /image PATH".into());
+            state.push_notification("Uso: /image CAMINHO".into());
             keep_draft = true;
             state.revisions.status += 1;
         }
         _ if command.starts_with("/image ") => {
             let path = command.trim_start_matches("/image ").trim();
             if path.is_empty() {
-                state.push_notification("Usage: /image PATH".into());
+                state.push_notification("Uso: /image CAMINHO".into());
                 keep_draft = true;
             } else {
                 effects.push(Effect::Send(UiCommand::AttachImage(path.to_owned())));
@@ -1405,7 +1521,7 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                     instructions: String::new(),
                 }));
             } else {
-                state.push_notification("No provider connected. Use /login.".into());
+                state.push_notification("Nenhum provedor conectado. Use /login.".into());
                 keep_draft = true;
             }
             state.revisions.status += 1;
@@ -1416,7 +1532,7 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                     instructions: command.trim_start_matches("/compact ").trim().to_owned(),
                 }));
             } else {
-                state.push_notification("No provider connected. Use /login.".into());
+                state.push_notification("Nenhum provedor conectado. Use /login.".into());
                 keep_draft = true;
             }
             state.revisions.status += 1;
@@ -1460,7 +1576,9 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                             fast: state.codex_fast,
                         }));
                     } else {
-                        state.push_notification("Unknown model. Use sol, terra, or luna.".into());
+                        state.push_notification(
+                            "Modelo desconhecido. Use sol, terra ou luna.".into(),
+                        );
                         keep_draft = true;
                     }
                 }
@@ -1484,7 +1602,9 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                             effort,
                         }));
                     } else {
-                        state.push_notification("Unknown OpenCode Go model. Use /models.".into());
+                        state.push_notification(
+                            "Modelo OpenCode Go desconhecido. Use /models.".into(),
+                        );
                         keep_draft = true;
                     }
                 }
@@ -1504,7 +1624,9 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                             effort,
                         }));
                     } else {
-                        state.push_notification("Unknown OpenCode Zen model. Use /models.".into());
+                        state.push_notification(
+                            "Modelo OpenCode Zen desconhecido. Use /models.".into(),
+                        );
                         keep_draft = true;
                     }
                 }
@@ -1521,7 +1643,9 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                             effort: ReasoningEffort::High,
                         }));
                     } else {
-                        state.push_notification("Unknown ClinePass model. Use /models.".into());
+                        state.push_notification(
+                            "Modelo ClinePass desconhecido. Use /models.".into(),
+                        );
                         keep_draft = true;
                     }
                 }
@@ -1536,7 +1660,9 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                             effort: ReasoningEffort::High,
                         }));
                     } else {
-                        state.push_notification("Unknown Command Code model. Use /models.".into());
+                        state.push_notification(
+                            "Modelo Command Code desconhecido. Use /models.".into(),
+                        );
                         keep_draft = true;
                     }
                 }
@@ -1548,7 +1674,7 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                         }));
                     } else {
                         state.push_notification(
-                            "Unknown xAI model. Use grok-4.3, grok-4.5, grok-4.6, or grok-build-0.1."
+                            "Modelo xAI desconhecido. Use grok-4.3, grok-4.5, grok-4.6 ou grok-build-0.1."
                                 .into(),
                         );
                         keep_draft = true;
@@ -1556,7 +1682,7 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                 }
                 _ => {
                     state.push_notification(
-                        "Connect OpenAI Codex, OpenCode Go, ClinePass, Command Code, or xAI before selecting a model."
+                        "Conecte OpenAI Codex, OpenCode Go, ClinePass, Command Code ou xAI antes de selecionar um modelo."
                             .into(),
                     );
                     keep_draft = true;
@@ -1570,7 +1696,7 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
             effects.push(Effect::Send(UiCommand::SendPrompt(prompt)));
         }
         _ if !state.authenticated => {
-            state.push_notification("No provider connected. Use /login.".into());
+            state.push_notification("Nenhum provedor conectado. Use /login.".into());
             state.revisions.status += 1;
             return effects;
         }
@@ -1588,6 +1714,99 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
     state.slash_suggestions = None;
     effects.push(Effect::RequestRender);
     effects
+}
+
+/// Handles local queue controls. Queue positions are intentionally parsed as
+/// one-based human positions and resolved against the current deque, so an
+/// item removed earlier cannot leave a stale index embedded in the transcript.
+fn reduce_queue_command(state: &mut AppState, command: &str, effects: &mut Vec<Effect>) -> bool {
+    let mut parts = command.split_whitespace();
+    let _queue = parts.next();
+    let action = parts.next().unwrap_or("status");
+    let position = parts.next();
+    if parts.next().is_some() {
+        state.push_notification("Uso: /queue [status|pause|resume|edit N|remove N]".into());
+        state.revisions.status += 1;
+        return false;
+    }
+
+    match action {
+        "status" if position.is_none() => {
+            let status = if state.queue_paused {
+                "pausada"
+            } else {
+                "ativa"
+            };
+            state.push_notification(format!("Fila {status} · {} pendente(s)", state.queue_len()));
+            state.revisions.status += 1;
+            true
+        }
+        "pause" if position.is_none() => {
+            state.queue_paused = true;
+            state.push_notification(format!("Fila pausada · {} pendente(s)", state.queue_len()));
+            state.revisions.status += 1;
+            true
+        }
+        "resume" if position.is_none() => {
+            if state.working {
+                state.push_notification("A fila pode ser retomada após a execução atual".into());
+                state.revisions.status += 1;
+                return true;
+            }
+            state.queue_paused = false;
+            if let Some(prompt) = state.pop_queued_prompt() {
+                effects.push(Effect::Send(UiCommand::SendPrompt(prompt)));
+                state.push_notification("Fila retomada".into());
+            } else {
+                state.push_notification("Fila vazia".into());
+            }
+            state.revisions.status += 1;
+            true
+        }
+        "remove" if position.is_some() => {
+            let Some(index) = parse_queue_position(position.unwrap()) else {
+                state.push_notification("Posição de fila inválida".into());
+                state.revisions.status += 1;
+                return false;
+            };
+            if state.remove_queued_prompt(index).is_some() {
+                state.push_notification(format!("Item {} removido da fila", position.unwrap()));
+                state.revisions.status += 1;
+                true
+            } else {
+                state.push_notification("Posição de fila inexistente".into());
+                state.revisions.status += 1;
+                false
+            }
+        }
+        "edit" if position.is_some() => {
+            let Some(index) = parse_queue_position(position.unwrap()) else {
+                state.push_notification("Posição de fila inválida".into());
+                state.revisions.status += 1;
+                return false;
+            };
+            let Some(prompt) = state.take_queued_prompt_for_edit(index) else {
+                state.push_notification("Posição de fila inexistente".into());
+                state.revisions.status += 1;
+                return false;
+            };
+            state.composer.clear();
+            state.composer.insert_text(prompt);
+            sync_slash_suggestions(state);
+            state.revisions.content += 1;
+            true
+        }
+        _ => {
+            state.push_notification("Uso: /queue [status|pause|resume|edit N|remove N]".into());
+            state.revisions.status += 1;
+            false
+        }
+    }
+}
+
+fn parse_queue_position(value: &str) -> Option<usize> {
+    let position = value.parse::<usize>().ok()?;
+    position.checked_sub(1)
 }
 
 fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
@@ -2071,7 +2290,7 @@ fn reduce_palette_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 state.revisions.focus += 1;
                 if state.working {
                     state.push_notification(
-                        "A run is active; wait or cancel before resuming".into(),
+                        "Há uma execução ativa; aguarde ou cancele antes de retomar".into(),
                     );
                     state.revisions.status += 1;
                     return vec![Effect::RequestRender];
@@ -2216,7 +2435,10 @@ mod tests {
         LoginProvider, ModelAlias, OpenCodeCatalogSource, OpenCodeModelView, ReasoningEffort,
         UiCommand, UiEvent,
     };
-    use crate::app::{AppState, FrameClock, LoginStage};
+    use crate::app::{
+        ActivityPhase, AppState, CancellationPhase, ConfirmedSetting, FrameClock, LoginStage,
+        NotificationPriority, RunOutcomeKind,
+    };
 
     fn enter() -> KeyEvent {
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
@@ -2556,10 +2778,9 @@ mod tests {
         let _ = reduce(&mut state, Action::Key(enter()));
         assert_eq!(state.composer.payload(), "/model not-a-model");
         assert!(
-            state
-                .notifications
-                .iter()
-                .any(|notification| notification.as_str().contains("Unknown ClinePass")),
+            state.notifications.iter().any(|notification| notification
+                .as_str()
+                .contains("Modelo ClinePass desconhecido")),
             "rejection must stay visible: {:?}",
             state.notifications
         );
@@ -2768,7 +2989,7 @@ mod tests {
             .all(|effect| !matches!(effect, Effect::Send(UiCommand::SendPrompt(_)))));
         assert_eq!(
             state.notifications.last().map(|notice| notice.as_str()),
-            Some("No provider connected. Use /login.")
+            Some("Nenhum provedor conectado. Use /login.")
         );
     }
 
@@ -2835,7 +3056,10 @@ mod tests {
         assert!(state.notifications.is_empty());
         reduce(&mut state, Action::ClipboardCompleted { success: false });
         assert_eq!(state.notifications.len(), 1);
-        assert_eq!(state.notifications[0].message, "Clipboard unavailable");
+        assert_eq!(
+            state.notifications[0].message,
+            "Área de transferência indisponível"
+        );
     }
 
     #[test]
@@ -2899,7 +3123,7 @@ mod tests {
     }
 
     #[test]
-    fn new_content_invalidates_coordinate_selection() {
+    fn new_content_preserves_coordinate_selection_snapshot() {
         let mut state = AppState::new();
         reduce(
             &mut state,
@@ -2916,8 +3140,8 @@ mod tests {
                 text: "new content".into(),
             }),
         );
-        assert!(state.selection.is_none() && state.selection_area.is_none());
-        assert!(state.selection_text.is_empty());
+        assert!(state.selection.is_some() && state.selection_area.is_some());
+        assert_eq!(state.selection_text, "old content");
     }
 
     #[test]
@@ -3411,7 +3635,345 @@ mod tests {
         assert!(state
             .notifications
             .iter()
-            .any(|notification| notification.message.starts_with("Usage: /mcp")));
+            .any(|notification| notification.message.starts_with("Uso: /mcp")));
+    }
+
+    #[test]
+    fn parallel_tool_activity_keeps_running_call_until_each_identity_ends() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::RunStarted {
+            run_id: 1,
+            max_mutating_tool_calls: 8,
+            max_read_tool_calls: 8,
+            max_turns: 4,
+        });
+        let batch_a = crate::api::ToolBatchId("batch-a".into());
+        let call_a = crate::api::ToolCallId("call-a".into());
+        let batch_b = crate::api::ToolBatchId("batch-b".into());
+        let call_b = crate::api::ToolCallId("call-b".into());
+
+        state.apply_event(UiEvent::ToolAdmitted {
+            batch_id: batch_a.clone(),
+            call_id: call_a.clone(),
+            name: "search".into(),
+        });
+        assert_eq!(
+            state.activity.as_ref().map(|activity| &activity.phase),
+            Some(&ActivityPhase::QueuedTool("search".into()))
+        );
+        state.apply_event(UiEvent::ToolStarted {
+            batch_id: batch_a.clone(),
+            call_id: call_a.clone(),
+            name: "search".into(),
+            arguments_summary: "{}".into(),
+        });
+        state.apply_event(UiEvent::ToolAdmitted {
+            batch_id: batch_b.clone(),
+            call_id: call_b.clone(),
+            name: "write".into(),
+        });
+        assert_eq!(
+            state.activity.as_ref().map(|activity| &activity.phase),
+            Some(&ActivityPhase::RunningTool("search".into()))
+        );
+        state.apply_event(UiEvent::ToolStarted {
+            batch_id: batch_b,
+            call_id: call_b,
+            name: "write".into(),
+            arguments_summary: "{}".into(),
+        });
+        state.apply_event(UiEvent::ToolEnded {
+            batch_id: batch_a,
+            call_id: call_a,
+            name: "search".into(),
+            success: true,
+            duration_ms: 10,
+        });
+        assert_eq!(
+            state.activity.as_ref().map(|activity| &activity.phase),
+            Some(&ActivityPhase::RunningTool("write".into()))
+        );
+    }
+
+    #[test]
+    fn retry_state_is_cleared_by_provider_phase_and_late_retry_is_ignored() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::RunStarted {
+            run_id: 7,
+            max_mutating_tool_calls: 1,
+            max_read_tool_calls: 1,
+            max_turns: 1,
+        });
+        state.apply_event(UiEvent::RetryScheduled {
+            attempt: 1,
+            limit: 3,
+            wait_ms: 250,
+            reason: Some("timeout".into()),
+        });
+        assert!(state.retry.is_some());
+        state.apply_event(UiEvent::ProviderPhaseChanged {
+            phase: slim_core::ProviderPhase::HeadersReceived,
+            label: "headers".into(),
+            elapsed_ms: 11,
+        });
+        assert!(state.retry.is_none());
+        state.apply_event(UiEvent::RunCompleted { run_id: 7 });
+        state.apply_event(UiEvent::RetryScheduled {
+            attempt: 2,
+            limit: 3,
+            wait_ms: 500,
+            reason: None,
+        });
+        assert!(state.retry.is_none());
+    }
+
+    #[test]
+    fn explicit_cancel_pauses_queue_until_deliberate_resume() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::RunStarted {
+            run_id: 3,
+            max_mutating_tool_calls: 1,
+            max_read_tool_calls: 1,
+            max_turns: 1,
+        });
+        state.enqueue_queued_prompt("first".into());
+        state.enqueue_queued_prompt("second".into());
+        reduce(
+            &mut state,
+            Action::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        );
+        assert_eq!(
+            state.cancellation.map(|cancellation| cancellation.phase),
+            Some(CancellationPhase::Requested)
+        );
+        let effects = reduce(
+            &mut state,
+            Action::UiEventReceived(UiEvent::RunStopped {
+                run_id: 3,
+                message: "cancelled".into(),
+            }),
+        );
+        assert!(state.queue_paused);
+        assert_eq!(state.queue_len(), 2);
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Send(UiCommand::SendPrompt(_)))));
+
+        state.composer.insert_text("/queue resume");
+        let effects = reduce(&mut state, Action::Key(enter()));
+        assert!(!state.queue_paused);
+        assert!(effects.contains(&Effect::Send(UiCommand::SendPrompt("first".into()))));
+        assert_eq!(state.queue_len(), 1);
+
+        state.composer.insert_text("/queue edit 1");
+        reduce(&mut state, Action::Key(enter()));
+        assert_eq!(state.composer.payload(), "second");
+        assert_eq!(state.queue_len(), 0);
+    }
+
+    #[test]
+    fn explicit_cancel_keeps_queue_paused_even_if_completion_wins_race() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::RunStarted {
+            run_id: 4,
+            max_mutating_tool_calls: 1,
+            max_read_tool_calls: 1,
+            max_turns: 1,
+        });
+        state.enqueue_queued_prompt("after cancel".into());
+        reduce(
+            &mut state,
+            Action::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        );
+        let effects = reduce(
+            &mut state,
+            Action::UiEventReceived(UiEvent::RunCompleted { run_id: 4 }),
+        );
+        assert!(state.queue_paused);
+        assert_eq!(state.queue_len(), 1);
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Send(UiCommand::SendPrompt(_)))));
+        assert_eq!(
+            state.last_execution.as_ref().map(|summary| summary.outcome),
+            Some(RunOutcomeKind::Completed)
+        );
+    }
+
+    #[test]
+    fn execution_summary_survives_next_run_and_tracks_outcome() {
+        let mut state = AppState::new();
+        state.clock.elapsed_ms = 100;
+        state.apply_event(UiEvent::RunStarted {
+            run_id: 1,
+            max_mutating_tool_calls: 1,
+            max_read_tool_calls: 1,
+            max_turns: 1,
+        });
+        state.clock.elapsed_ms = 275;
+        state.apply_event(UiEvent::RunCompleted { run_id: 1 });
+        let summary = state.last_execution.as_ref().expect("completed summary");
+        assert_eq!(summary.run_id, 1);
+        assert_eq!(summary.duration_ms, 175);
+        assert_eq!(summary.outcome, RunOutcomeKind::Completed);
+        state.apply_event(UiEvent::RunStarted {
+            run_id: 2,
+            max_mutating_tool_calls: 1,
+            max_read_tool_calls: 1,
+            max_turns: 1,
+        });
+        assert_eq!(
+            state.last_execution.as_ref().map(|summary| summary.run_id),
+            Some(1)
+        );
+        state.clock.elapsed_ms = 300;
+        state.apply_event(UiEvent::RunStopped {
+            run_id: 2,
+            message: "stopped".into(),
+        });
+        assert_eq!(state.execution_history.len(), 2);
+        assert_eq!(
+            state.last_execution.as_ref().map(|summary| summary.outcome),
+            Some(RunOutcomeKind::Interrupted)
+        );
+    }
+
+    #[test]
+    fn todo_dock_preference_survives_todo_updates() {
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::TodoChanged {
+            items: vec![crate::api::TodoItemView {
+                title: "pending".into(),
+                status: crate::api::TodoItemStatus::Pending,
+            }],
+        });
+        assert!(state.todo_dock_open);
+        reduce(&mut state, Action::ToggleTodoDock);
+        assert!(!state.todo_dock_open);
+        state.apply_event(UiEvent::TodoChanged {
+            items: vec![crate::api::TodoItemView {
+                title: "still pending".into(),
+                status: crate::api::TodoItemStatus::Pending,
+            }],
+        });
+        assert!(!state.todo_dock_open);
+    }
+
+    #[test]
+    fn confirmed_setting_records_effective_changes_only() {
+        let mut state = AppState::new();
+        state.clock.elapsed_ms = 10;
+        state.apply_event(UiEvent::ModeChanged {
+            mode: slim_core::OperatingMode::Auto,
+        });
+        assert!(state.confirmed_setting.is_none());
+        state.apply_event(UiEvent::ModeChanged {
+            mode: slim_core::OperatingMode::ReadOnly,
+        });
+        assert_eq!(state.confirmed_setting, Some((ConfirmedSetting::Mode, 10)));
+        state.clock.elapsed_ms = 20;
+        state.apply_event(UiEvent::EffortChanged {
+            effort: ReasoningEffort::Low,
+        });
+        assert_eq!(
+            state.confirmed_setting,
+            Some((ConfirmedSetting::Effort, 20))
+        );
+        state.clock.elapsed_ms = 30;
+        state.apply_event(UiEvent::ModelChanged {
+            model: "gpt-5.6-terra".into(),
+        });
+        assert_eq!(state.confirmed_setting, Some((ConfirmedSetting::Model, 30)));
+    }
+
+    #[test]
+    fn notification_coalescing_preserves_priority_and_history() {
+        let mut state = AppState::new();
+        state.clock.elapsed_ms = 1;
+        state.push_notification("same".into());
+        state.clock.elapsed_ms = 2;
+        state.push_notification("same".into());
+        assert_eq!(state.notifications.len(), 1);
+        assert_eq!(state.notifications[0].repeat_count, 2);
+        assert_eq!(state.notification_history()[0].repeat_count, 2);
+        state.push_notification_with_priority("same".into(), NotificationPriority::Warning);
+        state.push_notification_with_priority("failure".into(), NotificationPriority::Error);
+        let toast = state.visible_toast_tail(3);
+        assert_eq!(toast.len(), 1);
+        assert_eq!(toast[0].message, "failure");
+        assert_eq!(toast[0].priority, NotificationPriority::Error);
+    }
+
+    #[test]
+    fn thinking_preview_retention_uses_thinking_start_and_releases_at_boundary() {
+        let mut state = AppState::new();
+        state.clock.elapsed_ms = 10;
+        state.apply_event(UiEvent::RunStarted {
+            run_id: 9,
+            max_mutating_tool_calls: 1,
+            max_read_tool_calls: 1,
+            max_turns: 1,
+        });
+        state.clock.elapsed_ms = 20;
+        state.apply_event(UiEvent::ThinkingStarted);
+        state.clock.elapsed_ms = 50;
+        state.apply_event(UiEvent::ThinkingDelta {
+            text: "reason".into(),
+        });
+        let thinking_id = state
+            .blocks()
+            .iter()
+            .find(|block| matches!(block.kind(), crate::block::BlockKind::Thinking(_)))
+            .map(|block| block.id.clone())
+            .expect("thinking block");
+        let thinking = state
+            .blocks()
+            .iter()
+            .find(|block| block.id == thinking_id)
+            .unwrap();
+        assert_eq!(thinking.started_ms, Some(20));
+        state.clock.elapsed_ms = 60;
+        state.apply_event(UiEvent::ThinkingEnded);
+        assert!(state
+            .blocks()
+            .iter()
+            .find(|block| block.id == thinking_id)
+            .is_some_and(|block| block.preview_retained));
+        state.clock.elapsed_ms = 70;
+        state.apply_event(UiEvent::AssistantDelta {
+            text: "answer".into(),
+        });
+        assert!(state
+            .blocks()
+            .iter()
+            .find(|block| block.id == thinking_id)
+            .is_some_and(|block| !block.preview_retained));
+    }
+
+    #[test]
+    fn approval_decision_waits_until_runtime_marks_content_accessible() {
+        let mut state = AppState::new();
+        let request_id = crate::api::InteractionRequestId("approval-1".into());
+        state.apply_event(UiEvent::ApprovalRequired {
+            request_id: request_id.clone(),
+            summary: "run command".into(),
+            persisted: false,
+        });
+        let blocked = reduce(
+            &mut state,
+            Action::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+        );
+        assert!(!blocked
+            .iter()
+            .any(|effect| matches!(effect, Effect::Send(UiCommand::Approve { .. }))));
+        reduce(&mut state, Action::SetApprovalContentAccessible(true));
+        let approved = reduce(
+            &mut state,
+            Action::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+        );
+        assert!(approved
+            .iter()
+            .any(|effect| matches!(effect, Effect::Send(UiCommand::Approve { request_id: id }) if id == &request_id)));
     }
 }
 
@@ -3662,7 +4224,7 @@ mod slash_tests {
         assert_eq!(slash_matches("lo"), vec!["/login", "/logout"]);
         assert_eq!(slash_matches("logi"), vec!["/login"]);
         assert_eq!(slash_matches("he"), vec!["/help"]);
-        assert_eq!(slash_matches("").len(), 13);
+        assert_eq!(slash_matches("").len(), 14);
         assert!(slash_matches("zzz").is_empty());
     }
 
@@ -3837,7 +4399,7 @@ mod queued_prompt_tests {
 
         assert_eq!(effects, vec![Effect::RequestRender]);
         assert!(state.composer.payload().is_empty());
-        assert_eq!(queued_texts(&state), vec!["queued[0] second question"]);
+        assert_eq!(queued_texts(&state), vec!["second question"]);
         assert_eq!(state.queued_prompts.len(), 1);
     }
 
@@ -3850,10 +4412,7 @@ mod queued_prompt_tests {
         type_text(&mut state, "second");
         reduce(&mut state, Action::Key(enter()));
 
-        assert_eq!(
-            queued_texts(&state),
-            vec!["queued[0] first", "queued[1] second"]
-        );
+        assert_eq!(queued_texts(&state), vec!["first", "second"]);
     }
 
     #[test]
@@ -3874,7 +4433,7 @@ mod queued_prompt_tests {
         assert!(state
             .notifications
             .iter()
-            .any(|notification| notification.message == "Prompt queue full (8)."));
+            .any(|notification| notification.message == "Fila de prompts cheia (8)."));
     }
 
     #[test]
@@ -3885,7 +4444,7 @@ mod queued_prompt_tests {
         let effects = reduce(&mut state, Action::Key(alt_enter()));
 
         assert_eq!(effects, vec![Effect::RequestRender]);
-        assert_eq!(queued_texts(&state), vec!["queued[0] steered"]);
+        assert_eq!(queued_texts(&state), vec!["steered"]);
     }
 
     #[test]
@@ -3923,7 +4482,7 @@ mod queued_prompt_tests {
         let first = reduce(&mut state, run_completed(1));
         assert!(first.contains(&Effect::Send(UiCommand::SendPrompt("alpha".into()))));
         assert_eq!(state.queued_prompts.len(), 1);
-        assert_eq!(queued_texts(&state), vec!["queued[1] beta"]);
+        assert_eq!(queued_texts(&state), vec!["beta"]);
 
         let second = reduce(&mut state, run_completed(2));
         assert!(second.contains(&Effect::Send(UiCommand::SendPrompt("beta".into()))));

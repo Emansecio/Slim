@@ -667,6 +667,45 @@ fn selection_keeps_prior_file_recovery_when_a_small_later_group_would_drop_it() 
 }
 
 #[test]
+fn selection_recognizes_current_and_legacy_ambiguous_patch_recovery_markers() {
+    let policy = CompactionPolicy {
+        keep_recent_tokens: 8_000,
+        ..CompactionPolicy::default()
+    };
+
+    for marker in [
+        "Example context only for the first match at line 2; choose the intended occurrence explicitly:",
+        "Suggested unique expected:",
+    ] {
+        let recovery = format!(
+            "t.txt: file unchanged. Matches start at lines 2, 4; {marker}\n{}",
+            "R".repeat(40_000)
+        );
+        let messages = vec![
+            ProviderMessage::user("root"),
+            ProviderMessage::assistant(
+                "patch",
+                vec![ProviderToolCall {
+                    id: "patch-1".into(),
+                    name: "patch".into(),
+                    arguments: r#"{"path":"t.txt","edits":[{"expected":"same","replacement":"new"}]}"#.into(),
+                }],
+            ),
+            ProviderMessage::tool("patch", "patch-1", recovery),
+            ProviderMessage::assistant("continue without rereading", Vec::new()),
+        ];
+        let selection = select_compaction_history(&messages, &policy).expect("compactable");
+        assert!(
+            selection
+                .kept
+                .iter()
+                .any(|message| message.content.contains(marker)),
+            "marker must keep the oversized patch recovery group: {marker}"
+        );
+    }
+}
+
+#[test]
 fn selection_still_drops_oversized_non_recovery_group() {
     let policy = CompactionPolicy {
         keep_recent_tokens: 8_000,

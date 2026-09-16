@@ -315,7 +315,7 @@ fn native_overwrite_recovers_from_missing_final_newline_without_weakening_guard(
     );
     assert!(!stale.success);
     assert!(
-        stale.output.contains("current file below"),
+        stale.output.contains("Current file is below"),
         "{}",
         stale.output
     );
@@ -501,7 +501,7 @@ fn failed_overwrite_includes_current_file_for_retry_without_a_new_read() {
     assert!(stale.output.contains("stale read"), "{}", stale.output);
     assert!(stale.output.contains("next\n"), "{}", stale.output);
     assert!(
-        stale.output.contains("current file below"),
+        stale.output.contains("Current file is below"),
         "{}",
         stale.output
     );
@@ -734,7 +734,7 @@ fn write_rejects_expected_above_the_mutation_budget() {
 
 #[test]
 fn shared_native_contracts_reach_chat_messages_and_responses() {
-    let tools = slim_core::Runtime::new().advertised_tool_definitions(OperatingMode::Auto);
+    let mut tools = slim_core::Runtime::new().advertised_tool_definitions(OperatingMode::Auto);
     let advertised = &tools;
     let read = advertised
         .iter()
@@ -768,11 +768,36 @@ fn shared_native_contracts_reach_chat_messages_and_responses() {
         .as_array()
         .unwrap()
         .contains(&json!("context_lines")));
+    assert_eq!(
+        search["input_schema"]["anyOf"],
+        json!([
+            {"required":["query"]}, {"required":["patterns"]}
+        ])
+    );
+    assert!(search["input_schema"].get("oneOf").is_none());
     println!(
         "NATIVE_PREFIX system_bytes={} schema_bytes={}",
         slim_core::provider::NATIVE_SYSTEM_PROMPT.len(),
         serde_json::to_vec(&advertised).unwrap().len(),
     );
+    // Runtime only advertises semantic navigation with an available backend;
+    // serialize its shared contract here without starting one.
+    let intel = slim_core::tools::code_intel_definition();
+    let branches = &intel["input_schema"]["oneOf"];
+    assert_eq!(
+        branches[0]["properties"]["action"]["enum"],
+        json!(["definition", "references", "hover"])
+    );
+    assert_eq!(branches[0]["required"], json!(["path", "line", "column"]));
+    assert_eq!(
+        branches[1]["anyOf"],
+        json!([{"required":["path"]}, {"required":["query"]}])
+    );
+    assert_eq!(
+        branches[2]["properties"]["action"]["enum"],
+        json!(["diagnostics", "status"])
+    );
+    tools.push(intel);
     let mut adapters: Vec<Box<dyn ProviderAdapter>> = vec![
         Box::new(
             OpenAiCompatibleAdapter::new(ProviderConfig::openai(
@@ -823,7 +848,7 @@ fn shared_native_contracts_reach_chat_messages_and_responses() {
             .unwrap();
         let body: Value = serde_json::from_slice(request.body()).unwrap();
         let wire_tools = body["tools"].as_array().unwrap();
-        for name in ["write", "shell", "search"] {
+        for name in ["write", "shell", "search", "code_intel"] {
             let original = tools.iter().find(|tool| tool["name"] == name).unwrap();
             let wire = wire_tools
                 .iter()
@@ -880,24 +905,65 @@ fn shared_native_contracts_reach_chat_messages_and_responses() {
 }
 
 #[test]
-fn patch_ambiguous_match_includes_suggested_excerpt() {
+fn patch_ambiguous_match_describes_example_and_allows_selecting_second() {
     let root = Workspace::new();
-    fs::write(root.0.join("t.txt"), "same\nsame\n").unwrap();
+    let original = "first\nsame\nmiddle\nsame\nlast\n";
+    fs::write(root.0.join("t.txt"), original).unwrap();
     let result = root.call(
         "patch",
         json!({"path":"t.txt","edits":[{"expected":"same\n","replacement":"x\n"}]}),
     );
     assert!(!result.success, "{}", result.output);
     assert!(
-        result.output.contains("Suggested unique expected"),
+        result
+            .output
+            .contains("Example context only for the first match at line 2"),
         "{}",
         result.output
     );
-    assert!(result.output.contains("same\nsame\n"), "{}", result.output);
+    assert!(
+        result.output.contains("first\nsame\nmiddle\n"),
+        "{}",
+        result.output
+    );
+    assert!(
+        result
+            .output
+            .contains("choose the intended occurrence explicitly"),
+        "{}",
+        result.output
+    );
+    assert!(!result.output.contains("Suggested unique expected"));
+    assert_eq!(fs::read_to_string(root.0.join("t.txt")).unwrap(), original);
+
+    let second = root.call(
+        "patch",
+        json!({
+            "path":"t.txt",
+            "edits":[{"expected":"middle\nsame\nlast\n","replacement":"middle\nchanged\nlast\n"}]
+        }),
+    );
+    assert!(second.success, "{}", second.output);
     assert_eq!(
         fs::read_to_string(root.0.join("t.txt")).unwrap(),
-        "same\nsame\n"
+        "first\nsame\nmiddle\nchanged\nlast\n"
     );
+}
+
+#[test]
+fn patch_unique_identical_match_succeeds_without_changing_file() {
+    let root = Workspace::new();
+    let path = root.0.join("t.txt");
+    let original = "only\nmatch\n";
+    fs::write(&path, original).unwrap();
+
+    let result = root.call(
+        "patch",
+        json!({"path":"t.txt","edits":[{"expected":"only\nmatch\n","replacement":"only\nmatch\n"}]}),
+    );
+    assert!(result.success, "{}", result.output);
+    assert!(result.output.contains("expected equals replacement"));
+    assert_eq!(fs::read_to_string(path).unwrap(), original);
 }
 
 #[test]
@@ -953,6 +1019,13 @@ fn patch_repetitive_ambiguous_match_includes_current_file_when_excerpt_is_not_un
         result.output
     );
     assert!(
+        !result
+            .output
+            .contains("Example context only for the first match"),
+        "{}",
+        result.output
+    );
+    assert!(
         result.output.contains("Current file is below"),
         "{}",
         result.output
@@ -973,7 +1046,7 @@ fn patch_zero_match_explains_corrupted_or_non_ascii_excerpt() {
     assert!(!corrupted.success, "{}", corrupted.output);
     assert!(corrupted.output.contains("U+FFFD"), "{}", corrupted.output);
     assert!(
-        corrupted.output.contains("verbatim"),
+        corrupted.output.contains("copy current text verbatim"),
         "{}",
         corrupted.output
     );
@@ -992,4 +1065,295 @@ fn patch_zero_match_explains_corrupted_or_non_ascii_excerpt() {
         fs::read_to_string(root.0.join("t.txt")).unwrap(),
         "regressões em módulos\n"
     );
+}
+
+#[test]
+fn python_environment_search_noise_is_skipped_but_explicit_reads_work() {
+    let root = Workspace::new();
+    fs::create_dir_all(root.0.join(".venv/Lib/site-packages/pkg")).unwrap();
+    fs::write(
+        root.0.join(".venv/Lib/site-packages/pkg/data.txt"),
+        "needle DEPENDENCY_NOISE",
+    )
+    .unwrap();
+    fs::write(
+        root.0.join("source.py"),
+        "needle PROJECT_SOURCE\nneedle SECOND_SOURCE\n",
+    )
+    .unwrap();
+    let tools = ToolRegistry::default();
+    let args = json!({"path":".","query":"needle","max_hits":1});
+    let first = tools.execute(OperatingMode::Auto, &root.0, "search", &args.to_string());
+    assert!(first.success, "{}", first.output);
+    assert!(first.output.contains("PROJECT_SOURCE"), "{}", first.output);
+    assert!(
+        !first.output.contains("DEPENDENCY_NOISE"),
+        "{}",
+        first.output
+    );
+    assert!(
+        first.output.contains(".venv"),
+        "exclusions must be disclosed"
+    );
+    let marker = "pass \"cursor\": \"";
+    let tail = first.output.split_once(marker).expect("continuation").1;
+    let cursor = tail.split('"').next().unwrap();
+    let second = tools.execute(
+        OperatingMode::Auto,
+        &root.0,
+        "search",
+        &json!({"path":".","query":"needle","max_hits":1,"cursor":cursor}).to_string(),
+    );
+    assert!(second.success, "{}", second.output);
+    assert!(second.output.contains("SECOND_SOURCE"), "{}", second.output);
+    assert!(!second.output.contains("DEPENDENCY_NOISE"));
+    let explicit = root.call(
+        "read",
+        json!({"path":".venv/Lib/site-packages/pkg/data.txt"}),
+    );
+    assert!(explicit.success && explicit.output.contains("DEPENDENCY_NOISE"));
+    let listed = root.call("list", json!({"path":".venv/Lib/site-packages/pkg"}));
+    assert!(listed.success && listed.output.contains("data.txt"));
+}
+
+#[test]
+fn json_write_reports_syntax_without_rolling_back_or_claiming_task_validation() {
+    let root = Workspace::new();
+    let invalid = "{\n  \"first\": 1\n  \"second\": 2\n}\n";
+    let result = root.call("write", json!({"path":"new.json","content":invalid}));
+    assert!(
+        result.success,
+        "a diagnostic must not lie about a completed write"
+    );
+    assert!(
+        result.output.contains("JSON syntax diagnostic"),
+        "{}",
+        result.output
+    );
+    assert!(result.output.contains("line 3"), "{}", result.output);
+    assert_eq!(
+        fs::read_to_string(root.0.join("new.json")).unwrap(),
+        invalid
+    );
+    for (path, content) in [
+        ("valid.json", "{\"x\":1e9999}"),
+        ("comments.jsonc", "{// supported elsewhere\n}"),
+        ("plain.txt", invalid),
+    ] {
+        let result = root.call("write", json!({"path":path,"content":content}));
+        assert!(result.success, "{}", result.output);
+        assert!(
+            !result.output.contains("JSON syntax diagnostic"),
+            "{}",
+            result.output
+        );
+    }
+    fs::write(root.0.join("template.json"), "{ {{template}} }").unwrap();
+    let template = root.call(
+        "write",
+        json!({"path":"template.json","expected":"{ {{template}} }","content":"{ {{changed}} }"}),
+    );
+    assert!(template.success && !template.output.contains("JSON syntax diagnostic"));
+}
+
+#[test]
+fn json_patch_checks_final_content_once_and_recovers_with_crlf_intact() {
+    let root = Workspace::new();
+    let original = "{\r\n  \"a\": 1,\r\n  \"b\": 2\r\n}\r\n";
+    fs::write(root.0.join("config.json"), original).unwrap();
+    let transient = root.call(
+        "patch",
+        json!({"path":"config.json","edits":[
+            {"expected":"\"a\": 1,","replacement":"\"a\": 2"},
+            {"expected":"\"a\": 2","replacement":"\"a\": 3,"}
+        ]}),
+    );
+    assert!(transient.success && !transient.output.contains("JSON syntax diagnostic"));
+    let malformed = root.call(
+        "patch",
+        json!({"path":"config.json","expected":"\"a\": 3,","replacement":"\"a\": 3"}),
+    );
+    assert!(
+        malformed.success && malformed.output.contains("JSON syntax diagnostic"),
+        "{}",
+        malformed.output
+    );
+    let fixed = root.call(
+        "patch",
+        json!({"path":"config.json","expected":"\"a\": 3","replacement":"\"a\": 4,"}),
+    );
+    assert!(fixed.success && !fixed.output.contains("JSON syntax diagnostic"));
+    let text = fs::read_to_string(root.0.join("config.json")).unwrap();
+    assert_eq!(text, original.replace("\"a\": 1", "\"a\": 4"));
+    assert!(serde_json::from_str::<Value>(&text).is_ok());
+}
+
+#[test]
+fn recovery_guidance_is_bounded_without_duplicate_actions_or_evidence_loss() {
+    let root = Workspace::new();
+    fs::write(root.0.join("write.txt"), "current\n").unwrap();
+    let stale = root.call(
+        "write",
+        json!({"path":"write.txt", "content":"next\n", "expected":"wrong\n"}),
+    );
+    assert!(!stale.success, "{}", stale.output);
+    let stale_path = stale
+        .output
+        .strip_prefix("stale read: ")
+        .and_then(|text| {
+            text.split_once("; precondition differs")
+                .map(|(path, _)| path)
+        })
+        .expect("stale path");
+    let normalized_stale = stale.output.replace(stale_path, "<path>");
+    let old_stale = "stale read: <path>; the precondition differs from current bytes. Retry write with expected set to the current file below, or patch an exact current excerpt. No write applied.\nCurrent file is below; retry write with expected set to this full text, or patch a unique excerpt. Do not read again.\ncurrent\n";
+    assert!(normalized_stale.len() <= old_stale.len());
+    let (_, stale_evidence) = stale
+        .output
+        .split_once("Current file is below; ")
+        .and_then(|(_, rest)| rest.split_once('\n'))
+        .expect("stale recovery context");
+    assert_eq!(stale_evidence, "current\n");
+    assert_eq!(stale.output.matches("Do not read again").count(), 1);
+
+    fs::write(root.0.join("patch.txt"), "hello\nworld\n").unwrap();
+    let missing = root.call(
+        "patch",
+        json!({"path":"patch.txt", "edits":[{"expected":"missing\n", "replacement":"x\n"}]}),
+    );
+    assert!(!missing.success, "{}", missing.output);
+    let patch_path = missing
+        .output
+        .lines()
+        .nth(1)
+        .and_then(|line| line.split_once(": file unchanged.").map(|(path, _)| path))
+        .expect("patch path");
+    let normalized_patch = missing.output.replace(patch_path, "<path>");
+    let old_patch = "expected exactly one match, got 0\n<path>: file unchanged. Use a unique exact excerpt, including its whitespace and line endings.\nCurrent file is below; retry patch with a unique exact excerpt from this text, including whitespace and line endings. Do not read again.\nhello\nworld\n";
+    assert!(normalized_patch.len() <= old_patch.len());
+    let (_, patch_evidence) = missing
+        .output
+        .split_once("Current file is below; ")
+        .and_then(|(_, rest)| rest.split_once('\n'))
+        .expect("patch recovery context");
+    assert_eq!(patch_evidence, "hello\nworld\n");
+    assert_eq!(missing.output.matches("Current file is below").count(), 1);
+
+    assert!(recovery_guidance_bytes(&stale.output, &root.0.join("write.txt")) <= 256);
+    assert!(recovery_guidance_bytes(&missing.output, &root.0.join("patch.txt")) <= 256);
+
+    let mut large = "🦀".repeat(40_000);
+    large.push('\n');
+    for index in 0..63 {
+        large.push_str(&format!("line{index}\n"));
+    }
+    fs::write(root.0.join("large.txt"), &large).unwrap();
+    let mut edits = Vec::with_capacity(64);
+    for index in 0..63 {
+        edits.push(json!({
+            "expected": format!("line{index}\n"),
+            "replacement": format!("line{index}\n")
+        }));
+    }
+    edits.push(json!({"expected":"🦀missing", "replacement":"x"}));
+    let batch = root.call("patch", json!({"path":"large.txt", "edits":edits}));
+    assert!(!batch.success, "{}", batch.output);
+    assert!(
+        batch
+            .output
+            .contains("Edit 64 rejected in proposed content; no edits applied."),
+        "{}",
+        batch.output
+    );
+    assert!(batch
+        .output
+        .contains("non-ASCII; copy current text verbatim."));
+    assert!(batch.output.contains("Current file edges are below"));
+    assert!(
+        recovery_guidance_bytes(&batch.output, &root.0.join("large.txt")) <= 256,
+        "guidance bytes={}",
+        recovery_guidance_bytes(&batch.output, &root.0.join("large.txt"))
+    );
+    assert!(batch.output.contains("🦀🦀🦀🦀"));
+    assert!(batch.output.contains("line62\n"));
+    assert!(batch.output.contains("[truncated"));
+    assert_eq!(fs::read_to_string(root.0.join("large.txt")).unwrap(), large);
+
+    let partial_write = root.call(
+        "write",
+        json!({"path":"large.txt", "content":"next", "expected":"wrong"}),
+    );
+    assert!(!partial_write.success);
+    assert!(partial_write
+        .output
+        .contains("read the complete file before write"));
+    assert!(recovery_guidance_bytes(&partial_write.output, &root.0.join("large.txt")) <= 256);
+
+    let complete = (0..63)
+        .map(|index| format!("line{index}\n"))
+        .collect::<String>();
+    fs::write(root.0.join("large.txt"), &complete).unwrap();
+    let complete_batch = root.call("patch", json!({"path":"large.txt", "edits":edits}));
+    assert!(!complete_batch.success);
+    assert!(complete_batch.output.ends_with(&complete));
+    assert!(
+        recovery_guidance_bytes(&complete_batch.output, &root.0.join("large.txt")) <= 256,
+        "guidance bytes={}",
+        recovery_guidance_bytes(&complete_batch.output, &root.0.join("large.txt"))
+    );
+    assert_eq!(
+        fs::read_to_string(root.0.join("large.txt")).unwrap(),
+        complete
+    );
+
+    let repetitive = "same\n".repeat(40_000);
+    fs::write(root.0.join("ambiguous.txt"), &repetitive).unwrap();
+    let ambiguous = root.call(
+        "patch",
+        json!({"path":"ambiguous.txt", "edits":[
+            {"expected":"same\n", "replacement":"new\n"},
+            {"expected":"later", "replacement":"x"}
+        ]}),
+    );
+    assert!(!ambiguous.success, "{}", ambiguous.output);
+    assert!(ambiguous.output.contains("Current file edges are below"));
+    assert!(!ambiguous
+        .output
+        .contains("Example context only for the first match"));
+    assert!(
+        recovery_guidance_bytes(&ambiguous.output, &root.0.join("ambiguous.txt")) <= 256,
+        "guidance bytes={}",
+        recovery_guidance_bytes(&ambiguous.output, &root.0.join("ambiguous.txt"))
+    );
+    assert!(ambiguous.output.contains("same\n"));
+}
+
+fn recovery_guidance_bytes(output: &str, path: &std::path::Path) -> usize {
+    let mut prefix = String::new();
+    let mut found_evidence = false;
+    for line in output.split_inclusive('\n') {
+        prefix.push_str(line);
+        if line.starts_with("Current file is below")
+            || line.starts_with("Current file edges are below")
+            || line.starts_with("Example context only for the first match at line ")
+        {
+            found_evidence = true;
+            break;
+        }
+    }
+    assert!(found_evidence, "missing evidence boundary: {output}");
+    let path = fs::canonicalize(path).unwrap();
+    assert!(prefix.contains(path.to_str().unwrap()));
+    let mut guidance = prefix.replace(path.to_str().unwrap(), "");
+    // Line locations are diagnostic evidence; retain every surrounding label,
+    // header, separator and instruction, including the fixed 'first 8' notice.
+    if let Some(start) = guidance.find("Matches at lines ") {
+        let start = start + "Matches at lines ".len();
+        let length = guidance[start..]
+            .bytes()
+            .take_while(|byte| byte.is_ascii_digit() || matches!(byte, b',' | b' '))
+            .count();
+        guidance.replace_range(start..start + length, "");
+    }
+    guidance.len()
 }

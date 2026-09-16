@@ -17,6 +17,7 @@ unicode-segmentation = "1"
 unicode-width = "0.2"
 
 [dev-dependencies]
+portable-pty = "0.9"
 proptest = "1"
 
 [target.'cfg(windows)'.dependencies]

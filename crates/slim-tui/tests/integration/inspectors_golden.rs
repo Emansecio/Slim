@@ -107,12 +107,12 @@ fn restored_tools_are_neutral_history_in_both_inspectors() {
     for key in ['d', 'j'] {
         reduce(&mut state, ctrl(key));
         let frame = render(&state, 80, 24);
-        assert!(frame.contains("- write · history"), "{frame}");
+        assert!(frame.contains("- write · histórico"), "{frame}");
         assert!(!frame.contains('✓'), "{frame}");
         let buffer = render_buffer(&state, 80, 24);
         assert_eq!(
-            cell_at_token(&buffer, "- write · history").fg,
-            cell_at_token(&buffer, "write · history").fg
+            cell_at_token(&buffer, "- write · histórico").fg,
+            cell_at_token(&buffer, "write · histórico").fg
         );
     }
 }
@@ -127,8 +127,16 @@ fn inspector_shortcuts_toggle_truthful_responsive_panels() {
     reduce(&mut state, ctrl('d'));
     assert_eq!(state.inspector.active, Some(InspectorKind::Diff));
     let wide = render(&state, 100, 30);
-    assert!(wide.contains("Changes"), "{wide}");
-    assert!(wide.contains("No file changes reported"), "{wide}");
+    assert!(wide.contains("Operações de alteração"), "{wide}");
+    let normalized = wide
+        .replace('│', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        normalized.contains("Nenhuma operação de alteração reportada"),
+        "{wide}"
+    );
     assert!(
         wide.contains("drawer-tail-marker"),
         "wide drawer must reflow rather than erase transcript content\n{wide}"
@@ -137,7 +145,7 @@ fn inspector_shortcuts_toggle_truthful_responsive_panels() {
     reduce(&mut state, ctrl('j'));
     assert_eq!(state.inspector.active, Some(InspectorKind::Activity));
     let narrow = render(&state, 99, 18);
-    assert!(narrow.contains("Activity"), "{narrow}");
+    assert!(narrow.contains("Atividade"), "{narrow}");
 
     reduce(&mut state, press(KeyCode::Esc));
     assert_eq!(state.inspector.active, None);
@@ -159,7 +167,7 @@ fn transcript_search_reports_and_cycles_real_matches() {
         reduce(&mut state, press(KeyCode::Char(character)));
     }
     let first = render(&state, 80, 24);
-    assert!(first.contains("Find: parser"), "{first}");
+    assert!(first.contains("Buscar: parser"), "{first}");
     assert!(first.contains("1/2"), "{first}");
 
     reduce(&mut state, press(KeyCode::Enter));
@@ -206,12 +214,12 @@ fn search_filter_cycles_all_errors_and_tools() {
         reduce(&mut state, press(KeyCode::Char(character)));
     }
     let all = render(&state, 80, 24);
-    assert!(all.contains("[all]"), "{all}");
+    assert!(all.contains("[tudo]"), "{all}");
     assert!(all.contains("1/3"), "{all}");
 
     reduce(&mut state, press(KeyCode::Tab));
     let errors = render(&state, 80, 24);
-    assert!(errors.contains("[errors]"), "{errors}");
+    assert!(errors.contains("[erros]"), "{errors}");
     assert!(errors.contains("1/2"), "{errors}");
 
     // Cycling the filter resets the selection instead of keeping a stale one.
@@ -220,12 +228,12 @@ fn search_filter_cycles_all_errors_and_tools() {
     assert!(advanced.contains("2/2"), "{advanced}");
     reduce(&mut state, press(KeyCode::Tab));
     let tools = render(&state, 80, 24);
-    assert!(tools.contains("[tools]"), "{tools}");
+    assert!(tools.contains("[ferramentas]"), "{tools}");
     assert!(tools.contains("1/1"), "{tools}");
 
     reduce(&mut state, press(KeyCode::Tab));
     let back = render(&state, 80, 24);
-    assert!(back.contains("[all]"), "{back}");
+    assert!(back.contains("[tudo]"), "{back}");
     assert!(back.contains("1/3"), "{back}");
 }
 
@@ -243,7 +251,7 @@ fn copy_shortcut_targets_the_latest_assistant_and_reports_the_real_result() {
     assert!(state
         .notifications
         .iter()
-        .any(|notification| notification.as_str() == "Clipboard unavailable"));
+        .any(|notification| notification.as_str() == "Área de transferência indisponível"));
 }
 
 #[test]
@@ -329,12 +337,12 @@ fn wide_transcript_is_centered_at_reading_width_without_automatic_inspector() {
 
     let user_line = wide
         .lines()
-        .find(|line| line.contains("You  Revise a organização visual"))
+        .find(|line| line.contains("Você  Revise a organização visual"))
         .expect("user prompt");
     assert_eq!(
-        user_line.find("You"),
-        Some(2),
-        "140-column transcript uses full terminal width\n{wide}"
+        user_line.find("Você"),
+        Some(22),
+        "140-column transcript is centered inside the 100-cell reading column\n{wide}"
     );
 }
 
@@ -346,12 +354,14 @@ fn below_default_breakpoint_uses_full_width_single_column_without_run_inspector(
         assert!(!narrow.contains(" Run "), "width {width}\n{narrow}");
         let user_line = narrow
             .lines()
-            .find(|line| line.contains("You  Revise a organização visual"))
+            .find(|line| line.contains("Você  Revise a organização visual"))
             .expect("user prompt");
+        let reading_width = width.min(100) as usize;
+        let reading_x = (width as usize - reading_width) / 2;
         assert_eq!(
-            user_line.find("You"),
-            Some(2),
-            "width {width} transcript should use the full-width reading area\n{narrow}"
+            user_line.find("Você"),
+            Some(reading_x + 2),
+            "width {width} transcript should use the centered reading area\n{narrow}"
         );
         assert!(
             narrow.lines().any(|row| row.trim() == "Slim"),

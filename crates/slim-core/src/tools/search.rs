@@ -30,10 +30,17 @@ const MAX_SEARCH_SCAN_FILES: usize = 4096;
 const MAX_SEARCH_SNAPSHOTS: usize = 8;
 const SEARCH_SNAPSHOT_TTL: Duration = Duration::from_secs(120);
 
-pub(crate) const SKIP_DIR_NAMES: &[&str] =
-    &["node_modules", "target", "dist", ".git", ".slim", ".pi"];
+pub(crate) const SKIP_DIR_NAMES: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    ".git",
+    ".slim",
+    ".pi",
+    ".venv",
+];
 const SEARCH_SKIP_FOOTER: &str =
-    "[skipped: node_modules, target, dist, .git, .slim, .pi — use list/shell in those trees]";
+    "[skipped: node_modules, target, dist, .git, .slim, .pi, .venv — use read/list/shell in those trees]";
 
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1964,7 +1971,7 @@ mod tests {
             Path::new("."),
         );
         assert!(formatted.contains(SEARCH_SKIP_FOOTER));
-        assert!(formatted.contains("use list/shell"));
+        assert!(formatted.contains("use read/list/shell"));
     }
 
     #[test]

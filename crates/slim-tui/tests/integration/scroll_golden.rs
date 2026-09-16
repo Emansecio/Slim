@@ -383,7 +383,10 @@ fn scrolling_up_pins_and_counts_unseen_content() {
         !frame.contains("fresh answer"),
         "pinned view must not jump to live edge\n{frame}"
     );
-    assert!(frame.contains("End latest"), "unseen hint must be visible");
+    assert!(
+        frame.contains("End recentes"),
+        "unseen hint must be visible"
+    );
 }
 
 #[test]

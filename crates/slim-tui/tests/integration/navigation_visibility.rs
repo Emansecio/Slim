@@ -5,7 +5,7 @@ use ratatui::Terminal;
 
 use slim_tui::api::{ToolBatchId, ToolCallId, UiEvent};
 use slim_tui::app::AppState;
-use slim_tui::reducer::{reduce, Action, ScrollIntent};
+use slim_tui::reducer::{palette_matches, reduce, Action, ScrollIntent};
 use slim_tui::render::WrapCache;
 use slim_tui::runtime::{render_frame, terminal_action};
 use slim_tui::theme::{Capabilities, ColorDepth};
@@ -77,9 +77,9 @@ fn palette_end_keeps_the_last_grouped_command_visible() {
     reduce(&mut state, key(KeyCode::End, KeyModifiers::NONE));
 
     let frame = render(&state, 100, 30);
-    assert_eq!(state.palette_selected, 12);
+    assert_eq!(state.palette_selected, palette_matches("").len() - 1);
     assert!(
-        frame.contains("inspect"),
+        frame.contains("inspeção"),
         "group heading must render:\n{frame}"
     );
     assert!(
@@ -104,7 +104,7 @@ fn login_end_keeps_the_last_provider_visible_in_a_short_viewport() {
         "last provider must be visible after End:\n{frame}"
     );
     assert!(
-        frame.contains("Esc cancel"),
+        frame.contains("Esc cancelar"),
         "action hint must remain visible:\n{frame}"
     );
 }
@@ -399,7 +399,7 @@ fn narrow_search_bar_preserves_the_query_before_hints() {
     let frame = render(&state, 40, 16);
     let search_row = frame
         .lines()
-        .find(|line| line.contains("Find:"))
+        .find(|line| line.contains("Buscar:"))
         .expect("search bar row");
     assert!(
         search_row.contains("hierarquia"),

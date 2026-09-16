@@ -1,8 +1,11 @@
 use serde_json::json;
 use slim_core::provider::{
-    AnthropicAdapter, HttpRequest, OpenAiCodexAdapter, OpenAiCompatibleAdapter, ProviderAdapter,
-    ProviderAuth, ProviderConfig, ProviderContentBlock, ProviderEvent, ProviderKind,
-    ProviderMessage, ProviderToolCall, UsageBreakdown,
+    AnthropicAdapter, ClinePassAdapter, CommandCodeAdapter, HttpRequest, OpenAiCodexAdapter,
+    OpenAiCompatibleAdapter, OpenCodeGoAdapter, OpenCodeZenAdapter, ProviderAdapter, ProviderAuth,
+    ProviderConfig, ProviderContentBlock, ProviderError, ProviderEvent, ProviderKind,
+    ProviderMessage, ProviderToolCall, UsageBreakdown, XaiAdapter, CLINEPASS_BASE_URL,
+    COMMANDCODE_BASE_URL, OPENCODE_GO_BASE_URL, OPENCODE_ZEN_BASE_URL, OPENCODE_ZEN_PUBLIC_KEY,
+    XAI_BASE_URL,
 };
 use slim_core::ProviderPricing;
 
@@ -1371,6 +1374,186 @@ fn provider_tool_definitions_use_each_wire_format() {
     .expect("anthropic body");
     assert_eq!(anthropic_body["tools"][0]["name"], "read");
     assert_eq!(anthropic_body["tools"][0]["input_schema"]["type"], "object");
+}
+
+#[test]
+fn checked_requests_reject_invalid_tool_arguments_across_message_and_compaction_paths() {
+    let adapters: Vec<Box<dyn ProviderAdapter>> = vec![
+        Box::new(
+            OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+                "https://example.invalid/v1/chat/completions",
+                "model-a",
+                "secret-a",
+            ))
+            .expect("OpenAI adapter"),
+        ),
+        Box::new(
+            AnthropicAdapter::new(ProviderConfig::anthropic(
+                "https://example.invalid/v1/messages",
+                "claude-test",
+                "secret-b",
+            ))
+            .expect("Anthropic adapter"),
+        ),
+        Box::new(
+            OpenAiCodexAdapter::new(ProviderConfig::openai_codex(
+                "https://example.invalid/backend-api",
+                "gpt-test",
+                "secret-c",
+                "account-id",
+            ))
+            .expect("Codex adapter"),
+        ),
+        Box::new(
+            ClinePassAdapter::new(
+                CLINEPASS_BASE_URL,
+                "cline-pass/future-open-model",
+                "secret-d",
+                None,
+            )
+            .expect("Cline Pass adapter"),
+        ),
+        Box::new(
+            CommandCodeAdapter::new(
+                COMMANDCODE_BASE_URL,
+                "deepseek/deepseek-v4.1-flash",
+                "secret-e",
+                None,
+            )
+            .expect("Command Code adapter"),
+        ),
+        Box::new(
+            OpenCodeGoAdapter::new(OPENCODE_GO_BASE_URL, "deepseek-v4-flash", "secret-f", None)
+                .expect("OpenCode Go adapter"),
+        ),
+        Box::new(
+            OpenCodeZenAdapter::new(
+                OPENCODE_ZEN_BASE_URL,
+                "big-pickle",
+                OPENCODE_ZEN_PUBLIC_KEY,
+                None,
+            )
+            .expect("OpenCode Zen adapter"),
+        ),
+        Box::new(XaiAdapter::new(XAI_BASE_URL, "grok-4.5", "secret-g", None).expect("xAI adapter")),
+    ];
+    for (arguments, expected_fragment) in [
+        ("{", "invalid JSON"),
+        ("null", "must be a JSON object"),
+        ("[]", "must be a JSON object"),
+        (r#""text""#, "must be a JSON object"),
+    ] {
+        let messages = [ProviderMessage::assistant(
+            "",
+            vec![ProviderToolCall {
+                id: "fixture-call".into(),
+                name: "read".into(),
+                arguments: arguments.into(),
+            }],
+        )];
+        for adapter in &adapters {
+            for result in [
+                adapter.prepare_messages_request_with_tools_checked(&messages, &[]),
+                adapter.prepare_compaction_request_checked(&messages),
+            ] {
+                let Err(ProviderError::InvalidResponse { message }) = result else {
+                    panic!(
+                        "invalid arguments must fail before request construction: {arguments:?}"
+                    );
+                };
+                assert!(message.contains("fixture-call"));
+                assert!(message.contains("read"));
+                assert!(message.contains(expected_fragment), "{message}");
+            }
+        }
+    }
+}
+
+#[test]
+fn valid_unicode_tool_arguments_round_trip_and_anthropic_unchecked_fallback_preserves_raw() {
+    let arguments = r#"{"path":"á😀","metadata":{"label":"café"}}"#;
+    let messages = [ProviderMessage::assistant(
+        "",
+        vec![ProviderToolCall {
+            id: "unicode-call".into(),
+            name: "read".into(),
+            arguments: arguments.into(),
+        }],
+    )];
+    let openai = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        "https://example.invalid/v1/chat/completions",
+        "model-a",
+        "secret-a",
+    ))
+    .expect("OpenAI adapter");
+    let openai_body: serde_json::Value = serde_json::from_slice(
+        openai
+            .prepare_messages_request_with_tools_checked(&messages, &[])
+            .expect("OpenAI request")
+            .body(),
+    )
+    .expect("OpenAI body");
+    let openai_message = openai_body["messages"]
+        .as_array()
+        .and_then(|messages| {
+            messages
+                .iter()
+                .find(|message| message["role"] == "assistant")
+        })
+        .expect("OpenAI assistant message");
+    assert_eq!(openai_message["tool_calls"][0]["id"], "unicode-call");
+    assert_eq!(openai_message["tool_calls"][0]["function"]["name"], "read");
+    assert_eq!(
+        openai_message["tool_calls"][0]["function"]["arguments"],
+        arguments
+    );
+
+    let anthropic = AnthropicAdapter::new(ProviderConfig::anthropic(
+        "https://example.invalid/v1/messages",
+        "claude-test",
+        "secret-b",
+    ))
+    .expect("Anthropic adapter");
+    let anthropic_body: serde_json::Value = serde_json::from_slice(
+        anthropic
+            .prepare_messages_request_with_tools_checked(&messages, &[])
+            .expect("Anthropic request")
+            .body(),
+    )
+    .expect("Anthropic body");
+    let anthropic_message = anthropic_body["messages"]
+        .as_array()
+        .and_then(|messages| {
+            messages
+                .iter()
+                .find(|message| message["role"] == "assistant")
+        })
+        .expect("Anthropic assistant message");
+    assert_eq!(anthropic_message["content"][0]["id"], "unicode-call");
+    assert_eq!(anthropic_message["content"][0]["name"], "read");
+    assert_eq!(
+        anthropic_message["content"][0]["input"],
+        json!({"path":"á😀","metadata":{"label":"café"}})
+    );
+
+    let invalid = [ProviderMessage::assistant(
+        "",
+        vec![ProviderToolCall {
+            id: "raw-call".into(),
+            name: "read".into(),
+            arguments: "not-json".into(),
+        }],
+    )];
+    let unchecked: serde_json::Value =
+        serde_json::from_str(&anthropic.build_messages_request(&invalid).body)
+            .expect("unchecked Anthropic body");
+    assert_eq!(
+        unchecked["messages"][0]["content"][0]["input"],
+        json!("not-json")
+    );
+    assert!(anthropic
+        .prepare_messages_request_with_tools_checked(&invalid, &[])
+        .is_err());
 }
 
 #[test]

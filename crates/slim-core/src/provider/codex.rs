@@ -246,6 +246,10 @@ impl ProviderAdapter for OpenAiCodexAdapter {
         &self.config.model
     }
 
+    fn reasoning_classification(&self) -> Option<crate::ReasoningClassification> {
+        Some(crate::ReasoningClassification::Summary)
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             supports_prompt_cache_key: true,

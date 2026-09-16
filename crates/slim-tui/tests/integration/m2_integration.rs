@@ -49,12 +49,15 @@ fn completed_run_retains_pending_tasks_without_marking_the_run_failed() {
         assert_eq!(state.todo_items[0].status, status);
         let notices = |state: &AppState| {
             state.blocks().iter().filter(|block| {
-            matches!(block.kind(), BlockKind::System(text) if text.contains("recorded task(s) remain pending"))
+            matches!(block.kind(), BlockKind::System(text) if text.contains("tarefa(s) registrada(s) continuam pendentes"))
         }).count()
         };
         assert_eq!(notices(&state), usize::from(expected));
         let frame = render(&state, 100, 24).lines.join("\n");
-        assert_eq!(frame.contains("recorded task(s) remain pending"), expected);
+        assert_eq!(
+            frame.contains("tarefa(s) registrada(s) continuam pendentes"),
+            expected
+        );
         state.apply_event(UiEvent::RunCompleted { run_id: 1 });
         assert_eq!(
             notices(&state),
@@ -148,7 +151,7 @@ fn render_uses_same_state_as_m0_view_model() {
     let state = AppState::new();
     assert_eq!(
         render(&state, 80, 24).lines.last(),
-        Some(&"signed out · /login".to_string())
+        Some(&"desconectado · /login".to_string())
     );
 }
 
@@ -506,10 +509,10 @@ fn activity_queue_todo_and_composer_are_projected_into_one_frame() {
     state.composer.paste("long\npaste");
     let lines = render(&state, 80, 24).lines;
     assert!(lines.iter().any(|line| line == "activity: child running"));
-    assert!(lines.iter().any(|line| line == "> queued[1] second prompt"));
+    assert!(lines.iter().any(|line| line == "> second prompt"));
     assert!(lines.iter().any(|line| line == "todo: 1/2 second prompt"));
     assert!(lines
         .iter()
         .any(|line| line == "composer: [Pasted Content 0 10 chars]"));
-    assert!(lines.iter().any(|line| line == "signed out · /login"));
+    assert!(lines.iter().any(|line| line == "desconectado · /login"));
 }
