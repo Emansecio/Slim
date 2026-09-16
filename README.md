@@ -590,3 +590,10 @@ OAuth usa PKCE S256, callback restrito a loopback, validação de `state`, refre
 e browser via `ShellExecuteW` sem shell. Codex usa SSE Responses; WebSocket fica
 fora deste checkpoint. Testes são localhost/offline: nenhum login real foi
 executado, e política de limites/cobrança pertence aos providers.
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
+
+This license applies to the original Slim code. Third-party dependencies and
+materials retain their respective licenses and rights.

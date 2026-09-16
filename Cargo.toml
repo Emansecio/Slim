@@ -7,6 +7,9 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+license = "Apache-2.0"
+
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 assigning_clones = "deny"
