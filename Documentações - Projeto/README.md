@@ -1,5 +1,10 @@
 # Documentação do Slim — índice canônico
 
+> Limpeza de 16/09/2026: removidos os módulos isolados de observabilidade e o
+> scheduler legado. O journal produtivo e o lifecycle durável de child no
+> serviço de capabilities permanecem. Os checkpoints abaixo são históricos;
+> a retirada de APIs está registrada no [checkout](../README.md).
+
 > **Status de implementação: checkpoint de integração parcial; v1 ainda não
 > concluída.** Atualizado em: 2026-08 (execução do tracker de auditoria TUI).
 >

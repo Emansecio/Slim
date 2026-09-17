@@ -340,24 +340,8 @@ fn is_cancel_droppable(event: &SessionEvent) -> bool {
     )
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SessionSnapshot {
-    pub session_id: String,
-    pub sequence: u64,
-}
-
-impl SessionSnapshot {
-    pub fn new(session_id: impl Into<String>, sequence: u64) -> Self {
-        Self {
-            session_id: session_id.into(),
-            sequence,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct AppHandle {
-    snapshot: Option<SessionSnapshot>,
     events: Vec<SessionEvent>,
     last_event_seq: Option<u64>,
     event_sender: Option<SessionEventSender>,
@@ -366,9 +350,7 @@ pub struct AppHandle {
 
 impl PartialEq for AppHandle {
     fn eq(&self, other: &Self) -> bool {
-        self.snapshot == other.snapshot
-            && self.events == other.events
-            && self.last_event_seq == other.last_event_seq
+        self.events == other.events && self.last_event_seq == other.last_event_seq
     }
 }
 
@@ -377,20 +359,11 @@ impl Eq for AppHandle {}
 impl AppHandle {
     pub fn fake() -> Self {
         Self {
-            snapshot: None,
             events: Vec::new(),
             last_event_seq: None,
             event_sender: None,
             run_journal: None,
         }
-    }
-
-    pub fn apply_session_snapshot(&mut self, snapshot: SessionSnapshot) {
-        self.snapshot = Some(snapshot);
-    }
-
-    pub fn snapshot(&self) -> Option<&SessionSnapshot> {
-        self.snapshot.as_ref()
     }
 
     pub fn set_event_sender(&mut self, sender: SessionEventSender) {
@@ -399,10 +372,6 @@ impl AppHandle {
 
     pub fn set_run_journal(&mut self, journal: Arc<Mutex<crate::session::ManualRunJournal>>) {
         self.run_journal = Some(journal);
-    }
-
-    pub fn clear_event_sender(&mut self) {
-        self.event_sender = None;
     }
 
     pub fn push_event(&mut self, event: SessionEvent) -> Result<(), &'static str> {

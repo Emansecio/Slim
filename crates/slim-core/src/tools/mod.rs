@@ -578,13 +578,6 @@ fn mode_definitions_base(mode: OperatingMode) -> Arc<[Value]> {
 }
 
 impl ToolRegistry {
-    pub fn with_process_runner(process_runner: ProcessRunner) -> Self {
-        Self {
-            services: Arc::new(ToolServices::new(process_runner)),
-            ..Self::default()
-        }
-    }
-
     pub(crate) fn process_runner(&self) -> &ProcessRunner {
         &self.services.process_runner
     }

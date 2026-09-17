@@ -38,10 +38,15 @@ pub struct AdaptiveTokenEstimator {
 
 impl AdaptiveTokenEstimator {
     pub fn estimate(&self, provider: &str, model: &str, serialized_chars: u64) -> u64 {
+        // The map holds one entry per provider/model pair; a linear scan avoids
+        // allocating the owned lookup key on every estimate.
         let ratio = self
             .chars_per_token_milli
-            .get(&(provider.to_owned(), model.to_owned()))
-            .copied()
+            .iter()
+            .find(|((known_provider, known_model), _)| {
+                known_provider.as_str() == provider && known_model.as_str() == model
+            })
+            .map(|(_, ratio)| *ratio)
             .unwrap_or(DEFAULT_CHARS_PER_TOKEN_MILLI);
         serialized_chars
             .saturating_mul(1_000)
@@ -268,10 +273,6 @@ impl CompactionHandle {
 
     pub fn mark_preparing(&self) {
         self.with_state_mut(|state| state.status = CompactionStatus::Preparing);
-    }
-
-    pub fn mark_ready(&self) {
-        self.with_state_mut(|state| state.status = CompactionStatus::Ready);
     }
 
     pub fn store_prepared(&self, prepared: PreparedCompaction) {

@@ -25,11 +25,6 @@ impl PositionEncoding {
             PositionEncoding::Utf32 => "utf-32",
         }
     }
-
-    /// UTF-16 code-unit count of a character (1 for BMP, 2 for astral planes).
-    pub fn utf16_units_of(ch: char) -> usize {
-        ch.len_utf16()
-    }
 }
 
 impl fmt::Display for PositionEncoding {

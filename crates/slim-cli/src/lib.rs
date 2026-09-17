@@ -13,8 +13,6 @@ pub mod opencode_go_catalog;
 pub mod opencode_zen_catalog;
 mod tui;
 
-use slim_core::AppHandle;
-
 pub use auth::{
     delete_api_key, delete_api_key_file, load_auth_credential, load_auth_file, redact,
     resolve_api_key, resolve_provider_credential, save_api_key, save_api_key_file, AuthError,
@@ -37,10 +35,6 @@ pub use tui::{
     run_provider_tui_turn, run_tui, spawn_tui_runtime, spawn_tui_runtime_with_resume, TuiError,
     TuiRuntimeHandle,
 };
-
-pub fn compose_app() -> AppHandle {
-    AppHandle::fake()
-}
 
 pub(crate) fn canonical_provider_model(
     kind: slim_core::provider::ProviderKind,

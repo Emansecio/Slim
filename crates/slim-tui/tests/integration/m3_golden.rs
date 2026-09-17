@@ -2,7 +2,7 @@ use slim_core::OperatingMode;
 use slim_tui::image::{render_image, ImageCapabilities, ImageRender};
 use slim_tui::input::cycle_mode;
 use slim_tui::inspector::{CommandPalette, InspectorKind, InspectorState};
-use slim_tui::theme::{detect_capabilities, glyph, resolve_theme, Capabilities, ColorDepth};
+use slim_tui::theme::{glyph, resolve_theme, Capabilities, ColorDepth};
 
 #[test]
 fn mode_cycle_and_command_palette_are_deterministic() {
@@ -45,16 +45,6 @@ fn inspectors_toggle_and_capabilities_degrade_safely() {
 }
 
 #[test]
-fn capability_detection_defaults_to_safe_fallbacks() {
-    let capabilities = detect_capabilities();
-    assert!(matches!(
-        capabilities.color_depth,
-        ColorDepth::TrueColor | ColorDepth::Ansi16 | ColorDepth::None
-    ));
-    assert_eq!(resolve_theme(capabilities).background, (0x00, 0x00, 0x00));
-}
-
-#[test]
 fn focused_composer_uses_the_normative_green_border() {
     let capabilities = Capabilities {
         color_depth: ColorDepth::TrueColor,
@@ -88,8 +78,6 @@ fn capability_matrix_covers_color_glyph_mouse_clipboard_and_image_fallbacks() {
         };
         assert_eq!(glyph(capabilities, '✓', '+'), expected_glyph);
         assert_eq!(resolve_theme(capabilities).background, (0x00, 0x00, 0x00));
-        assert!(capabilities.mouse);
-        assert!(capabilities.clipboard);
         assert_eq!(
             render_image("supported", ImageCapabilities { supported: true }),
             ImageRender::Inline {

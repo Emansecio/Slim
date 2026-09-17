@@ -1,6 +1,7 @@
 // In-memory integration cases share one executable.
 // Keep property tests and the composer latency check in their own targets.
 mod fault_injection;
+mod focused_input;
 mod golden_matrix;
 mod inspectors_golden;
 mod interaction_roundtrip;

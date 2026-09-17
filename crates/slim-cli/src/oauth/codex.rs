@@ -122,11 +122,7 @@ async fn device_login(
         .get("user_code")
         .and_then(Value::as_str)
         .ok_or_else(|| OAuthError::InvalidResponse("Codex user code is missing".into()))?;
-    let interval = value
-        .get("interval")
-        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
-        .unwrap_or(5)
-        .max(1);
+    let interval = poll_interval_secs(&value);
     let _ = progress.send(OAuthProgress::AuthUrl {
         url: endpoints.codex_device_verify.clone(),
         user_code: Some(user_code.into()),
@@ -268,9 +264,39 @@ pub fn account_id(access_token: &str) -> Result<String, OAuthError> {
         .ok_or_else(|| OAuthError::InvalidResponse("Codex account id is missing".into()))
 }
 
+/// Server-supplied poll interval, clamped: an absurd value would overflow
+/// `Instant::now() + Duration::from_secs(interval)` inside `sleep`.
+fn poll_interval_secs(value: &Value) -> u64 {
+    value
+        .get("interval")
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+        .unwrap_or(5)
+        .clamp(1, 300)
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_interval_clamps_absurd_server_values() {
+        assert_eq!(
+            poll_interval_secs(&serde_json::json!({"interval": u64::MAX})),
+            300
+        );
+        assert_eq!(
+            poll_interval_secs(&serde_json::json!({"interval": "99999999999999999999"})),
+            5
+        );
+        assert_eq!(poll_interval_secs(&serde_json::json!({"interval": "7"})), 7);
+        assert_eq!(poll_interval_secs(&serde_json::json!({})), 5);
+        assert_eq!(poll_interval_secs(&serde_json::json!({"interval": 0})), 1);
+    }
 }

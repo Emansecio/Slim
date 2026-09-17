@@ -1,0 +1,23 @@
+# gauge-prepare-cost
+# arms: loop(codex real) | loop-noenv(P1 off) | direct(P2 on, 4 secrets) | direct-nosens
+size_kb,arm,body_bytes,median_ms,min_ms,max_ms
+64,loop,79610,4.220,4.084,7.274
+64,loop-noenv,79610,4.672,4.166,4.940
+64,direct,79610,3.674,3.578,3.781
+64,direct-nosens,79610,3.371,3.255,3.462
+256,loop,277734,12.050,11.891,12.340
+256,loop-noenv,277734,12.055,11.892,12.311
+256,direct,277734,11.331,10.492,34.021
+256,direct-nosens,277734,9.687,9.531,10.363
+1024,loop,1084661,44.538,43.843,65.359
+1024,loop-noenv,1084661,44.215,43.771,44.515
+1024,direct,1084661,39.458,38.379,56.081
+1024,direct-nosens,1084661,35.028,34.667,36.418
+micro,chars_count,1084340,0.033 per op (20 iters)
+micro,len_bytes,1084340,0.000 per op (20 iters)
+micro,json_parse_body,1084340,2.689 per op (20 iters)
+micro,json_encode_body,1084340,10.544 per op (20 iters)
+micro,components_items_writer,1084340,9.733 per op (20 iters)
+micro,estimate_chars_fold_prefix,1084340,7.312 per op (20 iters)
+micro,estimate_bytes_fold_current,1084340,4.932 per op (20 iters)
+micro,history_to_vec_1MB,1052950,0.150,(20 iters)

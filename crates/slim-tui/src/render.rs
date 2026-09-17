@@ -1443,16 +1443,6 @@ impl WrapCache {
         self.bodies.retained_bytes()
     }
 
-    /// Drops every cached wrapped body and styled memo. Call this when theme
-    /// or render configuration changes so stale color/style derivations are
-    /// never reused.
-    pub fn invalidate_render_configuration(&mut self) {
-        self.bodies.clear();
-        self.scratch_bodies.clear();
-        self.block_line_memos.clear();
-        self.inspector_memo = None;
-    }
-
     /// Looks up the cached wrapped body for a stable block, or computes and
     /// stores it via `produce` on a miss. Non-cacheable blocks (streaming or
     /// oversized) reuse a small scratch slot per content generation so the

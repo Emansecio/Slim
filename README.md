@@ -1,5 +1,53 @@
 # Slim
 
+**Checkout — auditoria de performance e corretude, 16/09/2026:** varredura
+paralela dos quatro crates aplicou otimizações de comportamento idêntico no
+slim-core (estimador de tokens por byte-scan, fast-path sem segredos na redação
+e no clone de histórico, framer MCP O(n), contagem de bytes no body) e na
+slim-tui (decoder de paste O(n²)→O(n), scrollbar sem alocação por frame,
+scans únicos no reducer), além de dois bugs corrigidos no slim-cli (stdin
+ignorado com `--effort`/`--fast`/`--normal`/`--abandon-pending`; leitura de
+header de sessão sem limite, agora 64 KiB) e um bug latente no cache
+ponderado da TUI. A suíte perdeu 4 testes inúteis e 1 fixture órfão.
+Medição dedicada (`bench/gauge-prepare-cost`) localizou o custo dominante por
+turno na serialização dupla do accounting de prepare (~20 ms @1 MiB de body) —
+registrada como proposta, pois exige mudança no contrato `ProviderAdapter`.
+Validação desta sessão: `cargo fmt --all -- --check` limpo,
+`cargo clippy --workspace --lib --bins --offline -- -D warnings` limpo e
+`cargo test --workspace --offline` com 1673 testes aprovados, 0 falhas,
+34 ignorados. Apenas checkout, sem deploy; números de bench em profile dev.
+
+**Checkout — foco nos campos de texto, 16/09/2026:** login por API key, busca,
+paleta e filtro de modelos passam a posicionar o cursor nativo no campo ativo.
+A barra pisca pelo próprio terminal, sem timer extra, e sua forma padrão é
+restaurada ao sair. O login mantém a chave mascarada, mostra orientação quando
+vazio e exibe progresso/erro de salvamento; durante a operação, oculta o cursor.
+Apenas checkout, sem deploy; piscada física depende do suporte do terminal.
+
+**Checkout — catálogo ClinePass, 16/09/2026:** o limite de 256 modelos é aplicado
+depois do filtro `cline-pass/`, evitando rejeitar um catálogo geral grande que
+contenha modelos elegíveis. O limite bruto de 1 MiB permanece. Na consulta desta
+data, Union Alpha apareceu nos endpoints Go/Zen (`union-alpha`) e Cline
+(`stealth/union-alpha`), mas os registros locais Go/Zen e o namespace ClinePass
+não o admitem. O GET Cline autenticado retornou 444 IDs, nenhum `cline-pass/`;
+nesse caso, o Slim usa o bundle estático. Não foi adicionada exceção para o modelo
+nem validada inferência com ele. Apenas checkout, sem deploy.
+
+Validação dessas duas correções: `cargo test -p slim-tui --offline` (505 testes
+aprovados, 5 ignorados), teste `clinepass_provider` (6 aprovados), catálogos
+Go/Zen e smoke de integração (17 aprovados). `cargo fmt --all -- --check` e
+`cargo clippy --workspace --lib --bins --offline -- -D warnings` passaram.
+A piscada não foi observada em console físico nesta validação.
+
+**Checkout — limpeza de APIs, 16/09/2026:** removidos wrappers sem consumidores,
+helpers visuais obsoletos, snapshots artificiais de smoke, o scheduler legado e
+os módulos isolados de snapshot/watch/hooks/telemetria. O smoke usa estado,
+eventos e renderização reais da TUI. O journal, a persistência de TODO e os
+contratos duráveis de child/Plan/Goal permanecem; os registros `task.v1` continuam
+aceitos na retomada. Esta limpeza reduz APIs públicas e não é compatível com
+consumidores externos das APIs removidas. Apenas checkout, sem deploy.
+[Relatório da limpeza, medições e validação](analysis_outputs/LIMPEZA-2026-09-16.md).
+
 **Checkout — composer, colagem e fila, 16/09/2026:** a colagem do Windows passa
 por um decodificador no fluxo de eventos (`input.rs`): marcadores `ESC [200~` /
 `ESC [201~` viram um payload atômico e um paste sem marcadores tem os `Enter`

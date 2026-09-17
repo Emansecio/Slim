@@ -32,17 +32,15 @@ pub use interaction::{
     QuestionAnswerSource, QuestionOption, MAX_OPTION_DESCRIPTION_CHARS, MAX_OPTION_LABEL_CHARS,
     MAX_QUESTION_CHARS, MAX_QUESTION_OPTIONS,
 };
-pub use model::{
-    AppHandle, EventQueueStats, SessionEventReceiver, SessionEventSender, SessionSnapshot,
-};
+pub use model::{AppHandle, EventQueueStats, SessionEventReceiver, SessionEventSender};
 pub use profiles::{Profile, ProfileCatalog, ProfileId};
 pub use protocol::OperatingMode;
 pub use provider::{
-    run_http_provider, run_http_provider_messages, AnthropicAdapter, FakeProvider,
-    HttpProviderClient, HttpRequest, OpenAiCompatibleAdapter, PreparedProviderRequest,
-    ProviderAdapter, ProviderConfig, ProviderError, ProviderEvent, ProviderKind, ProviderMessage,
-    ProviderPhase, ProviderPricing, ProviderRequestComponents, ProviderRequestFingerprints,
-    ProviderTimeouts, ProviderToolCall, UsageBreakdown,
+    run_http_provider_messages, AnthropicAdapter, FakeProvider, HttpProviderClient, HttpRequest,
+    OpenAiCompatibleAdapter, PreparedProviderRequest, ProviderAdapter, ProviderConfig,
+    ProviderError, ProviderEvent, ProviderKind, ProviderMessage, ProviderPhase, ProviderPricing,
+    ProviderRequestComponents, ProviderRequestFingerprints, ProviderTimeouts, ProviderToolCall,
+    UsageBreakdown,
 };
 pub use runtime::{
     tool_call_is_read_only, without_workspace_snapshot, AgentLoopConfig, AgentLoopResult,

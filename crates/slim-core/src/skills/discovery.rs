@@ -125,11 +125,6 @@ fn discover_workspace_with_profile(
     discover(&roots)
 }
 
-#[allow(dead_code)]
-fn _is_skill_directory(path: &Path) -> bool {
-    path.is_dir() && path.join("SKILL.md").is_file()
-}
-
 #[cfg(test)]
 mod tests {
     use super::discover_workspace_with_profile;

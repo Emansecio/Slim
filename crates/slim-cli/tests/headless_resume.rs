@@ -868,13 +868,16 @@ fn credential_bearing_tool_is_rejected_before_durable_effects() {
         let body = format!("data: {payload}\n\ndata: [DONE]\n\n");
         stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
     });
-    let result = run_provider_headless_with_resume(request(endpoint), &path).unwrap();
+    let result = run_provider_headless_with_resume(request(endpoint), &path);
     server.join().unwrap();
-    assert_eq!(result.code, ExitCode::Provider);
-    assert!(result
-        .stop_message
-        .unwrap()
-        .contains("registered sensitive material"));
+    let Err(error) = result else {
+        panic!("sensitive-material rejection must propagate fail-closed as Err")
+    };
+    assert!(matches!(
+        error,
+        slim_core::provider::ProviderError::InvalidResponse { ref message }
+            if message.contains("registered sensitive material")
+    ));
     let report = preflight_session(&path).unwrap();
     assert!(!report.records.iter().any(|record| matches!(record,
         DurableRecord::Fact { fact, .. } if fact.namespace == "task.v1")));

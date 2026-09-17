@@ -39,11 +39,9 @@ impl BracketedPasteDecoder {
                 let Some(end) = find_subslice(&self.buffer, END) else {
                     break;
                 };
-                let payload = self.buffer.drain(..end).collect::<Vec<_>>();
-                self.buffer.drain(..END.len());
-                decoded.push(DecodedInput::Paste(
-                    String::from_utf8_lossy(&payload).into(),
-                ));
+                let payload = String::from_utf8_lossy(&self.buffer[..end]).into_owned();
+                self.buffer.drain(..end + END.len());
+                decoded.push(DecodedInput::Paste(payload));
                 self.pasting = false;
                 continue;
             }
@@ -51,14 +49,16 @@ impl BracketedPasteDecoder {
                 let keep = longest_suffix_prefix(&self.buffer, START);
                 let emit_len = self.buffer.len().saturating_sub(keep);
                 if emit_len > 0 {
-                    let text = self.buffer.drain(..emit_len).collect::<Vec<_>>();
-                    decoded.push(DecodedInput::Text(String::from_utf8_lossy(&text).into()));
+                    let text = String::from_utf8_lossy(&self.buffer[..emit_len]).into_owned();
+                    self.buffer.drain(..emit_len);
+                    decoded.push(DecodedInput::Text(text));
                 }
                 break;
             };
             if start > 0 {
-                let text = self.buffer.drain(..start).collect::<Vec<_>>();
-                decoded.push(DecodedInput::Text(String::from_utf8_lossy(&text).into()));
+                let text = String::from_utf8_lossy(&self.buffer[..start]).into_owned();
+                self.buffer.drain(..start);
+                decoded.push(DecodedInput::Text(text));
             }
             self.buffer.drain(..START.len());
             self.pasting = true;
@@ -137,6 +137,9 @@ pub struct PasteStreamDecoder {
     /// Press events held while a marker is undecided (at most 5).
     pending: Vec<KeyEvent>,
     payload: String,
+    /// `payload.chars().count()` kept incrementally: a per-char scan would
+    /// make a ConPTY paste burst quadratic (one key event per pasted char).
+    payload_chars: usize,
     /// Text already seen in the current input burst; an `Enter` that follows
     /// it (or precedes more queued input) is a paste newline, not a submit.
     burst_text: bool,
@@ -204,10 +207,12 @@ impl PasteStreamDecoder {
                 self.pending.clear();
                 if self.pasting {
                     self.pasting = false;
+                    self.payload_chars = 0;
                     return vec![DecodedEvent::Paste(std::mem::take(&mut self.payload))];
                 }
                 self.pasting = true;
                 self.payload.clear();
+                self.payload_chars = 0;
             }
             return Vec::new();
         }
@@ -218,6 +223,7 @@ impl PasteStreamDecoder {
             for held in self.pending.drain(..) {
                 if let Some(character) = paste_char(held.code) {
                     self.payload.push(character);
+                    self.payload_chars += 1;
                 }
             }
         } else {
@@ -241,8 +247,10 @@ impl PasteStreamDecoder {
         match paste_char(key.code) {
             Some(character) => {
                 self.payload.push(character);
-                if self.payload.chars().count() >= crate::composer::MAX_DRAFT_CHARS {
+                self.payload_chars += 1;
+                if self.payload_chars >= crate::composer::MAX_DRAFT_CHARS {
                     self.pasting = false;
+                    self.payload_chars = 0;
                     return vec![DecodedEvent::Paste(std::mem::take(&mut self.payload))];
                 }
                 Vec::new()
@@ -282,5 +290,101 @@ fn paste_char(code: KeyCode) -> Option<char> {
         KeyCode::Backspace => Some('\x08'),
         KeyCode::Esc => Some('\x1b'),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BracketedPasteDecoder, DecodedEvent, DecodedInput, PasteStreamDecoder};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn bracketed_paste_decodes_across_partial_feeds() {
+        let mut decoder = BracketedPasteDecoder::default();
+        // The marker tail is held back until the rest arrives.
+        assert_eq!(
+            decoder.feed(b"hello \x1b[20"),
+            vec![DecodedInput::Text("hello ".into())]
+        );
+        assert_eq!(
+            decoder.feed(b"0~payload\nlines\x1b[201~ tail"),
+            vec![
+                DecodedInput::Paste("payload\nlines".into()),
+                DecodedInput::Text(" tail".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn key_paste_roundtrips_through_markers() {
+        let mut decoder = PasteStreamDecoder::default();
+        for code in [
+            KeyCode::Esc,
+            KeyCode::Char('['),
+            KeyCode::Char('2'),
+            KeyCode::Char('0'),
+            KeyCode::Char('0'),
+            KeyCode::Char('~'),
+        ] {
+            assert!(decoder.feed(Event::Key(key(code)), false).is_empty());
+        }
+        for event in [KeyCode::Char('a'), KeyCode::Enter, KeyCode::Char('b')] {
+            assert!(decoder.feed(Event::Key(key(event)), false).is_empty());
+        }
+        let mut pasted = None;
+        for code in [
+            KeyCode::Esc,
+            KeyCode::Char('['),
+            KeyCode::Char('2'),
+            KeyCode::Char('0'),
+            KeyCode::Char('1'),
+            KeyCode::Char('~'),
+        ] {
+            for decoded in decoder.feed(Event::Key(key(code)), false) {
+                if let DecodedEvent::Paste(payload) = decoded {
+                    pasted = Some(payload);
+                }
+            }
+        }
+        assert_eq!(pasted.as_deref(), Some("a\nb"));
+    }
+
+    #[test]
+    fn key_paste_cap_counts_chars_incrementally() {
+        let mut decoder = PasteStreamDecoder::default();
+        for code in [
+            KeyCode::Esc,
+            KeyCode::Char('['),
+            KeyCode::Char('2'),
+            KeyCode::Char('0'),
+            KeyCode::Char('0'),
+            KeyCode::Char('~'),
+        ] {
+            decoder.feed(Event::Key(key(code)), false);
+        }
+        let mut emitted = None;
+        for _ in 0..crate::composer::MAX_DRAFT_CHARS {
+            for decoded in decoder.feed(Event::Key(key(KeyCode::Char('a'))), false) {
+                if let DecodedEvent::Paste(payload) = decoded {
+                    emitted = Some(payload);
+                }
+            }
+        }
+        let payload = emitted.expect("draft-size cap flushes the paste");
+        assert_eq!(
+            payload.chars().count(),
+            crate::composer::MAX_DRAFT_CHARS,
+            "payload ends exactly at the cap"
+        );
+        // The decoder recovered: fresh input flows as normal events again.
+        let press = Event::Key(key(KeyCode::Char('a')));
+        assert_eq!(
+            decoder.feed(press.clone(), false),
+            vec![DecodedEvent::Event(press)]
+        );
     }
 }

@@ -132,23 +132,6 @@ impl SearchFilter {
     }
 }
 
-pub fn block_search_text(block: &Block) -> String {
-    match block.kind() {
-        BlockKind::User(text)
-        | BlockKind::Assistant(text)
-        | BlockKind::Thinking(text)
-        | BlockKind::System(text)
-        | BlockKind::Error(text)
-        | BlockKind::Activity(text)
-        | BlockKind::QueuedUser(text) => text.clone(),
-        BlockKind::Tool(tool) => format!(
-            "{} {} {} {}",
-            tool.name, tool.arguments_summary, tool.preview, tool.materialized_output
-        ),
-        BlockKind::InteractionRequest(request) => request.display_text(),
-    }
-}
-
 fn str_contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
     if needle_lower.is_empty() {
         return true;
@@ -196,10 +179,6 @@ pub fn block_matches_query(block: &Block, query_lower: &str) -> bool {
             str_contains_ignore_case(&request.display_text(), query_lower)
         }
     }
-}
-
-pub fn search_match_indices(blocks: &[Block], query: &str) -> Vec<usize> {
-    search_match_indices_filtered(blocks, query, SearchFilter::All)
 }
 
 pub fn search_match_indices_filtered(
@@ -264,10 +243,4 @@ impl CommandPalette {
     }
 }
 
-pub fn safe_block_text<T>(
-    render: impl FnOnce() -> Result<T, String>,
-    fallback: impl FnOnce() -> T,
-) -> T {
-    render().unwrap_or_else(|_| fallback())
-}
 use crate::block::{is_failed_tool, Block, BlockKind};

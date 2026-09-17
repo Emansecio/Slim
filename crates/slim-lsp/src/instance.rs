@@ -13,14 +13,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lsp_types::{
-    ClientCapabilities, ClientInfo, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, GeneralClientCapabilities,
-    GotoCapability, HoverClientCapabilities, InitializeParams, InitializeResult, InitializedParams,
-    MarkupKind, ProgressParams, ProgressParamsValue, ProgressToken,
-    PublishDiagnosticsClientCapabilities, ServerCapabilities, TextDocumentClientCapabilities,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentSyncClientCapabilities, VersionedTextDocumentIdentifier, WindowClientCapabilities,
-    WorkDoneProgress, WorkspaceClientCapabilities, WorkspaceFolder,
+    ClientCapabilities, ClientInfo, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, GeneralClientCapabilities, GotoCapability, HoverClientCapabilities,
+    InitializeParams, InitializeResult, InitializedParams, MarkupKind, ProgressParams,
+    ProgressParamsValue, ProgressToken, PublishDiagnosticsClientCapabilities, ServerCapabilities,
+    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentSyncClientCapabilities, VersionedTextDocumentIdentifier,
+    WindowClientCapabilities, WorkDoneProgress, WorkspaceClientCapabilities, WorkspaceFolder,
 };
 use serde_json::{json, Value};
 use slim_core::runtime::CancellationToken;
@@ -34,8 +33,6 @@ use crate::transport::{
     LspTransport, NotificationReceiver, ServerNotification, TransportError, TransportOptions,
 };
 
-/// Latest negotiated LSP protocol version advertised in initialize.
-pub const PROTOCOL_VERSION: &str = "3.17";
 const SHUTDOWN_REQUEST_GRACE: Duration = Duration::from_millis(500);
 
 struct SyncTransaction<'a> {
@@ -709,47 +706,6 @@ impl LspServerInstance {
         Ok(())
     }
 
-    /// didClose for a document (LRU eviction or shutdown path).
-    pub async fn close_document(&self, path: &Path) {
-        let Some(path) = crate::path_policy::existing_workspace_path(&self.config.root, path)
-        else {
-            return;
-        };
-        let _document_sync = self.document_lock(&path).lock_owned().await;
-        let _lifecycle = self.document_lifecycle.lock().await;
-        if self.transport.is_closed() {
-            return;
-        }
-        let Some(uri) = file_uri(&path) else {
-            return;
-        };
-        let mut transaction = SyncTransaction {
-            transport: &self.transport,
-            committed: false,
-        };
-        let removed = {
-            let mut state = self.state.lock().await;
-            state.documents.remove(&path).is_some()
-        };
-        if !removed {
-            transaction.committed = true;
-            return;
-        }
-        let params = DidCloseTextDocumentParams {
-            text_document: TextDocumentIdentifier {
-                uri: to_lsp_uri(&uri),
-            },
-        };
-        let result = self
-            .transport
-            .notify(
-                "textDocument/didClose",
-                serde_json::to_value(&params).unwrap_or(Value::Null),
-            )
-            .await;
-        transaction.committed = result.is_ok();
-    }
-
     /// Low-level typed request used by the manager for LSP queries.
     pub async fn request_value(
         &self,
@@ -778,19 +734,6 @@ impl LspServerInstance {
         }
         let state = self.state.lock().await;
         state.documents.get(&path).map(|doc| doc.version)
-    }
-
-    pub async fn document_snapshot_async(&self, path: &Path) -> Option<(i64, String)> {
-        let path = crate::path_policy::existing_workspace_path(&self.config.root, path)?;
-        let _document_sync = self.document_lock(&path).lock_owned().await;
-        if self.transport.is_closed() {
-            return None;
-        }
-        let state = self.state.lock().await;
-        state
-            .documents
-            .get(&path)
-            .map(|document| (document.version, document.text.to_string()))
     }
 
     pub(crate) async fn document_content_snapshot_async(
@@ -839,17 +782,6 @@ impl LspServerInstance {
             truncated: stored.truncated,
             items,
         })
-    }
-
-    pub async fn diagnostics_for(
-        &self,
-        uri: &url::Url,
-        include_info: bool,
-    ) -> Vec<lsp_types::Diagnostic> {
-        self.diagnostics_snapshot(uri, include_info)
-            .await
-            .map(|snapshot| snapshot.items)
-            .unwrap_or_default()
     }
 
     /// URIs that currently have stored diagnostics from this server.

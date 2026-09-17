@@ -109,18 +109,6 @@ impl ExecutableResolver {
         Ok(resolved)
     }
 
-    /// Explicit configuration wins over PATH and never silently falls back.
-    pub fn resolve_configured(
-        &self,
-        configured: Option<&Path>,
-        fallback: impl AsRef<Path>,
-    ) -> io::Result<Option<PathBuf>> {
-        match configured {
-            Some(program) => self.resolve(program),
-            None => self.resolve(fallback),
-        }
-    }
-
     /// Clears positive and negative entries while retaining this shared instance.
     pub fn bump_generation(&self) {
         let mut state = self

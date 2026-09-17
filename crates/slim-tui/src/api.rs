@@ -642,16 +642,6 @@ impl UiEvent {
         self.is_accounting_telemetry() || matches!(self, Self::AssistantEnded)
     }
 
-    pub fn is_interaction_protocol(&self) -> bool {
-        matches!(
-            self,
-            Self::ApprovalRequired { .. }
-                | Self::InputRequired { .. }
-                | Self::QuestionRequired { .. }
-                | Self::InteractionAcknowledged { .. }
-        )
-    }
-
     /// Events that are part of an already-emitted causal suffix must not be
     /// discarded when cancellation interrupts projector backpressure.
     pub fn survives_cancellation(&self) -> bool {
@@ -668,16 +658,6 @@ impl UiEvent {
                     | Self::InteractionAcknowledged { .. }
                     | Self::RequestCompleted { .. }
             )
-    }
-
-    pub fn run_terminal_id(&self) -> Option<u64> {
-        match self {
-            Self::RunCompleted { run_id }
-            | Self::RunStopped { run_id, .. }
-            | Self::RunCancelled { run_id } => Some(*run_id),
-            Self::RunFailed { run_id, .. } => *run_id,
-            _ => None,
-        }
     }
 
     pub fn is_run_terminal(&self) -> bool {
@@ -1357,7 +1337,6 @@ impl WakeSignal {
     }
 
     #[cfg(windows)]
-    #[allow(dead_code)]
     pub(crate) fn raw_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
         self.0.event
     }

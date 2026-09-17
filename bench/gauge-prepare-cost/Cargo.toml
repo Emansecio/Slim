@@ -1,0 +1,24 @@
+[package]
+name = "gauge-prepare-cost"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone workspace on purpose: this crate must NOT share D:\Slim\target
+# or the workspace Cargo.lock with the fixers. slim-core is built from source
+# into ./target under this directory.
+[workspace]
+
+[dependencies]
+slim-core = { path = "../../crates/slim-core" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "net", "time", "io-util"] }
+
+[profile.dev]
+# runtime/mod.rs:1965 has `debug_assert!(serialized_chars <= preflight_chars)`.
+# The structural estimate is designed to bound production payloads, but a
+# synthetic history shape could in principle trip it; keeping debug asserts
+# off avoids an abort mid-measurement. All timed code paths are identical
+# (debug_assert is a compile-time check, not work).
+debug-assertions = false
+overflow-checks = false

@@ -374,12 +374,15 @@ fn select_previous_tui_session(
 }
 
 /// First-line decode of a durable session header. The strict deserialize
-/// rejects non-v2 schema versions and non-session record types.
+/// rejects non-v2 schema versions and non-session record types. The line
+/// read is capped so a hostile or corrupt .jsonl in the sessions directory
+/// cannot be loaded into memory whole.
 fn read_session_header(path: &Path) -> Option<DurableSessionHeader> {
+    const MAX_HEADER_LINE_BYTES: u64 = 64 * 1024;
     let file = fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(std::io::Read::take(file, MAX_HEADER_LINE_BYTES));
     let mut first_line = Vec::new();
-    std::io::BufRead::read_until(&mut std::io::BufReader::new(file), b'\n', &mut first_line)
-        .ok()?;
+    std::io::BufRead::read_until(&mut reader, b'\n', &mut first_line).ok()?;
     serde_json::from_slice(&first_line).ok()
 }
 
@@ -3368,13 +3371,7 @@ fn run_worker(
 /// Scrubs text headed for UI surfaces: the CLI-side redactor plus every
 /// configured MCP env/header value (a stderr tail can echo them).
 fn redact_mcp_text(manager: &McpManager, input: &str) -> String {
-    let mut text = crate::redact(input);
-    for secret in manager.sensitive_values() {
-        if !secret.is_empty() {
-            text = text.replace(&secret, "[REDACTED]");
-        }
-    }
-    text
+    crate::auth::redact_with_secrets(input, &manager.sensitive_values())
 }
 
 /// Maps manager state to the UI view: target/error lines are bounded,
@@ -6151,5 +6148,37 @@ mod restored_tool_tests {
             })
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn session_header_decodes_valid_first_line() {
+        let path = std::env::temp_dir().join(format!(
+            "slim-session-header-ok-{}-{}.jsonl",
+            std::process::id(),
+            system_time_nanos(SystemTime::now())
+        ));
+        let header = DurableSessionHeader::new("tui-check", "1", "D:/tmp", None, None);
+        let mut bytes = serde_json::to_vec(&header).expect("encode header");
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"{\"type\":\"operation\"}");
+        fs::write(&path, &bytes).expect("write fixture");
+        let parsed = read_session_header(&path).expect("header");
+        assert_eq!(parsed.id, "tui-check");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn session_header_rejects_line_beyond_the_read_cap() {
+        let path = std::env::temp_dir().join(format!(
+            "slim-session-header-huge-{}-{}.jsonl",
+            std::process::id(),
+            system_time_nanos(SystemTime::now())
+        ));
+        let header = DurableSessionHeader::new("tui-huge", "1", "x".repeat(128 * 1024), None, None);
+        let mut bytes = serde_json::to_vec(&header).expect("encode header");
+        bytes.push(b'\n');
+        fs::write(&path, &bytes).expect("write fixture");
+        assert!(read_session_header(&path).is_none());
+        let _ = fs::remove_file(&path);
     }
 }

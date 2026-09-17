@@ -1,6 +1,6 @@
 use std::io::{self, Stdout};
 
-use crossterm::cursor::Hide;
+use crossterm::cursor::{Hide, SetCursorStyle};
 use crossterm::event::EnableBracketedPaste;
 use crossterm::execute;
 use ratatui::backend::CrosstermBackend;
@@ -31,7 +31,7 @@ impl FullscreenBackend {
                 return Err(error);
             }
         }
-        let _ = execute!(stdout, Hide);
+        let _ = execute!(stdout, SetCursorStyle::BlinkingBar, Hide);
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self { terminal, guard })
     }

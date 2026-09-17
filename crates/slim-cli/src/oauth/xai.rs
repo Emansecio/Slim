@@ -54,7 +54,7 @@ pub async fn login(
     });
     let _ = browser.open(&device.verification_uri);
     let deadline = now_ms().saturating_add(device.expires_in.saturating_mul(1000));
-    let interval = device.interval.max(1);
+    let interval = device.poll_interval_secs();
     loop {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
@@ -170,9 +170,43 @@ fn default_interval() -> u64 {
     5
 }
 
+impl DeviceCode {
+    /// Server-supplied poll interval, clamped: an absurd value would overflow
+    /// `Instant::now() + Duration::from_secs(interval)` inside `sleep`.
+    fn poll_interval_secs(&self) -> u64 {
+        self.interval.clamp(1, 300)
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_poll_interval_clamps_absurd_server_values() {
+        let device: DeviceCode = serde_json::from_str(
+            r#"{"device_code":"d","user_code":"u","verification_uri":"https://x","interval":18446744073709551615,"expires_in":900}"#,
+        )
+        .expect("device response parses");
+        assert_eq!(device.poll_interval_secs(), 300);
+
+        let device: DeviceCode = serde_json::from_str(
+            r#"{"device_code":"d","user_code":"u","verification_uri":"https://x","expires_in":900}"#,
+        )
+        .expect("missing interval defaults");
+        assert_eq!(device.poll_interval_secs(), 5);
+
+        let device: DeviceCode = serde_json::from_str(
+            r#"{"device_code":"d","user_code":"u","verification_uri":"https://x","interval":0,"expires_in":900}"#,
+        )
+        .expect("zero interval parses");
+        assert_eq!(device.poll_interval_secs(), 1);
+    }
 }

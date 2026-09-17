@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use slim_core::events::{EventKind, SessionEvent};
-use slim_core::session::{branch, recover, SessionIndex, SessionSnapshot, SessionWriter};
+use slim_core::session::{branch, recover, SessionIndex, SessionWriter};
 
 fn temp_path(name: &str) -> PathBuf {
     let unique = format!(
@@ -17,7 +17,7 @@ fn temp_path(name: &str) -> PathBuf {
 }
 
 #[test]
-fn branch_keeps_parent_identity_and_rebuildable_caches() {
+fn branch_keeps_parent_identity_and_rebuildable_index() {
     let path = temp_path("parent.jsonl");
     let mut writer = SessionWriter::create(&path, "parent", "D:\\Slim").expect("create");
     for seq in 1..=2 {
@@ -39,9 +39,7 @@ fn branch_keeps_parent_identity_and_rebuildable_caches() {
     assert_eq!(child.header.cutoff_seq, Some(1));
     assert_eq!(child.events.len(), 1);
 
-    let snapshot = SessionSnapshot::rebuild(&child.events);
     let index = SessionIndex::rebuild(&child.events);
-    assert_eq!(snapshot.event_count, 1);
     assert_eq!(index.last_seq, Some(1));
 
     let _ = fs::remove_dir_all(path.parent().expect("parent"));

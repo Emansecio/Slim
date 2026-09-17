@@ -1,6 +1,6 @@
 use std::io::{self, Stdout, Write};
 
-use crossterm::cursor::Show;
+use crossterm::cursor::{SetCursorStyle, Show};
 use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -194,7 +194,13 @@ fn enable_with_rollback(
 }
 
 fn restore_surface<W: Write>(stdout: &mut W, mouse_capture: bool) -> io::Result<()> {
-    execute!(stdout, Show, LeaveAlternateScreen, DisableBracketedPaste)?;
+    execute!(
+        stdout,
+        SetCursorStyle::DefaultUserShape,
+        Show,
+        LeaveAlternateScreen,
+        DisableBracketedPaste
+    )?;
     if mouse_capture {
         execute!(stdout, DisableMouseCapture)?;
     }
@@ -246,6 +252,12 @@ mod tests {
 
         super::restore_surface(&mut output, false)
             .expect("terminal cleanup without mouse capture should succeed");
+        assert!(
+            output
+                .windows(b"\x1b[0 q".len())
+                .any(|window| window == b"\x1b[0 q"),
+            "terminal cleanup must restore the user's cursor shape"
+        );
     }
 
     #[test]

@@ -16,10 +16,6 @@ impl ContextBudget {
         }
     }
 
-    pub fn threshold_tokens(self) -> u64 {
-        CompactionPolicy::default().hard_threshold_tokens(self.window_tokens)
-    }
-
     pub fn should_compact(self) -> bool {
         CompactionPolicy::default().is_over_hard(
             self.used_tokens,

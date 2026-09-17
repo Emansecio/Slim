@@ -556,6 +556,21 @@ pub fn redact(input: &str) -> String {
     redacted
 }
 
+/// `redact` plus literal secret values, longest first — the same discipline as
+/// the runtime's `normalize_sensitive_values`. Replacing in arbitrary order
+/// lets a shorter secret that overlaps a longer one consume its head and leak
+/// the remaining tail.
+pub(crate) fn redact_with_secrets(input: &str, secrets: &[String]) -> String {
+    let mut secrets: Vec<&String> = secrets.iter().filter(|value| !value.is_empty()).collect();
+    secrets.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    secrets.dedup();
+    let mut text = redact(input);
+    for secret in secrets {
+        text = text.replace(secret.as_str(), "[REDACTED]");
+    }
+    text
+}
+
 fn redact_json_value(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(object) => {
@@ -1122,3 +1137,35 @@ mod native_acl {
 
 #[cfg(windows)]
 use native_acl::NativeAuthFile;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_with_secrets_replaces_longest_first_on_overlap() {
+        // Shorter secret is a substring of the longer one: applied first it
+        // would leave "123def" — the tail of the real secret — in the output.
+        let secrets = vec!["abc".to_string(), "abc123def".to_string()];
+        assert_eq!(
+            redact_with_secrets("token abc123def here", &secrets),
+            "token [REDACTED] here"
+        );
+    }
+
+    #[test]
+    fn redact_with_secrets_mid_overlap_leaks_no_fragments() {
+        // "SECRET" overlaps the middle of the longer secret: applied first it
+        // would leak both "XYZ-" and "-789" fragments.
+        let secrets = vec!["SECRET".to_string(), "XYZ-SECRET-789".to_string()];
+        let out = redact_with_secrets("key=XYZ-SECRET-789", &secrets);
+        assert_eq!(out, "key=[REDACTED]");
+        assert!(!out.contains("789"));
+    }
+
+    #[test]
+    fn redact_with_secrets_ignores_empty_and_dedups() {
+        let secrets = vec!["".to_string(), "dup".to_string(), "dup".to_string()];
+        assert_eq!(redact_with_secrets("a dup b", &secrets), "a [REDACTED] b");
+    }
+}

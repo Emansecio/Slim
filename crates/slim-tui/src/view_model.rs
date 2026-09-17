@@ -515,102 +515,6 @@ pub fn format_context(state: &AppState, compact: bool) -> String {
     }
 }
 
-/// Format tokens per second (stored as tenths of tok/s, e.g. 854 = 85.4 tok/s).
-pub fn format_tokens_per_sec(tenths: u64) -> String {
-    if tenths == 0 {
-        return String::new();
-    }
-    if tenths < 1_000 {
-        format!("{}.{} tok/s", tenths / 10, tenths % 10)
-    } else if tenths < 100_000 {
-        format!("{} tok/s", (tenths + 5) / 10)
-    } else {
-        format!("{}.{}k tok/s", tenths / 10_000, (tenths % 10_000) / 1_000)
-    }
-}
-
-/// Compact tokens per second for narrow terminals (stored as tenths of tok/s).
-pub fn format_tokens_per_sec_compact(tenths: u64) -> String {
-    if tenths == 0 {
-        return String::new();
-    }
-    if tenths < 100 {
-        format!("{}.{} t/s", tenths / 10, tenths % 10)
-    } else if tenths < 100_000 {
-        format!("{} t/s", (tenths + 5) / 10)
-    } else {
-        format!("{}k t/s", (tenths + 5_000) / 10_000)
-    }
-}
-
-/// Vertical fractional block characters (U+2581..=U+2588) for 8-level sparklines.
-pub const FRACTIONAL_VERTICAL: [char; 8] = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-
-/// Horizontal fractional block characters (U+258F..=U+2588) for 8x sub-character precision.
-pub const FRACTIONAL_HORIZONTAL: [char; 8] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
-
-/// Render a sparkline from a series of values using vertical fractional blocks (tui-design visual-catalog).
-/// Returns an empty string if values is empty. Scaled between 0 and the maximum observed value.
-pub fn render_sparkline(values: &[u64]) -> String {
-    if values.is_empty() {
-        return String::new();
-    }
-    let max = *values.iter().max().unwrap_or(&0);
-    if max == 0 {
-        return " ".repeat(values.len());
-    }
-    values
-        .iter()
-        .map(|&v| {
-            let level = ((v as u128 * 7) / max as u128) as usize;
-            FRACTIONAL_VERTICAL[level.min(7)]
-        })
-        .collect()
-}
-
-/// Render a horizontal progress bar using sub-character fractional blocks (U+258F..=U+2588).
-/// Provides 8x resolution per character cell.
-pub fn render_fractional_bar(fraction: f64, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let clamped = fraction.clamp(0.0, 1.0);
-    let total_eighths = (clamped * width as f64 * 8.0).round() as usize;
-    let full_cells = (total_eighths / 8).min(width);
-    let remainder = total_eighths % 8;
-
-    let mut bar = String::with_capacity(width * 4);
-    for _ in 0..full_cells {
-        bar.push('█');
-    }
-    if full_cells < width {
-        if remainder > 0 {
-            bar.push(FRACTIONAL_HORIZONTAL[remainder - 1]);
-            for _ in (full_cells + 1)..width {
-                bar.push('░');
-            }
-        } else {
-            for _ in full_cells..width {
-                bar.push('░');
-            }
-        }
-    }
-    bar
-}
-
-/// High-resolution sub-character visual gauge of context window tokens used (tui-design visual-catalog).
-/// e.g. `ctx [████▍░░░░░] 45%`
-pub fn format_context_bar(state: &AppState, bar_width: usize) -> String {
-    if state.context_window_tokens == 0 {
-        return "ctx --".into();
-    }
-    let fraction = (state.context_tokens as f64) / (state.context_window_tokens as f64);
-    let bar = render_fractional_bar(fraction, bar_width);
-    let estimate = if state.context_exact { "" } else { "~" };
-    let pct = ((fraction * 100.0).min(999.0)).round() as u64;
-    format!("ctx [{bar}] {estimate}{pct}%")
-}
-
 /// A single projection for styled and plain footers. Each row fits in cells;
 /// critical controls win over metadata when space is scarce.
 pub(crate) fn footer_lines(
@@ -807,14 +711,6 @@ pub(crate) fn model_metadata(state: &AppState, width: usize) -> String {
     }
 }
 
-/// Compact footer projection retained for callers that request one row.
-pub fn status_line(state: &AppState, _context_in_session_rail: bool) -> String {
-    footer_lines(state, 80, 1, state.working && state.activity.is_some())
-        .into_iter()
-        .next()
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod minimal_footer_tests {
     use super::{completed_tool_phrase, footer_lines};
@@ -885,41 +781,6 @@ mod minimal_footer_tests {
             let lines = footer_lines(&state, 24, rows, false).join("\n");
             assert!(lines.contains("^C") || lines.contains("Ctrl+C"), "{lines}");
         }
-    }
-
-    #[test]
-    fn sparkline_renders_vertical_blocks_proportional_to_values() {
-        use super::render_sparkline;
-        assert_eq!(render_sparkline(&[]), "");
-        assert_eq!(render_sparkline(&[0, 0, 0]), "   ");
-        let spark = render_sparkline(&[0, 10, 20, 40, 70]);
-        assert_eq!(spark.chars().count(), 5);
-        assert_eq!(spark.chars().next(), Some(' '));
-        assert_eq!(spark.chars().last(), Some('█'));
-    }
-
-    #[test]
-    fn fractional_bar_sub_character_precision() {
-        use super::render_fractional_bar;
-        assert_eq!(render_fractional_bar(0.0, 0), "");
-        assert_eq!(render_fractional_bar(0.0, 5), "░░░░░");
-        assert_eq!(render_fractional_bar(1.0, 5), "█████");
-        let half = render_fractional_bar(0.5, 4);
-        assert_eq!(half, "██░░");
-        let eighth = render_fractional_bar(0.125, 8);
-        assert_eq!(eighth, "█░░░░░░░");
-    }
-
-    #[test]
-    fn context_bar_renders_clean_gauge() {
-        use super::format_context_bar;
-        let mut state = AppState::new();
-        assert_eq!(format_context_bar(&state, 8), "ctx --");
-        state.context_window_tokens = 100;
-        state.context_tokens = 50;
-        state.context_exact = true;
-        let bar = format_context_bar(&state, 6);
-        assert_eq!(bar, "ctx [███░░░] 50%");
     }
 }
 

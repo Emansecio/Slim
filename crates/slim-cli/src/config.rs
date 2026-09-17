@@ -464,7 +464,12 @@ pub fn upsert_mcp_server_to(
         fields.insert("enabled".into(), enabled.into());
     }
     if let Some(timeout_ms) = server.timeout_ms {
-        fields.insert("timeout_ms".into(), (timeout_ms as i64).into());
+        // TOML integers are i64; an unchecked `as` cast wraps huge values to
+        // negatives and writes a file the next load cannot parse.
+        fields.insert(
+            "timeout_ms".into(),
+            i64::try_from(timeout_ms).unwrap_or(i64::MAX).into(),
+        );
     }
     entry.insert(name.to_owned(), toml::Value::Table(fields));
     write_config_table_locked(path, &table)
@@ -1229,6 +1234,32 @@ mod tests {
         assert_eq!(
             mcp.get("url").and_then(toml::Value::as_str),
             Some("https://mcp.example.com")
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mcp_upsert_saturates_timeout_ms_beyond_i64() {
+        let path =
+            std::env::temp_dir().join(format!("slim-mcp-timeout-{}.toml", std::process::id()));
+        let server = FileMcpServerConfig {
+            command: Some("npx".into()),
+            timeout_ms: Some(u64::MAX),
+            ..FileMcpServerConfig::default()
+        };
+        upsert_mcp_server_to(&path, "fs", &server).expect("upsert");
+        // The written file must round-trip: a wrapped negative i64 would fail
+        // to parse back into Option<u64>.
+        let parsed = FileConfig::load(&path)
+            .expect("load")
+            .expect("config present");
+        assert_eq!(
+            parsed
+                .mcp
+                .and_then(|mcp| mcp.servers)
+                .and_then(|mut servers| servers.remove("fs"))
+                .and_then(|server| server.timeout_ms),
+            Some(i64::MAX as u64)
         );
         fs::remove_file(&path).ok();
     }

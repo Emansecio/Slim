@@ -154,7 +154,19 @@ pub(crate) fn acquire_lock(path: &Path) -> io::Result<File> {
     options.write(true).create(true);
     #[cfg(windows)]
     options.share_mode(FILE_SHARE_READ);
-    open_checked(options, &lock_path)
+    let file = open_checked(options, &lock_path)?;
+    // Windows excludes second writers through the share mode above; on Unix
+    // the open alone grants nothing, so the durable session lock must be a
+    // real advisory lock. Without it two processes append at stale offsets
+    // and recovery can truncate a live writer.
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            format!("session is already in use: {}", path.display()),
+        )),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
 }
 
 pub(crate) fn open_data_handle(options: OpenOptions, path: &Path) -> io::Result<File> {

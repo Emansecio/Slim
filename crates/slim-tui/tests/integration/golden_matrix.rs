@@ -11,9 +11,7 @@ use slim_tui::layout::plan_with_session_rail;
 use slim_tui::reducer::reduce;
 use slim_tui::render::WrapCache;
 use slim_tui::runtime::render_frame;
-use slim_tui::theme::{
-    detect_capabilities, resolve_theme, to_terminal_color, Capabilities, ColorDepth,
-};
+use slim_tui::theme::{resolve_theme, to_terminal_color, Capabilities, ColorDepth};
 
 fn state_with_content() -> AppState {
     let mut state = AppState::new();
@@ -166,12 +164,4 @@ fn surface_levels_stay_distinguishable_across_color_depths() {
             assert_eq!(surface, composer, "composer joins transcript at {depth:?}");
         }
     }
-}
-
-#[test]
-fn detected_capabilities_resolve_to_a_cached_theme() {
-    let capabilities = detect_capabilities();
-    let theme = resolve_theme(capabilities);
-    // Resolved twice, same values: the cache stores the resolved theme.
-    assert_eq!(theme, resolve_theme(capabilities));
 }

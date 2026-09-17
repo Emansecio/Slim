@@ -476,7 +476,7 @@ fn grok_footer_keeps_aligned_inset_box_and_adjacent_status() {
         let bottom = corner_columns(lines[bottom_index], '╰', '╯');
 
         assert_eq!(top, bottom, "symmetric corners at width={width}");
-        let band_width = usize::from(width.min(100));
+        let band_width = usize::from(width);
         let band_x = (usize::from(width) - band_width) / 2;
         assert_eq!(
             top,
@@ -806,7 +806,6 @@ fn estimated_speed_remains_in_diagnostics_only() {
     let footer = frame.lines().last().unwrap();
     assert!(!footer.contains('~'), "{frame}");
     assert!(!footer.contains("tok/s"), "{footer}");
-    assert!(!slim_tui::view_model::status_line(&state, false).contains('~'));
     state.last_tok_per_sec = Some(500);
     state.inspector.active = Some(slim_tui::inspector::InspectorKind::Diagnostics);
     let details = render_to_string(&state, 140, 30);
@@ -894,4 +893,21 @@ fn manual_todo_collapse_survives_subsequent_updates() {
         !frame.contains("revisar diff"),
         "pending rows stay hidden\n{frame}"
     );
+}
+
+#[test]
+fn wide_composer_uses_full_width_for_wrapping_with_and_without_inspector() {
+    for inspector in [None, Some(slim_tui::inspector::InspectorKind::Activity)] {
+        let mut state = AppState::new();
+        state.authenticated = true;
+        state.inspector.active = inspector;
+        state.composer.insert_text(&"x".repeat(150));
+        let frame = render_to_string(&state, 200, 24);
+        let lines = frame.lines().collect::<Vec<_>>();
+        let top = lines.iter().rposition(|line| line.contains('╭')).unwrap();
+        let bottom = lines.iter().rposition(|line| line.contains('╰')).unwrap();
+        assert_eq!(corner_columns(lines[top], '╭', '╮'), (1, 198));
+        assert_eq!(bottom - top, 2, "draft fits in one row at full width");
+        assert!(lines[top + 1].contains(&"x".repeat(150)));
+    }
 }

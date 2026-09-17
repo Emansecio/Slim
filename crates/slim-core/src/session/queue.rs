@@ -259,24 +259,6 @@ impl DurableQueue {
         Ok(())
     }
 
-    /// Explicitly put suspended work back in the queue. Restore never calls
-    /// this method; callers must make the safe-replay decision themselves.
-    pub fn requeue_suspended(&mut self, operation_id: &str) -> Result<(), DurableQueueError> {
-        let entry = self.entry(operation_id)?;
-        if entry.status != QueueStatus::Suspended {
-            return Err(self.transition_error(operation_id));
-        }
-        self.ensure_capacity()?;
-        let entry = self
-            .entries
-            .get_mut(operation_id)
-            .expect("queue entry checked before mutation");
-        entry.status = QueueStatus::Queued;
-        entry.suspension_reason = None;
-        self.pending.push_back(operation_id.to_owned());
-        Ok(())
-    }
-
     pub(crate) fn grow_capacity_to(&mut self, capacity: usize) {
         self.capacity = self.capacity.max(capacity.max(1));
     }
@@ -321,13 +303,6 @@ impl DurableQueue {
 
     pub fn from_repo<R: DurableRepo>(capacity: usize, repo: &R) -> Result<Self, DurableQueueError> {
         Self::from_records(capacity, repo.records())
-    }
-
-    pub fn restore_repo<R: DurableRepo>(
-        capacity: usize,
-        repo: &R,
-    ) -> Result<Self, DurableQueueError> {
-        Self::from_repo(capacity, repo)
     }
 
     pub fn enqueue_persisted<R: DurableRepo>(

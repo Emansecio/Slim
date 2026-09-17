@@ -845,13 +845,7 @@ pub(crate) fn resume_messages_from_preflight(
 }
 
 fn redact_secret(input: &str, secrets: &[String]) -> String {
-    let mut redacted = crate::redact(input);
-    for secret in secrets {
-        if !secret.is_empty() {
-            redacted = redacted.replace(secret, "[REDACTED]");
-        }
-    }
-    redacted
+    crate::auth::redact_with_secrets(input, secrets)
 }
 
 /// API key + every configured MCP env/header value: the set scrubbed from
@@ -1744,6 +1738,13 @@ pub(crate) async fn execute_provider_turn_async(
             loop_result.tool_results,
         ),
         Err(error) => {
+            if matches!(
+                &error,
+                ProviderError::InvalidResponse { message }
+                if message.contains("sensitive material")
+            ) {
+                return Err(error);
+            }
             let (code, stop, message) = provider_failure_details(error);
             if !has_partial_output {
                 text.clone_from(&message);

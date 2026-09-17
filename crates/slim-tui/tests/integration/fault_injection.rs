@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use slim_tui::api::UiEvent;
 use slim_tui::app::AppState;
-use slim_tui::block::{Block, BlockKind, BlockLifecycle};
 use slim_tui::render::EventCoalescer;
 
 #[test]
@@ -72,18 +71,4 @@ fn stale_content_page_is_bounded_notification_not_state_corruption() {
         state.blocks().is_empty(),
         "content page must not fabricate transcript blocks"
     );
-}
-
-#[test]
-fn block_lifecycle_states_are_expressible_for_fault_paths() {
-    for lifecycle in [
-        BlockLifecycle::Pending,
-        BlockLifecycle::Streaming,
-        BlockLifecycle::Complete,
-        BlockLifecycle::Failed,
-        BlockLifecycle::Cancelled,
-    ] {
-        let block = Block::new("f1", BlockKind::System("s".into()), lifecycle);
-        assert_eq!(block.lifecycle, lifecycle);
-    }
 }

@@ -1,42 +1,29 @@
-#[path = "support/fake_clock.rs"]
-mod fake_clock;
-#[path = "support/fake_provider.rs"]
-mod fake_provider;
-
-use fake_clock::FakeClock;
-use fake_provider::FakeProvider;
-use slim_cli::compose_app;
 use slim_core::AppHandle;
 use slim_core::{EventKind, SessionEvent};
 use slim_tui::api::UiEvent;
-use slim_tui::render_snapshot;
+use slim_tui::app::AppState;
+use slim_tui::testkit::render_terminal_text;
 
 #[test]
-fn composes_all_workspace_crates_with_a_fake_snapshot() {
-    let mut clock = FakeClock::new();
-    clock.tick();
-
-    let provider = FakeProvider;
-    let snapshot = provider.snapshot();
-    let mut app: AppHandle = compose_app();
-    app.apply_session_snapshot(snapshot.clone());
-
-    assert_eq!(clock.ticks(), 1);
-    assert_eq!(app.snapshot(), Some(&snapshot));
-    assert_eq!(render_snapshot(&snapshot), "fake-session#1");
-
+fn projects_core_events_into_the_real_tui_renderer() {
+    let mut app = AppHandle::fake();
     app.push_event(SessionEvent::new(
         1,
+        EventKind::SessionStarted {
+            session_id: "smoke-session".into(),
+        },
+    ))
+    .expect("session event");
+    app.push_event(SessionEvent::new(
+        2,
         EventKind::AssistantTextDelta {
             text: "hello".into(),
         },
     ))
     .expect("event");
-    let event = app.drain_events().pop().expect("drained event");
-    assert_eq!(
-        UiEvent::from_core(event),
-        Some(UiEvent::AssistantDelta {
-            text: "hello".into()
-        })
-    );
+    let mut state = AppState::new();
+    for event in app.drain_events() {
+        state.apply_event(UiEvent::from_core(event).expect("mapped core event"));
+    }
+    assert!(render_terminal_text(&state, 80, 24).contains("hello"));
 }

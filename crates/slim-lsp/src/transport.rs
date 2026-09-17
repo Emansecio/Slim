@@ -517,6 +517,30 @@ impl Drop for IncompleteFrame<'_> {
     }
 }
 
+/// Fail-safe cleanup for the read task. The loop's normal exits deliver the
+/// precise error and close the mailbox before breaking; this guard covers
+/// every other way out — a panic inside the loop (e.g. in the server request
+/// handler, which runs inline) or task abort — which would otherwise leave
+/// `closed` unset and the mailbox open: `recv()` would wait forever and
+/// `is_closed()` would keep reporting healthy while new requests piled into
+/// a dead reader until each timed out.
+struct ReadLoopExit {
+    closed: Arc<AtomicBool>,
+    notifications: NotificationSender,
+    inner: Arc<TransportInner>,
+}
+
+impl Drop for ReadLoopExit {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+        self.notifications.close();
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            LspTransport::fail_all_pending(&inner, TransportError::ServerClosed).await;
+        });
+    }
+}
+
 /// Reads a full framed message from a buffered reader. Returns None on EOF.
 /// Headers arrive line by line through the buffer (one syscall per chunk,
 /// not per byte); the buffer persists across frames so body bytes already
@@ -659,6 +683,14 @@ impl LspTransport {
         server_request_handler: ServerRequestHandler,
         closed: Arc<std::sync::atomic::AtomicBool>,
     ) {
+        // Panic/abort-safe cleanup: the normal exits below deliver the
+        // precise error first; this guard makes a dead read task always
+        // observable through `is_closed` and the notification stream.
+        let _exit = ReadLoopExit {
+            closed: closed.clone(),
+            notifications: notify_tx.clone(),
+            inner: inner.clone(),
+        };
         // Buffered once for the connection lifetime: chunked header reads
         // must not consume body bytes past the blank line.
         let mut reader = tokio::io::BufReader::with_capacity(1024, reader);
@@ -686,11 +718,12 @@ impl LspTransport {
             let is_response = message.get("id").is_some() && message.get("method").is_none();
             if is_response {
                 let id = message.get("id").cloned().unwrap_or(Value::Null);
-                let outcome = if let Some(error) = message.get("error") {
-                    Err(remote_error(error))
-                } else {
-                    Ok(message.get("result").cloned().unwrap_or(Value::Null))
-                };
+                let outcome =
+                    if let Some(error) = message.get("error").filter(|error| !error.is_null()) {
+                        Err(remote_error(error))
+                    } else {
+                        Ok(message.get("result").cloned().unwrap_or(Value::Null))
+                    };
                 let pending = {
                     let mut map = inner.pending.lock().await;
                     map.remove(&id)
@@ -734,7 +767,7 @@ impl LspTransport {
                         &writer,
                         &closed,
                         inner.options.max_message_bytes,
-                        tokio::time::Instant::now() + inner.options.request_timeout,
+                        deadline_after(inner.options.request_timeout),
                         &method,
                         &response,
                         None,
@@ -783,7 +816,7 @@ impl LspTransport {
         params: Value,
         cancellation: Option<&CancellationToken>,
     ) -> Result<Value, TransportError> {
-        let deadline = tokio::time::Instant::now() + self.inner.options.request_timeout;
+        let deadline = deadline_after(self.inner.options.request_timeout);
         if self.closed.load(Ordering::Acquire) {
             return Err(TransportError::ServerClosed);
         }
@@ -869,13 +902,8 @@ impl LspTransport {
         timeout: Duration,
     ) -> Result<(), TransportError> {
         let payload = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-        self.write_payload(
-            method,
-            &payload,
-            tokio::time::Instant::now() + timeout,
-            None,
-        )
-        .await
+        self.write_payload(method, &payload, deadline_after(timeout), None)
+            .await
     }
 
     async fn write_payload(
@@ -940,6 +968,18 @@ impl LspTransport {
     pub fn notification_drop_count(&self) -> u64 {
         self.notifications.dropped()
     }
+}
+
+/// `Instant::now() + span`, saturating instead of panicking: the std/tokio
+/// `Instant` add overflows for absurdly large configured durations (a TOML
+/// `u64::MAX` millisecond timeout reaches this code), and an unguarded add
+/// crashes the caller. An overflow clamps to roughly a year out — close
+/// enough to "never" for any timeout.
+pub(crate) fn deadline_after(span: Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(span)
+        .or_else(|| now.checked_add(Duration::from_secs(86_400 * 365)))
+        .unwrap_or(now)
 }
 
 async fn await_bounded<T>(
@@ -1286,6 +1326,84 @@ mod tests {
             .expect("notification stream open");
         assert_eq!(notification.method, "window/logMessage");
         assert_eq!(notification.params["message"], "ready");
+    }
+
+    #[tokio::test]
+    async fn extreme_request_timeout_saturates_deadline_instead_of_panicking() {
+        let (client, server) = tokio::io::duplex(TEST_MAX_MESSAGE_BYTES);
+        let options = TransportOptions {
+            max_message_bytes: TEST_MAX_MESSAGE_BYTES,
+            request_timeout: Duration::from_millis(u64::MAX),
+            read_progress_timeout: Duration::from_secs(30),
+            max_pending_requests: 8,
+            notification_capacity: 4,
+            notification_max_bytes: TEST_MAX_MESSAGE_BYTES,
+        };
+        let (transport, _notifications) =
+            LspTransport::new(Box::new(client), options, Box::new(|_, _| Ok(Value::Null)));
+        let mut server = tokio::io::BufReader::new(server);
+        let responder = async {
+            let request = read_required(&mut server).await;
+            send(
+                &mut server,
+                json!({"jsonrpc":"2.0", "id": request["id"], "result": "ok"}),
+            )
+            .await;
+        };
+        let (result, ()) = tokio::join!(transport.request("example/huge", json!({})), responder);
+        assert_eq!(result.expect("request completes"), "ok");
+        assert!(deadline_after(Duration::MAX) > tokio::time::Instant::now());
+    }
+
+    #[tokio::test]
+    async fn panicking_server_request_handler_closes_transport_and_releases_waiters() {
+        let (client, server) = tokio::io::duplex(TEST_MAX_MESSAGE_BYTES);
+        let options = TransportOptions {
+            max_message_bytes: TEST_MAX_MESSAGE_BYTES,
+            request_timeout: Duration::from_secs(30),
+            read_progress_timeout: Duration::from_secs(30),
+            max_pending_requests: 8,
+            notification_capacity: 4,
+            notification_max_bytes: TEST_MAX_MESSAGE_BYTES,
+        };
+        let (transport, mut notifications) = LspTransport::new(
+            Box::new(client),
+            options,
+            Box::new(|_, _| panic!("fixture handler failure")),
+        );
+        let mut server = tokio::io::BufReader::new(server);
+        let mut request = Box::pin(transport.request("example/inflight", json!({})));
+        let _inflight = tokio::select! {
+            message = read_required(&mut server) => message,
+            result = &mut request => panic!("request resolved early: {result:?}"),
+        };
+        send(
+            &mut server,
+            json!({"jsonrpc":"2.0", "id": 900, "method": "workspace/applyEdit"}),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !transport.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("read-task panic must mark the transport closed");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), notifications.recv())
+                .await
+                .expect("notification receiver must not hang")
+                .is_none()
+        );
+        let result = request.await;
+        assert!(
+            matches!(result, Err(TransportError::ServerClosed)),
+            "{result:?}"
+        );
+        assert!(matches!(
+            transport.request("example/after", json!({})).await,
+            Err(TransportError::ServerClosed)
+        ));
     }
 
     #[tokio::test]

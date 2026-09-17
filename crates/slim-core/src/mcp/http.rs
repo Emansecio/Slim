@@ -12,6 +12,23 @@ const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
 const SESSION_HEADER: &str = "mcp-session-id";
 
+/// Display-safe form of a configured URL: query, fragment and userinfo can
+/// carry credentials, so they never appear in errors or status text.
+fn sanitized_url(raw: &str) -> String {
+    let base = raw.split(['?', '#']).next().unwrap_or(raw);
+    match base.split_once("://") {
+        Some((scheme, rest)) => {
+            let path_start = rest.find('/').unwrap_or(rest.len());
+            let (authority, path) = rest.split_at(path_start);
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            format!("{scheme}://{host}{path}")
+        }
+        None => base
+            .rsplit_once('@')
+            .map_or_else(|| base.to_owned(), |(_, rest)| rest.to_owned()),
+    }
+}
+
 /// Streamable HTTP transport (MCP 2025-11-25): every JSON-RPC message is a
 /// POST to a single endpoint carrying `Accept: application/json,
 /// text/event-stream`. Responses arrive either as a single JSON document or
@@ -34,11 +51,13 @@ impl HttpConnection {
         headers: BTreeMap<String, String>,
         timeout: Duration,
     ) -> Result<Self, McpError> {
-        let parsed = reqwest::Url::parse(&url)
-            .map_err(|error| McpError::Protocol(format!("invalid MCP url {url}: {error}")))?;
+        let parsed = reqwest::Url::parse(&url).map_err(|error| {
+            McpError::Protocol(format!("invalid MCP url {}: {error}", sanitized_url(&url)))
+        })?;
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err(McpError::Protocol(format!(
-                "MCP url must be http(s): {url}"
+                "MCP url must be http(s): {}",
+                sanitized_url(&url)
             )));
         }
         let client = reqwest::Client::builder()
@@ -109,11 +128,9 @@ impl HttpConnection {
     }
 
     async fn send_request(&self, body: Value, expected_id: u64) -> Result<Value, McpError> {
-        let response = self
-            .post(body)
-            .send()
-            .await
-            .map_err(|error| McpError::Protocol(format!("http request failed: {error}")))?;
+        let response = self.post(body).send().await.map_err(|error| {
+            McpError::Protocol(format!("http request failed: {}", error.without_url()))
+        })?;
         self.remember_session(&response);
         let status = response.status();
         if status.as_u16() == 404 {
@@ -147,8 +164,9 @@ impl HttpConnection {
             let mut stream = response.bytes_stream();
             let mut bytes = Vec::new();
             while let Some(chunk) = stream.next().await {
-                let chunk =
-                    chunk.map_err(|error| McpError::Protocol(format!("http body: {error}")))?;
+                let chunk = chunk.map_err(|error| {
+                    McpError::Protocol(format!("http body: {}", error.without_url()))
+                })?;
                 if bytes.len() + chunk.len() > MAX_MESSAGE_BYTES {
                     return Err(McpError::Protocol("response exceeds 16 MiB".into()));
                 }
@@ -177,8 +195,9 @@ impl HttpConnection {
         // least its terminating newline, so empty lines cannot bypass the cap.
         let mut payload = String::new();
         while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|error| McpError::Protocol(format!("sse stream: {error}")))?;
+            let chunk = chunk.map_err(|error| {
+                McpError::Protocol(format!("sse stream: {}", error.without_url()))
+            })?;
             buffer.extend_from_slice(&chunk);
             if buffer.len() > MAX_MESSAGE_BYTES {
                 return Err(McpError::Protocol("sse message exceeds 16 MiB".into()));
@@ -193,10 +212,13 @@ impl HttpConnection {
                         continue;
                     }
                     let body = std::mem::take(&mut payload);
-                    let message: Value =
-                        serde_json::from_str(body.trim_end()).map_err(|error| {
-                            McpError::Protocol(format!("invalid SSE message: {error}"))
-                        })?;
+                    let body = body.trim_end();
+                    if body.is_empty() {
+                        continue;
+                    }
+                    let message: Value = serde_json::from_str(body).map_err(|error| {
+                        McpError::Protocol(format!("invalid SSE message: {error}"))
+                    })?;
                     match classify_inbound(&message, expected_id) {
                         Inbound::Response(result) => return result,
                         Inbound::ServerRequest(id) => self.reject_server_request(id).await,
@@ -279,7 +301,7 @@ fn classify_inbound(message: &Value, expected_id: u64) -> Inbound {
 }
 
 fn extract_result(message: Value) -> Result<Value, McpError> {
-    if let Some(error) = message.get("error") {
+    if let Some(error) = message.get("error").filter(|error| !error.is_null()) {
         return Err(McpError::Server {
             code: error.get("code").and_then(Value::as_i64).unwrap_or(0),
             message: crate::mcp::spec::bounded_server_text(

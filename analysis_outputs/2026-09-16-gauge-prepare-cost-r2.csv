@@ -1,0 +1,37 @@
+# gauge-prepare-cost
+# arms: loop(codex real) | loop-noenv(P1 off) | direct(P2 on, 4 secrets) | direct-nosens
+size_kb,arm,body_bytes,median_ms,min_ms,max_ms
+64,loop,79610,4.733,4.572,7.667
+64,loop-noenv,79610,4.857,4.629,5.207
+64,direct,79610,4.212,4.014,4.356
+64,direct-nosens,79610,3.816,3.597,4.475
+256,loop,277734,13.212,12.277,13.503
+256,loop-noenv,277734,12.437,12.180,13.219
+256,direct,277734,11.091,11.002,11.454
+256,direct-nosens,277734,9.946,9.720,10.608
+1024,loop,1084661,44.364,43.126,45.296
+1024,loop-noenv,1084661,45.250,43.144,47.740
+1024,direct,1084661,40.354,39.496,42.715
+1024,direct-nosens,1084661,36.028,34.891,38.175
+micro,chars_count,1084340,0.029 per op (20 iters)
+micro,len_bytes,1084340,0.000 per op (20 iters)
+micro,json_parse_body,1084340,2.726 per op (20 iters)
+micro,json_encode_body,1084340,10.424 per op (20 iters)
+micro,components_items_writer,1084340,10.007 per op (20 iters)
+micro,estimate_chars_fold_prefix,1084340,7.310 per op (20 iters)
+micro,estimate_bytes_fold_current,1084340,5.134 per op (20 iters)
+micro,serchars_bytes_filter_current,1084340,7.815 per op (20 iters)
+micro,redact_values_prefix,11296,0.154 per op (20 iters)
+micro,redact_values_current,11296,0.075 per op (20 iters)
+micro,stream_chunk_prefix_alloc,4096,0.019 per op (20 iters)
+micro,stream_chunk_current_take,4096,0.003 per op (20 iters)
+micro,history_to_vec_1MB,1052950,0.176,(20 iters)
+micro,session_preflight,74057,1.871 per op (20 iters)
+micro,session_rebuild_messages,74057,0.030 per op (20 iters)
+micro,session_open_no_repair,74057,0.768 per op (20 iters)
+micro,session_preflight,266307,2.869 per op (20 iters)
+micro,session_rebuild_messages,266307,0.127 per op (20 iters)
+micro,session_open_no_repair,266307,2.650 per op (20 iters)
+micro,session_preflight,1050813,9.479 per op (20 iters)
+micro,session_rebuild_messages,1050813,0.888 per op (20 iters)
+micro,session_open_no_repair,1050813,9.292 per op (20 iters)

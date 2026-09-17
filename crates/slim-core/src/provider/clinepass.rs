@@ -164,7 +164,6 @@ pub fn parse_clinepass_catalog(bytes: &[u8]) -> Result<Vec<ClinePassCatalogEntry
         .object
         .as_deref()
         .is_some_and(|object| object != "list")
-        || document.data.len() > MAX_CATALOG_ENTRIES
     {
         return Err(ProviderError::InvalidResponse {
             message: "ClinePass catalog schema is invalid".into(),
@@ -175,6 +174,13 @@ pub fn parse_clinepass_catalog(bytes: &[u8]) -> Result<Vec<ClinePassCatalogEntry
     for entry in document.data {
         if !is_clinepass_model_id(&entry.id) {
             continue;
+        }
+        // The endpoint also lists the general Cline catalog; bound the
+        // eligible ClinePass subset, while MAX_CATALOG_BYTES bounds the input.
+        if models.len() >= MAX_CATALOG_ENTRIES {
+            return Err(ProviderError::InvalidResponse {
+                message: "ClinePass catalog exceeds its model bound".into(),
+            });
         }
         if !seen.insert(entry.id.clone()) {
             return Err(ProviderError::InvalidResponse {

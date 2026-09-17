@@ -90,6 +90,11 @@
 
 ### 9. Snapshot, watch, hooks e telemetria
 
+> Atualização do checkout em 16/09/2026: os quatro módulos de observabilidade
+> sem integração ao executável foram removidos, junto de seus testes exclusivos.
+> A conclusão e os gates abaixo registram a implementação histórica; não
+> descrevem mais uma API disponível. Journal, reducer e repositórios permanecem.
+
 - [x] **Etapa 9 — observar o runtime sem alterar sua autoridade.**
 - **Dependências:** etapas 3 a 8.
 - **Entregáveis:** snapshots consistentes; watch; hooks; telemetria de operações, usage e falhas.
@@ -97,6 +102,11 @@
 - **Estado atual factual:** concluída; snapshot/watch/hooks/telemetria bounded, leituras e linhas limitadas a 64 MiB, IDs sanitizados e falhas de observabilidade isoladas. Limite documentado: overwrite same-inode/same-length hostil não é detectado sem hash de prefixo.
 
 ### 10. Ligar Skills, MCP, subagentes e Todo
+
+> Atualização do checkout em 16/09/2026: removidos o scheduler legado
+> (`agents::Scheduler`), `MutationLease` e tipos exclusivos desse scheduler.
+> O lifecycle durável de child em `CapabilityService` e os contratos
+> Todo/Plan/Goal permanecem, inclusive a leitura de fatos `task.v1`.
 
 - [x] **Etapa 10 — conectar as superfícies de automação ao harness durável.**
 - **Dependências:** etapas 4 a 9 e contratos de autorização das superfícies.

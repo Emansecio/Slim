@@ -79,9 +79,13 @@ fn credential_key(key: &str) -> bool {
                     | "secret"
                     | "password"
                     | "passwd"
+                    | "pass"
+                    | "passphrase"
                     | "credential"
                     | "credentials"
+                    | "creds"
                     | "signature"
+                    | "key"
             )
         })
 }
@@ -100,15 +104,6 @@ pub enum McpServerStatus {
     Connecting,
     Ready { tools: Arc<Vec<McpToolSummary>> },
     Failed { error: String },
-}
-
-impl McpServerStatus {
-    pub fn tool_count(&self) -> Option<usize> {
-        match self {
-            Self::Ready { tools } => Some(tools.len()),
-            _ => None,
-        }
-    }
 }
 
 /// Snapshot of one server for status surfaces (`/mcp` overlay, `list`).

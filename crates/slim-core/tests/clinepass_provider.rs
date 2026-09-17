@@ -56,6 +56,40 @@ fn parse_catalog_keeps_only_cline_pass_slugs() {
     assert_eq!(models[1].context_window, 256_000);
 }
 
+#[test]
+fn general_catalog_size_does_not_hide_eligible_models_at_the_end() {
+    let mut data: Vec<_> = (0..512)
+        .map(|index| serde_json::json!({"id": format!("other/model-{index}")}))
+        .collect();
+    data.push(serde_json::json!({"id": "stealth/new-model"}));
+    data.push(serde_json::json!({"id": "cline-pass/new-live"}));
+    let body = serde_json::to_vec(&serde_json::json!({"object": "list", "data": data}))
+        .expect("catalog body");
+
+    let models = parse_clinepass_catalog(&body).expect("eligible subset");
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].id, "cline-pass/new-live");
+}
+
+#[test]
+fn eligible_catalog_still_has_a_bounded_model_count() {
+    let mut data: Vec<_> = (0..256)
+        .map(|index| serde_json::json!({"id": format!("cline-pass/model-{index}")}))
+        .collect();
+    let body = serde_json::to_vec(&serde_json::json!({"object": "list", "data": data}))
+        .expect("catalog body");
+    assert_eq!(parse_clinepass_catalog(&body).expect("at bound").len(), 256);
+
+    data.push(serde_json::json!({"id": "cline-pass/one-too-many"}));
+    let body = serde_json::to_vec(&serde_json::json!({"object": "list", "data": data}))
+        .expect("catalog body");
+    assert!(matches!(
+        parse_clinepass_catalog(&body),
+        Err(slim_core::provider::ProviderError::InvalidResponse { message })
+            if message.contains("model bound")
+    ));
+}
+
 #[tokio::test]
 async fn catalog_fetch_rejects_chunked_body_past_raw_limit() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");

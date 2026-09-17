@@ -1190,15 +1190,6 @@ fn replace_compaction_authority(
     })
 }
 
-pub async fn run_http_provider<A: ProviderAdapter>(
-    client: &HttpProviderClient<A>,
-    app: &mut crate::AppHandle,
-    prompt: &str,
-    next_seq: u64,
-) -> Result<u64, ProviderError> {
-    run_http_provider_messages(client, app, &[ProviderMessage::user(prompt)], next_seq).await
-}
-
 pub async fn run_http_provider_messages<A: ProviderAdapter>(
     client: &HttpProviderClient<A>,
     app: &mut crate::AppHandle,
@@ -1935,22 +1926,6 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         )
     }
 
-    pub fn with_shared_transport_and_cache<C>(
-        adapter: A,
-        timeouts: ProviderTimeouts,
-        cache: C,
-    ) -> Result<Self, ProviderError>
-    where
-        C: Into<Arc<ProviderCache>>,
-    {
-        Self::build_with_client(
-            adapter,
-            timeouts,
-            Some(cache.into()),
-            shared_http_client(timeouts.connect)?,
-        )
-    }
-
     fn build(
         adapter: A,
         timeouts: ProviderTimeouts,
@@ -2183,22 +2158,6 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         C: Future<Output = ()>,
     {
         let request = self.prepare_messages_with_tools(messages, tools)?;
-        let request = self.estimate_direct_request(request);
-        self.stream_prepared_cancellable(request, cancellation, on_event)
-            .await
-    }
-
-    pub async fn stream_compaction_messages_cancellable<F, C>(
-        &self,
-        messages: &[ProviderMessage],
-        cancellation: C,
-        on_event: F,
-    ) -> Result<(), ProviderError>
-    where
-        F: FnMut(ProviderEvent),
-        C: Future<Output = ()>,
-    {
-        let request = self.prepare_compaction_messages(messages)?;
         let request = self.estimate_direct_request(request);
         self.stream_prepared_cancellable(request, cancellation, on_event)
             .await
@@ -2786,6 +2745,12 @@ pub(crate) fn normalize_sensitive_values(sensitive_values: &mut Vec<String>) {
 }
 
 fn redact_values(input: &str, sensitive_values: &[String]) -> String {
+    if !sensitive_values
+        .iter()
+        .any(|value| !value.is_empty() && input.contains(value.as_str()))
+    {
+        return input.to_owned();
+    }
     let mut values = sensitive_values
         .iter()
         .filter(|value| !value.is_empty())
@@ -2793,7 +2758,11 @@ fn redact_values(input: &str, sensitive_values: &[String]) -> String {
     values.sort_by_key(|value| std::cmp::Reverse(value.len()));
     values.dedup();
     values.into_iter().fold(input.to_owned(), |output, value| {
-        output.replace(value, "[REDACTED]")
+        if output.contains(value.as_str()) {
+            output.replace(value, "[REDACTED]")
+        } else {
+            output
+        }
     })
 }
 
@@ -2942,6 +2911,9 @@ fn take_redacted_event_chunk(
     flush: bool,
 ) -> String {
     pending.push_str(delta);
+    if sensitive_values.is_empty() {
+        return std::mem::take(pending);
+    }
     let split_at = if flush {
         pending.len()
     } else {

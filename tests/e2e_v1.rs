@@ -2,7 +2,6 @@ use std::fs;
 use std::sync::Arc;
 
 use slim_cli::{run_fake_headless, ExitCode, HeadlessRequest};
-use slim_core::agents::{ChildStatus, Scheduler, SpawnRequest, SpawnResult};
 use slim_core::context::{compact, ArtifactStore, ContextItem};
 use slim_core::mcp::McpCatalog;
 use slim_core::runtime::PromptQueue;
@@ -103,15 +102,6 @@ fn fake_v1_flow_covers_headless_core_and_tui_contracts() {
             .expect("mcp tool"),
         "mcp.demo.read({})"
     );
-
-    let mut scheduler = Scheduler::new(4, 32);
-    assert_eq!(
-        scheduler.spawn(SpawnRequest::new("child", 1, true)),
-        SpawnResult::Started
-    );
-    scheduler.finish("child", "done");
-    assert_eq!(scheduler.status("child"), Some(ChildStatus::Completed));
-    assert_eq!(scheduler.list().len(), 1);
 
     let mut queue = PromptQueue::new(8);
     queue.push("first").expect("queue");

@@ -316,7 +316,7 @@ fn workspace_state() -> AppState {
 }
 
 #[test]
-fn wide_transcript_is_centered_at_reading_width_without_automatic_inspector() {
+fn wide_transcript_uses_terminal_width_without_automatic_inspector() {
     let state = workspace_state();
     let wide = render(&state, 140, 30);
     let header = wide.lines().next().unwrap_or_default();
@@ -341,8 +341,8 @@ fn wide_transcript_is_centered_at_reading_width_without_automatic_inspector() {
         .expect("user prompt");
     assert_eq!(
         user_line.find("Você"),
-        Some(22),
-        "140-column transcript is centered inside the 100-cell reading column\n{wide}"
+        Some(2),
+        "140-column transcript starts at the terminal inset\n{wide}"
     );
 }
 
@@ -356,12 +356,10 @@ fn below_default_breakpoint_uses_full_width_single_column_without_run_inspector(
             .lines()
             .find(|line| line.contains("Você  Revise a organização visual"))
             .expect("user prompt");
-        let reading_width = width.min(100) as usize;
-        let reading_x = (width as usize - reading_width) / 2;
         assert_eq!(
             user_line.find("Você"),
-            Some(reading_x + 2),
-            "width {width} transcript should use the centered reading area\n{narrow}"
+            Some(2),
+            "width {width} transcript should use the full terminal width\n{narrow}"
         );
         assert!(
             narrow.lines().any(|row| row.trim() == "Slim"),

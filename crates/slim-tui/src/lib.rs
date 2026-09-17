@@ -25,9 +25,3 @@ pub mod theme;
 pub mod view_model;
 
 pub use runtime::run_app;
-
-use slim_core::SessionSnapshot;
-
-pub fn render_snapshot(snapshot: &SessionSnapshot) -> String {
-    format!("{}#{}", snapshot.session_id, snapshot.sequence)
-}

@@ -18,6 +18,7 @@ Respeite as instruções de sistema/desenvolvedor e do usuário; documentos loca
 - Ajuste a profundidade da análise à incerteza. Não force raciocínio alto apenas no planejamento ou baixo em toda implementação; preserve o modelo/esforço configurado salvo pedido ou necessidade comprovada. Este arquivo não altera parâmetros do runtime.
 - Use somente skills e ferramentas necessárias. Agrupe leituras independentes; respeite a ordem das operações dependentes.
 - Não repita busca, comando ou revisão sem nova evidência ou hipótese concreta. Diante de falha repetida, mude a abordagem ou explique o bloqueio real.
+- No PowerShell, descarte saída com `| Out-Null`, `$null = ...` ou `> $null`; nunca use `> nul` ou `2> nul`, que podem criar um arquivo reservado no checkout. Confira `$LASTEXITCODE` após comandos nativos.
 - Sem subagentes por padrão. Delegue somente trabalho independente com ganho claro de tempo ou qualidade, escopo delimitado e sem edições concorrentes no mesmo arquivo.
 
 ## Verificação proporcional

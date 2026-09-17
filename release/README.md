@@ -1,6 +1,37 @@
 # Release do Slim
 
-## Deploy local atual — Tipos dos argumentos de skill (2026-09-16)
+## Deploy local atual — Consolidação pós-limpeza e auditoria (2026-09-17)
+
+`refresh-slim.ps1` concluído com `OK:` e exit 0; build release em **3m21s**.
+PATH: `C:\Users\User\bin\Slim.exe`, build **2026-09-17 04:05:50**,
+`slim 0.1.0`, **17.917.952 bytes**. SHA-256 do instalado e de
+`target/release/slim.exe` idênticos:
+`F97E582FBA2A979D25636741AAA6BF783110CDF432D5138B55CEB70195ACF294`.
+
+O binário reflete o checkout com a limpeza de APIs, a auditoria de
+performance/corretude, o foco nos campos de texto, o catálogo ClinePass e a
+cobertura adversarial — tudo ainda não commitado na data do deploy. Smoke
+instalado: `--version`, exit 0. Suíte completa não repetida nesta tarefa;
+a última execução registrada é a da auditoria (1.673 testes aprovados).
+Console físico não validado.
+
+## Deploy anterior — TUI em largura total (2026-09-16)
+
+`refresh-slim.ps1` concluiu com `OK:` e exit 0; build release em **3m03s**.
+PATH: `C:\Users\User\bin\Slim.exe`, build **2026-09-16 18:23:34**,
+`slim 0.1.0`, **17.884.160 bytes**. SHA-256 do instalado e de
+`target/release/slim.exe`, conferidos após a cópia e idênticos:
+`FE53F87EC6E46CBD7C63D86B5A5CA243A04A101D6FCDC4AD206C622ADA9E5F56`.
+
+Remove os limites de 100/144 colunas e a centralização do workspace; conversa,
+composer e rodapé usam toda a largura disponível. O cálculo de altura do
+composer acompanha essa largura, inclusive com inspetor aberto.
+
+Validação anterior ao deploy nesta tarefa: `cargo test -p slim-tui --quiet`,
+499 testes aprovados e 5 ignorados. Smoke instalado: `--version`, exit 0.
+A suíte completa do workspace não foi repetida. Console físico não validado.
+
+## Deploy anterior — Tipos dos argumentos de skill (2026-09-16)
 
 `refresh-slim.ps1` concluiu com `OK:` e exit 0; build release em **5m06s**.
 PATH resolvido: `C:\Users\User\bin\Slim.exe`, build **2026-09-16 04:14:37**,

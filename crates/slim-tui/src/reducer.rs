@@ -163,10 +163,14 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
         }
         Action::Paste(payload) => {
             // G250: paste never edits the composer underneath a stacked modal
-            // (model/effort/mcp overlays do not accept pulls).
+            // (model/effort/mcp overlays do not accept pulls). Search and the
+            // palette are also capturing input surfaces: a pull reaching the
+            // composer while they own the keyboard edits a hidden draft.
             if state.model_overlay.is_some()
                 || state.effort_overlay.is_some()
                 || state.mcp_overlay.is_some()
+                || state.search.is_some()
+                || state.palette_query.is_some()
             {
                 return vec![Effect::RequestRender];
             }
@@ -210,6 +214,8 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
                 || state.model_overlay.is_some()
                 || state.effort_overlay.is_some()
                 || state.mcp_overlay.is_some()
+                || state.search.is_some()
+                || state.palette_query.is_some()
                 || paste_blocked(state);
             if let (Some(path), false) = (image, modal) {
                 return vec![
@@ -495,29 +501,34 @@ fn slash_token_span(composer: &crate::composer::Composer) -> Option<(usize, usiz
     if cursor > composer.char_count() {
         return None;
     }
-    let start = composer
-        .payload_chars()
-        .take(cursor)
-        .enumerate()
-        .filter(|(_, character)| character.is_whitespace())
-        .map(|(index, _)| index + 1)
-        .last()
-        .unwrap_or(0);
-    let tail_len = composer
-        .payload_chars()
-        .skip(cursor)
-        .take_while(|character| !character.is_whitespace())
-        .count();
-    let end = cursor + tail_len;
-    if composer.payload_chars().nth(start) != Some('/') {
-        return None;
+    // Single pass over the payload: the whitespace-delimited token holding
+    // the cursor, its first char, and the text after `/`. The previous
+    // four-iterator version traversed the whole draft several times per
+    // keystroke — costly once a paste chip grows the draft toward 1 MiB.
+    let mut start = 0usize;
+    let mut first = None;
+    let mut end = None;
+    let mut query = String::new();
+    for (index, character) in composer.payload_chars().enumerate() {
+        if index >= cursor {
+            if character.is_whitespace() {
+                end = Some(index);
+                break;
+            }
+        } else if character.is_whitespace() {
+            start = index + 1;
+            first = None;
+            query.clear();
+            continue;
+        }
+        if index == start {
+            first = Some(character);
+        } else if index > start {
+            query.push(character);
+        }
     }
-    let query = composer
-        .payload_chars()
-        .skip(start + 1)
-        .take(end - start - 1)
-        .collect();
-    Some((start, end, query))
+    let end = end.unwrap_or_else(|| composer.char_count());
+    (first == Some('/')).then_some((start, end, query))
 }
 
 fn replace_slash_token(state: &mut AppState, command: &str) {
@@ -669,10 +680,14 @@ fn paste_blocked(state: &AppState) -> bool {
 fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     // G250: Ctrl+P must not open the palette over a stacked modal (login,
     // effort, model) — those gates dispatch first, so add the guard here.
+    // A pending interaction owns the keyboard (G220/§16.4): palette, search,
+    // inspector and overlays must not open on top of it.
+    let interaction_pending = state.pending_interaction().is_some();
     let overlays_open = state.login_overlay.is_some()
         || state.effort_overlay.is_some()
         || state.model_overlay.is_some()
-        || state.mcp_overlay.is_some();
+        || state.mcp_overlay.is_some()
+        || interaction_pending;
     if is_ctrl_c(&key) && crate::selection::has_copyable_text(&state.selection_text) {
         return vec![
             Effect::CopyToClipboard(state.selection_text.clone()),
@@ -758,7 +773,7 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             return effects;
         }
     }
-    let inspector = if key.modifiers.contains(KeyModifiers::CONTROL) {
+    let inspector = if !interaction_pending && key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('d') => Some(InspectorKind::Diff),
             KeyCode::Char('j') => Some(InspectorKind::Activity),
@@ -809,7 +824,10 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     // G250: spec §17.2 bindings that were missing. Ctrl+L opens the model
     // overlay (same as /model); Ctrl+T toggles the Todo dock. Both sit after
     // the overlay gates, so they never fire beneath a stacked modal.
-    if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
+    if key.code == KeyCode::Char('l')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !interaction_pending
+    {
         let mut effects = open_model_overlay(state);
         effects.push(Effect::RequestRender);
         return effects;
@@ -1031,20 +1049,6 @@ fn reduce_search_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             state.revisions.focus += 1;
             return vec![Effect::RequestRender];
         }
-        KeyCode::Enter | KeyCode::Down => {
-            let total =
-                search_match_indices_filtered(state.blocks(), &search.query, search.filter).len();
-            if total > 0 {
-                search.selected = (search.selected + 1) % total;
-            }
-        }
-        KeyCode::Up => {
-            let total =
-                search_match_indices_filtered(state.blocks(), &search.query, search.filter).len();
-            if total > 0 {
-                search.selected = search.selected.checked_sub(1).unwrap_or(total - 1);
-            }
-        }
         KeyCode::Tab => {
             search.filter = search.filter.next();
             search.selected = 0;
@@ -1062,7 +1066,18 @@ fn reduce_search_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         _ => {}
     }
+    // One transcript scan per key: match navigation and pinning share it
+    // (navigation used to rescan the identical query a second time).
     let matches = search_match_indices_filtered(state.blocks(), &search.query, search.filter);
+    match key.code {
+        KeyCode::Enter | KeyCode::Down if !matches.is_empty() => {
+            search.selected = (search.selected + 1) % matches.len();
+        }
+        KeyCode::Up if !matches.is_empty() => {
+            search.selected = search.selected.checked_sub(1).unwrap_or(matches.len() - 1);
+        }
+        _ => {}
+    }
     if matches.is_empty() {
         search.selected = 0;
     } else if search.selected >= matches.len() {
@@ -1370,21 +1385,16 @@ fn parse_mcp_args(
 }
 
 fn submit_composer(state: &mut AppState) -> Vec<Effect> {
-    if matches!(
-        state
-            .pending_interaction()
-            .map(|interaction| &interaction.kind),
-        Some(InteractionRequestKind::Input { .. })
-    ) {
-        return submit_pending_input(state);
-    }
-    if matches!(
-        state
-            .pending_interaction()
-            .map(|interaction| &interaction.kind),
-        Some(InteractionRequestKind::Question { .. })
-    ) {
-        return submit_pending_question_custom(state);
+    // One reverse scan over the blocks; the two dispatch arms used to run
+    // `pending_interaction` once each.
+    if let Some(interaction) = state.pending_interaction() {
+        match &interaction.kind {
+            InteractionRequestKind::Input { .. } => return submit_pending_input(state),
+            InteractionRequestKind::Question { .. } => {
+                return submit_pending_question_custom(state);
+            }
+            _ => {}
+        }
     }
     let prompt = state.composer.payload();
     let command = prompt.trim().to_owned();

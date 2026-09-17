@@ -1655,6 +1655,16 @@ impl AppState {
         self.approval_scroll = InspectorScroll::default();
         self.approval_content_accessible = false;
         self.slash_suggestions = None;
+        // G220/§16.4: the pending interaction owns the keyboard. Search,
+        // palette and inspector dispatch before it and would keep stealing
+        // (or, for the inspector, silently forwarding) its keys.
+        if self.search.take().is_some()
+            || self.palette_query.take().is_some()
+            || self.inspector.active.take().is_some()
+        {
+            self.inspector.scroll.top();
+            self.revisions.focus += 1;
+        }
         self.note_new_content();
         if self.terminal_tail.is_none() {
             self.transition_activity(ActivityPhase::WaitingForInput);

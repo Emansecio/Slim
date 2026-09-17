@@ -287,10 +287,6 @@ impl ToolPhaseLedger {
         &self.batches
     }
 
-    pub fn reconstruct_batches(&self) -> &[ToolBatch] {
-        self.batches()
-    }
-
     pub fn batch(&self, batch_id: &str) -> Option<&ToolBatch> {
         self.batch_positions
             .get(batch_id)
@@ -302,17 +298,6 @@ impl ToolPhaseLedger {
             .iter()
             .flat_map(|batch| batch.calls.iter())
             .filter(|call| call.is_incomplete())
-            .collect()
-    }
-
-    pub fn incomplete_calls(&self) -> Vec<&ToolCallState> {
-        self.incomplete()
-    }
-
-    pub fn incomplete_batches(&self) -> Vec<&ToolBatch> {
-        self.batches
-            .iter()
-            .filter(|batch| batch.calls.iter().any(ToolCallState::is_incomplete))
             .collect()
     }
 
@@ -697,10 +682,6 @@ impl ReplayPlan {
             .iter()
             .filter(|item| item.disposition == ReplayDisposition::SafePending)
             .collect()
-    }
-
-    pub fn replayable(&self) -> Vec<&ReplayItem> {
-        self.pending()
     }
 
     pub fn is_empty(&self) -> bool {

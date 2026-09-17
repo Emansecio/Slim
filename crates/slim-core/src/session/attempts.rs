@@ -329,12 +329,6 @@ impl AttemptLedger {
             .is_some_and(|operation| operation.terminal)
     }
 
-    pub fn operation_was_started(&self, operation_id: &str) -> bool {
-        self.operations
-            .get(operation_id)
-            .is_some_and(|operation| operation.started)
-    }
-
     pub fn usage(&self, operation_id: &str, attempt_id: &str) -> Option<&DurableUsage> {
         self.usage
             .get(&(operation_id.to_owned(), attempt_id.to_owned()))

@@ -60,13 +60,6 @@ const COMPOSER_OVERFLOW_HINT: &str = "<";
 const CONTROL_BATCH_LIMIT: usize = 32;
 const STREAM_BATCH_LIMIT: usize = 1_024;
 const DOCKED_INSPECTOR_MIN_WIDTH: u16 = 100;
-/// The transcript, activity rail, composer and footer share this centred
-/// reading column.  Wider terminals keep the surrounding black margin quiet
-/// instead of stretching every line across the screen.
-const SHARED_READING_COLUMN_MAX: u16 = 100;
-/// A docked inspector gets a little more room, while the complete workspace
-/// (transcript plus inspector) remains bounded for predictable wrapping.
-const INSPECTOR_WORKSPACE_MAX: u16 = 144;
 const INFO_TOAST_HIGHLIGHT_MS: u64 = 249;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -963,17 +956,7 @@ fn inspector_panel_metrics(
 }
 
 fn workspace_regions(state: &AppState, scrollback: ratatui::layout::Rect) -> WorkspaceRegions {
-    let requested_max = if state.inspector.active.is_some() {
-        INSPECTOR_WORKSPACE_MAX
-    } else {
-        SHARED_READING_COLUMN_MAX
-    };
-    let workspace_width = scrollback.width.min(requested_max);
-    let workspace = ratatui::layout::Rect {
-        x: scrollback.x + scrollback.width.saturating_sub(workspace_width) / 2,
-        width: workspace_width,
-        ..scrollback
-    };
+    let workspace = scrollback;
     let inspector_visible =
         state.inspector.active.is_some() && workspace.width >= DOCKED_INSPECTOR_MIN_WIDTH;
     if !inspector_visible {
@@ -1209,6 +1192,7 @@ pub fn render_frame(
     let scrollback = to_ratatui(regions.scrollback);
     let workspace = workspace_regions(state, scrollback);
     let band = workspace_band(&workspace);
+    let cursor_target = input_cursor_target(state);
 
     if session_visible {
         render_session_rail(
@@ -1276,7 +1260,14 @@ pub fn render_frame(
         );
     }
     let composer_area = chrome_area(to_ratatui(regions.composer), band);
-    render_composer(frame, composer_area, state, &palette, cache);
+    render_composer(
+        frame,
+        composer_area,
+        state,
+        &palette,
+        cache,
+        cursor_target == Some(InputCursorTarget::Composer),
+    );
     if let Some(suggestions) = &state.slash_suggestions {
         let matches = cache.slash_matches(state, &suggestions.query);
         render_slash_popup(frame, composer_area, suggestions, &matches, &palette);
@@ -1321,6 +1312,7 @@ pub fn render_frame(
             state,
             &palette,
             &search_matches,
+            cursor_target == Some(InputCursorTarget::Search),
         );
     }
     if let Some(overlay) = &state.model_overlay {
@@ -1342,6 +1334,7 @@ pub fn render_frame(
             &state.zen_models,
             &rows,
             &palette,
+            cursor_target == Some(InputCursorTarget::ModelFilter),
         );
     }
     if let Some(overlay) = &state.mcp_overlay {
@@ -1351,7 +1344,12 @@ pub fn render_frame(
         render_effort_overlay(frame, overlay, &palette);
     }
     if let Some(overlay) = &state.login_overlay {
-        render_login_overlay(frame, overlay, &palette);
+        render_login_overlay(
+            frame,
+            overlay,
+            &palette,
+            cursor_target == Some(InputCursorTarget::LoginApiKey),
+        );
     }
     if let Some(query) = &state.palette_query {
         render_palette(
@@ -1361,6 +1359,7 @@ pub fn render_frame(
             state.palette_viewport_start,
             &palette,
             cache,
+            cursor_target == Some(InputCursorTarget::Palette),
         );
     }
     if validate_painted_selection(frame, state, cache) {
@@ -1424,12 +1423,7 @@ fn plan_regions(
     );
     let show_session =
         !state.blocks().is_empty() && !is_trivial_cwd(&state.cwd) && width >= 80 && height >= 12;
-    let workspace_width = width.min(if state.inspector.active.is_some() {
-        INSPECTOR_WORKSPACE_MAX
-    } else {
-        SHARED_READING_COLUMN_MAX
-    });
-    let snapshot_width = composer_text_budget_for_viewport(workspace_width, height);
+    let snapshot_width = composer_text_budget_for_viewport(width, height);
     let composer_lines = cache
         .composer_snapshot(&state.composer, snapshot_width)
         .total_lines
@@ -1858,25 +1852,20 @@ fn render_scrollback(
             .checked_div(bottom)
             .unwrap_or(0)
             .min(max_top);
-        let bar: Vec<Line> = (0..track)
-            .map(|row| {
-                let (glyph, style) = if row >= thumb_top && row < thumb_top.saturating_add(thumb) {
-                    ("┃", palette.scrollbar_thumb)
-                } else {
-                    ("│", palette.scrollbar_track)
-                };
-                Line::from(Span::styled(glyph, style))
-            })
-            .collect();
-        frame.render_widget(
-            Paragraph::new(bar),
-            ratatui::layout::Rect {
-                x: area.x + area.width.saturating_sub(1),
-                y: area.y,
-                width: 1,
-                height: track as u16,
-            },
-        );
+        // One cell per row, written straight into the buffer: building a
+        // `Vec<Line>` for a Paragraph costs ~3 allocations per visible row
+        // on every frame the scrollbar is painted.
+        let bar_x = area.x + area.width.saturating_sub(1);
+        for row in 0..track {
+            let (glyph, style) = if row >= thumb_top && row < thumb_top.saturating_add(thumb) {
+                ("┃", palette.scrollbar_thumb)
+            } else {
+                ("│", palette.scrollbar_track)
+            };
+            frame
+                .buffer_mut()
+                .set_string(bar_x, area.y + row as u16, glyph, style);
+        }
     }
     if notice_count > 0 {
         let history_count = state.notification_history().len().saturating_sub(1);
@@ -3299,6 +3288,41 @@ fn composer_is_focused(state: &AppState) -> bool {
         && !interaction_blocks_composer(state)
 }
 
+/// Returns whether the frame owns a text caret.  List and choice overlays
+/// intentionally keep the native cursor hidden; only their filter fields (and
+/// the API-key field) capture text input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputCursorTarget {
+    Composer,
+    LoginApiKey,
+    Search,
+    ModelFilter,
+    Palette,
+}
+
+fn input_cursor_target(state: &AppState) -> Option<InputCursorTarget> {
+    // Match the visual/input priority: the last painted capturing overlay
+    // wins, while a non-text modal suppresses every cursor beneath it.
+    if state.palette_query.is_some() {
+        return Some(InputCursorTarget::Palette);
+    }
+    if let Some(login) = &state.login_overlay {
+        return matches!(&login.stage, LoginStage::ApiKey(_))
+            .then_some(InputCursorTarget::LoginApiKey)
+            .filter(|_| !login.in_progress);
+    }
+    if state.effort_overlay.is_some() || state.mcp_overlay.is_some() {
+        return None;
+    }
+    if state.model_overlay.is_some() {
+        return Some(InputCursorTarget::ModelFilter);
+    }
+    if state.search.is_some() {
+        return Some(InputCursorTarget::Search);
+    }
+    composer_is_focused(state).then_some(InputCursorTarget::Composer)
+}
+
 fn interaction_blocks_composer(state: &AppState) -> bool {
     let Some(interaction) = state.pending_interaction() else {
         return false;
@@ -3876,11 +3900,12 @@ fn render_composer(
     state: &AppState,
     palette: &Palette,
     cache: &mut WrapCache,
+    cursor_focused: bool,
 ) {
     if area.height == 0 {
         return;
     }
-    let focused = composer_is_focused(state);
+    let focused = cursor_focused;
     let glyph_style = if focused {
         palette.accent
     } else {
@@ -4229,12 +4254,37 @@ fn footer_segment_is_shortcut(lower: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// Places a caret inside a painted rectangle while keeping tiny terminal
+/// sizes inside the frame.  `offset_x`/`offset_y` are measured in display
+/// cells from the rectangle's origin.
+fn set_cursor_in_rect(
+    frame: &mut ratatui::Frame,
+    rect: ratatui::layout::Rect,
+    offset_x: usize,
+    offset_y: usize,
+) {
+    let rect = rect.intersection(frame.area());
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    let x = rect
+        .x
+        .saturating_add(u16::try_from(offset_x).unwrap_or(u16::MAX))
+        .min(rect.right().saturating_sub(1));
+    let y = rect
+        .y
+        .saturating_add(u16::try_from(offset_y).unwrap_or(u16::MAX))
+        .min(rect.bottom().saturating_sub(1));
+    frame.set_cursor_position((x, y));
+}
+
 fn render_search_bar(
     frame: &mut ratatui::Frame,
     scrollback: ratatui::layout::Rect,
     state: &AppState,
     palette: &Palette,
     matches: &[usize],
+    cursor_focused: bool,
 ) {
     let Some(search) = &state.search else {
         return;
@@ -4292,6 +4342,11 @@ fn render_search_bar(
     } else {
         truncate_search_query(safe_query.as_ref(), query_budget)
     };
+    let query_cursor_width = if safe_query.is_empty() {
+        0
+    } else {
+        UnicodeWidthStr::width(query.as_str())
+    };
     let area = ratatui::layout::Rect {
         x: scrollback.x + 1,
         y: scrollback.y,
@@ -4315,6 +4370,14 @@ fn render_search_bar(
         .style(palette.surface_alt),
         area,
     );
+    if cursor_focused {
+        set_cursor_in_rect(
+            frame,
+            area,
+            prefix_width.saturating_add(query_cursor_width),
+            0,
+        );
+    }
 }
 
 fn truncate_search_query(query: &str, max_width: usize) -> String {
@@ -4930,11 +4993,14 @@ fn render_model_overlay(
     zen: &[crate::api::OpenCodeModelView],
     rows: &[ModelRow],
     palette: &Palette,
+    cursor_focused: bool,
 ) {
     let frame_area = frame.area();
     let width = ((u32::from(frame_area.width) * 9) / 10) as u16;
     let width = width.clamp(24, 72).min(frame_area.width);
-    let reserved = usize::from(!overlay.filter.is_empty()) + 1;
+    // The first inner row is always the editable filter.  Keeping its
+    // placeholder painted gives the caret a stable home even before typing.
+    let reserved = 2;
     let content_height = u16::try_from(rows.len() + reserved + 2).unwrap_or(u16::MAX);
     let height = content_height.clamp(6, frame_area.height.saturating_sub(2).max(6));
     let area = centered(frame_area, width, height);
@@ -4946,12 +5012,28 @@ fn render_model_overlay(
         _ => "OpenCode Zen",
     };
     let mut lines: Vec<Line> = Vec::new();
-    if !overlay.filter.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!(" Filtro: {}", sanitize_terminal_text(&overlay.filter)),
-            palette.muted,
-        )));
-    }
+    const FILTER_PREFIX: &str = " Filtro: ";
+    let inner_width = usize::from(area.width.saturating_sub(2));
+    let filter_prefix_width = UnicodeWidthStr::width(FILTER_PREFIX);
+    let filter_budget = inner_width.saturating_sub(filter_prefix_width);
+    let filter_display_budget = filter_budget.saturating_sub(1);
+    let safe_filter = sanitize_terminal_text(&overlay.filter);
+    let filter_value = if safe_filter.is_empty() {
+        crate::view_model::truncate_display_width("Digite para filtrar…", filter_display_budget)
+    } else {
+        truncate_search_query(&safe_filter, filter_display_budget)
+    };
+    lines.push(Line::from(vec![
+        Span::styled(FILTER_PREFIX, palette.muted),
+        Span::styled(
+            filter_value.clone(),
+            if safe_filter.is_empty() {
+                palette.muted
+            } else {
+                palette.text
+            },
+        ),
+    ]));
     let capacity = (area.height.saturating_sub(2) as usize).saturating_sub(reserved);
     let window = visible_window(
         rows.len(),
@@ -5060,6 +5142,25 @@ fn render_model_overlay(
         Paragraph::new(lines).block(modal_block(" Selecionar modelo ", palette)),
         area,
     );
+    if cursor_focused {
+        let inner = ratatui::layout::Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        let value_width = if safe_filter.is_empty() {
+            0
+        } else {
+            UnicodeWidthStr::width(filter_value.as_str())
+        };
+        set_cursor_in_rect(
+            frame,
+            inner,
+            filter_prefix_width.saturating_add(value_width),
+            0,
+        );
+    }
 }
 
 fn model_row_matches(
@@ -5278,7 +5379,28 @@ fn render_effort_overlay(frame: &mut ratatui::Frame, overlay: &EffortOverlay, pa
     );
 }
 
-fn render_login_overlay(frame: &mut ratatui::Frame, overlay: &LoginOverlay, palette: &Palette) {
+fn masked_api_key(key: &crate::api::SensitiveText, budget: usize) -> String {
+    let length = key.char_len();
+    if length == 0 || budget == 0 {
+        return String::new();
+    }
+    let mask_length = length.max(4);
+    let visible = mask_length.min(budget);
+    if visible == mask_length {
+        return "•".repeat(visible);
+    }
+    if visible == 1 {
+        return "•".into();
+    }
+    format!("…{}", "•".repeat(visible - 1))
+}
+
+fn render_login_overlay(
+    frame: &mut ratatui::Frame,
+    overlay: &LoginOverlay,
+    palette: &Palette,
+    cursor_focused: bool,
+) {
     if let LoginStage::ApiKey(key) = &overlay.stage {
         let title = match overlay.provider() {
             LoginProvider::OpenCodeGo => " OpenCode Go API key ",
@@ -5289,18 +5411,77 @@ fn render_login_overlay(frame: &mut ratatui::Frame, overlay: &LoginOverlay, pale
             LoginProvider::OpenAiCodex => " OpenAI Codex API key ",
             LoginProvider::Xai => " xAI API key ",
         };
-        let mask = if key.is_empty() {
-            String::new()
-        } else {
-            "•".repeat(key.char_len().max(4))
-        };
         let area = centered(frame.area(), 58, 8);
+        let inner = ratatui::layout::Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        let mask_budget = usize::from(inner.width).saturating_sub(2);
+        let mask = masked_api_key(key, mask_budget);
+        let field = if mask.is_empty() {
+            "Cole sua API key…".to_owned()
+        } else {
+            mask.clone()
+        };
+        let status = if overlay.in_progress {
+            "Salvando…".to_owned()
+        } else {
+            overlay
+                .progress
+                .as_ref()
+                .map(|progress| sanitize_terminal_text(progress))
+                .unwrap_or_default()
+        };
+        let status = truncate_cells(&status, usize::from(inner.width));
+        let field = truncate_cells(&field, mask_budget);
+        let mut lines = vec![
+            Line::default(),
+            Line::from(vec![
+                Span::styled(" ", palette.muted),
+                Span::styled(
+                    field.clone(),
+                    if mask.is_empty() {
+                        palette.muted
+                    } else {
+                        palette.text
+                    },
+                ),
+            ]),
+            Line::default(),
+        ];
+        if !status.is_empty() {
+            lines.push(Line::from(Span::styled(
+                status,
+                if overlay.in_progress {
+                    palette.warning
+                } else {
+                    palette.error
+                },
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            " Enter salvar · Esc voltar",
+            palette.muted,
+        )));
         frame.render_widget(Clear, area);
         frame.render_widget(
-            Paragraph::new(format!("\n {mask}\n\n Enter salvar · Esc voltar"))
-                .block(modal_block(title, palette)),
+            Paragraph::new(lines).block(modal_block(title, palette)),
             area,
         );
+        if cursor_focused && !overlay.in_progress {
+            set_cursor_in_rect(
+                frame,
+                inner,
+                1usize.saturating_add(if mask.is_empty() {
+                    0
+                } else {
+                    UnicodeWidthStr::width(field.as_str())
+                }),
+                1,
+            );
+        }
         return;
     }
     let providers = [
@@ -5439,6 +5620,7 @@ fn render_palette(
     viewport_start: usize,
     palette: &Palette,
     cache: &mut WrapCache,
+    cursor_focused: bool,
 ) {
     let matches = cache.palette_matches(query);
     let rows = grouped_command_lines(&matches, Some(selected), palette);
@@ -5463,27 +5645,45 @@ fn render_palette(
         capacity,
     );
     let end = start.saturating_add(capacity).min(rows.len());
-    let query_row = if query.is_empty() {
-        Span::styled(" Digite para filtrar…", palette.muted)
+    let inner_width = usize::from(area.width.saturating_sub(2));
+    let query_budget = inner_width.saturating_sub(2);
+    let safe_query = sanitize_terminal_text(query);
+    let query_value = if safe_query.is_empty() {
+        crate::view_model::truncate_display_width("Digite para filtrar…", query_budget)
     } else {
-        Span::styled(
-            format!(
-                " {}",
-                truncate_cells(
-                    &sanitize_terminal_text(query),
-                    area.width.saturating_sub(2) as usize,
-                )
-            ),
-            palette.text,
-        )
+        truncate_search_query(&safe_query, query_budget)
     };
-    let mut lines = vec![Line::from(query_row)];
+    let mut lines = vec![Line::from(vec![
+        Span::styled(" ", palette.muted),
+        Span::styled(
+            query_value.clone(),
+            if safe_query.is_empty() {
+                palette.muted
+            } else {
+                palette.text
+            },
+        ),
+    ])];
     lines.extend(rows[start..end].iter().map(|row| row.line.clone()));
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(modal_block(" Comandos ", palette)),
         area,
     );
+    if cursor_focused {
+        let inner = ratatui::layout::Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        let value_width = if safe_query.is_empty() {
+            0
+        } else {
+            UnicodeWidthStr::width(query_value.as_str())
+        };
+        set_cursor_in_rect(frame, inner, 1usize.saturating_add(value_width), 0);
+    }
 }
 
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];

@@ -66,10 +66,6 @@ impl SessionPreflight {
             && !self.needs_separator
             && !self.sequence_overflow
     }
-
-    pub fn is_healthy(&self) -> bool {
-        self.status == PreflightStatus::Healthy
-    }
 }
 
 /// The file has either a confirmed healthy prefix or an explicit condition

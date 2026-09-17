@@ -30,22 +30,32 @@ pub enum FramedLine {
 #[derive(Default)]
 pub struct JsonLineFramer {
     buffer: Vec<u8>,
+    /// Bytes at the front of `buffer` already confirmed newline-free; the
+    /// scan resumes here so a long unterminated line is not re-scanned on
+    /// every chunk.
+    scanned: usize,
 }
 
 impl JsonLineFramer {
     pub fn push(&mut self, chunk: &[u8]) -> Vec<FramedLine> {
         self.buffer.extend_from_slice(chunk);
         let mut lines = Vec::new();
-        while let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let line: Vec<u8> = self.buffer.drain(..=index).collect();
-            let trimmed = line.strip_suffix(b"\n").unwrap_or(&line);
-            if trimmed.is_empty() {
+        let mut consumed = 0;
+        while let Some(relative) = self.buffer[self.scanned..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        {
+            let newline = self.scanned + relative;
+            let line = &self.buffer[consumed..newline];
+            consumed = newline + 1;
+            self.scanned = consumed;
+            if line.is_empty() {
                 continue;
             }
-            match serde_json::from_slice(trimmed) {
+            match serde_json::from_slice(line) {
                 Ok(message) => lines.push(FramedLine::Message(message)),
                 Err(_) => {
-                    let noise = String::from_utf8_lossy(trimmed);
+                    let noise = String::from_utf8_lossy(line);
                     let noise = if noise.chars().count() > 160 {
                         format!("{}…", noise.chars().take(160).collect::<String>())
                     } else {
@@ -55,6 +65,8 @@ impl JsonLineFramer {
                 }
             }
         }
+        self.buffer.drain(..consumed);
+        self.scanned = self.buffer.len();
         lines
     }
 
@@ -415,7 +427,8 @@ fn dispatch_inbound(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&id);
         if let Some(sender) = sender {
-            let result = if let Some(error) = message.get("error") {
+            let result = if let Some(error) = message.get("error").filter(|error| !error.is_null())
+            {
                 Err(McpError::Server {
                     code: error.get("code").and_then(Value::as_i64).unwrap_or(0),
                     message: crate::mcp::spec::bounded_server_text(
@@ -453,8 +466,9 @@ fn spawn_stderr_reader(
             }
             let mut tail = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             tail.extend(&chunk[..read]);
-            while tail.len() > STDERR_TAIL_BYTES {
-                tail.pop_front();
+            let excess = tail.len().saturating_sub(STDERR_TAIL_BYTES);
+            if excess > 0 {
+                tail.drain(..excess);
             }
         }
     })

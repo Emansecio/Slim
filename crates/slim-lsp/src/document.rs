@@ -16,7 +16,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use lsp_types::VersionedTextDocumentIdentifier;
 use url::Url;
 
 pub const DEFAULT_MAX_OPEN_DOCUMENTS: usize = 64;
@@ -423,16 +422,6 @@ impl DocumentStore {
             }
         }
         evicted
-    }
-
-    pub fn lsp_document_identifier(
-        &self,
-        path: &std::path::Path,
-    ) -> Option<VersionedTextDocumentIdentifier> {
-        self.get(path).map(|doc| VersionedTextDocumentIdentifier {
-            uri: crate::instance::to_lsp_uri(&doc.uri),
-            version: doc.version.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-        })
     }
 }
 

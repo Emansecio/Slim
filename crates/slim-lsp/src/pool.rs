@@ -736,7 +736,10 @@ impl LspProcessPool {
         let pool = self.clone();
         let key = key.clone();
         entry.idle_task = Some(tokio::spawn(async move {
-            tokio::time::sleep(idle).await;
+            // sleep() panics when `Instant::now() + idle` overflows (a huge
+            // configured idle_shutdown_minutes); the saturating deadline
+            // keeps "never expire" semantics without crashing the task.
+            tokio::time::sleep_until(crate::transport::deadline_after(idle)).await;
             pool.shutdown_if_idle(&key, &expected).await;
         }));
     }

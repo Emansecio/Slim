@@ -9,17 +9,12 @@ mod jsonl_repo;
 mod manual_drive;
 mod manual_journal;
 mod memory_repo;
-mod observability_hooks;
-mod observability_snapshot;
-mod observability_telemetry;
-mod observability_watch;
 mod queue;
 mod recovery;
 mod reducer;
 mod repository;
 mod resume;
 mod schema_v2;
-mod snapshot;
 mod tool_phases;
 mod transcript;
 
@@ -54,18 +49,6 @@ pub use manual_drive::{
 };
 pub use manual_journal::ManualRunJournal;
 pub use memory_repo::MemoryRepo;
-pub use observability_hooks::{
-    append_with_hooks, DurableAppendProjection, DurableOperationProjection, FactValueKind,
-    HookFailure, HookReport, PostAppendHook, PostAppendHooks, MAX_OBSERVABILITY_ID_BYTES,
-};
-pub use observability_snapshot::{DurableSnapshot, DurableSnapshotSummary, SnapshotError};
-pub use observability_telemetry::{
-    OperationClass, TelemetryCounters, TelemetryEvent, TelemetryKind, TelemetryRing,
-    MAX_TELEMETRY_EVENTS,
-};
-pub use observability_watch::{
-    DurableWatch, DurableWatchBatch, DurableWatchCursor, WatchBatch, WatchCursor,
-};
 pub use queue::{DurableQueue, DurableQueueError, QueueItem, QueueStatus};
 pub use recovery::{branch, recover, RecoveredSession};
 pub use reducer::{reduce, restore_records, DurableState, ReduceError};
@@ -85,7 +68,6 @@ pub use schema_v2::{
     MAX_COMPACTION_SUMMARY_BYTES, MAX_DURABLE_SESSION_BYTES, MAX_TOOL_BATCH_LIMIT,
     MAX_TOOL_INLINE_BYTES, MAX_TOOL_METADATA_BYTES,
 };
-pub use snapshot::SessionSnapshot;
 pub use tool_phases::{
     ReplayDisposition, ReplayItem, ReplayPlan, ToolBatch, ToolCallState, ToolOutput,
     ToolPhaseError, ToolPhaseLedger,

@@ -828,10 +828,6 @@ impl Runtime {
         Ok(runtime)
     }
 
-    pub fn set_artifact_store(&mut self, store: ArtifactStore) {
-        self.artifact_store = Some(store);
-    }
-
     pub fn set_tool_registry(&mut self, tools: ToolRegistry) {
         self.tools = tools;
     }
@@ -1207,11 +1203,17 @@ impl Runtime {
         next_seq: u64,
         finalize: bool,
     ) -> Result<ProviderTurnResult, ProviderError> {
-        let redacted = self.redact_messages(messages);
-        let mut request = if finalize {
-            client.prepare_finalization_messages(&redacted)?
+        let redacted;
+        let messages: &[ProviderMessage] = if self.sensitive_values.0.is_empty() {
+            messages
         } else {
-            client.prepare_messages_with_tools(&redacted, tools)?
+            redacted = self.redact_messages(messages);
+            redacted.as_slice()
+        };
+        let mut request = if finalize {
+            client.prepare_finalization_messages(messages)?
+        } else {
+            client.prepare_messages_with_tools(messages, tools)?
         };
         let serialized_chars = request.serialized_chars;
         let ProviderRequestComponents {
@@ -1250,7 +1252,7 @@ impl Runtime {
             })?;
         self.run_provider_messages_with_tools_after_snapshot(
             client,
-            messages_are_text_only(&redacted),
+            messages_are_text_only(messages),
             request,
             request_next_seq,
             false,
@@ -1471,19 +1473,6 @@ impl Runtime {
             config,
         )
         .await
-    }
-
-    pub async fn run_agent_loop_with_message<A: ProviderAdapter + Send + Sync + 'static>(
-        &mut self,
-        client: &HttpProviderClient<A>,
-        message: ProviderMessage,
-        mode: crate::OperatingMode,
-        cwd: impl AsRef<Path>,
-        next_seq: u64,
-        config: AgentLoopConfig,
-    ) -> Result<AgentLoopResult, ProviderError> {
-        self.run_agent_loop_with_messages(client, &[message], mode, cwd, next_seq, config)
-            .await
     }
 
     pub async fn run_agent_loop_with_messages<A: ProviderAdapter + Send + Sync + 'static>(
@@ -5553,6 +5542,9 @@ impl Runtime {
     }
 
     fn redact_message(&self, mut message: ProviderMessage) -> ProviderMessage {
+        if self.sensitive_values.0.is_empty() {
+            return message;
+        }
         message.content = self.redact_sensitive(&message.content);
         message.name = message.name.map(|value| self.redact_sensitive(&value));
         message.tool_call_id = message
@@ -5580,6 +5572,9 @@ impl Runtime {
     }
 
     fn redact_messages(&self, messages: &[ProviderMessage]) -> Vec<ProviderMessage> {
+        if self.sensitive_values.0.is_empty() {
+            return messages.to_vec();
+        }
         messages
             .iter()
             .cloned()
@@ -5699,6 +5694,12 @@ impl Runtime {
             })
             .collect::<Vec<_>>();
         let build = |scale: usize| {
+            // Duplicate detection must see the same context the assembly loop
+            // will: base history plus this batch's already chosen tool
+            // messages. Otherwise a repeated result inside one batch is
+            // budgeted as another full copy and can shrink the first
+            // occurrence even when one copy plus the notice would fit.
+            let mut batch_messages = Vec::with_capacity(calls.len());
             results
                 .iter()
                 .zip(&targets)
@@ -5712,45 +5713,65 @@ impl Runtime {
                     let duplicate = format!(
                         "[duplicate {name} result omitted; identical output already in context]"
                     );
-                    if result.success
-                        && duplicate.len() < result.output.len()
-                        && tool_output_already_in_context(base_messages, &name, &result.output)
-                    {
-                        return ToolPresentation::complete(duplicate);
-                    }
-                    let allowance = target.saturating_mul(scale).div_ceil(1000);
-                    let suffix = Self::artifact_reference(result);
-                    let body_budget =
-                        allowance.saturating_sub(suffix.as_ref().map_or(0, String::len));
-                    let mut presentation = self
-                        .presentation_sources
-                        .get(&(batch_id.to_owned(), call.id.clone()))
-                        .map(|source| {
-                            source.present(PresentationBudget {
-                                max_bytes: body_budget,
-                            })
-                        })
-                        .unwrap_or_else(|| {
-                            present_unstructured(
-                                &result.name,
-                                &result.output,
-                                PresentationBudget {
+                    let already_in_context = |text: &str| {
+                        duplicate.len() < text.len()
+                            && (tool_output_already_in_context(base_messages, &name, text)
+                                || tool_output_already_in_context(&batch_messages, &name, text))
+                    };
+                    let presentation = if result.success && already_in_context(&result.output) {
+                        ToolPresentation::complete(duplicate)
+                    } else {
+                        let allowance = target.saturating_mul(scale).div_ceil(1000);
+                        let suffix = Self::artifact_reference(result);
+                        let body_budget =
+                            allowance.saturating_sub(suffix.as_ref().map_or(0, String::len));
+                        let mut presentation = self
+                            .presentation_sources
+                            .get(&(batch_id.to_owned(), call.id.clone()))
+                            .map(|source| {
+                                source.present(PresentationBudget {
                                     max_bytes: body_budget,
-                                },
-                            )
-                        });
-                    if let Some(suffix) = suffix {
-                        if presentation.text.len().saturating_add(suffix.len()) <= allowance {
-                            presentation.text.push_str(&suffix);
-                        } else {
-                            // Keep the recovery handle even when the aggregate
-                            // budget cannot carry both the selected records and
-                            // metadata. The explicit over-budget notice is a
-                            // safer contract than an unreachable artifact.
-                            presentation.text.push('\n');
-                            presentation.text.push_str(&suffix);
+                                })
+                            })
+                            .unwrap_or_else(|| {
+                                present_unstructured(
+                                    &result.name,
+                                    &result.output,
+                                    PresentationBudget {
+                                        max_bytes: body_budget,
+                                    },
+                                )
+                            });
+                        if let Some(suffix) = suffix {
+                            if presentation.text.len().saturating_add(suffix.len()) <= allowance {
+                                presentation.text.push_str(&suffix);
+                            } else {
+                                // Keep the recovery handle even when the aggregate
+                                // budget cannot carry both the selected records and
+                                // metadata. The explicit over-budget notice is a
+                                // safer contract than an unreachable artifact.
+                                presentation.text.push('\n');
+                                presentation.text.push_str(&suffix);
+                            }
                         }
-                    }
+                        // The assembly loop also collapses a projection that is
+                        // already verbatim in context (e.g. an identical
+                        // truncation); mirror it so the budgeted size matches
+                        // the emitted one.
+                        if result.success && already_in_context(&presentation.text) {
+                            ToolPresentation::complete(duplicate)
+                        } else {
+                            presentation
+                        }
+                    };
+                    // Mirror `append_conversation_message`: the retained wire
+                    // message is the redacted presentation, and it is what the
+                    // next duplicate check compares against.
+                    batch_messages.push(self.redact_message(ProviderMessage::tool(
+                        name,
+                        self.redact_sensitive(&call.id),
+                        presentation.text.clone(),
+                    )));
                     presentation
                 })
                 .collect::<Vec<_>>()
@@ -5765,31 +5786,34 @@ impl Runtime {
                 ));
             }
             // The loop's preflight uses the conservative structural estimate
-            // before preparing the wire request. Reuse that exact path for
-            // the hard-threshold decision; JSON escaping and envelopes can
-            // make it larger than the adapter's serialized byte count. Keep
-            // the prepared request for the reserve/window check below.
-            let structural_tokens = {
-                let mut structural_candidate = candidate.clone();
-                let overlay = self.overlay_channel(&mut structural_candidate, mode);
-                estimate_unprepared_request_chars(client.adapter(), overlay.view(), tools, None)
-                    .map(|chars| {
-                        self.token_estimator.estimate(
-                            crate::provider::provider_kind_name(client.adapter().kind()),
-                            client.adapter().model(),
-                            chars,
-                        )
-                    })
+            // before preparing the wire request, and that estimate never
+            // under-counts the serialized body. When the adapter bounds its
+            // request envelope the structural estimate alone is the decision
+            // input — the exact path the loop already takes — so transport
+            // metadata is only built for adapters without the bound.
+            let overlay = self.overlay_channel(&mut candidate, mode);
+            let structural_chars =
+                estimate_unprepared_request_chars(client.adapter(), overlay.view(), tools, None);
+            drop(overlay);
+            let budget_estimated = match structural_chars {
+                Some(chars) => self.token_estimator.estimate(
+                    crate::provider::provider_kind_name(client.adapter().kind()),
+                    client.adapter().model(),
+                    chars,
+                ),
+                None => {
+                    let Ok(request) =
+                        self.prepare_loop_request(client, &mut candidate, tools, mode)
+                    else {
+                        return false;
+                    };
+                    self.token_estimator.estimate(
+                        crate::provider::provider_kind_name(client.adapter().kind()),
+                        client.adapter().model(),
+                        request.serialized_chars,
+                    )
+                }
             };
-            let Ok(request) = self.prepare_loop_request(client, &mut candidate, tools, mode) else {
-                return false;
-            };
-            let estimated = self.token_estimator.estimate(
-                crate::provider::provider_kind_name(client.adapter().kind()),
-                client.adapter().model(),
-                request.serialized_chars,
-            );
-            let budget_estimated = estimated.max(structural_tokens.unwrap_or(estimated));
             let under_hard_threshold =
                 hard_threshold.is_none_or(|threshold| budget_estimated < threshold);
             under_hard_threshold
@@ -7146,6 +7170,9 @@ fn estimate_unprepared_request_chars<A: ProviderAdapter>(
 ) -> Option<u64> {
     const MESSAGE_ENVELOPE_CHARS: u64 = 256;
     const TOOL_ENVELOPE_CHARS: u64 = 128;
+    // Without the adapter's envelope bound there is no estimate at all; ask
+    // before scanning so adapters without one skip the whole walk.
+    let request_envelope_chars = adapter.request_envelope_upper_bound_chars()?;
     let system_chars = system_prompt_override
         .or_else(|| adapter.system_prompt_for_budget())
         .map_or(0, estimate_json_string_chars);
@@ -7213,7 +7240,6 @@ fn estimate_unprepared_request_chars<A: ProviderAdapter>(
                 .saturating_add(TOOL_ENVELOPE_CHARS)
                 .saturating_add(chars)
         });
-    let request_envelope_chars = adapter.request_envelope_upper_bound_chars()?;
     Some(
         request_envelope_chars
             .saturating_add(estimate_json_string_chars(adapter.model()))
@@ -7224,10 +7250,13 @@ fn estimate_unprepared_request_chars<A: ProviderAdapter>(
 }
 
 fn estimate_json_string_chars(value: &str) -> u64 {
-    value.chars().fold(2_u64, |total, character| {
-        total.saturating_add(match character {
-            '\u{0000}'..='\u{001f}' => 6,
-            '"' | '\\' => 2,
+    // Byte scan equivalent to the per-char version: multi-byte UTF-8
+    // sequences contribute 1 via the lead byte; continuation bytes add 0.
+    value.bytes().fold(2_u64, |total, byte| {
+        total.saturating_add(match byte {
+            0x00..=0x1f => 6,
+            b'"' | b'\\' => 2,
+            0x80..=0xbf => 0,
             _ => 1,
         })
     })
@@ -7456,10 +7485,20 @@ fn redact_task_value(value: &mut Value, sensitive_values: &[String]) {
 }
 
 fn redact_values(sensitive_values: &[String], input: &str) -> String {
+    if !sensitive_values
+        .iter()
+        .any(|value| input.contains(value.as_str()))
+    {
+        return input.to_owned();
+    }
     sensitive_values
         .iter()
         .fold(input.to_owned(), |redacted, value| {
-            redacted.replace(value, "[REDACTED]")
+            if redacted.contains(value.as_str()) {
+                redacted.replace(value, "[REDACTED]")
+            } else {
+                redacted
+            }
         })
 }
 
@@ -8112,6 +8151,9 @@ fn take_redacted_stream_chunk(
     flush: bool,
 ) -> String {
     pending.push_str(delta);
+    if sensitive_values.is_empty() {
+        return std::mem::take(pending);
+    }
     let split_at = if flush {
         pending.len()
     } else {
@@ -8278,21 +8320,35 @@ pub(crate) fn tool_events_contain_sensitive_values(
 }
 
 fn sensitive_tool_arguments(arguments: &str, secrets: &[String]) -> bool {
-    fn contains(value: &Value, secret: &str) -> bool {
+    // `normalize_tool_arguments` unwraps one JSON-string layer at publish
+    // time, so the gate cannot stop at a single decode: a string value that
+    // itself parses as JSON is checked at every level the executor can reach.
+    // Decoded text strictly shrinks per level and nested JSON quoting grows
+    // ~2x outward, so real payloads stay far below this bound.
+    const MAX_UNWRAP_DEPTH: u32 = 8;
+    fn contains(value: &Value, secret: &str, depth: u32) -> bool {
         match value {
-            Value::String(text) => text.contains(secret),
-            Value::Array(values) => values.iter().any(|value| contains(value, secret)),
+            Value::String(text) => {
+                text.contains(secret)
+                    || (depth > 0
+                        && serde_json::from_str::<Value>(text)
+                            .is_ok_and(|inner| contains(&inner, secret, depth - 1)))
+            }
+            Value::Array(values) => values.iter().any(|value| contains(value, secret, depth)),
             Value::Object(values) => values
                 .iter()
-                .any(|(key, value)| key.contains(secret) || contains(value, secret)),
+                .any(|(key, value)| key.contains(secret) || contains(value, secret, depth)),
             _ => value.to_string().contains(secret),
         }
     }
-    let parsed = serde_json::from_str::<Value>(arguments).ok();
+    let mut parsed = None;
     secrets.iter().any(|secret| {
         !secret.is_empty()
             && (arguments.contains(secret)
-                || parsed.as_ref().is_some_and(|value| contains(value, secret)))
+                || parsed
+                    .get_or_insert_with(|| serde_json::from_str::<Value>(arguments).ok())
+                    .as_ref()
+                    .is_some_and(|value| contains(value, secret, MAX_UNWRAP_DEPTH)))
     })
 }
 

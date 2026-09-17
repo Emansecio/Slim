@@ -747,7 +747,7 @@ histórico sem timestamps não ganha duração estimada. Com o cabeçalho visív
 ele recebe o tempo do pensamento, e a barra reserva o tempo total/idade de dados.
 A classificação do raciocínio é preservada somente quando conhecida pelo adapter.
 
-Mantêm-se a coluna compartilhada de 100 células (workspace com inspetor até 144),
+A superfície compartilhada usa toda a largura do terminal, mantendo
 o composer contornado e a paleta preta/marfim/verde. Rodapé usa tons secundários;
 ferramentas recolhidas conservam alvo e resultado disponíveis. Soma de tempos
 de chamadas é identificada como acumulada, nunca como duração real do lote.
@@ -765,10 +765,10 @@ eventos com indicador nominal de 83 ms e coalescimento de deltas em 16 ms.
 Resumo de execução registra duração/desfecho observado, sem afirmar que o objetivo
 do usuário foi comprovadamente resolvido.
 
-**Revisão autorizada em 10/09/2026, refinada em 14/09/2026 — referência Cursor CLI:** a superfície passa
-a usar uma coluna de leitura central de até 100 células, compartilhada por
-conversa, atividade, composer e footer. Com inspector docked, preserva-se o
-workspace de até 144 células. O composer mantém seu box e edição multilinha;
+**Revisão de largura em 16/09/2026, por solicitação do usuário:** a superfície usa
+toda a largura disponível do terminal, compartilhada por conversa, atividade,
+composer e footer. O inspector docked divide esse espaço com a conversa,
+sem limitar a largura total do workspace. O composer mantém seu box e edição multilinha;
 modelo/esforço/contexto passam para o footer alinhado à esquerda, com duas rows
 no estado comum em altura >=12 e uma nos tamanhos menores. Metadados degradam
 antes de cancelamento, acesso ao login e retorno ao live edge.
@@ -828,7 +828,7 @@ afirmar que o modelo está emitindo raciocínio. A animação não invalida as l
 estáveis do corpo; um draw por evento consome os marcos de animação/status já
 pintados, evitando solicitar imediatamente o mesmo frame.
 
-Esta revisão substitui as prescrições conflitantes de largura total, palette
+Esta revisão substitui as prescrições conflitantes de palette
 fria, welcome centralizado e modelo no contorno do composer descritas no
 checkpoint histórico abaixo. Os testes de interação e lifecycle permanecem
 obrigatórios; expectativa visual deve seguir esta revisão.
@@ -1429,8 +1429,11 @@ só entra como fallback offline. Cache em `%USERPROFILE%\.slim\command-code-mode
 `https://api.cline.bot/api/v1/chat/completions`. O modelo padrão é
 `cline-pass/qwen3.7-max`. Somente slugs `cline-pass/…` com charset válido são
 aceitos — o catálogo ao vivo (`GET https://api.cline.bot/api/v1/models`, Bearer)
-é a fonte da verdade; o bundle estático é fallback quando o GET falha ou volta
-vazio. Credenciais: `SLIM_API_KEY` → `CLINEPASS_API_KEY` → `auth.json`.
+fornece os modelos desse namespace; o bundle estático é fallback quando o GET
+falha ou não contém modelos elegíveis. Esse endpoint também lista o catálogo
+geral Cline, que não equivale à assinatura ClinePass. O limite de 256 modelos
+aplica-se ao subconjunto elegível, preservando o limite bruto de 1 MiB.
+Credenciais: `SLIM_API_KEY` → `CLINEPASS_API_KEY` → `auth.json`.
 Aliases CLI: `clinepass`, `cline-pass`, `cp`.
 
 ## 8. Estado da aplicação
@@ -2062,10 +2065,15 @@ vai a `Top`; `End` volta a `LiveEdge` sem prompt preso.
   / commands · Ctrl+P · Ctrl+C exit
 ```
 
-Sem inspector, o workspace central tem até 100 células. Conversa, composer,
+O workspace ocupa toda a largura disponível do terminal. Conversa, composer,
 atividade, perguntas e footer compartilham essa faixa, com inset de uma célula
-no chrome. Com inspector docked o workspace central pode chegar a 144 células.
+no chrome. O inspector docked divide o workspace sem centralização ou teto de largura.
 Alturas, wrap, scroll, seleção e cursor usam a largura real dessas regiões.
+Campos de texto com foco exibem o cursor nativo em barra piscante, inclusive
+chave de API, busca, paleta e filtro de modelos. O terminal controla a piscada;
+não há timer de redesenho para o cursor. Placeholders mantêm o cursor no início
+do campo; segredos permanecem mascarados. Menus sem edição e operações de login
+em andamento ocultam o cursor. Ao sair, restaura-se a forma padrão do terminal.
 Conversas que cabem crescem a partir da entrada, com uma row de respiro; o
 histórico longo preserva o page-fill e a âncora de leitura existentes.
 
@@ -2258,8 +2266,8 @@ o `row_offset` dentro da nova altura.
 - antes de todo `User` posterior ao primeiro há exatamente uma row física vazia,
   medida pelo `HeightIndex` e materializada pelo renderer; o primeiro user não
   recebe espaçamento superior;
-- mensagens usam a largura útil do scrollback dentro da coluna central de até
-  100 células (§14.1), sem balões individuais estreitos;
+- mensagens usam a largura útil do scrollback em toda a largura disponível
+  do terminal (§14.1), sem balões individuais estreitos;
 - headings Markdown removem os marcadores visuais `#`/`##`/`###`: H1 usa
   `assistant_accent`, H2 usa `heading_accent`, H3 usa `thinking_accent` e níveis
   maiores usam `heading_accent`; links usam `link_accent`; prosa comum permanece

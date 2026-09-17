@@ -71,6 +71,12 @@ impl<K: Eq + Hash, V> WeightedCache<K, V> {
         let Some(map) = &mut self.map else {
             return false;
         };
+        // A replacement frees the previous entry's weight before admission:
+        // without this the tracker keeps counting dropped bytes, evicting
+        // unrelated entries and eventually rejecting every insert.
+        if let Some((_, old_bytes)) = map.pop(&key) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(old_bytes);
+        }
         let max_entries = map.cap().get();
         while map.len() >= max_entries || self.retained_bytes.saturating_add(bytes) > self.max_bytes
         {
@@ -225,6 +231,30 @@ mod tests {
         assert!(!empty.insert("any", 1, 1), "zero capacity stores nothing");
         assert!(empty.is_empty());
         assert_eq!(empty.capacity(), 0);
+    }
+
+    #[test]
+    fn weighted_cache_replacement_frees_the_old_weight() {
+        let mut cache = WeightedCache::new(4, 100);
+        assert!(cache.insert("a", 1, 60));
+        assert!(cache.insert("b", 2, 40));
+        // Reinserting "a" at a new weight must not count the old 60 bytes.
+        assert!(cache.insert("a", 3, 40));
+        assert_eq!(cache.retained_bytes(), 80);
+        assert_eq!(cache.get(&"a"), Some(&3));
+        assert_eq!(cache.get(&"b"), Some(&2), "no innocent eviction");
+        assert_eq!(cache.evictions(), 0);
+
+        // Repeated replacements must not leak the tracker into a state that
+        // rejects inserts while the map still has room. The first reinsert
+        // evicts b to fit the 100-byte budget; the rest replace a alone.
+        for _ in 0..8 {
+            assert!(cache.insert("a", 9, 80), "replacement stays admissible");
+        }
+        assert_eq!(cache.retained_bytes(), 80);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.evictions(), 1);
+        assert_eq!(cache.get(&"a"), Some(&9));
     }
 
     #[test]
