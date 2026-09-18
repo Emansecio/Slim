@@ -56,6 +56,8 @@ fn has_positional_prompt(args: &[String]) -> bool {
                 | "--recover"
                 | "--image"
                 | "--effort"
+                | "--experiment-id"
+                | "--task-id"
         ) {
             index += 2;
             continue;
@@ -72,10 +74,10 @@ fn known_options_without_prompt(args: &[String]) -> bool {
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--plan" | "--read-only" | "--verbose" | "--jsonl" | "--headless" | "--tui"
-            | "--fake" | "--abandon-pending" | "--fast" | "--normal" => {}
+            "--plan" | "--read-only" | "--jev" | "--verbose" | "--jsonl" | "--headless"
+            | "--tui" | "--fake" | "--abandon-pending" | "--fast" | "--normal" => {}
             "--prompt" | "--provider" | "--model" | "--endpoint" | "--session" | "--resume"
-            | "--recover" | "--image" | "--effort" => {
+            | "--recover" | "--image" | "--effort" | "--experiment-id" | "--task-id" => {
                 if args.get(index + 1).is_none() {
                     return false;
                 }
@@ -136,5 +138,32 @@ mod tests {
     fn unknown_option_disables_stdin() {
         let args = args(&["--headless", "--bogus"]);
         assert!(!known_options_without_prompt(&args));
+    }
+
+    #[test]
+    fn jev_flag_keeps_stdin_prompt_mode() {
+        let args = args(&[
+            "--headless",
+            "--jev",
+            "--provider",
+            "anthropic",
+            "--model",
+            "claude-sonnet-5",
+        ]);
+        assert!(!has_positional_prompt(&args));
+        assert!(known_options_without_prompt(&args));
+    }
+
+    #[test]
+    fn benchmark_label_values_are_not_positional_prompts() {
+        let args = args(&[
+            "--headless",
+            "--experiment-id",
+            "jev-arm-b",
+            "--task-id",
+            "repo-17",
+        ]);
+        assert!(!has_positional_prompt(&args));
+        assert!(known_options_without_prompt(&args));
     }
 }

@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use super::{
     OpenAiCompatibleAdapter, PreparedProviderRequest, ProviderAdapter, ProviderCapabilities,
-    ProviderConfig, ProviderError, ProviderEvent, ProviderKind, ProviderMessage,
+    ProviderConfig, ProviderError, ProviderEvent, ProviderKind, ProviderMessage, ReasoningOff,
 };
 
 pub const CLINEPASS_BASE_URL: &str = "https://api.cline.bot/api/v1/chat/completions";
@@ -327,6 +327,14 @@ impl ClinePassAdapter {
 impl ProviderAdapter for ClinePassAdapter {
     fn kind(&self) -> ProviderKind {
         ProviderKind::ClinePass
+    }
+
+    fn reasoning_off(&self) -> Option<ReasoningOff> {
+        self.inner.reasoning_off()
+    }
+
+    fn set_reasoning_disabled(&mut self) -> Result<(), ProviderError> {
+        self.inner.set_reasoning_disabled()
     }
 
     fn wire_kind(&self) -> ProviderKind {

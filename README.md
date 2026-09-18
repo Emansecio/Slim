@@ -1,5 +1,74 @@
 # Slim
 
+**Checkout — modo Jev, 17/09/2026:** o ciclo de modos passa a
+`Auto → Read-only → Plan → Jev → Auto`. Em Jev, o Slim consulta o TypeSafe
+(`TYPESAFE_API_KEY`) para escolher a próxima ação entre as ferramentas
+disponíveis, `respond` e `blocked`; o modelo principal produz os argumentos, o
+código e o texto final com reasoning OFF nativo imposto no adapter. O
+enforcement é fail-closed: uma tool call fora da ação escolhida é rejeitada
+antes de executar, `blocked` encerra como tarefa incompleta e não há fallback
+silencioso para Auto nem para o menor esforço. Como OFF não pode ser simulado,
+o modo resolve a representação por **protocolo + endpoint conhecido + modelo**:
+`gpt-5.6-sol`/`terra`/`luna` e `gpt-5.5` na API oficial da OpenAI usam
+`reasoning_effort: none`; `gpt-5.6-sol`/`terra`/`luna` na assinatura Codex usam
+`reasoning.effort: none` (backend não documentado: se ele ignorar o pedido e
+devolver reasoning, o run aborta antes de qualquer ferramenta); DeepSeek em
+`api.deepseek.com`, GLM 5.0–5.2 (`glm-5`, `5.1`, `5.2`) em `api.z.ai` e Kimi
+K2.5/K2.6 em `api.moonshot.ai` usam `thinking: {"type": "disabled"}`, forma
+também usada pelos Claude documentados (`claude-sonnet-5`, `opus-5`,
+`opus-4.8/4.7/4.6`, `sonnet-4.6`, `opus-4.5`, `sonnet-4.5`, `haiku-4.5`) na API
+oficial da Anthropic. Gateways comunitários não são prova: o formato de
+reasoning deles não é o do fornecedor, então são recusados no Jev salvo
+`SLIM_JEV_GATEWAY_OFF=1`, que libera apenas os modelos com contrato conhecido
+nos hosts embutidos (OpenCode Go/Zen, Command Code, ClinePass). Seguem
+bloqueados `gpt-6-astra` (HTTP 400 em `none`), Fable/Mythos e os que sempre
+pensam — GLM-5.3/5.3-Flash, Kimi K3/K2.7-Code e MiniMax M2.x, que aceita
+`disabled` e ignora — além de rotas sem contrato documentado. O detector de OFF
+reconhece `reasoning_content`, `reasoning` e o formato unificado
+`reasoning_details`, então um toggle ignorado aborta o run. O mesmo ajuste
+corrige `--effort none` em DeepSeek/GLM/Kimi, que antes omitia o campo e
+deixava o raciocínio ligado. `--jev` é incompatível com `--plan`, `--read-only`,
+`--fake` e `--effort` diferente de OFF, e a validação usa as flags realmente
+interpretadas — `--prompt "--jev"` é texto, não seleção de modo. As decisões
+Jev são persistidas como fatos `jev.v1`, com chave
+`<operation_id>/<decision_index>/<request_id>` e payload que preserva modelo,
+escolha, confidence, probabilidades, bytes, uso, duração e rejeições sem
+duplicar prompts nem permitir replay. Cada operação durável também grava
+`run.telemetry.v1`: um snapshot sincronizado antes do primeiro efeito e outro no
+mesmo lote do término/falha, com modo, provider/modelos, revisão, IDs opcionais
+de experimento/tarefa, uso/custos agregados, validação e limites resolvidos. O
+reducer expõe o snapshot terminal por operação, enquanto o JSONL mantém ambos e
+continua legível por consumidores anteriores. Benchmarks podem definir os IDs
+sem contaminar o prompt usando `--experiment-id ID` e `--task-id ID` (ou os
+builders equivalentes de `ProviderRunOptions`). Com Jev ativo, o
+seletor `/model` mostra apenas as rotas que a mesma política OFF admite
+(resolvida localmente, sem rede) e explica em uma linha quando nada é
+compatível; ao sair de Jev a lista normal volta e o esforço salvo é preservado.
+A chave TypeSafe pode ser cadastrada pela própria TUI: ao ativar Jev sem
+credencial o Slim abre a entrada mascarada (`/login typesafe` permite
+substituí-la depois) e guarda no mesmo arquivo protegido dos outros providers,
+sem virar provider ativo nem tocar no login do modelo principal;
+`TYPESAFE_API_KEY` continua como override e não é copiada para o disco, e
+cancelar preserva o estado anterior. Shift+Tab e `/mode jev` alternam o modo
+fora de runs ativos; modelo incompatível abre o seletor filtrado, sem troca
+automática. O contexto selecionado passa a
+ser enviado também à TypeSafe, inclusive quando o modelo principal é local, e a
+chave entra na redação do runtime. Custos Jev ficam em categoria própria
+(`RequestKind::JevDecision`), fora dos turnos do LLM principal, e uma rejeição
+de rota conta como tentativa falha sem duplicar a request.
+
+Validação desta sessão: `cargo fmt --all -- --check` e
+`cargo clippy --workspace --lib --bins --offline -- -D warnings` limpos;
+testes direcionados verdes — política pública de OFF por rota, filtro do seletor
+em Jev e restauração da lista ao sair, resultado vazio que não trava a
+interface, login TypeSafe mascarado e round-trip da chave no store protegido.
+Deploy local: `refresh-slim.ps1` exit 0, build release em 3m03s; `slim` resolve
+para `C:\Users\User\bin\Slim.exe`, com hash idêntico ao `target\release\Slim.exe`
+(evidência em `release/README.md`), `slim 0.1.0` e `--help` com `--jev`. A suíte
+completa não foi reexecutada nesta tarefa; o recorde de 1865 aprovados refere-se
+a antes destas mudanças. A TUI não foi observada em execução — o recebimento
+físico de Alt+Tab e o diálogo seguem não validados.
+
 **Checkout — auditoria de performance e corretude, 16/09/2026:** varredura
 paralela dos quatro crates aplicou otimizações de comportamento idêntico no
 slim-core (estimador de tokens por byte-scan, fast-path sem segredos na redação

@@ -56,6 +56,7 @@ pub enum RequestKind {
     #[default]
     ProviderTurn,
     Compaction,
+    JevDecision,
 }
 
 /// Provider-declared meaning of the reasoning stream.  Adapters only emit a
@@ -88,6 +89,24 @@ pub enum EventKind {
     },
     ModeChanged {
         mode: OperatingMode,
+    },
+    JevDecisionCompleted {
+        attempts: u32,
+        model: String,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        state_bytes: u64,
+        duration_ms: u64,
+        cancelled: bool,
+        failed: bool,
+        metadata: serde_json::Value,
+    },
+    /// The model produced a batch the selected Jev action does not allow. The
+    /// whole batch was rejected before execution, so the attempt counts as a
+    /// failed request even though the provider stream itself completed.
+    JevActionRejected {
+        expected: String,
+        observed: Vec<String>,
     },
     AssistantTextDelta {
         text: String,

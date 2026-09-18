@@ -16,6 +16,42 @@ fn stdin_is_used_when_prompt_argument_is_absent() {
 }
 
 #[test]
+fn jev_rejects_contradictory_modes_and_effort() {
+    for args in [
+        vec!["--jev", "--plan"],
+        vec!["--jev", "--read-only"],
+        vec!["--jev", "--fake"],
+        vec!["--jev", "--effort", "high"],
+    ] {
+        let output = run_cli(args.clone(), "hello");
+        assert_eq!(output.code, ExitCode::InputRequired, "{args:?}");
+        assert!(
+            output.stderr.contains("--jev"),
+            "{args:?}: {}",
+            output.stderr
+        );
+    }
+}
+
+#[test]
+fn mode_flags_are_read_from_options_not_option_values() {
+    // `--jev` as a prompt value is text, not a mode selection.
+    let output = run_cli(["--headless", "--prompt", "--jev"], "");
+    assert!(
+        !output.stderr.contains("incompatible"),
+        "prompt text must not select a mode: {}",
+        output.stderr
+    );
+    // A real Jev selection is not contradicted by a prompt that looks like a flag.
+    let output = run_cli(["--headless", "--jev", "--prompt", "--plan"], "");
+    assert!(
+        !output.stderr.contains("incompatible"),
+        "prompt text must not contradict a real selection: {}",
+        output.stderr
+    );
+}
+
+#[test]
 fn headless_without_provider_is_auth_not_silent_success() {
     let output = run_cli(["--headless", "--prompt", "Reply exactly READY."], "");
     assert_eq!(output.code, ExitCode::Auth);
@@ -302,7 +338,7 @@ fn tui_help_uses_the_normal_cli_contract_without_opening_fullscreen() {
 fn help_version_and_unknown_flags_are_stable() {
     assert_eq!(
         run_cli(["--help"], "").stdout,
-        "Slim coding agent\n\nUsage:\n  Slim [TUI OPTIONS]\n  Slim --headless [OPTIONS] [PROMPT...]\n\nModes:\n  --tui              Open the fullscreen TUI (default)\n  --headless         Run one prompt without the TUI\n  --fake             Use the deterministic offline provider\n  --plan             Allow inspection without workspace mutations\n  --read-only        Disable workspace mutations\n\nProvider:\n  --provider NAME    Provider route\n  --model MODEL      Model identifier (Codex: astra, sol, terra, luna)\n  --effort LEVEL     Reasoning effort\n  --fast             Enable Codex Fast (higher usage)\n  --normal           Use normal Codex speed\n  --endpoint URL     Override the provider endpoint\n\nInput and sessions:\n  --prompt TEXT      Prompt text; positional text or stdin also works\n  --image PATH       Attach a local image (repeatable)\n  --session PATH     Persist the run to a session file\n  --resume PATH      Continue an existing session\n  --recover PATH     Repair a durable session without running a prompt\n  --abandon-pending  With --recover: abandon unfinished work; effects stay unverified\n\nOutput:\n  --verbose          Include detailed human-readable events\n  --jsonl            Emit machine-readable JSON Lines\n\nOther:\n  -h, --help         Show this help\n  -V, --version      Show the version\n\nExamples:\n  Slim\n  Slim --headless --fake \"Summarize this repository\"\n  Slim --headless --provider anthropic --model MODEL --prompt \"Review src\"\n"
+        "Slim coding agent\n\nUsage:\n  Slim [TUI OPTIONS]\n  Slim --headless [OPTIONS] [PROMPT...]\n\nModes:\n  --tui              Open the fullscreen TUI (default)\n  --headless         Run one prompt without the TUI\n  --fake             Use the deterministic offline provider\n  --plan             Allow inspection without workspace mutations\n  --read-only        Disable workspace mutations\n  --jev              TypeSafe-controlled actions, native reasoning OFF (TYPESAFE_API_KEY)\n\nProvider:\n  --provider NAME    Provider route\n  --model MODEL      Model identifier (Codex: astra, sol, terra, luna)\n  --effort LEVEL     Reasoning effort\n  --fast             Enable Codex Fast (higher usage)\n  --normal           Use normal Codex speed\n  --endpoint URL     Override the provider endpoint\n\nInput and sessions:\n  --prompt TEXT      Prompt text; positional text or stdin also works\n  --image PATH       Attach a local image (repeatable)\n  --session PATH     Persist the run to a session file\n  --resume PATH      Continue an existing session\n  --recover PATH     Repair a durable session without running a prompt\n  --abandon-pending  With --recover: abandon unfinished work; effects stay unverified\n\nOutput:\n  --verbose          Include detailed human-readable events\n  --jsonl            Emit machine-readable JSON Lines\n\nOther:\n  -h, --help         Show this help\n  -V, --version      Show the version\n\nExamples:\n  Slim\n  Slim --headless --fake \"Summarize this repository\"\n  Slim --headless --provider anthropic --model MODEL --prompt \"Review src\"\n"
     );
     assert_eq!(run_cli(["--version"], "").stdout, "slim 0.1.0\n");
     assert_eq!(run_cli(["--unknown"], "").code, ExitCode::Internal);

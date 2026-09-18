@@ -2,6 +2,8 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 
+use serde_json::Value;
+
 use super::effects::{Effect, EffectId};
 use super::reducer::{restore_records, DurableState, ReduceError};
 use super::repository::DurableRepo;
@@ -46,6 +48,40 @@ impl ProviderResponse {
     }
 }
 
+/// Stable, non-sensitive metadata that identifies one durable provider run.
+/// The start snapshot is written before the provider or any tool can run; a
+/// terminal snapshot with the same key later replaces it in the reducer while
+/// both records remain available in the append-only JSONL.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunTelemetryContext {
+    pub experiment_id: Option<String>,
+    pub task_id: Option<String>,
+    pub mode: crate::OperatingMode,
+    pub provider: String,
+    pub model: String,
+    pub jev_model: Option<String>,
+    pub build_revision: String,
+    /// Unix timestamp in milliseconds.
+    pub started_at: u64,
+    /// Configured limits known before execution. The terminal snapshot may
+    /// replace this with the fully resolved limits used by the runtime.
+    pub limits: Value,
+}
+
+/// Runtime-derived terminal fields for one durable run telemetry snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunTelemetryTerminal {
+    pub stop: String,
+    pub outcome: DurableOutcome,
+    pub validated_completion: bool,
+    pub validation_source: Option<String>,
+    pub usage: Value,
+    pub costs: Value,
+    pub limits: Value,
+    /// Actual Jev model observed in accounting, when available.
+    pub jev_model: Option<String>,
+}
+
 /// Synchronous executor boundary used by the manual durable driver.
 pub trait ManualExecutor {
     type Error;
@@ -77,6 +113,7 @@ pub struct ManualRunSpec {
     pub input: String,
     pub first_seq: u64,
     pub input_content_blocks: Vec<crate::provider::ProviderContentBlock>,
+    pub run_telemetry: Option<RunTelemetryContext>,
 }
 
 impl ManualRunSpec {
@@ -97,11 +134,17 @@ impl ManualRunSpec {
             input: input.into(),
             first_seq,
             input_content_blocks: Vec::new(),
+            run_telemetry: None,
         }
     }
 
     pub fn with_parent_entry_id(mut self, parent_entry_id: impl Into<String>) -> Self {
         self.parent_entry_id = Some(parent_entry_id.into());
+        self
+    }
+
+    pub fn with_run_telemetry(mut self, telemetry: RunTelemetryContext) -> Self {
+        self.run_telemetry = Some(telemetry);
         self
     }
 
@@ -216,7 +259,7 @@ where
 {
     preflight(repo, spec)?;
     let mut seq = spec.first_seq;
-    let mut prefix = Vec::with_capacity(3);
+    let mut prefix = Vec::with_capacity(if spec.run_telemetry.is_some() { 4 } else { 3 });
     prefix.push(DurableRecord::Entry {
         seq,
         entry: DurableEntry {
@@ -251,6 +294,10 @@ where
             },
         },
     });
+    if let Some(fact) = run_telemetry_fact(spec, None, None) {
+        seq = next_seq(seq)?;
+        prefix.push(DurableRecord::Fact { seq, fact });
+    }
     repo.append_batch(prefix)
         .map_err(ManualDriveError::Persist)?;
     Ok(seq)
@@ -265,8 +312,22 @@ pub(super) fn persist_manual_failure<R, E>(
 where
     R: DurableRepo,
 {
-    let seq = next_seq(seq)?;
-    repo.append(DurableRecord::Operation {
+    persist_manual_failure_with_facts(repo, spec, seq, error, Vec::new())
+}
+
+pub(super) fn persist_manual_failure_with_facts<R, E>(
+    repo: &mut R,
+    spec: &ManualRunSpec,
+    mut seq: u64,
+    error: DurableErrorClass,
+    facts: Vec<super::schema_v2::DurableFact>,
+) -> Result<(), ManualDriveError<E>>
+where
+    R: DurableRepo,
+{
+    let mut records = Vec::with_capacity(facts.len().saturating_add(1));
+    seq = next_seq(seq)?;
+    records.push(DurableRecord::Operation {
         seq,
         operation: DurableOperation {
             operation_id: spec.operation_id.clone(),
@@ -275,8 +336,13 @@ where
                 error,
             },
         },
-    })
-    .map_err(ManualDriveError::Persist)
+    });
+    for fact in facts {
+        seq = next_seq(seq)?;
+        records.push(DurableRecord::Fact { seq, fact });
+    }
+    repo.append_batch(records)
+        .map_err(ManualDriveError::Persist)
 }
 
 fn persist_manual_success<R, E>(
@@ -328,9 +394,20 @@ where
 pub(super) fn persist_manual_terminal<R: DurableRepo, E>(
     repo: &mut R,
     spec: ManualRunSpec,
+    seq: u64,
+    suffix: Vec<DurableRecord>,
+    response: ProviderResponse,
+) -> Result<(), ManualDriveError<E>> {
+    persist_manual_terminal_with_facts(repo, spec, seq, suffix, response, Vec::new())
+}
+
+pub(super) fn persist_manual_terminal_with_facts<R: DurableRepo, E>(
+    repo: &mut R,
+    spec: ManualRunSpec,
     mut seq: u64,
     mut suffix: Vec<DurableRecord>,
     response: ProviderResponse,
+    facts: Vec<super::schema_v2::DurableFact>,
 ) -> Result<(), ManualDriveError<E>> {
     if let Some(mut usage) = response.usage {
         usage.operation_id.clone_from(&spec.operation_id);
@@ -373,7 +450,78 @@ pub(super) fn persist_manual_terminal<R: DurableRepo, E>(
             kind: terminal,
         },
     });
+    for fact in facts {
+        seq = next_seq(seq)?;
+        suffix.push(DurableRecord::Fact { seq, fact });
+    }
     repo.append_batch(suffix).map_err(ManualDriveError::Persist)
+}
+
+pub(super) fn run_telemetry_terminal_fact(
+    spec: &ManualRunSpec,
+    terminal: &RunTelemetryTerminal,
+    duration_ms: u64,
+) -> Option<super::schema_v2::DurableFact> {
+    run_telemetry_fact(spec, Some(terminal), Some(duration_ms))
+}
+
+fn run_telemetry_fact(
+    spec: &ManualRunSpec,
+    terminal: Option<&RunTelemetryTerminal>,
+    duration_ms: Option<u64>,
+) -> Option<super::schema_v2::DurableFact> {
+    let context = spec.run_telemetry.as_ref()?;
+    let jev_model = terminal
+        .and_then(|terminal| terminal.jev_model.as_ref())
+        .or(context.jev_model.as_ref());
+    let (stop, outcome, validated_completion, validation_source, usage, costs, limits, phase) =
+        match terminal {
+            Some(terminal) => (
+                Value::String(terminal.stop.clone()),
+                serde_json::to_value(&terminal.outcome).unwrap_or(Value::Null),
+                Value::Bool(terminal.validated_completion),
+                serde_json::to_value(&terminal.validation_source).unwrap_or(Value::Null),
+                terminal.usage.clone(),
+                terminal.costs.clone(),
+                terminal.limits.clone(),
+                "terminal",
+            ),
+            None => (
+                Value::Null,
+                Value::String("running".into()),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                context.limits.clone(),
+                "started",
+            ),
+        };
+    Some(super::schema_v2::DurableFact {
+        namespace: "run.telemetry.v1".into(),
+        key: spec.operation_id.clone(),
+        value: serde_json::json!({
+            "operation_id": spec.operation_id,
+            "attempt_id": spec.attempt_id,
+            "experiment_id": context.experiment_id,
+            "task_id": context.task_id,
+            "mode": context.mode,
+            "provider": context.provider,
+            "model": context.model,
+            "jev_model": jev_model,
+            "build_revision": context.build_revision,
+            "started_at": context.started_at,
+            "duration_ms": duration_ms,
+            "stop": stop,
+            "outcome": outcome,
+            "validated_completion": validated_completion,
+            "validation_source": validation_source,
+            "usage": usage,
+            "costs": costs,
+            "limits": limits,
+            "phase": phase,
+        }),
+    })
 }
 
 /// Restore is deliberately only a reducer operation: it never receives an executor.

@@ -6909,6 +6909,46 @@ fn malformed_arguments_are_repaired_without_executing_the_rejected_batch() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn invalid_json_escape_is_repaired_and_executed_without_a_repair_request() {
+    let root = std::env::temp_dir().join(format!("slim-escape-repair-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let arguments = r#"{"path":"escaped.txt","content":"literal \* star"}"#;
+    let call = json!({"choices":[{"delta":{"tool_calls":[
+        {"index":0,"id":"escaped-write","function":{"name":"write","arguments":arguments}}
+    ]},"finish_reason":"tool_calls"}]});
+    let final_answer = json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]});
+    let (client, done, server) = recovery_fixture(vec![
+        (200, format!("data: {call}\n\ndata: [DONE]\n\n")),
+        (200, format!("data: {final_answer}\n\ndata: [DONE]\n\n")),
+    ]);
+    let mut runtime = Runtime::new();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "write the literal backslash",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig::default(),
+        ));
+    let _ = done.send(());
+    let requests = server.join().unwrap();
+    let result = result.expect("invalid string escape is repaired in place");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(requests.len(), 2, "no repair round-trip is requested");
+    assert!(!requests[1].contains("[Tool argument validation]"));
+    assert_eq!(result.tool_results.len(), 1);
+    assert_eq!(result.tool_results[0].name, "write");
+    assert!(result.tool_results[0].success);
+    assert_eq!(
+        std::fs::read_to_string(root.join("escaped.txt")).unwrap(),
+        r"literal \* star"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn anthropic_recovery_fixture(
     responses: Vec<(u16, String)>,
 ) -> (

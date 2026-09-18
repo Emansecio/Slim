@@ -632,7 +632,7 @@ impl ToolRegistry {
     pub fn names_for_mode(&self, mode: OperatingMode) -> Vec<&'static str> {
         self.specs
             .iter()
-            .filter(|spec| mode == OperatingMode::Auto || !spec.operational().mutates_workspace())
+            .filter(|spec| mode.allows_mutation() || !spec.operational().mutates_workspace())
             .map(|spec| spec.name)
             .collect()
     }
@@ -652,7 +652,7 @@ impl ToolRegistry {
 
     pub(crate) fn definitions_for_mode_shared(&self, mode: OperatingMode) -> Arc<[Value]> {
         match mode {
-            OperatingMode::Auto => Arc::clone(&MODE_DEFINITIONS_AUTO),
+            OperatingMode::Auto | OperatingMode::Jev => Arc::clone(&MODE_DEFINITIONS_AUTO),
             OperatingMode::ReadOnly => Arc::clone(&MODE_DEFINITIONS_READ_ONLY),
             OperatingMode::Plan => Arc::clone(&MODE_DEFINITIONS_PLAN),
         }

@@ -1,12 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
+use std::time::Instant;
 
 use crate::context::ArtifactStore;
 use crate::provider::{ProviderMessage, ProviderToolCall};
 use crate::EventKind;
 
-use super::manual_drive::{persist_manual_failure, persist_manual_prefix, persist_manual_terminal};
+use super::manual_drive::{
+    persist_manual_failure_with_facts, persist_manual_prefix, persist_manual_terminal_with_facts,
+    run_telemetry_terminal_fact,
+};
 use super::schema_v2::DurableFact;
 use super::{
     DurableEntry, DurableOutcome, DurableRecord, DurableRepo, JsonlRepo, ManualRunSpec,
@@ -29,6 +33,11 @@ pub struct ManualRunJournal {
     tool_entries: BTreeMap<String, String>,
     presentation_fact_keys: BTreeSet<String>,
     process_fact_keys: BTreeSet<String>,
+    jev_decision_index: u64,
+    jev_rejection_index: u64,
+    last_jev_decision: Option<(u64, String)>,
+    run_started: Instant,
+    run_telemetry_terminal: Option<super::RunTelemetryTerminal>,
     uncertain: bool,
     entries_written: usize,
     failure: Option<String>,
@@ -48,6 +57,7 @@ impl fmt::Debug for ManualRunJournal {
 
 impl ManualRunJournal {
     pub fn start(mut repo: JsonlRepo, spec: ManualRunSpec) -> io::Result<Self> {
+        let run_started = Instant::now();
         persist_manual_prefix::<_, io::Error>(&mut repo, &spec).map_err(io::Error::other)?;
         Ok(Self {
             parent: spec.input_entry_id.clone(),
@@ -59,6 +69,11 @@ impl ManualRunJournal {
             tool_entries: BTreeMap::new(),
             presentation_fact_keys: BTreeSet::new(),
             process_fact_keys: BTreeSet::new(),
+            jev_decision_index: 0,
+            jev_rejection_index: 0,
+            last_jev_decision: None,
+            run_started,
+            run_telemetry_terminal: None,
             uncertain: false,
             entries_written: 0,
             failure: None,
@@ -234,6 +249,98 @@ impl ManualRunJournal {
                 });
                 self.remember_failure(result)?;
             }
+            EventKind::JevDecisionCompleted {
+                attempts,
+                model,
+                input_tokens,
+                output_tokens,
+                state_bytes,
+                duration_ms,
+                cancelled,
+                failed,
+                metadata,
+            } => {
+                // Operation-scoped identity is required because each resumed
+                // operation owns a fresh journal. A journal-local counter alone
+                // would collide in the reducer and hide earlier decisions.
+                let decision_index = self.jev_decision_index;
+                self.jev_decision_index = self
+                    .jev_decision_index
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("durable Jev decision index overflowed"))?;
+                let request_id = metadata
+                    .get("request_id")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("unknown")
+                    .to_owned();
+                let key = format!("{}/{decision_index}/{request_id}", self.spec.operation_id);
+                let seq = self.repo.next_seq()?;
+                let result = self.repo.append(DurableRecord::Fact {
+                    seq,
+                    fact: DurableFact {
+                        namespace: "jev.v1".into(),
+                        key,
+                        value: serde_json::json!({
+                            "outcome": "decision",
+                            "operation_id": self.spec.operation_id,
+                            "attempt_id": self.spec.attempt_id,
+                            "decision_index": decision_index,
+                            "request_id": request_id,
+                            "model": model,
+                            "requested_model": metadata.get("requested_model"),
+                            "choice": metadata.get("choice"),
+                            "confidence": metadata.get("confidence"),
+                            "probabilities": metadata.get("probabilities"),
+                            "attempts": attempts,
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "state_bytes": state_bytes,
+                            "duration_ms": duration_ms,
+                            "request_bytes": metadata.get("request_bytes"),
+                            "cancelled": cancelled,
+                            "failed": failed,
+                            "reasoning_disabled": true,
+                        }),
+                    },
+                });
+                self.remember_failure(result)?;
+                self.last_jev_decision = Some((decision_index, request_id));
+            }
+            EventKind::JevActionRejected { expected, observed } => {
+                let rejection_index = self.jev_rejection_index;
+                self.jev_rejection_index = self
+                    .jev_rejection_index
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("durable Jev rejection index overflowed"))?;
+                let (decision_index, request_id) = self
+                    .last_jev_decision
+                    .clone()
+                    .unwrap_or((self.jev_decision_index, "unbound".into()));
+                let key = format!(
+                    "{}/{decision_index}/{request_id}/rejected/{rejection_index}",
+                    self.spec.operation_id
+                );
+                let seq = self.repo.next_seq()?;
+                let result = self.repo.append(DurableRecord::Fact {
+                    seq,
+                    fact: DurableFact {
+                        namespace: "jev.v1".into(),
+                        key,
+                        value: serde_json::json!({
+                            "outcome": "rejected",
+                            "operation_id": self.spec.operation_id,
+                            "attempt_id": self.spec.attempt_id,
+                            "decision_index": decision_index,
+                            "request_id": request_id,
+                            "rejection_index": rejection_index,
+                            "expected": expected,
+                            "observed": observed,
+                        }),
+                    },
+                });
+                self.remember_failure(result)?;
+            }
             _ => {}
         }
         Ok(())
@@ -254,6 +361,25 @@ impl ManualRunJournal {
         self.append(message).map(|_| ())
     }
 
+    pub fn set_run_telemetry_terminal(
+        &mut self,
+        terminal: super::RunTelemetryTerminal,
+    ) -> io::Result<()> {
+        self.check()?;
+        if self.spec.run_telemetry.is_none() {
+            return Err(io::Error::other(
+                "durable run telemetry terminal has no start context",
+            ));
+        }
+        if self.run_telemetry_terminal.is_some() {
+            return Err(io::Error::other(
+                "durable run telemetry terminal was already recorded",
+            ));
+        }
+        self.run_telemetry_terminal = Some(terminal);
+        Ok(())
+    }
+
     pub fn finish(&mut self, mut response: ProviderResponse) -> io::Result<()> {
         self.check()?;
         self.close_pending()?;
@@ -266,18 +392,28 @@ impl ManualRunJournal {
         if self.uncertain {
             response.outcome = DurableOutcome::Unknown;
         }
+        let telemetry_fact = self.take_run_telemetry_fact(
+            response.outcome.clone(),
+            match &response.outcome {
+                DurableOutcome::Success => "completed",
+                DurableOutcome::Failed => "failed",
+                DurableOutcome::Cancelled => "cancelled",
+                DurableOutcome::Unknown => "unknown_tool_effect",
+            },
+        );
         let seq = self
             .repo
             .records()
             .last()
             .expect("manual prefix exists")
             .seq();
-        let result = persist_manual_terminal::<_, io::Error>(
+        let result = persist_manual_terminal_with_facts::<_, io::Error>(
             &mut self.repo,
             self.spec.clone(),
             seq,
             Vec::new(),
             response,
+            telemetry_fact.into_iter().collect(),
         )
         .map_err(io::Error::other);
         self.remember_failure(result)
@@ -285,15 +421,55 @@ impl ManualRunJournal {
 
     pub fn fail_attempt(&mut self, error: super::DurableErrorClass) -> io::Result<()> {
         self.check()?;
+        let (outcome, stop) = match &error {
+            super::DurableErrorClass::Cancelled => (DurableOutcome::Cancelled, "cancelled"),
+            _ => (DurableOutcome::Failed, "provider_error"),
+        };
+        let telemetry_fact = self.take_run_telemetry_fact(outcome, stop);
         let seq = self
             .repo
             .records()
             .last()
             .expect("manual prefix exists")
             .seq();
-        let result = persist_manual_failure::<_, io::Error>(&mut self.repo, &self.spec, seq, error)
-            .map_err(io::Error::other);
+        let result = persist_manual_failure_with_facts::<_, io::Error>(
+            &mut self.repo,
+            &self.spec,
+            seq,
+            error,
+            telemetry_fact.into_iter().collect(),
+        )
+        .map_err(io::Error::other);
         self.remember_failure(result)
+    }
+
+    fn take_run_telemetry_fact(
+        &mut self,
+        outcome: DurableOutcome,
+        fallback_stop: &str,
+    ) -> Option<DurableFact> {
+        let context = self.spec.run_telemetry.as_ref()?;
+        let mut terminal =
+            self.run_telemetry_terminal
+                .take()
+                .unwrap_or_else(|| super::RunTelemetryTerminal {
+                    stop: fallback_stop.into(),
+                    outcome: outcome.clone(),
+                    validated_completion: false,
+                    validation_source: None,
+                    usage: serde_json::Value::Null,
+                    costs: serde_json::Value::Null,
+                    limits: context.limits.clone(),
+                    jev_model: None,
+                });
+        terminal.outcome = outcome;
+        let duration_ms = self
+            .run_started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        run_telemetry_terminal_fact(&self.spec, &terminal, duration_ms)
     }
 
     fn close_pending(&mut self) -> io::Result<()> {
@@ -383,8 +559,10 @@ mod tests {
     use super::*;
     use crate::session::{
         preflight_session, provider_messages_from_entries, provider_messages_from_records,
-        DurableSessionHeader,
+        restore_records, DurableErrorClass, DurableOperationKind, DurableSessionHeader,
+        RunTelemetryContext, RunTelemetryTerminal,
     };
+    use crate::OperatingMode;
     use std::fs;
 
     fn fixture() -> (std::path::PathBuf, ManualRunJournal) {
@@ -565,6 +743,290 @@ mod tests {
                 stderr_discarded_bytes: 0,
             },
         }
+    }
+
+    fn run_telemetry(task_id: &str) -> RunTelemetryContext {
+        RunTelemetryContext {
+            experiment_id: Some("jev-benchmark".into()),
+            task_id: Some(task_id.into()),
+            mode: OperatingMode::Jev,
+            provider: "openai-compatible".into(),
+            model: "fixture-main".into(),
+            jev_model: Some("jev-requested".into()),
+            build_revision: "test-build".into(),
+            started_at: 1_700_000_000_000,
+            limits: serde_json::json!({"configured": true}),
+        }
+    }
+
+    fn run_terminal() -> RunTelemetryTerminal {
+        RunTelemetryTerminal {
+            stop: "provider_completed".into(),
+            outcome: DurableOutcome::Success,
+            validated_completion: true,
+            validation_source: Some("derived_runtime".into()),
+            usage: serde_json::json!({"provider_turns": 1, "jev_decisions": 1}),
+            costs: serde_json::json!({"total_micros": 7, "jev_micros": 1}),
+            limits: serde_json::json!({"configured": false, "max_turns": 8}),
+            jev_model: Some("jev-actual".into()),
+        }
+    }
+
+    fn jev_decision(request_id: &str) -> EventKind {
+        EventKind::JevDecisionCompleted {
+            attempts: 1,
+            model: "jev-actual".into(),
+            input_tokens: Some(21),
+            output_tokens: Some(0),
+            state_bytes: 321,
+            duration_ms: 9,
+            cancelled: false,
+            failed: false,
+            metadata: serde_json::json!({
+                "request_id": request_id,
+                "requested_model": "jev-requested",
+                "choice": "respond",
+                "confidence": 0.91,
+                "probabilities": {"respond": 0.91, "blocked": 0.09},
+                "request_bytes": 654,
+            }),
+        }
+    }
+
+    #[test]
+    fn operation_scoped_jev_and_run_telemetry_survive_two_resumed_operations() {
+        let root = std::env::temp_dir().join(format!(
+            "slim-journal-telemetry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let repo = JsonlRepo::create(
+            &path,
+            DurableSessionHeader::new("telemetry", "now", root.to_str().unwrap(), None, None),
+        )
+        .unwrap();
+
+        let mut first = ManualRunJournal::start(
+            repo,
+            ManualRunSpec::new("op-a", "attempt-a", "input-a", "final-a", "one", 0)
+                .with_run_telemetry(run_telemetry("task-a")),
+        )
+        .unwrap();
+        first.record_event(&jev_decision("shared-request")).unwrap();
+        first
+            .record_message(ProviderMessage::assistant("done-a", Vec::new()))
+            .unwrap();
+        first.set_run_telemetry_terminal(run_terminal()).unwrap();
+        first
+            .finish(ProviderResponse::with_outcome(
+                "done-a",
+                None,
+                DurableOutcome::Success,
+            ))
+            .unwrap();
+        drop(first);
+
+        let repo = JsonlRepo::open(&path).unwrap();
+        let first_seq = repo.next_seq().unwrap();
+        let mut second = ManualRunJournal::start(
+            repo,
+            ManualRunSpec::new("op-b", "attempt-b", "input-b", "final-b", "two", first_seq)
+                .with_run_telemetry(run_telemetry("task-b")),
+        )
+        .unwrap();
+        second
+            .record_event(&jev_decision("shared-request"))
+            .unwrap();
+        second
+            .record_message(ProviderMessage::assistant("done-b", Vec::new()))
+            .unwrap();
+        second.set_run_telemetry_terminal(run_terminal()).unwrap();
+        second
+            .finish(ProviderResponse::with_outcome(
+                "done-b",
+                None,
+                DurableOutcome::Success,
+            ))
+            .unwrap();
+        drop(second);
+
+        let report = preflight_session(&path).unwrap();
+        let jev_facts = report
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                DurableRecord::Fact { fact, .. } if fact.namespace == "jev.v1" => Some(fact),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(jev_facts.len(), 2);
+        assert_eq!(jev_facts[0].key, "op-a/0/shared-request");
+        assert_eq!(jev_facts[1].key, "op-b/0/shared-request");
+        assert_eq!(jev_facts[0].value["operation_id"], "op-a");
+        assert_eq!(jev_facts[0].value["attempt_id"], "attempt-a");
+        assert_eq!(jev_facts[0].value["decision_index"], 0);
+        assert_eq!(jev_facts[0].value["request_id"], "shared-request");
+        assert_eq!(jev_facts[0].value["request_bytes"], 654);
+        assert_eq!(jev_facts[0].value["probabilities"]["respond"], 0.91);
+
+        let first_start = report
+            .records
+            .iter()
+            .position(|record| {
+                matches!(record, DurableRecord::Fact { fact, .. }
+                if fact.namespace == "run.telemetry.v1"
+                    && fact.key == "op-a"
+                    && fact.value["phase"] == "started")
+            })
+            .unwrap();
+        let first_decision = report
+            .records
+            .iter()
+            .position(|record| {
+                matches!(record, DurableRecord::Fact { fact, .. }
+                if fact.namespace == "jev.v1" && fact.key == "op-a/0/shared-request")
+            })
+            .unwrap();
+        assert!(first_start < first_decision);
+        let first_finished = report
+            .records
+            .iter()
+            .position(|record| {
+                matches!(record, DurableRecord::Operation { operation, .. }
+                if operation.operation_id == "op-a"
+                    && matches!(&operation.kind, DurableOperationKind::Finished { .. }))
+            })
+            .unwrap();
+        let first_terminal_telemetry = report
+            .records
+            .iter()
+            .position(|record| {
+                matches!(record, DurableRecord::Fact { fact, .. }
+                if fact.namespace == "run.telemetry.v1"
+                    && fact.key == "op-a"
+                    && fact.value["phase"] == "terminal")
+            })
+            .unwrap();
+        assert!(first_finished < first_terminal_telemetry);
+
+        let raw_run_facts = report
+            .records
+            .iter()
+            .filter(|record| {
+                matches!(record, DurableRecord::Fact { fact, .. }
+                if fact.namespace == "run.telemetry.v1")
+            })
+            .count();
+        assert_eq!(raw_run_facts, 4);
+
+        let reduced = restore_records(&report.records).unwrap();
+        assert_eq!(
+            reduced
+                .facts()
+                .keys()
+                .filter(|(namespace, _)| namespace == "jev.v1")
+                .count(),
+            2
+        );
+        let terminal = reduced.fact_value("run.telemetry.v1", "op-a").unwrap();
+        assert_eq!(terminal["phase"], "terminal");
+        assert_eq!(terminal["mode"], "jev");
+        assert_eq!(terminal["provider"], "openai-compatible");
+        assert_eq!(terminal["model"], "fixture-main");
+        assert_eq!(terminal["jev_model"], "jev-actual");
+        assert_eq!(terminal["build_revision"], "test-build");
+        assert_eq!(terminal["stop"], "provider_completed");
+        assert_eq!(terminal["outcome"], "success");
+        assert_eq!(terminal["validated_completion"], true);
+        assert_eq!(terminal["validation_source"], "derived_runtime");
+        assert_eq!(terminal["usage"]["jev_decisions"], 1);
+        assert_eq!(terminal["costs"]["jev_micros"], 1);
+        assert_eq!(terminal["limits"]["max_turns"], 8);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pre_decision_failure_keeps_started_mode_and_writes_terminal_telemetry() {
+        let root = std::env::temp_dir().join(format!(
+            "slim-journal-telemetry-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let repo = JsonlRepo::create(
+            &path,
+            DurableSessionHeader::new(
+                "telemetry-failure",
+                "now",
+                root.to_str().unwrap(),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        let mut journal = ManualRunJournal::start(
+            repo,
+            ManualRunSpec::new("op-fail", "attempt-fail", "input", "final", "run", 0)
+                .with_run_telemetry(run_telemetry("task-fail")),
+        )
+        .unwrap();
+        journal.fail_attempt(DurableErrorClass::Invalid).unwrap();
+        drop(journal);
+
+        let report = preflight_session(&path).unwrap();
+        let telemetry = report
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                DurableRecord::Fact { fact, .. }
+                    if fact.namespace == "run.telemetry.v1" && fact.key == "op-fail" =>
+                {
+                    Some(fact)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(telemetry.len(), 2);
+        assert_eq!(telemetry[0].value["phase"], "started");
+        assert_eq!(telemetry[0].value["mode"], "jev");
+        assert_eq!(telemetry[0].value["outcome"], "running");
+        assert_eq!(telemetry[1].value["phase"], "terminal");
+        assert_eq!(telemetry[1].value["stop"], "provider_error");
+        assert_eq!(telemetry[1].value["outcome"], "failed");
+        assert_eq!(telemetry[1].value["validated_completion"], false);
+        assert!(telemetry[1].value["duration_ms"].is_u64());
+        let failed_attempt = report
+            .records
+            .iter()
+            .position(|record| matches!(record, DurableRecord::Operation { operation, .. }
+                if operation.operation_id == "op-fail"
+                    && matches!(&operation.kind, DurableOperationKind::ProviderAttemptFailed { .. })))
+            .unwrap();
+        let terminal_telemetry = report
+            .records
+            .iter()
+            .position(|record| {
+                matches!(record, DurableRecord::Fact { fact, .. }
+                if fact.namespace == "run.telemetry.v1"
+                    && fact.key == "op-fail"
+                    && fact.value["phase"] == "terminal")
+            })
+            .unwrap();
+        assert!(failed_attempt < terminal_telemetry);
+        assert!(!report.records.iter().any(|record| matches!(record,
+            DurableRecord::Fact { fact, .. } if fact.namespace == "jev.v1")));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

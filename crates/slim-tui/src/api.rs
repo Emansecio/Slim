@@ -12,6 +12,9 @@ pub enum LoginProvider {
     ClinePass,
     CommandCode,
     Xai,
+    /// Jev controller credential. Not a model provider: it never becomes the
+    /// active provider and never replaces the main login.
+    Typesafe,
 }
 
 impl LoginProvider {
@@ -24,6 +27,7 @@ impl LoginProvider {
             Self::ClinePass => "ClinePass — API key",
             Self::CommandCode => "Command Code — API key",
             Self::Xai => "xAI — Grok/X subscription",
+            Self::Typesafe => "TypeSafe — Jev controller (TYPESAFE_API_KEY)",
         }
     }
 }
@@ -561,6 +565,14 @@ pub enum UiEvent {
         provider: Option<LoginProvider>,
         authenticated: bool,
     },
+    /// Jev needs a TypeSafe key before it can start: open the masked entry.
+    JevKeyRequired,
+    /// The TypeSafe key was stored; close the entry without touching the main
+    /// provider's authentication state.
+    JevKeySaved,
+    /// Jev is active and the current model cannot run with reasoning OFF: open
+    /// the filtered picker. The model is never switched automatically.
+    JevModelRequired,
     LoginProgress {
         message: String,
     },
@@ -679,6 +691,24 @@ impl UiEvent {
                 skill_names: Vec::new(),
             }),
             slim_core::EventKind::ModeChanged { mode } => Some(Self::ModeChanged { mode }),
+            slim_core::EventKind::JevDecisionCompleted { metadata, .. } => {
+                let action = metadata
+                    .get("choice")
+                    .or_else(|| metadata.get("outcome"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("decision");
+                Some(Self::ProviderPhaseChanged {
+                    phase: slim_core::ProviderPhase::Connecting,
+                    label: format!("Jev · {} · reasoning OFF", bounded_first_line(action, 128)),
+                    elapsed_ms: metadata
+                        .get("duration_ms")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or_default(),
+                })
+            }
+            // The run reports the rejection as its terminal error; a second
+            // surface here would duplicate it.
+            slim_core::EventKind::JevActionRejected { .. } => None,
             slim_core::EventKind::AssistantTextDelta { text } => {
                 Some(Self::AssistantDelta { text })
             }

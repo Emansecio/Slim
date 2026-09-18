@@ -3,7 +3,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::api::{BlockId, LoginProvider, ModelAlias, ReasoningEffort, UiCommand, UiEvent};
 use crate::app::{
     AppState, EffortOverlay, FollowMode, FrameClock, LoginOverlay, LoginStage, ModelOverlay,
-    ModelRow, NotificationPriority, ScrollAnchor,
+    ModelRow, NotificationPriority, ScrollAnchor, TYPESAFE_LOGIN_INDEX,
 };
 use crate::block::{BlockKind, InteractionRequestKind};
 use crate::composer::ComposerError;
@@ -839,7 +839,15 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         state.request_cancel_active_run();
         return vec![Effect::Send(UiCommand::CancelRun), Effect::RequestRender];
     }
-    if key.code == KeyCode::BackTab {
+    if (key.code == KeyCode::BackTab
+        || (key.code == KeyCode::Tab && key.modifiers == KeyModifiers::ALT))
+        && !interaction_pending
+    {
+        if state.working {
+            state.push_notification("Aguarde ou cancele a execução antes de trocar o modo".into());
+            state.revisions.status += 1;
+            return vec![Effect::RequestRender];
+        }
         return vec![
             Effect::Send(UiCommand::SetMode(cycle_mode(state.mode))),
             Effect::RequestRender,
@@ -1275,6 +1283,7 @@ fn open_model_overlay(state: &mut AppState) -> Vec<Effect> {
         &state.cline_pass_models,
         &state.command_code_models,
         &state.zen_models,
+        state.mode == slim_core::OperatingMode::Jev,
     ));
     state.revisions.status += 1;
     vec![
@@ -1478,6 +1487,16 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
             });
             state.revisions.status += 1;
         }
+        // Jev controller credential: reuses the masked-entry flow so the key can
+        // be replaced later without a dedicated panel.
+        "/login typesafe" | "/login jev" => {
+            state.login_overlay = Some(LoginOverlay {
+                selected: TYPESAFE_LOGIN_INDEX,
+                stage: LoginStage::ApiKey(Default::default()),
+                ..LoginOverlay::default()
+            });
+            state.revisions.status += 1;
+        }
         "/logout" => {
             effects.push(Effect::Send(UiCommand::Logout));
             state.revisions.status += 1;
@@ -1496,8 +1515,26 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                 keep_draft = true;
             }
         }
-        "/mode" => {
-            effects.push(Effect::Send(UiCommand::SetMode(cycle_mode(state.mode))));
+        _ if command == "/mode" || command.starts_with("/mode ") => {
+            let mode = match command.strip_prefix("/mode").unwrap_or_default().trim() {
+                "" => Some(cycle_mode(state.mode)),
+                "auto" => Some(slim_core::OperatingMode::Auto),
+                "read-only" | "readonly" => Some(slim_core::OperatingMode::ReadOnly),
+                "plan" => Some(slim_core::OperatingMode::Plan),
+                "jev" => Some(slim_core::OperatingMode::Jev),
+                _ => None,
+            };
+            if state.working {
+                state.push_notification(
+                    "Aguarde ou cancele a execução antes de trocar o modo".into(),
+                );
+                keep_draft = true;
+            } else if let Some(mode) = mode {
+                effects.push(Effect::Send(UiCommand::SetMode(mode)));
+            } else {
+                state.push_notification("Uso: /mode auto|read-only|plan|jev".into());
+                keep_draft = true;
+            }
             state.revisions.status += 1;
         }
         "/image" => {
@@ -1823,11 +1860,13 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     let Some(mut overlay) = state.model_overlay.clone() else {
         return vec![];
     };
+    let jev = state.mode == slim_core::OperatingMode::Jev;
     let rows = overlay.rows(
         &state.open_code_models,
         &state.cline_pass_models,
         &state.command_code_models,
         &state.zen_models,
+        jev,
     );
     match key.code {
         KeyCode::Esc => {
@@ -1859,6 +1898,7 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                         &state.cline_pass_models,
                         &state.command_code_models,
                         &state.zen_models,
+                        jev,
                     )
                     .len()
                     .saturating_sub(1),
@@ -1997,6 +2037,7 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         &state.cline_pass_models,
         &state.command_code_models,
         &state.zen_models,
+        jev,
     );
     overlay.viewport_start = ensure_visible_start(
         overlay.viewport_start,
@@ -2440,14 +2481,14 @@ fn fitted_fold_navigation(state: &AppState, intent: ScrollIntent) -> Option<Foll
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::{reduce, Action, Effect};
+    use super::{open_model_overlay, reduce, Action, Effect};
     use crate::api::{
         LoginProvider, ModelAlias, OpenCodeCatalogSource, OpenCodeModelView, ReasoningEffort,
         UiCommand, UiEvent,
     };
     use crate::app::{
         ActivityPhase, AppState, CancellationPhase, ConfirmedSetting, FrameClock, LoginStage,
-        NotificationPriority, RunOutcomeKind,
+        ModelRow, NotificationPriority, RunOutcomeKind,
     };
 
     fn enter() -> KeyEvent {
@@ -3286,6 +3327,71 @@ mod tests {
     }
 
     #[test]
+    fn alt_tab_cycles_mode_like_shift_tab_including_jev() {
+        for (from, expected) in [
+            (
+                slim_core::OperatingMode::Auto,
+                slim_core::OperatingMode::ReadOnly,
+            ),
+            (
+                slim_core::OperatingMode::ReadOnly,
+                slim_core::OperatingMode::Plan,
+            ),
+            (
+                slim_core::OperatingMode::Plan,
+                slim_core::OperatingMode::Jev,
+            ),
+            (
+                slim_core::OperatingMode::Jev,
+                slim_core::OperatingMode::Auto,
+            ),
+        ] {
+            let mut state = AppState::new();
+            state.mode = from;
+            let effects = reduce(
+                &mut state,
+                Action::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::ALT)),
+            );
+            assert!(
+                effects.contains(&Effect::Send(UiCommand::SetMode(expected))),
+                "{from:?} via Alt+Tab"
+            );
+        }
+    }
+
+    #[test]
+    fn mode_switch_is_refused_while_a_run_is_active() {
+        let mut state = AppState::new();
+        state.working = true;
+        for key in [
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::ALT),
+        ] {
+            let effects = reduce(&mut state, Action::Key(key));
+            assert!(!effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Send(UiCommand::SetMode(_)))));
+        }
+    }
+
+    #[test]
+    fn mode_slash_command_accepts_explicit_modes() {
+        let mut state = AppState::new();
+        state.composer.insert_text("/mode jev");
+        let effects = reduce(&mut state, Action::Key(enter()));
+        assert!(effects.contains(&Effect::Send(UiCommand::SetMode(
+            slim_core::OperatingMode::Jev
+        ))));
+
+        let mut state = AppState::new();
+        state.composer.insert_text("/mode bogus");
+        let effects = reduce(&mut state, Action::Key(enter()));
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Send(UiCommand::SetMode(_)))));
+    }
+
+    #[test]
     fn mode_slash_command_cycles_like_shift_tab() {
         let mut state = AppState::new();
         state.composer.insert_text("/mode");
@@ -3294,6 +3400,137 @@ mod tests {
             slim_core::OperatingMode::ReadOnly
         ))));
         assert!(state.composer.payload().is_empty());
+    }
+
+    #[test]
+    fn jev_filter_hides_incompatible_models_and_groups() {
+        let mut state = AppState::new();
+        state.mode = slim_core::OperatingMode::Jev;
+        let _ = open_model_overlay(&mut state);
+        let overlay = state.model_overlay.clone().expect("overlay");
+        let rows = overlay.rows(
+            &state.open_code_models,
+            &state.cline_pass_models,
+            &state.command_code_models,
+            &state.zen_models,
+            true,
+        );
+        let aliases: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| match row {
+                ModelRow::Alias(alias) => Some(alias.id()),
+                _ => None,
+            })
+            .collect();
+        // Sol/Terra/Luna document `none`; Astra rejects it.
+        assert_eq!(
+            aliases,
+            vec!["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+        );
+        // Gateways are refused by policy, so their groups disappear entirely.
+        assert!(!rows
+            .iter()
+            .any(|row| matches!(row, ModelRow::Header(1..=4))));
+        assert!(!rows
+            .iter()
+            .any(|row| matches!(row, ModelRow::Catalog(_) | ModelRow::Zen(_))));
+    }
+
+    #[test]
+    fn leaving_jev_restores_the_full_model_list() {
+        let mut state = AppState::new();
+        state.mode = slim_core::OperatingMode::Jev;
+        let _ = open_model_overlay(&mut state);
+        let overlay = state.model_overlay.clone().expect("overlay");
+        let catalogs = (
+            state.open_code_models.clone(),
+            state.cline_pass_models.clone(),
+            state.command_code_models.clone(),
+            state.zen_models.clone(),
+        );
+        let jev_rows = overlay
+            .rows(&catalogs.0, &catalogs.1, &catalogs.2, &catalogs.3, true)
+            .len();
+        state.mode = slim_core::OperatingMode::Auto;
+        let normal_rows = overlay
+            .rows(&catalogs.0, &catalogs.1, &catalogs.2, &catalogs.3, false)
+            .len();
+        assert!(
+            normal_rows > jev_rows,
+            "leaving Jev restores the unfiltered list"
+        );
+        // Every group is back, header included.
+        assert_eq!(
+            overlay
+                .rows(&catalogs.0, &catalogs.1, &catalogs.2, &catalogs.3, false)
+                .iter()
+                .filter(|row| matches!(row, ModelRow::Header(_)))
+                .count(),
+            5
+        );
+    }
+
+    #[test]
+    fn jev_picker_survives_an_empty_result() {
+        let mut state = AppState::new();
+        state.mode = slim_core::OperatingMode::Jev;
+        let _ = open_model_overlay(&mut state);
+        let mut overlay = state.model_overlay.clone().expect("overlay");
+        // Nothing matches in Jev mode: the list is empty rather than showing
+        // dead headers, and no model can be selected.
+        overlay.filter = "zzz-no-such-model".into();
+        state.model_overlay = Some(overlay);
+
+        let effects = reduce(
+            &mut state,
+            Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Send(UiCommand::SetModel { .. })
+                | Effect::Send(UiCommand::SetOpenCodeModel { .. })
+                | Effect::Send(UiCommand::SetZenModel { .. })
+                | Effect::Send(UiCommand::SetClinePassModel { .. })
+                | Effect::Send(UiCommand::SetCommandCodeModel { .. })
+        )));
+
+        // Esc still leaves: the interface never sticks.
+        reduce(
+            &mut state,
+            Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        );
+        assert!(state.model_overlay.is_none());
+    }
+
+    #[test]
+    fn typesafe_login_collects_the_controller_secret_masked() {
+        let mut state = AppState::new();
+        state.composer.insert_text("/login typesafe");
+        reduce(&mut state, Action::Key(enter()));
+        assert_eq!(
+            state.login_overlay.as_ref().expect("overlay").provider(),
+            LoginProvider::Typesafe
+        );
+        for character in "ts-fixture-secret".chars() {
+            reduce(
+                &mut state,
+                Action::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+            );
+        }
+
+        let effects = reduce(&mut state, Action::Key(enter()));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::Send(UiCommand::SaveApiKey {
+                    provider: LoginProvider::Typesafe,
+                    ..
+                }),
+                Effect::RequestRender
+            ]
+        ));
+        assert!(!format!("{state:?}").contains("ts-fixture-secret"));
     }
 
     #[test]

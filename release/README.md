@@ -1,6 +1,47 @@
 # Release do Slim
 
-## Deploy local atual — Consolidação pós-limpeza e auditoria (2026-09-17)
+## Deploy local atual — Telemetria durável do modo Jev (2026-09-18)
+
+`refresh-slim.ps1` concluiu com `OK:` e exit 0; build release em **5m46s**.
+PATH resolvido: `C:\Users\User\bin\Slim.exe`, build **2026-09-18 02:28:52**,
+`slim 0.1.0`, **18.279.936 bytes**. SHA-256 do instalado e de
+`target/release/slim.exe` idênticos:
+`594A9269D02A8B3A0B05AB35426B3F750FE067093D80A63218FCCF0F424DFAAD`.
+
+O binário inclui o modo Jev com enforcement fail-closed e a telemetria durável
+necessária para avaliar sua utilidade: decisões `jev.v1` usam identidade por
+operação/índice/request, e cada operação grava envelopes `run.telemetry.v1` de
+início e término com modo, providers/modelos, uso e custos agregados, validação,
+limites resolvidos, duração e IDs opcionais de experimento/tarefa. Os envelopes
+terminais são anexados depois do registro terminal da operação, de modo que um
+crash anterior não permita interpretar uma execução incompleta como concluída.
+
+Validação desta atualização: `cargo fmt --all -- --check`, `cargo clippy
+--workspace --lib --bins --offline -- -D warnings`, **17 testes focados**
+(2 do journal/reducer, 3 do wiring CLI e 12 de retomada durável) e
+`git diff --check`, todos com exit 0. Smoke do instalado: `--version` retornou
+`slim 0.1.0` e `--help` contém `--jev`. A suíte completa do workspace não foi
+repetida após os últimos ajustes; provider TypeSafe real e TUI em console físico
+não foram exercitados nesta atualização.
+
+## Deploy local atual — Usabilidade do modo Jev (2026-09-17)
+
+`refresh-slim.ps1` concluído com `OK:` e exit 0; build release em **3m03s**.
+PATH: `C:\Users\User\bin\Slim.exe`, build **2026-09-17 21:07:30**,
+`slim 0.1.0`, **18.220.032 bytes**. SHA-256 do instalado e de
+`target/release/slim.exe` idênticos:
+`4A4197556EE8256ECA05052B9D300F8209DFA88BFB65FE1137253709974E3A9E`.
+
+O binário reflete o checkout com: filtro do seletor `/model` pela mesma política
+OFF da execução (com Jev ativo), cadastro da chave TypeSafe pela TUI em entrada
+mascarada no store protegido, e o fluxo ativar Jev → chave → modelo compatível.
+Smoke instalado: `--version` exit 0 e `--help` com a linha `--jev`.
+Verificações na tarefa: `cargo fmt --all -- --check` e
+`cargo clippy --workspace --lib --bins --offline -- -D warnings` limpos, mais os
+testes direcionados do filtro, da lista vazia, do login TypeSafe e do store.
+Suíte completa não repetida nesta tarefa; console físico não validado.
+
+## Deploy anterior — Consolidação pós-limpeza e auditoria (2026-09-17)
 
 `refresh-slim.ps1` concluído com `OK:` e exit 0; build release em **3m21s**.
 PATH: `C:\Users\User\bin\Slim.exe`, build **2026-09-17 04:05:50**,

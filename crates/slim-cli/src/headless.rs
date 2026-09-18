@@ -20,7 +20,8 @@ use slim_core::runtime::{
 use slim_core::session::{
     preflight_session, provider_messages_from_entries, provider_messages_from_records,
     DurableEntry, DurableErrorClass, DurableOutcome, DurableRepo, DurableSessionHeader, JsonlRepo,
-    ManualRunJournal, ManualRunSpec, ProviderResponse, SessionFormat, SessionPreflight,
+    ManualRunJournal, ManualRunSpec, ProviderResponse, RunTelemetryContext, RunTelemetryTerminal,
+    SessionFormat, SessionPreflight,
 };
 use slim_core::tools::ToolRegistry;
 use slim_core::{
@@ -171,6 +172,12 @@ impl Eq for SharedToolRegistry {}
 pub struct ProviderRunOptions {
     /// Stable conversation identity for provider routing, shared across turns.
     pub provider_session_id: Option<String>,
+    /// Optional benchmark grouping identifier persisted only in durable run
+    /// telemetry. It is never added to the provider prompt.
+    pub experiment_id: Option<String>,
+    /// Optional caller-defined task identifier persisted only in durable run
+    /// telemetry. It is never added to the provider prompt.
+    pub task_id: Option<String>,
     pub content_blocks: Vec<ProviderContentBlock>,
     pub history: Vec<ProviderMessage>,
     pub task_facts: Vec<slim_core::session::DurableFact>,
@@ -206,6 +213,16 @@ pub(crate) struct SkillInstructions {
 }
 
 impl ProviderRunOptions {
+    pub fn with_experiment_id(mut self, experiment_id: impl Into<String>) -> Self {
+        self.experiment_id = Some(experiment_id.into());
+        self
+    }
+
+    pub fn with_task_id(mut self, task_id: impl Into<String>) -> Self {
+        self.task_id = Some(task_id.into());
+        self
+    }
+
     pub fn with_content_blocks(mut self, blocks: Vec<ProviderContentBlock>) -> Self {
         self.content_blocks = blocks;
         self
@@ -326,6 +343,8 @@ pub struct UsageCostSummary {
     pub cost_per_validated_completion_micros: Option<u64>,
     pub failed_attempts_micros: Option<u64>,
     pub compaction_micros: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jev_micros: Option<u64>,
     pub cancelled_estimated_micros: Option<u64>,
 }
 
@@ -347,6 +366,8 @@ pub(crate) struct ToolLoopLimits {
     pub max_total_tool_calls: usize,
     pub max_turns: usize,
     pub max_output_tokens: u32,
+    pub max_result_bytes: usize,
+    pub context_window_tokens: u64,
 }
 
 #[derive(Serialize)]
@@ -579,6 +600,7 @@ async fn run_provider_resume_with_preflight_events_inner(
         options.history = history;
     }
     options.task_facts = session_task_facts(&preflight);
+    spec = spec.with_run_telemetry(durable_run_telemetry_context(&request, &options)?);
     let compaction_handle = options.compaction.clone();
     let journal = std::sync::Arc::new(std::sync::Mutex::new(
         ManualRunJournal::start(repo, spec).map_err(|error| resume_error(error.to_string()))?,
@@ -1019,7 +1041,7 @@ impl DurableProviderExecutor {
             }
         };
         let mut response =
-            ProviderResponse::with_outcome(execution.result.text.clone(), usage, outcome);
+            ProviderResponse::with_outcome(execution.result.text.clone(), usage, outcome.clone());
         response.transcript = std::mem::take(&mut execution.turn_transcript);
         response.task_facts = execution
             .task_facts
@@ -1061,6 +1083,12 @@ impl DurableProviderExecutor {
                 .record_message(message.clone())
                 .map_err(|error| resume_error(error.to_string()))?;
         }
+        let terminal = run_telemetry_terminal(&execution, outcome)?;
+        self.journal
+            .lock()
+            .map_err(|_| resume_error("durable run lock poisoned"))?
+            .set_run_telemetry_terminal(terminal)
+            .map_err(|error| resume_error(error.to_string()))?;
         self.execution = Some(execution);
         Ok(response)
     }
@@ -1079,6 +1107,174 @@ fn classify_provider_error(error: &ProviderError) -> DurableErrorClass {
             DurableErrorClass::Invalid
         }
         ProviderError::Cancelled => DurableErrorClass::Cancelled,
+    }
+}
+
+const MAX_RUN_TELEMETRY_ID_BYTES: usize = 256;
+
+fn durable_run_telemetry_context(
+    request: &ProviderRequest,
+    options: &ProviderRunOptions,
+) -> Result<RunTelemetryContext, ProviderError> {
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| ProviderError::InvalidResponse {
+            message: format!("system clock precedes Unix epoch: {error}"),
+        })?
+        .as_millis()
+        .try_into()
+        .map_err(|_| ProviderError::InvalidResponse {
+            message: "run telemetry timestamp overflowed".into(),
+        })?;
+    let experiment_id = validate_run_telemetry_id(options.experiment_id.as_deref(), "experiment")?;
+    let task_id = validate_run_telemetry_id(options.task_id.as_deref(), "task")?;
+    let jev_model = (request.mode == OperatingMode::Jev)
+        .then(requested_jev_model)
+        .flatten();
+    Ok(RunTelemetryContext {
+        experiment_id,
+        task_id,
+        mode: request.mode,
+        provider: provider_kind_name(request.kind).into(),
+        model: request.model.clone(),
+        jev_model,
+        build_revision: option_env!("SLIM_BUILD_REVISION")
+            .unwrap_or(env!("CARGO_PKG_VERSION"))
+            .into(),
+        started_at,
+        limits: serde_json::json!({
+            "resolved": false,
+            "context_window_tokens": options.context_window_tokens,
+            "max_output_tokens": options.max_output_tokens,
+            "max_mutating_tool_calls": options.max_tool_calls,
+            "max_read_tool_calls": options.max_read_tool_calls,
+            "max_total_tool_calls": options.max_total_tool_calls,
+            "max_turns": options.max_turns,
+            "max_result_bytes": options.max_result_bytes,
+        }),
+    })
+}
+
+fn validate_run_telemetry_id(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<String>, ProviderError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_empty()
+        || value.len() > MAX_RUN_TELEMETRY_ID_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(ProviderError::InvalidResponse {
+            message: format!(
+                "{field} telemetry id must be 1..={MAX_RUN_TELEMETRY_ID_BYTES} bytes without control characters"
+            ),
+        });
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn requested_jev_model() -> Option<String> {
+    match std::env::var("SLIM_JEV_MODEL") {
+        Ok(model) if !model.is_empty() && model.len() <= 128 => Some(model),
+        Ok(_) | Err(std::env::VarError::NotUnicode(_)) => None,
+        Err(std::env::VarError::NotPresent) => Some(slim_core::DEFAULT_JEV_MODEL.into()),
+    }
+}
+
+fn run_telemetry_terminal(
+    execution: &ProviderExecution,
+    outcome: DurableOutcome,
+) -> Result<RunTelemetryTerminal, ProviderError> {
+    let totals = &execution.result.usage;
+    let total_input_tokens = totals
+        .uncached_input_tokens
+        .saturating_add(totals.cache_write_tokens)
+        .saturating_add(totals.cache_read_tokens);
+    let usage = serde_json::json!({
+        "request_count": totals.requests.len(),
+        "uncached_input_tokens": totals.uncached_input_tokens,
+        "cache_write_tokens": totals.cache_write_tokens,
+        "cache_read_tokens": totals.cache_read_tokens,
+        "total_input_tokens": total_input_tokens,
+        "output_tokens": totals.output_tokens,
+        "reasoning_tokens": totals.reasoning_tokens,
+        "total_tokens": total_input_tokens.saturating_add(totals.output_tokens),
+        "usage_unknown": totals.usage_unknown,
+        "system_bytes": totals.system_bytes,
+        "tool_schema_bytes": totals.tool_schema_bytes,
+        "history_bytes": totals.history_bytes,
+        "tool_result_bytes": totals.tool_result_bytes,
+        "provider_latency_ms": totals.provider_latency_ms,
+        "tool_latency_ms": totals.tool_latency_ms,
+        "retry_count": totals.retry_count,
+        "cancelled_requests": totals.cancelled_requests,
+        "provider_turns": totals.provider_turns,
+        "jev_decisions": totals.jev_decisions,
+        "jev_http_attempts": totals.jev_http_attempts,
+        "jev_input_tokens": totals.jev_input_tokens,
+        "jev_output_tokens": totals.jev_output_tokens,
+        "jev_latency_ms": totals.jev_latency_ms,
+        "jev_usage_unknown": totals.jev_usage_unknown,
+        "tool_calls_executed": totals.tool_calls_executed,
+        "tool_calls_reused": totals.tool_calls_reused,
+        "tool_calls_suppressed": totals.tool_calls_suppressed,
+        "no_progress_turns": totals.no_progress_turns,
+        "no_progress_tokens": totals.no_progress_tokens,
+        "duplicate_evidence_bytes_avoided": totals.duplicate_evidence_bytes_avoided,
+        "compaction_input_tokens": totals.compaction_input_tokens,
+        "compaction_output_tokens": totals.compaction_output_tokens,
+        "compaction_tokens_saved": totals.compaction_tokens_saved,
+        "post_compaction_reacquisitions": totals.post_compaction_reacquisitions,
+        "estimation_error_tokens": totals.estimation_error_tokens,
+        "validated_completion": totals.validated_completion,
+        "overflowed": totals.overflowed,
+    });
+    let costs = serde_json::to_value(&execution.result.costs).map_err(|error| {
+        ProviderError::InvalidResponse {
+            message: format!("serialize durable run costs: {error}"),
+        }
+    })?;
+    let jev_model = execution
+        .result
+        .usage
+        .requests
+        .iter()
+        .rev()
+        .find(|usage| usage.request_kind == RequestKind::JevDecision)
+        .map(|usage| usage.model.clone());
+    Ok(RunTelemetryTerminal {
+        stop: execution.result.stop.clone(),
+        outcome,
+        validated_completion: execution.result.usage.validated_completion,
+        validation_source: execution.result.validation_source.clone(),
+        usage,
+        costs,
+        limits: serde_json::json!({
+            "resolved": true,
+            "context_window_tokens": execution.limits.context_window_tokens,
+            "max_output_tokens": execution.limits.max_output_tokens,
+            "max_mutating_tool_calls": execution.limits.max_mutating_tool_calls,
+            "max_read_tool_calls": execution.limits.max_read_tool_calls,
+            "max_total_tool_calls": execution.limits.max_total_tool_calls,
+            "max_turns": execution.limits.max_turns,
+            "max_result_bytes": execution.limits.max_result_bytes,
+        }),
+        jev_model,
+    })
+}
+
+fn provider_kind_name(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::OpenAiCompatible => "openai-compatible",
+        ProviderKind::OpenAiCodex => "openai-codex",
+        ProviderKind::Anthropic => "anthropic",
+        ProviderKind::OpenCodeGo => "opencode-go",
+        ProviderKind::OpenCodeZen => "opencode-zen",
+        ProviderKind::ClinePass => "clinepass",
+        ProviderKind::CommandCode => "command-code",
+        ProviderKind::Xai => "xai",
     }
 }
 
@@ -1429,6 +1625,18 @@ pub(crate) async fn execute_provider_turn_async(
         runtime.set_background_compaction_enabled(true);
     }
     runtime.register_sensitive_value(&request.api_key);
+    if request.mode == OperatingMode::Jev {
+        // One resolved key for both sources: the environment override wins,
+        // then the protected local store registered through the TUI.
+        let key = crate::auth::resolve_typesafe_api_key()
+            .map_err(|error| ProviderError::InvalidResponse {
+                message: format!("Jev: {error}"),
+            })?
+            .ok_or_else(|| ProviderError::InvalidResponse {
+                message: "Jev requires a TypeSafe API key: set TYPESAFE_API_KEY or register it in the TUI (/login typesafe). Its selected context is also sent to TypeSafe, including when the main model is local.".into(),
+            })?;
+        runtime.enable_jev(&key)?;
+    }
     runtime.restore_task_facts(&options.task_facts, &cwd)?;
     // Per-turn Runtime, application-scoped language-server pool.
     if let Some(code_intelligence) = options.code_intelligence.as_ref() {
@@ -1457,6 +1665,8 @@ pub(crate) async fn execute_provider_turn_async(
         max_total_tool_calls: loop_config.max_total_tool_calls,
         max_turns: loop_config.max_turns,
         max_output_tokens,
+        max_result_bytes: loop_config.max_result_bytes,
+        context_window_tokens: loop_config.context_window_tokens,
     };
     let user_text = match skill_user_prefix.as_deref() {
         Some(prefix) => format!("{prefix}{}", request.prompt),
@@ -1473,6 +1683,9 @@ pub(crate) async fn execute_provider_turn_async(
                     .with_max_output_tokens(max_output_tokens);
             if let Some(effort) = reasoning_effort.as_deref() {
                 config = config.with_reasoning_effort(effort);
+            }
+            if request.mode == OperatingMode::Jev {
+                config = config.with_reasoning_disabled()?;
             }
             let adapter = OpenAiCompatibleAdapter::new(config)?;
             let model = adapter.model().to_owned();
@@ -1512,6 +1725,9 @@ pub(crate) async fn execute_provider_turn_async(
             if let Some(effort) = reasoning_effort.as_deref() {
                 config = config.with_reasoning_effort(effort);
             }
+            if request.mode == OperatingMode::Jev {
+                config = config.with_reasoning_disabled()?;
+            }
             let adapter = OpenAiCodexAdapter::new(config)?.with_fast_mode(options.codex_fast);
             let model = adapter.model().to_owned();
             let adapter = bind_history_scope(
@@ -1541,6 +1757,9 @@ pub(crate) async fn execute_provider_turn_async(
             if let Some(effort) = reasoning_effort.as_deref() {
                 config = config.with_reasoning_effort(effort);
             }
+            if request.mode == OperatingMode::Jev {
+                config = config.with_reasoning_disabled()?;
+            }
             let adapter = AnthropicAdapter::new(config.with_max_output_tokens(max_output_tokens))?;
             let model = adapter.model().to_owned();
             let adapter = bind_history_scope(
@@ -1569,10 +1788,13 @@ pub(crate) async fn execute_provider_turn_async(
                 reasoning_effort.as_deref(),
             )?
             .with_max_output_tokens(max_output_tokens);
-            let adapter = match options.provider_session_id.as_deref() {
+            let mut adapter = match options.provider_session_id.as_deref() {
                 Some(id) => adapter.with_session_id(id),
                 None => adapter,
             };
+            if request.mode == OperatingMode::Jev {
+                adapter.set_reasoning_disabled()?;
+            }
             adapter.validate_messages(&initial_messages)?;
             let model = adapter.model().to_owned();
             let adapter = bind_history_scope(
@@ -1601,10 +1823,13 @@ pub(crate) async fn execute_provider_turn_async(
                 reasoning_effort.as_deref(),
             )?
             .with_max_output_tokens(max_output_tokens);
-            let adapter = match options.provider_session_id.as_deref() {
+            let mut adapter = match options.provider_session_id.as_deref() {
                 Some(id) => adapter.with_session_id(id),
                 None => adapter,
             };
+            if request.mode == OperatingMode::Jev {
+                adapter.set_reasoning_disabled()?;
+            }
             adapter.validate_messages(&initial_messages)?;
             let model = adapter.model().to_owned();
             let adapter = bind_history_scope(
@@ -1626,13 +1851,16 @@ pub(crate) async fn execute_provider_turn_async(
                 .await
         }
         ProviderKind::ClinePass => {
-            let adapter = ClinePassAdapter::new(
+            let mut adapter = ClinePassAdapter::new(
                 &request.endpoint,
                 &request.model,
                 &api_key,
                 reasoning_effort.as_deref(),
             )?
             .with_max_output_tokens(max_output_tokens);
+            if request.mode == OperatingMode::Jev {
+                adapter.set_reasoning_disabled()?;
+            }
             let model = adapter.model().to_owned();
             let adapter = bind_history_scope(
                 adapter,
@@ -1653,7 +1881,7 @@ pub(crate) async fn execute_provider_turn_async(
                 .await
         }
         ProviderKind::CommandCode => {
-            let adapter = CommandCodeAdapter::new(
+            let mut adapter = CommandCodeAdapter::new(
                 &request.endpoint,
                 &request.model,
                 &api_key,
@@ -1661,6 +1889,9 @@ pub(crate) async fn execute_provider_turn_async(
             )?
             .with_max_output_tokens(max_output_tokens)
             .with_zero_data_retention(command_code_zero_data_retention());
+            if request.mode == OperatingMode::Jev {
+                adapter.set_reasoning_disabled()?;
+            }
             let model = adapter.model().to_owned();
             let adapter = bind_history_scope(
                 adapter,
@@ -1681,13 +1912,16 @@ pub(crate) async fn execute_provider_turn_async(
                 .await
         }
         ProviderKind::Xai => {
-            let adapter = XaiAdapter::new(
+            let mut adapter = XaiAdapter::new(
                 &request.endpoint,
                 &request.model,
                 &api_key,
                 reasoning_effort.as_deref(),
             )?
             .with_max_output_tokens(max_output_tokens);
+            if request.mode == OperatingMode::Jev {
+                adapter.set_reasoning_disabled()?;
+            }
             let model = adapter.model().to_owned();
             let adapter = bind_history_scope(
                 adapter,
@@ -2446,8 +2680,33 @@ struct UsagePricing {
 }
 
 fn cost_summary_for_usage(usage: &UsageTotals, pricing: Option<UsagePricing>) -> UsageCostSummary {
+    let jev_micros = (!usage.overflowed
+        && usage
+            .requests
+            .iter()
+            .any(|request| request.request_kind == RequestKind::JevDecision))
+    .then(|| {
+        let weighted = usage
+            .requests
+            .iter()
+            .filter(|request| request.request_kind == RequestKind::JevDecision)
+            .try_fold(0_u128, |total, request| {
+                jev_weighted_cost(request).and_then(|cost| total.checked_add(cost))
+            })?;
+        weighted_cost_micros(weighted)
+    })
+    .flatten();
     let Some(pricing) = pricing else {
-        return UsageCostSummary::default();
+        return UsageCostSummary {
+            total_micros: usage
+                .requests
+                .iter()
+                .all(|request| request.request_kind == RequestKind::JevDecision)
+                .then_some(jev_micros)
+                .flatten(),
+            jev_micros,
+            ..UsageCostSummary::default()
+        };
     };
     let total_micros = (!usage.overflowed
         && !usage.requests.is_empty()
@@ -2492,6 +2751,7 @@ fn cost_summary_for_usage(usage: &UsageTotals, pricing: Option<UsagePricing>) ->
             .flatten(),
         failed_attempts_micros,
         compaction_micros,
+        jev_micros,
         cancelled_estimated_micros,
     }
 }
@@ -2515,6 +2775,9 @@ fn sum_cancelled_estimated_costs<'a>(
 ) -> Option<u64> {
     let weighted = requests.try_fold(0_u128, |total, request| {
         let observed = request_weighted_cost(request, pricing)?;
+        if request.request_kind == RequestKind::JevDecision {
+            return total.checked_add(observed);
+        }
         let unknown_input_tokens = request
             .estimated_input_tokens
             .saturating_sub(request.total_input_tokens());
@@ -2527,7 +2790,19 @@ fn sum_cancelled_estimated_costs<'a>(
     weighted_cost_micros(weighted)
 }
 
+fn jev_weighted_cost(request: &slim_core::RequestUsage) -> Option<u128> {
+    // TypeSafe /models, verified 2026-09-17: jev-1.13.0 input $0.042/1M,
+    // free output. Unknown models/usage are not billed at the main LLM's rate.
+    if request.usage_unknown || request.provider != "typesafe" || request.model != "jev-1.13.0" {
+        return None;
+    }
+    u128::from(request.total_input_tokens()).checked_mul(42_000)
+}
+
 fn request_weighted_cost(request: &slim_core::RequestUsage, pricing: UsagePricing) -> Option<u128> {
+    if request.request_kind == RequestKind::JevDecision {
+        return jev_weighted_cost(request);
+    }
     let cache_write_rate = if request.cache_write_tokens == 0 {
         0
     } else {
@@ -2851,16 +3126,7 @@ pub fn render_provider_verbose_text(result: &ProviderHeadlessResult) -> String {
 }
 
 pub fn render_provider_jsonl(result: &ProviderHeadlessResult) -> Result<String, serde_json::Error> {
-    let provider = match result.provider {
-        ProviderKind::OpenAiCompatible => "openai-compatible",
-        ProviderKind::OpenAiCodex => "openai-codex",
-        ProviderKind::Anthropic => "anthropic",
-        ProviderKind::OpenCodeGo => "opencode-go",
-        ProviderKind::OpenCodeZen => "opencode-zen",
-        ProviderKind::ClinePass => "clinepass",
-        ProviderKind::CommandCode => "command-code",
-        ProviderKind::Xai => "xai",
-    };
+    let provider = provider_kind_name(result.provider);
     let kind = match result.code {
         ExitCode::Success => "assistant",
         ExitCode::ApprovalRequired => "approval_required",
@@ -3243,6 +3509,8 @@ fn empty_provider_execution(result: ProviderHeadlessResult) -> ProviderExecution
             max_total_tool_calls: AgentLoopConfig::DEFAULT_MAX_TOTAL_TOOL_CALLS,
             max_turns: AgentLoopConfig::DEFAULT_MAX_TURNS,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            max_result_bytes: AgentLoopConfig::default().max_result_bytes,
+            context_window_tokens: AgentLoopConfig::default().context_window_tokens,
         },
         resume_preflight: None,
     }
@@ -3605,6 +3873,8 @@ mod stop_message_tests {
                 max_total_tool_calls: 256,
                 max_turns: 128,
                 max_output_tokens: 4096,
+                max_result_bytes: 16 * 1024,
+                context_window_tokens: 32_000,
             },
         );
         assert!(message.starts_with("Tool budget exhausted (read 2/96, mutating 1/32):"));
@@ -3621,6 +3891,8 @@ mod stop_message_tests {
             max_total_tool_calls: 256,
             max_turns: 128,
             max_output_tokens: 4096,
+            max_result_bytes: 16 * 1024,
+            context_window_tokens: 32_000,
         };
         assert_eq!(
             format_run_stop_message("turn_limit", &[], limits),
@@ -3648,10 +3920,172 @@ mod stop_message_tests {
                     max_total_tool_calls: 0,
                     max_turns: 128,
                     max_output_tokens: 4096,
+                    max_result_bytes: 16 * 1024,
+                    context_window_tokens: 32_000,
                 },
             ),
             "Configured tool budgets are zero. Increase the tool limits to continue with tools."
         );
+    }
+}
+
+#[cfg(test)]
+mod run_telemetry_tests {
+    use super::{
+        durable_run_telemetry_context, empty_provider_execution, input_required_result,
+        run_provider_headless_with_session_and_options, run_telemetry_terminal, ExitCode,
+        ProviderRequest, ProviderRunOptions, ToolLoopLimits,
+    };
+    use slim_core::runtime::CancellationToken;
+    use slim_core::session::{
+        preflight_session, DurableOperationKind, DurableOutcome, DurableRecord,
+    };
+    use slim_core::{OperatingMode, ProviderKind, RequestKind, RequestUsage};
+    use std::fs;
+    use std::time::Duration;
+
+    fn request() -> ProviderRequest {
+        ProviderRequest {
+            prompt: "prompt-marker".into(),
+            mode: OperatingMode::Jev,
+            kind: ProviderKind::OpenAiCompatible,
+            endpoint: "http://127.0.0.1:1".into(),
+            model: "fixture-main".into(),
+            api_key: "secret-marker".into(),
+            account_id: None,
+            timeout: Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn context_exposes_explicit_benchmark_ids_without_prompt_data() {
+        let options = ProviderRunOptions::default()
+            .with_experiment_id("exp-a")
+            .with_task_id("task-7");
+        let context = durable_run_telemetry_context(&request(), &options).unwrap();
+        assert_eq!(context.experiment_id.as_deref(), Some("exp-a"));
+        assert_eq!(context.task_id.as_deref(), Some("task-7"));
+        assert_eq!(context.mode, OperatingMode::Jev);
+        assert_eq!(context.provider, "openai-compatible");
+        assert_eq!(context.model, "fixture-main");
+        assert_eq!(context.limits["resolved"], false);
+        let debug = format!("{context:?}");
+        assert!(!debug.contains("secret-marker"));
+        assert!(!debug.contains("prompt-marker"));
+    }
+
+    #[test]
+    fn terminal_usage_is_aggregate_and_records_actual_jev_model_and_limits() {
+        let request = request();
+        let mut execution = empty_provider_execution(input_required_result(&request));
+        execution.result.stop = "provider_completed".into();
+        execution.result.validation_source = Some("derived_runtime".into());
+        execution.result.usage.requests.push(RequestUsage {
+            request_kind: RequestKind::JevDecision,
+            provider: "typesafe".into(),
+            model: "jev-actual".into(),
+            uncached_input_tokens: 13,
+            ..RequestUsage::default()
+        });
+        execution.result.usage.uncached_input_tokens = 13;
+        execution.result.usage.output_tokens = 5;
+        execution.result.usage.provider_turns = 2;
+        execution.result.usage.jev_decisions = 1;
+        execution.result.usage.validated_completion = true;
+        execution.limits = ToolLoopLimits {
+            max_mutating_tool_calls: 3,
+            max_read_tool_calls: 4,
+            max_total_tool_calls: 5,
+            max_turns: 6,
+            max_output_tokens: 7,
+            max_result_bytes: 8,
+            context_window_tokens: 9,
+        };
+
+        let terminal = run_telemetry_terminal(&execution, DurableOutcome::Success).unwrap();
+        assert_eq!(terminal.jev_model.as_deref(), Some("jev-actual"));
+        assert_eq!(terminal.usage["request_count"], 1);
+        assert_eq!(terminal.usage["total_input_tokens"], 13);
+        assert_eq!(terminal.usage["total_tokens"], 18);
+        assert_eq!(terminal.usage["jev_decisions"], 1);
+        assert!(terminal.usage.get("requests").is_none());
+        assert_eq!(terminal.limits["resolved"], true);
+        assert_eq!(terminal.limits["context_window_tokens"], 9);
+        assert_eq!(terminal.limits["max_result_bytes"], 8);
+        assert!(terminal.validated_completion);
+    }
+
+    #[test]
+    fn cancelled_durable_run_writes_start_and_terminal_envelopes_end_to_end() {
+        let root = std::env::temp_dir().join(format!(
+            "slim-run-telemetry-cli-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let session_path = root.join("session.jsonl");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let mut options = ProviderRunOptions::default()
+            .with_workspace_root(&root)
+            .with_experiment_id("cancel-exp")
+            .with_task_id("cancel-task");
+        options.cancellation = Some(cancellation);
+        let mut request = request();
+        request.mode = OperatingMode::Auto;
+        request.api_key = "must-not-be-persisted".into();
+
+        let result =
+            run_provider_headless_with_session_and_options(request, &session_path, options)
+                .unwrap();
+        assert_eq!(result.code, ExitCode::Cancelled);
+
+        let report = preflight_session(&session_path).unwrap();
+        let telemetry = report
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                DurableRecord::Fact { fact, .. } if fact.namespace == "run.telemetry.v1" => {
+                    Some(fact)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(telemetry.len(), 2);
+        assert_eq!(telemetry[0].value["phase"], "started");
+        assert_eq!(telemetry[0].value["mode"], "auto");
+        assert_eq!(telemetry[0].value["experiment_id"], "cancel-exp");
+        assert_eq!(telemetry[0].value["task_id"], "cancel-task");
+        assert_eq!(telemetry[1].value["phase"], "terminal");
+        assert_eq!(telemetry[1].value["outcome"], "cancelled");
+        assert_eq!(telemetry[1].value["stop"], "cancelled");
+        assert!(telemetry[1].value["limits"]["resolved"].as_bool().unwrap());
+        let aborted = report
+            .records
+            .iter()
+            .position(|record| {
+                matches!(record, DurableRecord::Operation { operation, .. }
+                if matches!(&operation.kind, DurableOperationKind::Aborted))
+            })
+            .unwrap();
+        let terminal_fact = report
+            .records
+            .iter()
+            .position(|record| {
+                matches!(record, DurableRecord::Fact { fact, .. }
+                if fact.namespace == "run.telemetry.v1"
+                    && fact.value["phase"] == "terminal")
+            })
+            .unwrap();
+        assert!(aborted < terminal_fact);
+        assert!(!fs::read_to_string(&session_path)
+            .unwrap()
+            .contains("must-not-be-persisted"));
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
 

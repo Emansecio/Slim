@@ -3,6 +3,7 @@ pub fn mode_name(mode: crate::OperatingMode) -> &'static str {
         crate::OperatingMode::Auto => "Auto",
         crate::OperatingMode::ReadOnly => "Read-only",
         crate::OperatingMode::Plan => "Plan",
+        crate::OperatingMode::Jev => "Jev",
     }
 }
 
@@ -68,6 +69,12 @@ pub(super) fn channel_stanza(mode: crate::OperatingMode, can_ask: bool) -> &'sta
         }
         (crate::OperatingMode::Auto, false) => {
             "\n\nHarness channel: Auto, unattended. No interactive pause (ask_question is not available). Refuse unauthorized destructive/irreversible/external/production writes, secret exposure, new dependencies or scope expansion rather than executing them. Continue authorized work without waiting. Shell runs PowerShell, not bash."
+        }
+        (crate::OperatingMode::Jev, true) => {
+            "\n\nHarness channel: Jev, interactive, native reasoning OFF. Jev selects the next action; produce its arguments or the final answer. All Auto authorization constraints still apply: use ask_question for unauthorized destructive/irreversible/external/production writes, secret exposure, new dependencies, scope expansion or undiscoverable decisions; do not reconfirm authorized work. Shell runs PowerShell, not bash."
+        }
+        (crate::OperatingMode::Jev, false) => {
+            "\n\nHarness channel: Jev, unattended, native reasoning OFF. Jev selects the next action; produce its arguments or the final answer. Refuse unauthorized destructive/irreversible/external/production writes, secret exposure, new dependencies and scope expansion. Continue already authorized work. No interactive pause is available. Shell runs PowerShell, not bash."
         }
         (crate::OperatingMode::Plan, _) => {
             "\n\nHarness channel: Plan. Inspect and report only. Workspace mutations, shell, todo, skill and ask_question are not available."

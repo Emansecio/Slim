@@ -28,6 +28,7 @@ Modes:
   --fake             Use the deterministic offline provider
   --plan             Allow inspection without workspace mutations
   --read-only        Disable workspace mutations
+  --jev              TypeSafe-controlled actions, native reasoning OFF (TYPESAFE_API_KEY)
 
 Provider:
   --provider NAME    Provider route
@@ -44,6 +45,8 @@ Input and sessions:
   --resume PATH      Continue an existing session
   --recover PATH     Repair a durable session without running a prompt
   --abandon-pending  With --recover: abandon unfinished work; effects stay unverified
+  --experiment-id ID Label durable run telemetry for a benchmark experiment
+  --task-id ID       Label durable run telemetry for a benchmark task
 
 Output:
   --verbose          Include detailed human-readable events
@@ -79,6 +82,8 @@ pub(crate) struct ParsedArgs {
     pub resume_path: Option<String>,
     pub recover_path: Option<String>,
     pub abandon_pending: bool,
+    pub experiment_id: Option<String>,
+    pub task_id: Option<String>,
     pub image_paths: Vec<String>,
     pub positional: Vec<String>,
     pub tui: bool,
@@ -101,6 +106,8 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
         resume_path: None,
         recover_path: None,
         abandon_pending: false,
+        experiment_id: None,
+        task_id: None,
         image_paths: Vec::new(),
         positional: Vec::new(),
         tui: false,
@@ -109,20 +116,37 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
         verbose: false,
     };
     let mut index = 0;
+    // Parsed flags are the only evidence of a selected mode: values such as
+    // `--prompt "--jev"` are prompt text, not a mode selection.
+    let mut jev_flag = false;
+    let mut opposed_mode_flag = false;
     while index < args.len() {
         match args[index].as_str() {
             "--tui" => parsed.tui = true,
             "--headless" => parsed.headless = true,
-            "--fake" => parsed.fake = true,
+            "--fake" => {
+                parsed.fake = true;
+                opposed_mode_flag = true;
+            }
             "--abandon-pending" => parsed.abandon_pending = true,
             "--fast" => parsed.codex_fast = Some(true),
             "--normal" => parsed.codex_fast = Some(false),
             "--verbose" => parsed.verbose = true,
-            "--plan" => parsed.mode = OperatingMode::Plan,
-            "--read-only" => parsed.mode = OperatingMode::ReadOnly,
+            "--jev" => {
+                parsed.mode = OperatingMode::Jev;
+                jev_flag = true;
+            }
+            "--plan" => {
+                parsed.mode = OperatingMode::Plan;
+                opposed_mode_flag = true;
+            }
+            "--read-only" => {
+                parsed.mode = OperatingMode::ReadOnly;
+                opposed_mode_flag = true;
+            }
             "--jsonl" => parsed.format = OutputFormat::Jsonl,
             "--prompt" | "--provider" | "--model" | "--endpoint" | "--session" | "--resume"
-            | "--recover" | "--image" | "--effort" => {
+            | "--recover" | "--image" | "--effort" | "--experiment-id" | "--task-id" => {
                 let option = args[index].clone();
                 index += 1;
                 let value = args.get(index).cloned().ok_or_else(|| {
@@ -138,6 +162,8 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
                     "--resume" => parsed.resume_path = Some(value),
                     "--recover" => parsed.recover_path = Some(value),
                     "--image" => parsed.image_paths.push(value),
+                    "--experiment-id" => parsed.experiment_id = Some(value),
+                    "--task-id" => parsed.task_id = Some(value),
                     _ => unreachable!(),
                 }
             }
@@ -150,6 +176,26 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
             value => parsed.positional.push(value.to_owned()),
         }
         index += 1;
+    }
+    if jev_flag {
+        if opposed_mode_flag {
+            return Err(failure(
+                ExitCode::InputRequired,
+                "--jev is incompatible with --plan, --read-only and --fake\n",
+            ));
+        }
+        if parsed
+            .effort
+            .as_deref()
+            .is_some_and(|effort| !matches!(effort, "none" | "off"))
+        {
+            return Err(failure(
+                ExitCode::InputRequired,
+                "--jev requires native reasoning OFF; remove --effort or use none\n",
+            ));
+        }
+        // OFF is imposed by the Jev provider policy, not saved as a TUI effort.
+        parsed.effort = None;
     }
     let session_modes = [
         parsed.session_path.is_some(),
@@ -200,6 +246,8 @@ where
         resume_path,
         recover_path,
         abandon_pending,
+        experiment_id,
+        task_id,
         image_paths,
         positional,
         tui: _,
@@ -216,6 +264,12 @@ where
             "--verbose is available only with human text output; remove --jsonl\n",
         );
     }
+    if fake && (experiment_id.is_some() || task_id.is_some()) {
+        return failure(
+            ExitCode::InputRequired,
+            "--experiment-id and --task-id require a provider-backed run; remove --fake\n",
+        );
+    }
     let prompt = prompt.unwrap_or_else(|| {
         if positional.is_empty() {
             stdin.to_owned()
@@ -230,6 +284,8 @@ where
             || provider.is_some()
             || model.is_some()
             || endpoint.is_some()
+            || experiment_id.is_some()
+            || task_id.is_some()
             || !image_paths.is_empty()
             || mode != OperatingMode::Auto)
     {
@@ -263,12 +319,15 @@ where
         }
     }
 
-    let provider_requested = provider.is_some()
+    let provider_requested = mode == OperatingMode::Jev
+        || provider.is_some()
         || endpoint.is_some()
         || model.is_some()
         || session_path.is_some()
         || resume_path.is_some()
         || recover_path.is_some()
+        || experiment_id.is_some()
+        || task_id.is_some()
         || !image_paths.is_empty()
         || environment_provider.is_some();
     if provider_requested {
@@ -409,6 +468,12 @@ where
         let mut options = ProviderRunOptions::default()
             .with_content_blocks(content_blocks)
             .with_compaction_handle(slim_core::context::CompactionHandle::new(compaction_policy));
+        if let Some(experiment_id) = experiment_id {
+            options = options.with_experiment_id(experiment_id);
+        }
+        if let Some(task_id) = task_id {
+            options = options.with_task_id(task_id);
+        }
         if let Some(effort) = effort {
             options = options.with_reasoning_effort(effort);
         }
@@ -534,7 +599,7 @@ fn refresh_headless_oauth(kind: ProviderKind) -> Result<(String, Option<String>)
 pub(crate) fn default_provider_endpoint(kind: ProviderKind) -> &'static str {
     match kind {
         ProviderKind::OpenAiCompatible => "https://api.openai.com/v1/chat/completions",
-        ProviderKind::OpenAiCodex => "https://chatgpt.com/backend-api",
+        ProviderKind::OpenAiCodex => slim_core::provider::CODEX_BACKEND_ENDPOINT,
         ProviderKind::Anthropic => "https://api.anthropic.com/v1/messages",
         ProviderKind::OpenCodeGo => slim_core::provider::OPENCODE_GO_BASE_URL,
         ProviderKind::OpenCodeZen => slim_core::provider::OPENCODE_ZEN_BASE_URL,
@@ -803,5 +868,30 @@ fn recovery_output(format: OutputFormat, abandoned: bool) -> CliOutput {
         code: ExitCode::Success,
         stdout,
         stderr: String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_cli_args;
+
+    #[test]
+    fn benchmark_labels_are_parsed_as_explicit_values() {
+        let args = [
+            "--headless",
+            "--experiment-id",
+            "jev-arm-b",
+            "--task-id",
+            "repo-17",
+            "--prompt",
+            "inspect",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        let parsed = parse_cli_args(&args).expect("parse benchmark labels");
+        assert_eq!(parsed.experiment_id.as_deref(), Some("jev-arm-b"));
+        assert_eq!(parsed.task_id.as_deref(), Some("repo-17"));
+        assert_eq!(parsed.prompt.as_deref(), Some("inspect"));
     }
 }

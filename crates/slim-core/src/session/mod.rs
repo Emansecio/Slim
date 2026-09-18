@@ -46,6 +46,7 @@ pub use jsonl_repo::JsonlRepo;
 pub use manual_drive::{
     drive_manual, drive_manual_async, restore_manual_run, ConflictKind, ManualDrive,
     ManualDriveError, ManualDriver, ManualExecutor, ManualRunSpec, ProviderResponse,
+    RunTelemetryContext, RunTelemetryTerminal,
 };
 pub use manual_journal::ManualRunJournal;
 pub use memory_repo::MemoryRepo;

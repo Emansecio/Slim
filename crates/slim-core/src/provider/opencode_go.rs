@@ -4,7 +4,7 @@ use super::{
     endpoint_sensitive_values, harden_compaction_body, materialize_native_prompt_cache_key,
     normalize_messages, AnthropicAdapter, HttpRequest, OpenAiCodexAdapter, OpenAiCompatibleAdapter,
     PreparedProviderRequest, ProviderAdapter, ProviderCapabilities, ProviderConfig, ProviderError,
-    ProviderEvent, ProviderKind, ProviderMessage,
+    ProviderEvent, ProviderKind, ProviderMessage, ReasoningOff,
 };
 
 pub const OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
@@ -483,6 +483,24 @@ impl OpenCodeGoAdapter {
 impl ProviderAdapter for OpenCodeGoAdapter {
     fn kind(&self) -> ProviderKind {
         ProviderKind::OpenCodeGo
+    }
+
+    fn reasoning_off(&self) -> Option<ReasoningOff> {
+        match &self.wire {
+            WireAdapter::Chat(adapter) => adapter.reasoning_off(),
+            WireAdapter::Messages(adapter) => adapter.reasoning_off(),
+            WireAdapter::Responses { .. } => None,
+        }
+    }
+
+    fn set_reasoning_disabled(&mut self) -> Result<(), ProviderError> {
+        match &mut self.wire {
+            WireAdapter::Chat(adapter) => adapter.set_reasoning_disabled(),
+            WireAdapter::Messages(adapter) => adapter.set_reasoning_disabled(),
+            WireAdapter::Responses { .. } => Err(ProviderError::InvalidResponse {
+                message: "Jev requires documented native reasoning OFF; the Responses route has none. No fallback was applied.".into(),
+            }),
+        }
     }
 
     fn wire_kind(&self) -> ProviderKind {

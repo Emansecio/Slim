@@ -316,10 +316,15 @@ impl LoginOverlay {
             3 => LoginProvider::ClinePass,
             4 => LoginProvider::CommandCode,
             5 => LoginProvider::Xai,
-            _ => LoginProvider::OpenCodeZen,
+            6 => LoginProvider::OpenCodeZen,
+            _ => LoginProvider::Typesafe,
         }
     }
 }
+
+/// Login overlay index reserved for the TypeSafe credential. The provider list
+/// only navigates 0..=6, so this index is reachable only programmatically.
+pub const TYPESAFE_LOGIN_INDEX: usize = 7;
 
 /// Grouped model overlay (G233/G234): each provider is a collapsible group;
 /// Space toggles collapse; the filter narrows across all groups.
@@ -363,87 +368,136 @@ pub enum ModelRow {
     Zen(usize),
 }
 
+/// Canonical route of each overlay group, in `ModelOverlay::collapsed` order.
+/// The endpoint is the provider's own: an explicit `--endpoint` override is
+/// still validated by the runtime before a run.
+fn group_route(group: usize) -> (slim_core::ProviderKind, &'static str) {
+    match group {
+        0 => (
+            slim_core::ProviderKind::OpenAiCodex,
+            slim_core::provider::CODEX_BACKEND_ENDPOINT,
+        ),
+        1 => (
+            slim_core::ProviderKind::OpenCodeGo,
+            slim_core::provider::OPENCODE_GO_BASE_URL,
+        ),
+        2 => (
+            slim_core::ProviderKind::ClinePass,
+            slim_core::provider::CLINEPASS_BASE_URL,
+        ),
+        3 => (
+            slim_core::ProviderKind::CommandCode,
+            slim_core::provider::COMMANDCODE_BASE_URL,
+        ),
+        _ => (
+            slim_core::ProviderKind::OpenCodeZen,
+            slim_core::provider::OPENCODE_ZEN_BASE_URL,
+        ),
+    }
+}
+
+/// Jev only starts a route whose documented native reasoning OFF applies; the
+/// picker must not advertise anything else. Same function as the runtime.
+fn route_runs_jev(group: usize, model: &str) -> bool {
+    let (kind, endpoint) = group_route(group);
+    slim_core::provider::reasoning_off_support(kind, endpoint, model).is_ok()
+}
+
 impl ModelOverlay {
     /// Builds the flattened row list respecting the filter and collapsed state.
+    ///
+    /// With `jev`, every row must also pass the runtime's native-OFF policy, so
+    /// the picker never advertises a route the run would refuse. Groups left
+    /// with no compatible model are dropped entirely; an empty result is the
+    /// signal the overlay renders as "no compatible model".
     pub fn rows(
         &self,
         opencode_models: &[OpenCodeModelView],
         clinepass_models: &[OpenCodeModelView],
         command_code_models: &[OpenCodeModelView],
         zen_models: &[OpenCodeModelView],
+        jev: bool,
     ) -> Vec<ModelRow> {
         let query = self.filter.to_lowercase();
         let mut out = Vec::new();
+        let keep = |id: &str, name: &str| {
+            query.is_empty()
+                || id.to_lowercase().contains(&query)
+                || name.to_lowercase().contains(&query)
+        };
+        let push_group = |out: &mut Vec<ModelRow>, group: usize, rows: Vec<ModelRow>| {
+            if jev && rows.is_empty() {
+                return;
+            }
+            out.push(ModelRow::Header(group));
+            if !(self.collapsed[group] && query.is_empty()) {
+                out.extend(rows);
+            }
+        };
 
         // Group 0: OpenAI Codex built-in aliases
-        let codex_hidden = self.collapsed[0] && query.is_empty();
-        out.push(ModelRow::Header(0));
-        if !codex_hidden {
-            for alias in &ModelAlias::ALL {
-                if query.is_empty()
-                    || alias.id().contains(&query)
-                    || alias.label().to_lowercase().contains(&query)
-                {
-                    out.push(ModelRow::Alias(*alias));
-                }
-            }
-        }
+        push_group(
+            &mut out,
+            0,
+            ModelAlias::ALL
+                .iter()
+                .filter(|alias| !jev || route_runs_jev(0, alias.id()))
+                .filter(|alias| keep(alias.id(), alias.label()))
+                .map(|alias| ModelRow::Alias(*alias))
+                .collect(),
+        );
 
         // Group 1: OpenCode Go catalog
-        let opencode_hidden = self.collapsed[1] && query.is_empty();
-        out.push(ModelRow::Header(1));
-        if !opencode_hidden {
-            for (index, model) in opencode_models.iter().enumerate() {
-                if query.is_empty()
-                    || model.id.to_lowercase().contains(&query)
-                    || model.name.to_lowercase().contains(&query)
-                {
-                    out.push(ModelRow::Catalog(index));
-                }
-            }
-        }
+        push_group(
+            &mut out,
+            1,
+            opencode_models
+                .iter()
+                .enumerate()
+                .filter(|(_, model)| !jev || route_runs_jev(1, &model.id))
+                .filter(|(_, model)| keep(&model.id, &model.name))
+                .map(|(index, _)| ModelRow::Catalog(index))
+                .collect(),
+        );
 
         // Group 2: ClinePass catalog
-        let clinepass_hidden = self.collapsed[2] && query.is_empty();
-        out.push(ModelRow::Header(2));
-        if !clinepass_hidden {
-            for (index, model) in clinepass_models.iter().enumerate() {
-                if query.is_empty()
-                    || model.id.to_lowercase().contains(&query)
-                    || model.name.to_lowercase().contains(&query)
-                {
-                    out.push(ModelRow::ClinePass(index));
-                }
-            }
-        }
+        push_group(
+            &mut out,
+            2,
+            clinepass_models
+                .iter()
+                .enumerate()
+                .filter(|(_, model)| !jev || route_runs_jev(2, &model.id))
+                .filter(|(_, model)| keep(&model.id, &model.name))
+                .map(|(index, _)| ModelRow::ClinePass(index))
+                .collect(),
+        );
 
         // Group 3: Command Code catalog
-        let command_code_hidden = self.collapsed[3] && query.is_empty();
-        out.push(ModelRow::Header(3));
-        if !command_code_hidden {
-            for (index, model) in command_code_models.iter().enumerate() {
-                if query.is_empty()
-                    || model.id.to_lowercase().contains(&query)
-                    || model.name.to_lowercase().contains(&query)
-                {
-                    out.push(ModelRow::CommandCode(index));
-                }
-            }
-        }
+        push_group(
+            &mut out,
+            3,
+            command_code_models
+                .iter()
+                .enumerate()
+                .filter(|(_, model)| !jev || route_runs_jev(3, &model.id))
+                .filter(|(_, model)| keep(&model.id, &model.name))
+                .map(|(index, _)| ModelRow::CommandCode(index))
+                .collect(),
+        );
 
         // Group 4: OpenCode Zen free-tier catalog
-        let zen_hidden = self.collapsed[4] && query.is_empty();
-        out.push(ModelRow::Header(4));
-        if !zen_hidden {
-            for (index, model) in zen_models.iter().enumerate() {
-                if query.is_empty()
-                    || model.id.to_lowercase().contains(&query)
-                    || model.name.to_lowercase().contains(&query)
-                {
-                    out.push(ModelRow::Zen(index));
-                }
-            }
-        }
+        push_group(
+            &mut out,
+            4,
+            zen_models
+                .iter()
+                .enumerate()
+                .filter(|(_, model)| !jev || route_runs_jev(4, &model.id))
+                .filter(|(_, model)| keep(&model.id, &model.name))
+                .map(|(index, _)| ModelRow::Zen(index))
+                .collect(),
+        );
 
         out
     }
@@ -457,6 +511,9 @@ impl ModelOverlay {
 
     /// Returns a fresh overlay with the selection positioned at the currently
     /// active model, or the first non-header row as fallback.
+    /// The four catalogs and the mode flag stay explicit: bundling them into a
+    /// struct would touch every call site without changing behavior.
+    #[allow(clippy::too_many_arguments)]
     pub fn for_current(
         current_model: &str,
         active_provider: Option<LoginProvider>,
@@ -464,6 +521,7 @@ impl ModelOverlay {
         clinepass_models: &[OpenCodeModelView],
         command_code_models: &[OpenCodeModelView],
         zen_models: &[OpenCodeModelView],
+        jev: bool,
     ) -> Self {
         let active_group = if ModelAlias::parse(current_model).is_some() {
             0
@@ -493,6 +551,8 @@ impl ModelOverlay {
                 LoginProvider::OpenCodeZen => 4,
                 // xAI tem grupo próprio adiado no /models; cai no grupo 0.
                 LoginProvider::Xai => 0,
+                // TypeSafe não é provider de modelo: o grupo ativo segue o modelo.
+                LoginProvider::Typesafe => 0,
             })
         };
         let mut overlay = Self {
@@ -505,6 +565,7 @@ impl ModelOverlay {
             clinepass_models,
             command_code_models,
             zen_models,
+            jev,
         );
         overlay.selected = rows
             .iter()
@@ -2479,6 +2540,7 @@ impl AppState {
                         &self.cline_pass_models,
                         &self.command_code_models,
                         &self.zen_models,
+                        self.mode == OperatingMode::Jev,
                     );
                     overlay.selected = overlay.selected.min(rows.len().saturating_sub(1));
                 }
@@ -2494,6 +2556,7 @@ impl AppState {
                         &self.cline_pass_models,
                         &self.command_code_models,
                         &self.zen_models,
+                        self.mode == OperatingMode::Jev,
                     );
                     overlay.selected = overlay.selected.min(rows.len().saturating_sub(1));
                 }
@@ -2509,6 +2572,7 @@ impl AppState {
                         &self.cline_pass_models,
                         &self.command_code_models,
                         &self.zen_models,
+                        self.mode == OperatingMode::Jev,
                     );
                     overlay.selected = overlay.selected.min(rows.len().saturating_sub(1));
                 }
@@ -2524,6 +2588,7 @@ impl AppState {
                         &self.cline_pass_models,
                         &self.command_code_models,
                         &self.zen_models,
+                        self.mode == OperatingMode::Jev,
                     );
                     overlay.selected = overlay.selected.min(rows.len().saturating_sub(1));
                 }
@@ -2585,6 +2650,36 @@ impl AppState {
                 } else {
                     self.dismiss_notifications_starting_with("Connected:");
                 }
+                self.revisions.status += 1;
+            }
+            UiEvent::JevKeyRequired => {
+                // Reuse the credential overlay: masked entry, Esc cancels and
+                // leaves the previous mode untouched with no call issued.
+                self.login_overlay = Some(LoginOverlay {
+                    selected: TYPESAFE_LOGIN_INDEX,
+                    stage: LoginStage::ApiKey(SensitiveText::default()),
+                    ..LoginOverlay::default()
+                });
+                self.revisions.status += 1;
+            }
+            UiEvent::JevKeySaved => {
+                // Close the entry without claiming the main provider is
+                // authenticated (that flag means the model provider).
+                self.login_overlay = None;
+                self.revisions.status += 1;
+            }
+            UiEvent::JevModelRequired => {
+                // Filtered picker: the user chooses a compatible model; nothing
+                // is switched automatically.
+                self.model_overlay = Some(ModelOverlay::for_current(
+                    &self.model,
+                    self.auth_provider,
+                    &self.open_code_models,
+                    &self.cline_pass_models,
+                    &self.command_code_models,
+                    &self.zen_models,
+                    true,
+                ));
                 self.revisions.status += 1;
             }
             UiEvent::LoginProgress { message } => {

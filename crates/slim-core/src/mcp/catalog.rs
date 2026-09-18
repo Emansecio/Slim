@@ -51,7 +51,7 @@ impl McpCatalog {
     }
 
     pub fn tools_for_mode(&self, mode: OperatingMode) -> Vec<String> {
-        if mode != OperatingMode::Auto {
+        if !mode.allows_mutation() {
             return Vec::new();
         }
         self.tools
@@ -104,7 +104,7 @@ impl McpCatalog {
         tool: &str,
         arguments: &str,
     ) -> Result<String, String> {
-        if mode != OperatingMode::Auto {
+        if !mode.allows_mutation() {
             return Err("MCP tools are unavailable outside Auto".into());
         }
         if !self.tools.iter().any(|candidate| candidate == tool) {

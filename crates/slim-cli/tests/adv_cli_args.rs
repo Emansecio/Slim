@@ -67,6 +67,8 @@ fn missing_flag_value_is_internal_not_input_required() {
         "--resume",
         "--recover",
         "--image",
+        "--experiment-id",
+        "--task-id",
     ] {
         let output = run_cli([flag], "");
         assert_eq!(output.code, ExitCode::Internal, "{flag}");
@@ -179,6 +181,15 @@ fn fast_flag_requires_codex_provider() {
     let output = run_cli(["--fast", "--provider", "anthropic", "--prompt", "x"], "");
     assert_eq!(output.code, ExitCode::InputRequired);
     assert!(output.stderr.contains("openai-codex"));
+}
+
+#[test]
+fn benchmark_labels_require_a_provider_backed_run() {
+    for flag in ["--experiment-id", "--task-id"] {
+        let output = run_cli(["--fake", flag, "fixture", "--prompt", "x"], "");
+        assert_eq!(output.code, ExitCode::InputRequired, "{flag}");
+        assert!(output.stderr.contains("provider-backed run"), "{flag}");
+    }
 }
 
 // ---------------------------------------------------------------------------

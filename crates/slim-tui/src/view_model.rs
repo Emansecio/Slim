@@ -532,7 +532,11 @@ pub(crate) fn footer_lines(
             .find(|s| unicode_width::UnicodeWidthStr::width(s.as_str()) <= width)
             .unwrap_or_default()
     };
-    let mode = mode_name(state.mode);
+    let mode = if state.mode == slim_core::OperatingMode::Jev {
+        "Jev · reasoning OFF"
+    } else {
+        mode_name(state.mode)
+    };
     let controls = if state.working {
         let phase = if activity_visible {
             String::new()
@@ -687,7 +691,11 @@ pub(crate) fn model_metadata(state: &AppState, width: usize) -> String {
     }
     let model = crate::api::ModelAlias::parse(&state.model)
         .map_or_else(|| safe(&state.model), |alias| alias.label().to_owned());
-    let effort = format!("({})", state.effort.id());
+    let effort = if state.mode == slim_core::OperatingMode::Jev {
+        "(reasoning OFF)".to_owned()
+    } else {
+        format!("({})", state.effort.id())
+    };
     let suffix = if context.is_empty() {
         effort.clone()
     } else {

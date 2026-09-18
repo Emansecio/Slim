@@ -1,6 +1,7 @@
 mod app_handle;
 mod capability_bridge;
 mod governor;
+mod jev;
 mod loop_guard;
 mod mode;
 #[cfg(test)]
@@ -10,6 +11,8 @@ mod usage;
 mod workspace;
 
 pub use usage::{RequestUsage, UsageTotals};
+
+pub const DEFAULT_JEV_MODEL: &str = jev::DEFAULT_MODEL;
 pub use workspace::without_workspace_snapshot;
 
 use crate::codeintel::CodeIntelligence;
@@ -46,6 +49,7 @@ use crate::tools::{
 use futures_util::StreamExt;
 use governor::{CausalGovernor, GovernorObservation};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -722,6 +726,7 @@ pub struct Runtime {
     pending_argument_repair: Option<String>,
     finalization_error: Option<ProviderError>,
     sensitive_values: SensitiveValues,
+    jev: Option<jev::JevClient>,
     cancellation: Option<CancellationToken>,
     interaction_route: Option<InteractionRoute>,
     capability_bridge: Option<RuntimeCapabilityBridge<MemoryRepo>>,
@@ -809,6 +814,7 @@ impl Runtime {
             pending_argument_repair: None,
             finalization_error: None,
             sensitive_values: SensitiveValues::default(),
+            jev: None,
             cancellation: None,
             interaction_route: None,
             capability_bridge: None,
@@ -826,6 +832,15 @@ impl Runtime {
         let mut runtime = Self::new();
         runtime.artifact_store = Some(ArtifactStore::new(root)?);
         Ok(runtime)
+    }
+
+    /// Enables the TypeSafe controller with an already-resolved key, so the
+    /// same path serves `TYPESAFE_API_KEY` and a locally stored credential.
+    pub fn enable_jev(&mut self, api_key: &str) -> Result<(), ProviderError> {
+        let client = jev::JevClient::from_key(api_key.to_owned())?;
+        self.register_sensitive_value(client.sensitive_value());
+        self.jev = Some(client);
+        Ok(())
     }
 
     pub fn set_tool_registry(&mut self, tools: ToolRegistry) {
@@ -1024,7 +1039,7 @@ impl Runtime {
         if key.interaction_enabled {
             tools.push(ask_question_definition());
         }
-        if mode == crate::OperatingMode::Auto {
+        if mode.allows_mutation() {
             tools.push(todo_tool_definition());
             tools.push(skill_tool_definition());
             if key.mcp_enabled {
@@ -1414,6 +1429,11 @@ impl Runtime {
         if self.is_cancelled() {
             return Err(ProviderError::Cancelled);
         }
+        if mode == crate::OperatingMode::Jev {
+            return Err(ProviderError::InvalidResponse {
+                message: "Jev requires the controlled agent-loop entry point; direct tool turns are not allowed".into(),
+            });
+        }
         // Bound skill-discovery memoization to one entry-point call, mirroring
         // the reset in `prepare_loop_capabilities` for the agent loop.
         self.skill_discovery_cache = None;
@@ -1532,6 +1552,13 @@ impl Runtime {
                 usage: UsageTotals::default(),
             });
         }
+        if mode == crate::OperatingMode::Jev
+            && (!client.adapter().reasoning_disabled() || self.jev.is_none())
+        {
+            return Err(ProviderError::InvalidResponse {
+                message: "Jev requires an initialized TypeSafe controller and a verified native reasoning-OFF adapter".into(),
+            });
+        }
         let loop_event_start = self.app.events().len();
         let run_start_seq = next_seq;
         let cwd = cwd.as_ref();
@@ -1539,6 +1566,10 @@ impl Runtime {
         let mut messages = self.redact_messages(initial_messages);
         self.add_initial_workspace_context(client.adapter(), &mut messages, mode, cwd, config);
         for message in &mut messages {
+            if mode == crate::OperatingMode::Jev {
+                message.responses_reasoning.clear();
+                message.chat_reasoning = None;
+            }
             message
                 .responses_reasoning
                 .retain(|state| state.belongs_to(client.adapter()));
@@ -1951,9 +1982,53 @@ impl Runtime {
                     guard = LoopGuard::default();
                 }
             }
-            let mut serialized_request = match serialized_request {
-                Some(request) => request,
-                None => self.prepare_loop_request(client, &mut messages, &tools, mode)?,
+            let jev_action = if mode == crate::OperatingMode::Jev {
+                match self.decide_jev(&messages, &tools, &mut next_seq).await {
+                    Ok(action) => Some(action),
+                    Err(error) => {
+                        drop(
+                            self.cancel_pending_background(
+                                &mut pending_background,
+                                &mut next_seq,
+                                "jev_decision_failed",
+                            )
+                            .await?,
+                        );
+                        if matches!(error, ProviderError::Cancelled) {
+                            return Ok(AgentLoopResult {
+                                next_seq,
+                                turns,
+                                stop: AgentLoopStop::Cancelled,
+                                tool_results: all_results,
+                                usage: usage_since(&self.app, loop_event_start),
+                            });
+                        }
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+            let mut serialized_request = if let Some(action) = &jev_action {
+                let selected_tools = match action {
+                    jev::JevAction::Tool(name) => tools
+                        .iter()
+                        .filter(|tool| {
+                            tool.get("name").and_then(Value::as_str) == Some(name.as_str())
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+                // A transient request-only directive: never alter durable history.
+                let mut request_messages = messages.clone();
+                request_messages.push(ProviderMessage::user(action.directive()));
+                self.prepare_loop_request(client, &mut request_messages, &selected_tools, mode)?
+            } else {
+                match serialized_request {
+                    Some(request) => request,
+                    None => self.prepare_loop_request(client, &mut messages, &tools, mode)?,
+                }
             };
             if let Some(limit) = recovery_output_limit {
                 serialized_request =
@@ -1961,7 +2036,7 @@ impl Runtime {
             }
             let current_output_limit = serialized_request.output_token_limit();
             let serialized_chars = serialized_request.serialized_chars;
-            if !compaction_applied && recovery_output_limit.is_none() {
+            if jev_action.is_none() && !compaction_applied && recovery_output_limit.is_none() {
                 debug_assert!(serialized_chars <= preflight_chars);
             }
             let ProviderRequestComponents {
@@ -2315,6 +2390,35 @@ impl Runtime {
             let mut calls = tool_calls_since(&self.app, event_start);
             if blocks_tools {
                 calls.clear();
+            }
+            if let Some(action) = &jev_action {
+                // The selected route is a contract, not a hint: reject any batch
+                // that does not match it before effects. A truncated/filtered turn
+                // without calls is left to the existing incomplete-turn handling.
+                if provider_turn.stop == ProviderTurnStop::Normal || !calls.is_empty() {
+                    if let Err(error) = action.validate_calls(&calls) {
+                        // The provider stream completed, but the step contract
+                        // was violated: classify the attempt as failed so the
+                        // discarded batch is not counted as a healthy request.
+                        push_runtime_event(
+                            &mut self.app,
+                            &mut next_seq,
+                            crate::EventKind::JevActionRejected {
+                                expected: action.label(),
+                                observed: jev::observed_names(&calls),
+                            },
+                        )?;
+                        drop(
+                            self.cancel_pending_background(
+                                &mut pending_background,
+                                &mut next_seq,
+                                "jev_action_rejected",
+                            )
+                            .await?,
+                        );
+                        return Err(error);
+                    }
+                }
             }
             if calls.is_empty() {
                 let assistant_text = self
@@ -3397,6 +3501,84 @@ impl Runtime {
         )
     }
 
+    async fn decide_jev(
+        &mut self,
+        messages: &[ProviderMessage],
+        tools: &[Value],
+        next_seq: &mut u64,
+    ) -> Result<jev::JevAction, ProviderError> {
+        let messages = self.redact_messages(messages);
+        let controller = self
+            .jev
+            .as_ref()
+            .ok_or_else(|| ProviderError::InvalidResponse {
+                message: "Jev controller is not configured".into(),
+            })?;
+        let request = controller.prepare(&messages, tools)?;
+        push_runtime_event(
+            &mut self.app,
+            next_seq,
+            crate::EventKind::ProviderPhase {
+                phase: ProviderPhase::Connecting,
+                elapsed_ms: 0,
+                detail: Some("Jev: selecting the next action (reasoning OFF)".into()),
+            },
+        )?;
+        let cancellation = self.cancellation.clone().unwrap_or_default();
+        let evaluation = controller.decide(&request, &cancellation).await;
+        let cancelled = matches!(&evaluation.result, Err(ProviderError::Cancelled));
+        let failed = !evaluation
+            .result
+            .as_ref()
+            .is_ok_and(|decision| decision.action != jev::JevAction::Blocked);
+        let (input_tokens, output_tokens, mut metadata) = match &evaluation.result {
+            Ok(decision) => (
+                decision.input_tokens,
+                decision.output_tokens,
+                decision.metadata.clone(),
+            ),
+            Err(_) => (
+                None,
+                None,
+                json!({"requested_model": controller.model, "outcome": if cancelled { "cancelled" } else { "error" }}),
+            ),
+        };
+        metadata["duration_ms"] = json!(evaluation.duration_ms);
+        metadata["request_bytes"] = json!(request.body.len());
+        metadata["reasoning_disabled"] = json!(true);
+        let model = self.redact_sensitive(
+            metadata
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or(&controller.model),
+        );
+        redact_task_value(&mut metadata, &self.sensitive_values.0);
+        // A dedicated accounting event never changes the LLM's current context
+        // estimate or tokens-per-second sample in the UI.
+        push_runtime_event(
+            &mut self.app,
+            next_seq,
+            crate::EventKind::JevDecisionCompleted {
+                attempts: evaluation.attempts,
+                model,
+                input_tokens,
+                output_tokens,
+                state_bytes: request.state_bytes,
+                duration_ms: evaluation.duration_ms,
+                cancelled,
+                failed,
+                metadata,
+            },
+        )?;
+        let decision = evaluation.result?;
+        if decision.action == jev::JevAction::Blocked {
+            return Err(ProviderError::InvalidResponse {
+                message: "Jev selected blocked: essential evidence or authorization is missing. No tools were executed for this decision; task remains incomplete.".into(),
+            });
+        }
+        Ok(decision.action)
+    }
+
     fn prepare_loop_request<A: ProviderAdapter>(
         &self,
         client: &HttpProviderClient<A>,
@@ -4475,7 +4657,7 @@ impl Runtime {
                 arguments,
             },
         )?;
-        let mut result = if mode == crate::OperatingMode::Auto {
+        let mut result = if mode.allows_mutation() {
             run_mcp_dispatch(self.mcp.clone(), invocation.arguments).await
         } else {
             ToolResult {
@@ -4813,7 +4995,7 @@ impl Runtime {
         mode: crate::OperatingMode,
         invocation: ToolInvocation<'_>,
     ) -> ToolResult {
-        if mode != crate::OperatingMode::Auto {
+        if !mode.allows_mutation() {
             return ToolResult {
                 name: invocation.name.into(),
                 success: false,
@@ -7119,16 +7301,84 @@ fn validate_tool_arguments(name: &str, arguments: &str) -> Result<(), ProviderEr
     }
 }
 
-fn normalize_tool_arguments(raw: &str) -> String {
+fn normalize_tool_arguments(raw: &str) -> Cow<'_, str> {
     let trimmed = strip_json_fence(raw.trim());
-    match serde_json::from_str::<Value>(trimmed) {
-        Ok(Value::String(inner))
-            if serde_json::from_str::<Value>(&inner).is_ok_and(|value| value.is_object()) =>
-        {
-            inner
+    if let Ok(Value::String(inner)) = serde_json::from_str::<Value>(trimmed) {
+        if serde_json::from_str::<Value>(&inner).is_ok_and(|value| value.is_object()) {
+            return Cow::Owned(inner);
         }
-        _ => trimmed.to_owned(),
+        if let Some(repaired) = repaired_json_object(&inner) {
+            return Cow::Owned(repaired);
+        }
     }
+    if serde_json::from_str::<Value>(trimmed).is_ok_and(|value| value.is_object()) {
+        return Cow::Borrowed(trimmed);
+    }
+    repaired_json_object(trimmed)
+        .map(Cow::Owned)
+        .unwrap_or(Cow::Borrowed(trimmed))
+}
+
+/// A strict-parseable object is left to the caller; otherwise only invalid
+/// string escapes are repaired and the result is kept when it now parses as an
+/// object. This keeps every other malformed payload failing closed.
+fn repaired_json_object(candidate: &str) -> Option<String> {
+    let repaired = repair_invalid_json_escapes(candidate)?;
+    serde_json::from_str::<Value>(&repaired)
+        .is_ok_and(|value| value.is_object())
+        .then_some(repaired)
+}
+
+/// Doubles the backslash of escapes `serde_json` rejects inside strings: `\`
+/// followed by a character that cannot start a valid escape, or `\u` without
+/// four hex digits. Valid escapes and the surrounding structure are copied
+/// verbatim, so valid JSON never changes.
+fn repair_invalid_json_escapes(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut repaired = String::with_capacity(raw.len() + 8);
+    let mut in_string = false;
+    let mut changed = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'"' {
+            in_string = !in_string;
+            repaired.push('"');
+            index += 1;
+            continue;
+        }
+        if in_string && byte == b'\\' {
+            if let Some(&escape) = bytes.get(index + 1) {
+                if matches!(
+                    escape,
+                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't'
+                ) {
+                    repaired.push('\\');
+                    repaired.push(escape as char);
+                    index += 2;
+                    continue;
+                }
+                if escape == b'u'
+                    && index + 6 <= bytes.len()
+                    && bytes[index + 2..index + 6]
+                        .iter()
+                        .all(u8::is_ascii_hexdigit)
+                {
+                    repaired.push_str(&raw[index..index + 6]);
+                    index += 6;
+                    continue;
+                }
+            }
+            repaired.push_str("\\\\");
+            changed = true;
+            index += 1;
+            continue;
+        }
+        let character = raw[index..].chars().next().expect("char boundary");
+        repaired.push(character);
+        index += character.len_utf8();
+    }
+    changed.then_some(repaired)
 }
 
 fn strip_json_fence(raw: &str) -> &str {
@@ -8523,7 +8773,7 @@ fn publish_buffered_call(
     let Some(name) = call.name.filter(|name| !name.trim().is_empty()) else {
         return Err(ProviderError::MalformedToolCall);
     };
-    let arguments = normalize_tool_arguments(&call.arguments);
+    let arguments = normalize_tool_arguments(&call.arguments).into_owned();
     validate_tool_arguments(&name, &arguments)?;
     push_runtime_event(
         app,
@@ -9343,6 +9593,42 @@ mod tests {
                 "{arguments}"
             );
         }
+    }
+
+    #[test]
+    fn invalid_json_escapes_are_repaired_without_touching_valid_ones() {
+        let normalized = |raw: &str| normalize_tool_arguments(raw).into_owned();
+        assert_eq!(
+            normalized(r#"{"path":"C:\Slim\src"}"#),
+            r#"{"path":"C:\\Slim\\src"}"#
+        );
+        assert_eq!(
+            normalized(r#"{"content":"a\*b"}"#),
+            r#"{"content":"a\\*b"}"#
+        );
+        for valid in [
+            r#"{"text":"line\nbreak"}"#,
+            r#"{"text":"tab\there"}"#,
+            r#"{"text":"quote\"inside"}"#,
+            r#"{"path":"C:\\Slim"}"#,
+            r#"{"text":"slash\/here"}"#,
+            r#"{"text":"caf\u00e9"}"#,
+        ] {
+            assert_eq!(normalized(valid), valid, "{valid}");
+        }
+    }
+
+    #[test]
+    fn fenced_and_double_encoded_escapes_are_repaired_at_the_inner_layer() {
+        assert_eq!(
+            normalize_tool_arguments("```json\n{\"path\":\"a.txt\"}\n```").as_ref(),
+            r#"{"path":"a.txt"}"#
+        );
+        let double_encoded = r#""{\"content\":\"literal \\* star\"}""#;
+        assert_eq!(
+            normalize_tool_arguments(double_encoded).as_ref(),
+            r#"{"content":"literal \\* star"}"#
+        );
     }
 
     #[test]

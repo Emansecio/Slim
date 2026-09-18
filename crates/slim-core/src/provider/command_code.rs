@@ -4,7 +4,7 @@ use serde_json::Value;
 use super::{
     AnthropicAdapter, OpenAiCompatibleAdapter, PreparedProviderRequest, ProviderAdapter,
     ProviderCapabilities, ProviderConfig, ProviderError, ProviderEvent, ProviderKind,
-    ProviderMessage,
+    ProviderMessage, ReasoningOff,
 };
 
 pub const COMMANDCODE_BASE_URL: &str = "https://api.commandcode.ai/provider/v1";
@@ -381,6 +381,20 @@ impl CommandCodeAdapter {
 impl ProviderAdapter for CommandCodeAdapter {
     fn kind(&self) -> ProviderKind {
         ProviderKind::CommandCode
+    }
+
+    fn reasoning_off(&self) -> Option<ReasoningOff> {
+        match &self.wire {
+            WireAdapter::Chat(adapter) => adapter.reasoning_off(),
+            WireAdapter::Messages(adapter) => adapter.reasoning_off(),
+        }
+    }
+
+    fn set_reasoning_disabled(&mut self) -> Result<(), ProviderError> {
+        match &mut self.wire {
+            WireAdapter::Chat(adapter) => adapter.set_reasoning_disabled(),
+            WireAdapter::Messages(adapter) => adapter.set_reasoning_disabled(),
+        }
     }
 
     fn wire_kind(&self) -> ProviderKind {

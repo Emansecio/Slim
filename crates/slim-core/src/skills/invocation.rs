@@ -41,7 +41,7 @@ impl fmt::Display for SkillInvocationError {
 impl std::error::Error for SkillInvocationError {}
 
 pub fn validate_invocation(mode: OperatingMode, trusted: bool) -> Result<(), SkillInvocationError> {
-    if mode != OperatingMode::Auto {
+    if !mode.allows_mutation() {
         return Err(SkillInvocationError::ModeDenied);
     }
     if !trusted {

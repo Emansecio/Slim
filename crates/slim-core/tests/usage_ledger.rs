@@ -311,3 +311,59 @@ fn cross_component_input_overflow_marks_the_ledger() {
     assert!(ledger.overflowed);
     assert_eq!(ledger.total_input_tokens(), u64::MAX);
 }
+
+#[test]
+fn rejected_jev_batch_is_classified_as_a_failed_attempt() {
+    let events = vec![
+        SessionEvent::new(
+            1,
+            EventKind::ContextSnapshot {
+                request_kind: RequestKind::ProviderTurn,
+                provider: "openai-compatible".into(),
+                model: "gpt-5.6-sol".into(),
+                system_bytes: 1,
+                tool_schema_bytes: 2,
+                history_bytes: 3,
+                tool_result_bytes: 4,
+                serialized_chars: 10,
+                estimated_tokens: 5,
+                context_window_tokens: 1_000,
+            },
+        ),
+        SessionEvent::new(
+            2,
+            EventKind::Usage {
+                input_tokens: 10,
+                output_tokens: 2,
+            },
+        ),
+        SessionEvent::new(
+            3,
+            EventKind::RequestCompleted {
+                provider_latency_ms: 7,
+                cancelled: false,
+                failed: false,
+            },
+        ),
+        SessionEvent::new(
+            4,
+            EventKind::JevActionRejected {
+                expected: "read".into(),
+                observed: vec!["write".into()],
+            },
+        ),
+    ];
+
+    let ledger = UsageTotals::from_events(&events, false);
+
+    assert_eq!(
+        ledger.provider_turns, 1,
+        "the attempt must not be duplicated"
+    );
+    assert_eq!(ledger.requests.len(), 1);
+    assert!(
+        ledger.requests[0].failed,
+        "a batch discarded by the Jev contract is a failed attempt"
+    );
+    assert_eq!(ledger.requests[0].uncached_input_tokens, 10);
+}
