@@ -1,73 +1,108 @@
 # Slim
 
-**Checkout — modo Jev, 17/09/2026:** o ciclo de modos passa a
-`Auto → Read-only → Plan → Jev → Auto`. Em Jev, o Slim consulta o TypeSafe
-(`TYPESAFE_API_KEY`) para escolher a próxima ação entre as ferramentas
-disponíveis, `respond` e `blocked`; o modelo principal produz os argumentos, o
-código e o texto final com reasoning OFF nativo imposto no adapter. O
-enforcement é fail-closed: uma tool call fora da ação escolhida é rejeitada
-antes de executar, `blocked` encerra como tarefa incompleta e não há fallback
-silencioso para Auto nem para o menor esforço. Como OFF não pode ser simulado,
-o modo resolve a representação por **protocolo + endpoint conhecido + modelo**:
-`gpt-5.6-sol`/`terra`/`luna` e `gpt-5.5` na API oficial da OpenAI usam
-`reasoning_effort: none`; `gpt-5.6-sol`/`terra`/`luna` na assinatura Codex usam
-`reasoning.effort: none` (backend não documentado: se ele ignorar o pedido e
-devolver reasoning, o run aborta antes de qualquer ferramenta); DeepSeek em
-`api.deepseek.com`, GLM 5.0–5.2 (`glm-5`, `5.1`, `5.2`) em `api.z.ai` e Kimi
-K2.5/K2.6 em `api.moonshot.ai` usam `thinking: {"type": "disabled"}`, forma
-também usada pelos Claude documentados (`claude-sonnet-5`, `opus-5`,
-`opus-4.8/4.7/4.6`, `sonnet-4.6`, `opus-4.5`, `sonnet-4.5`, `haiku-4.5`) na API
-oficial da Anthropic. Gateways comunitários não são prova: o formato de
-reasoning deles não é o do fornecedor, então são recusados no Jev salvo
-`SLIM_JEV_GATEWAY_OFF=1`, que libera apenas os modelos com contrato conhecido
-nos hosts embutidos (OpenCode Go/Zen, Command Code, ClinePass). Seguem
-bloqueados `gpt-6-astra` (HTTP 400 em `none`), Fable/Mythos e os que sempre
-pensam — GLM-5.3/5.3-Flash, Kimi K3/K2.7-Code e MiniMax M2.x, que aceita
-`disabled` e ignora — além de rotas sem contrato documentado. O detector de OFF
-reconhece `reasoning_content`, `reasoning` e o formato unificado
-`reasoning_details`, então um toggle ignorado aborta o run. O mesmo ajuste
-corrige `--effort none` em DeepSeek/GLM/Kimi, que antes omitia o campo e
-deixava o raciocínio ligado. `--jev` é incompatível com `--plan`, `--read-only`,
-`--fake` e `--effort` diferente de OFF, e a validação usa as flags realmente
-interpretadas — `--prompt "--jev"` é texto, não seleção de modo. As decisões
-Jev são persistidas como fatos `jev.v1`, com chave
-`<operation_id>/<decision_index>/<request_id>` e payload que preserva modelo,
-escolha, confidence, probabilidades, bytes, uso, duração e rejeições sem
-duplicar prompts nem permitir replay. Cada operação durável também grava
-`run.telemetry.v1`: um snapshot sincronizado antes do primeiro efeito e outro no
-mesmo lote do término/falha, com modo, provider/modelos, revisão, IDs opcionais
-de experimento/tarefa, uso/custos agregados, validação e limites resolvidos. O
-reducer expõe o snapshot terminal por operação, enquanto o JSONL mantém ambos e
-continua legível por consumidores anteriores. Benchmarks podem definir os IDs
-sem contaminar o prompt usando `--experiment-id ID` e `--task-id ID` (ou os
-builders equivalentes de `ProviderRunOptions`). Com Jev ativo, o
-seletor `/model` mostra apenas as rotas que a mesma política OFF admite
-(resolvida localmente, sem rede) e explica em uma linha quando nada é
-compatível; ao sair de Jev a lista normal volta e o esforço salvo é preservado.
-A chave TypeSafe pode ser cadastrada pela própria TUI: ao ativar Jev sem
-credencial o Slim abre a entrada mascarada (`/login typesafe` permite
-substituí-la depois) e guarda no mesmo arquivo protegido dos outros providers,
-sem virar provider ativo nem tocar no login do modelo principal;
-`TYPESAFE_API_KEY` continua como override e não é copiada para o disco, e
-cancelar preserva o estado anterior. Shift+Tab e `/mode jev` alternam o modo
-fora de runs ativos; modelo incompatível abre o seletor filtrado, sem troca
-automática. O contexto selecionado passa a
-ser enviado também à TypeSafe, inclusive quando o modelo principal é local, e a
-chave entra na redação do runtime. Custos Jev ficam em categoria própria
-(`RequestKind::JevDecision`), fora dos turnos do LLM principal, e uma rejeição
-de rota conta como tentativa falha sem duplicar a request.
+**Checkout — compactação por poda Jev, 18/09/2026:** a compactação passa a ter
+duas estratégias selecionáveis. `jev` é o padrão: antes de pedir o resumo ao
+modelo principal, o Slim consulta o Jev (TypeSafe) para julgar quais pares
+tool call/result do prefixo resumido ainda importam; os obsoletos são
+descartados e o restante permanece verbatim — nada é reescrito por um modelo
+generativo. O prefixo já podado segue para o mesmo resumo LLM de antes, então
+o checkpoint, o fingerprint, a telemetria e os eventos continuam idênticos.
+`summary` mantém exatamente o comportamento anterior. A troca é explícita:
+`--compactor jev|summary`, `SLIM_COMPACTOR` ou `[compaction] strategy` no
+`slim.toml`, com precedência CLI > env > arquivo. Dois endpoints servem o
+mesmo modelo: a API System One da TypeSafe (`TYPESAFE_API_KEY`, padrão
+`jev-latest`) e a rota de avaliação do Vercel AI Gateway
+(`AI_GATEWAY_API_KEY`, padrão `typesafe-ai/jev`); `SLIM_JEV_BACKEND`
+(`typesafe`|`vercel`) escolhe explicitamente e `SLIM_JEV_MODEL` sobrepõe o
+modelo. Sem credencial o modo não faz chamada alguma. O enforcement é
+fail-open com aviso: falha de rede, resposta inválida, poda insuficiente ou
+credencial ausente emitem `CompactionJevFallback` com o motivo e a
+compactação segue pelo resumo LLM. Sucesso emite `CompactionJevPruned` com
+pares podados, resultados truncados, lotes e tokens estimados; a TUI mostra
+ambos como notificação. Um par só é podado quando a nota substitui conteúdo
+de fato maior (mínimo de 512 caracteres), para nunca inflar o contexto.
+Testes: unitários do pruner com judge fake (sem rede) e dois testes de loop
+no `agent_loop`, um de poda com arquivo grande e outro de fallback.
 
-Validação desta sessão: `cargo fmt --all -- --check` e
-`cargo clippy --workspace --lib --bins --offline -- -D warnings` limpos;
-testes direcionados verdes — política pública de OFF por rota, filtro do seletor
-em Jev e restauração da lista ao sair, resultado vazio que não trava a
-interface, login TypeSafe mascarado e round-trip da chave no store protegido.
-Deploy local: `refresh-slim.ps1` exit 0, build release em 3m03s; `slim` resolve
-para `C:\Users\User\bin\Slim.exe`, com hash idêntico ao `target\release\Slim.exe`
-(evidência em `release/README.md`), `slim 0.1.0` e `--help` com `--jev`. A suíte
-completa não foi reexecutada nesta tarefa; o recorde de 1865 aprovados refere-se
-a antes destas mudanças. A TUI não foi observada em execução — o recebimento
-físico de Alt+Tab e o diálogo seguem não validados.
+**Checkout — backend Vercel do Jev, 19/09/2026:** sem `SLIM_JEV_BACKEND`, a
+própria chave decide o endpoint: `vck_` é o prefixo que a Vercel emite, então
+uma chave do gateway basta e uma `TYPESAFE_API_KEY` comum continua na TypeSafe
+(uma chave `vck_` guardada em `TYPESAFE_API_KEY` também chega ao gateway). O
+contrato do gateway difere do TypeSafe em dois pontos, tratados no mesmo
+módulo: o modelo viaja no header `ai-model-id` e o primitivo booleano chama-se
+`boolean`, com a probabilidade em `probability` em vez de `noul`. Validação
+desta sessão: `cargo check --workspace --all-targets` limpo, `cargo fmt --all`
+aplicado, `slim-core --lib jev` 9/9, `slim-cli --lib config` 26/26 e
+`agent_loop jev` 2/2. Chamada viva ao gateway desta conta respondeu
+`customer_verification_required` ("requires a valid credit card on file"):
+chave e rota estão corretas, mas a conta Vercel precisa cadastrar cartão para
+liberar os créditos gratuitos. O backend TypeSafe está validado ao vivo nesta
+sessão: `POST https://api.typesafe.ai/v1/systemone` respondeu 200 com
+`model: jev-1.13.0`, e o `HttpJevJudge` real (reqwest + parse) podou dois pares
+com `estimated_saved_tokens: 4340`. São chamadas reais, que consomem tokens da
+chave TypeSafe; nenhum benchmark pago foi executado. Publicado no PATH em
+19/09/2026 — [identidade do build e smoke](release/README.md).
+
+**Checkout — remoção do modo Jev, 18/09/2026:** o modo Jev (roteamento de
+tool call) foi removido. O ciclo de modos voltou a
+`Auto → Read-only → Plan → Auto`; `Auto`, `Read-only` e `Plan` não mudaram.
+Saíram junto o controlador TypeSafe (`/login typesafe`), a flag `--jev`, os
+eventos e fatos duráveis `jev.*`, o custo em categoria própria
+(`RequestKind::JevDecision`) e toda a maquinaria de reasoning OFF do provider
+(`ReasoningOff`, `reasoning_off_support`, `SLIM_JEV_GATEWAY_OFF` e o
+`tool_choice: required`), que só existia para servir o modo. O seletor
+`/model` voltou a listar todas as rotas, sem filtro de compatibilidade, e
+nenhum modo impõe esforço. `--effort none` continua enviando o toggle nativo
+(`thinking: {"type": "disabled"}`) em DeepSeek/GLM/Kimi. A credencial TypeSafe
+eventualmente gravada em `~/.slim/auth.json` é preservada apenas para que
+arquivos existentes continuem sendo lidos; o Slim não a usa nem a reescreve. O
+modo não chegou a ser homologado, e a proposta que o descrevia
+(`PROPOSTA-MODO-JEV-SLIM-2026-09-17.md`) e o bench live (`bench/jev-live/`)
+foram removidos.
+
+Cada operação durável continua gravando `run.telemetry.v1`: um snapshot
+sincronizado antes do primeiro efeito e outro no mesmo lote do término/falha,
+com modo, provider/modelos, revisão, IDs opcionais de experimento/tarefa,
+uso/custos agregados, validação e limites resolvidos. O reducer expõe o snapshot
+terminal por operação, enquanto o JSONL mantém ambos e continua legível por
+consumidores anteriores. Benchmarks podem definir os IDs sem contaminar o prompt
+usando `--experiment-id ID` e `--task-id ID` (ou os builders equivalentes de
+`ProviderRunOptions`).
+
+Validação desta sessão: `cargo check --workspace --all-targets` sem avisos,
+`cargo fmt --all -- --check` e `git diff --check` limpos. No `cargo clippy
+--workspace --all-targets` restam duas falhas pré-existentes, em arquivos não
+tocados por esta remoção (`layout_golden.rs` e `auth.rs`); permitindo essas duas
+regras, o restante passa. Smoke real: `--help` sem `--jev`, `--jev` rejeitado
+como opção desconhecida e `--headless --fake` com exit 0. A suíte `cargo test`
+não foi reexecutada nesta tarefa — o recorde anterior continua sendo histórico.
+Nenhuma chamada a provider comercial foi feita.
+
+Validação da compactação por poda Jev (mesma sessão): `cargo check --workspace
+--all-targets` sem avisos, `cargo fmt --all -- --check` e `git diff --check`
+limpos, e `cargo clippy -p slim-core --all-targets -D warnings` limpo. Em
+`slim-cli` o clippy fica nas mesmas duas falhas pré-existentes já citadas
+(`layout_golden.rs` e `auth.rs`), ambas fora do escopo desta tarefa. Suítes:
+`slim-core` **57 suítes / 905 passed / 0 failed**, `slim-cli` **24 suítes / 314
+passed / 0 failed** (inclui o golden do `--help` e o novo
+`compactor_flag_rejects_unknown_name_and_accepts_known_ones`). Em `slim-tui`
+permanecem duas falhas pré-existentes da família "overlay de modelos/OpenCode"
+(`reducer::opencode_models_refresh_and_select_dynamic_catalog` no lib e
+`model_overlay_golden::opencode_catalog_filters_and_enter_sends_selection` na
+integração), em `reducer.rs`/`app.rs`, arquivos já modificados no working tree
+antes desta tarefa e que não passam pelo caminho alterado (`from_core` só ganhou
+dois braços). O restante passa: 252 no lib e 232 na integração. Testes novos
+desta tarefa: 4 unitários do pruner com judge fake (poda com preservação de ids,
+preservação verbatim quando o judge mantém, lista curta de respostas e ausência
+de candidatos) e 2 de loop (`agent_loop::jev_*`) — poda real com par antigo
+grande e fallback com judge falhando. Nenhuma chamada à TypeSafe foi feita nos
+testes: o judge é injetado e os fixtures são localhost.
+
+A estratégia governa também a compactação em background: o plano de background
+poda o prefixo antes de montar o prompt, e os eventos `CompactionJevPruned` /
+`CompactionJevFallback` saem no mesmo ponto em que a tentativa realmente começa
+(`CompactionAttemptStarted`). Quando o judge não está configurado, o caminho cai
+no resumo LLM sem chamada externa.
 
 **Checkout — auditoria de performance e corretude, 16/09/2026:** varredura
 paralela dos quatro crates aplicou otimizações de comportamento idêntico no
@@ -587,15 +622,15 @@ os IDs free verificados localmente; o último válido fica em
 fallback. O tier free é limitado pelo próprio gateway (rate limit por
 sessão).
 
-Os 1085 testes passados / 0 failed / 1 ignored (ConPTY físico) em 87 suítes comprovam
+## Estado de validação e deploy
+
+### Registro de 2026-09-03 (histórico)
+
+1085 testes passados / 0 failed / 1 ignored (ConPTY físico) em 87 suítes —
 componentes, contratos e caminhos headless/TUI offline; não comprovam
-integração completa do produto (contagem de 2026-09-03 via
+integração completa do produto (contagem via
 `cargo test --workspace -- --skip ordinary_tui_second_turn_sends_prior_user_and_assistant`,
 cujo teste filtrado tem expectativa `Explicitly invoked skill` sem implementação em `crates/`):
-
-Relatório persistente da auditoria iterativa: [WORKFLOW-LOOP-BUGS-SLIM.md](analysis_outputs/WORKFLOW-LOOP-BUGS-SLIM.md).
-
-Auditoria e otimização da suíte: [TEST-SUITE-OPTIMIZATION.md](analysis_outputs/TEST-SUITE-OPTIMIZATION.md).
 
 - `cargo test --workspace` e `refresh-slim.ps1 -Test`: exit code `0`, build
   release, deploy e smoke test concluídos (ver ressalva do teste filtrado acima);
@@ -611,8 +646,14 @@ Auditoria e otimização da suíte: [TEST-SUITE-OPTIMIZATION.md](analysis_output
   probe `ESC[6n`, sem frame; a matriz física completa de terminal, IME, mouse e
   clipboard permanece não observada.
 
-Deploy atual: `.\refresh-slim.ps1` com `OK:` (build release, cópia para o PATH e
-`slim --version` = `slim 0.1.0` com exit `0`).
+Deploy desse ciclo: `.\refresh-slim.ps1` com `OK:` (build release, cópia para o
+PATH e `slim --version` = `slim 0.1.0` com exit `0`). O estado de validação
+**vigente** está no checkout do topo desta página e no
+[registro de deploy](release/README.md).
+
+Auditorias persistentes: [WORKFLOW-LOOP-BUGS-SLIM.md](analysis_outputs/WORKFLOW-LOOP-BUGS-SLIM.md)
+e [TEST-SUITE-OPTIMIZATION.md](analysis_outputs/TEST-SUITE-OPTIMIZATION.md)
+(índice completo em [analysis_outputs/README.md](analysis_outputs/README.md)).
 
 ## Status atual de integração
 

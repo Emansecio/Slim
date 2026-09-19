@@ -1,7 +1,6 @@
 mod app_handle;
 mod capability_bridge;
 mod governor;
-mod jev;
 mod loop_guard;
 mod mode;
 #[cfg(test)]
@@ -12,7 +11,6 @@ mod workspace;
 
 pub use usage::{RequestUsage, UsageTotals};
 
-pub const DEFAULT_JEV_MODEL: &str = jev::DEFAULT_MODEL;
 pub use workspace::without_workspace_snapshot;
 
 use crate::codeintel::CodeIntelligence;
@@ -444,6 +442,10 @@ struct BackgroundCompactionPlan {
     safety_margin_tokens: u64,
     future_turns: u8,
     profitable: bool,
+    /// Jev pruning applied to the summarized prefix, when the strategy is Jev.
+    jev_stats: Option<crate::context::JevPruneStats>,
+    /// Why Jev pruning fell back to the LLM summary, when it did.
+    jev_error: Option<String>,
 }
 
 struct BackgroundCompactionResult {
@@ -726,11 +728,11 @@ pub struct Runtime {
     pending_argument_repair: Option<String>,
     finalization_error: Option<ProviderError>,
     sensitive_values: SensitiveValues,
-    jev: Option<jev::JevClient>,
     cancellation: Option<CancellationToken>,
     interaction_route: Option<InteractionRoute>,
     capability_bridge: Option<RuntimeCapabilityBridge<MemoryRepo>>,
     compaction_handle: Option<CompactionHandle>,
+    jev_judge: Option<std::sync::Arc<dyn crate::context::JevJudge>>,
     background_compaction_enabled: bool,
     code_intel: Option<Arc<dyn CodeIntelligence>>,
     mcp: Option<Arc<McpManager>>,
@@ -814,11 +816,11 @@ impl Runtime {
             pending_argument_repair: None,
             finalization_error: None,
             sensitive_values: SensitiveValues::default(),
-            jev: None,
             cancellation: None,
             interaction_route: None,
             capability_bridge: None,
             compaction_handle: None,
+            jev_judge: None,
             background_compaction_enabled: false,
             code_intel: None,
             mcp: None,
@@ -832,15 +834,6 @@ impl Runtime {
         let mut runtime = Self::new();
         runtime.artifact_store = Some(ArtifactStore::new(root)?);
         Ok(runtime)
-    }
-
-    /// Enables the TypeSafe controller with an already-resolved key, so the
-    /// same path serves `TYPESAFE_API_KEY` and a locally stored credential.
-    pub fn enable_jev(&mut self, api_key: &str) -> Result<(), ProviderError> {
-        let client = jev::JevClient::from_key(api_key.to_owned())?;
-        self.register_sensitive_value(client.sensitive_value());
-        self.jev = Some(client);
-        Ok(())
     }
 
     pub fn set_tool_registry(&mut self, tools: ToolRegistry) {
@@ -857,6 +850,13 @@ impl Runtime {
 
     pub fn set_compaction_handle(&mut self, handle: CompactionHandle) {
         self.compaction_handle = Some(handle);
+    }
+
+    /// Attach the Jev judge used when the active compaction policy selects the
+    /// Jev pruning strategy. `None` leaves every run on the LLM summary path
+    /// without any TypeSafe call.
+    pub fn set_jev_judge(&mut self, judge: Option<std::sync::Arc<dyn crate::context::JevJudge>>) {
+        self.jev_judge = judge;
     }
 
     fn retain_interrupted_turn(
@@ -1429,11 +1429,6 @@ impl Runtime {
         if self.is_cancelled() {
             return Err(ProviderError::Cancelled);
         }
-        if mode == crate::OperatingMode::Jev {
-            return Err(ProviderError::InvalidResponse {
-                message: "Jev requires the controlled agent-loop entry point; direct tool turns are not allowed".into(),
-            });
-        }
         // Bound skill-discovery memoization to one entry-point call, mirroring
         // the reset in `prepare_loop_capabilities` for the agent loop.
         self.skill_discovery_cache = None;
@@ -1552,13 +1547,6 @@ impl Runtime {
                 usage: UsageTotals::default(),
             });
         }
-        if mode == crate::OperatingMode::Jev
-            && (!client.adapter().reasoning_disabled() || self.jev.is_none())
-        {
-            return Err(ProviderError::InvalidResponse {
-                message: "Jev requires an initialized TypeSafe controller and a verified native reasoning-OFF adapter".into(),
-            });
-        }
         let loop_event_start = self.app.events().len();
         let run_start_seq = next_seq;
         let cwd = cwd.as_ref();
@@ -1566,10 +1554,6 @@ impl Runtime {
         let mut messages = self.redact_messages(initial_messages);
         self.add_initial_workspace_context(client.adapter(), &mut messages, mode, cwd, config);
         for message in &mut messages {
-            if mode == crate::OperatingMode::Jev {
-                message.responses_reasoning.clear();
-                message.chat_reasoning = None;
-            }
             message
                 .responses_reasoning
                 .retain(|state| state.belongs_to(client.adapter()));
@@ -1982,53 +1966,9 @@ impl Runtime {
                     guard = LoopGuard::default();
                 }
             }
-            let jev_action = if mode == crate::OperatingMode::Jev {
-                match self.decide_jev(&messages, &tools, &mut next_seq).await {
-                    Ok(action) => Some(action),
-                    Err(error) => {
-                        drop(
-                            self.cancel_pending_background(
-                                &mut pending_background,
-                                &mut next_seq,
-                                "jev_decision_failed",
-                            )
-                            .await?,
-                        );
-                        if matches!(error, ProviderError::Cancelled) {
-                            return Ok(AgentLoopResult {
-                                next_seq,
-                                turns,
-                                stop: AgentLoopStop::Cancelled,
-                                tool_results: all_results,
-                                usage: usage_since(&self.app, loop_event_start),
-                            });
-                        }
-                        return Err(error);
-                    }
-                }
-            } else {
-                None
-            };
-            let mut serialized_request = if let Some(action) = &jev_action {
-                let selected_tools = match action {
-                    jev::JevAction::Tool(name) => tools
-                        .iter()
-                        .filter(|tool| {
-                            tool.get("name").and_then(Value::as_str) == Some(name.as_str())
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                    _ => Vec::new(),
-                };
-                // A transient request-only directive: never alter durable history.
-                let mut request_messages = messages.clone();
-                request_messages.push(ProviderMessage::user(action.directive()));
-                self.prepare_loop_request(client, &mut request_messages, &selected_tools, mode)?
-            } else {
-                match serialized_request {
-                    Some(request) => request,
-                    None => self.prepare_loop_request(client, &mut messages, &tools, mode)?,
-                }
+            let mut serialized_request = match serialized_request {
+                Some(request) => request,
+                None => self.prepare_loop_request(client, &mut messages, &tools, mode)?,
             };
             if let Some(limit) = recovery_output_limit {
                 serialized_request =
@@ -2036,7 +1976,7 @@ impl Runtime {
             }
             let current_output_limit = serialized_request.output_token_limit();
             let serialized_chars = serialized_request.serialized_chars;
-            if jev_action.is_none() && !compaction_applied && recovery_output_limit.is_none() {
+            if !compaction_applied && recovery_output_limit.is_none() {
                 debug_assert!(serialized_chars <= preflight_chars);
             }
             let ProviderRequestComponents {
@@ -2072,23 +2012,23 @@ impl Runtime {
                 });
             }
             let remaining_model_turns = config.max_turns.saturating_sub(turn + 1);
-            let mut background_plan = pending_background
-                .is_none()
-                .then(|| {
-                    self.build_background_compaction_plan(
-                        client,
-                        &messages,
-                        &compaction_policy,
-                        ContextBudget::new(
-                            config.context_window_tokens,
-                            estimated_tokens,
-                            config.context_reserve_tokens,
-                        ),
-                        should_compact,
-                        remaining_model_turns,
-                    )
-                })
-                .flatten();
+            let mut background_plan = if pending_background.is_none() {
+                self.build_background_compaction_plan(
+                    client,
+                    &messages,
+                    &compaction_policy,
+                    ContextBudget::new(
+                        config.context_window_tokens,
+                        estimated_tokens,
+                        config.context_reserve_tokens,
+                    ),
+                    should_compact,
+                    remaining_model_turns,
+                )
+                .await
+            } else {
+                None
+            };
             let event_start = self.app.events().len();
             self.uncommitted_event_start = Some(event_start);
             let request_next_seq = checked_next_seq(next_seq)?;
@@ -2391,35 +2331,6 @@ impl Runtime {
             if blocks_tools {
                 calls.clear();
             }
-            if let Some(action) = &jev_action {
-                // The selected route is a contract, not a hint: reject any batch
-                // that does not match it before effects. A truncated/filtered turn
-                // without calls is left to the existing incomplete-turn handling.
-                if provider_turn.stop == ProviderTurnStop::Normal || !calls.is_empty() {
-                    if let Err(error) = action.validate_calls(&calls) {
-                        // The provider stream completed, but the step contract
-                        // was violated: classify the attempt as failed so the
-                        // discarded batch is not counted as a healthy request.
-                        push_runtime_event(
-                            &mut self.app,
-                            &mut next_seq,
-                            crate::EventKind::JevActionRejected {
-                                expected: action.label(),
-                                observed: jev::observed_names(&calls),
-                            },
-                        )?;
-                        drop(
-                            self.cancel_pending_background(
-                                &mut pending_background,
-                                &mut next_seq,
-                                "jev_action_rejected",
-                            )
-                            .await?,
-                        );
-                        return Err(error);
-                    }
-                }
-            }
             if calls.is_empty() {
                 let assistant_text = self
                     .app
@@ -2521,6 +2432,28 @@ impl Runtime {
                     )?;
                     let progress = Arc::new(Mutex::new(CompactionAttemptProgress::default()));
                     let task_progress = Arc::clone(&progress);
+                    // Jev outcomes belong to the attempt that actually starts.
+                    if let Some(stats) = &plan.jev_stats {
+                        push_runtime_event(
+                            &mut self.app,
+                            &mut next_seq,
+                            crate::EventKind::CompactionJevPruned {
+                                pairs_total: stats.pairs_total as u64,
+                                pairs_dropped: stats.pairs_dropped as u64,
+                                results_truncated: stats.results_truncated as u64,
+                                batches: stats.batches as u64,
+                                estimated_saved_tokens: stats.estimated_saved_tokens,
+                                duration_ms: 0,
+                            },
+                        )?;
+                    } else if let Some(detail) = &plan.jev_error {
+                        let detail = self.redact_sensitive(detail);
+                        push_runtime_event(
+                            &mut self.app,
+                            &mut next_seq,
+                            crate::EventKind::CompactionJevFallback { detail },
+                        )?;
+                    }
                     let usage_request = RequestUsage {
                         request_kind: crate::RequestKind::Compaction,
                         provider: plan.provider.clone(),
@@ -3273,7 +3206,7 @@ impl Runtime {
         )
     }
 
-    fn build_background_compaction_plan<A: ProviderAdapter>(
+    async fn build_background_compaction_plan<A: ProviderAdapter>(
         &self,
         client: &HttpProviderClient<A>,
         messages: &[ProviderMessage],
@@ -3298,7 +3231,30 @@ impl Runtime {
         let provider = crate::provider::provider_kind_name(client.adapter().kind());
         let model = client.adapter().model();
         let previous_summary = handle.previous_summary();
-        let summarized = selection.summarized_for_prompt();
+        let mut summarized = selection.summarized_for_prompt();
+        // Jev strategy: prune stale tool calls/results before the summary
+        // prompt is built, so the background request never pays for evidence
+        // Jev would drop. Failures fall back to the untouched prefix.
+        let mut jev_stats = None;
+        let mut jev_error = None;
+        if policy.strategy == crate::context::CompactionStrategy::Jev {
+            match &self.jev_judge {
+                Some(judge) => {
+                    match crate::context::prune_summarized(&**judge, &selection, &mut summarized)
+                        .await
+                    {
+                        Ok(stats) => jev_stats = Some(stats),
+                        Err(error) => jev_error = Some(error.to_string()),
+                    }
+                }
+                None => {
+                    jev_error = Some(
+                        "no Jev credential configured (set TYPESAFE_API_KEY or AI_GATEWAY_API_KEY)"
+                            .into(),
+                    )
+                }
+            }
+        }
         let prompt = build_bounded_summary_prompt_with_checkpoint(
             &summarized,
             previous_summary.as_deref(),
@@ -3356,6 +3312,8 @@ impl Runtime {
                 safety_margin_tokens,
                 future_turns,
                 profitable: false,
+                jev_stats,
+                jev_error,
             });
         }
         if preflight_input_tokens.saturating_add(budget.reserve_tokens) > budget.window_tokens {
@@ -3398,6 +3356,8 @@ impl Runtime {
             safety_margin_tokens,
             future_turns,
             profitable: true,
+            jev_stats,
+            jev_error,
         })
     }
 
@@ -3499,84 +3459,6 @@ impl Runtime {
             mode,
             self.interaction_route.is_some() && mode != crate::OperatingMode::Plan,
         )
-    }
-
-    async fn decide_jev(
-        &mut self,
-        messages: &[ProviderMessage],
-        tools: &[Value],
-        next_seq: &mut u64,
-    ) -> Result<jev::JevAction, ProviderError> {
-        let messages = self.redact_messages(messages);
-        let controller = self
-            .jev
-            .as_ref()
-            .ok_or_else(|| ProviderError::InvalidResponse {
-                message: "Jev controller is not configured".into(),
-            })?;
-        let request = controller.prepare(&messages, tools)?;
-        push_runtime_event(
-            &mut self.app,
-            next_seq,
-            crate::EventKind::ProviderPhase {
-                phase: ProviderPhase::Connecting,
-                elapsed_ms: 0,
-                detail: Some("Jev: selecting the next action (reasoning OFF)".into()),
-            },
-        )?;
-        let cancellation = self.cancellation.clone().unwrap_or_default();
-        let evaluation = controller.decide(&request, &cancellation).await;
-        let cancelled = matches!(&evaluation.result, Err(ProviderError::Cancelled));
-        let failed = !evaluation
-            .result
-            .as_ref()
-            .is_ok_and(|decision| decision.action != jev::JevAction::Blocked);
-        let (input_tokens, output_tokens, mut metadata) = match &evaluation.result {
-            Ok(decision) => (
-                decision.input_tokens,
-                decision.output_tokens,
-                decision.metadata.clone(),
-            ),
-            Err(_) => (
-                None,
-                None,
-                json!({"requested_model": controller.model, "outcome": if cancelled { "cancelled" } else { "error" }}),
-            ),
-        };
-        metadata["duration_ms"] = json!(evaluation.duration_ms);
-        metadata["request_bytes"] = json!(request.body.len());
-        metadata["reasoning_disabled"] = json!(true);
-        let model = self.redact_sensitive(
-            metadata
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or(&controller.model),
-        );
-        redact_task_value(&mut metadata, &self.sensitive_values.0);
-        // A dedicated accounting event never changes the LLM's current context
-        // estimate or tokens-per-second sample in the UI.
-        push_runtime_event(
-            &mut self.app,
-            next_seq,
-            crate::EventKind::JevDecisionCompleted {
-                attempts: evaluation.attempts,
-                model,
-                input_tokens,
-                output_tokens,
-                state_bytes: request.state_bytes,
-                duration_ms: evaluation.duration_ms,
-                cancelled,
-                failed,
-                metadata,
-            },
-        )?;
-        let decision = evaluation.result?;
-        if decision.action == jev::JevAction::Blocked {
-            return Err(ProviderError::InvalidResponse {
-                message: "Jev selected blocked: essential evidence or authorization is missing. No tools were executed for this decision; task remains incomplete.".into(),
-            });
-        }
-        Ok(decision.action)
     }
 
     fn prepare_loop_request<A: ProviderAdapter>(
@@ -6076,7 +5958,55 @@ impl Runtime {
             }
         })?;
         let previous_summary = handle.as_ref().and_then(CompactionHandle::previous_summary);
-        let summarized = selection.summarized_for_prompt();
+        let mut summarized = selection.summarized_for_prompt();
+        // Jev pruning strategy: judge and drop stale tool calls/results
+        // verbatim, then let the same LLM summarize the smaller prefix. Any
+        // failure or insufficient reduction falls back to the unchanged
+        // prefix, never to a silently empty summary.
+        if policy.strategy == crate::context::CompactionStrategy::Jev {
+            match &self.jev_judge {
+                Some(judge) => {
+                    let started = Instant::now();
+                    match crate::context::prune_summarized(&**judge, &selection, &mut summarized)
+                        .await
+                    {
+                        Ok(stats) => {
+                            let duration_ms =
+                                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                            push_runtime_event(
+                                &mut self.app,
+                                &mut next_seq,
+                                crate::EventKind::CompactionJevPruned {
+                                    pairs_total: stats.pairs_total as u64,
+                                    pairs_dropped: stats.pairs_dropped as u64,
+                                    results_truncated: stats.results_truncated as u64,
+                                    batches: stats.batches as u64,
+                                    estimated_saved_tokens: stats.estimated_saved_tokens,
+                                    duration_ms,
+                                },
+                            )?;
+                        }
+                        Err(error) => {
+                            let detail = self.redact_sensitive(&error.to_string());
+                            push_runtime_event(
+                                &mut self.app,
+                                &mut next_seq,
+                                crate::EventKind::CompactionJevFallback { detail },
+                            )?;
+                        }
+                    }
+                }
+                None => {
+                    push_runtime_event(
+                        &mut self.app,
+                        &mut next_seq,
+                        crate::EventKind::CompactionJevFallback {
+                            detail: "no Jev credential configured (set TYPESAFE_API_KEY or AI_GATEWAY_API_KEY)".into(),
+                        },
+                    )?;
+                }
+            }
+        }
         let summary_prompt = build_bounded_summary_prompt_with_checkpoint(
             &summarized,
             previous_summary.as_deref(),
@@ -11525,6 +11455,8 @@ mod tests {
                     safety_margin_tokens: 1,
                     future_turns: 1,
                     profitable: true,
+                    jev_stats: None,
+                    jev_error: None,
                 };
                 let task = tokio::spawn(async move {
                     BackgroundCompactionResult {

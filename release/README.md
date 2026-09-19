@@ -1,5 +1,130 @@
 # Release do Slim
 
+## Deploy local — poda Jev com backend Vercel (2026-09-19)
+
+`refresh-slim.ps1` concluído com exit 0. PATH: `C:\Users\User\bin\Slim.exe`,
+build **2026-09-19 03:10:09**, `slim 0.1.0`, **18.136.064 bytes**. SHA-256 do
+instalado e de `target/release/slim.exe` idênticos:
+`9F319D40081DB007FC0FFA2BB0A5164DBC5F4A4AF0E2B05D6B05E24462A5BF63`.
+
+Entrega a compactação por poda Jev com dois endpoints: a API System One da
+TypeSafe (`TYPESAFE_API_KEY`, padrão `jev-latest`) e a rota de avaliação do
+Vercel AI Gateway (`AI_GATEWAY_API_KEY`, chave `vck_`, padrão
+`typesafe-ai/jev`), selecionáveis por `SLIM_JEV_BACKEND` e com
+`SLIM_JEV_MODEL` sobrepondo o padrão. Smoke do instalado: `--version` = `slim
+0.1.0` com exit 0 e `--help` contendo `--compactor`.
+
+Validação: `cargo check --workspace --all-targets`, `cargo fmt --all --
+--check`, `git diff --check` e `cargo clippy -p slim-core --all-targets -D
+warnings` limpos; `slim-core --lib jev` 9/9, `slim-cli --lib config` 26/26 e
+`agent_loop jev` 2/2. A suíte completa não foi usada como gate: uma falha
+preexistente de `runtime::workspace` (orçamento cooperativo de 100 ms em
+`workspace.rs:51,85`) aparece só sob a suíte paralela e passa isolada. O
+backend TypeSafe foi validado ao vivo: `POST api.typesafe.ai/v1/systemone`
+respondeu 200 com `model: jev-1.13.0`, e o `HttpJevJudge` real podou dois pares
+com `estimated_saved_tokens: 4340`. A rota Vercel segue respondendo
+`customer_verification_required` até a conta cadastrar cartão.
+
+## Remoção do modo Jev (2026-09-18)
+
+O modo Jev foi removido do checkout. Saíram o controlador TypeSafe, a flag
+`--jev`, os eventos e fatos `jev.*`, a categoria de custo própria e a maquinaria
+de reasoning OFF do provider, que só existia para servir o modo. `Auto`,
+`Read-only` e `Plan` não mudaram.
+
+Validação: `cargo check --workspace --all-targets` sem avisos, `cargo fmt --all
+-- --check` e `git diff --check` limpos. `cargo clippy --workspace --all-targets`
+ainda falha em duas regras pré-existentes, em arquivos fora desta remoção
+(`layout_golden.rs` e `auth.rs`); permitindo essas duas, passa. Smoke real:
+`--help` sem `--jev`, `--jev` rejeitado como opção desconhecida e `--headless
+--fake` com exit 0. A suíte `cargo test` não foi reexecutada e **nenhum deploy
+foi feito nesta tarefa**: o binário instalado em `C:\Users\User\bin\Slim.exe`
+ainda contém o modo Jev e só é atualizado com `.\refresh-slim.ps1`.
+
+O registro abaixo descreve o deploy que estava no PATH até 19/09/2026 e ainda
+incluía o modo Jev.
+
+## Deploy local — Jev 0,99 e gateways fail-closed (2026-09-18)
+
+`refresh-slim.ps1` concluído com `OK:` e exit 0; build release em **5m18s**.
+PATH: `C:\Users\User\bin\Slim.exe`, build **2026-09-18 04:49:48**,
+`slim 0.1.0`, **18.300.416 bytes**. SHA-256 do instalado e de
+`target/release/slim.exe` idênticos:
+`3B8C770BBA0254B03F46B94305F9C9CD67ACB1B3A116BA375B3FA2AC1B426895`.
+
+Corrige o caso real em que a TypeSafe retornou uma distribuição de 13 opções
+somando `0,990000`: o parser aceita esse desvio decimal limitado, preservando a
+lista exata de opções, probabilidades entre 0 e 1 e a exigência de a escolha
+estar no máximo da distribuição. Soma `0,95` e escolha materialmente inferior
+continuam rejeitadas.
+
+Também revoga o falso suporte automático a reasoning OFF em OpenCode Go,
+ClinePass, Command Code e OpenCode Zen. Execuções reais mostraram que esses
+gateways podem devolver reasoning mesmo recebendo o toggle OFF; portanto o Jev
+estrito não os anuncia como compatíveis. `SLIM_JEV_GATEWAY_OFF=1` permanece
+somente como opt-in experimental e o detector continua abortando antes de
+ferramentas caso reasoning apareça. O seletor mostra uma explicação persistente
+para não parecer que os providers desapareceram sem motivo.
+
+Validação: core **245 aprovados / 0 falhas / 11 ignorados**, TUI **256/0**, CLI
+**123/0**, bridge TUI **22/0** e **12/12 testes específicos do parser Jev**.
+`cargo fmt`, Clippy do core com todos os targets, Clippy da TUI lib, Clippy do
+CLI de produção e `git diff --check` passaram. Nenhuma chamada cobrada à
+TypeSafe ou a provider comercial foi feita durante os testes; as capturas do
+usuário constituem a evidência live das duas falhas corrigidas.
+
+## Deploy anterior — tolerância de arredondamento do Jev (superado em 2026-09-18)
+
+Este build ainda recusava a soma real `0,990000` com 13 opções. Foi substituído
+pelo deploy acima.
+
+`refresh-slim.ps1` concluído com `OK:` e exit 0; build release em **5m16s**.
+PATH: `C:\Users\User\bin\Slim.exe`, build **2026-09-18 04:00:53**,
+`slim 0.1.0`, **18.299.904 bytes**. SHA-256 do instalado e de
+`target/release/slim.exe` idênticos:
+`88E96C695FA02759E802D8DE445A1C817F99F913F758EA937F2395DB853E7379`.
+
+Corrige a rejeição `Jev returned an inconsistent probability distribution` em
+distribuições válidas arredondadas pela API. O parser mantém a exigência de uma
+probabilidade válida para cada opção e de escolha compatível com o máximo, mas a
+soma agora admite somente o erro agregado correspondente à quantização decimal,
+limitado a 2%. Soma, desvio, tolerância, probabilidade escolhida e máximo ficam
+na telemetria. Respostas materialmente incompletas ou com escolha claramente
+inferior continuam falhando com mensagens numéricas separadas.
+
+Validação desta correção: **11/11 testes Jev**, incluindo três e 22 opções;
+core completo **244 aprovados / 0 falhas / 11 ignorados**; Clippy do core com
+todos os targets, `cargo fmt` e `git diff --check` aprovados. Não houve chamada
+real à TypeSafe nem repetição de uma ação remota durante os testes.
+
+## Deploy anterior — Jev multi-provider e reasoning OFF (retraído em 2026-09-18)
+
+A hipótese de que o contrato OFF do modelo de origem seria preservado pelos
+gateways foi refutada pelas execuções reais: eles devolveram reasoning. O deploy
+acima restaura a política fail-closed e substitui este comportamento.
+
+`refresh-slim.ps1` concluído com `OK:` e exit 0. PATH:
+`C:\Users\User\bin\Slim.exe`, build **2026-09-18 03:36:37**,
+`slim 0.1.0`, **18.294.272 bytes**. SHA-256 do instalado e de
+`target/release/slim.exe` idênticos:
+`4CA3C5BFB93018E81FE1D86F1E25E72625C1ED76BCA9BE2019BF45B6490A65D2`.
+
+Corrige o filtro que tratava OpenCode Go, ClinePass, Command Code e OpenCode Zen
+como gateways genéricos e deixava apenas Codex no seletor Jev. Os adapters
+integrados agora aplicam OFF apenas em hosts conhecidos e modelos com contrato
+validado; endpoints genéricos e modelos always-thinking continuam bloqueados.
+O picker Jev seleciona Codex diretamente e não abre mais a etapa
+Low/Medium/High/XHigh. O catálogo OpenCode possui fallback local enquanto a
+atualização remota não chega.
+
+Validação: core **240 aprovados / 0 falhas / 11 ignorados**, TUI **256/0**, CLI
+**123/0**, bridge TUI **22/0** e contratos dos providers OpenCode Go **18/0**,
+ClinePass **6/0**, Command Code **11/0** e Zen **8/0**. `cargo fmt`, Clippy do
+core com todos os targets, Clippy da TUI lib e do CLI de produção passaram. O
+Clippy de todos os targets da TUI ainda encontra um aviso preexistente em uma
+fixture de layout, fora desta mudança. Não houve chamada live a provider nem
+validação manual em console físico.
+
 ## Deploy local atual — Telemetria durável do modo Jev (2026-09-18)
 
 `refresh-slim.ps1` concluiu com `OK:` e exit 0; build release em **5m46s**.

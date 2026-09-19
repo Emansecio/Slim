@@ -1,6 +1,7 @@
 mod artifacts;
 mod budget;
 mod compact;
+pub mod jev_prune;
 pub(crate) use compact::recovery_transcript;
 
 pub use artifacts::{ArtifactHandle, ArtifactStore};
@@ -13,6 +14,10 @@ pub use compact::{
     estimate_text_tokens_from_chars, has_compactable_history,
     latest_user_instruction_before_boundary, local_emergency_summary, select_compaction_history,
     AdaptiveTokenEstimator, CompactionCommit, CompactionHandle, CompactionPolicy, CompactionReason,
-    CompactionResult, CompactionSelection, CompactionStatus, ContextItem, PreparedCompaction,
-    COMPACTION_SYSTEM_PROMPT,
+    CompactionResult, CompactionSelection, CompactionStatus, CompactionStrategy, ContextItem,
+    PreparedCompaction, COMPACTION_SYSTEM_PROMPT,
+};
+pub use jev_prune::{
+    prune_summarized, HttpJevJudge, JevBackend, JevJudge, JevPruneConfig, JevPruneError,
+    JevPruneStats, DEFAULT_JEV_MODEL, DEFAULT_VERCEL_JEV_MODEL,
 };

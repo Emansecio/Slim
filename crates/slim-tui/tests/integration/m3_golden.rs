@@ -8,8 +8,7 @@ use slim_tui::theme::{glyph, resolve_theme, Capabilities, ColorDepth};
 fn mode_cycle_and_command_palette_are_deterministic() {
     assert_eq!(cycle_mode(OperatingMode::Auto), OperatingMode::ReadOnly);
     assert_eq!(cycle_mode(OperatingMode::ReadOnly), OperatingMode::Plan);
-    assert_eq!(cycle_mode(OperatingMode::Plan), OperatingMode::Jev);
-    assert_eq!(cycle_mode(OperatingMode::Jev), OperatingMode::Auto);
+    assert_eq!(cycle_mode(OperatingMode::Plan), OperatingMode::Auto);
     let palette = CommandPalette {
         query: "/mode".into(),
     };

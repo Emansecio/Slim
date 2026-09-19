@@ -1323,7 +1323,6 @@ pub fn render_frame(
             &state.command_code_models,
             &state.zen_models,
             state.catalog_revision,
-            state.mode == slim_core::OperatingMode::Jev,
         );
         render_model_overlay(
             frame,
@@ -5035,13 +5034,12 @@ fn render_model_overlay(
             },
         ),
     ]));
-    // Only Jev can produce an empty list: groups without a compatible model are
-    // dropped. Explain it here instead of showing dead headers, and leave Esc as
-    // the way back.
+    // A filter that matches nothing leaves the list empty. Explain it here
+    // instead of showing dead headers, and leave Esc as the way back.
     if rows.is_empty() {
         lines.push(Line::from(Span::styled(
             crate::view_model::truncate_display_width(
-                "Nenhum modelo compatível com Jev · Esc para voltar",
+                "Nenhum modelo corresponde ao filtro · Esc para voltar",
                 filter_display_budget,
             ),
             palette.muted,
@@ -5423,7 +5421,6 @@ fn render_login_overlay(
             LoginProvider::Anthropic => " Anthropic API key ",
             LoginProvider::OpenAiCodex => " OpenAI Codex API key ",
             LoginProvider::Xai => " xAI API key ",
-            LoginProvider::Typesafe => " TypeSafe API key (Jev) ",
         };
         let area = centered(frame.area(), 58, 8);
         let inner = ratatui::layout::Rect {

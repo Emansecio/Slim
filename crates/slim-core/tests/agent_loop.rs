@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use slim_core::context::{CompactionHandle, CompactionStatus};
 use slim_core::provider::{
     AnthropicAdapter, HttpProviderClient, OpenAiCodexAdapter, OpenAiCompatibleAdapter,
-    ProviderAdapter, ProviderConfig, ProviderError, ProviderMessage,
+    ProviderAdapter, ProviderConfig, ProviderError, ProviderMessage, ProviderToolCall,
 };
 use slim_core::runtime::{AgentLoopConfig, AgentLoopStop, CancellationToken};
 use slim_core::{
@@ -2802,6 +2802,423 @@ fn threshold_requests_summary_then_real_turn_with_same_provider_model() {
         "main snapshot follows compaction"
     );
     assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+}
+
+#[test]
+fn jev_strategy_prunes_stale_evidence_before_the_summary_request() {
+    struct DropJudge;
+
+    #[async_trait::async_trait]
+    impl slim_core::context::JevJudge for DropJudge {
+        async fn judge(
+            &self,
+            _state: &str,
+            questions: &[(String, String)],
+        ) -> Result<Vec<f64>, String> {
+            // Every candidate is judged stale.
+            Ok(vec![0.02; questions.len()])
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "slim-jev-prune-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("workspace");
+    let big_file = root.join("big.txt");
+    std::fs::write(&big_file, "y".repeat(20_000)).expect("big file");
+    let big_path = big_file.to_string_lossy().replace('\\', "/");
+    let big_path_for_history = big_path.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for index in 0..3 {
+            let mut stream = accept_with_deadline(&listener);
+            let mut request = [0_u8; 64 * 1024];
+            let size = stream.read(&mut request).expect("request");
+            requests.push(String::from_utf8_lossy(&request[..size]).into_owned());
+            stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            ).expect("headers");
+            match index {
+                1 => {
+                    let event = json!({
+                        "choices": [{
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": "c",
+                                    "function": {
+                                        "name": "read",
+                                        "arguments": json!({
+                                            "path": big_path,
+                                            "max_lines": 10
+                                        }).to_string()
+                                    }
+                                }]
+                            }
+                        }]
+                    });
+                    stream
+                        .write_all(format!("data: {event}\n\n").as_bytes())
+                        .expect("tool call");
+                    stream
+                        .write_all(
+                            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+                        )
+                        .expect("tool finish");
+                }
+                0 => {
+                    stream
+                        .write_all(
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\nsummary from fixture\\n## Constraints\\nNone\\n## Progress\\nDone\\n## Blocked\\nNone\\n## Decisions\\nKeep context\\n## Next steps\\nContinue\\n## Critical context\\nFixture\"}}]}\n\n",
+                        )
+                        .expect("summary");
+                    stream
+                        .write_all(
+b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                        )
+                        .expect("summary end");
+                }
+                _ => {
+                    stream
+                        .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n")
+                        .expect("answer");
+                    stream
+                        .write_all(
+                            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                        )
+                        .expect("response");
+                }
+            }
+        }
+        requests
+    });
+
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+    let tools = Runtime::new().advertised_tool_definitions(OperatingMode::Auto);
+    let fixed_tokens = slim_core::context::estimate_text_tokens_from_chars(
+        client
+            .adapter()
+            .build_messages_request_with_tools_checked(&[], &tools)
+            .expect("fixed request")
+            .body
+            .chars()
+            .count() as u64,
+    );
+    let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
+    // Seed two older tool pairs: the newest group is always protected as the
+    // recent suffix, so the older pair is the one the summarized prefix holds.
+    let mut history = vec![ProviderMessage::user("start")];
+    let mut first_assistant = ProviderMessage::user("");
+    first_assistant.role = "assistant".into();
+    first_assistant.content = "read the big file".into();
+    first_assistant.tool_calls = vec![ProviderToolCall {
+        id: "old1".into(),
+        name: "read".into(),
+        arguments: json!({ "path": big_path_for_history, "max_lines": 10 }).to_string(),
+    }];
+    history.push(first_assistant);
+    history.push(ProviderMessage::tool("read", "old1", "z".repeat(20_000)));
+    history.push(ProviderMessage::user("continue"));
+    let mut second_assistant = ProviderMessage::user("");
+    second_assistant.role = "assistant".into();
+    second_assistant.content = "read it again".into();
+    second_assistant.tool_calls = vec![ProviderToolCall {
+        id: "old2".into(),
+        name: "read".into(),
+        arguments: json!({ "path": big_path_for_history, "max_lines": 10 }).to_string(),
+    }];
+    history.push(second_assistant);
+    history.push(ProviderMessage::tool("read", "old2", "w".repeat(20_000)));
+    let mut runtime = Runtime::new();
+    let mut policy = slim_core::context::CompactionPolicy {
+        keep_recent_tokens: 1_000,
+        ..slim_core::context::CompactionPolicy::default()
+    };
+    policy.strategy = slim_core::context::CompactionStrategy::Jev;
+    let handle = CompactionHandle::new(policy);
+    handle.request_manual("").expect("queue summary protocol");
+    runtime.set_compaction_handle(handle);
+    runtime.set_jev_judge(Some(std::sync::Arc::new(DropJudge)));
+    let result = tokio_runtime
+        .block_on(runtime.run_agent_loop_with_messages(
+            &client,
+            &history,
+            OperatingMode::Auto,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig {
+                context_window_tokens: fixed_tokens + 40_000,
+                context_reserve_tokens: 120,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .expect("loop");
+    let requests = server.join().expect("server");
+    drop(root);
+    let pruned = runtime
+        .app
+        .events()
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::CompactionJevPruned {
+                pairs_dropped,
+                batches,
+                ..
+            } => Some((*pairs_dropped, *batches)),
+            _ => None,
+        })
+        .expect("jev pruning event");
+    assert!(pruned.0 >= 1, "at least one pair dropped");
+    assert!(pruned.1 >= 1, "at least one batch judged");
+    assert!(
+        !runtime
+            .app
+            .events()
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::CompactionJevFallback { .. })),
+        "no fallback when pruning succeeds"
+    );
+    let summary_body = requests
+        .iter()
+        .find(|request| request.contains("You are a context compactor"))
+        .map(|request| request.split("\r\n\r\n").nth(1).unwrap_or("").to_string())
+        .expect("compaction request");
+    assert!(
+        summary_body.contains("jev-compaction"),
+        "summary transcript must show the prune note"
+    );
+    let bodies = requests
+        .iter()
+        .map(|request| {
+            let body = request.split("\r\n\r\n").nth(1).expect("body");
+            serde_json::from_str::<Value>(body).expect("json")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(bodies.len(), 3);
+    assert_eq!(bodies[2]["messages"][0]["role"], "system");
+    assert!(bodies[2]["messages"][2]["content"]
+        .as_str()
+        .expect("compacted context")
+        .contains("[Compacted context]"));
+    assert!(bodies.iter().all(|body| body["model"] == "fixture-model"));
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert!(runtime
+        .app
+        .events()
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::CompactionCompleted)));
+}
+
+#[test]
+fn jev_failure_falls_back_to_the_llm_summary() {
+    struct FailingJudge;
+
+    #[async_trait::async_trait]
+    impl slim_core::context::JevJudge for FailingJudge {
+        async fn judge(
+            &self,
+            _state: &str,
+            _questions: &[(String, String)],
+        ) -> Result<Vec<f64>, String> {
+            Err("connection refused".into())
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for index in 0..3 {
+            let mut stream = accept_with_deadline(&listener);
+            let mut request = [0_u8; 64 * 1024];
+            let size = stream.read(&mut request).expect("request");
+            requests.push(String::from_utf8_lossy(&request[..size]).into_owned());
+            stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            ).expect("headers");
+            match index {
+                1 => {
+                    let event = json!({
+                        "choices": [{
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": "c",
+                                    "function": {
+                                        "name": "read",
+                                        "arguments": json!({
+                                            "path": "missing-file.txt",
+                                            "max_lines": 10
+                                        }).to_string()
+                                    }
+                                }]
+                            }
+                        }]
+                    });
+                    stream
+                        .write_all(format!("data: {event}\n\n").as_bytes())
+                        .expect("tool call");
+                    stream
+                        .write_all(
+                            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+                        )
+                        .expect("tool finish");
+                }
+                0 => {
+                    stream
+                        .write_all(
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\nsummary from fixture\\n## Constraints\\nNone\\n## Progress\\nDone\\n## Blocked\\nNone\\n## Decisions\\nKeep context\\n## Next steps\\nContinue\\n## Critical context\\nFixture\"}}]}\n\n",
+                        )
+                        .expect("summary");
+                    stream
+                        .write_all(
+b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                        )
+                        .expect("summary end");
+                }
+                _ => {
+                    stream
+                        .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n")
+                        .expect("answer");
+                    stream
+                        .write_all(
+                            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                        )
+                        .expect("response");
+                }
+            }
+        }
+        requests
+    });
+
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+    let tools = Runtime::new().advertised_tool_definitions(OperatingMode::Auto);
+    let fixed_tokens = slim_core::context::estimate_text_tokens_from_chars(
+        client
+            .adapter()
+            .build_messages_request_with_tools_checked(&[], &tools)
+            .expect("fixed request")
+            .body
+            .chars()
+            .count() as u64,
+    );
+    let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
+    // Two older tool pairs: the newest is protected, so the older one is what
+    // the summarized prefix holds. The judge fails, so that prefix must reach
+    // the LLM summary untouched.
+    let mut history = vec![ProviderMessage::user("start")];
+    let mut first_assistant = ProviderMessage::user("");
+    first_assistant.role = "assistant".into();
+    first_assistant.content = "read the older file".into();
+    first_assistant.tool_calls = vec![ProviderToolCall {
+        id: "old1".into(),
+        name: "read".into(),
+        arguments: json!({ "path": "older.rs", "max_lines": 10 }).to_string(),
+    }];
+    history.push(first_assistant);
+    history.push(ProviderMessage::tool(
+        "read",
+        "old1",
+        format!("RAW_FALLBACK_MARKER{}", "z".repeat(20_000)),
+    ));
+    history.push(ProviderMessage::user("continue"));
+    let mut second_assistant = ProviderMessage::user("");
+    second_assistant.role = "assistant".into();
+    second_assistant.content = "read it again".into();
+    second_assistant.tool_calls = vec![ProviderToolCall {
+        id: "old2".into(),
+        name: "read".into(),
+        arguments: json!({ "path": "older.rs", "max_lines": 10 }).to_string(),
+    }];
+    history.push(second_assistant);
+    history.push(ProviderMessage::tool("read", "old2", "w".repeat(20_000)));
+    let mut runtime = Runtime::new();
+    let mut policy = slim_core::context::CompactionPolicy {
+        keep_recent_tokens: 1_000,
+        ..slim_core::context::CompactionPolicy::default()
+    };
+    policy.strategy = slim_core::context::CompactionStrategy::Jev;
+    let handle = CompactionHandle::new(policy);
+    handle.request_manual("").expect("queue summary protocol");
+    runtime.set_compaction_handle(handle);
+    runtime.set_jev_judge(Some(std::sync::Arc::new(FailingJudge)));
+    let result = tokio_runtime
+        .block_on(runtime.run_agent_loop_with_messages(
+            &client,
+            &history,
+            OperatingMode::Auto,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig {
+                context_window_tokens: fixed_tokens + 40_000,
+                context_reserve_tokens: 120,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .expect("loop");
+    let requests = server.join().expect("server");
+    let fallback = runtime
+        .app
+        .events()
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::CompactionJevFallback { detail } => Some(detail.clone()),
+            _ => None,
+        })
+        .expect("jev fallback event");
+    assert!(
+        fallback.contains("connection refused"),
+        "redacted reason carried: {fallback}"
+    );
+    assert!(
+        !runtime
+            .app
+            .events()
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::CompactionJevPruned { .. })),
+        "no pruning event when the judge fails"
+    );
+    let summary_body = requests
+        .iter()
+        .find(|request| request.contains("You are a context compactor"))
+        .map(|request| request.split("\r\n\r\n").nth(1).unwrap_or("").to_string())
+        .expect("compaction request");
+    assert!(
+        !summary_body.contains("jev-compaction"),
+        "fallback summarizes the untouched prefix"
+    );
+    assert!(
+        summary_body.contains("RAW_FALLBACK_MARKER") || summary_body.contains("older.rs"),
+        "raw tool evidence stays in the summary transcript"
+    );
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert!(runtime
+        .app
+        .events()
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::CompactionCompleted)));
 }
 
 #[test]

@@ -503,29 +503,11 @@ impl ProviderAuth {
     }
 }
 
-/// Native reasoning-OFF representation for the effective wire.
-///
-/// The mode imposes OFF, but each protocol expresses it differently, so the
-/// adapter resolves the contract from the protocol and the model instead of
-/// assuming that omitting a field is enough.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReasoningOff {
-    /// OpenAI Chat Completions: `reasoning_effort: "none"`.
-    EffortNone,
-    /// `thinking: {"type": "disabled"}`. DeepSeek V4, GLM and Kimi K2.x think
-    /// unless told not to, so omitting the field is not OFF; the Anthropic
-    /// models documented to accept `disabled` also use this shape.
-    ThinkingDisabled,
-    /// OpenAI Responses wire (Codex): `reasoning: {"effort": "none"}`.
-    ResponsesEffortNone,
-}
-
 pub struct ProviderConfig {
     pub kind: ProviderKind,
     pub endpoint: String,
     pub model: String,
     reasoning_effort: Option<String>,
-    reasoning_off: Option<ReasoningOff>,
     auth: ProviderAuth,
     max_output_tokens: u32,
     response_cache_scope_id: u64,
@@ -601,7 +583,6 @@ impl ProviderConfig {
             endpoint: endpoint.into(),
             model: model.into(),
             reasoning_effort: None,
-            reasoning_off: None,
             auth: ProviderAuth::ApiKey(api_key.into()),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             response_cache_scope_id: next_response_cache_scope_id(),
@@ -621,7 +602,6 @@ impl ProviderConfig {
             endpoint: endpoint.into(),
             model: model.into(),
             reasoning_effort: None,
-            reasoning_off: None,
             auth: ProviderAuth::OAuth {
                 access_token: access_token.into(),
                 account_id: Some(account_id.into()),
@@ -643,7 +623,6 @@ impl ProviderConfig {
             endpoint: endpoint.into(),
             model: model.into(),
             reasoning_effort: None,
-            reasoning_off: None,
             auth: ProviderAuth::ApiKey(api_key.into()),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             response_cache_scope_id: next_response_cache_scope_id(),
@@ -662,7 +641,6 @@ impl ProviderConfig {
             endpoint: endpoint.into(),
             model: model.into(),
             reasoning_effort: None,
-            reasoning_off: None,
             auth: ProviderAuth::OAuth {
                 access_token: access_token.into(),
                 account_id: None,
@@ -684,7 +662,6 @@ impl ProviderConfig {
             endpoint: endpoint.into(),
             model: model.into(),
             reasoning_effort: None,
-            reasoning_off: None,
             auth: ProviderAuth::Bearer(access_token.into()),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             response_cache_scope_id: next_response_cache_scope_id(),
@@ -704,41 +681,7 @@ impl ProviderConfig {
     }
 
     pub fn reasoning_effort(&self) -> Option<&str> {
-        match self.reasoning_off {
-            Some(ReasoningOff::EffortNone) => Some("none"),
-            Some(ReasoningOff::ThinkingDisabled | ReasoningOff::ResponsesEffortNone) => None,
-            None => self.reasoning_effort.as_deref(),
-        }
-    }
-
-    /// Native OFF is a wire contract, not a prompt or a minimum effort.
-    pub fn with_reasoning_disabled(mut self) -> Result<Self, ProviderError> {
-        self.enable_reasoning_disabled()?;
-        Ok(self)
-    }
-
-    /// Resolves and stores the documented OFF representation for this
-    /// protocol/endpoint/model. Also used by gateway adapters that build their
-    /// own inner configs.
-    pub(crate) fn enable_reasoning_disabled(&mut self) -> Result<(), ProviderError> {
-        self.reasoning_off = Some(self.documented_reasoning_off()?);
-        Ok(())
-    }
-
-    fn documented_reasoning_off(&self) -> Result<ReasoningOff, ProviderError> {
-        self.resolve_reasoning_off(unverified_gateway_off_enabled())
-    }
-
-    fn resolve_reasoning_off(
-        &self,
-        allow_unverified_gateways: bool,
-    ) -> Result<ReasoningOff, ProviderError> {
-        resolve_reasoning_off_for(
-            self.kind,
-            &self.endpoint,
-            &self.model,
-            allow_unverified_gateways,
-        )
+        self.reasoning_effort.as_deref()
     }
 
     /// Sets the finite output cap sent to the provider.
@@ -1030,21 +973,6 @@ impl PreparedProviderRequest {
 
 pub trait ProviderAdapter {
     fn kind(&self) -> ProviderKind;
-    /// Native reasoning-OFF representation this adapter would send, if any.
-    fn reasoning_off(&self) -> Option<ReasoningOff> {
-        None
-    }
-    /// Single check for callers; derived from the representation.
-    fn reasoning_disabled(&self) -> bool {
-        self.reasoning_off().is_some()
-    }
-    /// Applies the mode's OFF policy, resolving the documented representation.
-    /// Routes without one keep the default so Jev fails closed.
-    fn set_reasoning_disabled(&mut self) -> Result<(), ProviderError> {
-        Err(ProviderError::InvalidResponse {
-            message: "Jev requires a documented native reasoning-OFF adapter; this provider route has none. No fallback was applied.".into(),
-        })
-    }
     fn wire_kind(&self) -> ProviderKind {
         self.kind()
     }
@@ -1173,53 +1101,6 @@ pub trait ProviderAdapter {
         Vec::new()
     }
     fn parse_event(&self, value: &Value) -> Result<Vec<ProviderEvent>, ProviderError>;
-}
-
-fn reasoning_disabled_violation() -> ProviderError {
-    ProviderError::InvalidResponse {
-        message: "Native reasoning OFF was violated by the provider; response rejected before tool execution. No fallback was applied.".into(),
-    }
-}
-
-fn event_contains_reasoning(event: &ProviderEvent) -> bool {
-    match event {
-        ProviderEvent::ReasoningStarted | ProviderEvent::ResponsesReasoning(_) => true,
-        ProviderEvent::ReasoningDelta(text) => !text.is_empty(),
-        ProviderEvent::ChatReasoning(state) => !state.content.is_empty(),
-        ProviderEvent::UsageBreakdown { usage } => usage.reasoning_tokens > 0,
-        _ => false,
-    }
-}
-
-fn validate_reasoning_disabled_payload(
-    body: &[u8],
-    kind: ProviderKind,
-    off: ReasoningOff,
-) -> Result<(), ProviderError> {
-    let value: Value = serde_json::from_slice(body).map_err(|_| reasoning_disabled_violation())?;
-    let valid = match off {
-        ReasoningOff::EffortNone => {
-            kind == ProviderKind::OpenAiCompatible
-                && value.get("reasoning_effort").and_then(Value::as_str) == Some("none")
-                && value.pointer("/thinking/type").is_none()
-        }
-        ReasoningOff::ThinkingDisabled => {
-            value.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled")
-                && value.get("reasoning_effort").is_none()
-                && (kind != ProviderKind::Anthropic || value.get("output_config").is_none())
-        }
-        ReasoningOff::ResponsesEffortNone => {
-            kind == ProviderKind::OpenAiCodex
-                && value.pointer("/reasoning/effort").and_then(Value::as_str) == Some("none")
-                && value.pointer("/reasoning/summary").is_none()
-                && value.get("reasoning_effort").is_none()
-        }
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(reasoning_disabled_violation())
-    }
 }
 
 fn harden_compaction_request<A: ProviderAdapter + ?Sized>(
@@ -1634,115 +1515,8 @@ fn is_official_openai_endpoint(endpoint: &str) -> bool {
     endpoint_host_is(endpoint, "api.openai.com")
 }
 
-fn is_official_anthropic_endpoint(endpoint: &str) -> bool {
-    endpoint_host_is(endpoint, "api.anthropic.com")
-}
-
-/// Codex OAuth backend.
-fn is_codex_endpoint(endpoint: &str) -> bool {
-    endpoint_host_is(endpoint, "chatgpt.com")
-}
-
-fn is_deepseek_endpoint(endpoint: &str) -> bool {
-    endpoint_host_is(endpoint, "api.deepseek.com")
-}
-
-fn is_zai_endpoint(endpoint: &str) -> bool {
-    endpoint_host_is(endpoint, "api.z.ai")
-}
-
-fn is_moonshot_endpoint(endpoint: &str) -> bool {
-    endpoint_host_is(endpoint, "api.moonshot.ai") || endpoint_host_is(endpoint, "api.moonshot.cn")
-}
-
-/// Slim's bundled community gateways. Their reasoning format is not the
-/// vendor's, so they need an explicit opt-in instead of an assumption.
-fn is_known_gateway_endpoint(endpoint: &str) -> bool {
-    ["opencode.ai", "api.commandcode.ai", "api.cline.bot"]
-        .iter()
-        .any(|host| endpoint_host_is(endpoint, host))
-}
-
-fn unverified_gateway_off_enabled() -> bool {
-    std::env::var("SLIM_JEV_GATEWAY_OFF").is_ok_and(|value| value == "1")
-}
-
 /// Canonical Codex OAuth backend, shared by the execution path and the UI.
 pub const CODEX_BACKEND_ENDPOINT: &str = "https://chatgpt.com/backend-api";
-
-/// Whether this provider route can run with native reasoning OFF, and how.
-///
-/// Single source of truth for the Jev policy: the execution path and the model
-/// picker both call it, so the UI can never advertise a route the runtime would
-/// refuse. Local and pure — it never contacts a provider.
-pub fn reasoning_off_support(
-    kind: ProviderKind,
-    endpoint: &str,
-    model: &str,
-) -> Result<ReasoningOff, ProviderError> {
-    resolve_reasoning_off_for(kind, endpoint, model, unverified_gateway_off_enabled())
-}
-
-/// Resolves OFF from protocol + known endpoint + model. The vendor contract is
-/// only evidence on the endpoint that publishes it; an arbitrary compatible
-/// gateway may speak a different (e.g. unified) reasoning format, so it is
-/// refused unless `SLIM_JEV_GATEWAY_OFF=1` opts in. If a route ignores the
-/// toggle anyway, the reasoning detector aborts the run before any tool runs.
-fn resolve_reasoning_off_for(
-    kind: ProviderKind,
-    endpoint: &str,
-    model: &str,
-    allow_unverified_gateways: bool,
-) -> Result<ReasoningOff, ProviderError> {
-    let off = match kind {
-        ProviderKind::OpenAiCompatible => {
-            if is_official_openai_endpoint(endpoint)
-                && matches!(
-                    model,
-                    "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-5.5"
-                )
-            {
-                // OpenAI reasoning guide: GPT-6 Astra rejects `none` (HTTP 400);
-                // the GPT-5.6 family and GPT-5.5 document it.
-                Some(ReasoningOff::EffortNone)
-            } else if is_deepseek_endpoint(endpoint) && is_deepseek_model(model) {
-                // DeepSeek documents `thinking: {"type": "disabled"}`.
-                Some(ReasoningOff::ThinkingDisabled)
-            } else if is_zai_endpoint(endpoint) && is_glm_thinking_toggle(model) {
-                // Z.AI documents `thinking.type: "disabled"` up to GLM-5.2.
-                Some(ReasoningOff::ThinkingDisabled)
-            } else if is_moonshot_endpoint(endpoint) && is_kimi_thinking_toggle(model) {
-                // Moonshot documents `thinking.type: "disabled"` for K2.x.
-                Some(ReasoningOff::ThinkingDisabled)
-            } else if allow_unverified_gateways
-                && is_known_gateway_endpoint(endpoint)
-                && uses_thinking_toggle(model)
-            {
-                Some(ReasoningOff::ThinkingDisabled)
-            } else {
-                None
-            }
-        }
-        ProviderKind::Anthropic if is_official_anthropic_endpoint(endpoint) => {
-            is_thinking_disabled_anthropic(model).then_some(ReasoningOff::ThinkingDisabled)
-        }
-        ProviderKind::OpenAiCodex if is_codex_endpoint(endpoint) => {
-            // Responses wire: the GPT-5.6 family documents `none`. GPT-6 Astra
-            // rejects it and stays out.
-            matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna")
-                .then_some(ReasoningOff::ResponsesEffortNone)
-        }
-        _ => None,
-    };
-    if off.is_none() && is_always_thinking(model) {
-        return Err(ProviderError::InvalidResponse {
-            message: "Jev requires native reasoning OFF, and this model always thinks: GLM-5.3/5.3-Flash and Kimi K3/K2.7-Code force thinking, and MiniMax M2.x accepts `thinking.type: \"disabled\"` but keeps thinking on. Use another model or leave Jev mode. No fallback was applied.".into(),
-        });
-    }
-    off.ok_or_else(|| ProviderError::InvalidResponse {
-        message: "Jev requires documented native reasoning OFF on a known endpoint. Use the GPT-5.6 family or GPT-5.5 on the official OpenAI API, GPT-5.6 Sol/Terra/Luna on Codex, DeepSeek on api.deepseek.com, GLM on api.z.ai, Kimi on api.moonshot.ai, a documented Claude model on the official Anthropic API, or leave Jev mode. Community gateways are refused because their reasoning format is not the vendor's; set SLIM_JEV_GATEWAY_OFF=1 to try them anyway. No fallback was applied.".into(),
-    })
-}
 
 /// Model id without any `vendor/` prefix, so one matcher covers gateway ids.
 fn model_name(model: &str) -> &str {
@@ -1777,39 +1551,6 @@ fn is_kimi_thinking_toggle(model: &str) -> bool {
 /// Models whose documented wire OFF is the `thinking.type` toggle.
 fn uses_thinking_toggle(model: &str) -> bool {
     is_deepseek_model(model) || is_glm_thinking_toggle(model) || is_kimi_thinking_toggle(model)
-}
-
-/// Always-on thinkers: no request turns reasoning off, so they must never be
-/// mistaken for a supported OFF route. MiniMax M2.x is the sharp case: it
-/// accepts `thinking.type: "disabled"` and keeps thinking anyway.
-fn is_always_thinking(model: &str) -> bool {
-    let name = model_name(model);
-    ["glm-5.3", "glm-5.3-flash"]
-        .iter()
-        .any(|candidate| name.eq_ignore_ascii_case(candidate))
-        || ["kimi-k3", "kimi-k2.7-code", "kimi-k2.7-code-highspeed"]
-            .iter()
-            .any(|candidate| name.eq_ignore_ascii_case(candidate))
-        || ["minimax-m2", "minimax-m2.5", "minimax-m2.7"]
-            .iter()
-            .any(|candidate| name.eq_ignore_ascii_case(candidate))
-}
-
-/// Claude models whose 2026-09-17 per-model table does not reject
-/// `thinking: {"type": "disabled"}`. Fable/Mythos are always-on and rejected.
-fn is_thinking_disabled_anthropic(model: &str) -> bool {
-    model.starts_with("claude-haiku-4-5")
-        || matches!(
-            model,
-            "claude-sonnet-5"
-                | "claude-opus-5"
-                | "claude-opus-4-8"
-                | "claude-opus-4-7"
-                | "claude-opus-4-6"
-                | "claude-sonnet-4-6"
-                | "claude-opus-4-5"
-                | "claude-sonnet-4-5"
-        )
 }
 
 fn collect_request_sensitive_values(request: &HttpRequest, values: &mut Vec<String>) {
@@ -2354,7 +2095,7 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
                 .is_some_and(|model| model.reasoning_levels.contains(&"low")),
             _ => false,
         };
-        if supports_low && !adapter.reasoning_disabled() {
+        if supports_low {
             if let Some(effort) = body.get_mut("reasoning_effort") {
                 *effort = Value::String("low".into());
             }
@@ -2475,13 +2216,6 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         C: Future<Output = ()>,
     {
         tokio::pin!(cancellation);
-        let off = self.adapter.reasoning_off();
-        if let Some(off) = off {
-            validate_reasoning_disabled_payload(&request.body, self.adapter.wire_kind(), off)?;
-        }
-        let disabled = off.is_some();
-        let violation = std::sync::atomic::AtomicBool::new(false);
-        let violation_notify = tokio::sync::Notify::new();
         let mut request = request;
         let cache_key = request.response_cache_key.take();
         if let Some(events) = self
@@ -2497,9 +2231,6 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
                     _ = &mut cancellation => return Err(ProviderError::Cancelled),
                     _ = tokio::task::yield_now() => {}
                 }
-                if disabled && event_contains_reasoning(&event) {
-                    return Err(reasoning_disabled_violation());
-                }
                 if !marked_cache_hit {
                     on_event(ProviderEvent::ResponseCacheHit);
                     marked_cache_hit = true;
@@ -2513,20 +2244,6 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         let mut captured_bytes = cache_key.as_ref().map_or(0, String::capacity);
         let mut saw_stopped = false;
         let mut forward_event = |event| {
-            if disabled && event_contains_reasoning(&event) {
-                violation.store(true, Ordering::Relaxed);
-                violation_notify.notify_one();
-            }
-            if violation.load(Ordering::Relaxed)
-                && !matches!(
-                    event,
-                    ProviderEvent::Usage { .. }
-                        | ProviderEvent::UsagePartial { .. }
-                        | ProviderEvent::UsageBreakdown { .. }
-                )
-            {
-                return;
-            }
             if matches!(event, ProviderEvent::Phase { .. }) {
                 on_event(event);
                 return;
@@ -2609,7 +2326,6 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
             tokio::select! {
                 biased;
                 _ = &mut cancellation => Err(ProviderError::Cancelled),
-                _ = violation_notify.notified(), if disabled => Err(reasoning_disabled_violation()),
                 result = tokio::time::timeout(self.timeouts.wall, send) => result.unwrap_or(Err(ProviderError::Transport {
                     safe_to_retry: false,
                     message: "overall provider request deadline exceeded".into(),
@@ -2624,9 +2340,6 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
                 input_tokens,
                 output_tokens,
             });
-        }
-        if violation.load(Ordering::Relaxed) {
-            return Err(reasoning_disabled_violation());
         }
         let _saw_done = result?;
         if !saw_stopped {
@@ -4694,9 +4407,8 @@ impl OpenAiCompatibleAdapter {
                 body["verbosity"] = Value::String("low".into());
             }
         }
-        if self.config.reasoning_off == Some(ReasoningOff::ThinkingDisabled)
-            || (uses_thinking_toggle(&self.config.model)
-                && self.config.reasoning_effort() == Some("none"))
+        if uses_thinking_toggle(&self.config.model)
+            && self.config.reasoning_effort() == Some("none")
         {
             // DeepSeek, GLM and Kimi K2.x think unless told not to: an absent
             // field or a bare `none` effort would leave thinking on.
@@ -4742,14 +4454,6 @@ impl OpenAiCompatibleAdapter {
 }
 
 impl ProviderAdapter for OpenAiCompatibleAdapter {
-    fn reasoning_off(&self) -> Option<ReasoningOff> {
-        self.config.reasoning_off
-    }
-
-    fn set_reasoning_disabled(&mut self) -> Result<(), ProviderError> {
-        self.config.enable_reasoning_disabled()
-    }
-
     fn kind(&self) -> ProviderKind {
         self.config.kind
     }
@@ -4863,8 +4567,8 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                 }
             }
             // Unified gateway reasoning (e.g. OpenRouter's `reasoning_details`).
-            // Presence alone proves the model reasoned, so it must reach the OFF
-            // violation detector even when no readable text is carried.
+            // Presence alone proves the model reasoned, so emit an event even
+            // when no readable text is carried.
             if let Some(details) = delta
                 .get("reasoning_details")
                 .and_then(Value::as_array)
@@ -5148,9 +4852,6 @@ impl AnthropicAdapter {
         if let Some(effort) = self.config.reasoning_effort() {
             body["output_config"] = json!({"effort": effort});
         }
-        if self.config.reasoning_off == Some(ReasoningOff::ThinkingDisabled) {
-            body["thinking"] = json!({"type": "disabled"});
-        }
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.to_vec());
         }
@@ -5169,14 +4870,6 @@ impl AnthropicAdapter {
 }
 
 impl ProviderAdapter for AnthropicAdapter {
-    fn reasoning_off(&self) -> Option<ReasoningOff> {
-        self.config.reasoning_off
-    }
-
-    fn set_reasoning_disabled(&mut self) -> Result<(), ProviderError> {
-        self.config.enable_reasoning_disabled()
-    }
-
     fn kind(&self) -> ProviderKind {
         self.config.kind
     }
@@ -5331,6 +5024,12 @@ impl ProviderAdapter for AnthropicAdapter {
             }
             Some("content_block_start") => {
                 if let Some(block) = value.get("content_block") {
+                    if matches!(
+                        block.get("type").and_then(Value::as_str),
+                        Some("thinking" | "redacted_thinking")
+                    ) {
+                        events.push(ProviderEvent::ReasoningStarted);
+                    }
                     if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                         let index = value
                             .get("index")
@@ -5400,23 +5099,31 @@ impl ProviderAdapter for AnthropicAdapter {
                 });
             }
             Some("message_delta") => {
-                if let Some(output_tokens) = value
-                    .get("usage")
-                    .and_then(|usage| usage.get("output_tokens"))
-                    .and_then(Value::as_u64)
-                {
-                    events.push(ProviderEvent::UsageBreakdown {
-                        usage: UsageBreakdown {
+                if let Some(usage) = value.get("usage") {
+                    let output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
+                    // Hidden/summarized thinking is still billed. Claude reports
+                    // its native counter independently of visible thinking deltas.
+                    let reasoning_tokens = usage
+                        .pointer("/output_tokens_details/thinking_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    if output_tokens.is_some() || reasoning_tokens > 0 {
+                        events.push(ProviderEvent::UsageBreakdown {
+                            usage: UsageBreakdown {
+                                output_tokens: output_tokens.unwrap_or(0),
+                                reasoning_tokens,
+                                ..UsageBreakdown::default()
+                            },
+                        });
+                    }
+                    if let Some(output_tokens) = output_tokens {
+                        events.push(ProviderEvent::UsagePartial {
+                            input_tokens: 0,
                             output_tokens,
-                            ..UsageBreakdown::default()
-                        },
-                    });
-                    events.push(ProviderEvent::UsagePartial {
-                        input_tokens: 0,
-                        output_tokens,
-                        input_complete: false,
-                        output_complete: true,
-                    });
+                            input_complete: false,
+                            output_complete: true,
+                        });
+                    }
                 }
                 if let Some(stop_reason) = value
                     .get("delta")
@@ -5523,6 +5230,46 @@ impl ProviderAdapter for FakeProvider {
 #[cfg(test)]
 mod finalization_tests {
     use super::*;
+
+    #[test]
+    fn anthropic_hidden_thinking_emits_reasoning_signals() {
+        let adapter = AnthropicAdapter::new(ProviderConfig::anthropic(
+            "https://api.anthropic.com/v1/messages",
+            "claude-sonnet-4-6",
+            "fixture-key",
+        ))
+        .unwrap();
+        for event in [
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque"}}),
+        ] {
+            let events = adapter.parse_event(&event).unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, ProviderEvent::ReasoningStarted)),
+                "{event}"
+            );
+        }
+        for event in [
+            json!({"type":"message_delta","usage":{"output_tokens":100,"output_tokens_details":{"thinking_tokens":80}}}),
+            json!({"type":"message_delta","usage":{"output_tokens_details":{"thinking_tokens":80}}}),
+        ] {
+            let events = adapter.parse_event(&event).unwrap();
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    ProviderEvent::UsageBreakdown { usage } if usage.reasoning_tokens == 80
+                )),
+                "{event}"
+            );
+        }
+        let events = adapter.parse_event(&json!({"type":"message_delta","usage":{"output_tokens":20,"output_tokens_details":{"thinking_tokens":0}}})).unwrap();
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::UsageBreakdown { usage } if usage.reasoning_tokens > 0
+        )));
+    }
 
     #[test]
     fn responses_and_messages_errors_preserve_structured_identity() {
@@ -5663,207 +5410,6 @@ mod finalization_tests {
     }
 
     #[test]
-    fn native_reasoning_off_is_resolved_per_documented_contract() {
-        let off = |config: ProviderConfig| config.resolve_reasoning_off(false).map(Some);
-        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"] {
-            assert_eq!(
-                off(ProviderConfig::openai(
-                    "https://api.openai.com/v1/chat/completions",
-                    model,
-                    "k"
-                )),
-                Ok(Some(ReasoningOff::EffortNone)),
-                "{model}"
-            );
-        }
-        // DeepSeek: V4 thinks unless told not to, so the vendor toggle is the
-        // only true OFF.
-        for model in [
-            "deepseek-flash",
-            "deepseek-v4-pro",
-            "deepseek-v4-flash",
-            "deepseek/deepseek-v4-flash",
-            "deepseek/deepseek-v4.1-flash",
-        ] {
-            assert_eq!(
-                off(ProviderConfig::openai(
-                    "https://api.deepseek.com/chat/completions",
-                    model,
-                    "k"
-                )),
-                Ok(Some(ReasoningOff::ThinkingDisabled)),
-                "{model}"
-            );
-        }
-        for model in [
-            "claude-sonnet-5",
-            "claude-opus-5",
-            "claude-opus-4-8",
-            "claude-opus-4-7",
-            "claude-opus-4-6",
-            "claude-sonnet-4-6",
-            "claude-opus-4-5",
-            "claude-sonnet-4-5",
-            "claude-haiku-4-5-20251001",
-        ] {
-            assert_eq!(
-                off(ProviderConfig::anthropic(
-                    "https://api.anthropic.com/v1/messages",
-                    model,
-                    "k"
-                )),
-                Ok(Some(ReasoningOff::ThinkingDisabled)),
-                "{model}"
-            );
-        }
-        // GLM 5.0-5.2 and Kimi K2.5/K2.6 document the same toggle, but only on
-        // the vendor endpoint that publishes it.
-        for model in ["glm-5", "glm-5.1", "glm-5.2", "zai-org/GLM-5.2-Fast"] {
-            assert_eq!(
-                off(ProviderConfig::openai(
-                    "https://api.z.ai/api/paas/v4/chat/completions",
-                    model,
-                    "k"
-                )),
-                Ok(Some(ReasoningOff::ThinkingDisabled)),
-                "{model}"
-            );
-        }
-        for model in ["kimi-k2.5", "kimi-k2.6", "moonshotai/Kimi-K2.6"] {
-            assert_eq!(
-                off(ProviderConfig::openai(
-                    "https://api.moonshot.ai/v1/chat/completions",
-                    model,
-                    "k"
-                )),
-                Ok(Some(ReasoningOff::ThinkingDisabled)),
-                "{model}"
-            );
-        }
-        // Codex OAuth: the Responses wire documents `effort: none` for the
-        // GPT-5.6 family.
-        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
-            assert_eq!(
-                off(ProviderConfig::openai_codex(
-                    "https://chatgpt.com/backend-api",
-                    model,
-                    "k",
-                    "account"
-                )),
-                Ok(Some(ReasoningOff::ResponsesEffortNone)),
-                "{model}"
-            );
-        }
-        for config in [
-            // GPT-6 Astra rejects `reasoning_effort: "none"` with HTTP 400.
-            ProviderConfig::openai(
-                "https://api.openai.com/v1/chat/completions",
-                "gpt-6-astra",
-                "k",
-            ),
-            ProviderConfig::openai_codex(
-                "https://chatgpt.com/backend-api",
-                "gpt-6-astra",
-                "k",
-                "account",
-            ),
-            // An unlisted model behind a compatible gateway is not audited OFF.
-            ProviderConfig::openai(
-                "https://gateway.example/v1/chat/completions",
-                "gpt-5.6-sol",
-                "k",
-            ),
-            // Fable/Mythos are always-on; the official host does not change it.
-            ProviderConfig::anthropic(
-                "https://api.anthropic.com/v1/messages",
-                "claude-fable-5-1",
-                "k",
-            ),
-            ProviderConfig::anthropic("https://proxy.example/v1/messages", "claude-sonnet-5", "k"),
-        ] {
-            assert!(config.with_reasoning_disabled().is_err());
-        }
-        // A community gateway carries its own reasoning format, so the vendor
-        // contract is not evidence there: refused unless explicitly opted in.
-        for (model, endpoint) in [
-            ("glm-5.2", "https://opencode.ai/zen/go/v1/chat/completions"),
-            (
-                "deepseek-v4-flash",
-                "https://api.commandcode.ai/provider/v1/chat/completions",
-            ),
-            ("kimi-k2.6", "https://api.cline.bot/api/v1/chat/completions"),
-        ] {
-            assert!(
-                off(ProviderConfig::openai(endpoint, model, "k")).is_err(),
-                "{model}"
-            );
-        }
-        // Always-on thinkers fail with the dedicated explanation.
-        for (model, endpoint) in [
-            ("glm-5.3", "https://opencode.ai/zen/go/v1/chat/completions"),
-            (
-                "z-ai/glm-5.3-flash",
-                "https://opencode.ai/zen/v1/chat/completions",
-            ),
-            ("kimi-k3", "https://opencode.ai/zen/go/v1/chat/completions"),
-            (
-                "kimi-k2.7-code",
-                "https://api.commandcode.ai/provider/v1/chat/completions",
-            ),
-            (
-                "minimax-m2.7",
-                "https://opencode.ai/zen/go/v1/chat/completions",
-            ),
-        ] {
-            let error = match ProviderConfig::openai(endpoint, model, "k").with_reasoning_disabled()
-            {
-                Ok(_) => panic!("{model}: expected rejection"),
-                Err(error) => error,
-            };
-            assert!(
-                matches!(&error, ProviderError::InvalidResponse { message } if message.contains("always thinks")),
-                "{model}: {error:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn openai_off_body_sends_none_effort_without_a_thinking_field() {
-        let adapter = OpenAiCompatibleAdapter::new(
-            ProviderConfig::openai(
-                "https://api.openai.com/v1/chat/completions",
-                "gpt-5.6-sol",
-                "k",
-            )
-            .with_reasoning_disabled()
-            .expect("documented OFF"),
-        )
-        .expect("adapter");
-        let request = adapter.messages_request(&[ProviderMessage::user("hi")], &[]);
-        let body: Value = serde_json::from_str(&request.body).expect("json");
-        assert_eq!(body["reasoning_effort"], json!("none"));
-        assert!(body.get("thinking").is_none(), "{body}");
-    }
-
-    #[test]
-    fn deepseek_off_body_sends_the_thinking_toggle() {
-        let adapter = OpenAiCompatibleAdapter::new(
-            ProviderConfig::openai(
-                "https://api.deepseek.com/chat/completions",
-                "deepseek-v4-flash",
-                "k",
-            )
-            .with_reasoning_disabled()
-            .expect("documented OFF"),
-        )
-        .expect("adapter");
-        let request = adapter.messages_request(&[ProviderMessage::user("hi")], &[]);
-        let body: Value = serde_json::from_str(&request.body).expect("json");
-        assert_eq!(body["thinking"], json!({"type": "disabled"}));
-        assert!(body.get("reasoning_effort").is_none(), "{body}");
-    }
-
-    #[test]
     fn deepseek_effort_none_sends_the_toggle_instead_of_a_bare_none() {
         let adapter = OpenAiCompatibleAdapter::new(
             ProviderConfig::openai(
@@ -5900,203 +5446,31 @@ mod finalization_tests {
     }
 
     #[test]
-    fn glm_and_kimi_off_bodies_send_the_thinking_toggle() {
-        for (model, endpoint) in [
-            ("glm-5.2", "https://api.z.ai/api/paas/v4/chat/completions"),
-            (
-                "moonshotai/Kimi-K2.6",
-                "https://api.moonshot.ai/v1/chat/completions",
-            ),
-        ] {
-            let adapter = OpenAiCompatibleAdapter::new(
-                ProviderConfig::openai(endpoint, model, "k")
-                    .with_reasoning_disabled()
-                    .expect("documented OFF"),
-            )
-            .expect("adapter");
-            let request = adapter.messages_request(&[ProviderMessage::user("hi")], &[]);
-            let body: Value = serde_json::from_str(&request.body).expect("json");
-            assert_eq!(body["thinking"], json!({"type": "disabled"}), "{model}");
-            assert!(body.get("reasoning_effort").is_none(), "{model}: {body}");
-        }
-    }
-
-    #[test]
-    fn unverified_gateway_off_requires_an_explicit_opt_in() {
-        let config = ProviderConfig::openai(
-            "https://opencode.ai/zen/go/v1/chat/completions",
-            "glm-5.2",
-            "k",
-        );
-        assert!(config.resolve_reasoning_off(false).is_err());
-        assert_eq!(
-            config.resolve_reasoning_off(true),
-            Ok(ReasoningOff::ThinkingDisabled)
-        );
-        // The opt-in reuses the model contract; it never widens it.
-        let unknown = ProviderConfig::openai(
-            "https://opencode.ai/zen/go/v1/chat/completions",
-            "gpt-5.6-sol",
-            "k",
-        );
-        assert!(unknown.resolve_reasoning_off(true).is_err());
-    }
-
-    #[test]
-    fn public_off_policy_answers_for_ui_routes() {
-        use crate::provider::{
-            reasoning_off_support, CODEX_BACKEND_ENDPOINT, OPENCODE_GO_BASE_URL,
-        };
-        assert_eq!(
-            reasoning_off_support(
-                ProviderKind::OpenAiCodex,
-                CODEX_BACKEND_ENDPOINT,
-                "gpt-5.6-terra"
-            ),
-            Ok(ReasoningOff::ResponsesEffortNone)
-        );
-        // GPT-6 Astra rejects `none`, and a gateway route is refused by policy.
-        assert!(reasoning_off_support(
-            ProviderKind::OpenAiCodex,
-            CODEX_BACKEND_ENDPOINT,
-            "gpt-6-astra"
-        )
-        .is_err());
-        assert!(
-            reasoning_off_support(ProviderKind::OpenCodeGo, OPENCODE_GO_BASE_URL, "glm-5.2")
-                .is_err()
-        );
-        assert!(reasoning_off_support(
-            ProviderKind::Anthropic,
-            "https://api.anthropic.com/v1/messages",
-            "claude-fable-5-1"
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn unified_reasoning_details_reach_the_off_violation_detector() {
+    fn unified_reasoning_details_emit_reasoning_events() {
         let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
             "https://api.deepseek.com/chat/completions",
             "deepseek-flash",
             "k",
         ))
         .expect("adapter");
-        for (payload, expected_text) in [
-            (
-                json!({"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"hidden"}]}}]}),
-                Some("hidden"),
-            ),
-            (
-                json!({"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","data":"opaque"}]}}]}),
-                None,
-            ),
-        ] {
-            let events = adapter.parse_event(&payload).expect("events");
-            assert!(
-                events.iter().any(event_contains_reasoning),
-                "reasoning must be visible to the OFF detector: {payload}"
-            );
-            if let Some(text) = expected_text {
-                assert!(
-                    events.iter().any(
-                        |event| matches!(event, ProviderEvent::ReasoningDelta(t) if t == text)
-                    ),
-                    "{payload}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn codex_off_body_sends_none_effort_without_a_summary() {
-        let adapter = OpenAiCodexAdapter::new(
-            ProviderConfig::openai_codex(
-                "https://chatgpt.com/backend-api",
-                "gpt-5.6-sol",
-                "k",
-                "account",
-            )
-            .with_reasoning_disabled()
-            .expect("documented OFF"),
-        )
-        .expect("adapter");
-        let body: Value = serde_json::from_str(&adapter.build_request("hi").body).expect("json");
-        assert_eq!(body["reasoning"], json!({"effort": "none"}));
-        assert!(body.pointer("/reasoning/summary").is_none(), "{body}");
-    }
-
-    #[test]
-    fn reasoning_off_payload_is_verified_per_wire_protocol() {
-        assert!(validate_reasoning_disabled_payload(
-            br#"{"reasoning_effort":"none"}"#,
-            ProviderKind::OpenAiCompatible,
-            ReasoningOff::EffortNone
-        )
-        .is_ok());
-        assert!(validate_reasoning_disabled_payload(
-            br#"{"reasoning_effort":"low"}"#,
-            ProviderKind::OpenAiCompatible,
-            ReasoningOff::EffortNone
-        )
-        .is_err());
-        assert!(validate_reasoning_disabled_payload(
-            br#"{"thinking":{"type":"enabled"}}"#,
-            ProviderKind::OpenAiCompatible,
-            ReasoningOff::EffortNone
-        )
-        .is_err());
-        // DeepSeek: the toggle is the only true OFF on the chat wire.
-        assert!(validate_reasoning_disabled_payload(
-            br#"{"thinking":{"type":"disabled"}}"#,
-            ProviderKind::OpenAiCompatible,
-            ReasoningOff::ThinkingDisabled
-        )
-        .is_ok());
-        assert!(validate_reasoning_disabled_payload(
-            br#"{"thinking":{"type":"disabled"},"reasoning_effort":"high"}"#,
-            ProviderKind::OpenAiCompatible,
-            ReasoningOff::ThinkingDisabled
-        )
-        .is_err());
-        // Anthropic: OFF must not carry output_config or a reasoning effort.
-        assert!(validate_reasoning_disabled_payload(
-            br#"{"thinking":{"type":"disabled"}}"#,
-            ProviderKind::Anthropic,
-            ReasoningOff::ThinkingDisabled
-        )
-        .is_ok());
-        assert!(validate_reasoning_disabled_payload(
-            br#"{"thinking":{"type":"disabled"},"output_config":{"effort":"high"}}"#,
-            ProviderKind::Anthropic,
-            ReasoningOff::ThinkingDisabled
-        )
-        .is_err());
-        assert!(validate_reasoning_disabled_payload(
-            br#"{"thinking":{"type":"enabled","budget_tokens":1024}}"#,
-            ProviderKind::Anthropic,
-            ReasoningOff::ThinkingDisabled
-        )
-        .is_err());
-        // Codex/Responses: the effort lives under `reasoning`, with no summary.
-        assert!(validate_reasoning_disabled_payload(
-            br#"{"reasoning":{"effort":"none"}}"#,
-            ProviderKind::OpenAiCodex,
-            ReasoningOff::ResponsesEffortNone
-        )
-        .is_ok());
-        assert!(validate_reasoning_disabled_payload(
-            br#"{"reasoning":{"summary":"auto"}}"#,
-            ProviderKind::OpenAiCodex,
-            ReasoningOff::ResponsesEffortNone
-        )
-        .is_err());
-        assert!(validate_reasoning_disabled_payload(
-            br#"{"reasoning":{"effort":"none","summary":"auto"}}"#,
-            ProviderKind::OpenAiCodex,
-            ReasoningOff::ResponsesEffortNone
-        )
-        .is_err());
+        let visible = adapter
+            .parse_event(&json!({"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"hidden"}]}}]}))
+            .expect("events");
+        assert!(
+            visible
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::ReasoningDelta(t) if t == "hidden")),
+            "readable reasoning must reach the stream"
+        );
+        let opaque = adapter
+            .parse_event(&json!({"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","data":"opaque"}]}}]}))
+            .expect("events");
+        assert!(
+            opaque
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::ReasoningStarted)),
+            "opaque reasoning must still be observable"
+        );
     }
 
     #[test]

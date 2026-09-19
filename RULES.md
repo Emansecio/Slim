@@ -53,7 +53,8 @@ repita checks aprovados sem mudança relevante, falha ou dúvida concreta.
 Análise e mudanças somente documentais dispensam build, testes de código e deploy.
 
 O deploy local instala uma cópia estática em `%USERPROFILE%\bin\Slim.exe`;
-ela não acompanha o checkout automaticamente. Quando o deploy estiver autorizado:
+ela não acompanha o checkout automaticamente. Alterar código do Slim encerra
+com o deploy:
 
 ```powershell
 .\refresh-slim.ps1          # build release + cópia + smoke
@@ -63,8 +64,8 @@ ela não acompanha o checkout automaticamente. Quando o deploy estiver autorizad
 Escolha uma alternativa. `-Test` já executa `cargo test --workspace`: não rode
 a mesma suíte imediatamente antes sem uma mudança intermediária. Se os checks
 necessários já passaram, use o comando sem `-Test`. Informe `OK:` e a identidade
-do executável ao declarar deploy concluído. Sem deploy, informe que a mudança
-está apenas no checkout; isso não impede concluir uma tarefa de edição local.
+do executável ao declarar deploy concluído. Falha preexistente fora do escopo
+alterado não bloqueia o deploy: ela consta no relatório.
 
 ### R8 — Toolchain e variáveis do ambiente
 O incidente I2 envolveu instalações Rust diferentes e variáveis herdadas inválidas.
@@ -123,8 +124,8 @@ formulário. Indique explicitamente o que não se aplica.
   não aplicáveis a análise e documentação. A suíte completa só é necessária
   quando o risco ou o escopo a justificar (R7).
 - Medições atuais verificadas ou resultados históricos identificados (R2).
-- Deploy autorizado: resultado do script e identidade do binário; caso contrário,
-  não aplicável e mudança somente no checkout (R6, R7).
+- Deploy: resultado do script e identidade do binário; não aplicável a mudança
+  somente documental (R6, R7).
 - Documentação afetada atualizada, ou não aplicável (R11).
 - Incertezas e limites da validação (R4).
 

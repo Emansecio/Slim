@@ -652,7 +652,7 @@ impl ToolRegistry {
 
     pub(crate) fn definitions_for_mode_shared(&self, mode: OperatingMode) -> Arc<[Value]> {
         match mode {
-            OperatingMode::Auto | OperatingMode::Jev => Arc::clone(&MODE_DEFINITIONS_AUTO),
+            OperatingMode::Auto => Arc::clone(&MODE_DEFINITIONS_AUTO),
             OperatingMode::ReadOnly => Arc::clone(&MODE_DEFINITIONS_READ_ONLY),
             OperatingMode::Plan => Arc::clone(&MODE_DEFINITIONS_PLAN),
         }

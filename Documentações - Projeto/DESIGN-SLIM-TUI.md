@@ -387,11 +387,8 @@ milestone correspondente passou seu gate.
   bounded 4 para artefatos independentes; a TUI toma posse do conteúdo bounded
   sem clonar o `String` integral;
 - lifecycle básico de run/tool, resposta final e usage projetados para a TUI;
-- troca `Auto → Read-only → Plan → Jev → Auto` no boundary de modo; Jev impõe
-  reasoning OFF nativo resolvido por protocolo/modelo (OpenAI oficial via
-  `reasoning_effort: none`; DeepSeek e Claude documentados via
-  `thinking: {"type": "disabled"}`) e exige `TYPESAFE_API_KEY`, mantendo o
-  esforço salvo visível como `reasoning OFF` no rodapé;
+- troca `Auto → Read-only → Plan → Auto` no boundary de modo; o esforço salvo
+  continua visível no rodapé;
   Plan na TUI executa o loop com read/list/search (sem write/shell/`ask_question`);
   headless `--plan` continua `approval_required` / exit 10;
 - cancelamento encerra request ativo e processo shell iniciado pelo run;
@@ -1381,19 +1378,6 @@ ao picker sem alterar a velocidade ativa. O backend confirma a projeção com
 mantém a seleção anterior. Persistência usa `model`, `effort` e `codex_fast`.
 Fast solicita prioridade de processamento com maior uso; não reduz reasoning
 e não habilita novas ferramentas. Disponibilidade continua sujeita à conta Codex.
-
-### 7.4.2 Filtro do seletor com Jev ativo
-
-Com `OperatingMode::Jev`, o picker lista apenas as rotas cuja política nativa de
-reasoning OFF é documentada — a mesma função que o runtime aplica
-(`reasoning_off_support`), resolvida localmente e sem rede. Grupos sem modelo
-compatível desaparecem e, quando nada resta, o modal mostra uma linha curta de
-explicação com Esc para voltar; nenhuma troca de modelo é automática. Ao sair de
-Jev a lista completa volta e o esforço salvo é preservado. O filtro é visual: a
-autoridade continua no runtime. A credencial do controlador TypeSafe é pedida na
-ativação (entrada mascarada; `/login typesafe` permite substituí-la) e fica no
-mesmo arquivo protegido, sem virar provider ativo nem tocar no login do modelo
-principal; cancelar preserva o estado anterior.
 
 ### 7.5 Provider OpenCode Go
 

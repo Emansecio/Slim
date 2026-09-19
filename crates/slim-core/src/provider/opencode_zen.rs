@@ -6,7 +6,7 @@ use super::{
     opencode_go::{model, protocol_url, OpenCodeApi, OpenCodeModel},
     HttpRequest, OpenAiCodexAdapter, OpenAiCompatibleAdapter, PreparedProviderRequest,
     ProviderAdapter, ProviderCapabilities, ProviderConfig, ProviderError, ProviderEvent,
-    ProviderKind, ProviderMessage, ReasoningOff,
+    ProviderKind, ProviderMessage,
 };
 
 pub const OPENCODE_ZEN_BASE_URL: &str = "https://opencode.ai/zen/v1";
@@ -293,22 +293,6 @@ impl OpenCodeZenAdapter {
 impl ProviderAdapter for OpenCodeZenAdapter {
     fn kind(&self) -> ProviderKind {
         ProviderKind::OpenCodeZen
-    }
-
-    fn reasoning_off(&self) -> Option<ReasoningOff> {
-        match &self.wire {
-            WireAdapter::Chat(adapter) => adapter.reasoning_off(),
-            WireAdapter::Responses { .. } => None,
-        }
-    }
-
-    fn set_reasoning_disabled(&mut self) -> Result<(), ProviderError> {
-        match &mut self.wire {
-            WireAdapter::Chat(adapter) => adapter.set_reasoning_disabled(),
-            WireAdapter::Responses { .. } => Err(ProviderError::InvalidResponse {
-                message: "Jev requires documented native reasoning OFF; the Responses route has none. No fallback was applied.".into(),
-            }),
-        }
     }
 
     fn wire_kind(&self) -> ProviderKind {

@@ -16,6 +16,27 @@ use crate::block::{
 use crate::composer::Composer;
 use crate::inspector::{InspectorScroll, InspectorState, SearchState};
 
+/// Immediate offline fallback for the OpenCode Go picker. The live catalog
+/// still replaces it after refresh, so the picker is never Codex-only while
+/// the network request is pending or unavailable.
+fn default_open_code_models() -> Vec<OpenCodeModelView> {
+    slim_core::provider::open_code_models()
+        .iter()
+        .map(|model| OpenCodeModelView {
+            id: model.id.to_owned(),
+            name: model.name.to_owned(),
+            context_window_tokens: model.context_window.unwrap_or_default(),
+            max_output_tokens: model.max_output_tokens.unwrap_or_default() as u64,
+            reasoning_levels: model
+                .reasoning_levels
+                .iter()
+                .filter_map(|level| ReasoningEffort::parse(level))
+                .collect(),
+            accepts_images: model.accepts_images,
+        })
+        .collect()
+}
+
 /// Populates a vec of `OpenCodeModelView` from the static ClinePass model catalog.
 fn default_clinepass_models() -> Vec<OpenCodeModelView> {
     slim_core::provider::clinepass_models()
@@ -317,14 +338,11 @@ impl LoginOverlay {
             4 => LoginProvider::CommandCode,
             5 => LoginProvider::Xai,
             6 => LoginProvider::OpenCodeZen,
-            _ => LoginProvider::Typesafe,
+            // The provider list navigates 0..=6, so this arm is only a clamp.
+            _ => LoginProvider::OpenCodeZen,
         }
     }
 }
-
-/// Login overlay index reserved for the TypeSafe credential. The provider list
-/// only navigates 0..=6, so this index is reachable only programmatically.
-pub const TYPESAFE_LOGIN_INDEX: usize = 7;
 
 /// Grouped model overlay (G233/G234): each provider is a collapsible group;
 /// Space toggles collapse; the filter narrows across all groups.
@@ -368,55 +386,17 @@ pub enum ModelRow {
     Zen(usize),
 }
 
-/// Canonical route of each overlay group, in `ModelOverlay::collapsed` order.
-/// The endpoint is the provider's own: an explicit `--endpoint` override is
-/// still validated by the runtime before a run.
-fn group_route(group: usize) -> (slim_core::ProviderKind, &'static str) {
-    match group {
-        0 => (
-            slim_core::ProviderKind::OpenAiCodex,
-            slim_core::provider::CODEX_BACKEND_ENDPOINT,
-        ),
-        1 => (
-            slim_core::ProviderKind::OpenCodeGo,
-            slim_core::provider::OPENCODE_GO_BASE_URL,
-        ),
-        2 => (
-            slim_core::ProviderKind::ClinePass,
-            slim_core::provider::CLINEPASS_BASE_URL,
-        ),
-        3 => (
-            slim_core::ProviderKind::CommandCode,
-            slim_core::provider::COMMANDCODE_BASE_URL,
-        ),
-        _ => (
-            slim_core::ProviderKind::OpenCodeZen,
-            slim_core::provider::OPENCODE_ZEN_BASE_URL,
-        ),
-    }
-}
-
-/// Jev only starts a route whose documented native reasoning OFF applies; the
-/// picker must not advertise anything else. Same function as the runtime.
-fn route_runs_jev(group: usize, model: &str) -> bool {
-    let (kind, endpoint) = group_route(group);
-    slim_core::provider::reasoning_off_support(kind, endpoint, model).is_ok()
-}
-
 impl ModelOverlay {
     /// Builds the flattened row list respecting the filter and collapsed state.
     ///
-    /// With `jev`, every row must also pass the runtime's native-OFF policy, so
-    /// the picker never advertises a route the run would refuse. Groups left
-    /// with no compatible model are dropped entirely; an empty result is the
-    /// signal the overlay renders as "no compatible model".
+    /// Groups left empty by the filter are dropped entirely; an empty result is
+    /// the signal the overlay renders as "no model".
     pub fn rows(
         &self,
         opencode_models: &[OpenCodeModelView],
         clinepass_models: &[OpenCodeModelView],
         command_code_models: &[OpenCodeModelView],
         zen_models: &[OpenCodeModelView],
-        jev: bool,
     ) -> Vec<ModelRow> {
         let query = self.filter.to_lowercase();
         let mut out = Vec::new();
@@ -426,7 +406,7 @@ impl ModelOverlay {
                 || name.to_lowercase().contains(&query)
         };
         let push_group = |out: &mut Vec<ModelRow>, group: usize, rows: Vec<ModelRow>| {
-            if jev && rows.is_empty() {
+            if rows.is_empty() {
                 return;
             }
             out.push(ModelRow::Header(group));
@@ -441,7 +421,6 @@ impl ModelOverlay {
             0,
             ModelAlias::ALL
                 .iter()
-                .filter(|alias| !jev || route_runs_jev(0, alias.id()))
                 .filter(|alias| keep(alias.id(), alias.label()))
                 .map(|alias| ModelRow::Alias(*alias))
                 .collect(),
@@ -454,7 +433,6 @@ impl ModelOverlay {
             opencode_models
                 .iter()
                 .enumerate()
-                .filter(|(_, model)| !jev || route_runs_jev(1, &model.id))
                 .filter(|(_, model)| keep(&model.id, &model.name))
                 .map(|(index, _)| ModelRow::Catalog(index))
                 .collect(),
@@ -467,7 +445,6 @@ impl ModelOverlay {
             clinepass_models
                 .iter()
                 .enumerate()
-                .filter(|(_, model)| !jev || route_runs_jev(2, &model.id))
                 .filter(|(_, model)| keep(&model.id, &model.name))
                 .map(|(index, _)| ModelRow::ClinePass(index))
                 .collect(),
@@ -480,7 +457,6 @@ impl ModelOverlay {
             command_code_models
                 .iter()
                 .enumerate()
-                .filter(|(_, model)| !jev || route_runs_jev(3, &model.id))
                 .filter(|(_, model)| keep(&model.id, &model.name))
                 .map(|(index, _)| ModelRow::CommandCode(index))
                 .collect(),
@@ -493,7 +469,6 @@ impl ModelOverlay {
             zen_models
                 .iter()
                 .enumerate()
-                .filter(|(_, model)| !jev || route_runs_jev(4, &model.id))
                 .filter(|(_, model)| keep(&model.id, &model.name))
                 .map(|(index, _)| ModelRow::Zen(index))
                 .collect(),
@@ -511,9 +486,8 @@ impl ModelOverlay {
 
     /// Returns a fresh overlay with the selection positioned at the currently
     /// active model, or the first non-header row as fallback.
-    /// The four catalogs and the mode flag stay explicit: bundling them into a
-    /// struct would touch every call site without changing behavior.
-    #[allow(clippy::too_many_arguments)]
+    /// The four catalogs stay explicit: bundling them into a struct would touch
+    /// every call site without changing behavior.
     pub fn for_current(
         current_model: &str,
         active_provider: Option<LoginProvider>,
@@ -521,7 +495,6 @@ impl ModelOverlay {
         clinepass_models: &[OpenCodeModelView],
         command_code_models: &[OpenCodeModelView],
         zen_models: &[OpenCodeModelView],
-        jev: bool,
     ) -> Self {
         let active_group = if ModelAlias::parse(current_model).is_some() {
             0
@@ -551,8 +524,6 @@ impl ModelOverlay {
                 LoginProvider::OpenCodeZen => 4,
                 // xAI tem grupo próprio adiado no /models; cai no grupo 0.
                 LoginProvider::Xai => 0,
-                // TypeSafe não é provider de modelo: o grupo ativo segue o modelo.
-                LoginProvider::Typesafe => 0,
             })
         };
         let mut overlay = Self {
@@ -565,7 +536,6 @@ impl ModelOverlay {
             clinepass_models,
             command_code_models,
             zen_models,
-            jev,
         );
         overlay.selected = rows
             .iter()
@@ -762,7 +732,7 @@ impl Default for AppState {
             authenticated: false,
             login_overlay: None,
             model_overlay: None,
-            open_code_models: Vec::new(),
+            open_code_models: default_open_code_models(),
             cline_pass_models: default_clinepass_models(),
             command_code_models: default_command_code_models(),
             zen_models: default_zen_models(),
@@ -2540,7 +2510,6 @@ impl AppState {
                         &self.cline_pass_models,
                         &self.command_code_models,
                         &self.zen_models,
-                        self.mode == OperatingMode::Jev,
                     );
                     overlay.selected = overlay.selected.min(rows.len().saturating_sub(1));
                 }
@@ -2556,7 +2525,6 @@ impl AppState {
                         &self.cline_pass_models,
                         &self.command_code_models,
                         &self.zen_models,
-                        self.mode == OperatingMode::Jev,
                     );
                     overlay.selected = overlay.selected.min(rows.len().saturating_sub(1));
                 }
@@ -2572,7 +2540,6 @@ impl AppState {
                         &self.cline_pass_models,
                         &self.command_code_models,
                         &self.zen_models,
-                        self.mode == OperatingMode::Jev,
                     );
                     overlay.selected = overlay.selected.min(rows.len().saturating_sub(1));
                 }
@@ -2588,7 +2555,6 @@ impl AppState {
                         &self.cline_pass_models,
                         &self.command_code_models,
                         &self.zen_models,
-                        self.mode == OperatingMode::Jev,
                     );
                     overlay.selected = overlay.selected.min(rows.len().saturating_sub(1));
                 }
@@ -2650,36 +2616,6 @@ impl AppState {
                 } else {
                     self.dismiss_notifications_starting_with("Connected:");
                 }
-                self.revisions.status += 1;
-            }
-            UiEvent::JevKeyRequired => {
-                // Reuse the credential overlay: masked entry, Esc cancels and
-                // leaves the previous mode untouched with no call issued.
-                self.login_overlay = Some(LoginOverlay {
-                    selected: TYPESAFE_LOGIN_INDEX,
-                    stage: LoginStage::ApiKey(SensitiveText::default()),
-                    ..LoginOverlay::default()
-                });
-                self.revisions.status += 1;
-            }
-            UiEvent::JevKeySaved => {
-                // Close the entry without claiming the main provider is
-                // authenticated (that flag means the model provider).
-                self.login_overlay = None;
-                self.revisions.status += 1;
-            }
-            UiEvent::JevModelRequired => {
-                // Filtered picker: the user chooses a compatible model; nothing
-                // is switched automatically.
-                self.model_overlay = Some(ModelOverlay::for_current(
-                    &self.model,
-                    self.auth_provider,
-                    &self.open_code_models,
-                    &self.cline_pass_models,
-                    &self.command_code_models,
-                    &self.zen_models,
-                    true,
-                ));
                 self.revisions.status += 1;
             }
             UiEvent::LoginProgress { message } => {

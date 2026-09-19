@@ -113,10 +113,11 @@ struct AuthProviders {
         skip_serializing_if = "Option::is_none"
     )]
     command_code: Option<AuthProvider>,
-    /// Jev controller credential. Deliberately not a `ProviderKind`: it is not
-    /// a model provider and never becomes `active_provider`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    typesafe: Option<AuthProvider>,
+    /// Legacy controller credential. Slim no longer reads or writes it, but the
+    /// entry is preserved so existing auth files keep parsing under
+    /// `deny_unknown_fields` and no stored model credential is lost.
+    #[serde(rename = "typesafe", default, skip_serializing_if = "Option::is_none")]
+    legacy_controller: Option<AuthProvider>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -329,54 +330,6 @@ fn read_auth_document(path: &Path) -> Result<Option<AuthDocument>, AuthError> {
         return Err(AuthError::UnsupportedVersion);
     }
     Ok(Some(document))
-}
-
-/// TypeSafe (Jev) key precedence: the `TYPESAFE_API_KEY` override first, then
-/// the protected local store. The environment value is never copied to disk.
-pub fn resolve_typesafe_api_key() -> Result<Option<String>, AuthError> {
-    if let Some(value) = non_empty_environment_value("TYPESAFE_API_KEY") {
-        return Ok(Some(value));
-    }
-    let Some(path) = auth_file_path()? else {
-        return Ok(None);
-    };
-    load_typesafe_key_from(&path)
-}
-
-/// Offline variant used by tests and by callers that already resolved a path.
-pub fn load_typesafe_key_from(path: &Path) -> Result<Option<String>, AuthError> {
-    let Some(document) = read_auth_document(path)? else {
-        return Ok(None);
-    };
-    let Some(provider) = document.providers.typesafe else {
-        return Ok(None);
-    };
-    let Some(key) = provider.api_key else {
-        return Ok(None);
-    };
-    if key.trim().is_empty() {
-        return Err(AuthError::InvalidSchema);
-    }
-    Ok(Some(key))
-}
-
-/// Persist the Jev key in the same protected store, preserving every model
-/// provider entry and the active provider.
-pub fn save_typesafe_api_key(api_key: &str) -> Result<(), AuthError> {
-    let path = auth_file_path()?.ok_or(AuthError::InvalidPath)?;
-    save_typesafe_key_file(&path, api_key)
-}
-
-pub fn save_typesafe_key_file(path: &Path, api_key: &str) -> Result<(), AuthError> {
-    if api_key.trim().is_empty() || api_key.chars().count() > 4_096 {
-        return Err(AuthError::InvalidSchema);
-    }
-    update_auth_file(path, |document| {
-        document.providers.typesafe = Some(AuthProvider {
-            api_key: Some(api_key.to_owned()),
-            oauth: None,
-        });
-    })
 }
 
 fn provider_name(kind: ProviderKind) -> &'static str {
@@ -1230,42 +1183,20 @@ mod tests {
     }
 
     #[test]
-    fn typesafe_key_round_trips_without_touching_model_credentials() {
-        let root = std::env::temp_dir().join(format!("slim-typesafe-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("auth.json");
+    fn legacy_controller_entry_is_tolerated_and_never_becomes_active() {
+        let document: AuthDocument = serde_json::from_str(
+            r#"{"version":1,"active_provider":"opencode-go","providers":{"opencode-go":{"api_key":"model-fixture-key"},"typesafe":{"api_key":"legacy-fixture-key"}}}"#,
+        )
+        .expect("an auth file carrying the legacy controller entry must keep parsing");
 
-        save_api_key_file(&path, ProviderKind::OpenCodeGo, "model-fixture-key").unwrap();
-        save_typesafe_key_file(&path, "ts-fixture-key").unwrap();
-
+        assert_eq!(document.active_provider.as_deref(), Some("opencode-go"));
         assert_eq!(
-            load_typesafe_key_from(&path).unwrap().as_deref(),
-            Some("ts-fixture-key")
-        );
-        // The model credential survives, and the Jev slot never becomes the
-        // active provider.
-        assert_eq!(
-            load_auth_file(&path, ProviderKind::OpenCodeGo)
-                .unwrap()
+            document
+                .providers
+                .opencode_go
+                .and_then(|provider| provider.api_key)
                 .as_deref(),
             Some("model-fixture-key")
         );
-        let document: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(document["active_provider"], "opencode-go");
-        assert_eq!(
-            document["providers"]["typesafe"]["api_key"],
-            "ts-fixture-key"
-        );
-
-        // A blank key is refused before the file is touched.
-        assert!(save_typesafe_key_file(&path, "   ").is_err());
-        assert_eq!(
-            load_typesafe_key_from(&path).unwrap().as_deref(),
-            Some("ts-fixture-key")
-        );
-
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }

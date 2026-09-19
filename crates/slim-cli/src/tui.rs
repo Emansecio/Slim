@@ -516,9 +516,22 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
             },
         )
     })?;
-    let compaction_policy = layered_config
+    let mut compaction_policy = layered_config
         .compaction_policy()
         .map_err(|error| TuiError::new(ExitCode::Internal, format!("config error: {error}")))?;
+    if let Some(value) = std::env::var("SLIM_COMPACTOR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        compaction_policy.strategy = slim_core::context::CompactionStrategy::parse(&value)
+            .map_err(|error| TuiError::new(ExitCode::InputRequired, error))?;
+    }
+    let jev_prune = if compaction_policy.strategy == slim_core::context::CompactionStrategy::Jev {
+        crate::config::jev_prune_config_from_env()
+            .map_err(|error| TuiError::new(ExitCode::InputRequired, error))?
+    } else {
+        None
+    };
     let endpoint_override = parsed
         .endpoint
         .or_else(|| std::env::var("SLIM_ENDPOINT").ok())
@@ -711,6 +724,9 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
     let mut options = ProviderRunOptions::default()
         .with_content_blocks(content_blocks)
         .with_compaction_handle(slim_core::context::CompactionHandle::new(compaction_policy));
+    if let Some(jev_prune) = jev_prune {
+        options = options.with_jev_prune(jev_prune);
+    }
     if let Some(experiment_id) = parsed.experiment_id {
         options = options.with_experiment_id(experiment_id);
     }
@@ -1489,27 +1505,13 @@ fn answer_active_question(
     }
 }
 
-/// True when the resolved request can run Jev: same policy the execution path
-/// enforces, so the UI can never advertise a route the runtime would refuse.
-fn jev_route_compatible(request: &ProviderRequest) -> bool {
-    slim_core::provider::reasoning_off_support(request.kind, &request.endpoint, &request.model)
-        .is_ok()
-}
-
-/// Applies a mode change. Entering Jev never switches the model: when the
-/// current route cannot run with reasoning OFF, it asks the UI for the
-/// filtered picker instead.
+/// Applies a mode change to the startup state and the active request.
 fn apply_mode_change(startup: &mut TuiStartup, sink: &EventSink, mode: slim_core::OperatingMode) {
     startup.mode = mode;
     if let Some(request) = startup.request.as_mut() {
         request.mode = mode;
     }
     let _ = sink.send(UiEvent::ModeChanged { mode });
-    if mode == slim_core::OperatingMode::Jev
-        && !startup.request.as_ref().is_some_and(jev_route_compatible)
-    {
-        let _ = sink.send(UiEvent::JevModelRequired);
-    }
 }
 
 fn run_worker(
@@ -1545,9 +1547,6 @@ fn run_worker(
     };
     tokio_runtime.block_on(async move {
         let mut skill_memo = None;
-        // Set when entering Jev asked for the TypeSafe key, so saving it resumes
-        // the activation. A later `/login typesafe` only replaces the key.
-        let mut jev_key_pending = false;
         let cwd = startup
             .options
             .workspace_root
@@ -2333,41 +2332,6 @@ fn run_worker(
                                 }
                             }
                         }
-                        LoginProvider::Typesafe => {
-                            // The controller credential is separate from every
-                            // model provider: saving it never becomes the active
-                            // provider and never issues a request.
-                            let saved = tokio::task::spawn_blocking(move || {
-                                crate::auth::save_typesafe_api_key(&key_to_save)
-                            })
-                            .await;
-                            match saved {
-                                Ok(Ok(())) => {
-                                    let _ = sink.send(UiEvent::JevKeySaved);
-                                    let _ = sink.send(UiEvent::Notification {
-                                        message: "Connected: TypeSafe (Jev controller)".into(),
-                                    });
-                                    if jev_key_pending {
-                                        jev_key_pending = false;
-                                        apply_mode_change(
-                                            &mut startup,
-                                            &sink,
-                                            slim_core::OperatingMode::Jev,
-                                        );
-                                    }
-                                }
-                                Ok(Err(error)) => {
-                                    let _ = sink.send(UiEvent::LoginFailed {
-                                        message: error.to_string(),
-                                    });
-                                }
-                                Err(_) => {
-                                    let _ = sink.send(UiEvent::LoginFailed {
-                                        message: "TypeSafe key save task failed".into(),
-                                    });
-                                }
-                            }
-                        }
                         _ => {
                             let _ = sink.send(UiEvent::LoginFailed {
                                 message: "API-key login is unavailable for this provider."
@@ -2600,6 +2564,7 @@ fn run_worker(
                         });
                     }
                     startup.model_override = Some(model.clone());
+                    startup.effort = effort;
                     startup.options.reasoning_effort = Some(effort.id().into());
                     persist_model(&sink, &model, effort.id(), None);
                     let _ = sink.send(UiEvent::ModelChanged { model });
@@ -2637,6 +2602,7 @@ fn run_worker(
                         });
                     }
                     startup.model_override = Some(model.clone());
+                    startup.effort = effort;
                     startup.options.reasoning_effort = zen_model(&model)
                         .filter(|model| model.reasoning_levels.is_empty())
                         .map_or_else(|| Some(effort.id().into()), |_| None);
@@ -2684,6 +2650,7 @@ fn run_worker(
                         });
                     }
                     startup.model_override = Some(model.clone());
+                    startup.effort = effort;
                     startup.options.reasoning_effort = Some(effort.id().into());
                     persist_model(&sink, &model, effort.id(), None);
                     let _ = sink.send(UiEvent::ModelChanged { model });
@@ -2725,6 +2692,7 @@ fn run_worker(
                         });
                     }
                     startup.model_override = Some(model.clone());
+                    startup.effort = effort;
                     startup.options.reasoning_effort = Some(effort.id().into());
                     persist_model(&sink, &model, effort.id(), None);
                     let _ = sink.send(UiEvent::ModelChanged { model });
@@ -2766,6 +2734,7 @@ fn run_worker(
                         });
                     }
                     startup.model_override = Some(model.clone());
+                    startup.effort = effort;
                     startup.options.reasoning_effort = Some(effort.id().into());
                     persist_model(&sink, &model, effort.id(), None);
                     let _ = sink.send(UiEvent::ModelChanged { model });
@@ -3120,30 +3089,6 @@ fn run_worker(
                     reject_unbound_interaction(&sink, request_id);
                 }
                 UiCommand::SetMode(mode) => {
-                    if mode == slim_core::OperatingMode::Jev {
-                        // Fail closed: without the controller credential there is
-                        // nothing to call. Ask for the key and keep the previous
-                        // mode; cancelling the entry preserves it.
-                        match crate::auth::resolve_typesafe_api_key() {
-                            Ok(Some(_)) => {}
-                            Ok(None) => {
-                                jev_key_pending = true;
-                                let _ = sink.send(UiEvent::JevKeyRequired);
-                                continue;
-                            }
-                            Err(error) => {
-                                let _ = sink.send(UiEvent::Notification {
-                                    message: format!("TypeSafe: {error}"),
-                                });
-                                continue;
-                            }
-                        }
-                        if startup.mode != slim_core::OperatingMode::Jev {
-                            let _ = sink.send(UiEvent::Notification {
-                                message: "Jev: reasoning OFF obrigatório. O contexto também será enviado à TypeSafe.".into(),
-                            });
-                        }
-                    }
                     apply_mode_change(&mut startup, &sink, mode);
                 }
                 UiCommand::SetModel {
@@ -3211,6 +3156,7 @@ fn run_worker(
                         });
                     }
                     startup.model_override = Some(model.clone());
+                    startup.effort = effort;
                     startup.options.reasoning_effort = Some(effort.id().into());
                     if let Some(request) = startup.request.as_mut() {
                         request.model.clone_from(&model);
@@ -3791,9 +3737,7 @@ fn oauth_provider(provider: LoginProvider) -> Option<OAuthProvider> {
         LoginProvider::OpenCodeGo
         | LoginProvider::OpenCodeZen
         | LoginProvider::ClinePass
-        | LoginProvider::CommandCode
-        // TypeSafe is a controller credential, never an OAuth model provider.
-        | LoginProvider::Typesafe => None,
+        | LoginProvider::CommandCode => None,
     }
 }
 
@@ -5623,7 +5567,7 @@ mod tests {
                 "--provider".into(),
                 "codex".into(),
                 "--experiment-id".into(),
-                "jev-arm-b".into(),
+                "exp-arm-b".into(),
                 "--task-id".into(),
                 "repo-17".into(),
             ],
@@ -5631,7 +5575,7 @@ mod tests {
         )
         .expect("signed-out startup");
         assert!(startup.request.is_none());
-        assert_eq!(startup.options.experiment_id.as_deref(), Some("jev-arm-b"));
+        assert_eq!(startup.options.experiment_id.as_deref(), Some("exp-arm-b"));
         assert_eq!(startup.options.task_id.as_deref(), Some("repo-17"));
 
         match previous_auth {

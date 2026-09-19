@@ -195,6 +195,10 @@ pub struct ProviderRunOptions {
     pub max_result_bytes: Option<usize>,
     pub cancellation: Option<CancellationToken>,
     pub compaction: Option<CompactionHandle>,
+    /// TypeSafe credential for the Jev pruning compaction strategy. `None`
+    /// keeps every run on the LLM summary path; the runtime never calls
+    /// TypeSafe without it.
+    pub jev_prune: Option<slim_core::context::JevPruneConfig>,
     /// Shared for the whole host application; cloned into per-turn runtimes.
     pub code_intelligence: Option<CodeIntelligenceHandle>,
     /// Application-scoped MCP manager; connections stay lazy per server.
@@ -288,6 +292,11 @@ impl ProviderRunOptions {
         self
     }
 
+    pub fn with_jev_prune(mut self, config: slim_core::context::JevPruneConfig) -> Self {
+        self.jev_prune = Some(config);
+        self
+    }
+
     pub fn with_code_intelligence(mut self, manager: Arc<slim_lsp::LspCodeIntelligence>) -> Self {
         self.code_intelligence = Some(CodeIntelligenceHandle::new(manager));
         self
@@ -343,8 +352,6 @@ pub struct UsageCostSummary {
     pub cost_per_validated_completion_micros: Option<u64>,
     pub failed_attempts_micros: Option<u64>,
     pub compaction_micros: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub jev_micros: Option<u64>,
     pub cancelled_estimated_micros: Option<u64>,
 }
 
@@ -1128,16 +1135,12 @@ fn durable_run_telemetry_context(
         })?;
     let experiment_id = validate_run_telemetry_id(options.experiment_id.as_deref(), "experiment")?;
     let task_id = validate_run_telemetry_id(options.task_id.as_deref(), "task")?;
-    let jev_model = (request.mode == OperatingMode::Jev)
-        .then(requested_jev_model)
-        .flatten();
     Ok(RunTelemetryContext {
         experiment_id,
         task_id,
         mode: request.mode,
         provider: provider_kind_name(request.kind).into(),
         model: request.model.clone(),
-        jev_model,
         build_revision: option_env!("SLIM_BUILD_REVISION")
             .unwrap_or(env!("CARGO_PKG_VERSION"))
             .into(),
@@ -1175,14 +1178,6 @@ fn validate_run_telemetry_id(
     Ok(Some(value.to_owned()))
 }
 
-fn requested_jev_model() -> Option<String> {
-    match std::env::var("SLIM_JEV_MODEL") {
-        Ok(model) if !model.is_empty() && model.len() <= 128 => Some(model),
-        Ok(_) | Err(std::env::VarError::NotUnicode(_)) => None,
-        Err(std::env::VarError::NotPresent) => Some(slim_core::DEFAULT_JEV_MODEL.into()),
-    }
-}
-
 fn run_telemetry_terminal(
     execution: &ProviderExecution,
     outcome: DurableOutcome,
@@ -1211,12 +1206,6 @@ fn run_telemetry_terminal(
         "retry_count": totals.retry_count,
         "cancelled_requests": totals.cancelled_requests,
         "provider_turns": totals.provider_turns,
-        "jev_decisions": totals.jev_decisions,
-        "jev_http_attempts": totals.jev_http_attempts,
-        "jev_input_tokens": totals.jev_input_tokens,
-        "jev_output_tokens": totals.jev_output_tokens,
-        "jev_latency_ms": totals.jev_latency_ms,
-        "jev_usage_unknown": totals.jev_usage_unknown,
         "tool_calls_executed": totals.tool_calls_executed,
         "tool_calls_reused": totals.tool_calls_reused,
         "tool_calls_suppressed": totals.tool_calls_suppressed,
@@ -1236,14 +1225,6 @@ fn run_telemetry_terminal(
             message: format!("serialize durable run costs: {error}"),
         }
     })?;
-    let jev_model = execution
-        .result
-        .usage
-        .requests
-        .iter()
-        .rev()
-        .find(|usage| usage.request_kind == RequestKind::JevDecision)
-        .map(|usage| usage.model.clone());
     Ok(RunTelemetryTerminal {
         stop: execution.result.stop.clone(),
         outcome,
@@ -1261,7 +1242,6 @@ fn run_telemetry_terminal(
             "max_turns": execution.limits.max_turns,
             "max_result_bytes": execution.limits.max_result_bytes,
         }),
-        jev_model,
     })
 }
 
@@ -1624,19 +1604,13 @@ pub(crate) async fn execute_provider_turn_async(
         // hard threshold.
         runtime.set_background_compaction_enabled(true);
     }
-    runtime.register_sensitive_value(&request.api_key);
-    if request.mode == OperatingMode::Jev {
-        // One resolved key for both sources: the environment override wins,
-        // then the protected local store registered through the TUI.
-        let key = crate::auth::resolve_typesafe_api_key()
-            .map_err(|error| ProviderError::InvalidResponse {
-                message: format!("Jev: {error}"),
-            })?
-            .ok_or_else(|| ProviderError::InvalidResponse {
-                message: "Jev requires a TypeSafe API key: set TYPESAFE_API_KEY or register it in the TUI (/login typesafe). Its selected context is also sent to TypeSafe, including when the main model is local.".into(),
-            })?;
-        runtime.enable_jev(&key)?;
+    if let Some(config) = &options.jev_prune {
+        runtime.set_jev_judge(Some(std::sync::Arc::new(
+            slim_core::context::HttpJevJudge::new(config.clone()),
+        )));
+        runtime.register_sensitive_value(&config.api_key);
     }
+    runtime.register_sensitive_value(&request.api_key);
     runtime.restore_task_facts(&options.task_facts, &cwd)?;
     // Per-turn Runtime, application-scoped language-server pool.
     if let Some(code_intelligence) = options.code_intelligence.as_ref() {
@@ -1684,9 +1658,6 @@ pub(crate) async fn execute_provider_turn_async(
             if let Some(effort) = reasoning_effort.as_deref() {
                 config = config.with_reasoning_effort(effort);
             }
-            if request.mode == OperatingMode::Jev {
-                config = config.with_reasoning_disabled()?;
-            }
             let adapter = OpenAiCompatibleAdapter::new(config)?;
             let model = adapter.model().to_owned();
             let adapter = bind_history_scope(
@@ -1725,9 +1696,6 @@ pub(crate) async fn execute_provider_turn_async(
             if let Some(effort) = reasoning_effort.as_deref() {
                 config = config.with_reasoning_effort(effort);
             }
-            if request.mode == OperatingMode::Jev {
-                config = config.with_reasoning_disabled()?;
-            }
             let adapter = OpenAiCodexAdapter::new(config)?.with_fast_mode(options.codex_fast);
             let model = adapter.model().to_owned();
             let adapter = bind_history_scope(
@@ -1757,9 +1725,6 @@ pub(crate) async fn execute_provider_turn_async(
             if let Some(effort) = reasoning_effort.as_deref() {
                 config = config.with_reasoning_effort(effort);
             }
-            if request.mode == OperatingMode::Jev {
-                config = config.with_reasoning_disabled()?;
-            }
             let adapter = AnthropicAdapter::new(config.with_max_output_tokens(max_output_tokens))?;
             let model = adapter.model().to_owned();
             let adapter = bind_history_scope(
@@ -1788,13 +1753,10 @@ pub(crate) async fn execute_provider_turn_async(
                 reasoning_effort.as_deref(),
             )?
             .with_max_output_tokens(max_output_tokens);
-            let mut adapter = match options.provider_session_id.as_deref() {
+            let adapter = match options.provider_session_id.as_deref() {
                 Some(id) => adapter.with_session_id(id),
                 None => adapter,
             };
-            if request.mode == OperatingMode::Jev {
-                adapter.set_reasoning_disabled()?;
-            }
             adapter.validate_messages(&initial_messages)?;
             let model = adapter.model().to_owned();
             let adapter = bind_history_scope(
@@ -1823,13 +1785,10 @@ pub(crate) async fn execute_provider_turn_async(
                 reasoning_effort.as_deref(),
             )?
             .with_max_output_tokens(max_output_tokens);
-            let mut adapter = match options.provider_session_id.as_deref() {
+            let adapter = match options.provider_session_id.as_deref() {
                 Some(id) => adapter.with_session_id(id),
                 None => adapter,
             };
-            if request.mode == OperatingMode::Jev {
-                adapter.set_reasoning_disabled()?;
-            }
             adapter.validate_messages(&initial_messages)?;
             let model = adapter.model().to_owned();
             let adapter = bind_history_scope(
@@ -1851,16 +1810,13 @@ pub(crate) async fn execute_provider_turn_async(
                 .await
         }
         ProviderKind::ClinePass => {
-            let mut adapter = ClinePassAdapter::new(
+            let adapter = ClinePassAdapter::new(
                 &request.endpoint,
                 &request.model,
                 &api_key,
                 reasoning_effort.as_deref(),
             )?
             .with_max_output_tokens(max_output_tokens);
-            if request.mode == OperatingMode::Jev {
-                adapter.set_reasoning_disabled()?;
-            }
             let model = adapter.model().to_owned();
             let adapter = bind_history_scope(
                 adapter,
@@ -1881,7 +1837,7 @@ pub(crate) async fn execute_provider_turn_async(
                 .await
         }
         ProviderKind::CommandCode => {
-            let mut adapter = CommandCodeAdapter::new(
+            let adapter = CommandCodeAdapter::new(
                 &request.endpoint,
                 &request.model,
                 &api_key,
@@ -1889,9 +1845,6 @@ pub(crate) async fn execute_provider_turn_async(
             )?
             .with_max_output_tokens(max_output_tokens)
             .with_zero_data_retention(command_code_zero_data_retention());
-            if request.mode == OperatingMode::Jev {
-                adapter.set_reasoning_disabled()?;
-            }
             let model = adapter.model().to_owned();
             let adapter = bind_history_scope(
                 adapter,
@@ -1912,16 +1865,13 @@ pub(crate) async fn execute_provider_turn_async(
                 .await
         }
         ProviderKind::Xai => {
-            let mut adapter = XaiAdapter::new(
+            let adapter = XaiAdapter::new(
                 &request.endpoint,
                 &request.model,
                 &api_key,
                 reasoning_effort.as_deref(),
             )?
             .with_max_output_tokens(max_output_tokens);
-            if request.mode == OperatingMode::Jev {
-                adapter.set_reasoning_disabled()?;
-            }
             let model = adapter.model().to_owned();
             let adapter = bind_history_scope(
                 adapter,
@@ -2680,33 +2630,8 @@ struct UsagePricing {
 }
 
 fn cost_summary_for_usage(usage: &UsageTotals, pricing: Option<UsagePricing>) -> UsageCostSummary {
-    let jev_micros = (!usage.overflowed
-        && usage
-            .requests
-            .iter()
-            .any(|request| request.request_kind == RequestKind::JevDecision))
-    .then(|| {
-        let weighted = usage
-            .requests
-            .iter()
-            .filter(|request| request.request_kind == RequestKind::JevDecision)
-            .try_fold(0_u128, |total, request| {
-                jev_weighted_cost(request).and_then(|cost| total.checked_add(cost))
-            })?;
-        weighted_cost_micros(weighted)
-    })
-    .flatten();
     let Some(pricing) = pricing else {
-        return UsageCostSummary {
-            total_micros: usage
-                .requests
-                .iter()
-                .all(|request| request.request_kind == RequestKind::JevDecision)
-                .then_some(jev_micros)
-                .flatten(),
-            jev_micros,
-            ..UsageCostSummary::default()
-        };
+        return UsageCostSummary::default();
     };
     let total_micros = (!usage.overflowed
         && !usage.requests.is_empty()
@@ -2751,7 +2676,6 @@ fn cost_summary_for_usage(usage: &UsageTotals, pricing: Option<UsagePricing>) ->
             .flatten(),
         failed_attempts_micros,
         compaction_micros,
-        jev_micros,
         cancelled_estimated_micros,
     }
 }
@@ -2775,9 +2699,6 @@ fn sum_cancelled_estimated_costs<'a>(
 ) -> Option<u64> {
     let weighted = requests.try_fold(0_u128, |total, request| {
         let observed = request_weighted_cost(request, pricing)?;
-        if request.request_kind == RequestKind::JevDecision {
-            return total.checked_add(observed);
-        }
         let unknown_input_tokens = request
             .estimated_input_tokens
             .saturating_sub(request.total_input_tokens());
@@ -2790,19 +2711,7 @@ fn sum_cancelled_estimated_costs<'a>(
     weighted_cost_micros(weighted)
 }
 
-fn jev_weighted_cost(request: &slim_core::RequestUsage) -> Option<u128> {
-    // TypeSafe /models, verified 2026-09-17: jev-1.13.0 input $0.042/1M,
-    // free output. Unknown models/usage are not billed at the main LLM's rate.
-    if request.usage_unknown || request.provider != "typesafe" || request.model != "jev-1.13.0" {
-        return None;
-    }
-    u128::from(request.total_input_tokens()).checked_mul(42_000)
-}
-
 fn request_weighted_cost(request: &slim_core::RequestUsage, pricing: UsagePricing) -> Option<u128> {
-    if request.request_kind == RequestKind::JevDecision {
-        return jev_weighted_cost(request);
-    }
     let cache_write_rate = if request.cache_write_tokens == 0 {
         0
     } else {
@@ -3947,7 +3856,7 @@ mod run_telemetry_tests {
     fn request() -> ProviderRequest {
         ProviderRequest {
             prompt: "prompt-marker".into(),
-            mode: OperatingMode::Jev,
+            mode: OperatingMode::Auto,
             kind: ProviderKind::OpenAiCompatible,
             endpoint: "http://127.0.0.1:1".into(),
             model: "fixture-main".into(),
@@ -3965,7 +3874,7 @@ mod run_telemetry_tests {
         let context = durable_run_telemetry_context(&request(), &options).unwrap();
         assert_eq!(context.experiment_id.as_deref(), Some("exp-a"));
         assert_eq!(context.task_id.as_deref(), Some("task-7"));
-        assert_eq!(context.mode, OperatingMode::Jev);
+        assert_eq!(context.mode, OperatingMode::Auto);
         assert_eq!(context.provider, "openai-compatible");
         assert_eq!(context.model, "fixture-main");
         assert_eq!(context.limits["resolved"], false);
@@ -3975,22 +3884,21 @@ mod run_telemetry_tests {
     }
 
     #[test]
-    fn terminal_usage_is_aggregate_and_records_actual_jev_model_and_limits() {
+    fn terminal_usage_is_aggregate_and_records_limits() {
         let request = request();
         let mut execution = empty_provider_execution(input_required_result(&request));
         execution.result.stop = "provider_completed".into();
         execution.result.validation_source = Some("derived_runtime".into());
         execution.result.usage.requests.push(RequestUsage {
-            request_kind: RequestKind::JevDecision,
-            provider: "typesafe".into(),
-            model: "jev-actual".into(),
+            request_kind: RequestKind::ProviderTurn,
+            provider: "openai-compatible".into(),
+            model: "fixture-main".into(),
             uncached_input_tokens: 13,
             ..RequestUsage::default()
         });
         execution.result.usage.uncached_input_tokens = 13;
         execution.result.usage.output_tokens = 5;
         execution.result.usage.provider_turns = 2;
-        execution.result.usage.jev_decisions = 1;
         execution.result.usage.validated_completion = true;
         execution.limits = ToolLoopLimits {
             max_mutating_tool_calls: 3,
@@ -4003,11 +3911,10 @@ mod run_telemetry_tests {
         };
 
         let terminal = run_telemetry_terminal(&execution, DurableOutcome::Success).unwrap();
-        assert_eq!(terminal.jev_model.as_deref(), Some("jev-actual"));
         assert_eq!(terminal.usage["request_count"], 1);
         assert_eq!(terminal.usage["total_input_tokens"], 13);
         assert_eq!(terminal.usage["total_tokens"], 18);
-        assert_eq!(terminal.usage["jev_decisions"], 1);
+        assert_eq!(terminal.usage["provider_turns"], 2);
         assert!(terminal.usage.get("requests").is_none());
         assert_eq!(terminal.limits["resolved"], true);
         assert_eq!(terminal.limits["context_window_tokens"], 9);

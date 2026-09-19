@@ -70,18 +70,6 @@ pub struct UsageTotals {
     pub retry_count: u64,
     pub cancelled_requests: u64,
     pub provider_turns: u64,
-    #[serde(default)]
-    pub jev_decisions: u64,
-    #[serde(default)]
-    pub jev_http_attempts: u64,
-    #[serde(default)]
-    pub jev_input_tokens: u64,
-    #[serde(default)]
-    pub jev_output_tokens: u64,
-    #[serde(default)]
-    pub jev_latency_ms: u64,
-    #[serde(default)]
-    pub jev_usage_unknown: bool,
     pub tool_calls_executed: u64,
     pub tool_calls_reused: u64,
     pub tool_calls_suppressed: u64,
@@ -160,57 +148,6 @@ impl UsageTotals {
                         },
                         ..OpenRequest::default()
                     });
-                }
-                EventKind::JevDecisionCompleted {
-                    attempts,
-                    model,
-                    input_tokens,
-                    output_tokens,
-                    state_bytes,
-                    duration_ms,
-                    cancelled,
-                    failed,
-                    ..
-                } => {
-                    if let Some(previous) = open.take() {
-                        next_provider_retry_count = totals.finish_request(previous);
-                    }
-                    add(
-                        &mut totals.jev_http_attempts,
-                        u64::from(*attempts),
-                        &mut totals.overflowed,
-                    );
-                    totals.push_jev_request(RequestUsage {
-                        request_kind: RequestKind::JevDecision,
-                        provider: "typesafe".into(),
-                        model: model.clone(),
-                        uncached_input_tokens: input_tokens.unwrap_or_default(),
-                        output_tokens: output_tokens.unwrap_or_default(),
-                        usage_unknown: *attempts > 0
-                            && (input_tokens.is_none() || output_tokens.is_none() || *attempts > 1),
-                        history_bytes: *state_bytes,
-                        provider_latency_ms: *duration_ms,
-                        retry_count: u64::from(attempts.saturating_sub(1)),
-                        cancelled: *cancelled,
-                        failed: *failed,
-                        ..RequestUsage::default()
-                    });
-                }
-                EventKind::JevActionRejected { .. } => {
-                    // The batch never executed, but the provider request did:
-                    // classify it as a failed attempt without duplicating it.
-                    match &mut open {
-                        Some(request) => request.usage.failed = true,
-                        None => {
-                            if let Some(request) =
-                                totals.requests.iter_mut().rev().find(|request| {
-                                    request.request_kind == RequestKind::ProviderTurn
-                                })
-                            {
-                                request.failed = true;
-                            }
-                        }
-                    }
                 }
                 EventKind::UsageBreakdown { usage } => {
                     if let Some(request) = &mut open {
@@ -565,31 +502,6 @@ impl UsageTotals {
         self.mark_input_overflow();
     }
 
-    fn push_jev_request(&mut self, request: RequestUsage) {
-        add(&mut self.jev_decisions, 1, &mut self.overflowed);
-        add(
-            &mut self.jev_input_tokens,
-            request.total_input_tokens(),
-            &mut self.overflowed,
-        );
-        add(
-            &mut self.jev_output_tokens,
-            request.output_tokens,
-            &mut self.overflowed,
-        );
-        add(
-            &mut self.jev_latency_ms,
-            request.provider_latency_ms,
-            &mut self.overflowed,
-        );
-        self.jev_usage_unknown |= request.usage_unknown;
-        self.usage_unknown |= request.usage_unknown;
-        if request.cancelled {
-            add(&mut self.cancelled_requests, 1, &mut self.overflowed);
-        }
-        self.requests.push(request);
-    }
-
     fn finish_request(&mut self, mut open: OpenRequest) -> u64 {
         if !open.saw_breakdown {
             open.usage.uncached_input_tokens = open.fallback_input_tokens;
@@ -597,10 +509,7 @@ impl UsageTotals {
         }
         open.usage.usage_unknown |=
             !open.saw_terminal_usage || !open.input_usage_known || !open.output_usage_known;
-        if open.usage.request_kind != RequestKind::JevDecision
-            && !open.usage.usage_unknown
-            && !open.usage.response_cache_hit
-        {
+        if !open.usage.usage_unknown && !open.usage.response_cache_hit {
             open.usage.estimation_error_tokens = signed_difference(
                 open.usage.estimated_input_tokens,
                 open.usage.total_input_tokens(),
@@ -613,10 +522,6 @@ impl UsageTotals {
         };
         if open.usage.request_kind == RequestKind::Compaction {
             self.push_compaction_request(open.usage);
-            return retry;
-        }
-        if open.usage.request_kind == RequestKind::JevDecision {
-            self.push_jev_request(open.usage);
             return retry;
         }
         add(&mut self.provider_turns, 1, &mut self.overflowed);

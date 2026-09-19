@@ -40,10 +40,10 @@ pub use provider::{
     OpenAiCompatibleAdapter, PreparedProviderRequest, ProviderAdapter, ProviderConfig,
     ProviderError, ProviderEvent, ProviderKind, ProviderMessage, ProviderPhase, ProviderPricing,
     ProviderRequestComponents, ProviderRequestFingerprints, ProviderTimeouts, ProviderToolCall,
-    ReasoningOff, UsageBreakdown,
+    UsageBreakdown,
 };
 pub use runtime::{
     tool_call_is_read_only, without_workspace_snapshot, AgentLoopConfig, AgentLoopResult,
     AgentLoopStop, InProcessCapabilityAdapter, RequestUsage, Runtime, RuntimeCapabilityAdapter,
-    RuntimeCapabilityBridge, RuntimeCapabilityTarget, UsageTotals, DEFAULT_JEV_MODEL,
+    RuntimeCapabilityBridge, RuntimeCapabilityTarget, UsageTotals,
 };

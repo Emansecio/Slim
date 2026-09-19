@@ -59,7 +59,6 @@ pub struct RunTelemetryContext {
     pub mode: crate::OperatingMode,
     pub provider: String,
     pub model: String,
-    pub jev_model: Option<String>,
     pub build_revision: String,
     /// Unix timestamp in milliseconds.
     pub started_at: u64,
@@ -78,8 +77,6 @@ pub struct RunTelemetryTerminal {
     pub usage: Value,
     pub costs: Value,
     pub limits: Value,
-    /// Actual Jev model observed in accounting, when available.
-    pub jev_model: Option<String>,
 }
 
 /// Synchronous executor boundary used by the manual durable driver.
@@ -471,9 +468,6 @@ fn run_telemetry_fact(
     duration_ms: Option<u64>,
 ) -> Option<super::schema_v2::DurableFact> {
     let context = spec.run_telemetry.as_ref()?;
-    let jev_model = terminal
-        .and_then(|terminal| terminal.jev_model.as_ref())
-        .or(context.jev_model.as_ref());
     let (stop, outcome, validated_completion, validation_source, usage, costs, limits, phase) =
         match terminal {
             Some(terminal) => (
@@ -508,7 +502,6 @@ fn run_telemetry_fact(
             "mode": context.mode,
             "provider": context.provider,
             "model": context.model,
-            "jev_model": jev_model,
             "build_revision": context.build_revision,
             "started_at": context.started_at,
             "duration_ms": duration_ms,

@@ -82,6 +82,36 @@ impl AdaptiveTokenEstimator {
     }
 }
 
+/// Which producer builds the compacted-context checkpoint. `Jev` asks the
+/// TypeSafe decision model to prune stale tool calls/results verbatim; any
+/// failure falls back to the LLM `Summary` path with an explicit event.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionStrategy {
+    Summary,
+    #[default]
+    Jev,
+}
+
+impl CompactionStrategy {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Summary => "summary",
+            Self::Jev => "jev",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "summary" | "llm" => Ok(Self::Summary),
+            "jev" | "prune" => Ok(Self::Jev),
+            other => Err(format!(
+                "unknown compaction strategy '{other}'; expected 'summary' or 'jev'"
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompactionPolicy {
     pub enabled: bool,
@@ -89,6 +119,7 @@ pub struct CompactionPolicy {
     pub keep_recent_tokens: u64,
     pub summary_max_bytes: usize,
     pub manual_instructions_max_bytes: usize,
+    pub strategy: CompactionStrategy,
 }
 
 impl CompactionPolicy {
@@ -145,6 +176,7 @@ impl Default for CompactionPolicy {
             keep_recent_tokens: 20_000,
             summary_max_bytes: 64 * 1024,
             manual_instructions_max_bytes: 4 * 1024,
+            strategy: CompactionStrategy::default(),
         }
     }
 }
@@ -1093,7 +1125,7 @@ fn without_pinned(
         .collect()
 }
 
-fn format_transcript(messages: &[ProviderMessage]) -> String {
+pub(crate) fn format_transcript(messages: &[ProviderMessage]) -> String {
     messages
         .iter()
         .map(|message| format_provider_message(message, true))

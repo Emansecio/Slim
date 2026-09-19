@@ -28,7 +28,6 @@ Modes:
   --fake             Use the deterministic offline provider
   --plan             Allow inspection without workspace mutations
   --read-only        Disable workspace mutations
-  --jev              TypeSafe-controlled actions, native reasoning OFF (TYPESAFE_API_KEY)
 
 Provider:
   --provider NAME    Provider route
@@ -47,6 +46,8 @@ Input and sessions:
   --abandon-pending  With --recover: abandon unfinished work; effects stay unverified
   --experiment-id ID Label durable run telemetry for a benchmark experiment
   --task-id ID       Label durable run telemetry for a benchmark task
+  --compactor WHICH  Compaction strategy: jev (default, falls back to summary)
+                     or summary (LLM checkpoint). Env: SLIM_COMPACTOR
 
 Output:
   --verbose          Include detailed human-readable events
@@ -84,6 +85,7 @@ pub(crate) struct ParsedArgs {
     pub abandon_pending: bool,
     pub experiment_id: Option<String>,
     pub task_id: Option<String>,
+    pub compactor: Option<String>,
     pub image_paths: Vec<String>,
     pub positional: Vec<String>,
     pub tui: bool,
@@ -108,6 +110,7 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
         abandon_pending: false,
         experiment_id: None,
         task_id: None,
+        compactor: None,
         image_paths: Vec::new(),
         positional: Vec::new(),
         tui: false,
@@ -117,36 +120,26 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
     };
     let mut index = 0;
     // Parsed flags are the only evidence of a selected mode: values such as
-    // `--prompt "--jev"` are prompt text, not a mode selection.
-    let mut jev_flag = false;
-    let mut opposed_mode_flag = false;
+    // `--prompt "--plan"` are prompt text, not a mode selection.
     while index < args.len() {
         match args[index].as_str() {
             "--tui" => parsed.tui = true,
             "--headless" => parsed.headless = true,
-            "--fake" => {
-                parsed.fake = true;
-                opposed_mode_flag = true;
-            }
+            "--fake" => parsed.fake = true,
             "--abandon-pending" => parsed.abandon_pending = true,
             "--fast" => parsed.codex_fast = Some(true),
             "--normal" => parsed.codex_fast = Some(false),
             "--verbose" => parsed.verbose = true,
-            "--jev" => {
-                parsed.mode = OperatingMode::Jev;
-                jev_flag = true;
-            }
             "--plan" => {
                 parsed.mode = OperatingMode::Plan;
-                opposed_mode_flag = true;
             }
             "--read-only" => {
                 parsed.mode = OperatingMode::ReadOnly;
-                opposed_mode_flag = true;
             }
             "--jsonl" => parsed.format = OutputFormat::Jsonl,
             "--prompt" | "--provider" | "--model" | "--endpoint" | "--session" | "--resume"
-            | "--recover" | "--image" | "--effort" | "--experiment-id" | "--task-id" => {
+            | "--recover" | "--image" | "--effort" | "--experiment-id" | "--task-id"
+            | "--compactor" => {
                 let option = args[index].clone();
                 index += 1;
                 let value = args.get(index).cloned().ok_or_else(|| {
@@ -164,6 +157,7 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
                     "--image" => parsed.image_paths.push(value),
                     "--experiment-id" => parsed.experiment_id = Some(value),
                     "--task-id" => parsed.task_id = Some(value),
+                    "--compactor" => parsed.compactor = Some(value),
                     _ => unreachable!(),
                 }
             }
@@ -176,26 +170,6 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
             value => parsed.positional.push(value.to_owned()),
         }
         index += 1;
-    }
-    if jev_flag {
-        if opposed_mode_flag {
-            return Err(failure(
-                ExitCode::InputRequired,
-                "--jev is incompatible with --plan, --read-only and --fake\n",
-            ));
-        }
-        if parsed
-            .effort
-            .as_deref()
-            .is_some_and(|effort| !matches!(effort, "none" | "off"))
-        {
-            return Err(failure(
-                ExitCode::InputRequired,
-                "--jev requires native reasoning OFF; remove --effort or use none\n",
-            ));
-        }
-        // OFF is imposed by the Jev provider policy, not saved as a TUI effort.
-        parsed.effort = None;
     }
     let session_modes = [
         parsed.session_path.is_some(),
@@ -248,6 +222,7 @@ where
         abandon_pending,
         experiment_id,
         task_id,
+        compactor,
         image_paths,
         positional,
         tui: _,
@@ -264,6 +239,26 @@ where
             "--verbose is available only with human text output; remove --jsonl\n",
         );
     }
+    // Validate the flag and the environment value even when the run never
+    // compacts (`--fake`), so a typo is reported instead of silently ignored.
+    let parse_compactor = |value: &str| slim_core::context::CompactionStrategy::parse(value);
+    let cli_compactor = match compactor.as_deref() {
+        Some(value) => match parse_compactor(value) {
+            Ok(strategy) => Some(strategy),
+            Err(error) => return failure(ExitCode::InputRequired, &format!("{error}\n")),
+        },
+        None => None,
+    };
+    let env_compactor = match cli_compactor {
+        Some(strategy) => Some(strategy),
+        None => match std::env::var("SLIM_COMPACTOR") {
+            Ok(value) if !value.trim().is_empty() => match parse_compactor(&value) {
+                Ok(strategy) => Some(strategy),
+                Err(error) => return failure(ExitCode::InputRequired, &format!("{error}\n")),
+            },
+            _ => None,
+        },
+    };
     if fake && (experiment_id.is_some() || task_id.is_some()) {
         return failure(
             ExitCode::InputRequired,
@@ -319,8 +314,7 @@ where
         }
     }
 
-    let provider_requested = mode == OperatingMode::Jev
-        || provider.is_some()
+    let provider_requested = provider.is_some()
         || endpoint.is_some()
         || model.is_some()
         || session_path.is_some()
@@ -362,9 +356,25 @@ where
             Ok(config) => config,
             Err(error) => return failure(ExitCode::Internal, &format!("config error: {error}\n")),
         };
-        let compaction_policy = match layered_config.compaction_policy() {
+        let mut compaction_policy = match layered_config.compaction_policy() {
             Ok(policy) => policy,
             Err(error) => return failure(ExitCode::Internal, &format!("config error: {error}\n")),
+        };
+        // Compaction strategy precedence: --compactor > SLIM_COMPACTOR >
+        // [compaction] strategy > default (Jev with summary fallback).
+        if let Some(strategy) = env_compactor {
+            compaction_policy.strategy = strategy;
+        }
+        // The Jev pruning strategy only activates with a Jev credential;
+        // without it the runtime falls back to the LLM summary with an event.
+        let jev_prune = if compaction_policy.strategy == slim_core::context::CompactionStrategy::Jev
+        {
+            match crate::config::jev_prune_config_from_env() {
+                Ok(config) => config,
+                Err(error) => return failure(ExitCode::InputRequired, &format!("{error}\n")),
+            }
+        } else {
+            None
         };
         let credential = match crate::auth::resolve_provider_credential(kind) {
             Ok(Some(credential)) => credential,
@@ -468,6 +478,9 @@ where
         let mut options = ProviderRunOptions::default()
             .with_content_blocks(content_blocks)
             .with_compaction_handle(slim_core::context::CompactionHandle::new(compaction_policy));
+        if let Some(jev_prune) = jev_prune {
+            options = options.with_jev_prune(jev_prune);
+        }
         if let Some(experiment_id) = experiment_id {
             options = options.with_experiment_id(experiment_id);
         }
@@ -880,7 +893,7 @@ mod tests {
         let args = [
             "--headless",
             "--experiment-id",
-            "jev-arm-b",
+            "exp-arm-b",
             "--task-id",
             "repo-17",
             "--prompt",
@@ -890,7 +903,7 @@ mod tests {
         .map(str::to_owned)
         .collect::<Vec<_>>();
         let parsed = parse_cli_args(&args).expect("parse benchmark labels");
-        assert_eq!(parsed.experiment_id.as_deref(), Some("jev-arm-b"));
+        assert_eq!(parsed.experiment_id.as_deref(), Some("exp-arm-b"));
         assert_eq!(parsed.task_id.as_deref(), Some("repo-17"));
         assert_eq!(parsed.prompt.as_deref(), Some("inspect"));
     }

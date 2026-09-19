@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use serde::Deserialize;
-use slim_core::context::CompactionPolicy;
+use slim_core::context::{CompactionPolicy, JevBackend, JevPruneConfig};
 
 pub struct Config;
 
@@ -239,6 +239,8 @@ pub struct FileCompactionConfig {
     pub summary_max_bytes: Option<usize>,
     #[serde(default)]
     pub manual_instructions_max_bytes: Option<usize>,
+    #[serde(default)]
+    pub strategy: Option<String>,
 }
 
 /// Merged view of every config layer (project wins over global).
@@ -288,6 +290,10 @@ impl LayeredConfig {
                 );
             }
             policy.manual_instructions_max_bytes = value;
+        }
+        if let Some(value) = self.compaction.strategy.as_deref() {
+            policy.strategy = slim_core::context::CompactionStrategy::parse(value)
+                .map_err(|error| format!("compaction.strategy: {error}"))?;
         }
         Ok(policy)
     }
@@ -639,6 +645,45 @@ fn file_default<T>(value: Option<T>, env_key: &str) -> Option<T> {
     value.filter(|_| std::env::var_os(env_key).is_none())
 }
 
+const JEV_BACKEND_ENV: &str = "SLIM_JEV_BACKEND";
+const TYPESAFE_API_KEY_ENV: &str = "TYPESAFE_API_KEY";
+const AI_GATEWAY_API_KEY_ENV: &str = "AI_GATEWAY_API_KEY";
+const JEV_MODEL_ENV: &str = "SLIM_JEV_MODEL";
+
+/// Resolves the Jev pruning credential from the environment. `None` leaves the
+/// runtime on the LLM summary path without any external call.
+///
+/// `SLIM_JEV_BACKEND` (`typesafe` or `vercel`) selects the endpoint explicitly.
+/// Without it the credential decides, because Vercel AI Gateway keys carry the
+/// `vck_` prefix Vercel issues. A key reads from either variable, so a gateway
+/// key stored under `TYPESAFE_API_KEY` still reaches the gateway.
+pub fn jev_prune_config_from_env() -> Result<Option<JevPruneConfig>, String> {
+    jev_prune_config_from(|key| std::env::var(key).ok())
+}
+
+pub(crate) fn jev_prune_config_from(
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Option<JevPruneConfig>, String> {
+    let api_key = nonempty_env(&env, TYPESAFE_API_KEY_ENV)
+        .or_else(|| nonempty_env(&env, AI_GATEWAY_API_KEY_ENV));
+    let backend = match nonempty_env(&env, JEV_BACKEND_ENV) {
+        Some(value) => JevBackend::parse(&value)?,
+        None => JevBackend::for_api_key(api_key.as_deref().unwrap_or_default()),
+    };
+    let Some(api_key) = api_key else {
+        return Ok(None);
+    };
+    let config = JevPruneConfig::new(backend, api_key);
+    Ok(Some(match nonempty_env(&env, JEV_MODEL_ENV) {
+        Some(model) => config.with_model(model),
+        None => config,
+    }))
+}
+
+fn nonempty_env(env: &impl Fn(&str) -> Option<String>, key: &str) -> Option<String> {
+    env(key).filter(|value| !value.trim().is_empty())
+}
+
 pub(crate) fn load_layered_from(
     paths: impl IntoIterator<Item = PathBuf>,
 ) -> Result<LayeredConfig, String> {
@@ -777,6 +822,9 @@ fn merge_layer(target: &mut LayeredConfig, source: FileConfig) {
             target.compaction.manual_instructions_max_bytes =
                 compaction.manual_instructions_max_bytes;
         }
+        if compaction.strategy.is_some() {
+            target.compaction.strategy = compaction.strategy;
+        }
     }
 }
 
@@ -796,6 +844,94 @@ mod tests {
         assert_eq!(config.max_output_tokens, Some(8192));
         assert_eq!(config.timeout_secs, Some(180));
         assert_eq!(config.max_result_bytes, Some(32768));
+    }
+
+    #[test]
+    fn jev_credential_resolution_picks_the_backend_and_model() {
+        let resolve = |pairs: &[(&str, &str)]| {
+            let env = pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect::<BTreeMap<_, _>>();
+            jev_prune_config_from(|key| env.get(key).cloned())
+        };
+
+        // Without a credential the runtime must not call any endpoint.
+        assert_eq!(resolve(&[]), Ok(None));
+        assert_eq!(resolve(&[("TYPESAFE_API_KEY", "  ")]), Ok(None));
+
+        // A plain key stays on TypeSafe's own API.
+        let typesafe = resolve(&[("TYPESAFE_API_KEY", "tsk_1")])
+            .expect("resolved")
+            .expect("configured");
+        assert_eq!(typesafe.backend, JevBackend::Typesafe);
+        assert_eq!(typesafe.model, "jev-latest");
+
+        // A `vck_` key selects the Vercel AI Gateway and its model id.
+        let gateway = resolve(&[("AI_GATEWAY_API_KEY", "vck_1")])
+            .expect("resolved")
+            .expect("configured");
+        assert_eq!(gateway.backend, JevBackend::Vercel);
+        assert_eq!(gateway.model, "typesafe-ai/jev");
+
+        // An explicit backend wins over the prefix, and the model is overridable.
+        let explicit = resolve(&[
+            ("SLIM_JEV_BACKEND", "typesafe"),
+            ("TYPESAFE_API_KEY", "tsk_1"),
+            ("SLIM_JEV_MODEL", "jev-1.13.0"),
+        ])
+        .expect("resolved")
+        .expect("configured");
+        assert_eq!(explicit.backend, JevBackend::Typesafe);
+        assert_eq!(explicit.model, "jev-1.13.0");
+
+        assert!(
+            resolve(&[("SLIM_JEV_BACKEND", "openai"), ("TYPESAFE_API_KEY", "k")]).is_err(),
+            "an unknown backend is rejected instead of silently ignored"
+        );
+    }
+
+    #[test]
+    fn compaction_strategy_defaults_to_jev_and_parses_from_toml() {
+        // Default: Jev pruning with the runtime's summary fallback.
+        let default_policy = LayeredConfig::default()
+            .compaction_policy()
+            .expect("default policy");
+        assert_eq!(
+            default_policy.strategy,
+            slim_core::context::CompactionStrategy::Jev
+        );
+
+        let project =
+            FileConfig::parse("[compaction]\nstrategy = \"summary\"\n").expect("project config");
+        let mut layered = LayeredConfig::default();
+        merge_layer(&mut layered, project);
+        assert_eq!(
+            layered.compaction_policy().expect("policy").strategy,
+            slim_core::context::CompactionStrategy::Summary
+        );
+
+        let global =
+            FileConfig::parse("[compaction]\nstrategy = \"jev\"\n").expect("global config");
+        let mut layered = LayeredConfig::default();
+        merge_layer(&mut layered, global);
+        assert_eq!(
+            layered.compaction_policy().expect("policy").strategy,
+            slim_core::context::CompactionStrategy::Jev
+        );
+    }
+
+    #[test]
+    fn compaction_strategy_rejects_unknown_value() {
+        let config = FileConfig::parse("[compaction]\nstrategy = \"guess\"\n").expect("parses");
+        let mut layered = LayeredConfig::default();
+        merge_layer(&mut layered, config);
+        let error = layered
+            .compaction_policy()
+            .expect_err("unknown strategy rejected");
+        assert!(error.contains("compaction.strategy"), "{error}");
+        assert!(error.contains("summary"), "{error}");
+        assert!(error.contains("jev"), "{error}");
     }
 
     #[test]

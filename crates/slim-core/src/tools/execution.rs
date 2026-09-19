@@ -1458,6 +1458,20 @@ fn typed_arguments(
                 return Err("shell timeout_ms must be 1..=120000".into());
             }
             let command = nonempty_string_argument("command")?;
+            // Decode exactly one JSON layer; never split a command line or
+            // reinterpret the contents of an individual argument.
+            if let Some(encoded) = arguments.get("args").and_then(Value::as_str) {
+                if encoded.len() > 64 * 1024 {
+                    return Err("shell JSON-encoded args exceeds 64 KiB".into());
+                }
+                let decoded: Vec<String> = serde_json::from_str(encoded).map_err(|_| {
+                    "shell args must be an array of strings; only one JSON array layer can be decoded, never a command line".to_owned()
+                })?;
+                arguments["args"] = serde_json::json!(decoded);
+                admission_notes.push(
+                    "shell args JSON array decoded once; argument boundaries preserved".into(),
+                );
+            }
             let args = arguments
                 .get("args")
                 .map(|value| {
@@ -2346,6 +2360,65 @@ mod tests {
             diagnostics.canonical_fingerprint,
             diagnostics_canonical.canonical_fingerprint
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shell_double_encoded_args_preserve_identity_and_never_split_commands() {
+        let root = workspace("shell-json-args");
+        let values = vec!["check.py", "two words", "a;b", "$(literal)", ""];
+        let canonical = prepare(&root, "shell", json!({"command":"python", "args":values}));
+        let encoded = prepare(
+            &root,
+            "shell",
+            json!({"command":"python", "args":serde_json::to_string(&values).unwrap()}),
+        );
+        assert!(encoded.error.is_none(), "{:?}", encoded.error);
+        assert_eq!(
+            canonical.canonical_fingerprint,
+            encoded.canonical_fingerprint
+        );
+        match &encoded.arguments {
+            PreparedToolArguments::Shell { command, args, .. } => {
+                assert_eq!(command, "python");
+                assert_eq!(
+                    args.as_deref(),
+                    Some(
+                        values
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .as_slice()
+                    )
+                );
+            }
+            _ => panic!("expected a typed shell invocation"),
+        }
+        assert!(encoded
+            .admission_notes
+            .iter()
+            .any(|note| note.contains("decoded once")));
+        for invalid in [
+            "check.py --flag",
+            "[1]",
+            "[true]",
+            r#"[["check.py"]]"#,
+            r#"{"0":"check.py"}"#,
+            r#""[\"check.py\"]""#,
+            "null",
+        ] {
+            let call = prepare(&root, "shell", json!({"command":"python", "args":invalid}));
+            assert!(call.error.is_some(), "{invalid}");
+            assert!(matches!(call.arguments, PreparedToolArguments::External));
+        }
+        let too_large = serde_json::to_string(&vec!["x".repeat(65536)]).unwrap();
+        assert!(prepare(
+            &root,
+            "shell",
+            json!({"command":"python", "args":too_large})
+        )
+        .error
+        .is_some());
         let _ = fs::remove_dir_all(root);
     }
 

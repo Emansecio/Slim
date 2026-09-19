@@ -176,17 +176,10 @@ impl OpenAiCodexAdapter {
             "parallel_tool_calls": true,
             "tools": tools,
         });
-        let reasoning =
-            if self.config.reasoning_off == Some(super::ReasoningOff::ResponsesEffortNone) {
-                // Native OFF: no summary, and the documented `none` effort.
-                json!({ "effort": "none" })
-            } else {
-                let mut reasoning = json!({ "summary": "auto" });
-                if let Some(effort) = self.config.reasoning_effort.as_deref() {
-                    reasoning["effort"] = json!(effort);
-                }
-                reasoning
-            };
+        let mut reasoning = json!({ "summary": "auto" });
+        if let Some(effort) = self.config.reasoning_effort.as_deref() {
+            reasoning["effort"] = json!(effort);
+        }
         body["reasoning"] = reasoning;
         if codex_model(&self.config.model).is_some() {
             body["text"] = json!({"verbosity": "low"});
@@ -247,14 +240,6 @@ fn codex_content(message: &ProviderMessage) -> Vec<Value> {
 impl ProviderAdapter for OpenAiCodexAdapter {
     fn kind(&self) -> ProviderKind {
         ProviderKind::OpenAiCodex
-    }
-
-    fn reasoning_off(&self) -> Option<super::ReasoningOff> {
-        self.config.reasoning_off
-    }
-
-    fn set_reasoning_disabled(&mut self) -> Result<(), ProviderError> {
-        self.config.enable_reasoning_disabled()
     }
 
     fn model(&self) -> &str {

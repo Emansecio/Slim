@@ -938,9 +938,9 @@ pub struct WrapCache {
     /// Slash completion matches keyed by (query, skill list revision).
     #[allow(clippy::type_complexity)]
     slash_memo: Option<((String, u64), Arc<Vec<String>>)>,
-    /// Model overlay flattened rows keyed by (filter, collapsed, catalog rev, Jev).
+    /// Model overlay flattened rows keyed by (filter, collapsed, catalog rev).
     #[allow(clippy::type_complexity)]
-    model_rows_memo: Option<((String, [bool; 5], u64, bool), Arc<Vec<ModelRow>>)>,
+    model_rows_memo: Option<((String, [bool; 5], u64), Arc<Vec<ModelRow>>)>,
     /// Inspector panel lines keyed by (kind, content, status, second, width,
     /// palette). The row count is retained independently of the palette so a
     /// keyboard-only probe can reuse it without rebuilding styled lines.
@@ -1230,7 +1230,7 @@ impl WrapCache {
         .clone()
     }
 
-    /// Flattened model-overlay rows keyed by (filter, collapsed, catalogs, Jev).
+    /// Flattened model-overlay rows keyed by (filter, collapsed, catalogs).
     /// Mirrors `ModelOverlay::for_current`: the catalogs stay explicit.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn model_rows(
@@ -1241,12 +1241,11 @@ impl WrapCache {
         command_code: &[crate::api::OpenCodeModelView],
         zen: &[crate::api::OpenCodeModelView],
         catalog_rev: u64,
-        jev: bool,
     ) -> Arc<Vec<ModelRow>> {
         memoized(
             &mut self.model_rows_memo,
-            (overlay.filter.clone(), overlay.collapsed, catalog_rev, jev),
-            || Arc::new(overlay.rows(opencode, clinepass, command_code, zen, jev)),
+            (overlay.filter.clone(), overlay.collapsed, catalog_rev),
+            || Arc::new(overlay.rows(opencode, clinepass, command_code, zen)),
         )
         .clone()
     }

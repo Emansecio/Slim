@@ -86,10 +86,8 @@ fn event_sequence_is_monotonic_and_covers_the_initial_contract() {
     assert_eq!(OperatingMode::default(), OperatingMode::Auto);
     assert_eq!(OperatingMode::Auto.next(), OperatingMode::ReadOnly);
     assert_eq!(OperatingMode::ReadOnly.next(), OperatingMode::Plan);
-    assert_eq!(OperatingMode::Plan.next(), OperatingMode::Jev);
-    assert_eq!(OperatingMode::Jev.next(), OperatingMode::Auto);
+    assert_eq!(OperatingMode::Plan.next(), OperatingMode::Auto);
     assert!(OperatingMode::Auto.allows_mutation());
-    assert!(OperatingMode::Jev.allows_mutation());
     assert!(!OperatingMode::ReadOnly.allows_mutation());
     assert!(!OperatingMode::Plan.allows_mutation());
 

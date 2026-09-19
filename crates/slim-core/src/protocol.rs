@@ -7,20 +7,18 @@ pub enum OperatingMode {
     Auto,
     ReadOnly,
     Plan,
-    Jev,
 }
 
 impl OperatingMode {
     pub fn allows_mutation(self) -> bool {
-        matches!(self, Self::Auto | Self::Jev)
+        matches!(self, Self::Auto)
     }
 
     pub fn next(self) -> Self {
         match self {
             Self::Auto => Self::ReadOnly,
             Self::ReadOnly => Self::Plan,
-            Self::Plan => Self::Jev,
-            Self::Jev => Self::Auto,
+            Self::Plan => Self::Auto,
         }
     }
 }
