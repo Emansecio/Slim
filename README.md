@@ -1,5 +1,26 @@
 # Slim
 
+**Checkout — correções da compactação Jev, 19/09/2026:** cada lote de
+julgamento agora recebe o mesmo estado JSON limitado: a tarefa, as instruções
+de compactação manuais, a cronologia resumida sem corpos de ferramenta, o
+contexto retido e o conjunto completo de candidatos, identificados por
+caminhos explícitos como `candidates.candidate_0`. Acima do limite explícito
+de candidatos, a compactação recua para o resumo com o prefixo intacto. O Jev
+em segundo plano só inicia em um turno de ferramenta não suprimido que passa
+no break-even; as identidades das chamadas antigas permanecem num manifesto
+determinístico limitado e no arquivo completo de recuperação. A poda ficou
+conservadora: probabilidade de retenção
+ambígua é preservada, e só valores abaixo de `0.2` podem descartar evidência.
+A transformação é transacional — o prefixo original não muda quando a redução
+por par ou a redução total do prompt de resumo fica abaixo dos gates. A economia
+estimada passou a medir a representação limitada realmente enviada ao resumo,
+em vez do resultado bruto da ferramenta. Os eventos Jev registram duração,
+modelo resolvido e tokens de entrada/saída quando o endpoint os informa; esses
+tokens também entram nos totais de compactação e a telemetria marca uso
+desconhecido quando a API não o reporta. Como o preço do backend Jev não faz
+parte da tabela do provider principal, custo total e custo de compactação não
+exibem um valor parcial quando houve uso Jev.
+
 **Checkout — compactação por poda Jev, 18/09/2026:** a compactação passa a ter
 duas estratégias selecionáveis. `jev` é o padrão: antes de pedir o resumo ao
 modelo principal, o Slim consulta o Jev (TypeSafe) para julgar quais pares
@@ -11,7 +32,7 @@ o checkpoint, o fingerprint, a telemetria e os eventos continuam idênticos.
 `--compactor jev|summary`, `SLIM_COMPACTOR` ou `[compaction] strategy` no
 `slim.toml`, com precedência CLI > env > arquivo. Dois endpoints servem o
 mesmo modelo: a API System One da TypeSafe (`TYPESAFE_API_KEY`, padrão
-`jev-latest`) e a rota de avaliação do Vercel AI Gateway
+`jev-1.13.0`) e a rota de avaliação do Vercel AI Gateway
 (`AI_GATEWAY_API_KEY`, padrão `typesafe-ai/jev`); `SLIM_JEV_BACKEND`
 (`typesafe`|`vercel`) escolhe explicitamente e `SLIM_JEV_MODEL` sobrepõe o
 modelo. Sem credencial o modo não faz chamada alguma. O enforcement é

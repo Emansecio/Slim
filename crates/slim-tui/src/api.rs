@@ -894,7 +894,7 @@ impl UiEvent {
                     "Jev compacted context: dropped {pairs_dropped} stale tool call(s), truncated {results_truncated} result(s), saved ~{estimated_saved_tokens} tokens."
                 ),
             }),
-            slim_core::EventKind::CompactionJevFallback { detail } => Some(Self::Notification {
+            slim_core::EventKind::CompactionJevFallback { detail, .. } => Some(Self::Notification {
                 message: format!(
                     "Jev compaction unavailable; using LLM summary. {}",
                     bounded_first_line(&detail, 200)

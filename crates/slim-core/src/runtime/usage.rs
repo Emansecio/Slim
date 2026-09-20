@@ -78,6 +78,14 @@ pub struct UsageTotals {
     pub duplicate_evidence_bytes_avoided: u64,
     pub compaction_input_tokens: u64,
     pub compaction_output_tokens: u64,
+    #[serde(default)]
+    pub jev_input_tokens: u64,
+    #[serde(default)]
+    pub jev_output_tokens: u64,
+    #[serde(default)]
+    pub jev_latency_ms: u64,
+    #[serde(default)]
+    pub jev_usage_unknown: bool,
     pub compaction_tokens_saved: u64,
     pub post_compaction_reacquisitions: u64,
     pub estimation_error_tokens: i64,
@@ -314,6 +322,18 @@ impl UsageTotals {
                         request.no_progress = true;
                     }
                 }
+                EventKind::CompactionJevPruned {
+                    input_tokens,
+                    output_tokens,
+                    duration_ms,
+                    ..
+                }
+                | EventKind::CompactionJevFallback {
+                    input_tokens,
+                    output_tokens,
+                    duration_ms,
+                    ..
+                } => totals.record_jev_usage(*input_tokens, *output_tokens, *duration_ms),
                 EventKind::CompactionAttemptStarted {
                     provider,
                     model,
@@ -347,11 +367,23 @@ impl UsageTotals {
                     time_to_first_semantic_ms,
                     duration_ms,
                     usage_known,
+                    system_bytes,
+                    history_bytes,
+                    estimated_input_tokens,
                 } => {
                     let mut request = background_compaction.take().unwrap_or(RequestUsage {
                         request_kind: RequestKind::Compaction,
                         ..RequestUsage::default()
                     });
+                    if let Some(system_bytes) = system_bytes {
+                        request.system_bytes = *system_bytes;
+                    }
+                    if let Some(history_bytes) = history_bytes {
+                        request.history_bytes = *history_bytes;
+                    }
+                    if let Some(estimated_input_tokens) = estimated_input_tokens {
+                        request.estimated_input_tokens = *estimated_input_tokens;
+                    }
                     request.uncached_input_tokens = *uncached_input_tokens;
                     request.cache_write_tokens = *cache_write_tokens;
                     request.cache_read_tokens = *cache_read_tokens;
@@ -616,6 +648,43 @@ impl UsageTotals {
             add(&mut self.cancelled_requests, 1, &mut self.overflowed);
         }
         self.requests.push(request);
+    }
+
+    fn record_jev_usage(
+        &mut self,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        duration_ms: u64,
+    ) {
+        match input_tokens {
+            Some(tokens) => {
+                add(&mut self.jev_input_tokens, tokens, &mut self.overflowed);
+                add(
+                    &mut self.compaction_input_tokens,
+                    tokens,
+                    &mut self.overflowed,
+                );
+            }
+            None => {
+                self.jev_usage_unknown = true;
+                self.usage_unknown = true;
+            }
+        }
+        match output_tokens {
+            Some(tokens) => {
+                add(&mut self.jev_output_tokens, tokens, &mut self.overflowed);
+                add(
+                    &mut self.compaction_output_tokens,
+                    tokens,
+                    &mut self.overflowed,
+                );
+            }
+            None => {
+                self.jev_usage_unknown = true;
+                self.usage_unknown = true;
+            }
+        }
+        add(&mut self.jev_latency_ms, duration_ms, &mut self.overflowed);
     }
 }
 

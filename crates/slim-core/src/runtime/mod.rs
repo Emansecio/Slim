@@ -16,10 +16,11 @@ pub use workspace::without_workspace_snapshot;
 use crate::codeintel::CodeIntelligence;
 use crate::context::{
     apply_compaction_selection, build_bounded_summary_prompt_with_checkpoint,
-    compaction_prefix_fingerprint, estimate_provider_message_tokens, has_compactable_history,
-    local_emergency_summary, select_compaction_history, AdaptiveTokenEstimator, ArtifactStore,
-    CompactionCommit, CompactionHandle, CompactionPolicy, CompactionReason, CompactionSelection,
-    ContextBudget, PreparedCompaction, COMPACTION_SYSTEM_PROMPT,
+    build_bounded_summary_prompt_with_checkpoint_and_instructions, compaction_prefix_fingerprint,
+    estimate_provider_message_tokens, has_compactable_history, local_emergency_summary,
+    select_compaction_history, AdaptiveTokenEstimator, ArtifactStore, CompactionCommit,
+    CompactionHandle, CompactionPolicy, CompactionReason, CompactionSelection, ContextBudget,
+    PreparedCompaction, COMPACTION_SYSTEM_PROMPT,
 };
 use crate::interaction::{
     ask_question_definition, AskQuestion, InteractionRequestId, InteractionRoute,
@@ -428,6 +429,10 @@ struct BackgroundCompactionPlan {
     provider: String,
     model: String,
     provider_identity: String,
+    strategy: crate::context::CompactionStrategy,
+    previous_checkpoint: Option<String>,
+    context_window_tokens: u64,
+    reserve_tokens: u64,
     serialized_chars: u64,
     system_bytes: u64,
     history_bytes: u64,
@@ -442,10 +447,6 @@ struct BackgroundCompactionPlan {
     safety_margin_tokens: u64,
     future_turns: u8,
     profitable: bool,
-    /// Jev pruning applied to the summarized prefix, when the strategy is Jev.
-    jev_stats: Option<crate::context::JevPruneStats>,
-    /// Why Jev pruning fell back to the LLM summary, when it did.
-    jev_error: Option<String>,
 }
 
 struct BackgroundCompactionResult {
@@ -473,11 +474,17 @@ struct CompactionAttemptProgress {
 struct PendingBackgroundCompaction {
     task: tokio::task::JoinHandle<BackgroundCompactionResult>,
     progress: Arc<Mutex<CompactionAttemptProgress>>,
+    jev_outcome: Arc<Mutex<Option<JevAttemptOutcome>>>,
     usage_request: RequestUsage,
     request_bytes: u64,
     estimated_input_tokens: u64,
     tokens_before: u64,
     started: Instant,
+}
+
+struct JevAttemptOutcome {
+    error: Option<String>,
+    stats: crate::context::JevPruneStats,
 }
 
 /// Backstop: a background compaction task must never outlive its handle.
@@ -2432,28 +2439,6 @@ impl Runtime {
                     )?;
                     let progress = Arc::new(Mutex::new(CompactionAttemptProgress::default()));
                     let task_progress = Arc::clone(&progress);
-                    // Jev outcomes belong to the attempt that actually starts.
-                    if let Some(stats) = &plan.jev_stats {
-                        push_runtime_event(
-                            &mut self.app,
-                            &mut next_seq,
-                            crate::EventKind::CompactionJevPruned {
-                                pairs_total: stats.pairs_total as u64,
-                                pairs_dropped: stats.pairs_dropped as u64,
-                                results_truncated: stats.results_truncated as u64,
-                                batches: stats.batches as u64,
-                                estimated_saved_tokens: stats.estimated_saved_tokens,
-                                duration_ms: 0,
-                            },
-                        )?;
-                    } else if let Some(detail) = &plan.jev_error {
-                        let detail = self.redact_sensitive(detail);
-                        push_runtime_event(
-                            &mut self.app,
-                            &mut next_seq,
-                            crate::EventKind::CompactionJevFallback { detail },
-                        )?;
-                    }
                     let usage_request = RequestUsage {
                         request_kind: crate::RequestKind::Compaction,
                         provider: plan.provider.clone(),
@@ -2468,18 +2453,26 @@ impl Runtime {
                     let tokens_before = plan.tokens_before;
                     let cancellation = self.cancellation.clone();
                     let background_client = (*client).clone();
+                    let jev_judge = self.jev_judge.clone();
+                    let token_estimator = self.token_estimator.clone();
+                    let jev_outcome = Arc::new(Mutex::new(None));
+                    let task_outcome = Arc::clone(&jev_outcome);
                     let task = tokio::spawn(async move {
                         run_background_compaction(
                             background_client,
                             plan,
+                            jev_judge,
+                            token_estimator,
                             cancellation,
                             task_progress,
+                            task_outcome,
                         )
                         .await
                     });
                     pending_background = Some(PendingBackgroundCompaction {
                         task,
                         progress,
+                        jev_outcome,
                         usage_request,
                         request_bytes,
                         estimated_input_tokens,
@@ -2539,6 +2532,7 @@ impl Runtime {
                 }
             };
             next_seq = following_seq;
+            let mut reacquisitions = governor.take_post_compaction_reacquisitions();
             if self.is_cancelled() {
                 drop(
                     self.cancel_pending_background(
@@ -2689,6 +2683,27 @@ impl Runtime {
                             original_bytes: full_output_bytes,
                             emitted_bytes: output.len() as u64,
                             post_compaction: false,
+                        },
+                    ) {
+                        drop(
+                            self.cancel_pending_background(
+                                &mut pending_background,
+                                &mut next_seq,
+                                "tool_evidence_reused",
+                            )
+                            .await?,
+                        );
+                        return Err(error);
+                    }
+                }
+                if reacquisitions.remove(&call.id) && !duplicate_in_active_context {
+                    if let Err(error) = push_runtime_event(
+                        &mut self.app,
+                        &mut next_seq,
+                        crate::EventKind::ToolEvidenceReused {
+                            original_bytes: 0,
+                            emitted_bytes: 0,
+                            post_compaction: true,
                         },
                     ) {
                         drop(
@@ -2997,11 +3012,12 @@ impl Runtime {
     ) -> Result<UsageTotals, ProviderError> {
         let progress = compaction_progress_snapshot(&attempt.progress);
         let fallback_duration = elapsed_millis(attempt.started);
+        self.emit_background_jev_outcome(&attempt.jev_outcome, next_seq)?;
         let result = match joined {
             Ok(result) => result,
             Err(_) => {
                 let observed_usage =
-                    background_compaction_cancellation_usage(&attempt, fallback_duration);
+                    background_compaction_cancellation_usage(&attempt, None, fallback_duration);
                 self.record_background_cancellation(
                     next_seq,
                     attempt.request_bytes,
@@ -3015,8 +3031,11 @@ impl Runtime {
             }
         };
         if result.cancelled {
-            let observed_usage =
-                background_compaction_cancellation_usage(&attempt, result.duration_ms);
+            let observed_usage = background_compaction_cancellation_usage(
+                &attempt,
+                Some(&result.plan),
+                result.duration_ms,
+            );
             self.record_background_cancellation(
                 next_seq,
                 result.plan.request_bytes,
@@ -3051,6 +3070,9 @@ impl Runtime {
                 time_to_first_semantic_ms: result.time_to_first_semantic_ms.unwrap_or(0),
                 duration_ms: result.duration_ms,
                 usage_known: result.usage_known,
+                system_bytes: Some(result.plan.system_bytes),
+                history_bytes: Some(result.plan.history_bytes),
+                estimated_input_tokens: Some(result.plan.estimated_input_tokens),
             },
         )?;
         let compaction_input_tokens = result.usage.total_input_tokens();
@@ -3115,6 +3137,52 @@ impl Runtime {
         Ok(observed_usage)
     }
 
+    fn emit_background_jev_outcome(
+        &mut self,
+        outcome: &Arc<Mutex<Option<JevAttemptOutcome>>>,
+        next_seq: &mut u64,
+    ) -> Result<(), ProviderError> {
+        let outcome = match outcome.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        let Some(outcome) = outcome else {
+            return Ok(());
+        };
+        if let Some(detail) = outcome.error {
+            let detail = self.redact_sensitive(&detail);
+            push_runtime_event(
+                &mut self.app,
+                next_seq,
+                crate::EventKind::CompactionJevFallback {
+                    detail,
+                    batches: outcome.stats.batches as u64,
+                    input_tokens: outcome.stats.input_tokens,
+                    output_tokens: outcome.stats.output_tokens,
+                    model: outcome.stats.model,
+                    duration_ms: outcome.stats.duration_ms,
+                },
+            )?;
+        } else {
+            push_runtime_event(
+                &mut self.app,
+                next_seq,
+                crate::EventKind::CompactionJevPruned {
+                    pairs_total: outcome.stats.pairs_total as u64,
+                    pairs_dropped: outcome.stats.pairs_dropped as u64,
+                    results_truncated: outcome.stats.results_truncated as u64,
+                    batches: outcome.stats.batches as u64,
+                    estimated_saved_tokens: outcome.stats.estimated_saved_tokens,
+                    input_tokens: outcome.stats.input_tokens,
+                    output_tokens: outcome.stats.output_tokens,
+                    model: outcome.stats.model,
+                    duration_ms: outcome.stats.duration_ms,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     async fn cancel_pending_background(
         &mut self,
         pending: &mut Option<PendingBackgroundCompaction>,
@@ -3139,8 +3207,10 @@ impl Runtime {
         }
 
         attempt.task.abort();
+        let _ = (&mut attempt.task).await;
+        self.emit_background_jev_outcome(&attempt.jev_outcome, next_seq)?;
         let duration_ms = elapsed_millis(attempt.started);
-        let observed_usage = background_compaction_cancellation_usage(&attempt, duration_ms);
+        let observed_usage = background_compaction_cancellation_usage(&attempt, None, duration_ms);
         self.record_background_cancellation(
             next_seq,
             attempt.request_bytes,
@@ -3231,30 +3301,7 @@ impl Runtime {
         let provider = crate::provider::provider_kind_name(client.adapter().kind());
         let model = client.adapter().model();
         let previous_summary = handle.previous_summary();
-        let mut summarized = selection.summarized_for_prompt();
-        // Jev strategy: prune stale tool calls/results before the summary
-        // prompt is built, so the background request never pays for evidence
-        // Jev would drop. Failures fall back to the untouched prefix.
-        let mut jev_stats = None;
-        let mut jev_error = None;
-        if policy.strategy == crate::context::CompactionStrategy::Jev {
-            match &self.jev_judge {
-                Some(judge) => {
-                    match crate::context::prune_summarized(&**judge, &selection, &mut summarized)
-                        .await
-                    {
-                        Ok(stats) => jev_stats = Some(stats),
-                        Err(error) => jev_error = Some(error.to_string()),
-                    }
-                }
-                None => {
-                    jev_error = Some(
-                        "no Jev credential configured (set TYPESAFE_API_KEY or AI_GATEWAY_API_KEY)"
-                            .into(),
-                    )
-                }
-            }
-        }
+        let summarized = selection.summarized_for_prompt();
         let prompt = build_bounded_summary_prompt_with_checkpoint(
             &summarized,
             previous_summary.as_deref(),
@@ -3272,18 +3319,36 @@ impl Runtime {
         let preflight_input_tokens =
             self.token_estimator
                 .estimate(provider, model, preflight_chars);
-        let root_tokens =
-            estimate_provider_message_tokens(&[ProviderMessage::user(&selection.root_instruction)]);
-        let projected_tokens_after = root_tokens
-            .saturating_add(selection.recent_tokens)
+        let history_tokens_before = estimate_provider_message_tokens(messages);
+        let fixed_request_tokens = budget.used_tokens.saturating_sub(history_tokens_before);
+        let mut retained_conversation: Vec<ProviderMessage> = selection
+            .summarized
+            .iter()
+            .filter(|message| matches!(message.role.as_str(), "system" | "developer"))
+            .cloned()
+            .collect();
+        retained_conversation.push(ProviderMessage::user(selection.root_instruction.clone()));
+        retained_conversation.extend(selection.pinned.iter().cloned());
+        retained_conversation.extend(selection.kept.iter().cloned());
+        let projected_retained_tokens = estimate_provider_message_tokens(&retained_conversation);
+        let projected_tokens_after = fixed_request_tokens
+            .saturating_add(projected_retained_tokens)
             .saturating_add(COMPACTION_MAX_OUTPUT_TOKENS);
         let tokens_before = budget.used_tokens;
         let future_turns = u8::try_from(remaining_model_turns.min(2)).unwrap_or(2);
         let projected_savings_tokens = tokens_before
             .saturating_sub(projected_tokens_after)
             .saturating_mul(u64::from(future_turns));
-        let estimated_cost_tokens =
-            preflight_input_tokens.saturating_add(COMPACTION_MAX_OUTPUT_TOKENS);
+        let jev_input_tokens = if policy.strategy == crate::context::CompactionStrategy::Jev
+            && self.jev_judge.is_some()
+        {
+            crate::context::estimate_prune_input_tokens(&selection, None, &summarized)
+        } else {
+            0
+        };
+        let estimated_cost_tokens = preflight_input_tokens
+            .saturating_add(COMPACTION_MAX_OUTPUT_TOKENS)
+            .saturating_add(jev_input_tokens);
         let safety_margin_tokens = estimated_cost_tokens.div_ceil(4);
         let profitable =
             projected_savings_tokens > estimated_cost_tokens.saturating_add(safety_margin_tokens);
@@ -3298,6 +3363,10 @@ impl Runtime {
                     client.adapter().wire_kind(),
                     client.adapter().model()
                 ),
+                strategy: policy.strategy,
+                previous_checkpoint: previous_summary,
+                context_window_tokens: budget.window_tokens,
+                reserve_tokens: budget.reserve_tokens,
                 summary_max_bytes: policy.summary_max_bytes,
                 serialized_chars: 0,
                 system_bytes: 0,
@@ -3312,8 +3381,6 @@ impl Runtime {
                 safety_margin_tokens,
                 future_turns,
                 profitable: false,
-                jev_stats,
-                jev_error,
             });
         }
         if preflight_input_tokens.saturating_add(budget.reserve_tokens) > budget.window_tokens {
@@ -3342,6 +3409,10 @@ impl Runtime {
                 client.adapter().wire_kind(),
                 client.adapter().model()
             ),
+            strategy: policy.strategy,
+            previous_checkpoint: previous_summary,
+            context_window_tokens: budget.window_tokens,
+            reserve_tokens: budget.reserve_tokens,
             summary_max_bytes: policy.summary_max_bytes,
             serialized_chars,
             system_bytes,
@@ -3356,8 +3427,6 @@ impl Runtime {
             safety_margin_tokens,
             future_turns,
             profitable: true,
-            jev_stats,
-            jev_error,
         })
     }
 
@@ -5494,6 +5563,11 @@ impl Runtime {
         initial_messages: &[ProviderMessage],
         cwd: &Path,
     ) -> Result<String, ProviderError> {
+        let max_bytes = self
+            .compaction_handle
+            .as_ref()
+            .map(|handle| handle.policy().summary_max_bytes)
+            .unwrap_or_else(|| CompactionPolicy::default().summary_max_bytes);
         let mut retained = String::new();
         if !execution_facts.is_empty() {
             retained.push_str("\n\n[Runtime facts at compaction; subsequent actions may invalidate them. Prior-run facts remain historical, not proof of current state.]\n");
@@ -5575,17 +5649,21 @@ impl Runtime {
         }
         // Reserve space for deterministic facts and recovery, rather than
         // letting a maximum-sized model summary crowd them out of the checkpoint.
-        let max_bytes = self
-            .compaction_handle
-            .as_ref()
-            .map(|handle| handle.policy().summary_max_bytes)
-            .unwrap_or_else(|| CompactionPolicy::default().summary_max_bytes);
         const MARKER: &str = "\n[summary truncated to retain runtime facts and recovery]";
-        let retained = self.redact_sensitive(&retained);
+        let mut retained = self.redact_sensitive(&retained);
         if retained.len() > max_bytes {
             return Err(ProviderError::InvalidResponse {
                 message: "compaction recovery metadata exceeds checkpoint limit".into(),
             });
+        }
+        let manifest_room = max_bytes.saturating_sub(retained.len()).saturating_sub(2);
+        let manifest = self.redact_sensitive(&crate::context::tool_call_manifest_with_limit(
+            &selection.summarized,
+            manifest_room,
+        ));
+        if !manifest.is_empty() && retained.len() + 2 + manifest.len() <= max_bytes {
+            retained.push_str("\n\n");
+            retained.push_str(&manifest);
         }
         let remaining = max_bytes - retained.len();
         if summary.len() > remaining {
@@ -5958,6 +6036,9 @@ impl Runtime {
             }
         })?;
         let previous_summary = handle.as_ref().and_then(CompactionHandle::previous_summary);
+        let manual_instructions = handle
+            .as_ref()
+            .and_then(CompactionHandle::manual_instructions);
         let mut summarized = selection.summarized_for_prompt();
         // Jev pruning strategy: judge and drop stale tool calls/results
         // verbatim, then let the same LLM summarize the smaller prefix. Any
@@ -5966,13 +6047,15 @@ impl Runtime {
         if policy.strategy == crate::context::CompactionStrategy::Jev {
             match &self.jev_judge {
                 Some(judge) => {
-                    let started = Instant::now();
-                    match crate::context::prune_summarized(&**judge, &selection, &mut summarized)
-                        .await
+                    match crate::context::prune_summarized_with_instructions(
+                        &**judge,
+                        &selection,
+                        manual_instructions.as_deref(),
+                        &mut summarized,
+                    )
+                    .await
                     {
                         Ok(stats) => {
-                            let duration_ms =
-                                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                             push_runtime_event(
                                 &mut self.app,
                                 &mut next_seq,
@@ -5982,16 +6065,27 @@ impl Runtime {
                                     results_truncated: stats.results_truncated as u64,
                                     batches: stats.batches as u64,
                                     estimated_saved_tokens: stats.estimated_saved_tokens,
-                                    duration_ms,
+                                    input_tokens: stats.input_tokens,
+                                    output_tokens: stats.output_tokens,
+                                    model: stats.model,
+                                    duration_ms: stats.duration_ms,
                                 },
                             )?;
                         }
-                        Err(error) => {
-                            let detail = self.redact_sensitive(&error.to_string());
+                        Err(failure) => {
+                            let detail = self.redact_sensitive(&failure.to_string());
+                            let stats = *failure.stats;
                             push_runtime_event(
                                 &mut self.app,
                                 &mut next_seq,
-                                crate::EventKind::CompactionJevFallback { detail },
+                                crate::EventKind::CompactionJevFallback {
+                                    detail,
+                                    batches: stats.batches as u64,
+                                    input_tokens: stats.input_tokens,
+                                    output_tokens: stats.output_tokens,
+                                    model: stats.model,
+                                    duration_ms: stats.duration_ms,
+                                },
                             )?;
                         }
                     }
@@ -6002,14 +6096,20 @@ impl Runtime {
                         &mut next_seq,
                         crate::EventKind::CompactionJevFallback {
                             detail: "no Jev credential configured (set TYPESAFE_API_KEY or AI_GATEWAY_API_KEY)".into(),
+                            batches: 0,
+                            input_tokens: Some(0),
+                            output_tokens: Some(0),
+                            model: None,
+                            duration_ms: 0,
                         },
                     )?;
                 }
             }
         }
-        let summary_prompt = build_bounded_summary_prompt_with_checkpoint(
+        let summary_prompt = build_bounded_summary_prompt_with_checkpoint_and_instructions(
             &summarized,
             previous_summary.as_deref(),
+            manual_instructions.as_deref(),
             context_window_tokens,
             reserve_tokens,
         )
@@ -6881,6 +6981,9 @@ fn background_compaction_completed_usage(
     result: &BackgroundCompactionResult,
 ) -> UsageTotals {
     let mut request = attempt.usage_request.clone();
+    request.system_bytes = result.plan.system_bytes;
+    request.history_bytes = result.plan.history_bytes;
+    request.estimated_input_tokens = result.plan.estimated_input_tokens;
     request.uncached_input_tokens = result.usage.uncached_input_tokens;
     request.cache_write_tokens = result.usage.cache_write_tokens;
     request.cache_read_tokens = result.usage.cache_read_tokens;
@@ -6895,10 +6998,16 @@ fn background_compaction_completed_usage(
 
 fn background_compaction_cancellation_usage(
     attempt: &PendingBackgroundCompaction,
+    result_plan: Option<&BackgroundCompactionPlan>,
     duration_ms: u64,
 ) -> UsageTotals {
     let progress = compaction_progress_snapshot(&attempt.progress);
     let mut request = attempt.usage_request.clone();
+    if let Some(plan) = result_plan {
+        request.system_bytes = plan.system_bytes;
+        request.history_bytes = plan.history_bytes;
+        request.estimated_input_tokens = plan.estimated_input_tokens;
+    }
     request.usage_unknown = true;
     request.time_to_first_byte_ms = progress.time_to_first_byte_ms.unwrap_or(0);
     request.time_to_first_semantic_ms = progress.time_to_first_semantic_ms.unwrap_or(0);
@@ -6911,10 +7020,72 @@ fn background_compaction_cancellation_usage(
 async fn run_background_compaction<A: ProviderAdapter>(
     client: HttpProviderClient<A>,
     mut plan: BackgroundCompactionPlan,
+    jev_judge: Option<Arc<dyn crate::context::JevJudge>>,
+    token_estimator: AdaptiveTokenEstimator,
     cancellation: Option<CancellationToken>,
     progress: Arc<Mutex<CompactionAttemptProgress>>,
+    jev_outcome: Arc<Mutex<Option<JevAttemptOutcome>>>,
 ) -> BackgroundCompactionResult {
     let started = Instant::now();
+    if plan.strategy == crate::context::CompactionStrategy::Jev {
+        let outcome = match &jev_judge {
+            Some(judge) => {
+                let mut summarized = plan.selection.summarized_for_prompt();
+                match crate::context::prune_summarized_with_instructions(
+                    &**judge,
+                    &plan.selection,
+                    None,
+                    &mut summarized,
+                )
+                .await
+                {
+                    Ok(stats) => {
+                        let mut jev_error = None;
+                        match rebuild_pruned_compaction_request(
+                            &client,
+                            &plan,
+                            &summarized,
+                            &token_estimator,
+                        ) {
+                            Ok(request) => {
+                                plan.serialized_chars = request.serialized_chars;
+                                plan.system_bytes = request.components.system_bytes;
+                                plan.history_bytes = request.components.history_bytes;
+                                plan.request_bytes =
+                                    u64::try_from(request.body.len()).unwrap_or(u64::MAX);
+                                plan.estimated_input_tokens = request.estimated_tokens;
+                                plan.request = Some(request);
+                            }
+                            Err(detail) => jev_error = Some(detail),
+                        }
+                        JevAttemptOutcome {
+                            error: jev_error,
+                            stats,
+                        }
+                    }
+                    Err(failure) => JevAttemptOutcome {
+                        error: Some(failure.to_string()),
+                        stats: *failure.stats,
+                    },
+                }
+            }
+            None => JevAttemptOutcome {
+                error: Some(
+                    "no Jev credential configured (set TYPESAFE_API_KEY or AI_GATEWAY_API_KEY)"
+                        .into(),
+                ),
+                stats: crate::context::JevPruneStats {
+                    input_tokens: Some(0),
+                    output_tokens: Some(0),
+                    ..crate::context::JevPruneStats::default()
+                },
+            },
+        };
+        match jev_outcome.lock() {
+            Ok(mut slot) => *slot = Some(outcome),
+            Err(poisoned) => *poisoned.into_inner() = Some(outcome),
+        }
+    }
     let cancellation_future = {
         let cancellation = cancellation.clone();
         async move {
@@ -6951,6 +7122,32 @@ async fn run_background_compaction<A: ProviderAdapter>(
         usage_known,
         cancelled,
     }
+}
+
+fn rebuild_pruned_compaction_request<A: ProviderAdapter>(
+    client: &HttpProviderClient<A>,
+    plan: &BackgroundCompactionPlan,
+    summarized: &[ProviderMessage],
+    token_estimator: &AdaptiveTokenEstimator,
+) -> Result<PreparedProviderRequest, String> {
+    let prompt = build_bounded_summary_prompt_with_checkpoint(
+        summarized,
+        plan.previous_checkpoint.as_deref(),
+        plan.context_window_tokens,
+        plan.reserve_tokens,
+    )
+    .map_err(|message| format!("jev pruned prefix could not be repacked: {message}"))?;
+    let summary_messages = [ProviderMessage::user(prompt)];
+    let mut request = client
+        .prepare_compaction_messages(&summary_messages)
+        .map_err(|error| format!("jev pruned request could not be prepared: {error:?}"))?;
+    let provider = crate::provider::provider_kind_name(client.adapter().kind());
+    request.estimated_tokens =
+        token_estimator.estimate(provider, client.adapter().model(), request.serialized_chars);
+    if request.estimated_tokens.saturating_add(plan.reserve_tokens) > plan.context_window_tokens {
+        return Err("jev pruned request exceeds context window and reserve".into());
+    }
+    Ok(request)
 }
 
 fn update_compaction_progress(
@@ -8825,6 +9022,86 @@ mod tests {
         assert!(outside.contains("native read cannot access this artifact outside the workspace"));
         assert!(!outside.contains("use read on"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn compaction_checkpoint_carries_the_tool_call_manifest() {
+        let runtime = Runtime::new();
+        let mut assistant = ProviderMessage::assistant("reading", Vec::new());
+        assistant.tool_calls = vec![crate::provider::ProviderToolCall {
+            id: "call-1".into(),
+            name: "read".into(),
+            arguments: "{\"path\":\"a.rs\"}".into(),
+        }];
+        let selection = CompactionSelection {
+            root_instruction: "root".into(),
+            summarized: vec![
+                ProviderMessage::user("root"),
+                assistant,
+                ProviderMessage::tool("read", "call-1", "file body"),
+            ],
+            pinned: Vec::new(),
+            kept: Vec::new(),
+            first_kept_index: 3,
+            recent_tokens: 0,
+        };
+        let summary = runtime
+            .archive_compaction_summary(
+                &selection,
+                "interpretation".into(),
+                "",
+                &[],
+                Path::new("."),
+            )
+            .await
+            .unwrap();
+        assert!(summary.contains(
+            "[Prior tool calls; full results are recoverable from the prior visible transcript]"
+        ));
+        assert!(summary.contains("\"call_id\":\"call-1\""));
+        assert!(summary.contains("\"result_present\":true"));
+        assert!(!summary.contains("file body"));
+    }
+
+    #[tokio::test]
+    async fn compaction_manifest_yields_to_higher_priority_recovery_metadata() {
+        let mut runtime = Runtime::new();
+        runtime.set_compaction_handle(CompactionHandle::new(CompactionPolicy {
+            summary_max_bytes: 200,
+            ..CompactionPolicy::default()
+        }));
+        let mut assistant = ProviderMessage::assistant("reading", Vec::new());
+        assistant.tool_calls = vec![crate::provider::ProviderToolCall {
+            id: "call-1".into(),
+            name: "read".into(),
+            arguments: "{\"path\":\"a.rs\"}".into(),
+        }];
+        let selection = CompactionSelection {
+            root_instruction: "root".into(),
+            summarized: vec![
+                ProviderMessage::user("root"),
+                assistant,
+                ProviderMessage::tool("read", "call-1", "file body"),
+            ],
+            pinned: Vec::new(),
+            kept: Vec::new(),
+            first_kept_index: 3,
+            recent_tokens: 0,
+        };
+        let summary = runtime
+            .archive_compaction_summary(
+                &selection,
+                "summary".into(),
+                "run_start_seq=7 failure call_id=failed-write",
+                &[],
+                Path::new("."),
+            )
+            .await
+            .unwrap();
+        assert!(summary.len() <= 200);
+        assert!(summary.contains("Runtime facts at compaction"));
+        assert!(summary.ends_with("failure call_id=failed-write"));
+        assert!(!summary.contains("Prior tool calls"));
     }
 
     #[tokio::test]
@@ -11441,6 +11718,10 @@ mod tests {
                     provider: "provider".into(),
                     model: "model".into(),
                     provider_identity: "provider:model".into(),
+                    strategy: crate::context::CompactionStrategy::Summary,
+                    previous_checkpoint: None,
+                    context_window_tokens: 1,
+                    reserve_tokens: 0,
                     serialized_chars: 1,
                     system_bytes: 0,
                     history_bytes: 0,
@@ -11455,8 +11736,6 @@ mod tests {
                     safety_margin_tokens: 1,
                     future_turns: 1,
                     profitable: true,
-                    jev_stats: None,
-                    jev_error: None,
                 };
                 let task = tokio::spawn(async move {
                     BackgroundCompactionResult {
@@ -11478,6 +11757,7 @@ mod tests {
                 let mut pending = Some(PendingBackgroundCompaction {
                     task,
                     progress,
+                    jev_outcome: Arc::new(Mutex::new(None)),
                     usage_request: RequestUsage {
                         request_kind: crate::RequestKind::Compaction,
                         provider: "provider".into(),
@@ -11519,6 +11799,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_background_usage_reports_the_rebuilt_pruned_request() {
+        let plan = BackgroundCompactionPlan {
+            selection: CompactionSelection {
+                root_instruction: "root".into(),
+                summarized: vec![ProviderMessage::user("root")],
+                pinned: Vec::new(),
+                kept: Vec::new(),
+                first_kept_index: 1,
+                recent_tokens: 0,
+            },
+            request: None,
+            provider: "provider".into(),
+            model: "model".into(),
+            provider_identity: "provider:model".into(),
+            strategy: crate::context::CompactionStrategy::Jev,
+            previous_checkpoint: None,
+            context_window_tokens: 1,
+            reserve_tokens: 0,
+            serialized_chars: 11,
+            system_bytes: 22,
+            history_bytes: 33,
+            summary_max_bytes: 64 * 1024,
+            source_len: 1,
+            tokens_before: 1,
+            projected_tokens_after: 1,
+            request_bytes: 44,
+            estimated_input_tokens: 55,
+            projected_savings_tokens: 1,
+            estimated_cost_tokens: 1,
+            safety_margin_tokens: 1,
+            future_turns: 1,
+            profitable: true,
+        };
+        let result = BackgroundCompactionResult {
+            plan,
+            summary: "summary".into(),
+            usage: UsageTotals::default(),
+            time_to_first_byte_ms: None,
+            time_to_first_semantic_ms: None,
+            duration_ms: 1,
+            valid: true,
+            usage_known: true,
+            cancelled: false,
+        };
+        let attempt = PendingBackgroundCompaction {
+            task: tokio::spawn(std::future::pending::<BackgroundCompactionResult>()),
+            progress: Arc::new(Mutex::new(CompactionAttemptProgress::default())),
+            jev_outcome: Arc::new(Mutex::new(None)),
+            usage_request: RequestUsage {
+                request_kind: crate::RequestKind::Compaction,
+                system_bytes: 99,
+                history_bytes: 99,
+                estimated_input_tokens: 99,
+                ..RequestUsage::default()
+            },
+            request_bytes: 99,
+            estimated_input_tokens: 99,
+            tokens_before: 1,
+            started: Instant::now(),
+        };
+        let usage = background_compaction_completed_usage(&attempt, &result);
+        let request = usage
+            .requests
+            .iter()
+            .find(|request| request.request_kind == crate::RequestKind::Compaction)
+            .expect("compaction request");
+        assert_eq!(request.system_bytes, 22);
+        assert_eq!(request.history_bytes, 33);
+        assert_eq!(request.estimated_input_tokens, 55);
+
+        let usage = background_compaction_cancellation_usage(&attempt, Some(&result.plan), 7);
+        let request = usage
+            .requests
+            .iter()
+            .find(|request| request.request_kind == crate::RequestKind::Compaction)
+            .expect("cancelled compaction request");
+        assert_eq!(request.system_bytes, 22);
+        assert_eq!(request.history_bytes, 33);
+        assert_eq!(request.estimated_input_tokens, 55);
+        let usage = background_compaction_cancellation_usage(&attempt, None, 7);
+        let request = usage
+            .requests
+            .iter()
+            .find(|request| request.request_kind == crate::RequestKind::Compaction)
+            .expect("aborted compaction request");
+        assert_eq!(request.estimated_input_tokens, 99);
+    }
+
+    #[tokio::test]
     async fn dropping_pending_background_compaction_aborts_its_task() {
         let probe = std::sync::Arc::new(());
         let weak = std::sync::Arc::downgrade(&probe);
@@ -11530,6 +11899,7 @@ mod tests {
         drop(PendingBackgroundCompaction {
             task,
             progress: Arc::new(Mutex::new(CompactionAttemptProgress::default())),
+            jev_outcome: Arc::new(Mutex::new(None)),
             usage_request: RequestUsage {
                 ..RequestUsage::default()
             },

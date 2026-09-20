@@ -1,5 +1,35 @@
 # Release do Slim
 
+## Deploy local — compactação Jev contextual e recuperável (2026-09-19)
+
+`refresh-slim.ps1` concluiu com `OK:` e exit 0. PATH:
+`C:\Users\User\bin\Slim.exe`, build **2026-09-19 21:34:53**, `slim 0.1.0`,
+**18.294.784 bytes**. O executável instalado e
+`D:\Slim\target\release\Slim.exe` têm o mesmo SHA-256:
+`BBB18A15CEA718B34B4323206E67B625862680C860C0C17BB41E6C5044D9155D`.
+O smoke confirmou `--version` e `--help` com exit 0; nenhum executável em uso
+precisou ser preservado.
+
+A compactação agora honra instruções manuais, fornece ao Jev a cronologia não
+instrumental e o conjunto completo e limitado de candidatos, só inicia a poda
+background depois de tool calls aceitas e do break-even, mantém um manifesto
+limitado das chamadas antigas e arquiva o transcript integral para recuperação.
+Uso e latência Jev continuam contabilizados mesmo quando o resumo background é
+cancelado; reacquisição pós-compactação distingue evidência removida de resultado
+ainda presente e apenas deduplicado.
+
+Validação focada limpa: `cargo fmt --all -- --check`, `cargo check --workspace
+--all-targets`, `slim-core --lib jev_prune` **16/16**, `compaction` **27/27**,
+`governor` **19/19**, `usage_ledger` **5/5**, `agent_loop jev` **8/8** e os dois
+testes `post_compaction` **2/2**. O gate completo confirmou `slim-cli` **126/126**,
+`slim-core --lib` **249 aprovados / 11 ignorados** e `agent_loop` **90/90**, mas
+parou em `slim-tui` com **252 aprovados / 1 falha** antes dos alvos restantes e
+dos doc-tests. A falha
+`reducer::tests::opencode_models_refresh_and_select_dynamic_catalog` foi
+reproduzida sem alterações no `HEAD` `aa7992f` e está fora deste escopo; conforme
+o protocolo, o deploy foi então executado sem `-Test`. Nenhuma chamada live ou
+cobrada ao Jev foi feita nesta entrega.
+
 ## Deploy local — poda Jev com backend Vercel (2026-09-19)
 
 `refresh-slim.ps1` concluído com exit 0. PATH: `C:\Users\User\bin\Slim.exe`,

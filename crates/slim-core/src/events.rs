@@ -304,6 +304,12 @@ pub enum EventKind {
         duration_ms: u64,
         #[serde(default)]
         usage_known: bool,
+        #[serde(default)]
+        system_bytes: Option<u64>,
+        #[serde(default)]
+        history_bytes: Option<u64>,
+        #[serde(default)]
+        estimated_input_tokens: Option<u64>,
     },
     CompactionAttemptCancelled {
         #[serde(default)]
@@ -351,8 +357,6 @@ pub enum EventKind {
         #[serde(default)]
         duration_ms: u64,
     },
-    /// Jev pruning succeeded; the compacted prefix was produced by dropping
-    /// stale tool calls/results, not by an LLM summary.
     CompactionJevPruned {
         #[serde(default)]
         pairs_total: u64,
@@ -365,6 +369,12 @@ pub enum EventKind {
         #[serde(default)]
         estimated_saved_tokens: u64,
         #[serde(default)]
+        input_tokens: Option<u64>,
+        #[serde(default)]
+        output_tokens: Option<u64>,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
         duration_ms: u64,
     },
     /// Jev pruning was selected but could not complete; the LLM summary path
@@ -372,6 +382,16 @@ pub enum EventKind {
     CompactionJevFallback {
         #[serde(default)]
         detail: String,
+        #[serde(default)]
+        batches: u64,
+        #[serde(default)]
+        input_tokens: Option<u64>,
+        #[serde(default)]
+        output_tokens: Option<u64>,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        duration_ms: u64,
     },
     /// Per-turn wire-size snapshot emitted before each provider request so
     /// token-economy regressions are observable in the session log.

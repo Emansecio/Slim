@@ -95,6 +95,9 @@ fn ledger_separates_request_cost_drivers_and_execution_outcomes() {
                 time_to_first_semantic_ms: 6,
                 duration_ms: 10,
                 usage_known: true,
+                system_bytes: None,
+                history_bytes: None,
+                estimated_input_tokens: None,
             },
         ),
         SessionEvent::new(
@@ -204,6 +207,9 @@ fn discarded_background_compaction_is_a_failed_attempt() {
                 time_to_first_semantic_ms: 0,
                 duration_ms: 10,
                 usage_known: true,
+                system_bytes: None,
+                history_bytes: None,
+                estimated_input_tokens: None,
             },
         ),
         SessionEvent::new(
@@ -256,6 +262,46 @@ fn local_response_cache_hit_is_known_zero_provider_usage() {
     assert!(!ledger.requests[0].usage_unknown);
     assert_eq!(ledger.requests[0].total_tokens(), 0);
     assert_eq!(ledger.requests[0].estimation_error_tokens, 0);
+}
+
+#[test]
+fn jev_usage_is_counted_in_compaction_totals() {
+    let events = vec![
+        SessionEvent::new(
+            1,
+            EventKind::CompactionJevPruned {
+                pairs_total: 2,
+                pairs_dropped: 1,
+                results_truncated: 1,
+                batches: 1,
+                estimated_saved_tokens: 500,
+                input_tokens: Some(321),
+                output_tokens: Some(12),
+                model: Some("jev-1.13.0".into()),
+                duration_ms: 45,
+            },
+        ),
+        SessionEvent::new(
+            2,
+            EventKind::CompactionJevFallback {
+                detail: "transport failed".into(),
+                batches: 0,
+                input_tokens: None,
+                output_tokens: None,
+                model: None,
+                duration_ms: 10,
+            },
+        ),
+    ];
+
+    let ledger = UsageTotals::from_events(&events, false);
+    assert_eq!(ledger.jev_input_tokens, 321);
+    assert_eq!(ledger.jev_output_tokens, 12);
+    assert_eq!(ledger.jev_latency_ms, 55);
+    assert_eq!(ledger.compaction_input_tokens, 321);
+    assert_eq!(ledger.compaction_output_tokens, 12);
+    assert!(ledger.jev_usage_unknown);
+    assert!(ledger.usage_unknown);
 }
 
 #[test]

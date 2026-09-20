@@ -1214,6 +1214,10 @@ fn run_telemetry_terminal(
         "duplicate_evidence_bytes_avoided": totals.duplicate_evidence_bytes_avoided,
         "compaction_input_tokens": totals.compaction_input_tokens,
         "compaction_output_tokens": totals.compaction_output_tokens,
+        "jev_input_tokens": totals.jev_input_tokens,
+        "jev_output_tokens": totals.jev_output_tokens,
+        "jev_latency_ms": totals.jev_latency_ms,
+        "jev_usage_unknown": totals.jev_usage_unknown,
         "compaction_tokens_saved": totals.compaction_tokens_saved,
         "post_compaction_reacquisitions": totals.post_compaction_reacquisitions,
         "estimation_error_tokens": totals.estimation_error_tokens,
@@ -2633,7 +2637,13 @@ fn cost_summary_for_usage(usage: &UsageTotals, pricing: Option<UsagePricing>) ->
     let Some(pricing) = pricing else {
         return UsageCostSummary::default();
     };
+    // Jev is billed by a separate backend whose price is not represented by
+    // ProviderPricing. Keep token telemetry, but do not present a partial
+    // provider-only value as the total or compaction cost.
+    let has_unpriced_jev_usage =
+        usage.jev_usage_unknown || usage.jev_input_tokens > 0 || usage.jev_output_tokens > 0;
     let total_micros = (!usage.overflowed
+        && !has_unpriced_jev_usage
         && !usage.requests.is_empty()
         && usage.requests.iter().all(|request| !request.usage_unknown))
     .then(|| sum_request_costs(usage.requests.iter(), pricing))
@@ -2649,7 +2659,7 @@ fn cost_summary_for_usage(usage: &UsageTotals, pricing: Option<UsagePricing>) ->
             )
         })
         .flatten();
-    let compaction_micros = (!usage.overflowed)
+    let compaction_micros = (!usage.overflowed && !has_unpriced_jev_usage)
         .then(|| {
             sum_request_costs(
                 usage
@@ -2841,6 +2851,43 @@ mod usage_cost_tests {
         let costs = cost_summary_for_usage(&usage, Some(pricing));
 
         assert_eq!(costs.total_micros, Some(3));
+    }
+
+    #[test]
+    fn unpriced_jev_usage_does_not_produce_partial_total_or_compaction_cost() {
+        let pricing = UsagePricing {
+            provider: ProviderPricing {
+                input_micros_per_million: 1_000_000,
+                output_micros_per_million: 2_000_000,
+            },
+            cache_write_micros_per_million: Some(0),
+            cache_read_micros_per_million: Some(0),
+        };
+        let provider_request = RequestUsage {
+            request_kind: RequestKind::Compaction,
+            uncached_input_tokens: 4,
+            output_tokens: 2,
+            ..RequestUsage::default()
+        };
+        let with_reported_jev_usage = UsageTotals {
+            requests: vec![provider_request.clone()],
+            jev_input_tokens: 3,
+            jev_output_tokens: 1,
+            ..UsageTotals::default()
+        };
+
+        let costs = cost_summary_for_usage(&with_reported_jev_usage, Some(pricing));
+        assert_eq!(costs.total_micros, None);
+        assert_eq!(costs.compaction_micros, None);
+
+        let with_unknown_jev_usage = UsageTotals {
+            requests: vec![provider_request],
+            jev_usage_unknown: true,
+            ..UsageTotals::default()
+        };
+        let costs = cost_summary_for_usage(&with_unknown_jev_usage, Some(pricing));
+        assert_eq!(costs.total_micros, None);
+        assert_eq!(costs.compaction_micros, None);
     }
 
     #[test]

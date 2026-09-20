@@ -13,6 +13,7 @@ use std::fmt::Write as _;
 const MAX_OBSERVED_DEPENDENCIES: usize = 256;
 const MAX_EVENT_IDENTIFIER_BYTES: usize = 256;
 const MAX_COMPACTION_FAILURES: usize = 256;
+const MAX_COMPACTED_FINGERPRINTS: usize = 4_096;
 const MAX_COMPACTION_MUTATIONS: usize = 256;
 const MAX_COMPACTION_SNAPSHOT_BYTES: usize = 4096;
 const COMPACTION_OMISSION_RESERVE_BYTES: usize = 128;
@@ -64,6 +65,7 @@ pub(super) struct PendingCall {
     diagnostics: bool,
     admission_prefix: Option<String>,
     structural_rejection: bool,
+    post_compaction_reacquisition: bool,
 }
 
 impl PendingCall {
@@ -77,6 +79,7 @@ impl PendingCall {
 pub(super) struct CausalGovernor {
     ledger: ProgressLedger,
     stop_requested: bool,
+    pending_post_compaction_reacquisitions: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -96,6 +99,7 @@ struct ProgressLedger {
     mutation_omitted: usize,
     stagnant_turns: u32,
     turn: TurnState,
+    compacted_fingerprints: HashSet<String>,
 }
 
 struct ObservedDependency {
@@ -283,10 +287,22 @@ impl CausalGovernor {
     }
 
     pub(super) fn forget_compacted_evidence(&mut self) {
+        let mut compacted = self.ledger.evidence.keys().cloned().collect::<Vec<_>>();
+        compacted.sort();
+        for fingerprint in compacted {
+            if self.ledger.compacted_fingerprints.len() >= MAX_COMPACTED_FINGERPRINTS {
+                break;
+            }
+            self.ledger.compacted_fingerprints.insert(fingerprint);
+        }
         self.ledger.evidence.clear();
         self.ledger.seen_evidence.clear();
         self.ledger.stagnant_turns = 0;
         self.stop_requested = false;
+    }
+
+    pub(super) fn take_post_compaction_reacquisitions(&mut self) -> HashSet<String> {
+        std::mem::take(&mut self.pending_post_compaction_reacquisitions)
     }
 
     fn remember_failure(&mut self, pending: &PendingCall, result: &ToolResult) {
@@ -378,6 +394,7 @@ impl CausalGovernor {
                             &prepared.admission_notes,
                         ),
                         structural_rejection: true,
+                        post_compaction_reacquisition: false,
                     },
                     Vec::new(),
                 );
@@ -427,6 +444,7 @@ impl CausalGovernor {
                 diagnostics: prepared.name == "code_intel" && prepared.arguments.is_diagnostics(),
                 admission_prefix: crate::tools::admission_output_prefix(&prepared.admission_notes),
                 structural_rejection: false,
+                post_compaction_reacquisition: false,
             },
             Vec::new(),
         )
@@ -492,6 +510,14 @@ impl CausalGovernor {
             evidence_revision,
             self.ledger.uncertainty_epoch,
         );
+        pending.post_compaction_reacquisition = self
+            .ledger
+            .compacted_fingerprints
+            .remove(&pending.call_fingerprint);
+        if pending.post_compaction_reacquisition {
+            self.pending_post_compaction_reacquisitions
+                .insert(pending.call_id.clone());
+        }
         self.ledger
             .turn
             .last_call_fingerprint
@@ -852,6 +878,7 @@ impl CausalGovernor {
                 diagnostics: false,
                 admission_prefix: None,
                 structural_rejection: false,
+                post_compaction_reacquisition: false,
             },
             vec![GovernorObservation::Boundary {
                 batch_id,
@@ -1707,6 +1734,40 @@ mod tests {
                     ..
                 }
             )));
+    }
+
+    #[test]
+    fn post_compaction_reacquisition_counts_the_same_stateful_call_once() {
+        let temp = TestRoot::new("reacquisition");
+        fs::write(temp.path().join("state.txt"), "stable\ntail\n").expect("fixture");
+        let registry = ToolRegistry::default();
+        let mut governor = CausalGovernor::default();
+        let observe_read = |governor: &mut CausalGovernor, call_id: &str, args: &str| {
+            let prepared =
+                registry.prepare_invocation(OperatingMode::Auto, temp.path(), "read", args);
+            let (pending, _) = governor.observe_before_identified(&prepared, "batch", call_id);
+            let outcome =
+                registry.execute_prepared_with_cancellation_and_progress(&prepared, None, |_| {});
+            assert!(outcome.result.success);
+            governor.observe_after(pending, &outcome.result, &outcome.receipt);
+        };
+        let args = r#"{"path":"state.txt","offset":1,"max_lines":10}"#;
+        observe_read(&mut governor, "before-compaction", args);
+        assert!(governor.take_post_compaction_reacquisitions().is_empty());
+
+        governor.forget_compacted_evidence();
+        observe_read(&mut governor, "after-compaction", args);
+        let drained = governor.take_post_compaction_reacquisitions();
+        assert_eq!(drained.len(), 1);
+        assert!(drained.contains("after-compaction"));
+        observe_read(&mut governor, "after-compaction-again", args);
+        assert!(governor.take_post_compaction_reacquisitions().is_empty());
+        observe_read(
+            &mut governor,
+            "different-call",
+            r#"{"path":"state.txt","offset":1,"max_lines":2}"#,
+        );
+        assert!(governor.take_post_compaction_reacquisitions().is_empty());
     }
 
     #[test]

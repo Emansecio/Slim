@@ -2812,11 +2812,14 @@ fn jev_strategy_prunes_stale_evidence_before_the_summary_request() {
     impl slim_core::context::JevJudge for DropJudge {
         async fn judge(
             &self,
-            _state: &str,
+            _state: &serde_json::Value,
             questions: &[(String, String)],
-        ) -> Result<Vec<f64>, String> {
+        ) -> Result<slim_core::context::JevJudgment, String> {
             // Every candidate is judged stale.
-            Ok(vec![0.02; questions.len()])
+            Ok(slim_core::context::JevJudgment::probabilities(vec![
+                0.02;
+                questions.len()
+            ]))
         }
     }
 
@@ -3032,9 +3035,9 @@ fn jev_failure_falls_back_to_the_llm_summary() {
     impl slim_core::context::JevJudge for FailingJudge {
         async fn judge(
             &self,
-            _state: &str,
+            _state: &serde_json::Value,
             _questions: &[(String, String)],
-        ) -> Result<Vec<f64>, String> {
+        ) -> Result<slim_core::context::JevJudgment, String> {
             Err("connection refused".into())
         }
     }
@@ -3184,7 +3187,7 @@ b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE
         .events()
         .iter()
         .find_map(|event| match &event.kind {
-            EventKind::CompactionJevFallback { detail } => Some(detail.clone()),
+            EventKind::CompactionJevFallback { detail, .. } => Some(detail.clone()),
             _ => None,
         })
         .expect("jev fallback event");
@@ -3219,6 +3222,893 @@ b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE
         .events()
         .iter()
         .any(|event| matches!(event.kind, EventKind::CompactionCompleted)));
+}
+
+const SSE_FINAL_ANSWER: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"final answer\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+
+const SSE_COMPACTION_SUMMARY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\nprepared\\n## Constraints\\nNone\\n## Progress\\nPrepared\\n## Blocked\\nNone\\n## Decisions\\nReuse\\n## Next steps\\nContinue\\n## Critical context\\nFixture\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":29,\"completion_tokens\":6}}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+
+fn write_sse(stream: &mut TcpStream, body: &str) {
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .as_bytes(),
+        )
+        .expect("fixture response");
+}
+
+fn sse_read_call_body(call_id: &str) -> String {
+    let tool_call = json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": call_id,
+                    "function": {
+                        "name": "read",
+                        "arguments": json!({
+                            "path": "missing-file.txt",
+                            "max_lines": 1
+                        }).to_string()
+                    }
+                }]
+            }
+        }]
+    });
+    format!(
+        "data: {tool_call}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+    )
+}
+
+fn jev_openai_client(address: std::net::SocketAddr) -> HttpProviderClient<OpenAiCompatibleAdapter> {
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .expect("adapter");
+    HttpProviderClient::new(adapter, Duration::from_secs(5)).expect("client")
+}
+
+fn soft_only_context_window_tokens(
+    client: &HttpProviderClient<OpenAiCompatibleAdapter>,
+    messages: &[ProviderMessage],
+) -> u64 {
+    let tools = Runtime::new().advertised_tool_definitions(OperatingMode::Auto);
+    let request = client
+        .adapter()
+        .build_messages_request_with_tools_checked(messages, &tools)
+        .expect("request builds");
+    let estimated = slim_core::context::AdaptiveTokenEstimator::default().estimate(
+        "openai-compatible",
+        client.adapter().model(),
+        request.body.chars().count() as u64,
+    );
+    let window = estimated.saturating_mul(100).div_ceil(70);
+    let policy = slim_core::context::CompactionPolicy::default();
+    assert!(
+        policy.is_over_soft(estimated, window),
+        "exact estimate {estimated} must clear the soft threshold of window {window}"
+    );
+    assert!(
+        !policy.is_over_hard(estimated, window, 0),
+        "exact estimate {estimated} must stay under the hard threshold of window {window}"
+    );
+    window
+}
+
+fn jev_tool_pair_history() -> Vec<ProviderMessage> {
+    let read_args = json!({ "path": "older.rs", "max_lines": 10 }).to_string();
+    let mut first = ProviderMessage::assistant("read the older file", Vec::new());
+    first.tool_calls = vec![ProviderToolCall {
+        id: "old1".into(),
+        name: "read".into(),
+        arguments: read_args.clone(),
+    }];
+    let mut second = ProviderMessage::assistant("read it again", Vec::new());
+    second.tool_calls = vec![ProviderToolCall {
+        id: "old2".into(),
+        name: "read".into(),
+        arguments: read_args,
+    }];
+    vec![
+        ProviderMessage::user("start"),
+        ProviderMessage::assistant("old context ".repeat(20_000), Vec::new()),
+        first,
+        ProviderMessage::tool("read", "old1", "z".repeat(20_000)),
+        ProviderMessage::user("continue"),
+        second,
+        ProviderMessage::tool("read", "old2", "w".repeat(20_000)),
+    ]
+}
+
+struct CountingJevJudge {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl slim_core::context::JevJudge for CountingJevJudge {
+    async fn judge(
+        &self,
+        _state: &Value,
+        questions: &[(String, String)],
+    ) -> Result<slim_core::context::JevJudgment, String> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(slim_core::context::JevJudgment::probabilities(vec![
+            0.0;
+            questions.len()
+        ]))
+    }
+}
+
+fn jev_runtime(judge: Arc<dyn slim_core::context::JevJudge>) -> Runtime {
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(CompactionHandle::new(
+        slim_core::context::CompactionPolicy {
+            keep_recent_tokens: 1_000,
+            strategy: slim_core::context::CompactionStrategy::Jev,
+            ..slim_core::context::CompactionPolicy::default()
+        },
+    ));
+    runtime.set_background_compaction_enabled(true);
+    runtime.set_jev_judge(Some(judge));
+    runtime
+}
+
+fn run_loop_to_completion(
+    runtime: &mut Runtime,
+    client: &HttpProviderClient<OpenAiCompatibleAdapter>,
+    messages: &[ProviderMessage],
+    window_tokens: u64,
+    max_turns: usize,
+) -> slim_core::runtime::AgentLoopResult {
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(runtime.run_agent_loop_with_messages(
+            client,
+            messages,
+            OperatingMode::Auto,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig {
+                max_turns,
+                context_window_tokens: window_tokens,
+                context_reserve_tokens: 0,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .expect("loop")
+}
+
+#[test]
+fn jev_is_not_called_for_a_final_answer_turn() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let mut stream = accept_with_deadline(&listener);
+        let request = read_http_request(&mut stream);
+        write_sse(&mut stream, SSE_FINAL_ANSWER);
+        request
+    });
+
+    let client = jev_openai_client(address);
+    let messages = vec![
+        ProviderMessage::user("literal root"),
+        ProviderMessage::assistant("old context ".repeat(20_000), Vec::new()),
+        ProviderMessage::user("recent request"),
+    ];
+    let window = soft_only_context_window_tokens(&client, &messages);
+    let judge_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut runtime = jev_runtime(Arc::new(CountingJevJudge {
+        calls: judge_calls.clone(),
+    }));
+    let result = run_loop_to_completion(&mut runtime, &client, &messages, window, 3);
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(judge_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(!runtime.app.events().iter().any(|event| matches!(
+        event.kind,
+        EventKind::CompactionJevPruned { .. } | EventKind::CompactionJevFallback { .. }
+    )));
+}
+
+#[test]
+fn jev_estimate_enters_break_even_cost_and_judge_stays_uncalled() {
+    fn run_once(messages: &[ProviderMessage], jev: bool) -> (u64, u64, u64, u64, u64, usize) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let address = listener.local_addr().expect("address");
+        let server = thread::spawn(move || {
+            for index in 0..2 {
+                let mut stream = accept_with_deadline(&listener);
+                let request = read_http_request(&mut stream);
+                assert!(!request.contains("You are a context compactor"));
+                let body = if index == 0 {
+                    sse_read_call_body("jev-gate-read")
+                } else {
+                    SSE_FINAL_ANSWER.to_owned()
+                };
+                write_sse(&mut stream, &body);
+            }
+        });
+
+        let client = jev_openai_client(address);
+        let context_window_tokens = soft_only_context_window_tokens(&client, messages);
+        let judge_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut runtime = Runtime::new();
+        runtime.set_compaction_handle(CompactionHandle::new(
+            slim_core::context::CompactionPolicy {
+                keep_recent_tokens: 1_000,
+                strategy: if jev {
+                    slim_core::context::CompactionStrategy::Jev
+                } else {
+                    slim_core::context::CompactionStrategy::Summary
+                },
+                ..slim_core::context::CompactionPolicy::default()
+            },
+        ));
+        runtime.set_background_compaction_enabled(true);
+        if jev {
+            runtime.set_jev_judge(Some(Arc::new(CountingJevJudge {
+                calls: judge_calls.clone(),
+            })));
+        }
+        let result =
+            run_loop_to_completion(&mut runtime, &client, messages, context_window_tokens, 2);
+        server.join().expect("server");
+        assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+
+        let used_tokens = runtime
+            .app
+            .events()
+            .iter()
+            .find_map(|event| match &event.kind {
+                EventKind::ContextSnapshot {
+                    estimated_tokens, ..
+                } => Some(*estimated_tokens),
+                _ => None,
+            })
+            .expect("context snapshot");
+        let (savings, cost, future_turns) = runtime
+            .app
+            .events()
+            .iter()
+            .find_map(|event| match &event.kind {
+                EventKind::CompactionSkippedBelowBreakEven {
+                    projected_savings_tokens,
+                    estimated_cost_tokens,
+                    future_turns,
+                    ..
+                } => Some((
+                    *projected_savings_tokens,
+                    *estimated_cost_tokens,
+                    u64::from(*future_turns),
+                )),
+                _ => None,
+            })
+            .expect("below-break-even event");
+        (
+            savings,
+            cost,
+            future_turns,
+            used_tokens,
+            context_window_tokens,
+            judge_calls.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    let read_args = json!({ "path": "older.rs", "max_lines": 10 }).to_string();
+    let mut assistant = ProviderMessage::assistant("read earlier", Vec::new());
+    assistant.tool_calls = vec![ProviderToolCall {
+        id: "old1".into(),
+        name: "read".into(),
+        arguments: read_args.clone(),
+    }];
+    let mut recent = ProviderMessage::assistant("read the big file", Vec::new());
+    recent.tool_calls = vec![ProviderToolCall {
+        id: "new1".into(),
+        name: "read".into(),
+        arguments: read_args,
+    }];
+    let messages = vec![
+        ProviderMessage::user("literal root"),
+        assistant,
+        ProviderMessage::tool("read", "old1", "z".repeat(4_000)),
+        ProviderMessage::user("continue"),
+        recent,
+        ProviderMessage::tool("read", "new1", "w".repeat(200_000)),
+    ];
+
+    let (savings_summary, cost_summary, future_turns, used_tokens, window_tokens, _) =
+        run_once(&messages, false);
+    let (savings_jev, cost_jev, _, _, _, jev_calls) = run_once(&messages, true);
+
+    assert_eq!(jev_calls, 0);
+    assert_eq!(savings_jev, savings_summary, "savings ignore the strategy");
+
+    let mut capped_policy = slim_core::context::CompactionPolicy {
+        keep_recent_tokens: 1_000,
+        ..slim_core::context::CompactionPolicy::default()
+    };
+    capped_policy.keep_recent_tokens = capped_policy.keep_recent_for_window(window_tokens);
+    let selection = slim_core::context::select_compaction_history(&messages, &capped_policy)
+        .expect("selection");
+    let history_tokens = slim_core::context::estimate_provider_message_tokens(&messages);
+    let fixed_request_tokens = used_tokens.saturating_sub(history_tokens);
+    assert!(fixed_request_tokens > 0, "request has fixed overhead");
+    let mut retained: Vec<ProviderMessage> = selection
+        .summarized
+        .iter()
+        .filter(|message| matches!(message.role.as_str(), "system" | "developer"))
+        .cloned()
+        .collect();
+    retained.push(ProviderMessage::user(selection.root_instruction.clone()));
+    retained.extend(selection.pinned.iter().cloned());
+    retained.extend(selection.kept.iter().cloned());
+    let projected_after = fixed_request_tokens
+        .saturating_add(slim_core::context::estimate_provider_message_tokens(
+            &retained,
+        ))
+        .saturating_add(2_048);
+    assert_eq!(
+        savings_summary,
+        used_tokens
+            .saturating_sub(projected_after)
+            .saturating_mul(future_turns),
+        "fixed provider/tool-schema overhead is not counted as savings"
+    );
+
+    let expected_jev = slim_core::context::estimate_prune_input_tokens(
+        &selection,
+        None,
+        &selection.summarized_for_prompt(),
+    );
+    assert!(expected_jev > 0, "candidate keeps the estimate non-zero");
+    assert_eq!(
+        cost_jev.saturating_sub(cost_summary),
+        expected_jev,
+        "the Jev request-input estimate participates in the gate"
+    );
+}
+
+#[test]
+fn jev_runs_once_inside_the_settled_background_task() {
+    struct DropJudge {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl slim_core::context::JevJudge for DropJudge {
+        async fn judge(
+            &self,
+            _state: &Value,
+            questions: &[(String, String)],
+        ) -> Result<slim_core::context::JevJudgment, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(slim_core::context::JevJudgment {
+                probabilities: vec![0.0; questions.len()],
+                input_tokens: Some(321),
+                output_tokens: Some(12),
+                model: Some("jev-1.13.0".into()),
+            })
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let mut summary_body = String::new();
+        let mut turn_requests = 0;
+        for _ in 0..3 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            let body = if request.contains("You are a context compactor") {
+                summary_body = request;
+                SSE_COMPACTION_SUMMARY.to_owned()
+            } else {
+                turn_requests += 1;
+                if turn_requests == 1 {
+                    sse_read_call_body("bg-read-call")
+                } else {
+                    thread::sleep(Duration::from_millis(250));
+                    SSE_FINAL_ANSWER.to_owned()
+                }
+            };
+            write_sse(&mut stream, &body);
+        }
+        summary_body
+    });
+
+    let client = jev_openai_client(address);
+    let history = jev_tool_pair_history();
+    let window = soft_only_context_window_tokens(&client, &history);
+    let judge_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut runtime = jev_runtime(Arc::new(DropJudge {
+        calls: judge_calls.clone(),
+    }));
+    let result = run_loop_to_completion(&mut runtime, &client, &history, window, 3);
+    let summary_body = server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(judge_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let events = runtime.app.events();
+    let jev_index = events
+        .iter()
+        .position(|event| matches!(event.kind, EventKind::CompactionJevPruned { .. }))
+        .expect("jev pruning event emitted when the task settles");
+    match &events[jev_index].kind {
+        EventKind::CompactionJevPruned {
+            pairs_dropped,
+            batches,
+            input_tokens,
+            output_tokens,
+            model,
+            ..
+        } => {
+            assert_eq!(*batches, 1);
+            assert!(*pairs_dropped >= 1);
+            assert_eq!(*input_tokens, Some(321));
+            assert_eq!(*output_tokens, Some(12));
+            assert_eq!(model.as_deref(), Some("jev-1.13.0"));
+        }
+        _ => unreachable!(),
+    }
+    let completed_index = events
+        .iter()
+        .position(|event| matches!(event.kind, EventKind::CompactionAttemptCompleted { .. }))
+        .expect("summary attempt completed");
+    assert!(
+        jev_index < completed_index,
+        "the Jev outcome is emitted before the summary attempt result"
+    );
+    let spawned_estimate = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::CompactionAttemptStarted {
+                estimated_input_tokens,
+                ..
+            } => Some(*estimated_input_tokens),
+            _ => None,
+        })
+        .expect("attempt started");
+    let settled_estimate = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::CompactionAttemptCompleted {
+                estimated_input_tokens,
+                ..
+            } => *estimated_input_tokens,
+            _ => None,
+        })
+        .expect("settled estimate");
+    assert!(
+        settled_estimate < spawned_estimate,
+        "settled telemetry reports the rebuilt pruned request"
+    );
+    let rebuilt = slim_core::runtime::UsageTotals::from_events(events, false);
+    let settled_request = rebuilt
+        .requests
+        .iter()
+        .find(|request| request.request_kind == slim_core::RequestKind::Compaction)
+        .expect("reconstructed compaction request");
+    assert_eq!(settled_request.estimated_input_tokens, settled_estimate);
+    let observed_request = result
+        .usage
+        .requests
+        .iter()
+        .find(|request| request.request_kind == slim_core::RequestKind::Compaction)
+        .expect("observed compaction request");
+    assert_eq!(observed_request.estimated_input_tokens, settled_estimate);
+    assert!(
+        summary_body.contains("jev-compaction"),
+        "the pruned request reaches the summary model"
+    );
+}
+
+#[test]
+fn jev_latency_does_not_block_the_main_tool_turn() {
+    struct SlowJudge {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl slim_core::context::JevJudge for SlowJudge {
+        async fn judge(
+            &self,
+            _state: &Value,
+            questions: &[(String, String)],
+        ) -> Result<slim_core::context::JevJudgment, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            Ok(slim_core::context::JevJudgment::probabilities(vec![
+                0.0;
+                questions.len()
+            ]))
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        for index in 0..2 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            assert!(!request.contains("You are a context compactor"));
+            let body = if index == 0 {
+                sse_read_call_body("latency-read-call")
+            } else {
+                SSE_FINAL_ANSWER.to_owned()
+            };
+            write_sse(&mut stream, &body);
+        }
+    });
+
+    let client = jev_openai_client(address);
+    let history = jev_tool_pair_history();
+    let window = soft_only_context_window_tokens(&client, &history);
+    let judge_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut runtime = jev_runtime(Arc::new(SlowJudge {
+        calls: judge_calls.clone(),
+    }));
+    let started = Instant::now();
+    let result = run_loop_to_completion(&mut runtime, &client, &history, window, 3);
+    let elapsed = started.elapsed();
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(judge_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        elapsed < Duration::from_millis(1_000),
+        "loop took {elapsed:?}"
+    );
+}
+
+#[test]
+fn jev_failure_in_background_falls_back_to_unpruned_summary() {
+    struct FailingJudge {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl slim_core::context::JevJudge for FailingJudge {
+        async fn judge(
+            &self,
+            _state: &Value,
+            _questions: &[(String, String)],
+        ) -> Result<slim_core::context::JevJudgment, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("connection refused".into())
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let mut summary_body = String::new();
+        let mut turn_requests = 0;
+        for _ in 0..3 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            let body = if request.contains("You are a context compactor") {
+                summary_body = request;
+                SSE_COMPACTION_SUMMARY.to_owned()
+            } else {
+                turn_requests += 1;
+                if turn_requests == 1 {
+                    sse_read_call_body("bg-fallback-read")
+                } else {
+                    thread::sleep(Duration::from_millis(250));
+                    SSE_FINAL_ANSWER.to_owned()
+                }
+            };
+            write_sse(&mut stream, &body);
+        }
+        summary_body
+    });
+
+    let client = jev_openai_client(address);
+    let mut history = jev_tool_pair_history();
+    history[3] = ProviderMessage::tool(
+        "read",
+        "old1",
+        format!("RAW_FALLBACK_MARKER{}", "z".repeat(20_000)),
+    );
+    let window = soft_only_context_window_tokens(&client, &history);
+    let judge_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut runtime = jev_runtime(Arc::new(FailingJudge {
+        calls: judge_calls.clone(),
+    }));
+    let result = run_loop_to_completion(&mut runtime, &client, &history, window, 3);
+    let summary_body = server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(judge_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let detail = runtime
+        .app
+        .events()
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::CompactionJevFallback { detail, .. } => Some(detail.clone()),
+            _ => None,
+        })
+        .expect("jev fallback event");
+    assert!(detail.contains("connection refused"), "{detail}");
+    assert!(!runtime
+        .app
+        .events()
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::CompactionJevPruned { .. })));
+    assert!(
+        !summary_body.contains("jev-compaction"),
+        "the fallback request keeps the untouched source prefix"
+    );
+    assert!(
+        summary_body.contains("RAW_FALLBACK_MARKER") || summary_body.contains("older.rs"),
+        "raw tool evidence stays in the summary transcript"
+    );
+}
+
+#[test]
+fn jev_outcome_is_metered_when_the_summary_attempt_is_aborted() {
+    struct StatsJudge;
+
+    #[async_trait]
+    impl slim_core::context::JevJudge for StatsJudge {
+        async fn judge(
+            &self,
+            _state: &Value,
+            questions: &[(String, String)],
+        ) -> Result<slim_core::context::JevJudgment, String> {
+            Ok(slim_core::context::JevJudgment {
+                probabilities: vec![0.0; questions.len()],
+                input_tokens: Some(321),
+                output_tokens: Some(12),
+                model: Some("jev-1.13.0".into()),
+            })
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let (release_summary, summary_release) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut summary_release = Some(summary_release);
+        let mut summary_handlers = Vec::new();
+        let mut saw_summary = false;
+        let mut turn_requests = 0;
+        for _ in 0..3 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            if request.contains("You are a context compactor") {
+                saw_summary = true;
+                let release = summary_release.take().expect("one summary request");
+                summary_handlers.push(thread::spawn(move || {
+                    release.recv().expect("release background summary");
+                    let body = SSE_COMPACTION_SUMMARY;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }));
+            } else {
+                turn_requests += 1;
+                if turn_requests == 1 {
+                    write_sse(&mut stream, &sse_read_call_body("aborted-jev-read"));
+                } else {
+                    thread::sleep(Duration::from_millis(250));
+                    write_sse(&mut stream, SSE_FINAL_ANSWER);
+                }
+            }
+        }
+        assert!(saw_summary);
+        for handler in summary_handlers {
+            handler.join().expect("summary handler");
+        }
+    });
+
+    let client = jev_openai_client(address);
+    let history = jev_tool_pair_history();
+    let window = soft_only_context_window_tokens(&client, &history);
+    let mut runtime = jev_runtime(Arc::new(StatsJudge));
+    let result = run_loop_to_completion(&mut runtime, &client, &history, window, 3);
+    release_summary.send(()).expect("release summary");
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    let jev_events: Vec<_> = runtime
+        .app
+        .events()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                EventKind::CompactionJevPruned { .. } | EventKind::CompactionJevFallback { .. }
+            )
+        })
+        .collect();
+    assert_eq!(jev_events.len(), 1, "exactly one Jev outcome event");
+    match &jev_events[0].kind {
+        EventKind::CompactionJevPruned {
+            input_tokens,
+            output_tokens,
+            model,
+            ..
+        } => {
+            assert_eq!(*input_tokens, Some(321));
+            assert_eq!(*output_tokens, Some(12));
+            assert_eq!(model.as_deref(), Some("jev-1.13.0"));
+        }
+        other => panic!("expected pruned event, got {other:?}"),
+    }
+    assert!(runtime
+        .app
+        .events()
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::CompactionAttemptCancelled { .. })));
+    let totals = slim_core::runtime::UsageTotals::from_events(runtime.app.events(), false);
+    assert_eq!(totals.jev_input_tokens, 321);
+    assert_eq!(totals.jev_output_tokens, 12);
+}
+
+#[test]
+fn post_compaction_reacquisition_emits_one_event_per_call() {
+    let root = std::env::temp_dir().join(format!(
+        "slim-reacquisition-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("workspace");
+    std::fs::write(
+        root.join("state.txt"),
+        (1..=30)
+            .map(|line| format!("state-{line}\n"))
+            .collect::<String>(),
+    )
+    .expect("state fixture");
+    std::fs::write(
+        root.join("other.txt"),
+        (1..=30)
+            .map(|line| format!("other-{line}\n"))
+            .collect::<String>(),
+    )
+    .expect("other fixture");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let handle = CompactionHandle::new(slim_core::context::CompactionPolicy {
+        strategy: slim_core::context::CompactionStrategy::Summary,
+        keep_recent_tokens: 1,
+        ..slim_core::context::CompactionPolicy::default()
+    });
+    let server_handle = handle.clone();
+    let server = thread::spawn(move || {
+        let state_args = json!({
+            "path": "state.txt",
+            "offset": 1,
+            "max_lines": 10
+        })
+        .to_string();
+        let other_args = json!({
+            "path": "other.txt",
+            "offset": 1,
+            "max_lines": 10
+        })
+        .to_string();
+        let tool_call = |id: &str, arguments: &str| {
+            let call = json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": id,
+                            "function": {"name": "read", "arguments": arguments}
+                        }]
+                    }
+                }]
+            });
+            format!("data: {call}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n")
+        };
+        for turn in 0..6 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            let body = match turn {
+                0 => tool_call("read-1", &state_args),
+                1 => {
+                    server_handle
+                        .request_manual("")
+                        .expect("manual compaction request");
+                    tool_call("read-other", &other_args)
+                }
+                2 => {
+                    assert!(request.contains("You are a context compactor"));
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\nreacquire\\n## Constraints\\nNone\\n## Progress\\nDone\\n## Blocked\\nNone\\n## Decisions\\nKeep\\n## Next steps\\nGo\\n## Critical context\\nFixture\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_owned()
+                }
+                3 | 4 => tool_call(&format!("read-{turn}"), &state_args),
+                _ => {
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_owned()
+                }
+            };
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .expect("fixture response");
+        }
+    });
+
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(5)).expect("client");
+    let history = vec![
+        ProviderMessage::user("root"),
+        ProviderMessage::assistant("pad ".repeat(2_000), Vec::new()),
+        ProviderMessage::user("recent"),
+    ];
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle);
+    let result = tokio::runtime::Runtime::new()
+        .expect("tokio")
+        .block_on(runtime.run_agent_loop_with_messages(
+            &client,
+            &history,
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig {
+                max_turns: 5,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .expect("loop");
+    server.join().expect("server");
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    let reused: Vec<_> = runtime
+        .app
+        .events()
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ToolEvidenceReused {
+                original_bytes,
+                emitted_bytes,
+                post_compaction,
+            } => Some((*original_bytes, *emitted_bytes, *post_compaction)),
+            _ => None,
+        })
+        .collect();
+    let post_compaction: Vec<_> = reused.iter().filter(|(_, _, flag)| *flag).collect();
+    assert_eq!(post_compaction, &[&(0, 0, true)]);
+    assert!(reused
+        .iter()
+        .any(|(original, _, flag)| !flag && *original > 0));
+    let totals = slim_core::runtime::UsageTotals::from_events(runtime.app.events(), false);
+    assert_eq!(totals.post_compaction_reacquisitions, 1);
 }
 
 #[test]

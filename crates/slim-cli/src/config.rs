@@ -865,7 +865,7 @@ mod tests {
             .expect("resolved")
             .expect("configured");
         assert_eq!(typesafe.backend, JevBackend::Typesafe);
-        assert_eq!(typesafe.model, "jev-latest");
+        assert_eq!(typesafe.model, "jev-1.13.0");
 
         // A `vck_` key selects the Vercel AI Gateway and its model id.
         let gateway = resolve(&[("AI_GATEWAY_API_KEY", "vck_1")])
