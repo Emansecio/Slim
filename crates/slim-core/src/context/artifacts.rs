@@ -1,6 +1,7 @@
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::tools::digest_bytes;
 
@@ -15,6 +16,13 @@ pub struct ArtifactHandle {
 pub struct ArtifactStore {
     root: PathBuf,
 }
+
+pub(crate) struct StagedArtifact {
+    handle: ArtifactHandle,
+    temp_path: Option<PathBuf>,
+}
+
+static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 impl ArtifactStore {
     pub fn new(root: impl AsRef<Path>) -> io::Result<Self> {
@@ -33,6 +41,90 @@ impl ArtifactStore {
     /// timestamped duplicate: the write is skipped when a file with the same
     /// id already holds exactly `content.len()` bytes.
     pub fn put(&self, label: &str, content: &[u8]) -> io::Result<ArtifactHandle> {
+        let staged = self.stage(label, content)?;
+        self.commit_staged(staged)
+    }
+
+    pub(crate) fn stage(&self, label: &str, content: &[u8]) -> io::Result<StagedArtifact> {
+        let handle = self.preview(label, content);
+        let path = handle.path.clone();
+        let already_stored = fs::metadata(&path)
+            .map(|metadata| metadata.len() == content.len() as u64)
+            .unwrap_or(false);
+        if already_stored {
+            return Ok(StagedArtifact {
+                handle,
+                temp_path: None,
+            });
+        }
+        fs::create_dir_all(&self.root)?;
+        let temp_path = loop {
+            let sequence = STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let candidate = self.root.join(format!(
+                ".slim-artifact-stage-{}-{sequence}",
+                std::process::id()
+            ));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(mut file) => {
+                    if let Err(error) = file.write_all(content) {
+                        drop(file);
+                        let _ = fs::remove_file(&candidate);
+                        return Err(error);
+                    }
+                    break candidate;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        };
+        Ok(StagedArtifact {
+            handle,
+            temp_path: Some(temp_path),
+        })
+    }
+
+    pub(crate) fn discard_staged(staged: StagedArtifact) -> io::Result<()> {
+        match staged.temp_path {
+            Some(path) => fs::remove_file(path),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn commit_staged(&self, staged: StagedArtifact) -> io::Result<ArtifactHandle> {
+        let Some(temp_path) = staged.temp_path else {
+            return Ok(staged.handle);
+        };
+        if fs::metadata(&staged.handle.path)
+            .map(|metadata| metadata.len() == staged.handle.size)
+            .unwrap_or(false)
+        {
+            fs::remove_file(temp_path)?;
+            return Ok(staged.handle);
+        }
+        match fs::rename(&temp_path, &staged.handle.path) {
+            Ok(()) => Ok(staged.handle),
+            Err(_error)
+                if fs::metadata(&staged.handle.path)
+                    .map(|metadata| metadata.len() == staged.handle.size)
+                    .unwrap_or(false) =>
+            {
+                fs::remove_file(temp_path)?;
+                Ok(staged.handle)
+            }
+            Err(error) => {
+                let _ = fs::remove_file(temp_path);
+                Err(error)
+            }
+        }
+    }
+
+    /// Computes the stable content-addressed identity without touching disk.
+    /// Callers can validate references and budgets before committing a file.
+    pub(crate) fn preview(&self, label: &str, content: &[u8]) -> ArtifactHandle {
         let safe_label: String = label
             .chars()
             .map(|character| {
@@ -49,18 +141,11 @@ impl ArtifactStore {
             digest_bytes(b"slim-artifact-v1", content)
         );
         let path = self.root.join(&id);
-        let already_stored = fs::metadata(&path)
-            .map(|metadata| metadata.len() == content.len() as u64)
-            .unwrap_or(false);
-        if !already_stored {
-            fs::create_dir_all(&self.root)?;
-            fs::write(&path, content)?;
-        }
-        Ok(ArtifactHandle {
+        ArtifactHandle {
             id,
             path,
             size: content.len() as u64,
-        })
+        }
     }
 
     pub fn read(&self, handle: &ArtifactHandle) -> io::Result<Vec<u8>> {
@@ -100,6 +185,28 @@ mod tests {
             "identical content must not write a second file"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discarding_one_private_stage_cannot_remove_another_committed_artifact() {
+        let root = std::env::temp_dir().join(format!(
+            "slim-artifact-stage-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let store = ArtifactStore::new(&root).unwrap();
+        let cancelled = store.stage("context-history", b"same transcript").unwrap();
+        let committed = store.stage("context-history", b"same transcript").unwrap();
+        let handle = store.commit_staged(committed).unwrap();
+
+        ArtifactStore::discard_staged(cancelled).unwrap();
+
+        assert_eq!(store.read(&handle).unwrap(), b"same transcript");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

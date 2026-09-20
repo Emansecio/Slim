@@ -21,6 +21,15 @@ const TOOL_RESULT_MAX_CHARS: usize = 2_000;
 /// Capped at `keep_recent` so a 32k window (keep=8k) cannot retain 28k tokens
 /// and overshoot `hard_threshold` (27.2k) before root, summary, system, and tools.
 const RECOVERY_KEEP_TOKEN_SLACK: u64 = 20_000;
+const CHECKPOINT_HEADINGS: [&str; 7] = [
+    "## Goal",
+    "## Constraints",
+    "## Progress",
+    "## Blocked",
+    "## Decisions",
+    "## Next steps",
+    "## Critical context",
+];
 
 fn recovery_keep_token_slack(keep_recent_tokens: u64) -> u64 {
     RECOVERY_KEEP_TOKEN_SLACK.min(keep_recent_tokens)
@@ -796,33 +805,222 @@ pub fn apply_compaction_selection(
 }
 
 const LOCAL_EMERGENCY_SUMMARY_MAX_BYTES: usize = 8 * 1024;
+const LOCAL_EMERGENCY_MARKER: &str = "[local extract; not an LLM summary]";
+
+/// Validate the final checkpoint body after all runtime metadata has been
+/// mounted. The limit is measured in UTF-8 bytes, matching the wire/storage
+/// contract; `&str` guarantees that accepted content is valid UTF-8.
+pub fn validate_checkpoint_content(summary: &str, max_bytes: usize) -> Result<(), String> {
+    if summary.trim().is_empty() {
+        return Err("checkpoint content is empty".into());
+    }
+    if summary.len() > max_bytes {
+        return Err(format!(
+            "checkpoint content exceeds the configured limit of {max_bytes} bytes ({} bytes)",
+            summary.len()
+        ));
+    }
+
+    let mut found = Vec::new();
+    let mut seen = [false; CHECKPOINT_HEADINGS.len()];
+    for line in summary.lines().map(str::trim) {
+        let Some(index) = CHECKPOINT_HEADINGS
+            .iter()
+            .position(|heading| *heading == line)
+        else {
+            continue;
+        };
+        if !seen[index] {
+            seen[index] = true;
+            found.push(index);
+        }
+    }
+    if let Some(missing) = seen.iter().position(|present| !present) {
+        return Err(format!(
+            "checkpoint content omitted required heading: {}",
+            CHECKPOINT_HEADINGS[missing]
+        ));
+    }
+    if found != (0..CHECKPOINT_HEADINGS.len()).collect::<Vec<_>>() {
+        let mismatch = found
+            .iter()
+            .enumerate()
+            .find(|(expected, actual)| **actual != *expected)
+            .map(|(expected, actual)| (expected, *actual))
+            .expect("complete heading set has an ordering mismatch");
+        return Err(format!(
+            "checkpoint heading out of order: expected '{}', found '{}'",
+            CHECKPOINT_HEADINGS[mismatch.0], CHECKPOINT_HEADINGS[mismatch.1]
+        ));
+    }
+    Ok(())
+}
+
+const CHECKPOINT_TRUNCATED_MARKER: &str =
+    "[model checkpoint sections truncated to retain operational metadata]";
+
+/// Mount deterministic runtime metadata into the final structured checkpoint.
+/// When space is tight, only model-authored section bodies are shortened; all
+/// required headings and the supplied operational suffix remain intact.
+pub fn fit_checkpoint_content(
+    summary: &str,
+    operational_suffix: &str,
+    max_bytes: usize,
+) -> Result<String, String> {
+    validate_checkpoint_content(summary, usize::MAX)?;
+    let mut sections: [String; 7] = std::array::from_fn(|_| String::new());
+    let mut current = None;
+    let mut next = 0;
+    for line in summary.lines() {
+        let trimmed = line.trim();
+        if let Some(index) = CHECKPOINT_HEADINGS
+            .iter()
+            .position(|heading| *heading == trimmed)
+        {
+            if index == next {
+                current = Some(index);
+                next += 1;
+                continue;
+            }
+        }
+        if let Some(index) = current {
+            if !sections[index].is_empty() {
+                sections[index].push('\n');
+            }
+            sections[index].push_str(line);
+        }
+    }
+    for section in &mut sections {
+        *section = section.trim().to_owned();
+    }
+
+    let render = |bodies: &[String; 7], critical_suffix: &str| {
+        let mut content = String::new();
+        for (index, heading) in CHECKPOINT_HEADINGS.iter().enumerate() {
+            if index > 0 {
+                content.push('\n');
+            }
+            content.push_str(heading);
+            content.push('\n');
+            content.push_str(&bodies[index]);
+        }
+        if !critical_suffix.is_empty() {
+            // Always reserve the separator so allocating bytes to the
+            // Critical-context body cannot make the final render exceed the
+            // already-computed base budget.
+            content.push('\n');
+            content.push_str(critical_suffix);
+        }
+        content
+    };
+
+    let full = render(&sections, operational_suffix);
+    if full.len() <= max_bytes {
+        validate_checkpoint_content(&full, max_bytes)?;
+        return Ok(full);
+    }
+
+    let mut fitted: [String; 7] = std::array::from_fn(|_| String::new());
+    let mut critical_suffix = CHECKPOINT_TRUNCATED_MARKER.to_owned();
+    if !operational_suffix.is_empty() {
+        critical_suffix.push_str("\n\n");
+        critical_suffix.push_str(operational_suffix);
+    }
+    let base = render(&fitted, &critical_suffix);
+    if base.len() > max_bytes {
+        return Err(format!(
+            "checkpoint headings and operational metadata exceed the configured limit of {max_bytes} bytes ({} bytes)",
+            base.len()
+        ));
+    }
+    let mut remaining = max_bytes - base.len();
+    let priority = [0usize, 2, 6, 1, 3, 4, 5];
+    for (position, index) in priority.into_iter().enumerate() {
+        if remaining == 0 || sections[index].is_empty() {
+            continue;
+        }
+        let slots = 7 - position;
+        let requested = sections[index].len().min(remaining / slots.max(1));
+        let mut end = requested;
+        while end > 0 && !sections[index].is_char_boundary(end) {
+            end -= 1;
+        }
+        fitted[index].push_str(&sections[index][..end]);
+        remaining -= end;
+    }
+    // Spend boundary slack deterministically after every section received its
+    // first share.
+    for index in priority {
+        if remaining == 0 || fitted[index].len() == sections[index].len() {
+            continue;
+        }
+        let requested = sections[index]
+            .len()
+            .min(fitted[index].len().saturating_add(remaining));
+        let mut end = requested;
+        while end > fitted[index].len() && !sections[index].is_char_boundary(end) {
+            end -= 1;
+        }
+        let added = end - fitted[index].len();
+        fitted[index].push_str(&sections[index][fitted[index].len()..end]);
+        remaining -= added;
+    }
+    let fitted = render(&fitted, &critical_suffix);
+    validate_checkpoint_content(&fitted, max_bytes)?;
+    Ok(fitted)
+}
 
 /// Bounded extract of dropped history used when the hard threshold hits
 /// without a prepared LLM summary. Never performs a provider round-trip.
 pub fn local_emergency_summary(selection: &CompactionSelection) -> String {
-    let prefix = "(local extract; not an LLM summary)\n";
     let summarized = selection.summarized_for_prompt();
     let transcript = format_transcript(&summarized);
-    let max_bytes = LOCAL_EMERGENCY_SUMMARY_MAX_BYTES - prefix.len();
-    if transcript.len() <= max_bytes {
-        return format!("{prefix}{transcript}");
+    let fixed = format!(
+        "## Goal\n\n## Constraints\n\n## Progress\n\n## Blocked\n\n## Decisions\n\n## Next steps\n\n## Critical context\n{LOCAL_EMERGENCY_MARKER}\n"
+    );
+    let available = LOCAL_EMERGENCY_SUMMARY_MAX_BYTES.saturating_sub(fixed.len());
+    let goal_budget = available / 3;
+    let progress_budget = available.saturating_sub(goal_budget);
+    let goal = bounded_checkpoint_field(
+        &checkpoint_field_text(selection.root_instruction.trim()),
+        goal_budget,
+        "\n...[goal bounded; omitted text is not recoverable from this extract]...\n",
+    );
+    let progress = bounded_checkpoint_field(
+        &checkpoint_field_text(&transcript),
+        progress_budget,
+        "\n...[transcript bounded; omitted facts are not recoverable from this extract]...\n",
+    );
+    let summary = format!(
+        "## Goal\n{goal}\n\n## Constraints\n\n## Progress\n{progress}\n\n## Blocked\n\n## Decisions\n\n## Next steps\n\n## Critical context\n{LOCAL_EMERGENCY_MARKER}"
+    );
+    debug_assert!(summary.len() <= LOCAL_EMERGENCY_SUMMARY_MAX_BYTES);
+    summary
+}
+
+fn checkpoint_field_text(value: &str) -> String {
+    format!("> {}", value.replace('\n', "\\n"))
+}
+
+fn bounded_checkpoint_field(value: &str, max_bytes: usize, marker: &str) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
     }
-    let marker =
-        "\n...[transcript bounded; omitted facts are not recoverable from this extract]...\n";
+    if max_bytes <= marker.len() {
+        return marker[..max_bytes].to_owned();
+    }
     let room = max_bytes - marker.len();
-    let mut head_end = room / 2;
-    while !transcript.is_char_boundary(head_end) {
+    let head_room = room / 2;
+    let tail_room = room - head_room;
+    let mut head_end = head_room;
+    while !value.is_char_boundary(head_end) {
         head_end -= 1;
     }
-    let mut tail_start = transcript.len() - (room - room / 2);
-    while !transcript.is_char_boundary(tail_start) {
+    let mut tail_start = value.len() - tail_room;
+    while !value.is_char_boundary(tail_start) {
         tail_start += 1;
     }
-    format!(
-        "{prefix}{}{marker}{}",
-        &transcript[..head_end],
-        &transcript[tail_start..]
-    )
+    format!("{}{marker}{}", &value[..head_end], &value[tail_start..])
 }
 
 pub fn compaction_prefix_fingerprint(messages: &[ProviderMessage]) -> String {
@@ -1159,7 +1357,6 @@ pub(crate) fn format_transcript(messages: &[ProviderMessage]) -> String {
         .join("\n\n")
 }
 
-#[cfg(test)]
 const TOOL_CALL_MANIFEST_MAX_BYTES: usize = 4_096;
 const TOOL_CALL_MANIFEST_ARGUMENT_MAX_BYTES: usize = 512;
 const TOOL_CALL_MANIFEST_OMISSION_RESERVE_BYTES: usize = 128;
@@ -1188,15 +1385,11 @@ fn bounded_manifest_arguments(arguments: &str) -> String {
     )
 }
 
-#[cfg(test)]
-pub(crate) fn tool_call_manifest(messages: &[ProviderMessage]) -> String {
-    tool_call_manifest_with_limit(messages, TOOL_CALL_MANIFEST_MAX_BYTES)
-}
-
 pub(crate) fn tool_call_manifest_with_limit(
     messages: &[ProviderMessage],
     max_bytes: usize,
 ) -> String {
+    let max_bytes = max_bytes.min(TOOL_CALL_MANIFEST_MAX_BYTES);
     let answered: std::collections::HashSet<&str> = messages
         .iter()
         .filter(|message| message.role == "tool")
@@ -1350,7 +1543,11 @@ fn bounded_transcript(transcript: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_provider_message, recovery_transcript};
+    use super::{
+        fit_checkpoint_content, format_provider_message, local_emergency_summary,
+        recovery_transcript, tool_call_manifest_with_limit, validate_checkpoint_content,
+        CompactionSelection,
+    };
     use crate::provider::ProviderMessage;
     use serde_json::Value;
 
@@ -1488,7 +1685,7 @@ mod tests {
             arguments: "{}".into(),
         }];
         messages.push(orphan);
-        let manifest = super::tool_call_manifest(&messages);
+        let manifest = super::tool_call_manifest_with_limit(&messages, usize::MAX);
 
         assert!(manifest.starts_with(
             "[Prior tool calls; full results are recoverable from the prior visible transcript]\n"
@@ -1527,7 +1724,7 @@ mod tests {
             ));
         }
         messages.push(ProviderMessage::user("tail"));
-        let manifest = super::tool_call_manifest(&messages);
+        let manifest = super::tool_call_manifest_with_limit(&messages, usize::MAX);
 
         assert!(manifest.len() <= 4_096, "{} bytes", manifest.len());
         assert!(std::str::from_utf8(manifest.as_bytes()).is_ok());
@@ -1554,8 +1751,109 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_manifest_caps_large_caller_limit_without_breaking_unicode() {
+        let messages = tool_call_pair("chamada-α", &"β".repeat(20_000));
+        let manifest = tool_call_manifest_with_limit(&messages, usize::MAX);
+
+        assert!(manifest.len() <= 4_096);
+        assert!(std::str::from_utf8(manifest.as_bytes()).is_ok());
+        assert!(manifest.contains("chamada-α"));
+        assert!(manifest.contains("β"));
+    }
+
+    #[test]
+    fn checkpoint_validator_requires_ordered_headings_and_byte_budget() {
+        let valid = "## Goal\nobjetivo ✅\n## Constraints\n\n## Progress\nfeito\n## Blocked\n\n## Decisions\n\n## Next steps\n\n## Critical context\nlocal";
+        assert!(validate_checkpoint_content(" \n", 4096)
+            .unwrap_err()
+            .contains("empty"));
+        assert!(validate_checkpoint_content(valid, valid.len()).is_ok());
+        assert!(
+            validate_checkpoint_content(&valid.replace("## Blocked", ""), 4096)
+                .unwrap_err()
+                .contains("required heading")
+        );
+        let wrong_order = "## Goal\nobjetivo\n## Progress\nfeito\n## Constraints\n\n## Blocked\n\n## Decisions\n\n## Next steps\n\n## Critical context\nlocal";
+        assert!(validate_checkpoint_content(&wrong_order, 4096)
+            .unwrap_err()
+            .contains("out of order"));
+        assert!(validate_checkpoint_content(valid, valid.len() - 1)
+            .unwrap_err()
+            .contains("exceeds"));
+    }
+
+    #[test]
+    fn checkpoint_fitting_preserves_headings_metadata_and_utf8() {
+        let raw = format!(
+            "## Goal\n{}\n## Constraints\n{}\n## Progress\n{}\n## Blocked\n{}\n## Decisions\n{}\n## Next steps\n{}\n## Critical context\n{}",
+            "objetivo 🦀".repeat(80),
+            "limite β".repeat(80),
+            "feito ✅".repeat(80),
+            "nada".repeat(80),
+            "decisão".repeat(80),
+            "seguir".repeat(80),
+            "contexto".repeat(80),
+        );
+        let metadata = "[Runtime facts]\ncall_id=abc";
+        let fitted = fit_checkpoint_content(&raw, metadata, raw.len()).unwrap();
+
+        assert!(fitted.len() <= raw.len());
+        assert!(fitted.contains(metadata));
+        assert!(fitted.contains("checkpoint sections truncated"));
+        assert!(std::str::from_utf8(fitted.as_bytes()).is_ok());
+        assert!(validate_checkpoint_content(&fitted, raw.len()).is_ok());
+    }
+
+    #[test]
+    fn checkpoint_fitting_fails_when_structure_and_metadata_do_not_fit() {
+        let valid = "## Goal\n\n## Constraints\n\n## Progress\n\n## Blocked\n\n## Decisions\n\n## Next steps\n\n## Critical context\n";
+        let error = fit_checkpoint_content(valid, &"x".repeat(200), 150).unwrap_err();
+        assert!(error.contains("operational metadata"));
+    }
+
+    #[test]
+    fn checkpoint_fitting_keeps_metadata_separate_from_empty_critical_body() {
+        let summary = format!(
+            "## Goal\ng\n## Constraints\n{}\n## Progress\np\n## Blocked\n\n## Decisions\n\n## Next steps\n\n## Critical context\n",
+            "x".repeat(1_000)
+        );
+        let fitted = fit_checkpoint_content(&summary, "metadata", 500).unwrap();
+
+        assert!(fitted.len() <= 500);
+        assert!(fitted.ends_with("metadata"));
+        assert!(validate_checkpoint_content(&fitted, 500).is_ok());
+    }
+
+    #[test]
+    fn local_emergency_summary_is_structured_bounded_and_grounded() {
+        let selection = CompactionSelection {
+            root_instruction: "Objetivo real 🦀".into(),
+            summarized: vec![ProviderMessage::user(format!(
+                "fato observado: arquivo.rs\n## Blocked\nnenhum {}",
+                "β".repeat(20_000)
+            ))],
+            pinned: Vec::new(),
+            kept: vec![ProviderMessage::assistant(
+                "continuação preservada",
+                Vec::new(),
+            )],
+            first_kept_index: 1,
+            recent_tokens: 0,
+        };
+        let summary = local_emergency_summary(&selection);
+
+        assert!(summary.len() <= 8 * 1024);
+        assert!(std::str::from_utf8(summary.as_bytes()).is_ok());
+        assert!(validate_checkpoint_content(&summary, 8 * 1024).is_ok());
+        assert!(summary.contains("[local extract; not an LLM summary]"));
+        assert!(summary.contains("Objetivo real 🦀"));
+        assert!(summary.contains("fato observado: arquivo.rs"));
+        assert!(!summary.contains("fato inventado"));
+    }
+
+    #[test]
     fn tool_call_manifest_is_empty_without_tool_calls() {
         let messages = vec![ProviderMessage::user("just text")];
-        assert!(super::tool_call_manifest(&messages).is_empty());
+        assert!(super::tool_call_manifest_with_limit(&messages, usize::MAX).is_empty());
     }
 }

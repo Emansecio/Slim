@@ -274,10 +274,15 @@ fn jev_usage_is_counted_in_compaction_totals() {
                 pairs_dropped: 1,
                 results_truncated: 1,
                 batches: 1,
+                batches_started: 1,
+                batches_completed: 1,
+                usage_unknown: false,
                 estimated_saved_tokens: 500,
                 input_tokens: Some(321),
                 output_tokens: Some(12),
                 model: Some("jev-1.13.0".into()),
+                backend: Some("typesafe".into()),
+                requested_model: Some("jev-1.13.0".into()),
                 duration_ms: 45,
             },
         ),
@@ -286,9 +291,14 @@ fn jev_usage_is_counted_in_compaction_totals() {
             EventKind::CompactionJevFallback {
                 detail: "transport failed".into(),
                 batches: 0,
+                batches_started: 1,
+                batches_completed: 0,
+                usage_unknown: true,
                 input_tokens: None,
                 output_tokens: None,
                 model: None,
+                backend: Some("typesafe".into()),
+                requested_model: Some("jev-1.13.0".into()),
                 duration_ms: 10,
             },
         ),
@@ -302,6 +312,97 @@ fn jev_usage_is_counted_in_compaction_totals() {
     assert_eq!(ledger.compaction_output_tokens, 12);
     assert!(ledger.jev_usage_unknown);
     assert!(ledger.usage_unknown);
+}
+
+#[test]
+fn confirmed_jev_usage_survives_unknown_marker_and_tracks_typesafe_price_bucket() {
+    let events = vec![SessionEvent::new(
+        1,
+        EventKind::CompactionJevPruned {
+            pairs_total: 1,
+            pairs_dropped: 1,
+            results_truncated: 0,
+            batches: 1,
+            batches_started: 1,
+            batches_completed: 1,
+            usage_unknown: true,
+            estimated_saved_tokens: 3,
+            input_tokens: Some(100),
+            output_tokens: Some(0),
+            model: Some("jev-1.13.0".into()),
+            backend: Some("typesafe".into()),
+            requested_model: Some("jev-1.13.0".into()),
+            duration_ms: 1,
+        },
+    )];
+
+    let ledger = UsageTotals::from_events(&events, false);
+    assert_eq!(ledger.jev_input_tokens, 100);
+    assert_eq!(ledger.jev_output_tokens, 0);
+    assert_eq!(ledger.jev_priced_input_tokens, 100);
+    assert_eq!(ledger.jev_failed_priced_input_tokens, 0);
+    assert!(ledger.jev_usage_unknown);
+    assert!(!ledger.jev_pricing_unknown);
+}
+
+#[test]
+fn vercel_jev_usage_is_confirmed_but_not_marked_as_typesafe_priced() {
+    let events = vec![SessionEvent::new(
+        1,
+        EventKind::CompactionJevPruned {
+            pairs_total: 1,
+            pairs_dropped: 0,
+            results_truncated: 0,
+            batches: 1,
+            batches_started: 1,
+            batches_completed: 1,
+            usage_unknown: false,
+            estimated_saved_tokens: 0,
+            input_tokens: Some(100),
+            output_tokens: Some(2),
+            model: Some("typesafe-ai/jev".into()),
+            backend: Some("vercel".into()),
+            requested_model: Some("typesafe-ai/jev".into()),
+            duration_ms: 1,
+        },
+    )];
+
+    let ledger = UsageTotals::from_events(&events, false);
+    assert_eq!(ledger.jev_input_tokens, 100);
+    assert_eq!(ledger.jev_priced_input_tokens, 0);
+    assert!(ledger.jev_pricing_unknown);
+    assert!(!ledger.jev_usage_unknown);
+}
+
+#[test]
+fn legacy_jev_events_deserialize_with_new_telemetry_defaults() {
+    let event: SessionEvent = serde_json::from_value(serde_json::json!({
+        "seq": 7,
+        "kind": {
+            "type": "CompactionJevPruned",
+            "pairs_total": 1,
+            "pairs_dropped": 1,
+            "results_truncated": 0,
+            "batches": 1,
+            "estimated_saved_tokens": 2,
+            "input_tokens": 10,
+            "output_tokens": 0,
+            "model": "jev-1.13.0",
+            "duration_ms": 3
+        }
+    }))
+    .expect("legacy Jev event");
+    assert!(matches!(
+        event.kind,
+        EventKind::CompactionJevPruned {
+            batches_started: 0,
+            batches_completed: 0,
+            usage_unknown: false,
+            backend: None,
+            requested_model: None,
+            ..
+        }
+    ));
 }
 
 #[test]

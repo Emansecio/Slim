@@ -86,6 +86,21 @@ pub struct UsageTotals {
     pub jev_latency_ms: u64,
     #[serde(default)]
     pub jev_usage_unknown: bool,
+    /// Confirmed Jev input tokens for which the TypeSafe standard price is
+    /// known. This is deliberately separate from `jev_input_tokens`: tokens
+    /// from Vercel/custom backends must not be treated as TypeSafe cost.
+    #[serde(default)]
+    pub jev_priced_input_tokens: u64,
+    #[serde(default)]
+    pub jev_failed_priced_input_tokens: u64,
+    #[serde(default)]
+    pub jev_failed_usage_unknown: bool,
+    /// At least one Jev event carried usage for a backend/model whose price
+    /// is not part of Slim's static catalogue.
+    #[serde(default)]
+    pub jev_pricing_unknown: bool,
+    #[serde(default)]
+    pub jev_failed_pricing_unknown: bool,
     pub compaction_tokens_saved: u64,
     pub post_compaction_reacquisitions: u64,
     pub estimation_error_tokens: i64,
@@ -325,15 +340,32 @@ impl UsageTotals {
                 EventKind::CompactionJevPruned {
                     input_tokens,
                     output_tokens,
+                    usage_unknown,
+                    backend,
+                    requested_model,
+                    model,
                     duration_ms,
                     ..
                 }
                 | EventKind::CompactionJevFallback {
                     input_tokens,
                     output_tokens,
+                    usage_unknown,
+                    backend,
+                    requested_model,
+                    model,
                     duration_ms,
                     ..
-                } => totals.record_jev_usage(*input_tokens, *output_tokens, *duration_ms),
+                } => totals.record_jev_usage(
+                    *input_tokens,
+                    *output_tokens,
+                    *usage_unknown,
+                    matches!(&event.kind, EventKind::CompactionJevFallback { .. }),
+                    backend.as_deref(),
+                    requested_model.as_deref(),
+                    model.as_deref(),
+                    *duration_ms,
+                ),
                 EventKind::CompactionAttemptStarted {
                     provider,
                     model,
@@ -654,6 +686,11 @@ impl UsageTotals {
         &mut self,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        usage_unknown: bool,
+        failed: bool,
+        backend: Option<&str>,
+        requested_model: Option<&str>,
+        model: Option<&str>,
         duration_ms: u64,
     ) {
         match input_tokens {
@@ -668,6 +705,9 @@ impl UsageTotals {
             None => {
                 self.jev_usage_unknown = true;
                 self.usage_unknown = true;
+                if failed {
+                    self.jev_failed_usage_unknown = true;
+                }
             }
         }
         match output_tokens {
@@ -682,10 +722,73 @@ impl UsageTotals {
             None => {
                 self.jev_usage_unknown = true;
                 self.usage_unknown = true;
+                if failed {
+                    self.jev_failed_usage_unknown = true;
+                }
             }
+        }
+        if usage_unknown {
+            self.jev_usage_unknown = true;
+            self.usage_unknown = true;
+            if failed {
+                self.jev_failed_usage_unknown = true;
+            }
+        }
+
+        let known_typesafe_price = is_known_typesafe_jev(backend, requested_model, model);
+        let has_confirmed_usage = input_tokens.is_some_and(|tokens| tokens > 0)
+            || output_tokens.is_some_and(|tokens| tokens > 0);
+        if known_typesafe_price {
+            if let Some(tokens) = input_tokens {
+                if tokens > 0 {
+                    add(
+                        &mut self.jev_priced_input_tokens,
+                        tokens,
+                        &mut self.overflowed,
+                    );
+                    if failed {
+                        add(
+                            &mut self.jev_failed_priced_input_tokens,
+                            tokens,
+                            &mut self.overflowed,
+                        );
+                    }
+                }
+            }
+        } else if has_confirmed_usage || input_tokens.is_none() || output_tokens.is_none() {
+            if failed {
+                self.jev_failed_pricing_unknown = true;
+            }
+            self.jev_pricing_unknown = true;
         }
         add(&mut self.jev_latency_ms, duration_ms, &mut self.overflowed);
     }
+}
+
+/// TypeSafe's standard Jev price is stable for the built-in model and its
+/// public aliases. Vercel and caller-selected/dynamic models are intentionally
+/// left unpriced until the provider supplies a catalog entry.
+fn is_known_typesafe_jev(
+    backend: Option<&str>,
+    requested_model: Option<&str>,
+    resolved_model: Option<&str>,
+) -> bool {
+    if !backend.is_some_and(|backend| backend.eq_ignore_ascii_case("typesafe")) {
+        return false;
+    }
+    let models = [requested_model, resolved_model];
+    models
+        .iter()
+        .flatten()
+        .all(|model| is_known_typesafe_model(model))
+        && models.iter().flatten().next().is_some()
+}
+
+fn is_known_typesafe_model(model: &str) -> bool {
+    matches!(
+        model.trim().to_ascii_lowercase().as_str(),
+        "jev-1.13.0" | "typesafe-ai/jev" | "typesafe-ai/jev-1.13.0" | "jev"
+    )
 }
 
 fn input_token_total(

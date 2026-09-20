@@ -129,7 +129,7 @@ fn verbose_provider_text_prepends_only_redacted_tool_summaries() {
             "ledger uncached_input=4 cache_write=0 cache_read=0 reasoning=0 cache_hit_ratio=0.00%\n",
             "execution provider_turns=1 tool_calls_executed=0 tool_calls_reused=0 tool_calls_suppressed=0 no_progress_turns=0 no_progress_tokens=0\n",
             "economy duplicate_evidence_bytes_avoided=0 compaction_input=0 compaction_output=0 compaction_saved_estimated=0 post_compaction_reacquisitions=0 estimation_error=0\n",
-            "cost total=? per_validated_completion=? failed_attempts=? compaction=? cancelled_estimated=?\n"
+            "cost total=? per_validated_completion=? failed_attempts=? compaction=? cancelled_estimated=? usage_unknown=false pricing_unknown=false\n"
         )
     );
     assert!(!render_provider_text(&result).contains("timeline:"));

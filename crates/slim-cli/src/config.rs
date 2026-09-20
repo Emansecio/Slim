@@ -654,9 +654,11 @@ const JEV_MODEL_ENV: &str = "SLIM_JEV_MODEL";
 /// runtime on the LLM summary path without any external call.
 ///
 /// `SLIM_JEV_BACKEND` (`typesafe` or `vercel`) selects the endpoint explicitly.
-/// Without it the credential decides, because Vercel AI Gateway keys carry the
-/// `vck_` prefix Vercel issues. A key reads from either variable, so a gateway
-/// key stored under `TYPESAFE_API_KEY` still reaches the gateway.
+/// With it, the matching credential variable wins; the other variable is only
+/// accepted when the existing key rule identifies the selected backend. Without it,
+/// the credential decides, because Vercel AI Gateway keys carry the `vck_` prefix
+/// Vercel issues, and `TYPESAFE_API_KEY` remains the deterministic preference
+/// when both variables are populated.
 pub fn jev_prune_config_from_env() -> Result<Option<JevPruneConfig>, String> {
     jev_prune_config_from(|key| std::env::var(key).ok())
 }
@@ -664,11 +666,17 @@ pub fn jev_prune_config_from_env() -> Result<Option<JevPruneConfig>, String> {
 pub(crate) fn jev_prune_config_from(
     env: impl Fn(&str) -> Option<String>,
 ) -> Result<Option<JevPruneConfig>, String> {
-    let api_key = nonempty_env(&env, TYPESAFE_API_KEY_ENV)
-        .or_else(|| nonempty_env(&env, AI_GATEWAY_API_KEY_ENV));
-    let backend = match nonempty_env(&env, JEV_BACKEND_ENV) {
-        Some(value) => JevBackend::parse(&value)?,
-        None => JevBackend::for_api_key(api_key.as_deref().unwrap_or_default()),
+    let (backend, api_key) = match nonempty_env(&env, JEV_BACKEND_ENV) {
+        Some(value) => {
+            let backend = JevBackend::parse(&value)?;
+            (backend, jev_api_key_for_backend(&env, backend))
+        }
+        None => {
+            let api_key = nonempty_env(&env, TYPESAFE_API_KEY_ENV)
+                .or_else(|| nonempty_env(&env, AI_GATEWAY_API_KEY_ENV));
+            let backend = JevBackend::for_api_key(api_key.as_deref().unwrap_or_default());
+            (backend, api_key)
+        }
     };
     let Some(api_key) = api_key else {
         return Ok(None);
@@ -678,6 +686,19 @@ pub(crate) fn jev_prune_config_from(
         Some(model) => config.with_model(model),
         None => config,
     }))
+}
+
+fn jev_api_key_for_backend(
+    env: &impl Fn(&str) -> Option<String>,
+    backend: JevBackend,
+) -> Option<String> {
+    let (preferred, fallback) = match backend {
+        JevBackend::Typesafe => (TYPESAFE_API_KEY_ENV, AI_GATEWAY_API_KEY_ENV),
+        JevBackend::Vercel => (AI_GATEWAY_API_KEY_ENV, TYPESAFE_API_KEY_ENV),
+    };
+    nonempty_env(env, preferred).or_else(|| {
+        nonempty_env(env, fallback).filter(|api_key| JevBackend::for_api_key(api_key) == backend)
+    })
 }
 
 fn nonempty_env(env: &impl Fn(&str) -> Option<String>, key: &str) -> Option<String> {
@@ -865,6 +886,7 @@ mod tests {
             .expect("resolved")
             .expect("configured");
         assert_eq!(typesafe.backend, JevBackend::Typesafe);
+        assert_eq!(typesafe.api_key, "tsk_1");
         assert_eq!(typesafe.model, "jev-1.13.0");
 
         // A `vck_` key selects the Vercel AI Gateway and its model id.
@@ -872,18 +894,88 @@ mod tests {
             .expect("resolved")
             .expect("configured");
         assert_eq!(gateway.backend, JevBackend::Vercel);
+        assert_eq!(gateway.api_key, "vck_1");
         assert_eq!(gateway.model, "typesafe-ai/jev");
 
-        // An explicit backend wins over the prefix, and the model is overridable.
-        let explicit = resolve(&[
+        // Without an explicit backend, TYPESAFE_API_KEY remains the deterministic
+        // preference when both variables are populated.
+        let both = resolve(&[
+            ("TYPESAFE_API_KEY", "tsk_1"),
+            ("AI_GATEWAY_API_KEY", "vck_1"),
+        ])
+        .expect("resolved")
+        .expect("configured");
+        assert_eq!(both.backend, JevBackend::Typesafe);
+        assert_eq!(both.api_key, "tsk_1");
+
+        // An explicit backend selects its matching variable first, and the model
+        // remains overridable.
+        let explicit_typesafe = resolve(&[
             ("SLIM_JEV_BACKEND", "typesafe"),
             ("TYPESAFE_API_KEY", "tsk_1"),
+            ("AI_GATEWAY_API_KEY", "vck_1"),
             ("SLIM_JEV_MODEL", "jev-1.13.0"),
         ])
         .expect("resolved")
         .expect("configured");
-        assert_eq!(explicit.backend, JevBackend::Typesafe);
-        assert_eq!(explicit.model, "jev-1.13.0");
+        assert_eq!(explicit_typesafe.backend, JevBackend::Typesafe);
+        assert_eq!(explicit_typesafe.api_key, "tsk_1");
+        assert_eq!(explicit_typesafe.model, "jev-1.13.0");
+
+        let explicit_vercel = resolve(&[
+            ("SLIM_JEV_BACKEND", "vercel"),
+            ("TYPESAFE_API_KEY", "tsk_1"),
+            ("AI_GATEWAY_API_KEY", "vck_1"),
+        ])
+        .expect("resolved")
+        .expect("configured");
+        assert_eq!(explicit_vercel.backend, JevBackend::Vercel);
+        assert_eq!(explicit_vercel.api_key, "vck_1");
+        assert_eq!(explicit_vercel.model, "typesafe-ai/jev");
+
+        // A missing matching variable may use the other slot only when its key
+        // still identifies the explicitly selected backend.
+        let vercel_key_in_typesafe_slot = resolve(&[
+            ("SLIM_JEV_BACKEND", "vercel"),
+            ("TYPESAFE_API_KEY", "vck_compat"),
+        ])
+        .expect("resolved")
+        .expect("configured");
+        assert_eq!(vercel_key_in_typesafe_slot.backend, JevBackend::Vercel);
+        assert_eq!(vercel_key_in_typesafe_slot.api_key, "vck_compat");
+        assert_eq!(
+            resolve(&[
+                ("SLIM_JEV_BACKEND", "vercel"),
+                ("TYPESAFE_API_KEY", "tsk_1"),
+            ]),
+            Ok(None)
+        );
+        assert_eq!(
+            resolve(&[
+                ("SLIM_JEV_BACKEND", "typesafe"),
+                ("AI_GATEWAY_API_KEY", "vck_1"),
+            ]),
+            Ok(None)
+        );
+        assert_eq!(
+            resolve(&[
+                ("SLIM_JEV_BACKEND", "vercel"),
+                ("AI_GATEWAY_API_KEY", "  "),
+                ("TYPESAFE_API_KEY", "vck_1"),
+            ])
+            .expect("resolved")
+            .expect("configured")
+            .api_key,
+            "vck_1"
+        );
+
+        // The prefix remains authoritative when a Vercel key is stored under
+        // TYPESAFE_API_KEY and no backend is declared.
+        let prefixed_typesafe_slot = resolve(&[("TYPESAFE_API_KEY", "vck_2")])
+            .expect("resolved")
+            .expect("configured");
+        assert_eq!(prefixed_typesafe_slot.backend, JevBackend::Vercel);
+        assert_eq!(prefixed_typesafe_slot.api_key, "vck_2");
 
         assert!(
             resolve(&[("SLIM_JEV_BACKEND", "openai"), ("TYPESAFE_API_KEY", "k")]).is_err(),

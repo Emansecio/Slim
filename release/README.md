@@ -1,5 +1,44 @@
 # Release do Slim
 
+## Deploy local — compactação Jev/checkpoint endurecidos (2026-09-20)
+
+`refresh-slim.ps1` concluiu com `OK:` e exit 0 depois do gate descrito abaixo.
+PATH: `C:\Users\User\bin\Slim.exe`, build **2026-09-20 01:06:12 -03:00**,
+`slim 0.1.0`, **18.400.256 bytes**. O executável instalado e
+`D:\Slim\target\release\Slim.exe` têm o mesmo SHA-256:
+`7F70FF18C965B3C48E91BB90BFF349D92AD84FFEBC294190D35535EBB558C328`.
+Os smokes `--version` e `--help` retornaram exit 0.
+
+A poda agora julga cada par inequivocamente ligado por `tool_call_id`, sem
+apagar texto/blocos do assistant nem chamadas irmãs, e envia por lote somente
+os corpos completos julgáveis. O contrato HTTP oficial, validação estrita de
+respostas, limites, cancelamento foreground/background e telemetria de uso
+confirmado/desconhecido foram alinhados. Inelegibilidade ou falha do Jev não
+bloqueia o resumo convencional. O checkpoint final preserva os sete títulos,
+limites UTF-8, fatos e recuperação, limita o manifesto a 4 KiB e publica o
+artefato por stage privado + commit atômico, sem rollback destrutivo de objeto
+compartilhado. Custos TypeSafe conhecidos e preços desconhecidos permanecem
+separados.
+
+Validação focada: `cargo check --workspace --all-targets` e `git diff --check`
+limpos; `slim-core --lib compact` **26/26**, `slim-core --lib jev_prune`
+**24/24** e `agent_loop jev` **10/10**, incluindo cancelamento, HTTP localhost
+real e fallback com 257 candidatos. Configuração **26/26**, ledger **8/8**,
+custos headless **5/5**, armazenamento de artefatos **5/5** e projeção TUI
+afetada **1/1** também passaram. O primeiro `refresh-slim.ps1 -Test` encontrou
+um golden headless desatualizado pela nova telemetria; ele foi corrigido e
+passou isolado. A segunda execução avançou até `slim-tui --lib`, onde a falha
+fora do escopo
+`reducer::tests::opencode_models_refresh_and_select_dynamic_catalog` foi
+reproduzida isoladamente (**253 aprovados / 1 falha**) e abortou os targets
+seguintes/doc-tests. O diff desta entrega no TUI toca somente `api.rs`, não o
+reducer/model picker; conforme `RULES.md`, o deploy foi concluído sem `-Test`.
+
+O smoke live sintético da TypeSafe alcançou o endpoint, mas respondeu HTTP
+**401** com a credencial configurada; não foi repetido. Não havia credencial
+Vercel disponível. Portanto, transporte/contrato foram exercitados por fixture
+HTTP local, mas um sucesso autenticado live permanece pendente.
+
 ## Deploy local — compactação Jev contextual e recuperável (2026-09-19)
 
 `refresh-slim.ps1` concluiu com `OK:` e exit 0. PATH:

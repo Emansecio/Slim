@@ -1,27 +1,35 @@
 # Slim
 
-**Checkout — correções da compactação Jev, 19/09/2026:** cada lote de
-julgamento agora recebe o mesmo estado JSON limitado: a tarefa, as instruções
-de compactação manuais, a cronologia resumida sem corpos de ferramenta, o
-contexto retido e o conjunto completo de candidatos, identificados por
-caminhos explícitos como `candidates.candidate_0`. Acima do limite explícito
-de candidatos, a compactação recua para o resumo com o prefixo intacto. O Jev
-em segundo plano só inicia em um turno de ferramenta não suprimido que passa
-no break-even; as identidades das chamadas antigas permanecem num manifesto
-determinístico limitado e no arquivo completo de recuperação. A poda ficou
-conservadora: probabilidade de retenção
-ambígua é preservada, e só valores abaixo de `0.2` podem descartar evidência.
-A transformação é transacional — o prefixo original não muda quando a redução
-por par ou a redução total do prompt de resumo fica abaixo dos gates. A economia
-estimada passou a medir a representação limitada realmente enviada ao resumo,
-em vez do resultado bruto da ferramenta. Os eventos Jev registram duração,
-modelo resolvido e tokens de entrada/saída quando o endpoint os informa; esses
-tokens também entram nos totais de compactação e a telemetria marca uso
-desconhecido quando a API não o reporta. Como o preço do backend Jev não faz
-parte da tabela do provider principal, custo total e custo de compactação não
-exibem um valor parcial quando houve uso Jev.
+**Checkout — compactação Jev e checkpoint endurecidos, 20/09/2026:** cada
+`tool_call_id` seguramente ligado a um único resultado é um candidato
+independente. Cada lote recebe somente os corpos completos dos seus candidatos
+e um índice cronológico compacto do conjunto global; conteúdo e blocos do
+assistant, chamadas irmãs, IDs e nomes permanecem intactos. Quando uma chamada
+é podada, apenas seus argumentos viram `{}` e o resultado ligado recebe uma
+nota menor. Candidatos ambíguos, resultados com blocos estruturados, conjuntos
+acima de 256 itens e reduções insuficientes permanecem verbatim e o resumo LLM
+continua disponível.
 
-**Checkout — compactação por poda Jev, 18/09/2026:** a compactação passa a ter
+TypeSafe usa `POST /v1/systemone`; Vercel usa a rota oficial `POST
+/v1/evaluate`, ambas com `model` no corpo e contratos próprios de resposta.
+IDs, tipo e probabilidades precisam corresponder exatamente e valores fora de
+`[0,1]` ou não finitos são rejeitados sem clamp. Os limites locais em caracteres
+são apenas guardas de construção — os limites em tokens documentados pelo
+provider continuam autoritativos. Há deadline total de 90 s, timeout por
+request de 30 s e cancelamento cooperativo em foreground/background. Eventos
+separam lotes iniciados/concluídos, uso confirmado/desconhecido, backend e
+modelo solicitado/resolvido.
+
+O break-even do resumo não soma tokens de modelos com preços diferentes: a
+elegibilidade do Jev decide somente o pré-passe opcional. Custo TypeSafe Jev
+conhecido usa US$ 0,042/M de tokens de entrada e saída gratuita; Vercel/modelos
+customizados permanecem explicitamente sem preço estático. O checkpoint final
+é revalidado depois de fatos, recuperação e manifesto (máximo 4 KiB), conserva
+os sete títulos estruturais e fronteiras UTF-8 e falha explicitamente quando os
+metadados mínimos não cabem. A notificação Jev informa que a poda terminou, mas
+que o checkpoint ainda não foi aplicado.
+
+**Histórico — introdução da poda Jev, 18/09/2026:** a compactação passou a ter
 duas estratégias selecionáveis. `jev` é o padrão: antes de pedir o resumo ao
 modelo principal, o Slim consulta o Jev (TypeSafe) para julgar quais pares
 tool call/result do prefixo resumido ainda importam; os obsoletos são
@@ -45,12 +53,12 @@ de fato maior (mínimo de 512 caracteres), para nunca inflar o contexto.
 Testes: unitários do pruner com judge fake (sem rede) e dois testes de loop
 no `agent_loop`, um de poda com arquivo grande e outro de fallback.
 
-**Checkout — backend Vercel do Jev, 19/09/2026:** sem `SLIM_JEV_BACKEND`, a
+**Histórico — backend Vercel do Jev, 19/09/2026:** sem `SLIM_JEV_BACKEND`, a
 própria chave decide o endpoint: `vck_` é o prefixo que a Vercel emite, então
 uma chave do gateway basta e uma `TYPESAFE_API_KEY` comum continua na TypeSafe
 (uma chave `vck_` guardada em `TYPESAFE_API_KEY` também chega ao gateway). O
-contrato do gateway difere do TypeSafe em dois pontos, tratados no mesmo
-módulo: o modelo viaja no header `ai-model-id` e o primitivo booleano chama-se
+contrato do gateway diferia do TypeSafe em dois pontos, tratados no mesmo
+módulo: o primitivo booleano chama-se
 `boolean`, com a probabilidade em `probability` em vez de `noul`. Validação
 desta sessão: `cargo check --workspace --all-targets` limpo, `cargo fmt --all`
 aplicado, `slim-core --lib jev` 9/9, `slim-cli --lib config` 26/26 e
@@ -64,7 +72,7 @@ com `estimated_saved_tokens: 4340`. São chamadas reais, que consomem tokens da
 chave TypeSafe; nenhum benchmark pago foi executado. Publicado no PATH em
 19/09/2026 — [identidade do build e smoke](release/README.md).
 
-**Checkout — remoção do modo Jev, 18/09/2026:** o modo Jev (roteamento de
+**Histórico — remoção do modo Jev, 18/09/2026:** o modo Jev (roteamento de
 tool call) foi removido. O ciclo de modos voltou a
 `Auto → Read-only → Plan → Auto`; `Auto`, `Read-only` e `Plan` não mudaram.
 Saíram junto o controlador TypeSafe (`/login typesafe`), a flag `--jev`, os

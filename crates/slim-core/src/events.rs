@@ -366,6 +366,17 @@ pub enum EventKind {
         results_truncated: u64,
         #[serde(default)]
         batches: u64,
+        /// Number of Jev requests that entered the bounded batch loop. Kept
+        /// separate from the legacy `batches` field so partially completed
+        /// or cancelled pruning remains observable.
+        #[serde(default)]
+        batches_started: u64,
+        #[serde(default)]
+        batches_completed: u64,
+        /// True when at least one usage component was unavailable. Confirmed
+        /// components are still retained by the usage ledger.
+        #[serde(default)]
+        usage_unknown: bool,
         #[serde(default)]
         estimated_saved_tokens: u64,
         #[serde(default)]
@@ -374,22 +385,40 @@ pub enum EventKind {
         output_tokens: Option<u64>,
         #[serde(default)]
         model: Option<String>,
+        /// Jev endpoint identity. `model` is the resolved model returned by
+        /// the provider; this field records the requested model and backend
+        /// for pricing/audit decisions.
+        #[serde(default)]
+        backend: Option<String>,
+        #[serde(default)]
+        requested_model: Option<String>,
         #[serde(default)]
         duration_ms: u64,
     },
-    /// Jev pruning was selected but could not complete; the LLM summary path
-    /// is used instead. `detail` carries a bounded, redacted reason.
+    /// Jev pruning was selected but could not complete. The ordinary failure
+    /// path uses the LLM summary; cancellation stops the compaction instead.
+    /// `detail` carries a bounded, redacted reason.
     CompactionJevFallback {
         #[serde(default)]
         detail: String,
         #[serde(default)]
         batches: u64,
         #[serde(default)]
+        batches_started: u64,
+        #[serde(default)]
+        batches_completed: u64,
+        #[serde(default)]
+        usage_unknown: bool,
+        #[serde(default)]
         input_tokens: Option<u64>,
         #[serde(default)]
         output_tokens: Option<u64>,
         #[serde(default)]
         model: Option<String>,
+        #[serde(default)]
+        backend: Option<String>,
+        #[serde(default)]
+        requested_model: Option<String>,
         #[serde(default)]
         duration_ms: u64,
     },

@@ -891,15 +891,19 @@ impl UiEvent {
                 ..
             } => Some(Self::Notification {
                 message: format!(
-                    "Jev compacted context: dropped {pairs_dropped} stale tool call(s), truncated {results_truncated} result(s), saved ~{estimated_saved_tokens} tokens."
+                    "Jev pruning completed: dropped {pairs_dropped} stale tool call(s), truncated {results_truncated} result(s), removed ~{estimated_saved_tokens} prompt tokens. The checkpoint is not applied yet."
                 ),
             }),
-            slim_core::EventKind::CompactionJevFallback { detail, .. } => Some(Self::Notification {
-                message: format!(
-                    "Jev compaction unavailable; using LLM summary. {}",
-                    bounded_first_line(&detail, 200)
-                ),
-            }),
+            slim_core::EventKind::CompactionJevFallback { detail, .. } => {
+                let detail = bounded_first_line(&detail, 200);
+                Some(Self::Notification {
+                    message: if detail.contains("cancelled") {
+                        format!("Jev pruning cancelled; the checkpoint was not applied. {detail}")
+                    } else {
+                        format!("Jev compaction unavailable; using LLM summary. {detail}")
+                    },
+                })
+            }
             slim_core::EventKind::CompactionState {
                 state,
                 reason,
@@ -1637,6 +1641,34 @@ mod tests {
         let projected = UiEvent::from_core(SessionEvent::new(4, EventKind::CompactionCompleted));
         assert_eq!(projected, Some(UiEvent::CompactionCompleted));
         assert!(!UiEvent::CompactionCompleted.is_control());
+    }
+
+    #[test]
+    fn jev_pruning_notification_does_not_claim_checkpoint_was_applied() {
+        let projected = UiEvent::from_core(SessionEvent::new(
+            4,
+            EventKind::CompactionJevPruned {
+                pairs_total: 2,
+                pairs_dropped: 1,
+                results_truncated: 1,
+                batches: 1,
+                batches_started: 1,
+                batches_completed: 1,
+                estimated_saved_tokens: 512,
+                input_tokens: Some(10),
+                output_tokens: Some(0),
+                usage_unknown: false,
+                backend: Some("typesafe".into()),
+                requested_model: Some("jev-1.13.0".into()),
+                model: Some("jev-1.13.0".into()),
+                duration_ms: 3,
+            },
+        ));
+        let Some(UiEvent::Notification { message }) = projected else {
+            panic!("Jev pruning must project a notification");
+        };
+        assert!(message.contains("not applied yet"));
+        assert!(!message.contains("compacted context"));
     }
 
     #[test]

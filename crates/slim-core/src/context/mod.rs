@@ -12,14 +12,15 @@ pub use compact::{
     build_bounded_summary_prompt_with_checkpoint_and_instructions, build_summary_prompt,
     build_summary_prompt_with_checkpoint, compact, compact_provider_messages,
     compaction_prefix_fingerprint, estimate_provider_message_tokens,
-    estimate_text_tokens_from_chars, has_compactable_history,
+    estimate_text_tokens_from_chars, fit_checkpoint_content, has_compactable_history,
     latest_user_instruction_before_boundary, local_emergency_summary, select_compaction_history,
-    AdaptiveTokenEstimator, CompactionCommit, CompactionHandle, CompactionPolicy, CompactionReason,
-    CompactionResult, CompactionSelection, CompactionStatus, CompactionStrategy, ContextItem,
-    PreparedCompaction, COMPACTION_SYSTEM_PROMPT,
+    validate_checkpoint_content, AdaptiveTokenEstimator, CompactionCommit, CompactionHandle,
+    CompactionPolicy, CompactionReason, CompactionResult, CompactionSelection, CompactionStatus,
+    CompactionStrategy, ContextItem, PreparedCompaction, COMPACTION_SYSTEM_PROMPT,
 };
 pub use jev_prune::{
     estimate_prune_input_tokens, prune_summarized, prune_summarized_with_instructions,
-    HttpJevJudge, JevBackend, JevJudge, JevJudgment, JevPruneConfig, JevPruneError,
-    JevPruneFailure, JevPruneStats, DEFAULT_JEV_MODEL, DEFAULT_VERCEL_JEV_MODEL,
+    prune_summarized_with_instructions_cancellable, HttpJevJudge, JevBackend, JevInputEstimate,
+    JevJudge, JevJudgeMetadata, JevJudgment, JevPruneConfig, JevPruneError, JevPruneFailure,
+    JevPruneStats, DEFAULT_JEV_MODEL, DEFAULT_VERCEL_JEV_MODEL,
 };

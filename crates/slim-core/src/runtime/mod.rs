@@ -473,6 +473,7 @@ struct CompactionAttemptProgress {
 
 struct PendingBackgroundCompaction {
     task: tokio::task::JoinHandle<BackgroundCompactionResult>,
+    cancellation: CancellationToken,
     progress: Arc<Mutex<CompactionAttemptProgress>>,
     jev_outcome: Arc<Mutex<Option<JevAttemptOutcome>>>,
     usage_request: RequestUsage,
@@ -628,35 +629,11 @@ impl CompactionSummary {
                 });
             }
         }
-        if self.text.trim().is_empty() {
-            return Err(ProviderError::InvalidResponse {
-                message: "summary provider returned an empty summary".into(),
-            });
-        }
-        if self.text.len() > max_bytes {
-            return Err(ProviderError::InvalidResponse {
-                message: format!(
-                    "summary provider exceeded the configured limit of {max_bytes} bytes"
-                ),
-            });
-        }
-        let mut lines = self.text.lines().map(str::trim);
-        for heading in [
-            "## Goal",
-            "## Constraints",
-            "## Progress",
-            "## Blocked",
-            "## Decisions",
-            "## Next steps",
-            "## Critical context",
-        ] {
-            if !lines.any(|line| line == heading) {
-                return Err(ProviderError::InvalidResponse {
-                    message: format!("summary provider omitted required heading: {heading}"),
-                });
+        crate::context::validate_checkpoint_content(&self.text, max_bytes).map_err(|message| {
+            ProviderError::InvalidResponse {
+                message: format!("summary provider returned an invalid checkpoint: {message}"),
             }
-        }
-        Ok(())
+        })
     }
 }
 
@@ -1743,7 +1720,7 @@ impl Runtime {
                         .saturating_add(estimate_provider_message_tokens(&prepared.pinned)),
                     };
                     let summary = self.redact_sensitive(&prepared.summary);
-                    let summary = self
+                    let summary_result = self
                         .archive_compaction_summary(
                             &selection,
                             summary,
@@ -1751,7 +1728,19 @@ impl Runtime {
                             initial_messages,
                             cwd,
                         )
-                        .await?;
+                        .await;
+                    let summary = match summary_result {
+                        Err(ProviderError::Cancelled) => {
+                            return Ok(cancelled_agent_loop_result(
+                                next_seq,
+                                turns,
+                                all_results,
+                                Vec::new(),
+                                usage_since(&self.app, loop_event_start),
+                            ));
+                        }
+                        result => result?,
+                    };
                     messages = apply_compaction_selection(&messages, &selection, summary.clone())
                         .map_err(|message| ProviderError::InvalidResponse {
                         message: message.into(),
@@ -1915,7 +1904,7 @@ impl Runtime {
                         message: message.into(),
                     })?;
                     let summary = self.redact_sensitive(&local_emergency_summary(&selection));
-                    let summary = self
+                    let summary_result = self
                         .archive_compaction_summary(
                             &selection,
                             summary,
@@ -1923,7 +1912,19 @@ impl Runtime {
                             initial_messages,
                             cwd,
                         )
-                        .await?;
+                        .await;
+                    let summary = match summary_result {
+                        Err(ProviderError::Cancelled) => {
+                            return Ok(cancelled_agent_loop_result(
+                                next_seq,
+                                turns,
+                                all_results,
+                                Vec::new(),
+                                usage_since(&self.app, loop_event_start),
+                            ));
+                        }
+                        result => result?,
+                    };
                     let tokens_before = preflight_tokens;
                     let prefix_fingerprint = compaction_prefix_fingerprint(&selection.summarized);
                     messages = apply_compaction_selection(&messages, &selection, summary.clone())
@@ -2451,7 +2452,8 @@ impl Runtime {
                     let request_bytes = plan.request_bytes;
                     let estimated_input_tokens = plan.estimated_input_tokens;
                     let tokens_before = plan.tokens_before;
-                    let cancellation = self.cancellation.clone();
+                    let cancellation = CancellationToken::new();
+                    let task_cancellation = cancellation.clone();
                     let background_client = (*client).clone();
                     let jev_judge = self.jev_judge.clone();
                     let token_estimator = self.token_estimator.clone();
@@ -2463,7 +2465,7 @@ impl Runtime {
                             plan,
                             jev_judge,
                             token_estimator,
-                            cancellation,
+                            Some(task_cancellation),
                             task_progress,
                             task_outcome,
                         )
@@ -2471,6 +2473,7 @@ impl Runtime {
                     });
                     pending_background = Some(PendingBackgroundCompaction {
                         task,
+                        cancellation,
                         progress,
                         jev_outcome,
                         usage_request,
@@ -3090,7 +3093,10 @@ impl Runtime {
         }
 
         let summary = self.redact_sensitive(&result.summary);
-        if !result.valid || summary.trim().is_empty() || summary.len() > policy.summary_max_bytes {
+        if !result.valid
+            || crate::context::validate_checkpoint_content(&summary, policy.summary_max_bytes)
+                .is_err()
+        {
             if let Some(handle) = &self.compaction_handle {
                 handle.background_failed();
             }
@@ -3157,8 +3163,13 @@ impl Runtime {
                 crate::EventKind::CompactionJevFallback {
                     detail,
                     batches: outcome.stats.batches as u64,
+                    batches_started: outcome.stats.batches_started as u64,
+                    batches_completed: outcome.stats.batches_completed as u64,
                     input_tokens: outcome.stats.input_tokens,
                     output_tokens: outcome.stats.output_tokens,
+                    usage_unknown: outcome.stats.usage_unknown,
+                    backend: outcome.stats.backend,
+                    requested_model: outcome.stats.requested_model,
                     model: outcome.stats.model,
                     duration_ms: outcome.stats.duration_ms,
                 },
@@ -3172,9 +3183,14 @@ impl Runtime {
                     pairs_dropped: outcome.stats.pairs_dropped as u64,
                     results_truncated: outcome.stats.results_truncated as u64,
                     batches: outcome.stats.batches as u64,
+                    batches_started: outcome.stats.batches_started as u64,
+                    batches_completed: outcome.stats.batches_completed as u64,
                     estimated_saved_tokens: outcome.stats.estimated_saved_tokens,
                     input_tokens: outcome.stats.input_tokens,
                     output_tokens: outcome.stats.output_tokens,
+                    usage_unknown: outcome.stats.usage_unknown,
+                    backend: outcome.stats.backend,
+                    requested_model: outcome.stats.requested_model,
                     model: outcome.stats.model,
                     duration_ms: outcome.stats.duration_ms,
                 },
@@ -3206,21 +3222,35 @@ impl Runtime {
             return self.finish_background_attempt(attempt, joined, &policy, next_seq);
         }
 
-        attempt.task.abort();
-        let _ = (&mut attempt.task).await;
-        self.emit_background_jev_outcome(&attempt.jev_outcome, next_seq)?;
-        let duration_ms = elapsed_millis(attempt.started);
-        let observed_usage = background_compaction_cancellation_usage(&attempt, None, duration_ms);
-        self.record_background_cancellation(
-            next_seq,
-            attempt.request_bytes,
-            attempt.estimated_input_tokens,
-            attempt.tokens_before,
-            duration_ms,
-            compaction_progress_snapshot(&attempt.progress),
-            reason,
-        )?;
-        Ok(observed_usage)
+        attempt.cancellation.cancel();
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut attempt.task).await {
+            Ok(joined) => {
+                let policy = self
+                    .compaction_handle
+                    .as_ref()
+                    .map(CompactionHandle::policy)
+                    .unwrap_or_default();
+                self.finish_background_attempt(attempt, joined, &policy, next_seq)
+            }
+            Err(_) => {
+                attempt.task.abort();
+                let _ = (&mut attempt.task).await;
+                self.emit_background_jev_outcome(&attempt.jev_outcome, next_seq)?;
+                let duration_ms = elapsed_millis(attempt.started);
+                let observed_usage =
+                    background_compaction_cancellation_usage(&attempt, None, duration_ms);
+                self.record_background_cancellation(
+                    next_seq,
+                    attempt.request_bytes,
+                    attempt.estimated_input_tokens,
+                    attempt.tokens_before,
+                    duration_ms,
+                    compaction_progress_snapshot(&attempt.progress),
+                    reason,
+                )?;
+                Ok(observed_usage)
+            }
+        }
     }
 
     #[expect(
@@ -3339,16 +3369,26 @@ impl Runtime {
         let projected_savings_tokens = tokens_before
             .saturating_sub(projected_tokens_after)
             .saturating_mul(u64::from(future_turns));
-        let jev_input_tokens = if policy.strategy == crate::context::CompactionStrategy::Jev
-            && self.jev_judge.is_some()
-        {
-            crate::context::estimate_prune_input_tokens(&selection, None, &summarized)
+        // Decide whether the summary itself is worthwhile using only tokens
+        // from the summary model. Jev is a separate model with separate
+        // pricing, so adding its token estimate here would pretend unlike
+        // tokens were a financial total. Ineligibility changes only the
+        // optional pre-pass; it must never block a valid summary compaction.
+        let strategy = if policy.strategy == crate::context::CompactionStrategy::Jev {
+            match crate::context::estimate_prune_input_tokens(&selection, None, &summarized) {
+                crate::context::JevInputEstimate::Eligible(_) => {
+                    crate::context::CompactionStrategy::Jev
+                }
+                crate::context::JevInputEstimate::NoCandidates
+                | crate::context::JevInputEstimate::TooManyCandidates { .. } => {
+                    crate::context::CompactionStrategy::Summary
+                }
+            }
         } else {
-            0
+            crate::context::CompactionStrategy::Summary
         };
-        let estimated_cost_tokens = preflight_input_tokens
-            .saturating_add(COMPACTION_MAX_OUTPUT_TOKENS)
-            .saturating_add(jev_input_tokens);
+        let estimated_cost_tokens =
+            preflight_input_tokens.saturating_add(COMPACTION_MAX_OUTPUT_TOKENS);
         let safety_margin_tokens = estimated_cost_tokens.div_ceil(4);
         let profitable =
             projected_savings_tokens > estimated_cost_tokens.saturating_add(safety_margin_tokens);
@@ -3363,7 +3403,7 @@ impl Runtime {
                     client.adapter().wire_kind(),
                     client.adapter().model()
                 ),
-                strategy: policy.strategy,
+                strategy,
                 previous_checkpoint: previous_summary,
                 context_window_tokens: budget.window_tokens,
                 reserve_tokens: budget.reserve_tokens,
@@ -3409,7 +3449,7 @@ impl Runtime {
                 client.adapter().wire_kind(),
                 client.adapter().model()
             ),
-            strategy: policy.strategy,
+            strategy,
             previous_checkpoint: previous_summary,
             context_window_tokens: budget.window_tokens,
             reserve_tokens: budget.reserve_tokens,
@@ -5558,7 +5598,7 @@ impl Runtime {
     async fn archive_compaction_summary(
         &self,
         selection: &CompactionSelection,
-        mut summary: String,
+        summary: String,
         execution_facts: &str,
         initial_messages: &[ProviderMessage],
         cwd: &Path,
@@ -5568,11 +5608,53 @@ impl Runtime {
             .as_ref()
             .map(|handle| handle.policy().summary_max_bytes)
             .unwrap_or_else(|| CompactionPolicy::default().summary_max_bytes);
+        if self.is_cancelled() {
+            return Err(ProviderError::Cancelled);
+        }
+        let summary = self.redact_sensitive(&summary);
+        crate::context::validate_checkpoint_content(&summary, usize::MAX).map_err(|message| {
+            ProviderError::InvalidResponse {
+                message: format!("compaction checkpoint rejected before archival: {message}"),
+            }
+        })?;
         let mut retained = String::new();
         if !execution_facts.is_empty() {
-            retained.push_str("\n\n[Runtime facts at compaction; subsequent actions may invalidate them. Prior-run facts remain historical, not proof of current state.]\n");
+            retained.push_str("[Runtime facts at compaction; subsequent actions may invalidate them. Prior-run facts remain historical, not proof of current state.]\n");
             retained.push_str(&self.redact_sensitive(execution_facts));
         }
+        let mut manifest = self.redact_sensitive(&crate::context::tool_call_manifest_with_limit(
+            &selection.summarized,
+            usize::MAX,
+        ));
+        let append_block = |target: &mut String, block: &str| {
+            if block.is_empty() {
+                return;
+            }
+            if !target.is_empty() {
+                target.push_str("\n\n");
+            }
+            target.push_str(block);
+        };
+        let mut preflight = retained.clone();
+        if self.artifact_store.is_some() {
+            append_block(
+                &mut preflight,
+                "[Prior visible transcript archive reference pending.]",
+            );
+        }
+        let mut with_manifest = preflight.clone();
+        append_block(&mut with_manifest, &manifest);
+        if crate::context::fit_checkpoint_content(&summary, &with_manifest, max_bytes).is_err() {
+            manifest.clear();
+        }
+        crate::context::fit_checkpoint_content(&summary, &preflight, max_bytes).map_err(
+            |message| ProviderError::InvalidResponse {
+                message: format!(
+                    "compaction checkpoint cannot retain operational metadata: {message}"
+                ),
+            },
+        )?;
+        let mut artifact_write = None;
         if let Some(store) = self.artifact_store.clone() {
             // Elision changes only the active view. Restore uniquely identified
             // original outputs before archiving; never reread a mutated file.
@@ -5622,65 +5704,96 @@ impl Runtime {
                 }
             }
             let transcript = crate::context::recovery_transcript(&self.redact_messages(&recovered));
-            let workspace = cwd.to_owned();
-            let (artifact, read_path) = tokio::task::spawn_blocking(move || {
-                let artifact = store.put("context-history", transcript.as_bytes())?;
-                let workspace = std::fs::canonicalize(workspace)?;
-                let canonical = std::fs::canonicalize(&artifact.path)?;
-                let read_path = canonical
-                    .strip_prefix(workspace)
-                    .ok()
-                    .map(|path| path.to_string_lossy().replace('\\', "/"));
-                Ok::<_, std::io::Error>((artifact, read_path))
+            let artifact = store.preview("context-history", transcript.as_bytes());
+            let read_path = artifact
+                .path
+                .strip_prefix(cwd)
+                .ok()
+                .map(|path| path.to_string_lossy().replace('\\', "/"));
+            if let Some(path) = read_path {
+                let path = serde_json::to_string(&path).expect("path serializes");
+                append_block(&mut retained, &format!("[Prior visible transcript: use read on {path} with offset=1 for an index of user-role messages (including runtime notices), checkpoints and tool_call_id evidence. Follow indexed offset/max_lines and pagination to recover historical text; earlier checkpoints link earlier archives. Apply later user corrections. Opaque reasoning and binary attachments are not included.]"));
+            } else {
+                append_block(&mut retained, &format!("[Prior visible transcript archived at {}; native read cannot access this artifact outside the workspace.]", artifact.path.display()));
+            }
+            artifact_write = Some((store, transcript));
+        }
+        let mut retained_with_manifest = retained.clone();
+        append_block(&mut retained_with_manifest, &manifest);
+        let retained_with_manifest = self.redact_sensitive(&retained_with_manifest);
+        let final_checkpoint = match crate::context::fit_checkpoint_content(
+            &summary,
+            &retained_with_manifest,
+            max_bytes,
+        ) {
+            Ok(checkpoint) => checkpoint,
+            Err(_) if !manifest.is_empty() => {
+                let retained = self.redact_sensitive(&retained);
+                crate::context::fit_checkpoint_content(&summary, &retained, max_bytes).map_err(
+                    |message| ProviderError::InvalidResponse {
+                        message: format!("final compaction checkpoint rejected: {message}"),
+                    },
+                )?
+            }
+            Err(message) => {
+                return Err(ProviderError::InvalidResponse {
+                    message: format!("final compaction checkpoint rejected: {message}"),
+                });
+            }
+        };
+        if self.is_cancelled() {
+            return Err(ProviderError::Cancelled);
+        }
+        if let Some((store, transcript)) = artifact_write {
+            let stage_store = store.clone();
+            let staged = tokio::task::spawn_blocking(move || {
+                stage_store.stage("context-history", transcript.as_bytes())
             })
             .await
             .map_err(|_| ProviderError::InvalidResponse {
                 message: "context artifact worker failed".into(),
             })?
             .map_err(|_| ProviderError::InvalidResponse {
-                message: "context artifact could not be stored".into(),
+                message: "context artifact could not be staged".into(),
             })?;
-            if let Some(path) = read_path {
-                let path = serde_json::to_string(&path).expect("path serializes");
-                retained.push_str(&format!("\n\n[Prior visible transcript: use read on {path} with offset=1 for an index of user-role messages (including runtime notices), checkpoints and tool_call_id evidence. Follow indexed offset/max_lines and pagination to recover historical text; earlier checkpoints link earlier archives. Apply later user corrections. Opaque reasoning and binary attachments are not included.]"));
-            } else {
-                retained.push_str(&format!("\n\n[Prior visible transcript archived at {}; native read cannot access this artifact outside the workspace.]", artifact.path.display()));
+            if self.is_cancelled() {
+                crate::context::ArtifactStore::discard_staged(staged).map_err(|_| {
+                    ProviderError::InvalidResponse {
+                        message:
+                            "cancelled compaction could not discard its staged recovery artifact"
+                                .into(),
+                    }
+                })?;
+                return Err(ProviderError::Cancelled);
+            }
+            let commit_cancellation = self.cancellation.clone();
+            let committed = tokio::task::spawn_blocking(move || {
+                // This check and the atomic publication share one blocking job.
+                // Cancellation wins until this linearization point; after it,
+                // the checkpoint transaction is committed and the shared,
+                // content-addressed artifact must never be rolled back.
+                if commit_cancellation
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+                {
+                    crate::context::ArtifactStore::discard_staged(staged)?;
+                    Ok(None)
+                } else {
+                    store.commit_staged(staged).map(Some)
+                }
+            })
+            .await
+            .map_err(|_| ProviderError::InvalidResponse {
+                message: "context artifact worker failed".into(),
+            })?
+            .map_err(|_| ProviderError::InvalidResponse {
+                message: "context artifact could not be committed".into(),
+            })?;
+            if committed.is_none() {
+                return Err(ProviderError::Cancelled);
             }
         }
-        // Reserve space for deterministic facts and recovery, rather than
-        // letting a maximum-sized model summary crowd them out of the checkpoint.
-        const MARKER: &str = "\n[summary truncated to retain runtime facts and recovery]";
-        let mut retained = self.redact_sensitive(&retained);
-        if retained.len() > max_bytes {
-            return Err(ProviderError::InvalidResponse {
-                message: "compaction recovery metadata exceeds checkpoint limit".into(),
-            });
-        }
-        let manifest_room = max_bytes.saturating_sub(retained.len()).saturating_sub(2);
-        let manifest = self.redact_sensitive(&crate::context::tool_call_manifest_with_limit(
-            &selection.summarized,
-            manifest_room,
-        ));
-        if !manifest.is_empty() && retained.len() + 2 + manifest.len() <= max_bytes {
-            retained.push_str("\n\n");
-            retained.push_str(&manifest);
-        }
-        let remaining = max_bytes - retained.len();
-        if summary.len() > remaining {
-            let marker = if remaining >= MARKER.len() {
-                MARKER
-            } else {
-                ""
-            };
-            let mut end = remaining - marker.len();
-            while !summary.is_char_boundary(end) {
-                end -= 1;
-            }
-            summary.truncate(end);
-            summary.push_str(marker);
-        }
-        summary.push_str(&retained);
-        Ok(summary)
+        Ok(final_checkpoint)
     }
 
     fn redact_message(&self, mut message: ProviderMessage) -> ProviderMessage {
@@ -6047,11 +6160,12 @@ impl Runtime {
         if policy.strategy == crate::context::CompactionStrategy::Jev {
             match &self.jev_judge {
                 Some(judge) => {
-                    match crate::context::prune_summarized_with_instructions(
+                    match crate::context::prune_summarized_with_instructions_cancellable(
                         &**judge,
                         &selection,
                         manual_instructions.as_deref(),
                         &mut summarized,
+                        self.cancellation.as_ref(),
                     )
                     .await
                     {
@@ -6064,15 +6178,22 @@ impl Runtime {
                                     pairs_dropped: stats.pairs_dropped as u64,
                                     results_truncated: stats.results_truncated as u64,
                                     batches: stats.batches as u64,
+                                    batches_started: stats.batches_started as u64,
+                                    batches_completed: stats.batches_completed as u64,
                                     estimated_saved_tokens: stats.estimated_saved_tokens,
                                     input_tokens: stats.input_tokens,
                                     output_tokens: stats.output_tokens,
+                                    usage_unknown: stats.usage_unknown,
+                                    backend: stats.backend,
+                                    requested_model: stats.requested_model,
                                     model: stats.model,
                                     duration_ms: stats.duration_ms,
                                 },
                             )?;
                         }
                         Err(failure) => {
+                            let cancelled =
+                                matches!(failure.error, crate::context::JevPruneError::Cancelled);
                             let detail = self.redact_sensitive(&failure.to_string());
                             let stats = *failure.stats;
                             push_runtime_event(
@@ -6081,12 +6202,20 @@ impl Runtime {
                                 crate::EventKind::CompactionJevFallback {
                                     detail,
                                     batches: stats.batches as u64,
+                                    batches_started: stats.batches_started as u64,
+                                    batches_completed: stats.batches_completed as u64,
                                     input_tokens: stats.input_tokens,
                                     output_tokens: stats.output_tokens,
+                                    usage_unknown: stats.usage_unknown,
+                                    backend: stats.backend,
+                                    requested_model: stats.requested_model,
                                     model: stats.model,
                                     duration_ms: stats.duration_ms,
                                 },
                             )?;
+                            if cancelled {
+                                return Err(ProviderError::Cancelled);
+                            }
                         }
                     }
                 }
@@ -6097,8 +6226,13 @@ impl Runtime {
                         crate::EventKind::CompactionJevFallback {
                             detail: "no Jev credential configured (set TYPESAFE_API_KEY or AI_GATEWAY_API_KEY)".into(),
                             batches: 0,
+                            batches_started: 0,
+                            batches_completed: 0,
                             input_tokens: Some(0),
                             output_tokens: Some(0),
+                            usage_unknown: false,
+                            backend: None,
+                            requested_model: None,
                             model: None,
                             duration_ms: 0,
                         },
@@ -7031,11 +7165,12 @@ async fn run_background_compaction<A: ProviderAdapter>(
         let outcome = match &jev_judge {
             Some(judge) => {
                 let mut summarized = plan.selection.summarized_for_prompt();
-                match crate::context::prune_summarized_with_instructions(
+                match crate::context::prune_summarized_with_instructions_cancellable(
                     &**judge,
                     &plan.selection,
                     None,
                     &mut summarized,
+                    cancellation.as_ref(),
                 )
                 .await
                 {
@@ -8925,6 +9060,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn valid_checkpoint(detail: &str) -> String {
+        format!(
+            "## Goal\n{detail}\n## Constraints\n\n## Progress\n\n## Blocked\n\n## Decisions\n\n## Next steps\n\n## Critical context\n"
+        )
+    }
+
     #[tokio::test]
     async fn compaction_archive_recovers_original_outputs_and_chains_checkpoints() {
         let root = std::env::temp_dir().join(format!(
@@ -8964,7 +9105,7 @@ mod tests {
         let summary = runtime
             .archive_compaction_summary(
                 &selection,
-                "model interpretation".into(),
+                valid_checkpoint("model interpretation"),
                 "run_start_seq=7 validation_revision=1 current=false private-fixture-token",
                 &initial,
                 &root,
@@ -8993,7 +9134,7 @@ mod tests {
         let second = runtime
             .archive_compaction_summary(
                 &selection,
-                "new interpretation".into(),
+                valid_checkpoint("new interpretation"),
                 "",
                 &initial,
                 &root,
@@ -9016,7 +9157,13 @@ mod tests {
         let workspace = root.join("workspace");
         std::fs::create_dir(&workspace).unwrap();
         let outside = runtime
-            .archive_compaction_summary(&selection, "summary".into(), "", &initial, &workspace)
+            .archive_compaction_summary(
+                &selection,
+                valid_checkpoint("summary"),
+                "",
+                &initial,
+                &workspace,
+            )
             .await
             .unwrap();
         assert!(outside.contains("native read cannot access this artifact outside the workspace"));
@@ -9048,7 +9195,7 @@ mod tests {
         let summary = runtime
             .archive_compaction_summary(
                 &selection,
-                "interpretation".into(),
+                valid_checkpoint("interpretation"),
                 "",
                 &[],
                 Path::new("."),
@@ -9088,20 +9235,21 @@ mod tests {
             first_kept_index: 3,
             recent_tokens: 0,
         };
-        let summary = runtime
+        let error = runtime
             .archive_compaction_summary(
                 &selection,
-                "summary".into(),
+                valid_checkpoint("summary"),
                 "run_start_seq=7 failure call_id=failed-write",
                 &[],
                 Path::new("."),
             )
             .await
-            .unwrap();
-        assert!(summary.len() <= 200);
-        assert!(summary.contains("Runtime facts at compaction"));
-        assert!(summary.ends_with("failure call_id=failed-write"));
-        assert!(!summary.contains("Prior tool calls"));
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderError::InvalidResponse { message }
+                if message.contains("cannot retain operational metadata")
+        ));
     }
 
     #[tokio::test]
@@ -9123,7 +9271,7 @@ mod tests {
         let summary = runtime
             .archive_compaction_summary(
                 &selection,
-                "😀".repeat(max_bytes / 4),
+                valid_checkpoint(&"😀".repeat((max_bytes - 200) / 4)),
                 "run_start_seq=11 failure call_id=failed-write",
                 &[],
                 Path::new("."),
@@ -9131,13 +9279,13 @@ mod tests {
             .await
             .unwrap();
         assert!(summary.len() <= max_bytes);
-        assert!(summary.contains("summary truncated"));
+        assert!(summary.contains("checkpoint sections truncated"));
         assert!(summary.ends_with("failure call_id=failed-write"));
         assert!(!summary.contains("Prior visible transcript"));
         assert!(runtime
             .archive_compaction_summary(
                 &selection,
-                "summary".into(),
+                valid_checkpoint("summary"),
                 &"x".repeat(max_bytes),
                 &[],
                 Path::new(".")
@@ -9148,12 +9296,56 @@ mod tests {
             summary_max_bytes: 4,
             ..CompactionPolicy::default()
         }));
-        assert_eq!(
-            runtime
-                .archive_compaction_summary(&selection, "😀😀".into(), "", &[], Path::new("."))
-                .await
-                .unwrap(),
-            "😀"
+        assert!(runtime
+            .archive_compaction_summary(
+                &selection,
+                valid_checkpoint("😀😀"),
+                "",
+                &[],
+                Path::new(".")
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn impossible_checkpoint_budget_does_not_create_recovery_artifact() {
+        let root = std::env::temp_dir().join(format!(
+            "slim-checkpoint-transaction-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut runtime = Runtime::with_artifact_store(&root).unwrap();
+        runtime.set_compaction_handle(CompactionHandle::new(CompactionPolicy {
+            summary_max_bytes: 128,
+            ..CompactionPolicy::default()
+        }));
+        let selection = CompactionSelection {
+            root_instruction: "root".into(),
+            summarized: vec![ProviderMessage::user("historical evidence")],
+            pinned: Vec::new(),
+            kept: Vec::new(),
+            first_kept_index: 1,
+            recent_tokens: 0,
+        };
+
+        let result = runtime
+            .archive_compaction_summary(
+                &selection,
+                valid_checkpoint("goal"),
+                "run_start_seq=1 failure call_id=write",
+                &[],
+                Path::new("."),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            !root.exists(),
+            "preflight failure must not write an artifact"
         );
     }
 
@@ -11756,6 +11948,7 @@ mod tests {
                 let progress = Arc::new(Mutex::new(CompactionAttemptProgress::default()));
                 let mut pending = Some(PendingBackgroundCompaction {
                     task,
+                    cancellation: CancellationToken::new(),
                     progress,
                     jev_outcome: Arc::new(Mutex::new(None)),
                     usage_request: RequestUsage {
@@ -11845,6 +12038,7 @@ mod tests {
         };
         let attempt = PendingBackgroundCompaction {
             task: tokio::spawn(std::future::pending::<BackgroundCompactionResult>()),
+            cancellation: CancellationToken::new(),
             progress: Arc::new(Mutex::new(CompactionAttemptProgress::default())),
             jev_outcome: Arc::new(Mutex::new(None)),
             usage_request: RequestUsage {
@@ -11898,6 +12092,7 @@ mod tests {
         });
         drop(PendingBackgroundCompaction {
             task,
+            cancellation: CancellationToken::new(),
             progress: Arc::new(Mutex::new(CompactionAttemptProgress::default())),
             jev_outcome: Arc::new(Mutex::new(None)),
             usage_request: RequestUsage {

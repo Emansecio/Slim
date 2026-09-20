@@ -2935,7 +2935,7 @@ b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE
         arguments: json!({ "path": big_path_for_history, "max_lines": 10 }).to_string(),
     }];
     history.push(first_assistant);
-    history.push(ProviderMessage::tool("read", "old1", "z".repeat(20_000)));
+    history.push(ProviderMessage::tool("read", "old1", "z".repeat(8_000)));
     history.push(ProviderMessage::user("continue"));
     let mut second_assistant = ProviderMessage::user("");
     second_assistant.role = "assistant".into();
@@ -2946,7 +2946,7 @@ b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE
         arguments: json!({ "path": big_path_for_history, "max_lines": 10 }).to_string(),
     }];
     history.push(second_assistant);
-    history.push(ProviderMessage::tool("read", "old2", "w".repeat(20_000)));
+    history.push(ProviderMessage::tool("read", "old2", "w".repeat(8_000)));
     let mut runtime = Runtime::new();
     let mut policy = slim_core::context::CompactionPolicy {
         keep_recent_tokens: 1_000,
@@ -3144,7 +3144,7 @@ b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE
     history.push(ProviderMessage::tool(
         "read",
         "old1",
-        format!("RAW_FALLBACK_MARKER{}", "z".repeat(20_000)),
+        format!("RAW_FALLBACK_MARKER{}", "z".repeat(8_000)),
     ));
     history.push(ProviderMessage::user("continue"));
     let mut second_assistant = ProviderMessage::user("");
@@ -3156,7 +3156,7 @@ b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE
         arguments: json!({ "path": "older.rs", "max_lines": 10 }).to_string(),
     }];
     history.push(second_assistant);
-    history.push(ProviderMessage::tool("read", "old2", "w".repeat(20_000)));
+    history.push(ProviderMessage::tool("read", "old2", "w".repeat(8_000)));
     let mut runtime = Runtime::new();
     let mut policy = slim_core::context::CompactionPolicy {
         keep_recent_tokens: 1_000,
@@ -3222,6 +3222,95 @@ b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE
         .events()
         .iter()
         .any(|event| matches!(event.kind, EventKind::CompactionCompleted)));
+}
+
+#[test]
+fn foreground_cancellation_interrupts_slow_jev_without_committing_checkpoint() {
+    struct BlockingJudge {
+        started: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    }
+
+    #[async_trait]
+    impl slim_core::context::JevJudge for BlockingJudge {
+        async fn judge(
+            &self,
+            _state: &Value,
+            _questions: &[(String, String)],
+        ) -> Result<slim_core::context::JevJudgment, String> {
+            if let Some(started) = self.started.lock().unwrap().take() {
+                started.send(()).unwrap();
+            }
+            std::future::pending().await
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let client = jev_openai_client(listener.local_addr().unwrap());
+    let history = jev_tool_pair_history();
+    let handle = CompactionHandle::new(slim_core::context::CompactionPolicy {
+        keep_recent_tokens: 1_000,
+        strategy: slim_core::context::CompactionStrategy::Jev,
+        ..slim_core::context::CompactionPolicy::default()
+    });
+    handle.request_manual("").unwrap();
+    let cancellation = CancellationToken::new();
+    let cancel = cancellation.clone();
+    let (started, judge_started) = std::sync::mpsc::channel();
+    let watcher = thread::spawn(move || {
+        judge_started
+            .recv_timeout(Duration::from_secs(2))
+            .expect("Jev started");
+        cancel.cancel();
+    });
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle);
+    runtime.set_jev_judge(Some(Arc::new(BlockingJudge {
+        started: std::sync::Mutex::new(Some(started)),
+    })));
+    runtime.set_cancellation_token(cancellation);
+
+    let started_at = Instant::now();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop_with_messages(
+            &client,
+            &history,
+            OperatingMode::Auto,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig::default(),
+        ))
+        .expect("cancellation is a normal stop");
+    watcher.join().unwrap();
+    drop(listener);
+
+    assert_eq!(result.stop, AgentLoopStop::Cancelled);
+    assert!(started_at.elapsed() < Duration::from_secs(1));
+    assert_eq!(runtime.conversation(), history.as_slice());
+    assert!(!runtime
+        .app
+        .events()
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::CompactionCompleted)));
+    let fallback = runtime
+        .app
+        .events()
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::CompactionJevFallback {
+                batches_started,
+                batches_completed,
+                usage_unknown,
+                detail,
+                ..
+            } => Some((*batches_started, *batches_completed, *usage_unknown, detail)),
+            _ => None,
+        })
+        .expect("cancelled Jev outcome");
+    assert_eq!(fallback.0, 1);
+    assert_eq!(fallback.1, 0);
+    assert!(fallback.2);
+    assert!(fallback.3.contains("cancelled"));
 }
 
 const SSE_FINAL_ANSWER: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"final answer\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
@@ -3319,10 +3408,10 @@ fn jev_tool_pair_history() -> Vec<ProviderMessage> {
         ProviderMessage::user("start"),
         ProviderMessage::assistant("old context ".repeat(20_000), Vec::new()),
         first,
-        ProviderMessage::tool("read", "old1", "z".repeat(20_000)),
+        ProviderMessage::tool("read", "old1", "z".repeat(8_000)),
         ProviderMessage::user("continue"),
         second,
-        ProviderMessage::tool("read", "old2", "w".repeat(20_000)),
+        ProviderMessage::tool("read", "old2", "w".repeat(8_000)),
     ]
 }
 
@@ -3419,7 +3508,7 @@ fn jev_is_not_called_for_a_final_answer_turn() {
 }
 
 #[test]
-fn jev_estimate_enters_break_even_cost_and_judge_stays_uncalled() {
+fn jev_eligibility_does_not_charge_pruning_tokens_to_summary_break_even() {
     fn run_once(messages: &[ProviderMessage], jev: bool) -> (u64, u64, u64, u64, u64, usize) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         listener.set_nonblocking(true).expect("nonblocking");
@@ -3569,12 +3658,84 @@ fn jev_estimate_enters_break_even_cost_and_judge_stays_uncalled() {
         None,
         &selection.summarized_for_prompt(),
     );
-    assert!(expected_jev > 0, "candidate keeps the estimate non-zero");
-    assert_eq!(
-        cost_jev.saturating_sub(cost_summary),
+    assert!(matches!(
         expected_jev,
-        "the Jev request-input estimate participates in the gate"
+        slim_core::context::JevInputEstimate::Eligible(tokens) if tokens > 0
+    ));
+    assert_eq!(
+        cost_jev, cost_summary,
+        "summary break-even is independent from optional Jev spend"
     );
+}
+
+#[test]
+fn over_limit_jev_candidates_still_allow_background_summary() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let mut summary_body = String::new();
+        let mut turn_requests = 0;
+        for _ in 0..3 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            let body = if request.contains("You are a context compactor") {
+                summary_body = request;
+                SSE_COMPACTION_SUMMARY.to_owned()
+            } else {
+                turn_requests += 1;
+                if turn_requests == 1 {
+                    sse_read_call_body("over-limit-read")
+                } else {
+                    thread::sleep(Duration::from_millis(250));
+                    SSE_FINAL_ANSWER.to_owned()
+                }
+            };
+            write_sse(&mut stream, &body);
+        }
+        summary_body
+    });
+
+    let client = jev_openai_client(address);
+    let mut history = vec![ProviderMessage::user("root")];
+    for index in 0..257 {
+        let id = format!("old-{index}");
+        let mut assistant = ProviderMessage::assistant("inspect", Vec::new());
+        assistant.tool_calls = vec![ProviderToolCall {
+            id: id.clone(),
+            name: "read".into(),
+            arguments: json!({"path": format!("old-{index}.rs")}).to_string(),
+        }];
+        history.push(assistant);
+        history.push(ProviderMessage::tool("read", id, "x".repeat(2_000)));
+    }
+    history.push(ProviderMessage::user("continue"));
+    let mut recent = ProviderMessage::assistant("read recent", Vec::new());
+    recent.tool_calls = vec![ProviderToolCall {
+        id: "recent".into(),
+        name: "read".into(),
+        arguments: json!({"path":"recent.rs"}).to_string(),
+    }];
+    history.push(recent);
+    history.push(ProviderMessage::tool("read", "recent", "w".repeat(200_000)));
+
+    let window = soft_only_context_window_tokens(&client, &history);
+    let judge_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut runtime = jev_runtime(Arc::new(CountingJevJudge {
+        calls: judge_calls.clone(),
+    }));
+    let result = run_loop_to_completion(&mut runtime, &client, &history, window, 3);
+    let summary_body = server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(judge_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(summary_body.contains("You are a context compactor"));
+    assert!(!summary_body.contains("jev-compaction"));
+    assert!(runtime
+        .app
+        .events()
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::CompactionAttemptCompleted { .. })));
 }
 
 #[test]
@@ -3769,6 +3930,24 @@ fn jev_latency_does_not_block_the_main_tool_turn() {
         elapsed < Duration::from_millis(1_000),
         "loop took {elapsed:?}"
     );
+    let cancelled = runtime
+        .app
+        .events()
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::CompactionJevFallback {
+                batches_started,
+                batches_completed,
+                usage_unknown,
+                detail,
+                ..
+            } if detail.contains("cancelled") => {
+                Some((*batches_started, *batches_completed, *usage_unknown))
+            }
+            _ => None,
+        })
+        .expect("background Jev cancellation is harvested");
+    assert_eq!(cancelled, (1, 0, true));
 }
 
 #[test]
@@ -3820,7 +3999,7 @@ fn jev_failure_in_background_falls_back_to_unpruned_summary() {
     history[3] = ProviderMessage::tool(
         "read",
         "old1",
-        format!("RAW_FALLBACK_MARKER{}", "z".repeat(20_000)),
+        format!("RAW_FALLBACK_MARKER{}", "z".repeat(8_000)),
     );
     let window = soft_only_context_window_tokens(&client, &history);
     let judge_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));

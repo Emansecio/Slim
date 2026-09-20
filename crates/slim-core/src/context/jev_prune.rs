@@ -19,12 +19,10 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_JEV_MODEL: &str = "jev-1.13.0";
 pub const DEFAULT_VERCEL_JEV_MODEL: &str = "typesafe-ai/jev";
 const TYPESAFE_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
-const VERCEL_ENDPOINT: &str = "https://ai-gateway.vercel.sh/v4/ai/evaluation-model";
-/// Headers the AI Gateway evaluation specification requires on every request.
-const VERCEL_PROTOCOL_VERSION: &str = "0.0.1";
-const VERCEL_EVALUATION_SPEC_VERSION: &str = "4";
-/// State the API sees per request; kept well under the model window so one
-/// batch of questions rarely needs a second fitting pass.
+const VERCEL_ENDPOINT: &str = "https://ai-gateway.vercel.sh/v1/evaluate";
+/// Local character guard for bounded request construction. This is not a
+/// token-window guarantee: the provider's documented request/state token
+/// limits remain authoritative and provider rejections fall back safely.
 const STATE_MAX_CHARS: usize = 30_000;
 const TASK_MAX_CHARS: usize = 3_000;
 const COMPACTION_INSTRUCTIONS_MAX_CHARS: usize = 4_000;
@@ -44,6 +42,7 @@ const MIN_PAIR_SAVINGS_CHARS: usize = 512;
 /// Below this the caller should fall back to the LLM summary path.
 const MIN_SAVINGS_TOKENS: u64 = 256;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 
 const KEEP_INSTRUCTIONS_PREFIX: &str =
@@ -132,9 +131,14 @@ pub struct JevPruneStats {
     pub pairs_dropped: usize,
     pub results_truncated: usize,
     pub batches: usize,
+    pub batches_started: usize,
+    pub batches_completed: usize,
     pub estimated_saved_tokens: u64,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub usage_unknown: bool,
+    pub backend: Option<String>,
+    pub requested_model: Option<String>,
     pub model: Option<String>,
     pub duration_ms: u64,
 }
@@ -143,6 +147,7 @@ pub struct JevPruneStats {
 pub enum JevPruneError {
     Transport(String),
     Response(String),
+    Cancelled,
     /// Nothing in the summarized prefix is a tool call/result pair.
     NoCandidates,
     /// Candidates existed but pruning freed too little to be worth it.
@@ -154,6 +159,7 @@ impl std::fmt::Display for JevPruneError {
         match self {
             Self::Transport(message) => write!(formatter, "jev request failed: {message}"),
             Self::Response(message) => write!(formatter, "jev response rejected: {message}"),
+            Self::Cancelled => write!(formatter, "jev request cancelled"),
             Self::NoCandidates => {
                 write!(formatter, "no prunable tool calls in the summarized prefix")
             }
@@ -188,6 +194,12 @@ pub struct JevJudgment {
     pub model: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct JevJudgeMetadata {
+    pub backend: Option<String>,
+    pub requested_model: Option<String>,
+}
+
 impl JevJudgment {
     pub fn probabilities(probabilities: Vec<f64>) -> Self {
         Self {
@@ -197,9 +209,20 @@ impl JevJudgment {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JevInputEstimate {
+    Eligible(u64),
+    NoCandidates,
+    TooManyCandidates { count: usize, maximum: usize },
+}
+
 /// Async boundary so unit tests never touch the network.
 #[async_trait::async_trait]
 pub trait JevJudge: Send + Sync {
+    fn metadata(&self) -> JevJudgeMetadata {
+        JevJudgeMetadata::default()
+    }
+
     async fn judge(
         &self,
         state: &Value,
@@ -210,6 +233,7 @@ pub trait JevJudge: Send + Sync {
 pub struct HttpJevJudge {
     client: reqwest::Client,
     config: JevPruneConfig,
+    endpoint_override: Option<String>,
 }
 
 impl HttpJevJudge {
@@ -219,7 +243,17 @@ impl HttpJevJudge {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { client, config }
+        Self {
+            client,
+            config,
+            endpoint_override: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_endpoint_for_test(mut self, endpoint: String) -> Self {
+        self.endpoint_override = Some(endpoint);
+        self
     }
 }
 
@@ -268,13 +302,7 @@ fn request_body(
             }),
         );
     }
-    let mut body = json!({ "state": state, "questions": Value::Object(map) });
-    // TypeSafe selects the model in the body; the gateway carries it in the
-    // `ai-model-id` header instead.
-    if backend == JevBackend::Typesafe {
-        body["model"] = Value::String(model.to_owned());
-    }
-    body
+    json!({ "model": model, "state": state, "questions": Value::Object(map) })
 }
 
 fn parse_answer_probabilities(
@@ -286,14 +314,36 @@ fn parse_answer_probabilities(
         .get("answers")
         .and_then(Value::as_object)
         .ok_or_else(|| "missing answers object".to_string())?;
+    if answers.len() != ids.len() || ids.iter().any(|id| !answers.contains_key(id)) {
+        return Err(format!(
+            "answer IDs do not match requested IDs (expected {}, got {})",
+            ids.len(),
+            answers.len()
+        ));
+    }
     ids.iter()
         .map(|id| {
-            answers
+            let answer = answers
                 .get(id)
-                .and_then(|answer| answer.get(answer_field(backend)))
+                .and_then(Value::as_object)
+                .ok_or_else(|| format!("missing answer for '{id}'"))?;
+            let expected_type = question_type(backend);
+            if answer.get("type").and_then(Value::as_str) != Some(expected_type) {
+                return Err(format!(
+                    "answer for '{id}' has wrong type; expected {expected_type}"
+                ));
+            }
+            let probability = answer
+                .get(answer_field(backend))
                 .and_then(Value::as_f64)
-                .map(|probability| probability.clamp(0.0, 1.0))
-                .ok_or_else(|| format!("missing {} answer for '{id}'", answer_field(backend)))
+                .ok_or_else(|| format!("missing {} answer for '{id}'", answer_field(backend)))?;
+            if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+                return Err(format!(
+                    "{} answer for '{id}' must be finite and in [0,1]",
+                    answer_field(backend)
+                ));
+            }
+            Ok(probability)
         })
         .collect()
 }
@@ -306,25 +356,37 @@ fn usage_tokens(parsed: &Value, snake_case: &str, camel_case: &str) -> Option<u6
         .and_then(Value::as_u64)
 }
 
-fn parse_judgment(
-    backend: JevBackend,
-    parsed: &Value,
-    ids: &[String],
-) -> Result<JevJudgment, String> {
-    Ok(JevJudgment {
-        probabilities: parse_answer_probabilities(backend, parsed, ids)?,
-        input_tokens: usage_tokens(parsed, "input_tokens", "inputTokens"),
-        output_tokens: usage_tokens(parsed, "output_tokens", "outputTokens"),
+fn parse_judgment(backend: JevBackend, parsed: &Value, ids: &[String]) -> JevJudgment {
+    JevJudgment {
+        // A terminal response with an invalid answer contract is represented
+        // by an empty list. The pruner rejects the length after first
+        // recording the response's confirmed usage/model metadata.
+        probabilities: parse_answer_probabilities(backend, parsed, ids).unwrap_or_default(),
+        input_tokens: match backend {
+            JevBackend::Typesafe => usage_tokens(parsed, "input_tokens", "__unused__"),
+            JevBackend::Vercel => usage_tokens(parsed, "__unused__", "inputTokens"),
+        },
+        output_tokens: match backend {
+            JevBackend::Typesafe => usage_tokens(parsed, "output_tokens", "__unused__"),
+            JevBackend::Vercel => usage_tokens(parsed, "__unused__", "outputTokens"),
+        },
         model: parsed
             .get("model")
             .or_else(|| parsed.get("modelId"))
             .and_then(Value::as_str)
             .map(str::to_owned),
-    })
+    }
 }
 
 #[async_trait::async_trait]
 impl JevJudge for HttpJevJudge {
+    fn metadata(&self) -> JevJudgeMetadata {
+        JevJudgeMetadata {
+            backend: Some(self.config.backend.name().to_owned()),
+            requested_model: Some(self.config.model.clone()),
+        }
+    }
+
     async fn judge(
         &self,
         state: &Value,
@@ -332,22 +394,15 @@ impl JevJudge for HttpJevJudge {
     ) -> Result<JevJudgment, String> {
         let backend = self.config.backend;
         let body = request_body(backend, &self.config.model, state, questions);
-        let mut request = self
+        let request = self
             .client
-            .post(request_url(backend))
+            .post(
+                self.endpoint_override
+                    .as_deref()
+                    .unwrap_or_else(|| request_url(backend)),
+            )
             .bearer_auth(&self.config.api_key)
             .json(&body);
-        if backend == JevBackend::Vercel {
-            // Without these the gateway rejects the route before Jev runs.
-            request = request
-                .header("ai-gateway-protocol-version", VERCEL_PROTOCOL_VERSION)
-                .header("ai-gateway-auth-method", "api-key")
-                .header(
-                    "ai-evaluation-model-specification-version",
-                    VERCEL_EVALUATION_SPEC_VERSION,
-                )
-                .header("ai-model-id", &self.config.model);
-        }
         let response = request.send().await.map_err(|error| error.to_string())?;
         let status = response.status();
         let bytes = response.bytes().await.map_err(|error| error.to_string())?;
@@ -366,58 +421,54 @@ impl JevJudge for HttpJevJudge {
             .iter()
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
-        parse_judgment(backend, &parsed, &ids)
+        Ok(parse_judgment(backend, &parsed, &ids))
     }
 }
 
-/// One assistant/tool pair inside the summarized prefix that Jev may prune.
+/// One independently judgeable assistant call and its safely linked result.
 #[derive(Clone, Debug)]
-struct PrunablePair {
-    /// Index of the assistant message (with tool calls) inside `summarized`.
+struct PrunableCandidate {
+    global_index: usize,
     assistant_index: usize,
-    /// Indices of its tool-result messages inside `summarized`.
-    tool_indices: Vec<usize>,
+    call_index: usize,
+    tool_index: usize,
 }
 
-fn prunable_pairs(summarized: &[ProviderMessage]) -> Vec<PrunablePair> {
-    let mut pairs = Vec::new();
-    let mut index = 0usize;
-    while index < summarized.len() {
-        let message = &summarized[index];
-        if message.role == "assistant" && !message.tool_calls.is_empty() {
-            let wanted: std::collections::HashSet<&str> = message
+fn prunable_pairs(summarized: &[ProviderMessage]) -> Vec<PrunableCandidate> {
+    let mut candidates = Vec::new();
+    for (assistant_index, message) in summarized.iter().enumerate() {
+        if message.role != "assistant" {
+            continue;
+        }
+        for (call_index, call) in message.tool_calls.iter().enumerate() {
+            if message
                 .tool_calls
                 .iter()
-                .map(|call| call.id.as_str())
-                .collect();
-            let mut tool_indices = Vec::new();
-            let mut cursor = index + 1;
-            while cursor < summarized.len() {
-                let candidate = &summarized[cursor];
-                if candidate.role != "tool" {
-                    break;
-                }
-                if candidate
-                    .tool_call_id
-                    .as_deref()
-                    .is_some_and(|id| wanted.contains(id))
-                {
-                    tool_indices.push(cursor);
+                .filter(|other| other.id == call.id)
+                .count()
+                != 1
+            {
+                continue;
+            }
+            let mut matches = Vec::new();
+            let mut cursor = assistant_index + 1;
+            while cursor < summarized.len() && summarized[cursor].role == "tool" {
+                if summarized[cursor].tool_call_id.as_deref() == Some(call.id.as_str()) {
+                    matches.push(cursor);
                 }
                 cursor += 1;
             }
-            if !tool_indices.is_empty() {
-                pairs.push(PrunablePair {
-                    assistant_index: index,
-                    tool_indices,
+            if matches.len() == 1 {
+                candidates.push(PrunableCandidate {
+                    global_index: candidates.len(),
+                    assistant_index,
+                    call_index,
+                    tool_index: matches[0],
                 });
             }
-            index = cursor;
-        } else {
-            index += 1;
         }
     }
-    pairs
+    candidates
 }
 
 fn dropped_note(pair_index: usize, kept_head: &str) -> String {
@@ -455,16 +506,6 @@ fn bounded_middle(content: &str, max_chars: usize) -> String {
     format!("{head}{MARKER}{tail}")
 }
 
-fn pair_messages(pair: &PrunablePair, summarized: &[ProviderMessage]) -> Vec<ProviderMessage> {
-    std::iter::once(summarized[pair.assistant_index].clone())
-        .chain(
-            pair.tool_indices
-                .iter()
-                .map(|index| summarized[*index].clone()),
-        )
-        .collect()
-}
-
 fn candidate_key(index: usize) -> String {
     format!("candidate_{index}")
 }
@@ -474,15 +515,6 @@ fn keep_instructions(index: usize) -> String {
         "{KEEP_INSTRUCTIONS_PREFIX}{}{KEEP_INSTRUCTIONS_SUFFIX}",
         candidate_key(index)
     )
-}
-
-fn strictly_bounded(content: &str, max_chars: usize) -> String {
-    let bounded = bounded_middle(content, max_chars);
-    if bounded.chars().count() > max_chars {
-        bounded.chars().take(max_chars).collect()
-    } else {
-        bounded
-    }
 }
 
 fn summarized_context_text(summarized: &[ProviderMessage]) -> String {
@@ -518,11 +550,28 @@ fn summarized_context_text(summarized: &[ProviderMessage]) -> String {
     rendered.join("\n\n")
 }
 
+fn candidate_body(candidate: &PrunableCandidate, summarized: &[ProviderMessage]) -> String {
+    let call = &summarized[candidate.assistant_index].tool_calls[candidate.call_index];
+    let result = &summarized[candidate.tool_index];
+    let mut body = format!(
+        "tool_call: id={} name={} args={}\n{}: {}",
+        call.id, call.name, call.arguments, result.role, result.content
+    );
+    if let Some(name) = &result.name {
+        body.push_str(&format!(" [name={name}]"));
+    }
+    if let Some(id) = &result.tool_call_id {
+        body.push_str(&format!(" [tool_call_id={id}]"));
+    }
+    body
+}
+
 fn judge_state(
     selection: &CompactionSelection,
     instructions: Option<&str>,
     summarized: &[ProviderMessage],
-    pairs: &[PrunablePair],
+    candidates: &[PrunableCandidate],
+    judged_indices: &[usize],
 ) -> Value {
     let mut retained = selection.pinned.clone();
     retained.extend(selection.kept.iter().cloned());
@@ -532,21 +581,19 @@ fn judge_state(
         &summarized_context_text(summarized),
         SUMMARIZED_CONTEXT_MAX_CHARS,
     );
-    let mut candidates = Map::new();
-    let mut candidate_chars = 0usize;
-    for (index, pair) in pairs.iter().enumerate() {
-        let key = candidate_key(index);
-        let remaining_pairs = pairs.len() - index;
-        let allowance = CANDIDATES_MAX_CHARS
-            .saturating_sub(candidate_chars)
-            .saturating_sub(key.chars().count())
-            / remaining_pairs;
-        let bounded = strictly_bounded(
-            &format_transcript(&pair_messages(pair, summarized)),
-            allowance,
+    let mut bodies = Map::new();
+    // Keep the chronological index compact; full IDs and bodies appear only
+    // for candidates in this batch.
+    let index = candidates
+        .iter()
+        .map(|candidate| Value::from(candidate.global_index as u64))
+        .collect::<Vec<_>>();
+    for &candidate_index in judged_indices {
+        let candidate = &candidates[candidate_index];
+        bodies.insert(
+            candidate_key(candidate.global_index),
+            Value::String(candidate_body(candidate, summarized)),
         );
-        candidate_chars += key.chars().count() + bounded.chars().count();
-        candidates.insert(key, Value::String(bounded));
     }
     json!({
         "task": bounded_middle(&selection.root_instruction, TASK_MAX_CHARS),
@@ -556,7 +603,8 @@ fn judge_state(
         ),
         "summarized_context": summarized_context,
         "retained_context": retained_context,
-        "candidates": Value::Object(candidates),
+        "candidate_index": index,
+        "candidates": Value::Object(bodies),
     })
 }
 
@@ -572,18 +620,12 @@ fn state_text_chars(state: &Value) -> usize {
     }
 }
 
-fn pair_original_chars(pair: &PrunablePair, summarized: &[ProviderMessage]) -> usize {
-    summarized[pair.assistant_index].content.chars().count()
-        + summarized[pair.assistant_index]
-            .tool_calls
-            .iter()
-            .map(|call| call.arguments.chars().count())
-            .sum::<usize>()
-        + pair
-            .tool_indices
-            .iter()
-            .map(|index| summarized[*index].content.chars().count())
-            .sum::<usize>()
+fn candidate_original_chars(
+    candidate: &PrunableCandidate,
+    summarized: &[ProviderMessage],
+) -> usize {
+    let call = &summarized[candidate.assistant_index].tool_calls[candidate.call_index];
+    call.arguments.chars().count() + summarized[candidate.tool_index].content.chars().count()
 }
 
 fn estimated_summary_tokens(messages: &[ProviderMessage]) -> u64 {
@@ -602,14 +644,48 @@ fn failure(started: Instant, error: JevPruneError, mut stats: JevPruneStats) -> 
     }
 }
 
-fn add_reported_tokens(total: &mut Option<u64>, reported: Option<u64>) {
+fn add_reported_tokens(total: &mut Option<u64>, reported: Option<u64>, unknown: &mut bool) {
     let Some(current) = total.as_mut() else {
+        *unknown = true;
         return;
     };
     match reported {
         Some(tokens) => *current = current.saturating_add(tokens),
-        None => *total = None,
+        None => *unknown = true,
     }
+}
+
+fn candidate_batches(
+    candidates: &[PrunableCandidate],
+    summarized: &[ProviderMessage],
+) -> Vec<Vec<usize>> {
+    let mut batches = Vec::new();
+    let mut batch = Vec::new();
+    let mut chars = 0usize;
+    for (index, candidate) in candidates.iter().enumerate() {
+        if !summarized[candidate.tool_index].content_blocks.is_empty() {
+            continue;
+        }
+        let body_chars = candidate_body(candidate, summarized).chars().count();
+        let key_chars = candidate_key(candidate.global_index).chars().count();
+        // Never truncate a candidate body.  If the bounded state cannot carry
+        // the complete evidence, the call remains untouched and unjudged.
+        if body_chars.saturating_add(key_chars) > CANDIDATES_MAX_CHARS {
+            continue;
+        }
+        if batch.len() == QUESTIONS_PER_BATCH
+            || chars.saturating_add(body_chars).saturating_add(key_chars) > CANDIDATES_MAX_CHARS
+        {
+            batches.push(std::mem::take(&mut batch));
+            chars = 0;
+        }
+        chars = chars.saturating_add(body_chars).saturating_add(key_chars);
+        batch.push(index);
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    batches
 }
 
 /// Prune the summarized prefix in place. Returns stats or an error that the
@@ -629,45 +705,119 @@ pub async fn prune_summarized_with_instructions(
     instructions: Option<&str>,
     summarized: &mut [ProviderMessage],
 ) -> Result<JevPruneStats, JevPruneFailure> {
+    prune_summarized_with_instructions_cancellable(judge, selection, instructions, summarized, None)
+        .await
+}
+
+pub async fn prune_summarized_with_instructions_cancellable(
+    judge: &dyn JevJudge,
+    selection: &CompactionSelection,
+    instructions: Option<&str>,
+    summarized: &mut [ProviderMessage],
+    cancellation: Option<&crate::runtime::CancellationToken>,
+) -> Result<JevPruneStats, JevPruneFailure> {
     let started = Instant::now();
-    let pairs = prunable_pairs(summarized);
+    let candidates = prunable_pairs(summarized);
+    let metadata = judge.metadata();
     let mut stats = JevPruneStats {
-        pairs_total: pairs.len(),
+        pairs_total: candidates.len(),
         input_tokens: Some(0),
         output_tokens: Some(0),
+        backend: metadata.backend,
+        requested_model: metadata.requested_model,
         ..JevPruneStats::default()
     };
-    if pairs.is_empty() {
+    if cancellation.is_some_and(crate::runtime::CancellationToken::is_cancelled) {
+        return Err(failure(started, JevPruneError::Cancelled, stats));
+    }
+    if candidates.is_empty() {
         return Err(failure(started, JevPruneError::NoCandidates, stats));
     }
-    if pairs.len() > MAX_JEV_CANDIDATES {
+    if candidates.len() > MAX_JEV_CANDIDATES {
         return Err(failure(
             started,
             JevPruneError::Response("candidate count exceeds 256".into()),
             stats,
         ));
     }
-    let state = judge_state(selection, instructions, summarized, &pairs);
-    debug_assert!(
-        state_text_chars(&state) <= STATE_MAX_CHARS,
-        "Jev state exceeded its local bound"
-    );
+    let batches = candidate_batches(&candidates, summarized);
+    if batches.is_empty() {
+        return Err(failure(started, JevPruneError::NoCandidates, stats));
+    }
     let tokens_before = estimated_summary_tokens(summarized);
-    let mut probabilities = Vec::with_capacity(pairs.len());
-    for (batch_index, chunk) in pairs.chunks(QUESTIONS_PER_BATCH).enumerate() {
-        let start = batch_index * QUESTIONS_PER_BATCH;
+    let mut probabilities = vec![None; candidates.len()];
+    for chunk in &batches {
+        stats.batches_started += 1;
         let questions = chunk
             .iter()
-            .enumerate()
-            .map(|(offset, _)| {
-                let index = start + offset;
-                (format!("keep_{index}"), keep_instructions(index))
+            .map(|&index| {
+                let global = candidates[index].global_index;
+                (format!("keep_{global}"), keep_instructions(global))
             })
             .collect::<Vec<_>>();
-        let judgment = match judge.judge(&state, &questions).await {
-            Ok(judgment) => judgment,
-            Err(message) => return Err(failure(started, JevPruneError::Transport(message), stats)),
+        let state = judge_state(selection, instructions, summarized, &candidates, chunk);
+        let state_chars = state_text_chars(&state);
+        if state_chars > STATE_MAX_CHARS {
+            return Err(failure(
+                started,
+                JevPruneError::Response(format!(
+                    "bounded Jev state exceeds the local guard ({state_chars} > {STATE_MAX_CHARS} characters)"
+                )),
+                stats,
+            ));
+        }
+        let remaining = TOTAL_TIMEOUT.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(failure(
+                started,
+                JevPruneError::Transport("jev total timeout exceeded".into()),
+                stats,
+            ));
+        }
+        let request = tokio::time::timeout(remaining, judge.judge(&state, &questions));
+        tokio::pin!(request);
+        let result = if let Some(cancellation) = cancellation {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    stats.usage_unknown = true;
+                    return Err(failure(started, JevPruneError::Cancelled, stats));
+                }
+                result = &mut request => result,
+            }
+        } else {
+            request.await
         };
+        let judgment = match result {
+            Ok(Ok(judgment)) => judgment,
+            Ok(Err(message)) => {
+                stats.usage_unknown = true;
+                return Err(failure(started, JevPruneError::Transport(message), stats));
+            }
+            Err(_) => {
+                stats.usage_unknown = true;
+                return Err(failure(
+                    started,
+                    JevPruneError::Transport("jev total timeout exceeded".into()),
+                    stats,
+                ));
+            }
+        };
+        stats.batches += 1;
+        stats.batches_completed += 1;
+        add_reported_tokens(
+            &mut stats.input_tokens,
+            judgment.input_tokens,
+            &mut stats.usage_unknown,
+        );
+        add_reported_tokens(
+            &mut stats.output_tokens,
+            judgment.output_tokens,
+            &mut stats.usage_unknown,
+        );
+        if stats.model.is_none() {
+            stats.model.clone_from(&judgment.model);
+        }
         if judgment.probabilities.len() != questions.len() {
             return Err(failure(
                 started,
@@ -679,44 +829,34 @@ pub async fn prune_summarized_with_instructions(
                 stats,
             ));
         }
-        stats.batches += 1;
-        add_reported_tokens(&mut stats.input_tokens, judgment.input_tokens);
-        add_reported_tokens(&mut stats.output_tokens, judgment.output_tokens);
-        if stats.model.is_none() {
-            stats.model = judgment.model;
+        for (index, probability) in chunk.iter().zip(judgment.probabilities) {
+            if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+                return Err(failure(
+                    started,
+                    JevPruneError::Response("probability must be finite and in [0,1]".into()),
+                    stats,
+                ));
+            }
+            probabilities[*index] = Some(probability);
         }
-        probabilities.extend(judgment.probabilities);
     }
     let mut drop_marks: Vec<Option<String>> = vec![None; summarized.len()];
-    for (pair_index, pair) in pairs.iter().enumerate() {
-        let keep = probabilities[pair_index];
+    let mut drop_calls = Vec::new();
+    for (candidate_index, candidate) in candidates.iter().enumerate() {
+        let Some(keep) = probabilities[candidate_index] else {
+            continue;
+        };
         if keep >= DROP_THRESHOLD {
             continue;
         }
-        let original_chars = pair_original_chars(pair, summarized);
-        let head = pair
-            .tool_indices
-            .first()
-            .filter(|_| original_chars > TRUNCATE_HEAD_CHARS * 4)
-            .map(|at| bounded_head(&summarized[*at].content))
+        let original_chars = candidate_original_chars(candidate, summarized);
+        let head = (original_chars > TRUNCATE_HEAD_CHARS * 4)
+            .then(|| bounded_head(&summarized[candidate.tool_index].content))
             .unwrap_or_default();
-        let assistant_note = dropped_note(pair_index, "");
         // Only prune when the replacement is genuinely smaller. A stale but
         // tiny result costs nothing, and rewriting it with a longer note
         // would grow the context instead of freeing it.
-        let replacement_chars = assistant_note.chars().count()
-            + pair
-                .tool_indices
-                .iter()
-                .map(|at| {
-                    let kept = if Some(at) == pair.tool_indices.first() {
-                        head.chars().count()
-                    } else {
-                        0
-                    };
-                    dropped_note(pair_index, "").chars().count() + kept
-                })
-                .sum::<usize>();
+        let replacement_chars = 2 + dropped_note(candidate.global_index, &head).chars().count();
         if original_chars.saturating_sub(replacement_chars) < MIN_PAIR_SAVINGS_CHARS {
             continue;
         }
@@ -724,15 +864,8 @@ pub async fn prune_summarized_with_instructions(
             stats.results_truncated += 1;
         }
         stats.pairs_dropped += 1;
-        drop_marks[pair.assistant_index] = Some(assistant_note);
-        for tool_index in &pair.tool_indices {
-            let note = if Some(tool_index) == pair.tool_indices.first() {
-                dropped_note(pair_index, &head)
-            } else {
-                dropped_note(pair_index, "")
-            };
-            drop_marks[*tool_index] = Some(note);
-        }
+        drop_calls.push(candidate_index);
+        drop_marks[candidate.tool_index] = Some(dropped_note(candidate.global_index, &head));
     }
     if stats.pairs_dropped == 0 {
         return Err(failure(
@@ -742,16 +875,31 @@ pub async fn prune_summarized_with_instructions(
         ));
     }
     let mut proposed = summarized.to_vec();
+    drop_calls.sort_by(|left, right| {
+        candidates[*right]
+            .assistant_index
+            .cmp(&candidates[*left].assistant_index)
+            .then_with(|| {
+                candidates[*right]
+                    .call_index
+                    .cmp(&candidates[*left].call_index)
+            })
+    });
+    for candidate_index in drop_calls {
+        let candidate = &candidates[candidate_index];
+        // Keep the call's identity and metadata so the result remains linked;
+        // only its judged arguments are redacted. Assistant text/blocks and
+        // all sibling calls remain byte-for-byte intact.
+        let message = &mut proposed[candidate.assistant_index];
+        if candidate.call_index < message.tool_calls.len() {
+            message.tool_calls[candidate.call_index].arguments = "{}".into();
+        }
+    }
     for (index, note) in drop_marks.into_iter().enumerate() {
         if let Some(note) = note {
             let message = &mut proposed[index];
             message.content = note;
             message.content_blocks.clear();
-            if message.role == "assistant" {
-                for call in &mut message.tool_calls {
-                    call.arguments = String::new();
-                }
-            }
         }
     }
     let tokens_after = estimated_summary_tokens(&proposed);
@@ -772,38 +920,43 @@ pub fn estimate_prune_input_tokens(
     selection: &CompactionSelection,
     instructions: Option<&str>,
     summarized: &[ProviderMessage],
-) -> u64 {
-    let pairs = prunable_pairs(summarized);
-    if pairs.is_empty() {
-        return 0;
+) -> JevInputEstimate {
+    let candidates = prunable_pairs(summarized);
+    if candidates.is_empty() {
+        return JevInputEstimate::NoCandidates;
     }
-    if pairs.len() > MAX_JEV_CANDIDATES {
-        return u64::MAX;
+    if candidates.len() > MAX_JEV_CANDIDATES {
+        return JevInputEstimate::TooManyCandidates {
+            count: candidates.len(),
+            maximum: MAX_JEV_CANDIDATES,
+        };
     }
-    let state = judge_state(selection, instructions, summarized, &pairs);
-    pairs
-        .chunks(QUESTIONS_PER_BATCH)
-        .enumerate()
-        .map(|(batch_index, chunk)| {
-            let start = batch_index * QUESTIONS_PER_BATCH;
+    let batches = candidate_batches(&candidates, summarized);
+    if batches.is_empty() {
+        return JevInputEstimate::NoCandidates;
+    }
+    let total = batches
+        .iter()
+        .map(|chunk| {
             let questions = chunk
                 .iter()
-                .enumerate()
-                .map(|(offset, _)| {
-                    let index = start + offset;
-                    (format!("keep_{index}"), keep_instructions(index))
+                .map(|&index| {
+                    let global = candidates[index].global_index;
+                    (format!("keep_{global}"), keep_instructions(global))
                 })
                 .collect::<Vec<_>>();
+            let state = judge_state(selection, instructions, summarized, &candidates, chunk);
             let body = request_body(JevBackend::Typesafe, DEFAULT_JEV_MODEL, &state, &questions);
             estimate_text_tokens_from_chars(body.to_string().chars().count() as u64)
         })
-        .sum()
+        .sum();
+    JevInputEstimate::Eligible(total)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ProviderToolCall;
+    use crate::provider::{ProviderContentBlock, ProviderToolCall};
 
     struct StubJudge {
         probabilities: Vec<f64>,
@@ -863,6 +1016,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_judge_uses_official_gateway_shape_and_parses_camel_case_usage() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let size = stream.read(&mut buffer).unwrap();
+                if size == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..size]);
+                let Some(headers_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..headers_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len() >= headers_end + 4 + content_length {
+                    break;
+                }
+            }
+            let response = serde_json::json!({
+                "modelId": "typesafe-ai/jev",
+                "answers": {
+                    "keep_0": { "type": "boolean", "probability": 0.25 }
+                },
+                "usage": { "inputTokens": 123, "outputTokens": 0 }
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let judge = HttpJevJudge::new(JevPruneConfig::new(JevBackend::Vercel, "vck_fixture-key"))
+            .with_endpoint_for_test(format!("http://{address}/v1/evaluate"));
+        let questions = vec![("keep_0".into(), "keep it?".into())];
+        let judgment = judge
+            .judge(&serde_json::json!({"task":"test"}), &questions)
+            .await
+            .unwrap();
+        let request = server.join().unwrap();
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+
+        assert!(request.starts_with("POST /v1/evaluate HTTP/1.1"));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer vck_fixture-key"));
+        assert_eq!(body["model"], DEFAULT_VERCEL_JEV_MODEL);
+        assert_eq!(body["questions"]["keep_0"]["type"], "boolean");
+        assert_eq!(judgment.probabilities, vec![0.25]);
+        assert_eq!(judgment.input_tokens, Some(123));
+        assert_eq!(judgment.output_tokens, Some(0));
+        assert_eq!(judgment.model.as_deref(), Some("typesafe-ai/jev"));
+    }
+
+    #[tokio::test]
     async fn drops_stale_pair_and_preserves_call_ids() {
         let mut summarized = pair("call-1", 8_000);
         summarized.push(message("user", "thanks, now patch it".into()));
@@ -874,11 +1101,190 @@ mod tests {
             .expect("pruned");
         assert_eq!(stats.pairs_dropped, 1);
         assert_eq!(summarized[0].tool_calls[0].id, "call-1");
+        assert_eq!(summarized[0].tool_calls[0].arguments, "{}");
         assert_eq!(summarized[1].tool_call_id.as_deref(), Some("call-1"));
         assert!(summarized[1].content.starts_with("[jev-compaction:"));
         assert!(summarized[1].content.contains('x')); // head retained
         assert_eq!(summarized[2].content, "thanks, now patch it");
         assert!(stats.estimated_saved_tokens >= 256);
+    }
+
+    #[tokio::test]
+    async fn judges_and_drops_one_call_without_rewriting_sibling_or_assistant_content() {
+        let mut assistant = message("assistant", "keep this assistant text".into());
+        assistant.content_blocks = vec![ProviderContentBlock::Text("keep this block".into())];
+        assistant.tool_calls = vec![
+            ProviderToolCall {
+                id: "call-1".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            },
+            ProviderToolCall {
+                id: "call-2".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            },
+        ];
+        let mut first = message("tool", "a".repeat(4_000));
+        first.tool_call_id = Some("call-1".into());
+        let mut second = message("tool", "b".repeat(4_000));
+        second.tool_call_id = Some("call-2".into());
+        let mut summarized = vec![assistant, first, second];
+        let judge = StubJudge {
+            probabilities: vec![0.05, 0.95],
+        };
+        prune_summarized(&judge, &selection(), &mut summarized)
+            .await
+            .expect("one call pruned");
+        assert_eq!(summarized[0].content, "keep this assistant text");
+        assert_eq!(summarized[0].content_blocks.len(), 1);
+        assert_eq!(summarized[0].tool_calls.len(), 2);
+        assert_eq!(summarized[0].tool_calls[0].id, "call-1");
+        assert_eq!(summarized[0].tool_calls[0].arguments, "{}");
+        assert_eq!(summarized[0].tool_calls[1].id, "call-2");
+        assert!(summarized[1].content.starts_with("[jev-compaction:"));
+        assert_eq!(summarized[2].content, "b".repeat(4_000));
+    }
+
+    #[tokio::test]
+    async fn rejects_non_finite_or_out_of_range_judgments_at_pruner_boundary() {
+        for probability in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            let mut summarized = pair("call-1", 8_000);
+            let judge = StubJudge {
+                probabilities: vec![probability],
+            };
+            let error = prune_summarized(&judge, &selection(), &mut summarized)
+                .await
+                .expect_err("invalid probability rejected");
+            assert!(matches!(error.error, JevPruneError::Response(_)));
+            assert_eq!(summarized, pair("call-1", 8_000));
+        }
+    }
+
+    struct FailingAfterFirstJudge {
+        calls: std::sync::Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl JevJudge for FailingAfterFirstJudge {
+        async fn judge(
+            &self,
+            _state: &Value,
+            questions: &[(String, String)],
+        ) -> Result<JevJudgment, String> {
+            let mut calls = self.calls.lock().expect("calls");
+            *calls += 1;
+            if *calls == 1 {
+                Ok(JevJudgment {
+                    probabilities: vec![0.9; questions.len()],
+                    input_tokens: Some(11),
+                    output_tokens: Some(2),
+                    ..JevJudgment::default()
+                })
+            } else {
+                Err("second batch failed".into())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_batch_keeps_confirmed_usage_and_marks_unknown() {
+        let mut summarized = Vec::new();
+        for index in 0..33 {
+            summarized.extend(pair(&format!("call-{index}"), 100));
+        }
+        let judge = FailingAfterFirstJudge {
+            calls: std::sync::Mutex::new(0),
+        };
+        let error = prune_summarized(&judge, &selection(), &mut summarized)
+            .await
+            .expect_err("second batch fails");
+        assert!(matches!(error.error, JevPruneError::Transport(_)));
+        assert_eq!(error.stats.input_tokens, Some(11));
+        assert_eq!(error.stats.output_tokens, Some(2));
+        assert!(error.stats.usage_unknown);
+        assert_eq!(error.stats.batches_started, 2);
+        assert_eq!(error.stats.batches_completed, 1);
+    }
+
+    struct InvalidTerminalJudge;
+
+    #[async_trait::async_trait]
+    impl JevJudge for InvalidTerminalJudge {
+        async fn judge(
+            &self,
+            _state: &Value,
+            _questions: &[(String, String)],
+        ) -> Result<JevJudgment, String> {
+            Ok(JevJudgment {
+                probabilities: Vec::new(),
+                input_tokens: Some(77),
+                output_tokens: Some(3),
+                model: Some("jev-1.13.0".into()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_terminal_answers_keep_confirmed_usage_in_failure_stats() {
+        let mut summarized = pair("call-1", 8_000);
+        let failure = prune_summarized(&InvalidTerminalJudge, &selection(), &mut summarized)
+            .await
+            .expect_err("invalid answer count");
+
+        assert!(matches!(failure.error, JevPruneError::Response(_)));
+        assert_eq!(failure.stats.input_tokens, Some(77));
+        assert_eq!(failure.stats.output_tokens, Some(3));
+        assert!(!failure.stats.usage_unknown);
+        assert_eq!(failure.stats.batches_started, 1);
+        assert_eq!(failure.stats.batches_completed, 1);
+    }
+
+    struct BlockingJudge {
+        started: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl JevJudge for BlockingJudge {
+        async fn judge(
+            &self,
+            _state: &Value,
+            _questions: &[(String, String)],
+        ) -> Result<JevJudgment, String> {
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_an_in_flight_batch_and_preserves_partial_stats() {
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let judge = BlockingJudge {
+            started: std::sync::Arc::clone(&started),
+        };
+        let cancellation = crate::runtime::CancellationToken::new();
+        let cancel = cancellation.clone();
+        let mut summarized = pair("call-1", 8_000);
+        let selection = selection();
+        let task = tokio::spawn(async move {
+            prune_summarized_with_instructions_cancellable(
+                &judge,
+                &selection,
+                None,
+                &mut summarized,
+                Some(&cancellation),
+            )
+            .await
+        });
+        started.notified().await;
+        cancel.cancel();
+        let failure = task.await.unwrap().expect_err("cancelled");
+
+        assert!(matches!(failure.error, JevPruneError::Cancelled));
+        assert_eq!(failure.stats.batches_started, 1);
+        assert_eq!(failure.stats.batches_completed, 0);
+        assert_eq!(failure.stats.input_tokens, Some(0));
+        assert!(failure.stats.usage_unknown);
     }
 
     #[tokio::test]
@@ -945,7 +1351,13 @@ mod tests {
         let mut selection = selection();
         selection.pinned = vec![message("user", "latest correction".into())];
         selection.kept = vec![message("assistant", "current progress".into())];
-        let state = judge_state(&selection, Some("keep auth details"), &summarized, &pairs);
+        let state = judge_state(
+            &selection,
+            Some("keep auth details"),
+            &summarized,
+            &pairs,
+            &[0, 1],
+        );
 
         assert_eq!(
             state["compaction_instructions"].as_str(),
@@ -998,7 +1410,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_batch_sees_the_same_complete_chronological_state() {
+    async fn each_batch_gets_only_its_candidate_bodies_and_a_global_chronological_index() {
         let mut summarized = Vec::new();
         for index in 0..33 {
             if index == 10 {
@@ -1007,7 +1419,7 @@ mod tests {
                     "correction: use the auth token from config.toml".into(),
                 ));
             }
-            summarized.extend(pair(&format!("call-{index}"), 900));
+            summarized.extend(pair(&format!("call-{index}"), 100));
         }
         let judge = RecordingJudge {
             states: std::sync::Mutex::new(Vec::new()),
@@ -1015,24 +1427,49 @@ mod tests {
         let _ = prune_summarized(&judge, &selection(), &mut summarized).await;
         let states = judge.states.lock().expect("state log");
         assert_eq!(states.len(), 2, "33 pairs span two 32-question batches");
-        for state in states.iter() {
+        for (batch, state) in states.iter().enumerate() {
             let candidates = state["candidates"].as_object().expect("candidates");
-            assert_eq!(candidates.len(), 33, "every batch sees all candidates");
-            assert!(candidates["candidate_0"]
-                .as_str()
-                .expect("oldest candidate")
-                .contains("call-0"));
-            assert!(candidates["candidate_32"]
-                .as_str()
-                .expect("newest candidate")
-                .contains("call-32"));
+            assert_eq!(candidates.len(), if batch == 0 { 32 } else { 1 });
+            assert_eq!(state["candidate_index"].as_array().unwrap().len(), 33);
             assert!(state["summarized_context"]
                 .as_str()
                 .expect("summarized context")
                 .contains("correction: use the auth token from config.toml"));
             assert!(state_text_chars(state) <= STATE_MAX_CHARS);
         }
-        assert_eq!(states[0], states[1], "batches share one identical state");
+        assert!(states[0]["candidates"].get("candidate_0").is_some());
+        assert!(states[1]["candidates"].get("candidate_32").is_some());
+    }
+
+    #[test]
+    fn maximum_candidate_index_and_bounded_context_stay_within_state_guard() {
+        let mut summarized = Vec::new();
+        for index in 0..MAX_JEV_CANDIDATES {
+            summarized.extend(pair(&format!("call-{index}-{}", "i".repeat(200)), 1));
+        }
+        let candidates = prunable_pairs(&summarized);
+        let batches = candidate_batches(&candidates, &summarized);
+        let mut selection = selection();
+        selection.root_instruction = "task".repeat(2_000);
+        selection.pinned = vec![message("user", "pinned".repeat(2_000))];
+        selection.kept = vec![message("assistant", "kept".repeat(2_000))];
+
+        assert_eq!(candidates.len(), MAX_JEV_CANDIDATES);
+        for batch in batches {
+            let state = judge_state(
+                &selection,
+                Some(&"instruction".repeat(1_000)),
+                &summarized,
+                &candidates,
+                &batch,
+            );
+            assert!(state_text_chars(&state) <= STATE_MAX_CHARS);
+            assert_eq!(
+                state["candidate_index"].as_array().unwrap().len(),
+                MAX_JEV_CANDIDATES
+            );
+            assert!(state["candidate_index"][0].is_u64());
+        }
     }
 
     #[tokio::test]
@@ -1059,7 +1496,10 @@ mod tests {
         assert_eq!(summarized, original);
         assert_eq!(
             estimate_prune_input_tokens(&selection(), None, &summarized),
-            u64::MAX
+            JevInputEstimate::TooManyCandidates {
+                count: 257,
+                maximum: 256
+            }
         );
     }
 
@@ -1069,15 +1509,18 @@ mod tests {
         summarized.extend(pair("call-2", 900));
         let first = estimate_prune_input_tokens(&selection(), None, &summarized);
         let second = estimate_prune_input_tokens(&selection(), None, &summarized);
-        assert!(first > 0);
-        assert_eq!(first, second);
+        let JevInputEstimate::Eligible(first_tokens) = first else {
+            panic!("eligible estimate expected")
+        };
+        assert!(first_tokens > 0);
+        assert_eq!(JevInputEstimate::Eligible(first_tokens), second);
         let text_only = vec![
             message("user", "start".into()),
             message("assistant", "just text".into()),
         ];
         assert_eq!(
             estimate_prune_input_tokens(&selection(), None, &text_only),
-            0
+            JevInputEstimate::NoCandidates
         );
     }
 
@@ -1125,8 +1568,7 @@ mod tests {
             &questions,
         );
         assert_eq!(gateway["questions"]["keep_0"]["type"], "boolean");
-        // The gateway takes the model from the `ai-model-id` header, not the body.
-        assert!(gateway.get("model").is_none());
+        assert_eq!(gateway["model"], "typesafe-ai/jev-1.13.0");
     }
 
     #[test]
@@ -1136,23 +1578,23 @@ mod tests {
         let typesafe = serde_json::json!({
             "answers": {
                 "keep_0": { "type": "noul", "noul": 0.25 },
-                "keep_1": { "type": "noul", "noul": 1.5 },
+                "keep_1": { "type": "noul", "noul": 0.75 },
             }
         });
         assert_eq!(
             parse_answer_probabilities(JevBackend::Typesafe, &typesafe, &ids),
-            Ok(vec![0.25, 1.0])
+            Ok(vec![0.25, 0.75])
         );
 
         let gateway = serde_json::json!({
             "answers": {
                 "keep_0": { "type": "boolean", "probability": 0.75 },
-                "keep_1": { "type": "boolean", "probability": -1.0 },
+                "keep_1": { "type": "boolean", "probability": 0.25 },
             }
         });
         assert_eq!(
             parse_answer_probabilities(JevBackend::Vercel, &gateway, &ids),
-            Ok(vec![0.75, 0.0])
+            Ok(vec![0.75, 0.25])
         );
     }
 
@@ -1163,7 +1605,7 @@ mod tests {
         let typesafe = serde_json::json!({ "answers": { "keep_0": { "noul": 0.5 } } });
         let error = parse_answer_probabilities(JevBackend::Vercel, &typesafe, &ids)
             .expect_err("gateway needs probability");
-        assert!(error.contains("probability"), "{error}");
+        assert!(error.contains("wrong type"), "{error}");
 
         let error = parse_answer_probabilities(
             JevBackend::Typesafe,
@@ -1171,7 +1613,7 @@ mod tests {
             &ids,
         )
         .expect_err("missing answer");
-        assert!(error.contains("noul"), "{error}");
+        assert!(error.contains("IDs"), "{error}");
     }
 
     #[test]
@@ -1182,10 +1624,26 @@ mod tests {
             "answers": { "keep_0": { "type": "noul", "noul": 0.1 } },
             "usage": { "input_tokens": 321, "output_tokens": 12 }
         });
-        let judgment = parse_judgment(JevBackend::Typesafe, &parsed, &ids).expect("judgment");
+        let judgment = parse_judgment(JevBackend::Typesafe, &parsed, &ids);
         assert_eq!(judgment.probabilities, vec![0.1]);
         assert_eq!(judgment.input_tokens, Some(321));
         assert_eq!(judgment.output_tokens, Some(12));
+        assert_eq!(judgment.model.as_deref(), Some("jev-1.13.0"));
+    }
+
+    #[test]
+    fn invalid_terminal_answers_keep_confirmed_usage_for_the_pruner() {
+        let ids = vec!["keep_0".to_owned()];
+        let parsed = serde_json::json!({
+            "model": "jev-1.13.0",
+            "answers": { "keep_0": { "type": "noul", "noul": 1.5 } },
+            "usage": { "input_tokens": 77, "output_tokens": 3 }
+        });
+        let judgment = parse_judgment(JevBackend::Typesafe, &parsed, &ids);
+
+        assert!(judgment.probabilities.is_empty());
+        assert_eq!(judgment.input_tokens, Some(77));
+        assert_eq!(judgment.output_tokens, Some(3));
         assert_eq!(judgment.model.as_deref(), Some("jev-1.13.0"));
     }
 }

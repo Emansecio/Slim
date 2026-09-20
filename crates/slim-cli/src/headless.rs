@@ -353,6 +353,12 @@ pub struct UsageCostSummary {
     pub failed_attempts_micros: Option<u64>,
     pub compaction_micros: Option<u64>,
     pub cancelled_estimated_micros: Option<u64>,
+    /// True when a usage component could not be confirmed (for example an
+    /// interrupted Jev request). Cost fields involving that component remain
+    /// `None` instead of presenting a partial number.
+    pub usage_unknown: bool,
+    /// True when a usage component has no static price catalogue entry.
+    pub pricing_unknown: bool,
 }
 
 pub(crate) struct ProviderExecution {
@@ -1218,6 +1224,11 @@ fn run_telemetry_terminal(
         "jev_output_tokens": totals.jev_output_tokens,
         "jev_latency_ms": totals.jev_latency_ms,
         "jev_usage_unknown": totals.jev_usage_unknown,
+        "jev_priced_input_tokens": totals.jev_priced_input_tokens,
+        "jev_failed_priced_input_tokens": totals.jev_failed_priced_input_tokens,
+        "jev_failed_usage_unknown": totals.jev_failed_usage_unknown,
+        "jev_pricing_unknown": totals.jev_pricing_unknown,
+        "jev_failed_pricing_unknown": totals.jev_failed_pricing_unknown,
         "compaction_tokens_saved": totals.compaction_tokens_saved,
         "post_compaction_reacquisitions": totals.post_compaction_reacquisitions,
         "estimation_error_tokens": totals.estimation_error_tokens,
@@ -2633,51 +2644,76 @@ struct UsagePricing {
     cache_read_micros_per_million: Option<u64>,
 }
 
+/// TypeSafe's published Jev price: $0.042 per million input tokens. Jev
+/// output is free. Vercel and caller-selected models stay explicitly
+/// unpriced until their backend supplies a current catalogue entry.
+const TYPESAFE_JEV_INPUT_MICROS_PER_MILLION: u64 = 42_000;
+
 fn cost_summary_for_usage(usage: &UsageTotals, pricing: Option<UsagePricing>) -> UsageCostSummary {
+    let has_jev_tokens = usage.jev_input_tokens > 0 || usage.jev_output_tokens > 0;
+    let usage_unknown = usage.usage_unknown || usage.jev_usage_unknown;
+    let pricing_unknown = usage.jev_pricing_unknown || usage.jev_failed_pricing_unknown;
     let Some(pricing) = pricing else {
-        return UsageCostSummary::default();
+        return UsageCostSummary {
+            usage_unknown,
+            pricing_unknown: pricing_unknown || !usage.requests.is_empty() || has_jev_tokens,
+            ..UsageCostSummary::default()
+        };
     };
-    // Jev is billed by a separate backend whose price is not represented by
-    // ProviderPricing. Keep token telemetry, but do not present a partial
-    // provider-only value as the total or compaction cost.
-    let has_unpriced_jev_usage =
-        usage.jev_usage_unknown || usage.jev_input_tokens > 0 || usage.jev_output_tokens > 0;
-    let total_micros = (!usage.overflowed
-        && !has_unpriced_jev_usage
-        && !usage.requests.is_empty()
-        && usage.requests.iter().all(|request| !request.usage_unknown))
-    .then(|| sum_request_costs(usage.requests.iter(), pricing))
-    .flatten();
-    let failed_attempts_micros = (!usage.overflowed)
-        .then(|| {
-            sum_request_costs(
-                usage
-                    .requests
-                    .iter()
-                    .filter(|request| request.failed && !request.cancelled),
-                pricing,
-            )
-        })
-        .flatten();
-    let compaction_micros = (!usage.overflowed && !has_unpriced_jev_usage)
-        .then(|| {
-            sum_request_costs(
-                usage
-                    .requests
-                    .iter()
-                    .filter(|request| request.request_kind == RequestKind::Compaction),
-                pricing,
-            )
-        })
-        .flatten();
-    let cancelled_estimated_micros = (!usage.overflowed)
-        .then(|| {
+    let provider_weighted = sum_request_weighted_costs(usage.requests.iter(), pricing);
+    let jev_weighted = jev_weighted_cost(usage, false);
+    let total_micros = if !usage.overflowed
+        && !usage_unknown
+        && !pricing_unknown
+        && usage.requests.iter().all(|request| !request.usage_unknown)
+        && (!usage.requests.is_empty() || has_jev_tokens)
+    {
+        provider_weighted
+            .and_then(|provider| provider.checked_add(jev_weighted?))
+            .and_then(weighted_cost_micros)
+    } else {
+        None
+    };
+    let failed_attempts_micros = if !usage.overflowed
+        && !usage.jev_failed_usage_unknown
+        && !usage.jev_failed_pricing_unknown
+    {
+        let provider = sum_request_weighted_costs(
+            usage
+                .requests
+                .iter()
+                .filter(|request| request.failed && !request.cancelled),
+            pricing,
+        );
+        provider
+            .and_then(|provider| provider.checked_add(jev_weighted_cost(usage, true)?))
+            .and_then(weighted_cost_micros)
+    } else {
+        None
+    };
+    let compaction_micros = if !usage.overflowed && !usage_unknown && !pricing_unknown {
+        let provider = sum_request_weighted_costs(
+            usage
+                .requests
+                .iter()
+                .filter(|request| request.request_kind == RequestKind::Compaction),
+            pricing,
+        );
+        provider
+            .and_then(|provider| provider.checked_add(jev_weighted?))
+            .and_then(weighted_cost_micros)
+    } else {
+        None
+    };
+    let cancelled_estimated_micros =
+        if !usage.overflowed && !usage.jev_usage_unknown && !usage.jev_pricing_unknown {
             sum_cancelled_estimated_costs(
                 usage.requests.iter().filter(|request| request.cancelled),
                 pricing,
             )
-        })
-        .flatten();
+        } else {
+            None
+        };
     UsageCostSummary {
         total_micros,
         cost_per_validated_completion_micros: usage
@@ -2687,20 +2723,21 @@ fn cost_summary_for_usage(usage: &UsageTotals, pricing: Option<UsagePricing>) ->
         failed_attempts_micros,
         compaction_micros,
         cancelled_estimated_micros,
+        usage_unknown,
+        pricing_unknown,
     }
 }
 
-fn sum_request_costs<'a>(
+fn sum_request_weighted_costs<'a>(
     mut requests: impl Iterator<Item = &'a slim_core::RequestUsage>,
     pricing: UsagePricing,
-) -> Option<u64> {
-    let weighted = requests.try_fold(0_u128, |total, request| {
+) -> Option<u128> {
+    requests.try_fold(0_u128, |total, request| {
         if request.usage_unknown {
             return None;
         }
         request_weighted_cost(request, pricing).and_then(|cost| total.checked_add(cost))
-    })?;
-    weighted_cost_micros(weighted)
+    })
 }
 
 fn sum_cancelled_estimated_costs<'a>(
@@ -2719,6 +2756,26 @@ fn sum_cancelled_estimated_costs<'a>(
             .and_then(|cost| total.checked_add(cost))
     })?;
     weighted_cost_micros(weighted)
+}
+
+fn jev_weighted_cost(usage: &UsageTotals, failed: bool) -> Option<u128> {
+    let (tokens, usage_unknown, pricing_unknown) = if failed {
+        (
+            usage.jev_failed_priced_input_tokens,
+            usage.jev_failed_usage_unknown,
+            usage.jev_failed_pricing_unknown,
+        )
+    } else {
+        (
+            usage.jev_priced_input_tokens,
+            usage.jev_usage_unknown,
+            usage.jev_pricing_unknown,
+        )
+    };
+    if usage_unknown || pricing_unknown {
+        return None;
+    }
+    u128::from(tokens).checked_mul(u128::from(TYPESAFE_JEV_INPUT_MICROS_PER_MILLION))
 }
 
 fn request_weighted_cost(request: &slim_core::RequestUsage, pricing: UsagePricing) -> Option<u128> {
@@ -2873,6 +2930,7 @@ mod usage_cost_tests {
             requests: vec![provider_request.clone()],
             jev_input_tokens: 3,
             jev_output_tokens: 1,
+            jev_pricing_unknown: true,
             ..UsageTotals::default()
         };
 
@@ -2888,6 +2946,41 @@ mod usage_cost_tests {
         let costs = cost_summary_for_usage(&with_unknown_jev_usage, Some(pricing));
         assert_eq!(costs.total_micros, None);
         assert_eq!(costs.compaction_micros, None);
+    }
+
+    #[test]
+    fn known_typesafe_jev_cost_is_added_without_charging_output_tokens() {
+        let pricing = UsagePricing {
+            provider: ProviderPricing {
+                input_micros_per_million: 1_000_000,
+                output_micros_per_million: 2_000_000,
+            },
+            cache_write_micros_per_million: Some(0),
+            cache_read_micros_per_million: Some(0),
+        };
+        let usage = UsageTotals {
+            validated_completion: true,
+            requests: vec![RequestUsage {
+                request_kind: RequestKind::Compaction,
+                uncached_input_tokens: 4,
+                output_tokens: 2,
+                ..RequestUsage::default()
+            }],
+            jev_input_tokens: 1_000,
+            jev_output_tokens: 30,
+            jev_priced_input_tokens: 1_000,
+            jev_failed_priced_input_tokens: 1_000,
+            ..UsageTotals::default()
+        };
+
+        let costs = cost_summary_for_usage(&usage, Some(pricing));
+        // Provider compaction: 4 + (2 * 2) = 8 micros. Jev: 1,000 *
+        // 42,000 / 1,000,000 = 42 micros; output is free.
+        assert_eq!(costs.total_micros, Some(50));
+        assert_eq!(costs.compaction_micros, Some(50));
+        assert_eq!(costs.failed_attempts_micros, Some(42));
+        assert!(!costs.pricing_unknown);
+        assert!(!costs.usage_unknown);
     }
 
     #[test]
@@ -3024,7 +3117,7 @@ fn provider_telemetry(result: &ProviderHeadlessResult) -> String {
             "ledger uncached_input={} cache_write={} cache_read={} reasoning={} cache_hit_ratio={cache_hit_ratio}\n",
             "execution provider_turns={} tool_calls_executed={} tool_calls_reused={} tool_calls_suppressed={} no_progress_turns={} no_progress_tokens={}\n",
             "economy duplicate_evidence_bytes_avoided={} compaction_input={} compaction_output={} compaction_saved_estimated={} post_compaction_reacquisitions={} estimation_error={}\n",
-            "cost total={} per_validated_completion={} failed_attempts={} compaction={} cancelled_estimated={}\n"
+            "cost total={} per_validated_completion={} failed_attempts={} compaction={} cancelled_estimated={} usage_unknown={} pricing_unknown={}\n"
         ),
         result.stop,
         result.validation_source.as_deref().unwrap_or("unvalidated"),
@@ -3052,6 +3145,8 @@ fn provider_telemetry(result: &ProviderHeadlessResult) -> String {
         cost(result.costs.failed_attempts_micros),
         cost(result.costs.compaction_micros),
         cost(result.costs.cancelled_estimated_micros),
+        result.costs.usage_unknown,
+        result.costs.pricing_unknown,
         input = input,
         output = output,
         cache_hit_ratio = cache_hit_ratio,
