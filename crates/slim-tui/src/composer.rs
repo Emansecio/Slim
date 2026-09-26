@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7,6 +8,30 @@ pub enum TextElement {
 }
 
 pub const MAX_DRAFT_CHARS: usize = 1_048_576;
+const MAX_EDIT_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_EDIT_HISTORY_STEPS: usize = 64;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DraftSnapshot {
+    elements: Vec<TextElement>,
+    cursor: usize,
+    char_count: usize,
+    newline_count: usize,
+}
+
+impl DraftSnapshot {
+    fn bytes(&self) -> usize {
+        self.elements
+            .iter()
+            .map(|element| match element {
+                TextElement::Text(text) => text.len(),
+                TextElement::Paste { payload, .. } => payload.len(),
+            })
+            .sum::<usize>()
+            + self.elements.len() * std::mem::size_of::<TextElement>()
+            + std::mem::size_of::<Self>()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ComposerError {
@@ -24,6 +49,10 @@ pub struct Composer {
     /// '\n' count across `Text` elements — `line_count` stays O(1) on drafts
     /// up to `MAX_DRAFT_CHARS`. Paste payloads display as a single token.
     newline_count: usize,
+    undo: VecDeque<DraftSnapshot>,
+    redo: VecDeque<DraftSnapshot>,
+    history_bytes: usize,
+    typing: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,6 +78,11 @@ impl Composer {
         {
             return Err(ComposerError::DraftTooLarge);
         }
+        if text.is_empty() {
+            return Ok(());
+        }
+        let typing = added_chars == 1 && !text.chars().next().unwrap().is_whitespace();
+        self.record_edit(typing);
         self.char_count += added_chars;
         self.newline_count += text.bytes().filter(|byte| *byte == b'\n').count();
         // char_count always equals the sum of element lengths, so a cursor at
@@ -82,6 +116,7 @@ impl Composer {
         {
             return Err(ComposerError::DraftTooLarge);
         }
+        self.record_edit(false);
         let id = self.next_paste_id;
         self.next_paste_id += 1;
         self.char_count += added_chars;
@@ -222,6 +257,10 @@ impl Composer {
     }
 
     pub fn remove_last_element(&mut self) -> Option<TextElement> {
+        if self.elements.is_empty() {
+            return None;
+        }
+        self.record_edit(false);
         let element = self.elements.pop()?;
         let (removed_chars, removed_newlines) = match &element {
             TextElement::Text(text) => (
@@ -240,6 +279,14 @@ impl Composer {
     /// Removes the last grapheme cluster from the draft (§15.3). A trailing
     /// paste segment is removed as a whole; returns whether anything changed.
     pub fn backspace(&mut self) -> bool {
+        if self.span_before_cursor().is_none() {
+            return false;
+        }
+        self.record_edit(false);
+        self.backspace_inner()
+    }
+
+    fn backspace_inner(&mut self) -> bool {
         let Some((index, start, _end)) = self.span_before_cursor() else {
             return false;
         };
@@ -276,6 +323,14 @@ impl Composer {
     }
 
     pub fn delete(&mut self) -> bool {
+        if self.span_after_cursor().is_none() {
+            return false;
+        }
+        self.record_edit(false);
+        self.delete_inner()
+    }
+
+    fn delete_inner(&mut self) -> bool {
         let Some((index, start, _end)) = self.span_after_cursor() else {
             return false;
         };
@@ -309,6 +364,7 @@ impl Composer {
     }
 
     pub fn move_left(&mut self) -> bool {
+        self.typing = false;
         let Some((index, start, _end)) = self.span_before_cursor() else {
             return false;
         };
@@ -328,6 +384,7 @@ impl Composer {
     }
 
     pub fn move_right(&mut self) -> bool {
+        self.typing = false;
         let Some((index, start, end)) = self.span_after_cursor() else {
             return false;
         };
@@ -347,6 +404,7 @@ impl Composer {
     }
 
     pub fn move_home(&mut self) -> bool {
+        self.typing = false;
         let target = self
             .payload_chars()
             .take(self.cursor)
@@ -364,6 +422,7 @@ impl Composer {
     }
 
     pub fn move_end(&mut self) -> bool {
+        self.typing = false;
         let target = self
             .payload_chars()
             .enumerate()
@@ -380,6 +439,10 @@ impl Composer {
     }
 
     pub fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+        self.history_bytes = 0;
+        self.typing = false;
         if self.elements.is_empty() {
             return;
         }
@@ -388,6 +451,153 @@ impl Composer {
         self.newline_count = 0;
         self.cursor = 0;
         self.bump();
+    }
+
+    fn snapshot(&self) -> DraftSnapshot {
+        DraftSnapshot {
+            elements: self.elements.clone(),
+            cursor: self.cursor,
+            char_count: self.char_count,
+            newline_count: self.newline_count,
+        }
+    }
+
+    fn restore(&mut self, snapshot: DraftSnapshot) {
+        self.elements = snapshot.elements;
+        self.cursor = snapshot.cursor;
+        self.char_count = snapshot.char_count;
+        self.newline_count = snapshot.newline_count;
+        self.typing = false;
+        self.bump();
+    }
+
+    fn trim_history(&mut self) {
+        while self.history_bytes > MAX_EDIT_HISTORY_BYTES
+            || self.undo.len() + self.redo.len() > MAX_EDIT_HISTORY_STEPS
+        {
+            if let Some(oldest) = self.undo.pop_front().or_else(|| self.redo.pop_front()) {
+                self.history_bytes -= oldest.bytes();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn record_edit(&mut self, typing: bool) {
+        for discarded in self.redo.drain(..) {
+            self.history_bytes -= discarded.bytes();
+        }
+        // Coalesce contiguous typing, so large drafts are not cloned per key.
+        if !typing || !self.typing {
+            let snapshot = self.snapshot();
+            self.history_bytes += snapshot.bytes();
+            self.undo.push_back(snapshot);
+            self.trim_history();
+        }
+        self.typing = typing;
+    }
+
+    pub fn undo(&mut self) -> bool {
+        let Some(previous) = self.undo.pop_back() else {
+            return false;
+        };
+        self.history_bytes -= previous.bytes();
+        let current = self.snapshot();
+        self.history_bytes += current.bytes();
+        self.redo.push_back(current);
+        self.restore(previous);
+        self.trim_history();
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(next) = self.redo.pop_back() else {
+            return false;
+        };
+        self.history_bytes -= next.bytes();
+        let current = self.snapshot();
+        self.history_bytes += current.bytes();
+        self.undo.push_back(current);
+        self.restore(next);
+        self.trim_history();
+        true
+    }
+
+    fn word_boundary(&self, forward: bool) -> usize {
+        let span = if forward {
+            self.span_after_cursor()
+        } else {
+            self.span_before_cursor()
+        };
+        let Some((index, start, end)) = span else {
+            return self.cursor;
+        };
+        let TextElement::Text(text) = &self.elements[index] else {
+            return if forward { end } else { start };
+        };
+        let byte = char_byte_index(text, self.cursor - start);
+        if forward {
+            let mut count = 0;
+            for segment in text[byte..].split_word_bounds() {
+                count += segment.chars().count();
+                if !segment.chars().all(char::is_whitespace) {
+                    break;
+                }
+            }
+            self.cursor + count
+        } else {
+            let mut count = 0;
+            for segment in text[..byte].split_word_bounds().rev() {
+                count += segment.chars().count();
+                if !segment.chars().all(char::is_whitespace) {
+                    break;
+                }
+            }
+            self.cursor - count
+        }
+    }
+
+    pub fn move_word(&mut self, forward: bool) -> bool {
+        self.typing = false;
+        let target = self.word_boundary(forward);
+        if target == self.cursor {
+            return false;
+        }
+        self.cursor = target;
+        self.bump();
+        true
+    }
+
+    pub fn delete_word(&mut self, forward: bool) -> bool {
+        let target = self.word_boundary(forward);
+        if target == self.cursor {
+            return false;
+        }
+        self.record_edit(false);
+        let (index, start, _) = if forward {
+            self.span_after_cursor()
+        } else {
+            self.span_before_cursor()
+        }
+        .unwrap();
+        let first = self.cursor.min(target);
+        let last = self.cursor.max(target);
+        match &mut self.elements[index] {
+            TextElement::Paste { .. } => {
+                self.elements.remove(index);
+            }
+            TextElement::Text(text) => {
+                let range =
+                    char_byte_index(text, first - start)..char_byte_index(text, last - start);
+                self.newline_count -= text[range.clone()].bytes().filter(|b| *b == b'\n').count();
+                text.replace_range(range, "");
+            }
+        }
+        self.char_count -= last - first;
+        self.cursor = first;
+        self.normalize_text_elements();
+        self.bump();
+        true
     }
 
     fn insert_element(&mut self, inserted: TextElement) {
@@ -644,6 +854,115 @@ fn append_visual_unit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn undo_redo_preserve_cursor_unicode_and_atomic_paste() {
+        let mut draft = Composer::default();
+        for c in "ação".chars() {
+            draft.insert_text(c.to_string());
+        }
+        assert!(draft.undo());
+        assert!(draft.is_empty());
+        assert!(draft.redo());
+        assert_eq!(draft.payload(), "ação");
+        draft.move_left();
+        let cursor = draft.cursor();
+        draft.paste("linha 1\nlinha 2");
+        let after = draft.snapshot();
+        assert!(draft.undo());
+        assert_eq!(draft.payload(), "ação");
+        assert_eq!(draft.cursor(), cursor);
+        assert!(draft.redo());
+        assert_eq!(draft.snapshot(), after);
+        assert!(draft.backspace());
+        assert_eq!(draft.payload(), "ação");
+        assert!(draft.undo());
+        assert_eq!(draft.snapshot(), after);
+    }
+
+    #[test]
+    fn edit_after_undo_discards_redo_and_clear_discards_all_history() {
+        let mut draft = Composer::default();
+        draft.insert_text("primeiro");
+        draft.paste("segundo");
+        assert!(draft.undo());
+        draft.insert_text("!");
+        assert!(!draft.redo());
+        assert_eq!(draft.payload(), "primeiro!");
+        draft.clear();
+        assert!(!draft.undo());
+        assert!(!draft.redo());
+        draft.insert_text("novo");
+        draft.undo();
+        assert!(draft.is_empty());
+        draft.clear();
+        assert!(
+            !draft.redo(),
+            "clear must also discard redo on an empty draft"
+        );
+    }
+
+    #[test]
+    fn edit_history_is_bounded_and_rejected_edits_do_not_destroy_redo() {
+        let mut draft = Composer::default();
+        for _ in 0..100 {
+            draft.insert_text("ab ");
+        }
+        assert!(draft.undo.len() <= MAX_EDIT_HISTORY_STEPS);
+        draft.clear();
+        draft.insert_text("á".repeat(MAX_DRAFT_CHARS / 2));
+        for _ in 0..30 {
+            draft.insert_text(" ");
+        }
+        assert!(draft.history_bytes <= MAX_EDIT_HISTORY_BYTES);
+        draft.undo();
+        assert_eq!(
+            draft.try_insert_text("x".repeat(MAX_DRAFT_CHARS)),
+            Err(ComposerError::DraftTooLarge)
+        );
+        assert!(draft.redo());
+    }
+
+    #[test]
+    fn word_edits_preserve_punctuation_graphemes_and_paste_boundaries() {
+        let mut draft = Composer::default();
+        draft.insert_text("ação/path a\u{301}🙂");
+        let original = draft.snapshot();
+        assert!(draft.delete_word(false));
+        assert_eq!(draft.payload(), "ação/path a\u{301}");
+        assert!(draft.delete_word(false));
+        assert_eq!(draft.payload(), "ação/path ");
+        assert!(draft.undo());
+        assert!(draft.undo());
+        assert_eq!(draft.snapshot(), original);
+        draft.move_home();
+        assert!(draft.move_word(true));
+        assert_eq!(draft.cursor(), 4);
+        assert!(draft.delete_word(true));
+        assert_eq!(draft.payload(), "açãopath a\u{301}🙂");
+        draft.paste("中文\nbloco");
+        let pasted = draft.snapshot();
+        assert!(draft.delete_word(false));
+        assert_eq!(draft.cursor(), 4);
+        assert!(draft.undo());
+        assert_eq!(draft.snapshot(), pasted);
+        assert!(draft.move_word(false));
+        assert_eq!(draft.cursor(), 4);
+        assert!(draft.delete_word(true));
+        assert_eq!(draft.payload(), "açãopath a\u{301}🙂");
+    }
+
+    #[test]
+    fn word_delete_is_one_undo_step_and_updates_line_count() {
+        let mut draft = Composer::default();
+        draft.insert_text("one\n\n  ");
+        draft.delete_word(false);
+        assert_eq!(draft.payload(), "");
+        assert_eq!(draft.line_count(), 1);
+        draft.undo();
+        assert_eq!(draft.payload(), "one\n\n  ");
+        assert_eq!(draft.line_count(), 3);
+    }
 
     #[test]
     fn line_count_matches_display_snapshot() {

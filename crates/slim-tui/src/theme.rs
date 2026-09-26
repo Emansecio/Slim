@@ -58,6 +58,8 @@ pub struct Theme {
     pub diff_add_emphasis_bg: (u8, u8, u8),
     pub diff_remove_emphasis_bg: (u8, u8, u8),
     pub code_bg: (u8, u8, u8),
+    /// Foreground of everything behind a centered modal.
+    pub backdrop: (u8, u8, u8),
 }
 
 pub fn env_flag_enabled(name: &str, default_enabled: bool) -> bool {
@@ -111,17 +113,22 @@ pub fn resolve_theme(capabilities: Capabilities) -> Theme {
         surface_alt: (0x18, 0x18, 0x18),
         // Composer/footer share transcript depth; border carries shape.
         composer_bg: (0x00, 0x00, 0x00),
-        user_prompt_bg: (0x10, 0x10, 0x10),
+        // The user band and code sit one quiet step above the transcript so
+        // turns read by depth rather than by color.
+        user_prompt_bg: (0x14, 0x14, 0x14),
         border: (0x3A, 0x3A, 0x3A),
-        border_focus: (0x72, 0xCC, 0x91),
+        // Focus stays green but subdued; bright green is reserved for state.
+        border_focus: (0x4F, 0x7D, 0x5A),
         operational_divider: (0x3A, 0x3A, 0x3A),
         scrollbar_track: (0x24, 0x23, 0x1A),
         scrollbar_thumb: (0x62, 0x67, 0x56),
         user_accent: (0xBC, 0xB9, 0xAF),
         assistant_accent: (0x72, 0xCC, 0x91),
         thinking_accent: (0xAF, 0xA9, 0x9D),
-        heading_accent: (0x91, 0xC2, 0x8F),
-        link_accent: (0x7E, 0xAB, 0x7F),
+        // Headings carry hierarchy by weight on ivory; links use the cool
+        // structural hue so green keeps meaning success/identity/focus.
+        heading_accent: (0xE8, 0xE5, 0xDB),
+        link_accent: (0x8A, 0xAD, 0xD4),
         tool_accent: (0x72, 0xCC, 0x91),
         success: (0x72, 0xCC, 0x91),
         warning: (0xE7, 0xC1, 0x5A),
@@ -134,7 +141,8 @@ pub fn resolve_theme(capabilities: Capabilities) -> Theme {
         diff_remove_bg: (0x2A, 0x18, 0x16),
         diff_add_emphasis_bg: (0x22, 0x57, 0x34),
         diff_remove_emphasis_bg: (0x51, 0x2A, 0x25),
-        code_bg: (0x0A, 0x0A, 0x0A),
+        code_bg: (0x14, 0x14, 0x14),
+        backdrop: (0x4A, 0x4A, 0x4A),
     };
     if capabilities.color_depth == ColorDepth::None {
         let white = (255, 255, 255);
@@ -261,14 +269,16 @@ mod tests {
         assert_eq!(theme.surface, (0x00, 0x00, 0x00));
         assert_eq!(theme.composer_bg, theme.surface);
         assert_eq!(theme.surface_alt, (0x18, 0x18, 0x18));
-        assert_eq!(theme.user_prompt_bg, (0x10, 0x10, 0x10));
-        assert_eq!(theme.code_bg, (0x0A, 0x0A, 0x0A));
+        assert_eq!(theme.user_prompt_bg, (0x14, 0x14, 0x14));
+        assert_eq!(theme.code_bg, theme.user_prompt_bg);
         assert_eq!(theme.border, (0x3A, 0x3A, 0x3A));
         assert_eq!(theme.foreground, (0xE8, 0xE5, 0xDB));
         assert_eq!(theme.muted, (0x99, 0x97, 0x8E));
         assert_eq!(theme.secondary_text, (0xBC, 0xB9, 0xAF));
         assert_eq!(theme.accent, (0x72, 0xCC, 0x91));
-        assert_eq!(theme.border_focus, theme.accent);
+        assert_eq!(theme.border_focus, (0x4F, 0x7D, 0x5A));
+        assert_eq!(theme.heading_accent, theme.foreground);
+        assert_ne!(theme.link_accent, theme.accent);
         assert_eq!(theme.assistant_accent, theme.accent);
         assert_eq!(theme.tool_accent, theme.accent);
         assert_eq!(theme.success, theme.accent);
@@ -277,6 +287,7 @@ mod tests {
             super::to_terminal_color(super::ColorDepth::Ansi256, theme.background),
             super::to_terminal_color(super::ColorDepth::Ansi256, theme.surface)
         );
+        // The raised user band must survive 256-color quantization.
         assert_ne!(
             super::to_terminal_color(super::ColorDepth::Ansi256, theme.background),
             super::to_terminal_color(super::ColorDepth::Ansi256, theme.user_prompt_bg)

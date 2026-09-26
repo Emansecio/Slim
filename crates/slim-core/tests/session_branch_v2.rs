@@ -148,6 +148,60 @@ fn async_branch_wrapper_appends_a_branch_compaction_checkpoint() {
 }
 
 #[test]
+fn failed_compaction_does_not_publish_child_or_consume_its_id() {
+    let path = path("compact-retry.jsonl");
+    let mut repo = JsonlRepo::create(
+        &path,
+        DurableSessionHeader::new("parent-retry", "now", "D:\\Slim", None, None),
+    )
+    .unwrap();
+    for (seq, content) in [
+        (0, "root".into()),
+        (1, "x".repeat(100_000)),
+        (2, "recent".into()),
+    ] {
+        repo.append(DurableRecord::Entry {
+            seq,
+            entry: DurableEntry {
+                entry_id: format!("entry-{seq}"),
+                role: DurableEntryRole::User,
+                content,
+                parent_entry_id: None,
+                operation_id: format!("operation-{seq}"),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+                content_blocks: Vec::new(),
+            },
+        })
+        .unwrap();
+    }
+    drop(repo);
+    let child = path.with_file_name("compact-retry-child.jsonl");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    assert!(runtime
+        .block_on(create_durable_branch_compacted(
+            &path,
+            "child",
+            2,
+            |_| async { Err(std::io::Error::other("summary failed")) }
+        ))
+        .is_err());
+    assert!(!child.exists());
+    let branch = runtime
+        .block_on(create_durable_branch_compacted(
+            &path,
+            "child",
+            2,
+            |_| async { Ok("## Goal\nRetry".into()) },
+        ))
+        .unwrap();
+    assert!(child.exists());
+    assert_eq!(branch.path.file_name(), child.file_name());
+    assert_eq!(branch.next_seq, 4);
+    cleanup(&path);
+}
+
+#[test]
 fn branch_compaction_prompt_excludes_the_pinned_latest_instruction() {
     let path = path("compact-pinned.jsonl");
     let mut repo = JsonlRepo::create(

@@ -1,17 +1,63 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
 
 use super::{OAuthCredential, OAuthError, OAuthProvider};
-use crate::auth::{auth_file_path, create_secure_auth_file, secure_auth_file};
+use crate::auth::{auth_file_path, create_secure_auth_file, secure_auth_file, PreferredAuthMethod};
 
 static STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(crate) struct StoreGuard {
     _lock: crate::auth::AuthStoreLock,
+}
+
+pub(crate) struct RefreshGuard {
+    _lock: crate::auth::OAuthRefreshLock,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct AuthEntrySnapshot {
+    oauth: Option<Value>,
+    api_key: Option<Value>,
+    preferred_method: Option<PreferredAuthMethod>,
+}
+
+impl AuthEntrySnapshot {
+    pub(crate) fn has_oauth(&self) -> bool {
+        self.oauth.is_some()
+    }
+
+    pub(crate) fn oauth_matches(&self, credential: &OAuthCredential) -> bool {
+        serde_json::to_value(credential).is_ok_and(|value| self.oauth.as_ref() == Some(&value))
+    }
+
+    pub(crate) fn selection_matches(&self, other: &Self) -> bool {
+        self.api_key == other.api_key && self.preferred_method == other.preferred_method
+    }
+
+    pub(crate) fn prefers_api_key(&self) -> bool {
+        self.preferred_method == Some(PreferredAuthMethod::ApiKey)
+    }
+
+    pub(crate) fn prefers_oauth(&self) -> bool {
+        self.preferred_method == Some(PreferredAuthMethod::OAuth)
+    }
+
+    pub(crate) fn with_oauth(&self, credential: &OAuthCredential) -> Result<Self, OAuthError> {
+        let mut snapshot = self.clone();
+        snapshot.oauth = Some(
+            serde_json::to_value(credential)
+                .map_err(|_| OAuthError::Store("OAuth credential serialization failed".into()))?,
+        );
+        Ok(snapshot)
+    }
 }
 
 struct TemporaryFile(PathBuf);
@@ -25,6 +71,8 @@ impl Drop for TemporaryFile {
 #[derive(Clone, Debug)]
 pub struct OAuthStore {
     path: PathBuf,
+    #[cfg(test)]
+    refresh_write_failure: Arc<AtomicBool>,
 }
 
 impl OAuthStore {
@@ -32,11 +80,15 @@ impl OAuthStore {
         let path = auth_file_path()
             .map_err(|error| OAuthError::Store(error.to_string()))?
             .ok_or_else(|| OAuthError::Store("USERPROFILE is unavailable".into()))?;
-        Ok(Self { path })
+        Ok(Self::at(path))
     }
 
     pub fn at(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            #[cfg(test)]
+            refresh_write_failure: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -52,6 +104,9 @@ impl OAuthStore {
         else {
             return Ok(None);
         };
+        if preferred_method(&document, provider)? == Some(PreferredAuthMethod::ApiKey) {
+            return Ok(None);
+        }
         self.credential_from(&document, provider)
             .transpose()
             .map(|credential| credential.map(|credential| (provider, credential)))
@@ -61,8 +116,32 @@ impl OAuthStore {
         &self,
         provider: OAuthProvider,
     ) -> Result<Option<OAuthCredential>, OAuthError> {
-        self.credential_from(&self.read_document()?, provider)
+        let document = self.read_document()?;
+        if preferred_method(&document, provider)? == Some(PreferredAuthMethod::ApiKey) {
+            return Ok(None);
+        }
+        self.credential_from(&document, provider).transpose()
+    }
+
+    pub(crate) fn credential_snapshot(
+        &self,
+        provider: OAuthProvider,
+    ) -> Result<(Option<OAuthCredential>, AuthEntrySnapshot), OAuthError> {
+        let document = self.read_document()?;
+        let entry = document.pointer(&format!("/providers/{}", provider.key()));
+        let snapshot = AuthEntrySnapshot {
+            oauth: entry.and_then(|entry| entry.get("oauth")).cloned(),
+            api_key: entry.and_then(|entry| entry.get("api_key")).cloned(),
+            preferred_method: preferred_method(&document, provider)?,
+        };
+        let credential = snapshot
+            .oauth
+            .clone()
+            .filter(|_| !snapshot.prefers_api_key())
+            .map(serde_json::from_value)
             .transpose()
+            .map_err(|_| OAuthError::Store("OAuth credential schema is invalid".into()))?;
+        Ok((credential, snapshot))
     }
 
     pub fn api_key(&self, provider: &str) -> Result<Option<String>, OAuthError> {
@@ -100,6 +179,7 @@ impl OAuthStore {
             .as_object_mut()
             .ok_or_else(|| OAuthError::Store("provider auth entry must be an object".into()))?;
         entry.insert("api_key".into(), Value::String(key.into()));
+        entry.insert("preferred_method".into(), Value::String("api_key".into()));
         self.write_document(&document)
     }
 
@@ -125,6 +205,11 @@ impl OAuthStore {
             return Ok(None);
         };
         document["active_provider"] = Value::String(provider.into());
+        document
+            .pointer_mut(&format!("/providers/{provider}"))
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| OAuthError::Store("provider auth entry must be an object".into()))?
+            .insert("preferred_method".into(), Value::String("api_key".into()));
         self.write_document(&document)?;
         Ok(Some(key))
     }
@@ -150,9 +235,24 @@ impl OAuthStore {
             }
         }
         if document.get("active_provider").and_then(Value::as_str) == Some(provider) {
-            document
-                .as_object_mut()
-                .map(|object| object.remove("active_provider"));
+            let entry = document.pointer(&format!("/providers/{provider}"));
+            let has_selected_credential = match entry
+                .and_then(|entry| entry.get("preferred_method"))
+                .and_then(Value::as_str)
+            {
+                Some("oauth") => entry.and_then(|entry| entry.get("oauth")).is_some(),
+                Some("api_key") => entry.and_then(|entry| entry.get("api_key")).is_some(),
+                None => {
+                    entry.and_then(|entry| entry.get("oauth")).is_some()
+                        || entry.and_then(|entry| entry.get("api_key")).is_some()
+                }
+                Some(_) => false,
+            };
+            if !has_selected_credential {
+                document
+                    .as_object_mut()
+                    .map(|object| object.remove("active_provider"));
+            }
         }
         self.write_document(&document)
     }
@@ -193,22 +293,85 @@ impl OAuthStore {
         let entry = entry
             .as_object_mut()
             .ok_or_else(|| OAuthError::Store("provider auth entry must be an object".into()))?;
-        entry.remove("api_key");
         entry.insert(
             "oauth".into(),
             serde_json::to_value(credential)
                 .map_err(|_| OAuthError::Store("OAuth credential serialization failed".into()))?,
         );
+        entry.insert("preferred_method".into(), Value::String("oauth".into()));
         self.write_document(&document)
+    }
+
+    pub(crate) fn persist_refresh_locked_if_unchanged(
+        &self,
+        provider: OAuthProvider,
+        expected: &AuthEntrySnapshot,
+        refreshed: &OAuthCredential,
+    ) -> Result<bool, OAuthError> {
+        let _guard = STORE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| OAuthError::Store("auth store lock poisoned".into()))?;
+        if !expected.has_oauth() || expected.prefers_api_key() {
+            return Ok(false);
+        }
+        let mut document = self.read_document()?;
+        let entry = document.pointer(&format!("/providers/{}", provider.key()));
+        let current = AuthEntrySnapshot {
+            oauth: entry.and_then(|entry| entry.get("oauth")).cloned(),
+            api_key: entry.and_then(|entry| entry.get("api_key")).cloned(),
+            preferred_method: preferred_method(&document, provider)?,
+        };
+        if current != *expected {
+            return Ok(false);
+        }
+        #[cfg(test)]
+        if self.refresh_write_failure.load(Ordering::Acquire) {
+            return Err(OAuthError::Store(
+                "injected OAuth persistence failure".into(),
+            ));
+        }
+        let entry = document
+            .pointer_mut(&format!("/providers/{}", provider.key()))
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                OAuthError::Store("auth provider entry changed during refresh".into())
+            })?;
+        entry.insert(
+            "oauth".into(),
+            serde_json::to_value(refreshed)
+                .map_err(|_| OAuthError::Store("OAuth credential serialization failed".into()))?,
+        );
+        self.write_document(&document)?;
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_refresh_persistence(&self, fail: bool) {
+        self.refresh_write_failure.store(fail, Ordering::Release);
     }
 
     pub fn remove(&self, provider: OAuthProvider) -> Result<(), OAuthError> {
         let _store_guard = self.lock_exclusive()?;
+        self.remove_locked(provider)
+    }
+
+    pub(crate) fn remove_locked(&self, provider: OAuthProvider) -> Result<(), OAuthError> {
         let _guard = STORE_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
             .map_err(|_| OAuthError::Store("auth store lock poisoned".into()))?;
         let mut document = self.read_document()?;
+        let had_oauth = document
+            .pointer(&format!("/providers/{}/oauth", provider.key()))
+            .is_some();
+        if had_oauth && preferred_method(&document, provider)?.is_none() {
+            document
+                .pointer_mut(&format!("/providers/{}", provider.key()))
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| OAuthError::Store("provider auth entry must be an object".into()))?
+                .insert("preferred_method".into(), Value::String("oauth".into()));
+        }
         if let Some(providers) = document.get_mut("providers").and_then(Value::as_object_mut) {
             let remove_entry = providers
                 .get_mut(provider.key())
@@ -222,9 +385,24 @@ impl OAuthStore {
             }
         }
         if document.get("active_provider").and_then(Value::as_str) == Some(provider.key()) {
-            document
-                .as_object_mut()
-                .map(|object| object.remove("active_provider"));
+            let entry = document.pointer(&format!("/providers/{}", provider.key()));
+            let has_selected_credential = match entry
+                .and_then(|entry| entry.get("preferred_method"))
+                .and_then(Value::as_str)
+            {
+                Some("oauth") => entry.and_then(|entry| entry.get("oauth")).is_some(),
+                Some("api_key") => entry.and_then(|entry| entry.get("api_key")).is_some(),
+                None => {
+                    entry.and_then(|entry| entry.get("oauth")).is_some()
+                        || entry.and_then(|entry| entry.get("api_key")).is_some()
+                }
+                Some(_) => false,
+            };
+            if !has_selected_credential {
+                document
+                    .as_object_mut()
+                    .map(|object| object.remove("active_provider"));
+            }
         }
         self.write_document(&document)
     }
@@ -237,6 +415,39 @@ impl OAuthStore {
                     OAuthError::Store("auth store lock timed out".into())
                 }
                 other => OAuthError::Store(other.to_string()),
+            })
+    }
+
+    pub(crate) fn lock_exclusive_until(
+        &self,
+        deadline: std::time::Instant,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<StoreGuard, OAuthError> {
+        crate::auth::lock_auth_store_until(&self.path, deadline, cancelled)
+            .map(|lock| StoreGuard { _lock: lock })
+            .map_err(|error| match error {
+                crate::auth::AuthError::Locked => {
+                    OAuthError::Store("auth store lock timed out".into())
+                }
+                other => OAuthError::Store(other.to_string()),
+            })
+    }
+
+    pub(crate) fn lock_refresh(
+        &self,
+        provider: OAuthProvider,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<RefreshGuard, OAuthError> {
+        crate::auth::lock_oauth_refresh(&self.path, provider.key(), cancelled)
+            .map(|lock| RefreshGuard { _lock: lock })
+            .map_err(|error| match error {
+                crate::auth::OAuthRefreshLockError::Cancelled => OAuthError::Cancelled,
+                crate::auth::OAuthRefreshLockError::Auth(crate::auth::AuthError::Locked) => {
+                    OAuthError::Store("OAuth refresh lock timed out".into())
+                }
+                crate::auth::OAuthRefreshLockError::Auth(error) => {
+                    OAuthError::Store(error.to_string())
+                }
             })
     }
 
@@ -267,6 +478,8 @@ impl OAuthStore {
         {
             return Err(OAuthError::Store("auth file schema is invalid".into()));
         }
+        crate::auth::validate_auth_document_value(&document)
+            .map_err(|_| OAuthError::Store("auth file schema is invalid".into()))?;
         Ok(document)
     }
 
@@ -296,6 +509,18 @@ impl OAuthStore {
         replace_file(&temporary, &self.path)?;
         Ok(())
     }
+}
+
+fn preferred_method(
+    document: &Value,
+    provider: OAuthProvider,
+) -> Result<Option<PreferredAuthMethod>, OAuthError> {
+    document
+        .pointer(&format!("/providers/{}/preferred_method", provider.key()))
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| OAuthError::Store("provider preferred auth method is invalid".into()))
 }
 
 fn validate_api_key_provider(provider: &str) -> Result<(), OAuthError> {

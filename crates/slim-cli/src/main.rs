@@ -74,10 +74,12 @@ fn known_options_without_prompt(args: &[String]) -> bool {
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            // Recovery has no prompt and must not wait for a piped stdin EOF.
+            "--recover" => return false,
             "--plan" | "--read-only" | "--verbose" | "--jsonl" | "--headless" | "--tui"
             | "--fake" | "--abandon-pending" | "--fast" | "--normal" => {}
             "--prompt" | "--provider" | "--model" | "--endpoint" | "--session" | "--resume"
-            | "--recover" | "--image" | "--effort" | "--experiment-id" | "--task-id" => {
+            | "--image" | "--effort" | "--experiment-id" | "--task-id" => {
                 if args.get(index + 1).is_none() {
                     return false;
                 }
@@ -91,65 +93,5 @@ fn known_options_without_prompt(args: &[String]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn args(list: &[&str]) -> Vec<String> {
-        list.iter().map(|arg| (*arg).to_owned()).collect()
-    }
-
-    #[test]
-    fn effort_value_is_not_a_positional_prompt() {
-        let args = args(&[
-            "--headless",
-            "--provider",
-            "openai-codex",
-            "--effort",
-            "high",
-        ]);
-        assert!(!has_positional_prompt(&args));
-        assert!(known_options_without_prompt(&args));
-    }
-
-    #[test]
-    fn effort_without_value_disables_stdin() {
-        let args = args(&["--headless", "--effort"]);
-        assert!(!has_positional_prompt(&args));
-        assert!(!known_options_without_prompt(&args));
-    }
-
-    #[test]
-    fn codex_speed_flags_keep_stdin_prompt_mode() {
-        for flag in ["--fast", "--normal"] {
-            let args = args(&["--headless", "--provider", "openai-codex", flag]);
-            assert!(!has_positional_prompt(&args), "{flag}");
-            assert!(known_options_without_prompt(&args), "{flag}");
-        }
-    }
-
-    #[test]
-    fn abandon_pending_flag_is_recognized() {
-        let args = args(&["--headless", "--recover", "run.slim", "--abandon-pending"]);
-        assert!(!has_positional_prompt(&args));
-        assert!(known_options_without_prompt(&args));
-    }
-
-    #[test]
-    fn unknown_option_disables_stdin() {
-        let args = args(&["--headless", "--bogus"]);
-        assert!(!known_options_without_prompt(&args));
-    }
-
-    #[test]
-    fn benchmark_label_values_are_not_positional_prompts() {
-        let args = args(&[
-            "--headless",
-            "--experiment-id",
-            "exp-arm-b",
-            "--task-id",
-            "repo-17",
-        ]);
-        assert!(!has_positional_prompt(&args));
-        assert!(known_options_without_prompt(&args));
-    }
-}
+#[path = "main/tests.rs"]
+mod tests;

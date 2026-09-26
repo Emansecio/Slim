@@ -77,14 +77,20 @@ fn todo_state() -> AppState {
         slim_tui::reducer::Action::UiEventReceived(UiEvent::TodoChanged {
             items: vec![
                 TodoItemView {
+                    reason: None,
+                    id: None,
                     title: "mapear fluxo".into(),
                     status: TodoItemStatus::Completed,
                 },
                 TodoItemView {
+                    reason: None,
+                    id: None,
                     title: "rodar testes".into(),
                     status: TodoItemStatus::InProgress,
                 },
                 TodoItemView {
+                    reason: None,
+                    id: None,
                     title: "revisar diff".into(),
                     status: TodoItemStatus::Pending,
                 },
@@ -123,9 +129,9 @@ fn session_rail_keeps_provider_phase_out_of_session_header() {
         !header.contains("Connecting to provider"),
         "phase belongs on the activity rail\n{header}"
     );
-    assert!(frame.contains("Conectando ao provedor"), "{frame}");
+    assert!(frame.contains("Aguardando resposta do provedor"), "{frame}");
     assert_eq!(
-        frame.matches("Conectando ao provedor").count(),
+        frame.matches("Aguardando resposta do provedor").count(),
         1,
         "phase must appear once on the activity rail\n{frame}"
     );
@@ -609,10 +615,14 @@ fn constrained_working_state_moves_from_activity_to_footer() {
     state.todo_dock_open = true;
     state.todo_items = vec![
         TodoItemView {
+            reason: None,
+            id: None,
             title: "index files".into(),
             status: TodoItemStatus::InProgress,
         },
         TodoItemView {
+            reason: None,
+            id: None,
             title: "run checks".into(),
             status: TodoItemStatus::Pending,
         },
@@ -858,14 +868,20 @@ fn manual_todo_collapse_survives_subsequent_updates() {
     state.apply_event(UiEvent::TodoChanged {
         items: vec![
             TodoItemView {
+                reason: None,
+                id: None,
                 title: "mapear fluxo".into(),
                 status: TodoItemStatus::Completed,
             },
             TodoItemView {
+                reason: None,
+                id: None,
                 title: "rodar testes".into(),
                 status: TodoItemStatus::InProgress,
             },
             TodoItemView {
+                reason: None,
+                id: None,
                 title: "revisar diff".into(),
                 status: TodoItemStatus::Pending,
             },
@@ -901,7 +917,7 @@ fn wide_composer_uses_full_width_for_wrapping_with_and_without_inspector() {
         let mut state = AppState::new();
         state.authenticated = true;
         state.inspector.active = inspector;
-        state.composer.insert_text(&"x".repeat(150));
+        state.composer.insert_text("x".repeat(150));
         let frame = render_to_string(&state, 200, 24);
         let lines = frame.lines().collect::<Vec<_>>();
         let top = lines.iter().rposition(|line| line.contains('╭')).unwrap();

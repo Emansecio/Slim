@@ -13,6 +13,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -85,7 +86,11 @@ fn read_request(stream: &mut TcpStream) -> String {
     String::from_utf8(bytes[..header_end + content_length].to_vec()).expect("utf8 request")
 }
 
-fn accept_one(listener: &TcpListener, deadline: Instant) -> Option<TcpStream> {
+fn accept_one(
+    listener: &TcpListener,
+    deadline: Instant,
+    finished: &AtomicBool,
+) -> Option<TcpStream> {
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -99,10 +104,11 @@ fn accept_one(listener: &TcpListener, deadline: Instant) -> Option<TcpStream> {
                 return Some(stream);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
+                // Check queued connections before honoring the completed run.
+                if finished.load(Ordering::Acquire) || Instant::now() >= deadline {
                     return None;
                 }
-                thread::yield_now();
+                thread::sleep(Duration::from_millis(1));
             }
             Err(error) => panic!("fixture accept: {error}"),
         }
@@ -165,13 +171,15 @@ fn sec_tool_call_double_encoded_secret_is_rejected_before_execution() {
 
     let tool_message_body = Arc::new(std::sync::Mutex::new(String::new()));
     let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let finished = Arc::new(AtomicBool::new(false));
     let server = {
+        let finished = Arc::clone(&finished);
         let tool_message_body = tool_message_body.clone();
         let request_count = request_count.clone();
         thread::spawn(move || {
             let deadline = Instant::now() + SERVER_DEADLINE;
             for turn in 0..2 {
-                let Some(mut stream) = accept_one(&listener, deadline) else {
+                let Some(mut stream) = accept_one(&listener, deadline, &finished) else {
                     break;
                 };
                 let request = read_request(&mut stream);
@@ -226,9 +234,11 @@ fn sec_tool_call_double_encoded_secret_is_rejected_before_execution() {
         },
         &session,
         ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
             .with_workspace_root(temp.path())
             .with_artifact_root(temp.path().join("artifacts")),
     );
+    finished.store(true, Ordering::Release);
     server.join().expect("server thread");
 
     let requests = request_count.load(std::sync::atomic::Ordering::SeqCst);
@@ -289,12 +299,14 @@ fn sec_tool_output_artifact_must_not_persist_secret() {
         .expect("nonblocking listener");
     let address = listener.local_addr().expect("address");
     let second_request = Arc::new(std::sync::Mutex::new(String::new()));
+    let finished = Arc::new(AtomicBool::new(false));
     let server = {
+        let finished = Arc::clone(&finished);
         let second_request = second_request.clone();
         thread::spawn(move || {
             let deadline = Instant::now() + SERVER_DEADLINE;
             for turn in 0..2 {
-                let Some(mut stream) = accept_one(&listener, deadline) else {
+                let Some(mut stream) = accept_one(&listener, deadline, &finished) else {
                     break;
                 };
                 let request = read_request(&mut stream);
@@ -348,10 +360,12 @@ fn sec_tool_output_artifact_must_not_persist_secret() {
         },
         &session,
         ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
             .with_workspace_root(temp.path())
             .with_artifact_root(temp.path().join("artifacts"))
             .with_max_result_bytes(16),
     );
+    finished.store(true, Ordering::Release);
     server.join().expect("server thread");
     let result = provider_result.expect("provider run");
     assert_eq!(result.code, ExitCode::Success);

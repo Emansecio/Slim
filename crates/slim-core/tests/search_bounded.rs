@@ -210,6 +210,11 @@ fn multipattern_search_distinguishes_absence_and_cursor_continuation() {
         absent.output
     );
     assert!(!absent.output.contains("pattern 2 `MISSING`: not covered"));
+    assert!(
+        !absent.output.contains("search incomplete"),
+        "{}",
+        absent.output
+    );
 
     let body = format!("{}RARE_ONLY\n", "COMMON\n".repeat(600));
     fs::write(root.join("data.txt"), body).expect("fixture");
@@ -268,6 +273,39 @@ fn multipattern_search_marks_uncovered_pattern_when_work_budget_ends() {
     assert!(result
         .output
         .contains("uncovered patterns are not confirmed absent"));
+    let _ = fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn registry_search_does_not_report_io_failures_for_binary_ignored_or_healthy_empty_scan() {
+    let root = temp_root("healthy-no-io-failures");
+    fs::create_dir_all(&root).expect("root");
+    fs::write(root.join(".gitignore"), "ignored.txt\n").expect("gitignore");
+    fs::write(root.join("ignored.txt"), "needle in ignored file\n").expect("ignored");
+    fs::write(root.join("binary.dat"), b"needle\0binary\n").expect("binary");
+    fs::write(root.join("plain.txt"), "healthy file without a match\n").expect("plain");
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&root)
+        .output()
+        .expect("git init");
+
+    let result = ToolRegistry::default().execute(
+        OperatingMode::ReadOnly,
+        &root,
+        "search",
+        r#"{"query":"needle","path":"."}"#,
+    );
+
+    assert!(result.success, "{}", result.output);
+    assert!(
+        !result.output.contains("search incomplete"),
+        "{}",
+        result.output
+    );
+    assert!(!result.output.contains("I/O failure"), "{}", result.output);
+    assert!(!result.output.contains("ignored.txt"), "{}", result.output);
+    assert!(!result.output.contains("binary.dat"), "{}", result.output);
     let _ = fs::remove_dir_all(root.parent().expect("parent"));
 }
 

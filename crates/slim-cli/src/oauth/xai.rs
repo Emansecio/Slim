@@ -106,22 +106,27 @@ pub async fn login(
     }
 }
 
-pub async fn refresh(
+pub async fn refresh_with_dispatch(
     client: &reqwest::Client,
     endpoints: &OAuthEndpoints,
     credential: &OAuthCredential,
+    on_dispatch: impl FnOnce() -> Result<(), OAuthError> + Send,
 ) -> Result<OAuthCredential, OAuthError> {
-    let response = client
-        .post(&endpoints.xai_token)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", credential.refresh.as_str()),
-            ("client_id", CLIENT_ID),
-        ])
+    let request = client.post(&endpoints.xai_token).form(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", credential.refresh.as_str()),
+        ("client_id", CLIENT_ID),
+    ]);
+    on_dispatch()?;
+    let response = request
         .send()
         .await
         .map_err(|_| OAuthError::Transport("xAI token refresh failed".into()))?;
-    parse_token(response, Some(&credential.refresh)).await
+    let mut refreshed = parse_token(response, Some(&credential.refresh)).await?;
+    if refreshed.account_id.is_none() {
+        refreshed.account_id = credential.account_id.clone();
+    }
+    Ok(refreshed)
 }
 
 async fn parse_token(

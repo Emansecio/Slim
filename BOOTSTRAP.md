@@ -25,17 +25,17 @@ cargo build --release -p slim-cli
 Copy-Item target\release\slim.exe "$env:USERPROFILE\bin\Slim.exe" -Force
 ```
 
-O `refresh-slim.ps1` do repo faz build + copia + smoke test, mas **tem caminhos
-fixos da maquina de origem** (`C:\Users\User\scoop\persist\rustup-msvc\...\rustc.exe`,
-`C:\Users\User\bin\Slim.exe`): em outro PC/usuario, ajuste essas linhas (o unico
-fallback e usar o `cargo` do PATH).
+O `refresh-slim.ps1` do repo faz build + copia + smoke test usando `cargo` e
+`rustc` do `PATH`. O destino e calculado como `%USERPROFILE%\bin\Slim.exe`.
+Variaveis `RUSTC`/`CARGO` herdadas que apontem para arquivos inexistentes sao
+removidas somente do processo do script.
 
 ## 4. Configuracao (opcional)
 
 | Camada | Caminho |
 |---|---|
 | Projeto | `./slim.toml` (diretorio de trabalho) |
-| Global | `%APPDATA%\slim\slim.toml` |
+| Global | `%APPDATA%\slim\config\slim.toml` |
 
 Chaves reconhecidas: `model`, `endpoint`, `effort`, `max_turns`,
 `max_mutating_tool_calls`, `max_read_tool_calls`, `max_output_tokens`,

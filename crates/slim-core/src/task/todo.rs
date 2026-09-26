@@ -12,6 +12,7 @@ pub struct TodoItem {
     pub id: u64,
     pub title: String,
     pub status: TodoStatus,
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -35,6 +36,7 @@ impl TodoTracker {
             id,
             title: title.into(),
             status: TodoStatus::Pending,
+            reason: None,
         });
         id
     }
@@ -54,6 +56,22 @@ impl TodoTracker {
             .find(|item| item.id == id)
             .ok_or("todo not found")?;
         item.status = status;
+        item.reason = None;
+        Ok(())
+    }
+
+    pub fn set_status_with_reason(
+        &mut self,
+        id: u64,
+        status: TodoStatus,
+        reason: Option<String>,
+    ) -> Result<(), &'static str> {
+        self.set_status(id, status)?;
+        self.items
+            .iter_mut()
+            .find(|item| item.id == id)
+            .ok_or("todo not found")?
+            .reason = reason;
         Ok(())
     }
 

@@ -4,7 +4,10 @@ use std::io;
 use std::time::Instant;
 
 use crate::context::ArtifactStore;
-use crate::provider::{ProviderMessage, ProviderToolCall};
+use crate::provider::{
+    normalized_provider_code, ProviderCallOutcome, ProviderCallTelemetry, ProviderMessage,
+    ProviderToolCall,
+};
 use crate::EventKind;
 
 use super::manual_drive::{
@@ -26,6 +29,7 @@ pub struct ManualRunJournal {
     batch_id: Option<String>,
     pending: BTreeMap<String, (String, bool)>,
     call_ids: BTreeMap<String, String>,
+    event_call_ids: BTreeMap<(String, String), String>,
     /// Durable raw tool entry keyed by the provider-visible call ID. The
     /// model-facing projection is recorded as a separate fact after the raw
     /// result has been appended, so replay can select it without replacing
@@ -33,7 +37,9 @@ pub struct ManualRunJournal {
     tool_entries: BTreeMap<String, String>,
     presentation_fact_keys: BTreeSet<String>,
     process_fact_keys: BTreeSet<String>,
+    job_output_fact_keys: BTreeSet<String>,
     run_started: Instant,
+    provider_call_ordinal: u32,
     run_telemetry_terminal: Option<super::RunTelemetryTerminal>,
     uncertain: bool,
     entries_written: usize,
@@ -63,10 +69,13 @@ impl ManualRunJournal {
             batch_id: None,
             pending: BTreeMap::new(),
             call_ids: BTreeMap::new(),
+            event_call_ids: BTreeMap::new(),
             tool_entries: BTreeMap::new(),
             presentation_fact_keys: BTreeSet::new(),
             process_fact_keys: BTreeSet::new(),
+            job_output_fact_keys: BTreeSet::new(),
             run_started,
+            provider_call_ordinal: 0,
             run_telemetry_terminal: None,
             uncertain: false,
             entries_written: 0,
@@ -115,7 +124,7 @@ impl ManualRunJournal {
                 return Err(io::Error::other("invalid or duplicate durable tool call"));
             }
         }
-        let call_ids = original_calls
+        let call_ids: BTreeMap<String, String> = original_calls
             .iter()
             .zip(&assistant.tool_calls)
             .map(|(original, redacted)| (original.id.clone(), redacted.id.clone()))
@@ -123,6 +132,10 @@ impl ManualRunJournal {
         self.append(assistant)?;
         self.batch_id = Some(batch_id.to_owned());
         self.pending = pending;
+        for (original, redacted) in &call_ids {
+            self.event_call_ids
+                .insert((batch_id.to_owned(), original.clone()), redacted.clone());
+        }
         self.call_ids = call_ids;
         Ok(())
     }
@@ -173,6 +186,7 @@ impl ManualRunJournal {
                 }
             }
             EventKind::ToolFinished {
+                batch_id,
                 call_id,
                 name,
                 success,
@@ -186,8 +200,8 @@ impl ManualRunJournal {
                 // resolves the redacted durable identity exactly like
                 // ToolStarted and never fails an otherwise healthy run.
                 let durable_id = self
-                    .call_ids
-                    .get(call_id)
+                    .event_call_ids
+                    .get(&(batch_id.clone(), call_id.clone()))
                     .cloned()
                     .unwrap_or_else(|| call_id.clone());
                 // Observability-only fact: skip the per-call data sync. The
@@ -209,6 +223,7 @@ impl ManualRunJournal {
                 self.remember_failure(result)?;
             }
             EventKind::ToolProcessFinished {
+                batch_id,
                 call_id,
                 name,
                 process,
@@ -219,8 +234,8 @@ impl ManualRunJournal {
                 // aligned with ToolStarted/ToolFinished while ensuring a
                 // repeated event cannot append the same fact twice.
                 let durable_id = self
-                    .call_ids
-                    .get(call_id)
+                    .event_call_ids
+                    .get(&(batch_id.clone(), call_id.clone()))
                     .cloned()
                     .unwrap_or_else(|| call_id.clone());
                 if !self.process_fact_keys.insert(durable_id.clone()) {
@@ -243,9 +258,96 @@ impl ManualRunJournal {
                 });
                 self.remember_failure(result)?;
             }
+            EventKind::ToolJobOutput {
+                batch_id,
+                call_id,
+                name,
+                output,
+            } => {
+                let durable_id = self
+                    .event_call_ids
+                    .get(&(batch_id.clone(), call_id.clone()))
+                    .cloned()
+                    .unwrap_or_else(|| call_id.clone());
+                if !self.job_output_fact_keys.insert(durable_id.clone()) {
+                    return Err(io::Error::other("duplicate durable shell job output"));
+                }
+                let seq = self.repo.next_seq()?;
+                let result = self.repo.append(DurableRecord::Fact {
+                    seq,
+                    fact: DurableFact {
+                        namespace: "tool.job_output.v1".into(),
+                        key: durable_id,
+                        value: serde_json::json!({"name": name, "output": output}),
+                    },
+                });
+                self.remember_failure(result)?;
+            }
+            EventKind::ArtifactStored { id, size } => {
+                let seq = self.repo.next_seq()?;
+                let result = self.repo.append(DurableRecord::Fact {
+                    seq,
+                    fact: DurableFact {
+                        namespace: "artifact.v1".into(),
+                        key: id.clone(),
+                        value: serde_json::json!({"size": size}),
+                    },
+                });
+                self.remember_failure(result)?;
+            }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Persist bounded metadata for one actual provider HTTP call. The caller
+    /// invokes this only after `HttpProviderClient` has started a network
+    /// request; cache hits never reach this boundary.
+    pub(crate) fn record_provider_call(
+        &mut self,
+        telemetry: &ProviderCallTelemetry,
+    ) -> io::Result<()> {
+        self.check()?;
+        let ordinal = self
+            .provider_call_ordinal
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("provider call ordinal exhausted"))?;
+        self.provider_call_ordinal = ordinal;
+        let id = format!("{}-provider-call-{ordinal}", self.spec.operation_id);
+        let outcome = match telemetry.outcome {
+            ProviderCallOutcome::Success => "success",
+            ProviderCallOutcome::Failed => "failed",
+            ProviderCallOutcome::Cancelled => "cancelled",
+        };
+        let code = telemetry.code.as_deref().and_then(normalized_provider_code);
+        let seq = self.repo.next_seq()?;
+        let result = self.repo.append(DurableRecord::Fact {
+            seq,
+            fact: DurableFact {
+                namespace: "provider.call.v1".into(),
+                key: id.clone(),
+                value: serde_json::json!({
+                    "id": id,
+                    "ordinal": ordinal,
+                    "operation_id": &self.spec.operation_id,
+                    "attempt_id": &self.spec.attempt_id,
+                    "provider": &telemetry.provider,
+                    "model": &telemetry.model,
+                    "duration_ms": telemetry.duration_ms,
+                    "headers_ms": telemetry.headers_ms,
+                    "first_semantic_ms": telemetry.first_semantic_ms,
+                    "outcome": outcome,
+                    "http_status": telemetry.status,
+                    "code": code,
+                    "retry_after_ms": telemetry.retry_after_ms,
+                }),
+            },
+        });
+        self.remember_failure(result.map_err(|error| {
+            io::Error::other(format!(
+                "provider call fact could not be persisted: {error}"
+            ))
+        }))
     }
 
     /// Tool calls/results were already saved at their execution boundaries.
@@ -507,6 +609,177 @@ mod tests {
     }
 
     #[test]
+    fn artifact_id_is_durable_for_session_resume() {
+        let (root, mut journal) = fixture();
+        journal
+            .record_event(&EventKind::ArtifactStored {
+                id: "shell-log-deadbeef".into(),
+                size: 42,
+            })
+            .unwrap();
+        let preflight = preflight_session(root.join("session.jsonl")).unwrap();
+        assert!(preflight.records.iter().any(|record| matches!(
+            record,
+            DurableRecord::Fact { fact, .. }
+                if fact.namespace == "artifact.v1"
+                    && fact.key == "shell-log-deadbeef"
+                    && fact.value["size"] == 42
+        )));
+        drop(journal);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn background_job_output_survives_later_tool_batches_without_second_tool_entry() {
+        let (root, mut journal) = fixture();
+        let original = vec![ProviderToolCall {
+            id: "private-launch-id".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        }];
+        let mut redacted = original.clone();
+        redacted[0].id = "redacted-launch-id".into();
+        journal
+            .begin_tools(
+                "launch-batch",
+                ProviderMessage::assistant("", redacted),
+                &original,
+            )
+            .unwrap();
+        journal
+            .record_event(&EventKind::ToolOutput {
+                batch_id: "launch-batch".into(),
+                call_id: original[0].id.clone(),
+                name: "shell".into(),
+                output: "job_id=shell-1 state=running".into(),
+            })
+            .unwrap();
+        let next = vec![call("other-call")];
+        journal
+            .begin_tools(
+                "next-batch",
+                ProviderMessage::assistant("", next.clone()),
+                &next,
+            )
+            .unwrap();
+        journal
+            .record_event(&EventKind::ToolOutput {
+                batch_id: "next-batch".into(),
+                call_id: "other-call".into(),
+                name: "read".into(),
+                output: "other result".into(),
+            })
+            .unwrap();
+        journal
+            .record_event(&EventKind::ToolJobOutput {
+                batch_id: "launch-batch".into(),
+                call_id: original[0].id.clone(),
+                name: "shell".into(),
+                output: "final marker".into(),
+            })
+            .unwrap();
+        journal
+            .record_event(&EventKind::ToolFinished {
+                batch_id: "launch-batch".into(),
+                call_id: original[0].id.clone(),
+                name: "shell".into(),
+                success: true,
+                duration_ms: 17,
+            })
+            .unwrap();
+        journal
+            .record_message(ProviderMessage::user(
+                "[Shell job completion: shell-1] final marker",
+            ))
+            .unwrap();
+        journal.finish(ProviderResponse::new("done", None)).unwrap();
+        drop(journal);
+        let report = preflight_session(root.join("session.jsonl")).unwrap();
+        let output_facts = report
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                DurableRecord::Fact { fact, .. } if fact.namespace == "tool.job_output.v1" => {
+                    Some(fact)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(output_facts.len(), 1);
+        assert_eq!(output_facts[0].key, "redacted-launch-id");
+        assert_eq!(output_facts[0].value["output"], "final marker");
+        let raw = fs::read_to_string(root.join("session.jsonl")).unwrap();
+        assert!(!raw.contains("private-launch-id"));
+        let tool_entries = report.records.iter().filter(|record| matches!(record,
+            DurableRecord::Entry { entry, .. } if entry.role == super::super::DurableEntryRole::Tool && entry.tool_call_id.as_deref() == Some("redacted-launch-id")
+        )).count();
+        assert_eq!(tool_entries, 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_call_facts_capture_ordered_outcomes_without_payloads() {
+        let (root, mut journal) = fixture();
+        journal
+            .record_provider_call(&ProviderCallTelemetry {
+                provider: "openai-compatible".into(),
+                model: "fixture-model".into(),
+                duration_ms: 12,
+                headers_ms: Some(4),
+                first_semantic_ms: None,
+                outcome: ProviderCallOutcome::Failed,
+                status: Some(429),
+                code: Some("header-secret".into()),
+                retry_after_ms: Some(2500),
+            })
+            .unwrap();
+        journal
+            .record_provider_call(&ProviderCallTelemetry {
+                provider: "openai-compatible".into(),
+                model: "fixture-model".into(),
+                duration_ms: 8,
+                headers_ms: Some(2),
+                first_semantic_ms: Some(5),
+                outcome: ProviderCallOutcome::Success,
+                status: Some(200),
+                code: None,
+                retry_after_ms: None,
+            })
+            .unwrap();
+        drop(journal);
+        let report = preflight_session(root.join("session.jsonl")).unwrap();
+        let facts = report
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                DurableRecord::Fact { fact, .. } if fact.namespace == "provider.call.v1" => {
+                    Some(fact)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].value["ordinal"], 1);
+        assert_eq!(facts[0].value["attempt_id"], "attempt");
+        assert_eq!(facts[0].value["outcome"], "failed");
+        assert_eq!(facts[0].value["http_status"], 429);
+        assert_eq!(facts[0].value["retry_after_ms"], 2500);
+        assert_eq!(facts[0].value["code"], "provider_error");
+        assert_eq!(facts[1].value["ordinal"], 2);
+        assert_eq!(facts[1].value["outcome"], "success");
+        assert_eq!(facts[1].value["http_status"], 200);
+        assert_eq!(facts[0].value["headers_ms"], 4);
+        assert!(facts[0].value["first_semantic_ms"].is_null());
+        assert_eq!(facts[1].value["headers_ms"], 2);
+        assert_eq!(facts[1].value["first_semantic_ms"], 5);
+        let raw = fs::read_to_string(root.join("session.jsonl")).unwrap();
+        assert!(!raw.contains("prompt-marker"));
+        assert!(!raw.contains("body-marker"));
+        assert!(!raw.contains("header-secret"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn journal_preserves_out_of_order_results_and_redacted_call_identity_once() {
         let (root, mut journal) = fixture();
         journal.configure_output(Some(ArtifactStore::new(root.join("artifacts")).unwrap()), 8);
@@ -638,6 +911,7 @@ mod tests {
                 exit_code,
                 timed_out: false,
                 cancelled: false,
+                capture_may_be_incomplete: false,
                 stdout_bytes: 4,
                 stderr_bytes: 2,
                 stdout_discarded_bytes: 1,
@@ -654,6 +928,8 @@ mod tests {
             provider: "openai-compatible".into(),
             model: "fixture-main".into(),
             build_revision: "test-build".into(),
+            executable_sha256: Some("a".repeat(64)),
+            executable_identity_error: None,
             started_at: 1_700_000_000_000,
             limits: serde_json::json!({"configured": true}),
         }
@@ -780,6 +1056,11 @@ mod tests {
         assert_eq!(terminal["provider"], "openai-compatible");
         assert_eq!(terminal["model"], "fixture-main");
         assert_eq!(terminal["build_revision"], "test-build");
+        assert_eq!(terminal["executable_sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(
+            terminal["executable_identity_error"],
+            serde_json::Value::Null
+        );
         assert_eq!(terminal["stop"], "provider_completed");
         assert_eq!(terminal["outcome"], "success");
         assert_eq!(terminal["validated_completion"], true);

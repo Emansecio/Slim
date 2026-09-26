@@ -50,18 +50,13 @@ pub fn operational_height(viewport_height: u16) -> u16 {
 }
 
 /// Todo dock height (§14.3): compact 1 row, expanded up to 6, 0 when empty.
-/// The in-progress item shares the header row, so it needs no row of its own.
-pub fn todo_height(expanded: bool, item_count: usize, has_active: bool) -> u16 {
+/// Expanded: summary, task rows and navigation/update footer.
+pub fn todo_height(expanded: bool, item_count: usize, _has_active: bool) -> u16 {
     if item_count == 0 {
         return 0;
     }
     if expanded {
-        let rows = if has_active {
-            item_count
-        } else {
-            item_count + 1
-        };
-        (rows as u16).clamp(2, 6)
+        item_count.saturating_add(2).min(6) as u16
     } else {
         1
     }

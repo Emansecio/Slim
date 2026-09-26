@@ -523,9 +523,14 @@ impl CausalGovernor {
             .last_call_fingerprint
             .clone_from(&pending.call_fingerprint);
 
-        match spec.effect_class {
+        let batch_id = pending.batch_id.clone();
+        let call_id = pending.call_id.clone();
+        let mut observations = match spec.effect_class {
             ToolEffectClass::PotentiallyVolatile => self.observe_volatile(pending),
-            ToolEffectClass::WorkspaceMutation if result.success => {
+            ToolEffectClass::WorkspaceMutation
+                if result.success
+                    || receipt.mutations.iter().any(|mutation| mutation.changed()) =>
+            {
                 self.observe_mutation(pending, receipt)
             }
             ToolEffectClass::WorkspaceMutation => {
@@ -561,7 +566,22 @@ impl CausalGovernor {
             }
             ToolEffectClass::Validation => self.observe_validation(pending, result, receipt),
             ToolEffectClass::SnapshotRead => self.observe_snapshot(pending, result, receipt),
+        };
+        if let Some(fused_shell) = &receipt.fused_shell {
+            let (shell_call, shell_result) = fused_shell.as_ref();
+            let fused_call_id = format!("{call_id}:then_run");
+            let (shell_pending, before) =
+                self.observe_before_identified(shell_call, &batch_id, &fused_call_id);
+            observations.extend(before);
+            let shell_receipt = ToolExecutionReceipt::unobserved(
+                shell_call,
+                receipt.revision_after,
+                receipt.revision_after,
+                0,
+            );
+            observations.extend(self.observe_after(shell_pending, shell_result, &shell_receipt));
         }
+        observations
     }
 
     pub(super) fn observe_snapshot_batch_after(
@@ -2219,6 +2239,125 @@ mod tests {
         assert!(governor
             .observe_after(pending, &outcome.result, &outcome.receipt)
             .is_empty());
+    }
+
+    #[test]
+    fn fused_validation_is_recorded_after_its_mutation_revision() {
+        let temp = TestRoot::new("fused-validation");
+        fs::create_dir_all(temp.path().join("src")).unwrap();
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"fused_validation_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 {\n    42\n}\n",
+        )
+        .unwrap();
+        fs::write(temp.path().join("README.md"), "before\n").unwrap();
+        let registry = ToolRegistry::default();
+        let prepared = registry.prepare_invocation(
+            OperatingMode::Auto,
+            temp.path(),
+            "write",
+            &serde_json::json!({
+                "path": "README.md",
+                "content": "after\n",
+                "expected": "before\n",
+                "then_run": {"command": "cargo", "args": ["fmt", "--check"]}
+            })
+            .to_string(),
+        );
+        assert!(prepared.error.is_none(), "{:?}", prepared.error);
+        let mut governor = CausalGovernor::default();
+        let (pending, _) = governor.observe_before_identified(&prepared, "batch", "edit");
+        let outcome =
+            registry.execute_prepared_with_cancellation_and_progress(&prepared, None, |_| {});
+        assert!(outcome.result.success, "{}", outcome.result.output);
+        assert!(outcome.receipt.revision_after > outcome.receipt.revision_before);
+        let observations = governor.observe_after(pending, &outcome.result, &outcome.receipt);
+        assert!(matches!(
+            observations.first(),
+            Some(GovernorObservation::Progress {
+                kind: CausalProgressKind::WorkspaceChanged,
+                ..
+            })
+        ));
+        assert!(observations.iter().any(|observation| matches!(observation,
+            GovernorObservation::Progress {
+                kind: CausalProgressKind::ValidationGreen, call_id, ..
+            } if call_id == "edit:then_run"
+        )));
+        assert!(governor.validations_satisfied());
+        assert!(governor
+            .compaction_snapshot(1)
+            .contains("validation_revision=1"));
+
+        let mut cancelled = outcome.clone();
+        super::super::mark_cancelled_tool_outcome(&mut cancelled);
+        assert!(!cancelled.result.success);
+        assert!(!cancelled.receipt.fused_shell.as_ref().unwrap().1.success);
+        let mut cancelled_governor = CausalGovernor::default();
+        let (cancelled_pending, _) =
+            cancelled_governor.observe_before_identified(&prepared, "batch", "cancelled");
+        let cancelled_observations = cancelled_governor.observe_after(
+            cancelled_pending,
+            &cancelled.result,
+            &cancelled.receipt,
+        );
+        assert!(cancelled_observations.iter().any(|observation| matches!(
+            observation,
+            GovernorObservation::Progress {
+                kind: CausalProgressKind::WorkspaceChanged,
+                ..
+            }
+        )));
+        assert!(!cancelled_observations.iter().any(|observation| matches!(
+            observation,
+            GovernorObservation::Progress {
+                kind: CausalProgressKind::ValidationGreen,
+                ..
+            }
+        )));
+        assert!(!cancelled_governor.validations_satisfied());
+
+        fs::write(
+            temp.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 42 }\n",
+        )
+        .unwrap();
+        let retry = registry.prepare_invocation(
+            OperatingMode::Auto,
+            temp.path(),
+            "write",
+            &serde_json::json!({
+                "path": "README.md",
+                "content": "after again\n",
+                "expected": "after\n",
+                "then_run": {"command": "cargo", "args": ["fmt", "--check"]}
+            })
+            .to_string(),
+        );
+        let (pending, _) = governor.observe_before_identified(&retry, "batch", "retry");
+        let failed = registry.execute_prepared_with_cancellation_and_progress(&retry, None, |_| {});
+        assert!(!failed.result.success);
+        assert_eq!(
+            fs::read_to_string(temp.path().join("README.md")).unwrap(),
+            "after again\n"
+        );
+        let observations = governor.observe_after(pending, &failed.result, &failed.receipt);
+        assert!(matches!(
+            observations.first(),
+            Some(GovernorObservation::Progress {
+                kind: CausalProgressKind::WorkspaceChanged,
+                ..
+            })
+        ));
+        assert!(!governor.validations_satisfied());
+        assert!(governor
+            .compaction_snapshot(2)
+            .contains("validation_revision=2"));
     }
 
     #[test]

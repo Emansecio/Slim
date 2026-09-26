@@ -27,3 +27,17 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Keep source locations/backtraces without generating all local type information.
+# Only workspace packages change; third-party/build dependencies reuse dev artifacts.
+[profile.test.package.slim-core]
+debug = 1
+
+[profile.test.package.slim-cli]
+debug = 1
+
+[profile.test.package.slim-lsp]
+debug = 1
+
+[profile.test.package.slim-tui]
+debug = 1

@@ -126,6 +126,44 @@ fn exact_patch_rejects_ambiguous_matches_without_writing() {
 }
 
 #[test]
+fn patch_single_edit_validates_before_writing_and_preserves_bytes() {
+    let path = temp_path("single.txt");
+    let root = path.parent().expect("parent");
+    fs::create_dir_all(root).unwrap();
+    let original = "// ação\r\n    old();\r\nsame\r\nsame\r\n";
+    fs::write(&path, original).unwrap();
+    let registry = ToolRegistry::default();
+    for arguments in [
+        serde_json::json!({"path":"single.txt", "edits":{"expected":"old", "replacement":"new", "extra":true}}),
+        serde_json::json!({"path":"single.txt", "edits":{"expected":"old"}}),
+        serde_json::json!({"path":"single.txt", "edits":{"expected":"", "replacement":"new"}}),
+        serde_json::json!({"path":"single.txt", "edits":{"expected":"old", "replacement":7}}),
+        serde_json::json!({"path":"single.txt", "edits":{"expected":"old", "replacement":"new"}, "expected":"old", "replacement":"new"}),
+        serde_json::json!({"path":"single.txt", "edits":{"expected":"same", "replacement":"new"}}),
+    ] {
+        let result = registry.execute(OperatingMode::Auto, root, "patch", &arguments.to_string());
+        assert!(!result.success, "accepted {arguments}");
+        assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+    }
+    let arguments = serde_json::json!({"path":"single.txt", "edits":{"expected":"    old();", "replacement":"    new();"}});
+    let denied = registry.execute(
+        OperatingMode::ReadOnly,
+        root,
+        "patch",
+        &arguments.to_string(),
+    );
+    assert!(!denied.success);
+    assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+    let result = registry.execute(OperatingMode::Auto, root, "patch", &arguments.to_string());
+    assert!(result.success, "{}", result.output);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        original.replace("old", "new").as_bytes()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn patch_accepts_lf_excerpt_from_crlf_read_and_preserves_other_bytes() {
     let path = temp_path("patch-crlf.txt");
     let root = path.parent().expect("parent");

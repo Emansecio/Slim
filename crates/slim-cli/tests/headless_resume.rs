@@ -9,10 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use slim_cli::{
-    run_cli, run_provider_headless_with_resume, run_provider_headless_with_resume_and_options,
-    ExitCode, ProviderRequest,
-};
+use slim_cli::{run_cli, run_provider_headless_with_resume_and_options, ExitCode, ProviderRequest};
 use slim_core::provider::ProviderKind;
 use slim_core::session::{
     preflight_session, recover_durable_v2, DurableEntry, DurableEntryRole, DurableOperation,
@@ -85,7 +82,13 @@ fn create_v2(path: &Path) {
 fn create_v2_with_history(path: &Path) {
     let mut repo = JsonlRepo::create(
         path,
-        DurableSessionHeader::new("history", "now", "D:\\Slim", None, None),
+        DurableSessionHeader::new(
+            "history",
+            "now",
+            path.parent().unwrap().to_str().unwrap(),
+            None,
+            None,
+        ),
     )
     .expect("v2 history session");
     repo.append(DurableRecord::Entry {
@@ -365,6 +368,7 @@ fn resume_explicit_zero_tool_budget_blocks_side_effect_and_records_failed_termin
         request(endpoint),
         &path,
         slim_cli::ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
             .with_workspace_root(&workspace)
             .with_max_tool_calls(0)
             .with_max_read_tool_calls(0),
@@ -694,7 +698,9 @@ fn failed_provider_after_tools_persists_the_redacted_reason_and_tool_history() {
         let result = run_provider_headless_with_resume_and_options(
             request(endpoint),
             &path,
-            slim_cli::ProviderRunOptions::default().with_workspace_root(workspace),
+            slim_cli::ProviderRunOptions::default()
+                .with_context_window_tokens(32_000)
+                .with_workspace_root(workspace),
         )
         .unwrap();
         server.join().unwrap();
@@ -885,4 +891,15 @@ fn credential_bearing_tool_is_rejected_before_durable_effects() {
         .unwrap()
         .contains("fixture-secret"));
     std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+fn run_provider_headless_with_resume(
+    request: ProviderRequest,
+    path: &Path,
+) -> Result<slim_cli::ProviderHeadlessResult, slim_core::provider::ProviderError> {
+    run_provider_headless_with_resume_and_options(
+        request,
+        path,
+        slim_cli::ProviderRunOptions::default().with_context_window_tokens(32_000),
+    )
 }

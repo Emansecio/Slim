@@ -5,8 +5,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
-use slim_tui::api::{LoginProvider, OpenCodeModelView, UiCommand};
-use slim_tui::app::AppState;
+use slim_tui::api::{LoginProvider, ModelAlias, OpenCodeModelView, ReasoningEffort, UiCommand};
+use slim_tui::app::{AppState, EffortTarget, ModelRow};
 use slim_tui::reducer::{reduce, Action, Effect};
 use slim_tui::render::WrapCache;
 use slim_tui::runtime::{render_frame, terminal_action};
@@ -135,16 +135,28 @@ fn codex_alias_filters_and_enter_opens_effort() {
     reduce(&mut state, Action::Key(press(KeyCode::Down)));
     reduce(&mut state, Action::Key(press(KeyCode::Enter)));
     let effort = state.effort_overlay.expect("effort step");
-    assert_eq!(effort.model.id(), "gpt-5.6-luna");
+    assert_eq!(effort.target, EffortTarget::Alias(ModelAlias::Luna));
+    assert!(
+        effort.speed_toggle(),
+        "Codex aliases keep the Normal/Fast toggle"
+    );
 }
 
 #[test]
 fn opencode_catalog_filters_and_enter_sends_selection() {
     let mut state = state_with_opencode_catalog();
     type_text(&mut state, "qwen");
-    // Filtered rows: Header(0), Header(1), Catalog(qwen3-coder) → two Downs.
-    reduce(&mut state, Action::Key(press(KeyCode::Down)));
-    reduce(&mut state, Action::Key(press(KeyCode::Down)));
+    // Position by predicate: other provider groups also match "qwen" and
+    // group headers are rows, so counting Downs is not stable.
+    let go_ids: Vec<String> = state
+        .open_code_models
+        .iter()
+        .map(|model| model.id.clone())
+        .collect();
+    select_row(
+        &mut state,
+        |row| matches!(row, ModelRow::Catalog(index) if go_ids[*index] == "qwen3-coder"),
+    );
     let effects = reduce(&mut state, Action::Key(press(KeyCode::Enter)));
 
     assert!(state.model_overlay.is_none(), "closed on select");
@@ -185,6 +197,85 @@ fn astra_picker_selects_reasoning_and_speed_and_cancel_does_not_apply_speed() {
         effort: ReasoningEffort::Max,
         fast: true,
     })));
+}
+
+fn state_with_zen_catalog() -> AppState {
+    let mut state = AppState::new();
+    state.authenticated = true;
+    state.auth_provider = Some(LoginProvider::OpenCodeZen);
+    // The picker expands the group of the model in use (G234).
+    state.model = "muse-spark-1.3-contributor-free".into();
+    state.zen_models = vec![OpenCodeModelView {
+        id: "muse-spark-1.3-contributor-free".into(),
+        name: "Muse Spark 1.3 Free".into(),
+        context_window_tokens: 1_048_576,
+        max_output_tokens: 131_072,
+        reasoning_levels: vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+        ],
+        accepts_images: true,
+    }];
+    type_text(&mut state, "/model");
+    reduce(&mut state, Action::Key(press(KeyCode::Enter)));
+    assert!(state.model_overlay.is_some(), "picker opens");
+    state
+}
+
+/// Headers are rows, so tests position on a row by predicate instead of
+/// counting Downs.
+fn select_row(state: &mut AppState, predicate: impl Fn(&ModelRow) -> bool) {
+    let rows = state.model_overlay.clone().expect("picker").rows(
+        &state.open_code_models,
+        &state.cline_pass_models,
+        &state.command_code_models,
+        &state.zen_models,
+    );
+    let index = rows.iter().position(predicate).expect("row in the picker");
+    reduce(state, Action::Key(press(KeyCode::Home)));
+    for _ in 0..index {
+        reduce(state, Action::Key(press(KeyCode::Down)));
+    }
+    assert_eq!(
+        state.model_overlay.as_ref().expect("picker").selected,
+        index
+    );
+}
+
+/// A catalog model with declared levels opens the effort step; that step must
+/// not advertise the Codex Normal/Fast toggle and Esc returns to the picker.
+#[test]
+fn catalog_effort_step_hides_the_codex_speed_row() {
+    let mut state = state_with_zen_catalog();
+    select_row(&mut state, |row| matches!(row, ModelRow::Zen(0)));
+    reduce(&mut state, Action::Key(press(KeyCode::Enter)));
+
+    let frame = render_to_string(&state);
+    assert!(
+        frame.contains("Selecionar esforço"),
+        "effort step is rendered:\n{frame}"
+    );
+    assert!(
+        frame.contains("XHigh"),
+        "declared levels are listed:\n{frame}"
+    );
+    assert!(
+        !frame.contains("Velocidade"),
+        "catalog models have no service tier:\n{frame}"
+    );
+    assert!(
+        !frame.contains("Tab alternar"),
+        "no inert Tab hint:\n{frame}"
+    );
+
+    reduce(&mut state, Action::Key(press(KeyCode::Esc)));
+    assert!(state.effort_overlay.is_none());
+    assert!(
+        state.model_overlay.is_some(),
+        "Esc returns to the picker with the model still selected (G239)"
+    );
 }
 
 /// Space folds and unfolds the group under the cursor; a collapsed group

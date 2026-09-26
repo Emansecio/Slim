@@ -2,6 +2,17 @@ use crate::context::CompactionStatus;
 use crate::{CausalAnomalyKind, EventKind, ProviderPhase, RequestKind, SessionEvent};
 use serde::{Deserialize, Serialize};
 
+struct JevUsage<'a> {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    usage_unknown: bool,
+    failed: bool,
+    backend: Option<&'a str>,
+    requested_model: Option<&'a str>,
+    model: Option<&'a str>,
+    duration_ms: u64,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RequestUsage {
     pub request_kind: RequestKind,
@@ -356,16 +367,16 @@ impl UsageTotals {
                     model,
                     duration_ms,
                     ..
-                } => totals.record_jev_usage(
-                    *input_tokens,
-                    *output_tokens,
-                    *usage_unknown,
-                    matches!(&event.kind, EventKind::CompactionJevFallback { .. }),
-                    backend.as_deref(),
-                    requested_model.as_deref(),
-                    model.as_deref(),
-                    *duration_ms,
-                ),
+                } => totals.record_jev_usage(JevUsage {
+                    input_tokens: *input_tokens,
+                    output_tokens: *output_tokens,
+                    usage_unknown: *usage_unknown,
+                    failed: matches!(&event.kind, EventKind::CompactionJevFallback { .. }),
+                    backend: backend.as_deref(),
+                    requested_model: requested_model.as_deref(),
+                    model: model.as_deref(),
+                    duration_ms: *duration_ms,
+                }),
                 EventKind::CompactionAttemptStarted {
                     provider,
                     model,
@@ -682,17 +693,17 @@ impl UsageTotals {
         self.requests.push(request);
     }
 
-    fn record_jev_usage(
-        &mut self,
-        input_tokens: Option<u64>,
-        output_tokens: Option<u64>,
-        usage_unknown: bool,
-        failed: bool,
-        backend: Option<&str>,
-        requested_model: Option<&str>,
-        model: Option<&str>,
-        duration_ms: u64,
-    ) {
+    fn record_jev_usage(&mut self, usage: JevUsage<'_>) {
+        let JevUsage {
+            input_tokens,
+            output_tokens,
+            usage_unknown,
+            failed,
+            backend,
+            requested_model,
+            model,
+            duration_ms,
+        } = usage;
         match input_tokens {
             Some(tokens) => {
                 add(&mut self.jev_input_tokens, tokens, &mut self.overflowed);

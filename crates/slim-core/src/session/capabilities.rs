@@ -543,6 +543,8 @@ pub enum TaskMutation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<u64>,
         status: TaskTodoStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     PlanAddNode {
         node_id: String,
@@ -1457,7 +1459,7 @@ impl<R> CapabilityService<R> {
                 }
                 Ok(())
             }
-            TaskMutation::TodoSetStatus { id, status } => {
+            TaskMutation::TodoSetStatus { id, status, .. } => {
                 let target = projection.todo_index(*id).ok_or(
                     CapabilityLedgerError::InvalidTaskTransition("todo id not found"),
                 )?;
@@ -1580,7 +1582,7 @@ impl<R> CapabilityService<R> {
                         .todo_statuses
                         .push(status.clone().unwrap_or(TaskTodoStatus::Pending));
                 }
-                TaskMutation::TodoSetStatus { id, status } => {
+                TaskMutation::TodoSetStatus { id, status, .. } => {
                     if let Some(index) = projection.todo_index(*id) {
                         projection.todo_statuses[index] = status.clone();
                     }
@@ -1629,6 +1631,14 @@ fn validate_task_request(request: &TaskMutationRequest) -> Result<(), Capability
     }
     let valid_text = |text: &str| !text.is_empty() && text.len() <= MAX_TASK_TEXT_BYTES;
     match &request.mutation {
+        TaskMutation::TodoSetStatus {
+            reason: Some(reason),
+            ..
+        } if reason.trim().is_empty() || reason.len() > 1024 => {
+            return Err(CapabilityLedgerError::InvalidTaskTransition(
+                "invalid todo reason",
+            ));
+        }
         TaskMutation::TodoAdd { title, .. } if !valid_text(title) => {
             return Err(CapabilityLedgerError::InvalidIdentifier("task mutation"));
         }

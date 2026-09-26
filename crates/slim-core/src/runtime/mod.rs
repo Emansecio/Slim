@@ -1,14 +1,18 @@
 mod app_handle;
 mod capability_bridge;
+mod economy;
 mod governor;
 mod loop_guard;
+mod manual_retry;
 mod mode;
 #[cfg(test)]
 mod performance;
 mod queue;
+mod shell_jobs;
 mod usage;
 mod workspace;
 
+pub use economy::CompactionPricing;
 pub use usage::{RequestUsage, UsageTotals};
 
 pub use workspace::without_workspace_snapshot;
@@ -22,14 +26,13 @@ use crate::context::{
     CompactionHandle, CompactionPolicy, CompactionReason, CompactionSelection, ContextBudget,
     PreparedCompaction, COMPACTION_SYSTEM_PROMPT,
 };
-use crate::interaction::{
-    ask_question_definition, AskQuestion, InteractionRequestId, InteractionRoute,
-};
-use crate::mcp::{McpCatalog, McpManager};
+use crate::interaction::{ask_question_definition, AskQuestion, InteractionRequestId, InteractionRoute};
+use crate::mcp::{McpCancellation, McpCatalog, McpManager, McpRequestOutcome};
 use crate::model::AppHandle;
 use crate::provider::{
-    HttpProviderClient, PreparedProviderRequest, ProviderAdapter, ProviderError, ProviderEvent,
-    ProviderKind, ProviderMessage, ProviderPhase, ProviderRequestComponents, ProviderToolCall,
+    HttpProviderClient, PreparedProviderRequest, ProviderAdapter, ProviderCallTelemetry,
+    ProviderError, ProviderEvent, ProviderKind, ProviderMessage, ProviderPhase,
+    ProviderRequestComponents, ProviderToolCall,
 };
 use crate::session::{
     AuthorizationGrant, CapabilityCatalog, CapabilityLedgerError, DurableFact, DurableRecord,
@@ -62,6 +65,7 @@ pub use capability_bridge::{
     RuntimeCapabilityBridge, RuntimeCapabilityTarget,
 };
 pub use loop_guard::LoopGuard;
+pub use manual_retry::ManualRetryHandle;
 pub use mode::mode_name;
 pub use queue::PromptQueue;
 
@@ -71,16 +75,27 @@ pub struct CancellationToken(Arc<CancellationState>);
 struct CancellationState {
     cancelled: AtomicBool,
     notify: Notify,
+    mcp: McpCancellation,
     native_work: AtomicUsize,
+    background_work: AtomicUsize,
     native_idle: Notify,
 }
 
-struct NativeWorkGuard(CancellationToken);
+struct NativeWorkGuard {
+    token: CancellationToken,
+    background: bool,
+}
 
 impl Drop for NativeWorkGuard {
     fn drop(&mut self) {
-        if self.0 .0.native_work.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.0 .0.native_idle.notify_waiters();
+        let state = &self.token.0;
+        let count = if self.background {
+            &state.background_work
+        } else {
+            &state.native_work
+        };
+        if count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            state.native_idle.notify_waiters();
         }
     }
 }
@@ -90,7 +105,9 @@ impl CancellationToken {
         Self(Arc::new(CancellationState {
             cancelled: AtomicBool::new(false),
             notify: Notify::new(),
+            mcp: McpCancellation::new(),
             native_work: AtomicUsize::new(0),
+            background_work: AtomicUsize::new(0),
             native_idle: Notify::new(),
         }))
     }
@@ -98,11 +115,16 @@ impl CancellationToken {
     pub fn cancel(&self) {
         if !self.0.cancelled.swap(true, Ordering::AcqRel) {
             self.0.notify.notify_waiters();
+            self.0.mcp.cancel();
         }
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.0.cancelled.load(Ordering::Acquire)
+    }
+
+    fn mcp_cancellation(&self) -> McpCancellation {
+        self.0.mcp.clone()
     }
 
     pub async fn cancelled(&self) {
@@ -115,7 +137,28 @@ impl CancellationToken {
 
     fn track_native_work(&self) -> NativeWorkGuard {
         self.0.native_work.fetch_add(1, Ordering::AcqRel);
-        NativeWorkGuard(self.clone())
+        NativeWorkGuard {
+            token: self.clone(),
+            background: false,
+        }
+    }
+
+    fn track_background_work(&self) -> NativeWorkGuard {
+        self.0.background_work.fetch_add(1, Ordering::AcqRel);
+        NativeWorkGuard {
+            token: self.clone(),
+            background: true,
+        }
+    }
+
+    async fn wait_for_foreground_work(&self) {
+        loop {
+            let notified = self.0.native_idle.notified();
+            if self.0.native_work.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Aborting an async task does not stop its blocking native worker.
@@ -123,7 +166,9 @@ impl CancellationToken {
     pub async fn wait_for_native_work(&self) {
         loop {
             let notified = self.0.native_idle.notified();
-            if self.0.native_work.load(Ordering::Acquire) == 0 {
+            if self.0.native_work.load(Ordering::Acquire) == 0
+                && self.0.background_work.load(Ordering::Acquire) == 0
+            {
                 return;
             }
             notified.await;
@@ -158,11 +203,11 @@ impl Eq for CancellationToken {}
 pub struct AgentLoopConfig {
     /// Run ceiling. Sequential 1-tool/turn work stops here, not on tool caps.
     pub max_turns: usize,
-    /// Per-turn mutating batch cap (write/patch/shell/todo/skill/…). Not a run total.
+    /// Per-turn mutating native action slots; then_run reserves a second slot.
     pub max_mutating_tool_calls: usize,
     /// Per-turn read batch cap (read/list/search). Not a run total.
     pub max_read_tool_calls: usize,
-    /// Cumulative tool calls cap across the entire run. Stops with ToolLimit when reached.
+    /// Cumulative native action slots reserved across the run; then_run reserves a second slot.
     pub max_total_tool_calls: usize,
     pub max_result_bytes: usize,
     pub context_window_tokens: u64,
@@ -205,6 +250,25 @@ fn tool_call_bucket(name: &str) -> ToolCallBucket {
     }
 }
 
+fn tool_call_slots(call: &ProviderToolCall) -> usize {
+    if matches!(call.name.as_str(), "write" | "patch")
+        && serde_json::from_str::<Value>(&call.arguments)
+            .ok()
+            .is_some_and(|arguments| arguments.get("then_run").is_some_and(Value::is_object))
+    {
+        2
+    } else {
+        1
+    }
+}
+
+fn mark_cancelled_tool_outcome(outcome: &mut ToolExecutionOutcome) {
+    outcome.result.success = false;
+    if let Some(fused_shell) = outcome.receipt.fused_shell.as_mut() {
+        fused_shell.1.success = false;
+    }
+}
+
 pub fn tool_call_is_read_only(name: &str) -> bool {
     matches!(tool_call_bucket(name), ToolCallBucket::Read)
 }
@@ -218,6 +282,16 @@ fn tool_call_is_parallel_snapshot_read(tools: &ToolRegistry, name: &str) -> bool
 
 fn is_serial_barrier(prepared: &PreparedToolInvocation) -> bool {
     matches!(prepared.name.as_str(), "shell" | "skill" | "mcp")
+        || matches!(
+            &prepared.arguments,
+            PreparedToolArguments::Write {
+                then_run: Some(_),
+                ..
+            } | PreparedToolArguments::Patch {
+                then_run: Some(_),
+                ..
+            }
+        )
 }
 
 fn is_file_mutation(prepared: &PreparedToolInvocation) -> bool {
@@ -339,18 +413,19 @@ struct ToolBudgetCut {
 fn truncate_calls_for_budget(
     calls: &mut Vec<ProviderToolCall>,
     config: AgentLoopConfig,
-    already_executed: usize,
+    already_reserved: usize,
 ) -> ToolBudgetCut {
     let original_len = calls.len();
     let mut read_used = 0usize;
     let mut mutating_used = 0usize;
     let mut total_used = 0usize;
     let mut hit_run_total = false;
-    let remaining_total = config.max_total_tool_calls.saturating_sub(already_executed);
+    let remaining_total = config.max_total_tool_calls.saturating_sub(already_reserved);
     let accepted = calls
         .iter()
         .take_while(|call| {
-            if total_used >= remaining_total {
+            let slots = tool_call_slots(call);
+            if total_used.saturating_add(slots) > remaining_total {
                 hit_run_total = true;
                 return false;
             }
@@ -358,11 +433,11 @@ fn truncate_calls_for_budget(
                 ToolCallBucket::Read => (&mut read_used, config.max_read_tool_calls),
                 ToolCallBucket::Mutating => (&mut mutating_used, config.max_mutating_tool_calls),
             };
-            if *used >= limit {
+            if used.saturating_add(slots) > limit {
                 return false;
             }
-            *used += 1;
-            total_used += 1;
+            *used = used.saturating_add(slots);
+            total_used = total_used.saturating_add(slots);
             true
         })
         .count();
@@ -430,6 +505,7 @@ struct BackgroundCompactionPlan {
     model: String,
     provider_identity: String,
     strategy: crate::context::CompactionStrategy,
+    jev_plan: Option<crate::context::jev_prune::PreparedPrune>,
     previous_checkpoint: Option<String>,
     context_window_tokens: u64,
     reserve_tokens: u64,
@@ -481,6 +557,12 @@ struct PendingBackgroundCompaction {
     estimated_input_tokens: u64,
     tokens_before: u64,
     started: Instant,
+}
+
+struct BackgroundCompactionObservers {
+    progress: Arc<Mutex<CompactionAttemptProgress>>,
+    jev_outcome: Arc<Mutex<Option<JevAttemptOutcome>>>,
+    provider_call_journal: Option<Arc<Mutex<crate::session::ManualRunJournal>>>,
 }
 
 struct JevAttemptOutcome {
@@ -705,7 +787,9 @@ fn cancelled_agent_loop_result(
 pub struct Runtime {
     pub app: AppHandle,
     tools: ToolRegistry,
+    shell_jobs: shell_jobs::ShellJobs,
     artifact_store: Option<ArtifactStore>,
+    restored_artifact_ids: std::collections::HashSet<String>,
     conversation: Vec<ProviderMessage>,
     turn_transcript: Option<Vec<ProviderMessage>>,
     uncommitted_event_start: Option<usize>,
@@ -716,7 +800,13 @@ pub struct Runtime {
     interaction_route: Option<InteractionRoute>,
     capability_bridge: Option<RuntimeCapabilityBridge<MemoryRepo>>,
     compaction_handle: Option<CompactionHandle>,
+    manual_retry: Option<ManualRetryHandle>,
     jev_judge: Option<std::sync::Arc<dyn crate::context::JevJudge>>,
+    jev_economy: economy::JevEconomy,
+    compaction_input_cost_micros_per_million: Option<u64>,
+    compaction_pricing: Option<CompactionPricing>,
+    read_presentation_bytes: usize,
+    write_projection_cache: Mutex<mode::WriteProjectionCache>,
     background_compaction_enabled: bool,
     code_intel: Option<Arc<dyn CodeIntelligence>>,
     mcp: Option<Arc<McpManager>>,
@@ -769,8 +859,10 @@ impl<'a> ToolInvocation<'a> {
 struct ToolDefinitionSetKey {
     mode: crate::OperatingMode,
     code_intel_enabled: bool,
+    artifact_enabled: bool,
     interaction_enabled: bool,
     mcp_enabled: bool,
+    skills_enabled: bool,
 }
 
 static TOOL_DEFINITION_SETS: LazyLock<
@@ -793,7 +885,9 @@ impl Runtime {
         Self {
             app: AppHandle::fake(),
             tools: ToolRegistry::default(),
+            shell_jobs: shell_jobs::ShellJobs::default(),
             artifact_store: None,
+            restored_artifact_ids: std::collections::HashSet::new(),
             conversation: Vec::new(),
             turn_transcript: None,
             uncommitted_event_start: None,
@@ -804,7 +898,13 @@ impl Runtime {
             interaction_route: None,
             capability_bridge: None,
             compaction_handle: None,
+            manual_retry: None,
             jev_judge: None,
+            jev_economy: economy::JevEconomy::default(),
+            compaction_input_cost_micros_per_million: None,
+            compaction_pricing: None,
+            read_presentation_bytes: 64 * 1024,
+            write_projection_cache: Mutex::new(mode::WriteProjectionCache::default()),
             background_compaction_enabled: false,
             code_intel: None,
             mcp: None,
@@ -818,6 +918,11 @@ impl Runtime {
         let mut runtime = Self::new();
         runtime.artifact_store = Some(ArtifactStore::new(root)?);
         Ok(runtime)
+    }
+
+    /// IDs come from artifact.v1 facts in the resumed durable session.
+    pub fn restore_artifact_ids(&mut self, ids: &[String]) {
+        self.restored_artifact_ids = ids.iter().cloned().collect();
     }
 
     pub fn set_tool_registry(&mut self, tools: ToolRegistry) {
@@ -840,7 +945,25 @@ impl Runtime {
     /// Jev pruning strategy. `None` leaves every run on the LLM summary path
     /// without any TypeSafe call.
     pub fn set_jev_judge(&mut self, judge: Option<std::sync::Arc<dyn crate::context::JevJudge>>) {
+        self.jev_economy = economy::JevEconomy::default();
         self.jev_judge = judge;
+    }
+
+    pub fn set_compaction_input_cost_micros_per_million(&mut self, price: Option<u64>) {
+        self.compaction_input_cost_micros_per_million = price;
+    }
+
+    pub fn set_compaction_pricing(&mut self, pricing: Option<CompactionPricing>) {
+        self.compaction_pricing = pricing;
+    }
+
+    /// Presentation only: internal read, digest and write preconditions are unchanged.
+    pub fn set_read_presentation_bytes(&mut self, bytes: usize) -> Result<(), String> {
+        if !(1024..=64 * 1024).contains(&bytes) {
+            return Err("read presentation bytes must be between 1024 and 65536".into());
+        }
+        self.read_presentation_bytes = bytes;
+        Ok(())
     }
 
     fn retain_interrupted_turn(
@@ -993,6 +1116,14 @@ impl Runtime {
     ) -> Arc<[Value]> {
         let key = ToolDefinitionSetKey {
             mode,
+            artifact_enabled: self.artifact_store.is_some(),
+            skills_enabled: self
+                .skill_discovery_cache
+                .as_ref()
+                .and_then(|(_, discovery)| discovery.as_ref())
+                .is_none_or(|discovery| {
+                    !discovery.active_entries().is_empty() || !discovery.warnings.is_empty()
+                }),
             code_intel_enabled,
             interaction_enabled: self.interaction_route.is_some()
                 && mode != crate::OperatingMode::Plan,
@@ -1012,6 +1143,7 @@ impl Runtime {
             .definitions_for_mode_shared(mode)
             .as_ref()
             .to_vec();
+        crate::tools::compact_provider_definitions(&mut tools);
         if !code_intel_enabled {
             tools.retain(|definition| {
                 definition
@@ -1020,12 +1152,18 @@ impl Runtime {
                     .is_none_or(|name| name != "code_intel")
             });
         }
+        if key.artifact_enabled {
+            tools.push(artifact_read_definition());
+        }
         if key.interaction_enabled {
             tools.push(ask_question_definition());
         }
         if mode.allows_mutation() {
+            tools.push(shell_jobs::definition());
             tools.push(todo_tool_definition());
-            tools.push(skill_tool_definition());
+            if key.skills_enabled {
+                tools.push(skill_tool_definition());
+            }
             if key.mcp_enabled {
                 tools.push(mcp_tool_definition());
             }
@@ -1283,10 +1421,16 @@ impl Runtime {
                 None => std::future::pending::<()>().await,
             }
         };
+        let provider_call_journal = self.app.run_journal.clone();
         let stream_result = client
-            .stream_prepared_cancellable(request, cancellation, |event| {
-                normalizer.push(&mut self.app, event);
-            })
+            .stream_prepared_cancellable_observed(
+                request,
+                cancellation,
+                |event| {
+                    normalizer.push(&mut self.app, event);
+                },
+                |telemetry| persist_provider_call(&provider_call_journal, telemetry),
+            )
             .await;
         let cancelled = matches!(&stream_result, Err(ProviderError::Cancelled));
         if stream_result.is_err() {
@@ -1416,7 +1560,12 @@ impl Runtime {
         // Bound skill-discovery memoization to one entry-point call, mirroring
         // the reset in `prepare_loop_capabilities` for the agent loop.
         self.skill_discovery_cache = None;
+        self.write_projection_cache
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         let event_start = self.app.events().len();
+        self.cached_skill_discovery(cwd.as_ref());
         let tools = self.workspace_tool_definitions(mode, cwd.as_ref());
         let provider_result = self
             .run_provider_messages_with_tools(client, messages, tools.as_ref(), next_seq, false)
@@ -1483,6 +1632,9 @@ impl Runtime {
         next_seq: u64,
         config: AgentLoopConfig,
     ) -> Result<AgentLoopResult, ProviderError> {
+        self.tools
+            .configure_artifacts(self.artifact_store.clone(), &self.sensitive_values.0);
+        self.shell_jobs = shell_jobs::ShellJobs::default();
         self.uncommitted_event_start = None;
         self.finalization_error = None;
         if let Some(handle) = &self.compaction_handle {
@@ -1495,11 +1647,24 @@ impl Runtime {
                 .map_err(|_| journal_error("durable run lock poisoned"))?
                 .configure_output(self.artifact_store.clone(), config.max_result_bytes);
         }
-        let result = self
+        let _job_scope = self.shell_jobs.scope();
+        let mut result = self
             .run_agent_loop_inner(client, initial_messages, mode, cwd, next_seq, config)
             .await;
+        self.shell_jobs.shutdown().await;
         if let Some(start) = self.uncommitted_event_start.take() {
             self.retain_interrupted_turn(start, config.max_result_bytes)?;
+        }
+        let mut completion_seq =
+            self.observed_next_seq(result.as_ref().map_or(next_seq, |r| r.next_seq));
+        let mut messages = self.conversation.clone();
+        self.deliver_shell_completions(
+            &mut messages,
+            config.max_result_bytes,
+            &mut completion_seq,
+        )?;
+        if let Ok(result) = &mut result {
+            result.next_seq = completion_seq;
         }
         result
     }
@@ -1564,11 +1729,13 @@ impl Runtime {
             )?;
         }
         let mut all_results = Vec::new();
+        let mut reserved_tool_slots = 0usize;
         let mut guard = LoopGuard::default();
         let mut governor = CausalGovernor::default();
         let mut turns = 0;
         let mut stop = AgentLoopStop::TurnLimit;
         let mut budget_steers_used = 0usize;
+        let mut todo_cadence = TodoCadence::default();
         let mut compaction_applied = false;
         let mut overflow_retry_used = false;
         let mut provider_recoveries = 0_u32;
@@ -1578,6 +1745,9 @@ impl Runtime {
         let mut compaction_recoveries = 0_u32;
         let mut argument_repairs = 0_u32;
         let mut provider_recovery_wait = std::time::Duration::ZERO;
+        let mut automatic_recoveries = 0_u32;
+        let mut provider_attempts = 0_u32;
+        let mut empty_recovery_used = false;
         let mut pending_background = None;
         let provider = crate::provider::provider_kind_name(client.adapter().kind());
         let model = client.adapter().model();
@@ -1601,13 +1771,15 @@ impl Runtime {
                     usage: usage_since(&self.app, loop_event_start),
                 });
             }
+            self.deliver_shell_completions(&mut messages, config.max_result_bytes, &mut next_seq)?;
             turns = turn + 1;
             if turn > 0 {
                 if let Some(handle) = &self.compaction_handle {
                     handle.completed_turn();
                 }
             }
-            // A tool batch may create/remove a project marker or install a backend.
+            // Skills stay fixed for the run. A newly available code backend
+            // still needs to be advertised after a project marker is created.
             let tools = self.workspace_tool_definitions(mode, cwd);
             let (preflight_chars, preflight_tokens, mut serialized_request) = {
                 let overlay = self.overlay_channel(&mut messages, mode);
@@ -1796,7 +1968,9 @@ impl Runtime {
                             detail: None,
                         },
                     )?;
+                    let mut compaction_attempts = 0_u32;
                     let compact_result = loop {
+                        compaction_attempts += 1;
                         let result = self
                             .compact_before_send(
                                 client,
@@ -1820,6 +1994,7 @@ impl Runtime {
                         match result {
                             Err(error)
                                 if compaction_recoveries < MAX_PROVIDER_RECOVERIES
+                                    && automatic_recoveries < MAX_AUTOMATIC_RECOVERIES
                                     && recoverable_provider_error(&error)
                                     && !self.is_cancelled() =>
                             {
@@ -1830,9 +2005,19 @@ impl Runtime {
                                     provider_recovery_wait,
                                 ) {
                                     Ok(delay) => delay,
-                                    Err(blocked) => break Err(blocked),
+                                    Err(blocked) => {
+                                        break Err(annotate_provider_recovery_error(
+                                            blocked,
+                                            "compaction",
+                                            compaction_attempts,
+                                            automatic_recoveries,
+                                            compaction_recoveries,
+                                            "retry wait budget exhausted",
+                                        ))
+                                    }
                                 };
                                 compaction_recoveries += 1;
+                                automatic_recoveries += 1;
                                 provider_recovery_wait += delay;
                                 let reason = self.redact_sensitive(&provider_retry_reason(&error));
                                 push_runtime_event(&mut self.app, &mut next_seq, crate::EventKind::ProviderPhase {
@@ -1864,6 +2049,20 @@ impl Runtime {
                                     break Err(ProviderError::Cancelled);
                                 }
                             }
+                            Err(error) if recoverable_provider_error(&error) => {
+                                break Err(annotate_provider_recovery_error(
+                                    error,
+                                    "compaction",
+                                    compaction_attempts,
+                                    automatic_recoveries,
+                                    compaction_recoveries,
+                                    if automatic_recoveries >= MAX_AUTOMATIC_RECOVERIES {
+                                        "global automatic recovery limit reached"
+                                    } else {
+                                        "consecutive compaction recovery limit reached"
+                                    },
+                                ));
+                            }
                             result => break result,
                         }
                     };
@@ -1890,6 +2089,7 @@ impl Runtime {
                     drop(summary_usage);
                     next_seq = following_seq;
                     compaction_applied = true;
+                    compaction_recoveries = 0;
                     governor.forget_compacted_evidence();
                     guard = LoopGuard::default();
                 } else if over_hard {
@@ -2097,6 +2297,7 @@ impl Runtime {
                     true,
                 )
                 .await;
+            provider_attempts = provider_attempts.saturating_add(1);
             next_seq = provider_result
                 .as_ref()
                 .map_or_else(|_| self.observed_next_seq(next_seq), |turn| turn.next_seq);
@@ -2126,7 +2327,56 @@ impl Runtime {
                 });
             }
             let provider_turn = match provider_result {
-                Ok(turn) => turn,
+                Ok(turn) => {
+                    provider_recoveries = 0;
+                    empty_recovery_used = false;
+                    turn
+                }
+                Err(error)
+                    if is_empty_provider_response(&error)
+                        && !empty_recovery_used
+                        && provider_recoveries < MAX_PROVIDER_RECOVERIES
+                        && automatic_recoveries < MAX_AUTOMATIC_RECOVERIES
+                        && turn + 1 < config.max_turns
+                        && !request_emitted_tools(&self.app, event_start) =>
+                {
+                    empty_recovery_used = true;
+                    automatic_recoveries += 1;
+                    provider_recoveries += 1;
+                    let reason = self.redact_sensitive(&provider_retry_reason(&error));
+                    self.append_conversation_message(&mut messages, ProviderMessage::user(
+                        "The provider returned an empty response. Produce an effective answer or make the needed tool call; do not return an empty response.",
+                    ))?;
+                    self.uncommitted_event_start = None;
+                    push_runtime_event(
+                        &mut self.app,
+                        &mut next_seq,
+                        crate::EventKind::ThinkingEnded,
+                    )?;
+                    push_runtime_event(
+                        &mut self.app,
+                        &mut next_seq,
+                        crate::EventKind::ProviderPhase {
+                            phase: ProviderPhase::Connecting,
+                            elapsed_ms: 0,
+                            detail: Some(format!(
+                                "Recovering empty provider response ({automatic_recoveries}/{MAX_AUTOMATIC_RECOVERIES})"
+                            )),
+                        },
+                    )?;
+                    push_runtime_event(
+                        &mut self.app,
+                        &mut next_seq,
+                        crate::EventKind::RetryScheduled {
+                            attempt: automatic_recoveries,
+                            limit: MAX_AUTOMATIC_RECOVERIES,
+                            wait_ms: 0,
+                            reason: Some(reason),
+                        },
+                    )?;
+                    turn += 1;
+                    continue;
+                }
                 Err(error)
                     if recovery_output_limit.is_some()
                         && truncation_recoveries < 2
@@ -2230,6 +2480,7 @@ impl Runtime {
                 }
                 Err(error)
                     if provider_recoveries < MAX_PROVIDER_RECOVERIES
+                        && automatic_recoveries < MAX_AUTOMATIC_RECOVERIES
                         && turn + 1 < config.max_turns
                         && recoverable_provider_error(&error)
                         && !request_emitted_tools(&self.app, event_start) =>
@@ -2249,11 +2500,26 @@ impl Runtime {
                                 )
                                 .await?,
                             );
-                            return Err(blocked);
+                            if self
+                                .wait_for_manual_retry(&error, event_start, &mut next_seq)
+                                .await?
+                            {
+                                turn += 1;
+                                continue;
+                            }
+                            return Err(annotate_provider_recovery_error(
+                                blocked,
+                                "provider",
+                                provider_attempts,
+                                automatic_recoveries,
+                                provider_recoveries,
+                                "retry wait budget exhausted",
+                            ));
                         }
                     };
                     provider_recovery_wait += delay;
                     provider_recoveries += 1;
+                    automatic_recoveries += 1;
                     let reason = self.redact_sensitive(&provider_retry_reason(&error));
                     let partial = self.app.events()[event_start..]
                         .iter()
@@ -2331,7 +2597,43 @@ impl Runtime {
                         )
                         .await?,
                     );
-                    return Err(error);
+                    let recovery_reason =
+                        if is_empty_provider_response(&error) && empty_recovery_used {
+                            "repeated empty provider response"
+                        } else if request_emitted_tools(&self.app, event_start) {
+                            "tool effects were emitted; request was not replayed"
+                        } else if automatic_recoveries >= MAX_AUTOMATIC_RECOVERIES {
+                            "global automatic recovery limit reached"
+                        } else if provider_recoveries >= MAX_PROVIDER_RECOVERIES {
+                            "consecutive provider recovery limit reached"
+                        } else if turn + 1 >= config.max_turns {
+                            "configured turn limit reached"
+                        } else {
+                            "automatic recovery stopped"
+                        };
+                    if turn + 1 < config.max_turns
+                        && self
+                            .wait_for_manual_retry(&error, event_start, &mut next_seq)
+                            .await?
+                    {
+                        turn += 1;
+                        continue;
+                    }
+                    return Err(
+                        if recoverable_provider_error(&error) || is_empty_provider_response(&error)
+                        {
+                            annotate_provider_recovery_error(
+                                error,
+                                "provider",
+                                provider_attempts,
+                                automatic_recoveries,
+                                provider_recoveries,
+                                recovery_reason,
+                            )
+                        } else {
+                            error
+                        },
+                    );
                 }
             };
             let blocks_tools = provider_turn.blocks_tools;
@@ -2356,6 +2658,54 @@ impl Runtime {
                 assistant.chat_reasoning = provider_turn.chat_reasoning;
                 self.append_conversation_message(&mut messages, assistant)?;
                 self.uncommitted_event_start = None;
+                // An idle agent waits on local job events, not more model calls.
+                // Completed output resumes the loop as an explicit harness message.
+                if provider_turn.stop == ProviderTurnStop::Normal && self.shell_jobs.running() {
+                    push_runtime_event(
+                        &mut self.app,
+                        &mut next_seq,
+                        crate::EventKind::ProviderPhase {
+                            phase: ProviderPhase::PreparingTool,
+                            elapsed_ms: 0,
+                            detail: Some("Aguardando jobs de shell; conclusão automática".into()),
+                        },
+                    )?;
+                    while self.shell_jobs.running() && !self.is_cancelled() {
+                        let detail = self.redact_sensitive(&self.shell_jobs.progress_summary());
+                        push_runtime_transient_event(
+                            &mut self.app,
+                            &mut next_seq,
+                            crate::EventKind::ProviderPhase {
+                                phase: ProviderPhase::PreparingTool,
+                                elapsed_ms: 0,
+                                detail: Some(detail),
+                            },
+                        )?;
+                        self.shell_jobs.wait().await;
+                        if self.deliver_shell_completions(
+                            &mut messages,
+                            config.max_result_bytes,
+                            &mut next_seq,
+                        )? {
+                            break;
+                        }
+                    }
+                    self.deliver_shell_completions(
+                        &mut messages,
+                        config.max_result_bytes,
+                        &mut next_seq,
+                    )?;
+                    turn += 1;
+                    continue;
+                }
+                if self.deliver_shell_completions(
+                    &mut messages,
+                    config.max_result_bytes,
+                    &mut next_seq,
+                )? {
+                    turn += 1;
+                    continue;
+                }
                 // Truncated tools are never executed. Preserve the partial answer
                 // and completed tool results, then ask for a small next step.
                 // Count these requests against the normal turn limit as well.
@@ -2389,6 +2739,18 @@ impl Runtime {
                     turn += 1;
                     continue;
                 }
+                if provider_turn.stop == ProviderTurnStop::Normal
+                    && mode == crate::OperatingMode::Auto
+                    && turn + 1 < config.max_turns
+                    && todo_cadence.before_final(&self.todo_items())
+                {
+                    self.append_conversation_message(
+                        &mut messages,
+                        ProviderMessage::user(TODO_FINAL_REVIEW),
+                    )?;
+                    turn += 1;
+                    continue;
+                }
                 stop = match provider_turn.stop {
                     ProviderTurnStop::Normal => AgentLoopStop::ProviderCompleted,
                     ProviderTurnStop::Truncated => AgentLoopStop::ProviderTruncated,
@@ -2397,7 +2759,11 @@ impl Runtime {
                 break;
             }
 
-            let budget_cut = truncate_calls_for_budget(&mut calls, config, all_results.len());
+            let budget_cut = truncate_calls_for_budget(&mut calls, config, reserved_tool_slots);
+            // Reserve both native actions before executing a fused call. A failed
+            // edit still consumes its reserved shell slot for this run.
+            reserved_tool_slots = reserved_tool_slots
+                .saturating_add(calls.iter().map(tool_call_slots).sum::<usize>());
             let suppressed_calls = budget_cut.suppressed;
             if suppressed_calls > 0 {
                 push_runtime_event(
@@ -2459,6 +2825,7 @@ impl Runtime {
                     let token_estimator = self.token_estimator.clone();
                     let jev_outcome = Arc::new(Mutex::new(None));
                     let task_outcome = Arc::clone(&jev_outcome);
+                    let provider_call_journal = self.app.run_journal.clone();
                     let task = tokio::spawn(async move {
                         run_background_compaction(
                             background_client,
@@ -2466,8 +2833,11 @@ impl Runtime {
                             jev_judge,
                             token_estimator,
                             Some(task_cancellation),
-                            task_progress,
-                            task_outcome,
+                            BackgroundCompactionObservers {
+                                progress: task_progress,
+                                jev_outcome: task_outcome,
+                                provider_call_journal,
+                            },
                         )
                         .await
                     });
@@ -2598,6 +2968,7 @@ impl Runtime {
                 &messages,
                 tools.as_ref(),
                 mode,
+                cwd,
                 &batch_id,
                 &calls,
                 &results,
@@ -2636,6 +3007,7 @@ impl Runtime {
                     &messages,
                     tools.as_ref(),
                     mode,
+                    cwd,
                     &batch_id,
                     &calls,
                     &results,
@@ -2647,6 +3019,12 @@ impl Runtime {
             for ((call, result), presentation) in
                 calls.iter().zip(results.iter()).zip(presentations.iter())
             {
+                let mutation_changed = matches!(call.name.as_str(), "write" | "patch")
+                    && self.app.events()[event_start..].iter().any(|event| {
+                        matches!(&event.kind, crate::EventKind::CausalProgressObserved {
+                            call_id, kind: crate::CausalProgressKind::WorkspaceChanged, ..
+                        } if call_id.as_ref() == call.id)
+                    });
                 let full_output = presentation.text.clone();
                 let tool_name = self.redact_sensitive(&call.name);
                 let duplicate_pointer = format!(
@@ -2663,7 +3041,7 @@ impl Runtime {
                 } else {
                     full_output.len() as u64
                 };
-                if result.success {
+                if result.success || mutation_changed {
                     guard.record_success(&call.name);
                     mutation_succeeded |= matches!(call.name.as_str(), "write" | "patch");
                     if matches!(
@@ -2730,13 +3108,13 @@ impl Runtime {
                 let volatile_boundary = self.app.events()[event_start..].iter().any(|event| {
                     matches!(&event.kind, crate::EventKind::CausalBoundaryObserved {
                         call_id, kind: crate::CausalBoundaryKind::PotentiallyVolatile, ..
-                    } if call_id.as_ref() == call.id)
+                    } if call_id.as_ref() == call.id || call_id.as_ref() == format!("{}:then_run", call.id))
                 });
                 let repeated_failure = if volatile_boundary {
                     guard = LoopGuard::default();
                     repeated_failure_in_batch = false;
                     false
-                } else if result.success {
+                } else if result.success || mutation_changed {
                     false
                 } else {
                     // Reuse the governor's prepared identity and dependency state.
@@ -2787,6 +3165,15 @@ impl Runtime {
                 }
             }
             self.uncommitted_event_start = None;
+            if mode == crate::OperatingMode::Auto
+                && turn + 1 < config.max_turns
+                && todo_cadence.after_batch(&self.todo_items())
+            {
+                self.append_conversation_message(
+                    &mut messages,
+                    ProviderMessage::user(TODO_PROGRESS_REVIEW),
+                )?;
+            }
             all_results.extend(results);
             if suppressed_calls > 0 {
                 if should_stop_after_tool_budget_cut(budget_cut, turn, config.max_turns) {
@@ -2865,6 +3252,10 @@ impl Runtime {
             )
             .await?,
         );
+
+        // A terminal budget/filter/stop must not leave hidden native work alive.
+        self.shell_jobs.shutdown().await;
+        self.deliver_shell_completions(&mut messages, config.max_result_bytes, &mut next_seq)?;
 
         if matches!(
             stop,
@@ -3155,6 +3546,7 @@ impl Runtime {
         let Some(outcome) = outcome else {
             return Ok(());
         };
+        self.jev_economy.observe(&outcome.stats);
         if let Some(detail) = outcome.error {
             let detail = self.redact_sensitive(&detail);
             push_runtime_event(
@@ -3306,6 +3698,27 @@ impl Runtime {
         )
     }
 
+    fn jev_plan_can_pay(
+        &self,
+        plan: &crate::context::jev_prune::PreparedPrune,
+        summary_tokens: u64,
+    ) -> bool {
+        let crate::context::JevInputEstimate::Eligible(input) = plan.input else {
+            return false;
+        };
+        let Some(judge) = &self.jev_judge else {
+            return false;
+        };
+        let savings = self
+            .jev_economy
+            .expected_savings(input, plan.max_saved_tokens.min(summary_tokens));
+        let price = self
+            .compaction_pricing
+            .map(|p| p.cache_read.min(p.input))
+            .or(self.compaction_input_cost_micros_per_million);
+        jev_prepass_can_pay(input, savings, price, &judge.metadata()) != Some(false)
+    }
+
     async fn build_background_compaction_plan<A: ProviderAdapter>(
         &self,
         client: &HttpProviderClient<A>,
@@ -3365,33 +3778,57 @@ impl Runtime {
             .saturating_add(projected_retained_tokens)
             .saturating_add(COMPACTION_MAX_OUTPUT_TOKENS);
         let tokens_before = budget.used_tokens;
-        let future_turns = u8::try_from(remaining_model_turns.min(2)).unwrap_or(2);
+        let items = self.todo_items();
+        let completed = items
+            .iter()
+            .filter(|item| item.status == "completed")
+            .count();
+        let open = items
+            .iter()
+            .filter(|item| matches!(item.status.as_str(), "pending" | "in_progress"))
+            .count();
+        let observed_turns = usage_since(&self.app, 0)
+            .requests
+            .iter()
+            .filter(|request| {
+                request.request_kind == crate::RequestKind::ProviderTurn
+                    && !request.failed
+                    && !request.cancelled
+            })
+            .count();
+        let future_turns =
+            economy::future_turns(remaining_model_turns, observed_turns, completed, open);
         let projected_savings_tokens = tokens_before
             .saturating_sub(projected_tokens_after)
             .saturating_mul(u64::from(future_turns));
-        // Decide whether the summary itself is worthwhile using only tokens
-        // from the summary model. Jev is a separate model with separate
-        // pricing, so adding its token estimate here would pretend unlike
-        // tokens were a financial total. Ineligibility changes only the
-        // optional pre-pass; it must never block a valid summary compaction.
-        let strategy = if policy.strategy == crate::context::CompactionStrategy::Jev {
-            match crate::context::estimate_prune_input_tokens(&selection, None, &summarized) {
-                crate::context::JevInputEstimate::Eligible(_) => {
-                    crate::context::CompactionStrategy::Jev
-                }
-                crate::context::JevInputEstimate::NoCandidates
-                | crate::context::JevInputEstimate::TooManyCandidates { .. } => {
-                    crate::context::CompactionStrategy::Summary
-                }
-            }
+        // The optional Jev pre-pass has a separate price comparison.
+        let jev_plan = (policy.strategy == crate::context::CompactionStrategy::Jev
+            && self.jev_judge.is_some())
+        .then(|| crate::context::jev_prune::PreparedPrune::new(&selection, None, &summarized))
+        .filter(|plan| self.jev_plan_can_pay(plan, preflight_input_tokens));
+        let strategy = if jev_plan.is_some() {
+            crate::context::CompactionStrategy::Jev
         } else {
             crate::context::CompactionStrategy::Summary
         };
         let estimated_cost_tokens =
             preflight_input_tokens.saturating_add(COMPACTION_MAX_OUTPUT_TOKENS);
         let safety_margin_tokens = estimated_cost_tokens.div_ceil(4);
-        let profitable =
-            projected_savings_tokens > estimated_cost_tokens.saturating_add(safety_margin_tokens);
+        let profitable = self.compaction_pricing.map_or_else(
+            || {
+                projected_savings_tokens
+                    > estimated_cost_tokens.saturating_add(safety_margin_tokens)
+            },
+            |pricing| {
+                pricing.can_pay(
+                    tokens_before,
+                    projected_tokens_after,
+                    preflight_input_tokens,
+                    COMPACTION_MAX_OUTPUT_TOKENS,
+                    future_turns,
+                )
+            },
+        );
         if !profitable {
             return Some(BackgroundCompactionPlan {
                 selection,
@@ -3404,6 +3841,7 @@ impl Runtime {
                     client.adapter().model()
                 ),
                 strategy,
+                jev_plan,
                 previous_checkpoint: previous_summary,
                 context_window_tokens: budget.window_tokens,
                 reserve_tokens: budget.reserve_tokens,
@@ -3450,6 +3888,7 @@ impl Runtime {
                 client.adapter().model()
             ),
             strategy,
+            jev_plan,
             previous_checkpoint: previous_summary,
             context_window_tokens: budget.window_tokens,
             reserve_tokens: budget.reserve_tokens,
@@ -3506,7 +3945,16 @@ impl Runtime {
                 })?;
         Ok(remap
             .into_iter()
-            .map(|index| prepared[index].clone())
+            .map(|index| {
+                let mut prepared = prepared[index].clone();
+                if self.shell_jobs.running() || calls.iter().any(|call| call.name == "shell") {
+                    if let Some(spec) = prepared.spec.as_mut() {
+                        spec.cacheability = crate::tools::ToolCacheability::None;
+                        spec.replay_policy = crate::tools::ToolReplayPolicy::Never;
+                    }
+                }
+                prepared
+            })
             .collect())
     }
 
@@ -3567,6 +4015,12 @@ impl Runtime {
             messages,
             mode,
             self.interaction_route.is_some() && mode != crate::OperatingMode::Plan,
+            Some(
+                &mut self
+                    .write_projection_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            ),
         )
     }
 
@@ -3625,10 +4079,13 @@ impl Runtime {
         let result = self
             .execute_provider_tool_batch_inner(mode, cwd, batch_id, calls, next_seq, governor)
             .await;
-        if result.is_err() {
+        if result.is_err() || cancellation.is_cancelled() {
             cancellation.cancel();
+            cancellation.wait_for_native_work().await;
+        } else {
+            // Managed jobs outlive a batch, but remain owned by the run.
+            cancellation.wait_for_foreground_work().await;
         }
-        cancellation.wait_for_native_work().await;
         self.cancellation = previous;
         result
     }
@@ -3691,7 +4148,7 @@ impl Runtime {
                 index += 1;
                 continue;
             }
-            if is_file_mutation(&prepared_all[index]) {
+            if is_file_mutation(&prepared_all[index]) && !is_serial_barrier(&prepared_all[index]) {
                 let mut cluster = vec![index];
                 let mut seen = std::collections::HashSet::new();
                 if let Some(key) = mutation_path_key(&prepared_all[index]) {
@@ -3703,7 +4160,9 @@ impl Runtime {
                         look += 1;
                         continue;
                     }
-                    if !is_file_mutation(&prepared_all[look]) {
+                    if !is_file_mutation(&prepared_all[look])
+                        || is_serial_barrier(&prepared_all[look])
+                    {
                         break;
                     }
                     let Some(key) = mutation_path_key(&prepared_all[look]) else {
@@ -4494,8 +4953,16 @@ impl Runtime {
     ) -> Result<(ToolExecutionOutcome, u64), ProviderError> {
         let started_at = Instant::now();
         let revision_before = self.tools.workspace_revision();
+        if invocation.name == "shell_job" || (invocation.name == "shell" && mode.allows_mutation())
+        {
+            return self
+                .execute_managed_shell(mode, invocation, prepared, next_seq)
+                .await;
+        }
         let special = if invocation.name == "ask_question" {
             Some(self.execute_ask_question(invocation, next_seq).await?)
+        } else if invocation.name == "artifact_read" {
+            Some(self.execute_artifact_read(invocation, next_seq)?)
         } else if invocation.name == "todo" {
             Some(self.execute_todo(mode, invocation, next_seq)?)
         } else if invocation.name == "skill" {
@@ -4533,6 +5000,110 @@ impl Runtime {
                 ),
             },
             following,
+        ))
+    }
+
+    fn execute_artifact_read(
+        &mut self,
+        invocation: ToolInvocation<'_>,
+        mut seq: u64,
+    ) -> Result<(ToolResult, u64), ProviderError> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Arguments {
+            id: String,
+            #[serde(default)]
+            offset: usize,
+            #[serde(default = "default_artifact_page_bytes")]
+            max_bytes: usize,
+        }
+
+        let redacted_arguments = self.redact_sensitive(invocation.arguments);
+        push_runtime_event(
+            &mut self.app,
+            &mut seq,
+            crate::EventKind::ToolStarted {
+                batch_id: invocation.batch_id.into(),
+                call_id: invocation.call_id.into(),
+                name: invocation.name.into(),
+                arguments: redacted_arguments,
+            },
+        )?;
+        let output = (|| -> Result<String, String> {
+            let args: Arguments = serde_json::from_str(invocation.arguments)
+                .map_err(|_| "artifact_read requires id, offset and max_bytes".to_owned())?;
+            if !(4..=16 * 1024).contains(&args.max_bytes) {
+                return Err("artifact_read max_bytes must be 4..=16384".into());
+            }
+            if !self.restored_artifact_ids.contains(&args.id) && !self.app.events().iter().any(|event| {
+                matches!(&event.kind, crate::EventKind::ArtifactStored { id, .. } if id == &args.id)
+            }) {
+                return Err("artifact id is not available in this session".into());
+            }
+            let store = self
+                .artifact_store
+                .as_ref()
+                .ok_or("artifact storage is unavailable")?;
+            let bytes = store
+                .read_id(&args.id)
+                .map_err(|error| format!("artifact could not be verified: {:?}", error.kind()))?;
+            let content =
+                std::str::from_utf8(&bytes).map_err(|_| "artifact is not UTF-8 text".to_owned())?;
+            if args.offset > content.len() || !content.is_char_boundary(args.offset) {
+                return Err("artifact offset is not a UTF-8 boundary".into());
+            }
+            let mut end = args
+                .offset
+                .saturating_add(args.max_bytes)
+                .min(content.len());
+            while end > args.offset && !content.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end == args.offset && end < content.len() {
+                return Err("artifact max_bytes is too small for the next character".into());
+            }
+            Ok(serde_json::json!({
+                "id": args.id,
+                "offset": args.offset,
+                "next_offset": end,
+                "eof": end == content.len(),
+                "content": &content[args.offset..end],
+            })
+            .to_string())
+        })();
+        let (success, output) = match output {
+            Ok(output) => (true, output),
+            Err(error) => (false, error),
+        };
+        push_runtime_event(
+            &mut self.app,
+            &mut seq,
+            crate::EventKind::ToolOutput {
+                batch_id: invocation.batch_id.into(),
+                call_id: invocation.call_id.into(),
+                name: invocation.name.into(),
+                output: output.clone(),
+            },
+        )?;
+        push_runtime_event(
+            &mut self.app,
+            &mut seq,
+            crate::EventKind::ToolFinished {
+                batch_id: invocation.batch_id.into(),
+                call_id: invocation.call_id.into(),
+                name: invocation.name.into(),
+                success,
+                duration_ms: 0,
+            },
+        )?;
+        Ok((
+            ToolResult {
+                name: invocation.name.into(),
+                success,
+                output,
+                artifact: None,
+            },
+            seq,
         ))
     }
 
@@ -4648,8 +5219,13 @@ impl Runtime {
                 arguments,
             },
         )?;
-        let mut result = if mode.allows_mutation() {
-            run_mcp_dispatch(self.mcp.clone(), invocation.arguments).await
+        let cancellation = self
+            .cancellation
+            .as_ref()
+            .map(CancellationToken::mcp_cancellation)
+            .unwrap_or_default();
+        let result = if mode.allows_mutation() {
+            run_mcp_dispatch(self.mcp.clone(), invocation.arguments, cancellation).await
         } else {
             ToolResult {
                 name: "mcp".into(),
@@ -4658,9 +5234,6 @@ impl Runtime {
                 artifact: None,
             }
         };
-        if self.is_cancelled() {
-            result.success = false;
-        }
         let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         let output = self.redact_sensitive(&result.output);
         push_runtime_event(
@@ -4697,7 +5270,9 @@ impl Runtime {
         prepared: &PreparedToolInvocation,
         outcome: &ToolExecutionOutcome,
     ) {
-        if (!outcome.result.success && !outcome.receipt.effects_uncertain)
+        if (!outcome.result.success
+            && outcome.receipt.mutations.is_empty()
+            && !outcome.receipt.effects_uncertain)
             || !matches!(invocation.name, "write" | "patch")
         {
             return;
@@ -4708,7 +5283,7 @@ impl Runtime {
         let Some(absolute) = prepared.target_paths.first().cloned() else {
             return;
         };
-        let text = if outcome.receipt.effects_uncertain {
+        let text = if outcome.receipt.effects_uncertain || outcome.receipt.fused_shell.is_some() {
             None
         } else {
             match &prepared.arguments {
@@ -5046,6 +5621,7 @@ impl Runtime {
                     });
                     match matched {
                         Some(id) => TaskMutation::TodoSetStatus {
+                            reason: None,
                             id: Some(id),
                             status,
                         },
@@ -5209,6 +5785,11 @@ impl Runtime {
         self.restore_task_facts(&self.task_facts(), cwd)?;
         // Bound skill-discovery memoization to one loop run.
         self.skill_discovery_cache = None;
+        self.write_projection_cache
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.cached_skill_discovery(cwd);
         Ok(())
     }
 
@@ -5287,8 +5868,21 @@ impl Runtime {
         arguments: &str,
         next_seq: u64,
     ) -> Result<(ToolResult, u64), ProviderError> {
+        self.tools
+            .configure_artifacts(self.artifact_store.clone(), &self.sensitive_values.0);
         let batch_id = format!("slim-batch-direct-{next_seq}");
         let call_id = format!("slim-call-direct-{next_seq}");
+        if name == "artifact_read" {
+            return self.execute_artifact_read(
+                ToolInvocation {
+                    batch_id: &batch_id,
+                    call_id: &call_id,
+                    name,
+                    arguments,
+                },
+                next_seq,
+            );
+        }
         let cwd = cwd.as_ref();
         let prepared = self.tools.prepare_invocation(mode, cwd, name, arguments);
         self.execute_tool_call(
@@ -5415,10 +6009,14 @@ impl Runtime {
             return Err(error);
         }
         if self.is_cancelled() {
-            outcome.result.success = false;
+            mark_cancelled_tool_outcome(&mut outcome);
         }
         let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         outcome.result.output = self.redact_sensitive(&outcome.result.output);
+        self.record_existing_artifact(&outcome.result, &mut following_seq)?;
+        if let Some(fused_shell) = outcome.receipt.fused_shell.as_mut() {
+            fused_shell.1.output = self.redact_sensitive(&fused_shell.1.output);
+        }
         push_runtime_event(
             &mut self.app,
             &mut following_seq,
@@ -5510,6 +6108,7 @@ impl Runtime {
         }
         let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         outcome.result.output = self.redact_sensitive(&outcome.result.output);
+        self.record_existing_artifact(&outcome.result, &mut following_seq)?;
         push_runtime_event(
             &mut self.app,
             &mut following_seq,
@@ -5816,9 +6415,10 @@ impl Runtime {
                 | crate::provider::ProviderContentBlock::Unsupported { kind: text } => {
                     *text = self.redact_sensitive(text);
                 }
-                crate::provider::ProviderContentBlock::Image { data, .. }
-                | crate::provider::ProviderContentBlock::Audio { data, .. }
-                | crate::provider::ProviderContentBlock::File { data, .. } => {
+                crate::provider::ProviderContentBlock::Image { media_type, data }
+                | crate::provider::ProviderContentBlock::Audio { media_type, data }
+                | crate::provider::ProviderContentBlock::File { media_type, data } => {
+                    *media_type = self.redact_sensitive(media_type);
                     *data = self.redact_sensitive(data);
                 }
             }
@@ -5835,6 +6435,29 @@ impl Runtime {
             .cloned()
             .map(|message| self.redact_message(message))
             .collect()
+    }
+
+    fn record_existing_artifact(
+        &mut self,
+        result: &ToolResult,
+        next_seq: &mut u64,
+    ) -> Result<(), ProviderError> {
+        let Some(handle) = result.artifact.as_ref() else {
+            return Ok(());
+        };
+        if self.app.events().iter().any(|event| {
+            matches!(&event.kind, crate::EventKind::ArtifactStored { id, .. } if id == &handle.id)
+        }) {
+            return Ok(());
+        }
+        push_runtime_event(
+            &mut self.app,
+            next_seq,
+            crate::EventKind::ArtifactStored {
+                id: handle.id.clone(),
+                size: handle.size,
+            },
+        )
     }
 
     async fn materialize_results(
@@ -5886,18 +6509,14 @@ impl Runtime {
             let result = &mut results[index];
             result.output = output;
             result.artifact = Some(handle.clone());
-            self.app
-                .push_event(crate::SessionEvent::new(
-                    next_seq,
-                    crate::EventKind::ArtifactStored {
-                        id: handle.id,
-                        size: handle.size,
-                    },
-                ))
-                .map_err(|message| ProviderError::InvalidResponse {
-                    message: message.into(),
-                })?;
-            next_seq += 1;
+            push_runtime_event(
+                &mut self.app,
+                &mut next_seq,
+                crate::EventKind::ArtifactStored {
+                    id: handle.id,
+                    size: handle.size,
+                },
+            )?;
         }
         Ok(next_seq)
     }
@@ -5911,6 +6530,7 @@ impl Runtime {
         base_messages: &[ProviderMessage],
         tools: &[Value],
         mode: crate::OperatingMode,
+        cwd: &Path,
         batch_id: &str,
         calls: &[ProviderToolCall],
         results: &[ToolResult],
@@ -5932,7 +6552,7 @@ impl Runtime {
             .zip(calls)
             .map(|(result, call)| {
                 let cap = if result.name == "read" {
-                    64 * 1024
+                    self.read_presentation_bytes
                 } else {
                     config.max_result_bytes
                 };
@@ -5948,6 +6568,10 @@ impl Runtime {
                 result.output.len().max(projected).min(cap)
             })
             .collect::<Vec<_>>();
+        let artifact_references = results
+            .iter()
+            .map(|result| Self::artifact_reference(result, cwd))
+            .collect::<Vec<_>>();
         let build = |scale: usize| {
             // Duplicate detection must see the same context the assembly loop
             // will: base history plus this batch's already chosen tool
@@ -5959,7 +6583,8 @@ impl Runtime {
                 .iter()
                 .zip(&targets)
                 .zip(calls)
-                .map(|((result, target), call)| {
+                .zip(&artifact_references)
+                .map(|(((result, target), call), suffix)| {
                     // A retained complete result needs only an identity
                     // pointer. Account for that before allocating page space,
                     // otherwise a tight budget can hide the duplicate behind
@@ -5977,7 +6602,6 @@ impl Runtime {
                         ToolPresentation::complete(duplicate)
                     } else {
                         let allowance = target.saturating_mul(scale).div_ceil(1000);
-                        let suffix = Self::artifact_reference(result);
                         let body_budget =
                             allowance.saturating_sub(suffix.as_ref().map_or(0, String::len));
                         let mut presentation = self
@@ -5999,14 +6623,14 @@ impl Runtime {
                             });
                         if let Some(suffix) = suffix {
                             if presentation.text.len().saturating_add(suffix.len()) <= allowance {
-                                presentation.text.push_str(&suffix);
+                                presentation.text.push_str(suffix);
                             } else {
                                 // Keep the recovery handle even when the aggregate
                                 // budget cannot carry both the selected records and
                                 // metadata. The explicit over-budget notice is a
                                 // safer contract than an unreachable artifact.
                                 presentation.text.push('\n');
-                                presentation.text.push_str(&suffix);
+                                presentation.text.push_str(suffix);
                             }
                         }
                         // The assembly loop also collapses a projection that is
@@ -6099,14 +6723,25 @@ impl Runtime {
         best
     }
 
-    fn artifact_reference(result: &ToolResult) -> Option<String> {
+    fn artifact_reference(result: &ToolResult, cwd: &Path) -> Option<String> {
         result.artifact.as_ref().map(|handle| {
-            format!(
-                "[artifact id={} size={} path={}]",
-                handle.id,
-                handle.size,
-                handle.path.display()
-            )
+            let read_path = std::fs::canonicalize(cwd)
+                .ok()
+                .zip(std::fs::canonicalize(&handle.path).ok())
+                .and_then(|(root, path)| path.strip_prefix(root).ok().map(Path::to_path_buf))
+                .map(|path| path.to_string_lossy().replace('\\', "/"));
+            match read_path {
+                Some(path) => format!(
+                    "[artifact id={} size={} path={path}]",
+                    handle.id, handle.size
+                ),
+                None => format!(
+                    "[artifact id={} size={} path={} (use artifact_read with this id)]",
+                    handle.id,
+                    handle.size,
+                    handle.path.display()
+                ),
+            }
         })
     }
 
@@ -6158,18 +6793,47 @@ impl Runtime {
         // failure or insufficient reduction falls back to the unchanged
         // prefix, never to a silently empty summary.
         if policy.strategy == crate::context::CompactionStrategy::Jev {
+            let jev_plan = crate::context::jev_prune::PreparedPrune::new(
+                &selection,
+                manual_instructions.as_deref(),
+                &summarized,
+            );
+            let jev_cannot_pay =
+                !self.jev_plan_can_pay(&jev_plan, estimate_provider_message_tokens(&summarized));
             match &self.jev_judge {
+                Some(judge) if jev_cannot_pay => {
+                    let metadata = judge.metadata();
+                    push_runtime_event(
+                        &mut self.app,
+                        &mut next_seq,
+                        crate::EventKind::CompactionJevFallback {
+                            detail:
+                                "estimated summary savings cannot pay for Jev pre-pass with margin"
+                                    .into(),
+                            batches: 0,
+                            batches_started: 0,
+                            batches_completed: 0,
+                            input_tokens: Some(0),
+                            output_tokens: Some(0),
+                            usage_unknown: false,
+                            backend: metadata.backend,
+                            requested_model: metadata.requested_model,
+                            model: None,
+                            duration_ms: 0,
+                        },
+                    )?;
+                }
                 Some(judge) => {
-                    match crate::context::prune_summarized_with_instructions_cancellable(
+                    match crate::context::jev_prune::prune_prepared(
                         &**judge,
-                        &selection,
-                        manual_instructions.as_deref(),
+                        jev_plan,
                         &mut summarized,
                         self.cancellation.as_ref(),
                     )
                     .await
                     {
                         Ok(stats) => {
+                            self.jev_economy.observe(&stats);
                             push_runtime_event(
                                 &mut self.app,
                                 &mut next_seq,
@@ -6196,6 +6860,7 @@ impl Runtime {
                                 matches!(failure.error, crate::context::JevPruneError::Cancelled);
                             let detail = self.redact_sensitive(&failure.to_string());
                             let stats = *failure.stats;
+                            self.jev_economy.observe(&stats);
                             push_runtime_event(
                                 &mut self.app,
                                 &mut next_seq,
@@ -6297,10 +6962,14 @@ impl Runtime {
             }
         };
         let mut collected = CompactionSummary::default();
+        let provider_call_journal = self.app.run_journal.clone();
         let stream_result = client
-            .stream_prepared_cancellable(serialized_request, cancellation, |event| {
-                collected.push(event)
-            })
+            .stream_prepared_cancellable_observed(
+                serialized_request,
+                cancellation,
+                |event| collected.push(event),
+                |telemetry| persist_provider_call(&provider_call_journal, telemetry),
+            )
             .await;
 
         if let Some(elapsed_ms) = collected.time_to_first_byte_ms {
@@ -6441,6 +7110,29 @@ impl Runtime {
     }
 }
 
+/// `None` means the price of one side is unknown. Only TypeSafe's default Jev
+/// model has a published static rate; custom models and Vercel stay unpriced.
+fn jev_prepass_can_pay(
+    jev_input_tokens: u64,
+    max_summary_input_savings_tokens: u64,
+    summary_input_micros_per_million: Option<u64>,
+    judge: &crate::context::JevJudgeMetadata,
+) -> Option<bool> {
+    if judge.backend.as_deref() != Some("typesafe")
+        || judge.requested_model.as_deref() != Some(crate::context::DEFAULT_JEV_MODEL)
+    {
+        return None;
+    }
+    let summary_price = u128::from(summary_input_micros_per_million?);
+    Some(
+        u128::from(max_summary_input_savings_tokens).saturating_mul(summary_price)
+            > (u128::from(jev_input_tokens)
+                * u128::from(crate::context::TYPESAFE_JEV_INPUT_MICROS_PER_MILLION))
+                * 5
+                / 4,
+    )
+}
+
 fn code_intel_action_name(request: &CodeIntelRequest) -> &'static str {
     match request {
         CodeIntelRequest::Status { .. } => "status",
@@ -6534,10 +7226,80 @@ fn prepared_code_intel_request(
     }
 }
 
+const TODO_PROGRESS_REVIEW: &str = "[Todo progress review] Reconcile evidenced transitions using returned IDs alongside independent work, before the final answer. Keep unfinished work pending/blocked; do not repeat work.";
+const TODO_FINAL_REVIEW: &str = "[Todo final review] Before answering, reconcile task statuses using returned IDs and actual results. Leave unfinished work pending/blocked and explain it; interruption is not cancellation. Do not expand scope.";
+
+#[derive(Default)]
+struct TodoCadence {
+    snapshot: Vec<crate::TodoChangedItem>,
+    unchanged_batches: usize,
+    reminders: usize,
+    final_reviewed: bool,
+}
+
+impl TodoCadence {
+    fn unfinished(items: &[crate::TodoChangedItem]) -> bool {
+        items
+            .iter()
+            .any(|item| matches!(item.status.as_str(), "pending" | "in_progress"))
+    }
+
+    fn after_batch(&mut self, items: &[crate::TodoChangedItem]) -> bool {
+        if self.snapshot != items {
+            self.snapshot = items.to_vec();
+            self.unchanged_batches = 0;
+            if Self::unfinished(items) && self.reminders < 2 {
+                self.reminders += 1;
+                return true;
+            }
+            return false;
+        }
+        if !Self::unfinished(items) {
+            return false;
+        }
+        self.unchanged_batches = self.unchanged_batches.saturating_add(1);
+        if self.unchanged_batches < 4 || self.reminders >= 2 {
+            return false;
+        }
+        self.unchanged_batches = 0;
+        self.reminders += 1;
+        true
+    }
+
+    fn before_final(&mut self, items: &[crate::TodoChangedItem]) -> bool {
+        if self.final_reviewed || !Self::unfinished(items) {
+            return false;
+        }
+        self.final_reviewed = true;
+        true
+    }
+}
+
+fn default_artifact_page_bytes() -> usize {
+    8 * 1024
+}
+
+fn artifact_read_definition() -> Value {
+    serde_json::json!({
+        "name": "artifact_read",
+        "description": "Read a verified text artifact by id from this session. Use next_offset to continue; an incomplete shell capture is marked in the artifact.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+                "max_bytes": {"type": "integer", "minimum": 4, "maximum": 16384, "default": 8192}
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        }
+    })
+}
+
 fn todo_tool_definition() -> Value {
     json!({
         "name": "todo",
-        "description": "Track multi-step work when needed/requested. Ordered entries: add {title,status?}, update {id,status} with returned IDs; titles do not rename. One in_progress. Failure reports and retains earlier applied entries.",
+        "description": "Track multi-step work when needed/requested. Update at transitions and before answering, based on results, not command success alone. Ordered entries: add {title,status?}; update {id,status,reason?} using returned IDs. One in_progress: complete the previous step before starting the next. Leave unfinished work pending/blocked; give blockers a short reason (requires id). Titles do not rename. Failure retains earlier applied entries.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -6549,7 +7311,8 @@ fn todo_tool_definition() -> Value {
                         "properties": {
                             "title": {"type": "string"},
                             "id": {"type": ["string", "integer"], "minimum": 0},
-                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "blocked", "cancelled"]}
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "blocked", "cancelled"]},
+                            "reason": {"type": "string", "minLength": 1, "maxLength": 1024}
                         },
                         "additionalProperties": false
                     }
@@ -6564,7 +7327,7 @@ fn todo_tool_definition() -> Value {
 fn skill_tool_definition() -> Value {
     json!({
         "name": "skill",
-        "description": "List skills with {list:true}; invoke by name. Default run.ps1, or SKILL.md if absent. Bodies load on request.",
+        "description": "List skills with {list:true}; load SKILL.md by name. Scripts require explicit host trust and cannot run from model tool calls.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -6600,7 +7363,11 @@ fn mcp_tool_definition() -> Value {
 /// is additionally capped by `max_result_bytes` downstream.
 const MAX_MCP_CALL_OUTPUT_BYTES: usize = 64 * 1024;
 
-async fn run_mcp_dispatch(manager: Option<Arc<McpManager>>, arguments: &str) -> ToolResult {
+async fn run_mcp_dispatch(
+    manager: Option<Arc<McpManager>>,
+    arguments: &str,
+    cancellation: McpCancellation,
+) -> ToolResult {
     fn result(output: impl Into<String>, success: bool) -> ToolResult {
         ToolResult {
             name: "mcp".into(),
@@ -6643,28 +7410,46 @@ async fn run_mcp_dispatch(manager: Option<Arc<McpManager>>, arguments: &str) -> 
     };
     let server = args.get("server").and_then(Value::as_str);
     let tool = args.get("tool").and_then(Value::as_str);
-    let outcome: Result<McpDispatch, crate::mcp::McpError> = match (list, server, tool, describe) {
-        (true, None, None, _) => Ok(McpDispatch::Text(manager.list_servers())),
+    let outcome: McpRequestOutcome<McpDispatch> = match (list, server, tool, describe) {
+        (true, None, None, _) => {
+            McpRequestOutcome::Completed(Ok(McpDispatch::Text(manager.list_servers())))
+        }
         (true, Some(server), _, _) => manager
-            .list_tools_text(server, offset)
+            .list_tools_text_cancellable(server, offset, cancellation.clone())
             .await
             .map(McpDispatch::Text),
-        (false, Some(server), Some(tool), true) => {
-            manager.describe(server, tool).await.map(McpDispatch::Text)
-        }
+        (false, Some(server), Some(tool), true) => manager
+            .describe_cancellable(server, tool, cancellation.clone())
+            .await
+            .map(McpDispatch::Text),
         (false, Some(server), Some(tool), false) => {
             let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
             manager
-                .call(server, tool, arguments)
+                .call_cancellable(server, tool, arguments, cancellation)
                 .await
                 .map(|value| render_mcp_call_result(&value))
         }
-        _ => Err(usage()),
+        _ => McpRequestOutcome::Completed(Err(usage())),
     };
     match outcome {
-        Ok(McpDispatch::Text(output)) => result(output, true),
-        Ok(McpDispatch::Call { output, is_error }) => result(output, !is_error),
-        Err(error) => result(format!("mcp error: {error}"), false),
+        McpRequestOutcome::Completed(Ok(McpDispatch::Text(output))) => result(output, true),
+        McpRequestOutcome::Completed(Ok(McpDispatch::Call { output, is_error })) => {
+            result(output, !is_error)
+        }
+        McpRequestOutcome::Completed(Err(error)) => result(format!("mcp error: {error}"), false),
+        McpRequestOutcome::InterruptedBeforeSend {
+            interruption,
+            cleanup,
+        } => result(
+            format!("mcp operation stopped before tools/call was sent: {interruption:?}; transport cleanup: {cleanup:?}"),
+            false,
+        ),
+        McpRequestOutcome::OutcomeUncertain { interruption, cleanup } => result(
+            format!(
+                "mcp operation outcome is uncertain: {interruption:?}; transport cleanup: {cleanup:?}; do not replay the call automatically"
+            ),
+            false,
+        ),
     }
 }
 
@@ -6713,6 +7498,8 @@ fn todo_changed_items(tracker: &crate::task::TodoTracker) -> Vec<crate::TodoChan
         .items()
         .iter()
         .map(|item| crate::TodoChangedItem {
+            reason: item.reason.clone(),
+            id: Some(item.id),
             title: item.title.clone(),
             status: todo_status_name(item.status).to_owned(),
         })
@@ -6741,6 +7528,20 @@ fn todo_text(value: &Value) -> Option<String> {
 }
 
 fn parse_todo_entry(entry: &Value) -> Result<(String, TaskMutation), String> {
+    let reason = entry
+        .get("reason")
+        .map(|value| {
+            let text = value
+                .as_str()
+                .map(str::trim)
+                .filter(|text| !text.is_empty() && text.len() <= 1024)
+                .ok_or_else(|| "reason must be nonempty text of at most 1024 bytes".to_owned())?;
+            if entry.get("id").is_none() {
+                return Err("reason requires an id/status update".to_owned());
+            }
+            Ok(text.to_owned())
+        })
+        .transpose()?;
     let status = entry
         .get("status")
         .map(|value| {
@@ -6761,6 +7562,7 @@ fn parse_todo_entry(entry: &Value) -> Result<(String, TaskMutation), String> {
         return Ok((
             format!("todo {id}"),
             TaskMutation::TodoSetStatus {
+                reason,
                 id: Some(id),
                 status,
             },
@@ -6839,6 +7641,7 @@ fn render_skill_list(discovery: &DiscoveryResult) -> ToolResult {
     if lines.is_empty() {
         lines.push("no skills found".into());
     }
+    lines.extend(discovery.diagnostic_lines());
     ToolResult {
         name: "skill".into(),
         success: true,
@@ -6927,6 +7730,22 @@ fn run_skill_dispatch(
             artifact: None,
         };
     };
+    if script.is_none() {
+        return match crate::skills::read_body(entry.path.join("SKILL.md")) {
+            Ok(body) => ToolResult {
+                name: "skill".into(),
+                success: true,
+                output: body,
+                artifact: None,
+            },
+            Err(error) => ToolResult {
+                name: "skill".into(),
+                success: false,
+                output: format!("skill instructions failed: {error}"),
+                artifact: None,
+            },
+        };
+    }
     let script = crate::skills::default_skill_script(script);
     if let Some(body) = crate::skills::fallback_skill_body(&entry.path, script) {
         return ToolResult {
@@ -6942,7 +7761,7 @@ fn run_skill_dispatch(
             skill_dir: &entry.path,
             script,
             mode,
-            trusted: true,
+            trusted: false,
             timeout: crate::skills::DEFAULT_SKILL_TIMEOUT,
             max_output_bytes: DEFAULT_SKILL_OUTPUT_BYTES,
             cancellation,
@@ -7086,6 +7905,20 @@ fn journal_error(error: impl std::fmt::Display) -> ProviderError {
     }
 }
 
+fn persist_provider_call(
+    journal: &Option<Arc<Mutex<crate::session::ManualRunJournal>>>,
+    telemetry: ProviderCallTelemetry,
+) -> Result<(), ProviderError> {
+    let Some(journal) = journal else {
+        return Ok(());
+    };
+    journal
+        .lock()
+        .map_err(|_| journal_error("durable run lock poisoned"))?
+        .record_provider_call(&telemetry)
+        .map_err(journal_error)
+}
+
 fn push_runtime_transient_event(
     app: &mut AppHandle,
     next_seq: &mut u64,
@@ -7157,18 +7990,23 @@ async fn run_background_compaction<A: ProviderAdapter>(
     jev_judge: Option<Arc<dyn crate::context::JevJudge>>,
     token_estimator: AdaptiveTokenEstimator,
     cancellation: Option<CancellationToken>,
-    progress: Arc<Mutex<CompactionAttemptProgress>>,
-    jev_outcome: Arc<Mutex<Option<JevAttemptOutcome>>>,
+    observers: BackgroundCompactionObservers,
 ) -> BackgroundCompactionResult {
     let started = Instant::now();
     if plan.strategy == crate::context::CompactionStrategy::Jev {
         let outcome = match &jev_judge {
             Some(judge) => {
                 let mut summarized = plan.selection.summarized_for_prompt();
-                match crate::context::prune_summarized_with_instructions_cancellable(
+                let prepared = plan.jev_plan.take().unwrap_or_else(|| {
+                    crate::context::jev_prune::PreparedPrune::new(
+                        &plan.selection,
+                        None,
+                        &summarized,
+                    )
+                });
+                match crate::context::jev_prune::prune_prepared(
                     &**judge,
-                    &plan.selection,
-                    None,
+                    prepared,
                     &mut summarized,
                     cancellation.as_ref(),
                 )
@@ -7216,7 +8054,7 @@ async fn run_background_compaction<A: ProviderAdapter>(
                 },
             },
         };
-        match jev_outcome.lock() {
+        match observers.jev_outcome.lock() {
             Ok(mut slot) => *slot = Some(outcome),
             Err(poisoned) => *poisoned.into_inner() = Some(outcome),
         }
@@ -7233,10 +8071,15 @@ async fn run_background_compaction<A: ProviderAdapter>(
     let mut collected = CompactionSummary::default();
     let stream_result = if let Some(request) = plan.request.take() {
         client
-            .stream_prepared_cancellable(request, cancellation_future, |event| {
-                update_compaction_progress(&progress, &event);
-                collected.push(event);
-            })
+            .stream_prepared_cancellable_observed(
+                request,
+                cancellation_future,
+                |event| {
+                    update_compaction_progress(&observers.progress, &event);
+                    collected.push(event);
+                },
+                |telemetry| persist_provider_call(&observers.provider_call_journal, telemetry),
+            )
             .await
     } else {
         Err(ProviderError::InvalidResponse {
@@ -7418,6 +8261,61 @@ fn recoverable_provider_error(error: &ProviderError) -> bool {
     }
 }
 
+const MAX_AUTOMATIC_RECOVERIES: u32 = 6;
+
+fn is_empty_provider_response(error: &ProviderError) -> bool {
+    matches!(
+        error,
+        ProviderError::InvalidResponse { message }
+            if message == "provider completed without assistant text or tool calls"
+    )
+}
+
+fn annotate_provider_recovery_error(
+    error: ProviderError,
+    scope: &str,
+    attempts: u32,
+    automatic_recoveries: u32,
+    consecutive_recoveries: u32,
+    reason: &str,
+) -> ProviderError {
+    let suffix = format!(
+        "; automatic recovery stopped ({reason}): {scope} attempts={attempts}; automatic recoveries={automatic_recoveries}/{MAX_AUTOMATIC_RECOVERIES}; consecutive {scope} recoveries={consecutive_recoveries}/{MAX_PROVIDER_RECOVERIES}; work remains pending"
+    );
+    match error {
+        ProviderError::Api { metadata, message } => ProviderError::Api {
+            metadata,
+            message: format!("{message}{suffix}"),
+        },
+        ProviderError::Http {
+            status,
+            retry_after,
+            message,
+        } => ProviderError::Http {
+            status,
+            retry_after,
+            message: format!("{message}{suffix}"),
+        },
+        ProviderError::Transport {
+            safe_to_retry,
+            message,
+        } => ProviderError::Transport {
+            safe_to_retry,
+            message: format!("{message}{suffix}"),
+        },
+        ProviderError::TransientRemote { message } => ProviderError::TransientRemote {
+            message: format!("{message}{suffix}"),
+        },
+        ProviderError::Remote { message } => ProviderError::Remote {
+            message: format!("{message}{suffix}"),
+        },
+        ProviderError::InvalidResponse { message } => ProviderError::InvalidResponse {
+            message: format!("{message}{suffix}"),
+        },
+        other => other,
+    }
+}
+
 fn request_emitted_tools(app: &AppHandle, event_start: usize) -> bool {
     app.events()
         .get(event_start..)
@@ -7463,10 +8361,10 @@ fn provider_recovery_delay(
 ) -> Result<std::time::Duration, ProviderError> {
     let requested = requested_provider_recovery_delay(error, attempt);
     let remaining = MAX_PROVIDER_RECOVERY_WAIT.saturating_sub(waited);
-    if remaining.is_zero() {
+    if requested > remaining {
         return Err(retry_wait_budget_exceeded(error, requested, remaining));
     }
-    Ok(requested.min(remaining))
+    Ok(requested)
 }
 
 fn provider_retry_reason(error: &ProviderError) -> String {
@@ -7488,7 +8386,7 @@ fn retry_wait_budget_exceeded(
     remaining: std::time::Duration,
 ) -> ProviderError {
     let suffix = format!(
-        "; Retry-After requires {} ms, exceeding the remaining automatic retry wait budget of {} ms; work remains pending",
+        "; automatic retry requires a wait of {} ms, exceeding the remaining wait budget of {} ms; no early retry was sent; work remains pending",
         requested.as_millis(),
         remaining.as_millis()
     );
@@ -7504,6 +8402,19 @@ fn retry_wait_budget_exceeded(
         } => ProviderError::Http {
             status: *status,
             retry_after: *retry_after,
+            message: format!("{message}{suffix}"),
+        },
+        ProviderError::Transport {
+            safe_to_retry,
+            message,
+        } => ProviderError::Transport {
+            safe_to_retry: *safe_to_retry,
+            message: format!("{message}{suffix}"),
+        },
+        ProviderError::TransientRemote { message } => ProviderError::TransientRemote {
+            message: format!("{message}{suffix}"),
+        },
+        ProviderError::InvalidResponse { message } => ProviderError::InvalidResponse {
             message: format!("{message}{suffix}"),
         },
         other => other.clone(),
@@ -7730,12 +8641,12 @@ fn estimate_unprepared_request_chars<A: ProviderAdapter>(
             .saturating_add(scalar_chars)
             .saturating_add(call_chars)
             .saturating_add(block_chars)
-            .saturating_add(
-                message
-                    .chat_reasoning
-                    .as_ref()
-                    .map_or(0, |state| estimate_json_string_chars(&state.content)),
-            )
+            .saturating_add(message.chat_reasoning.as_ref().map_or(0, |state| {
+                state.details.iter().fold(
+                    estimate_json_string_chars(&state.content),
+                    |total, detail| total.saturating_add(estimate_json_chars(detail)),
+                )
+            }))
             .saturating_add(
                 message
                     .responses_reasoning
@@ -7996,7 +8907,7 @@ fn redact_task_value(value: &mut Value, sensitive_values: &[String]) {
     }
 }
 
-fn redact_values(sensitive_values: &[String], input: &str) -> String {
+pub(crate) fn redact_values(sensitive_values: &[String], input: &str) -> String {
     if !sensitive_values
         .iter()
         .any(|value| input.contains(value.as_str()))
@@ -8341,6 +9252,7 @@ impl ProviderStreamNormalizer {
                         });
                     }
                     previous.content.push_str(&state.content);
+                    previous.details.extend(state.details);
                 } else {
                     self.chat_reasoning = Some(state);
                 }
@@ -9056,3338 +9968,4 @@ fn validate_buffered_call(call: &BufferedToolCall) -> Result<(), ProviderError> 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn valid_checkpoint(detail: &str) -> String {
-        format!(
-            "## Goal\n{detail}\n## Constraints\n\n## Progress\n\n## Blocked\n\n## Decisions\n\n## Next steps\n\n## Critical context\n"
-        )
-    }
-
-    #[tokio::test]
-    async fn compaction_archive_recovers_original_outputs_and_chains_checkpoints() {
-        let root = std::env::temp_dir().join(format!(
-            "slim-indexed-compaction-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mut runtime = Runtime::with_artifact_store(&root).unwrap();
-        runtime.register_sensitive_value("private-fixture-token");
-        let original = ProviderMessage::tool(
-            "read",
-            "old-read",
-            "original versão\nprivate-fixture-token\n",
-        );
-        let initial = vec![
-            ProviderMessage::user("Preserve a interface pública."),
-            original.clone(),
-        ];
-        let mut selection = CompactionSelection {
-            root_instruction: initial[0].content.clone(),
-            summarized: vec![
-                initial[0].clone(),
-                ProviderMessage::tool(
-                    "read",
-                    "old-read",
-                    "[superseded read output elided; file was overwritten]",
-                ),
-            ],
-            pinned: Vec::new(),
-            kept: Vec::new(),
-            first_kept_index: 2,
-            recent_tokens: 0,
-        };
-        let summary = runtime
-            .archive_compaction_summary(
-                &selection,
-                valid_checkpoint("model interpretation"),
-                "run_start_seq=7 validation_revision=1 current=false private-fixture-token",
-                &initial,
-                &root,
-            )
-            .await
-            .unwrap();
-        assert!(summary.contains("validation_revision=1 current=false"));
-        assert!(!summary.contains("private-fixture-token"));
-        let first_path = std::fs::read_dir(&root)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        let archived = std::fs::read_to_string(&first_path).unwrap();
-        assert!(archived.contains("original versão\n"));
-        assert!(archived.contains("Preserve a interface pública."));
-        assert!(!archived.contains("private-fixture-token"));
-        assert!(!archived.contains("[superseded read"));
-        assert!(archived.contains("\"offset\""));
-
-        selection.summarized = vec![
-            initial[0].clone(),
-            ProviderMessage::user(format!("[Compacted context]\n{summary}")),
-        ];
-        let second = runtime
-            .archive_compaction_summary(
-                &selection,
-                valid_checkpoint("new interpretation"),
-                "",
-                &initial,
-                &root,
-            )
-            .await
-            .unwrap();
-        let second_path = std::fs::read_dir(&root)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|path| path != &first_path)
-            .unwrap();
-        let previous = std::fs::read_to_string(&second_path).unwrap();
-        assert!(second.contains(
-            &serde_json::to_string(&second_path.file_name().unwrap().to_str().unwrap()).unwrap()
-        ));
-        assert!(previous.contains(
-            &serde_json::to_string(&first_path.file_name().unwrap().to_str().unwrap()).unwrap()
-        ));
-        assert!(previous.contains("validation_revision=1 current=false"));
-        let workspace = root.join("workspace");
-        std::fs::create_dir(&workspace).unwrap();
-        let outside = runtime
-            .archive_compaction_summary(
-                &selection,
-                valid_checkpoint("summary"),
-                "",
-                &initial,
-                &workspace,
-            )
-            .await
-            .unwrap();
-        assert!(outside.contains("native read cannot access this artifact outside the workspace"));
-        assert!(!outside.contains("use read on"));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn compaction_checkpoint_carries_the_tool_call_manifest() {
-        let runtime = Runtime::new();
-        let mut assistant = ProviderMessage::assistant("reading", Vec::new());
-        assistant.tool_calls = vec![crate::provider::ProviderToolCall {
-            id: "call-1".into(),
-            name: "read".into(),
-            arguments: "{\"path\":\"a.rs\"}".into(),
-        }];
-        let selection = CompactionSelection {
-            root_instruction: "root".into(),
-            summarized: vec![
-                ProviderMessage::user("root"),
-                assistant,
-                ProviderMessage::tool("read", "call-1", "file body"),
-            ],
-            pinned: Vec::new(),
-            kept: Vec::new(),
-            first_kept_index: 3,
-            recent_tokens: 0,
-        };
-        let summary = runtime
-            .archive_compaction_summary(
-                &selection,
-                valid_checkpoint("interpretation"),
-                "",
-                &[],
-                Path::new("."),
-            )
-            .await
-            .unwrap();
-        assert!(summary.contains(
-            "[Prior tool calls; full results are recoverable from the prior visible transcript]"
-        ));
-        assert!(summary.contains("\"call_id\":\"call-1\""));
-        assert!(summary.contains("\"result_present\":true"));
-        assert!(!summary.contains("file body"));
-    }
-
-    #[tokio::test]
-    async fn compaction_manifest_yields_to_higher_priority_recovery_metadata() {
-        let mut runtime = Runtime::new();
-        runtime.set_compaction_handle(CompactionHandle::new(CompactionPolicy {
-            summary_max_bytes: 200,
-            ..CompactionPolicy::default()
-        }));
-        let mut assistant = ProviderMessage::assistant("reading", Vec::new());
-        assistant.tool_calls = vec![crate::provider::ProviderToolCall {
-            id: "call-1".into(),
-            name: "read".into(),
-            arguments: "{\"path\":\"a.rs\"}".into(),
-        }];
-        let selection = CompactionSelection {
-            root_instruction: "root".into(),
-            summarized: vec![
-                ProviderMessage::user("root"),
-                assistant,
-                ProviderMessage::tool("read", "call-1", "file body"),
-            ],
-            pinned: Vec::new(),
-            kept: Vec::new(),
-            first_kept_index: 3,
-            recent_tokens: 0,
-        };
-        let error = runtime
-            .archive_compaction_summary(
-                &selection,
-                valid_checkpoint("summary"),
-                "run_start_seq=7 failure call_id=failed-write",
-                &[],
-                Path::new("."),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ProviderError::InvalidResponse { message }
-                if message.contains("cannot retain operational metadata")
-        ));
-    }
-
-    #[tokio::test]
-    async fn compaction_archive_reserves_bounded_facts_without_an_artifact_store() {
-        let mut runtime = Runtime::new();
-        let max_bytes = 1024;
-        runtime.set_compaction_handle(CompactionHandle::new(CompactionPolicy {
-            summary_max_bytes: max_bytes,
-            ..CompactionPolicy::default()
-        }));
-        let selection = CompactionSelection {
-            root_instruction: "root".into(),
-            summarized: Vec::new(),
-            pinned: Vec::new(),
-            kept: Vec::new(),
-            first_kept_index: 0,
-            recent_tokens: 0,
-        };
-        let summary = runtime
-            .archive_compaction_summary(
-                &selection,
-                valid_checkpoint(&"😀".repeat((max_bytes - 200) / 4)),
-                "run_start_seq=11 failure call_id=failed-write",
-                &[],
-                Path::new("."),
-            )
-            .await
-            .unwrap();
-        assert!(summary.len() <= max_bytes);
-        assert!(summary.contains("checkpoint sections truncated"));
-        assert!(summary.ends_with("failure call_id=failed-write"));
-        assert!(!summary.contains("Prior visible transcript"));
-        assert!(runtime
-            .archive_compaction_summary(
-                &selection,
-                valid_checkpoint("summary"),
-                &"x".repeat(max_bytes),
-                &[],
-                Path::new(".")
-            )
-            .await
-            .is_err());
-        runtime.set_compaction_handle(CompactionHandle::new(CompactionPolicy {
-            summary_max_bytes: 4,
-            ..CompactionPolicy::default()
-        }));
-        assert!(runtime
-            .archive_compaction_summary(
-                &selection,
-                valid_checkpoint("😀😀"),
-                "",
-                &[],
-                Path::new(".")
-            )
-            .await
-            .is_err());
-    }
-
-    #[tokio::test]
-    async fn impossible_checkpoint_budget_does_not_create_recovery_artifact() {
-        let root = std::env::temp_dir().join(format!(
-            "slim-checkpoint-transaction-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mut runtime = Runtime::with_artifact_store(&root).unwrap();
-        runtime.set_compaction_handle(CompactionHandle::new(CompactionPolicy {
-            summary_max_bytes: 128,
-            ..CompactionPolicy::default()
-        }));
-        let selection = CompactionSelection {
-            root_instruction: "root".into(),
-            summarized: vec![ProviderMessage::user("historical evidence")],
-            pinned: Vec::new(),
-            kept: Vec::new(),
-            first_kept_index: 1,
-            recent_tokens: 0,
-        };
-
-        let result = runtime
-            .archive_compaction_summary(
-                &selection,
-                valid_checkpoint("goal"),
-                "run_start_seq=1 failure call_id=write",
-                &[],
-                Path::new("."),
-            )
-            .await;
-
-        assert!(result.is_err());
-        assert!(
-            !root.exists(),
-            "preflight failure must not write an artifact"
-        );
-    }
-
-    #[test]
-    fn secret_gate_uses_call_identity_and_decoded_arguments() {
-        let events = [
-            ProviderEvent::ToolCallDelta {
-                index: Some(7),
-                id: Some("call".into()),
-                name: Some("read".into()),
-                arguments: "{\"path\":\"secret-".into(),
-            },
-            ProviderEvent::ToolCallDelta {
-                index: None,
-                id: Some("call".into()),
-                name: Some("read".into()),
-                arguments: "value\"}".into(),
-            },
-        ];
-        assert!(tool_events_contain_sensitive_values(
-            &events,
-            &["secret-value".into()]
-        ));
-        assert!(!tool_events_contain_sensitive_values(
-            &events,
-            &["callcall".into(), "readread".into()]
-        ));
-        assert!(sensitive_tool_arguments(
-            r#"{"path":"secret\u002dvalue"}"#,
-            &["secret-value".into()]
-        ));
-    }
-
-    #[test]
-    fn canonical_text_is_independent_of_chunk_boundaries() {
-        let source =
-            "```python\r\nvalue = 1\r\n\tprint('á € 🦀')\r\n```\n synthetic-secret-value \n";
-        let expected = source.replace("synthetic-secret-value", "[REDACTED]");
-        let boundaries = source
-            .char_indices()
-            .map(|(i, _)| i)
-            .chain(std::iter::once(source.len()))
-            .collect::<Vec<_>>();
-        for split in boundaries {
-            let mut app = AppHandle::fake();
-            let mut normalizer = ProviderStreamNormalizer::new(
-                ProviderKind::OpenAiCompatible,
-                1,
-                vec!["synthetic-secret-value".into()],
-            );
-            for chunk in [&source[..split], &source[split..]] {
-                normalizer.push(&mut app, ProviderEvent::TextDelta(chunk.into()));
-            }
-            normalizer.flush_text(&mut app).unwrap();
-            let actual = app
-                .events()
-                .iter()
-                .filter_map(|event| match &event.kind {
-                    crate::EventKind::AssistantTextDelta { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<String>();
-            assert_eq!(actual, expected, "split {split}");
-        }
-        let mut app = AppHandle::fake();
-        let mut normalizer = ProviderStreamNormalizer::new(
-            ProviderKind::OpenAiCompatible,
-            1,
-            vec!["synthetic-secret-value".into()],
-        );
-        for ch in source.chars() {
-            normalizer.push(&mut app, ProviderEvent::TextDelta(ch.to_string()));
-        }
-        normalizer.flush_text(&mut app).unwrap();
-        let actual = app
-            .events()
-            .iter()
-            .filter_map(|event| match &event.kind {
-                crate::EventKind::AssistantTextDelta { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<String>();
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn reasoning_classification_is_emitted_before_public_reasoning_text() {
-        let mut app = AppHandle::fake();
-        let mut normalizer = ProviderStreamNormalizer::new(ProviderKind::OpenAiCodex, 1, vec![])
-            .with_reasoning_classification(Some(crate::ReasoningClassification::Summary));
-        normalizer.push(&mut app, ProviderEvent::ReasoningDelta("summary".into()));
-        let kinds = app
-            .events()
-            .iter()
-            .map(|event| match &event.kind {
-                crate::EventKind::ReasoningClassification { classification } => {
-                    format!("classification:{classification:?}")
-                }
-                crate::EventKind::ThinkingStarted => "thinking_started".into(),
-                crate::EventKind::ReasoningDelta { .. } => "reasoning_delta".into(),
-                _ => "other".into(),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            kinds,
-            [
-                "classification:Summary",
-                "thinking_started",
-                "reasoning_delta"
-            ]
-        );
-    }
-
-    #[test]
-    fn generic_reasoning_stream_does_not_invent_a_classification() {
-        let mut app = AppHandle::fake();
-        let mut normalizer =
-            ProviderStreamNormalizer::new(ProviderKind::OpenAiCompatible, 1, vec![]);
-        normalizer.push(&mut app, ProviderEvent::ReasoningDelta("opaque".into()));
-        assert!(!app
-            .events()
-            .iter()
-            .any(|event| matches!(event.kind, crate::EventKind::ReasoningClassification { .. })));
-    }
-
-    #[tokio::test]
-    async fn journal_failure_cancels_and_drains_started_mutations() {
-        use crate::session::{DurableSessionHeader, JsonlRepo, ManualRunJournal, ManualRunSpec};
-        let root = std::env::temp_dir().join(format!(
-            "slim-drain-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&root).unwrap();
-        for name in ["first.txt", "waiting.txt"] {
-            std::fs::write(root.join(name), "before").unwrap();
-        }
-        let first_lock = std::fs::File::open(root.join("first.txt")).unwrap();
-        let waiting_lock = std::fs::File::open(root.join("waiting.txt")).unwrap();
-        first_lock.lock().unwrap();
-        waiting_lock.lock().unwrap();
-        let calls = ["first.txt", "waiting.txt"]
-            .iter()
-            .enumerate()
-            .map(|(i, name)| ProviderToolCall {
-                id: format!("write-{i}"),
-                name: "write".into(),
-                arguments: json!({"path":name,"content":"after","expected":"before"}).to_string(),
-            })
-            .collect::<Vec<_>>();
-        let repo = JsonlRepo::create(
-            root.join("session.jsonl"),
-            DurableSessionHeader::new("drain", "now", root.to_str().unwrap(), None, None),
-        )
-        .unwrap();
-        let mut journal = ManualRunJournal::start(
-            repo,
-            ManualRunSpec::new("op", "attempt", "input", "final", "write", 0),
-        )
-        .unwrap();
-        journal
-            .begin_tools(
-                "batch",
-                ProviderMessage::assistant("", calls.clone()),
-                &calls,
-            )
-            .unwrap();
-        let store = ArtifactStore::new(root.join("blocked")).unwrap();
-        std::fs::write(root.join("blocked"), "not a directory").unwrap();
-        journal.configure_output(Some(store), 0);
-        let mut runtime = Runtime::new();
-        runtime.app.run_journal = Some(Arc::new(Mutex::new(journal)));
-        let token = CancellationToken::new();
-        runtime.cancellation = Some(token.clone());
-        let mut governor = CausalGovernor::default();
-        let work = runtime.execute_provider_tool_batch(
-            crate::OperatingMode::Auto,
-            &root,
-            "batch",
-            &calls,
-            1,
-            &mut governor,
-        );
-        let release = async {
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while token.0.native_work.load(Ordering::Acquire) < 2 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            first_lock.unlock().unwrap();
-        };
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            tokio::join!(work, release)
-        })
-        .await
-        .unwrap();
-        assert!(result.is_err());
-        assert!(token.is_cancelled());
-        assert_eq!(token.0.native_work.load(Ordering::Acquire), 0);
-        waiting_lock.unlock().unwrap();
-        assert_eq!(
-            std::fs::read_to_string(root.join("first.txt")).unwrap(),
-            "after"
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join("waiting.txt")).unwrap(),
-            "before"
-        );
-        assert_eq!(
-            runtime
-                .app
-                .events()
-                .iter()
-                .filter(|event| matches!(event.kind, crate::EventKind::ToolFinished { .. }))
-                .count(),
-            2
-        );
-        drop((first_lock, waiting_lock, runtime));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn ordinary_mcp_configuration_preserves_native_arguments_and_durable_ids() {
-        use crate::mcp::McpTransport;
-        use crate::session::{DurableSessionHeader, JsonlRepo, ManualRunJournal, ManualRunSpec};
-        let transport = McpTransport::Stdio {
-            command: "unused".into(),
-            args: vec![],
-            env: [
-                ("WORKERS", "1"),
-                ("ENABLED", "true"),
-                ("NODE_ENV", "production"),
-                ("SERVICE_API_TOKEN", "synthetic-credential-long-42"),
-            ]
-            .into_iter()
-            .map(|(k, v)| (k.into(), v.into()))
-            .collect(),
-        };
-        let secrets = transport.sensitive_values().cloned().collect::<Vec<_>>();
-        assert_eq!(secrets, ["synthetic-credential-long-42"]);
-        let root = std::env::temp_dir().join(format!(
-            "slim-ordinary-config-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join("production.json"), "first\nsecond\n").unwrap();
-        let mut runtime = Runtime::new();
-        for secret in &secrets {
-            runtime.register_sensitive_value(secret);
-        }
-        let mut normalizer =
-            ProviderStreamNormalizer::new(ProviderKind::OpenAiCompatible, 1, secrets);
-        let args = r#"{"path":"production.json","offset":1,"max_lines":20}"#;
-        for i in 0..2 {
-            normalizer.push(
-                &mut runtime.app,
-                ProviderEvent::ToolCallDelta {
-                    index: Some(i),
-                    id: Some(format!("call-{i}")),
-                    name: Some("read".into()),
-                    arguments: args.into(),
-                },
-            );
-        }
-        normalizer.push(
-            &mut runtime.app,
-            ProviderEvent::Stopped {
-                reason: "tool_calls".into(),
-            },
-        );
-        let turn = normalizer.finish(&mut runtime.app).unwrap();
-        let calls = tool_calls_since(&runtime.app, 0);
-        assert_eq!(calls.len(), 2);
-        assert!(calls.iter().all(
-            |call| serde_json::from_str::<Value>(&call.arguments).unwrap()
-                == serde_json::from_str::<Value>(args).unwrap()
-        ));
-        let repo = JsonlRepo::create(
-            root.join("session.jsonl"),
-            DurableSessionHeader::new("ordinary", "now", root.to_str().unwrap(), None, None),
-        )
-        .unwrap();
-        let mut journal = ManualRunJournal::start(
-            repo,
-            ManualRunSpec::new("op", "attempt", "input", "final", "read", 0),
-        )
-        .unwrap();
-        journal
-            .begin_tools(
-                "batch",
-                ProviderMessage::assistant("", calls.clone()),
-                &calls,
-            )
-            .unwrap();
-        runtime.app.run_journal = Some(Arc::new(Mutex::new(journal)));
-        let (results, _) = runtime
-            .execute_provider_tool_batch(
-                crate::OperatingMode::Auto,
-                &root,
-                "batch",
-                &calls,
-                turn.next_seq,
-                &mut CausalGovernor::default(),
-            )
-            .await
-            .unwrap();
-        assert!(results
-            .iter()
-            .all(|result| result.success && result.output.contains("second")));
-        drop(runtime);
-        let durable = std::fs::read_to_string(root.join("session.jsonl")).unwrap();
-        assert!(durable.contains("call-0") && durable.contains("call-1"));
-        assert!(!durable.contains("synthetic-credential-long-42"));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn empty_content_and_placeholder_tool_delta_do_not_split_reasoning() {
-        let mut app = AppHandle::fake();
-        let mut normalizer =
-            ProviderStreamNormalizer::new(ProviderKind::OpenAiCompatible, 1, vec![]);
-        for event in [
-            ProviderEvent::ReasoningDelta("first".into()),
-            ProviderEvent::TextDelta(String::new()),
-            ProviderEvent::TextDelta(" \n ".into()),
-            ProviderEvent::ToolCallDelta {
-                index: Some(0),
-                id: None,
-                name: None,
-                arguments: String::new(),
-            },
-            ProviderEvent::ReasoningDelta(" second".into()),
-            ProviderEvent::Stopped {
-                reason: "stop".into(),
-            },
-        ] {
-            normalizer.push(&mut app, event);
-        }
-        normalizer.finish(&mut app).expect("normal stop");
-        let kinds: Vec<_> = app
-            .events()
-            .iter()
-            .filter_map(|event| match &event.kind {
-                crate::EventKind::ThinkingStarted => Some("start"),
-                crate::EventKind::ReasoningDelta { text } => Some(text.as_str()),
-                crate::EventKind::ThinkingEnded => Some("end"),
-                crate::EventKind::AssistantTextDelta { .. } => Some("text"),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(kinds, ["start", "first", "text", " second", "end"]);
-        assert!(app.events().iter().any(|event| matches!(&event.kind,
-            crate::EventKind::AssistantTextDelta { text } if text == " \n ")));
-    }
-
-    #[test]
-    fn argument_fragment_does_not_split_reasoning() {
-        let mut app = AppHandle::fake();
-        let mut normalizer =
-            ProviderStreamNormalizer::new(ProviderKind::OpenAiCompatible, 1, vec![]);
-        for event in [
-            ProviderEvent::ReasoningDelta("first".into()),
-            ProviderEvent::ToolCallDelta {
-                index: Some(0),
-                id: None,
-                name: None,
-                arguments: "{".into(),
-            },
-            ProviderEvent::ReasoningDelta(" second".into()),
-            ProviderEvent::Stopped {
-                reason: "stop".into(),
-            },
-        ] {
-            normalizer.push(&mut app, event);
-        }
-        normalizer.finish(&mut app).expect("normal stop");
-        let kinds: Vec<_> = app
-            .events()
-            .iter()
-            .filter_map(|event| match &event.kind {
-                crate::EventKind::ThinkingStarted => Some("start"),
-                crate::EventKind::ReasoningDelta { text } => Some(text.as_str()),
-                crate::EventKind::ThinkingEnded => Some("end"),
-                crate::EventKind::AssistantTextDelta { .. } => Some("text"),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(kinds, ["start", "first second", "end"]);
-    }
-
-    #[test]
-    fn reasoning_then_text_keeps_a_single_thought() {
-        let mut app = AppHandle::fake();
-        let mut normalizer =
-            ProviderStreamNormalizer::new(ProviderKind::OpenAiCompatible, 1, vec![]);
-        for event in [
-            ProviderEvent::ReasoningDelta("plan".into()),
-            ProviderEvent::TextDelta("answer".into()),
-            ProviderEvent::Stopped {
-                reason: "stop".into(),
-            },
-        ] {
-            normalizer.push(&mut app, event);
-        }
-        normalizer.finish(&mut app).expect("normal stop");
-        let kinds: Vec<_> = app
-            .events()
-            .iter()
-            .filter_map(|event| match &event.kind {
-                crate::EventKind::ThinkingStarted => Some("start"),
-                crate::EventKind::ReasoningDelta { text } => Some(text.as_str()),
-                crate::EventKind::ThinkingEnded => Some("end"),
-                crate::EventKind::AssistantTextDelta { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(kinds, ["start", "plan", "end", "answer"]);
-    }
-
-    #[test]
-    fn identical_stop_reason_is_idempotent() {
-        let mut app = AppHandle::fake();
-        let mut normalizer =
-            ProviderStreamNormalizer::new(ProviderKind::OpenAiCompatible, 1, vec![]);
-        normalizer.push(&mut app, ProviderEvent::TextDelta("done".into()));
-        normalizer.push(
-            &mut app,
-            ProviderEvent::Stopped {
-                reason: "stop".into(),
-            },
-        );
-        normalizer.push(
-            &mut app,
-            ProviderEvent::Stopped {
-                reason: "Stop".into(),
-            },
-        );
-        normalizer.finish(&mut app).expect("identical stop");
-        assert_eq!(
-            app.events()
-                .iter()
-                .filter(|event| matches!(event.kind, crate::EventKind::AssistantEnded { .. }))
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn conflicting_stop_reasons_are_rejected() {
-        let mut app = AppHandle::fake();
-        let mut normalizer =
-            ProviderStreamNormalizer::new(ProviderKind::OpenAiCompatible, 1, vec![]);
-        normalizer.push(&mut app, ProviderEvent::TextDelta("done".into()));
-        normalizer.push(
-            &mut app,
-            ProviderEvent::Stopped {
-                reason: "tool_calls".into(),
-            },
-        );
-        normalizer.push(
-            &mut app,
-            ProviderEvent::Stopped {
-                reason: "stop".into(),
-            },
-        );
-        match normalizer.finish(&mut app) {
-            Err(ProviderError::InvalidResponse { message })
-                if message.contains("more than one stop reason") => {}
-            Err(error) => panic!("expected conflicting stop, got {error:?}"),
-            Ok(_) => panic!("expected conflicting stop, got success"),
-        }
-    }
-
-    #[test]
-    fn unused_named_slot_without_id_does_not_reject_a_complete_sibling() {
-        let mut app = AppHandle::fake();
-        let mut normalizer =
-            ProviderStreamNormalizer::new(ProviderKind::OpenAiCompatible, 1, vec![]);
-        normalizer.push(
-            &mut app,
-            ProviderEvent::ToolCallDelta {
-                index: Some(0),
-                id: Some("call-a".into()),
-                name: Some("read".into()),
-                arguments: r#"{"path":"README.md"}"#.into(),
-            },
-        );
-        normalizer.push(
-            &mut app,
-            ProviderEvent::ToolCallDelta {
-                index: Some(1),
-                id: None,
-                name: Some("read".into()),
-                arguments: String::new(),
-            },
-        );
-        normalizer.push(
-            &mut app,
-            ProviderEvent::Stopped {
-                reason: "tool_calls".into(),
-            },
-        );
-        normalizer
-            .finish(&mut app)
-            .expect("named padding without identity is unused");
-        let published: Vec<_> = app
-            .events()
-            .iter()
-            .filter_map(|event| match &event.kind {
-                crate::EventKind::ProviderToolCall {
-                    id,
-                    name,
-                    arguments,
-                } => Some((id.as_str(), name.as_str(), arguments.as_str())),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(published, [("call-a", "read", r#"{"path":"README.md"}"#)]);
-    }
-
-    #[test]
-    fn unused_openai_tool_slot_does_not_reject_a_complete_sibling() {
-        let mut app = AppHandle::fake();
-        let mut normalizer =
-            ProviderStreamNormalizer::new(ProviderKind::OpenAiCompatible, 1, vec![]);
-        normalizer.push(
-            &mut app,
-            ProviderEvent::ToolCallDelta {
-                index: Some(0),
-                id: Some("call-a".into()),
-                name: Some("read".into()),
-                arguments: r#"{"path":"README.md"}"#.into(),
-            },
-        );
-        normalizer.push(
-            &mut app,
-            ProviderEvent::ToolCallDelta {
-                index: Some(1),
-                id: None,
-                name: Some(String::new()),
-                arguments: String::new(),
-            },
-        );
-        normalizer.push(
-            &mut app,
-            ProviderEvent::Stopped {
-                reason: "tool_calls".into(),
-            },
-        );
-        normalizer.finish(&mut app).expect("complete sibling runs");
-        let published: Vec<_> = app
-            .events()
-            .iter()
-            .filter_map(|event| match &event.kind {
-                crate::EventKind::ProviderToolCall {
-                    id,
-                    name,
-                    arguments,
-                } => Some((id.as_str(), name.as_str(), arguments.as_str())),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(published, [("call-a", "read", r#"{"path":"README.md"}"#)]);
-    }
-
-    #[test]
-    fn empty_name_fragment_does_not_malform_an_identified_call() {
-        let mut app = AppHandle::fake();
-        let mut normalizer =
-            ProviderStreamNormalizer::new(ProviderKind::OpenAiCompatible, 1, vec![]);
-        normalizer.push(
-            &mut app,
-            ProviderEvent::ToolCallDelta {
-                index: Some(0),
-                id: Some("call-a".into()),
-                name: Some("list".into()),
-                arguments: r#"{"path":"C:\\Users"}"#.into(),
-            },
-        );
-        normalizer.push(
-            &mut app,
-            ProviderEvent::ToolCallDelta {
-                index: Some(0),
-                id: Some("call-a".into()),
-                name: Some(String::new()),
-                arguments: String::new(),
-            },
-        );
-        normalizer.push(
-            &mut app,
-            ProviderEvent::Stopped {
-                reason: "tool_calls".into(),
-            },
-        );
-        normalizer.finish(&mut app).expect("empty name is ignored");
-        assert!(app.events().iter().any(|event| matches!(
-            &event.kind,
-            crate::EventKind::ProviderToolCall { name, .. } if name == "list"
-        )));
-    }
-
-    #[test]
-    fn fenced_and_double_encoded_arguments_are_accepted() {
-        for arguments in [
-            "```json\n{\"path\":\"a.txt\"}\n```",
-            "\"{\\\"path\\\":\\\"a.txt\\\"}\"",
-        ] {
-            let mut app = AppHandle::fake();
-            let mut normalizer =
-                ProviderStreamNormalizer::new(ProviderKind::OpenAiCompatible, 1, vec![]);
-            normalizer.push(
-                &mut app,
-                ProviderEvent::ToolCallDelta {
-                    index: Some(0),
-                    id: Some("call-a".into()),
-                    name: Some("read".into()),
-                    arguments: arguments.into(),
-                },
-            );
-            normalizer.push(
-                &mut app,
-                ProviderEvent::Stopped {
-                    reason: "tool_calls".into(),
-                },
-            );
-            normalizer
-                .finish(&mut app)
-                .unwrap_or_else(|error| panic!("accepted {arguments:?}: {error:?}"));
-            assert!(
-                app.events().iter().any(|event| matches!(
-                    &event.kind,
-                    crate::EventKind::ProviderToolCall { arguments, .. }
-                        if arguments == r#"{"path":"a.txt"}"#
-                )),
-                "{arguments}"
-            );
-        }
-    }
-
-    #[test]
-    fn invalid_json_escapes_are_repaired_without_touching_valid_ones() {
-        let normalized = |raw: &str| normalize_tool_arguments(raw).into_owned();
-        assert_eq!(
-            normalized(r#"{"path":"C:\Slim\src"}"#),
-            r#"{"path":"C:\\Slim\\src"}"#
-        );
-        assert_eq!(
-            normalized(r#"{"content":"a\*b"}"#),
-            r#"{"content":"a\\*b"}"#
-        );
-        for valid in [
-            r#"{"text":"line\nbreak"}"#,
-            r#"{"text":"tab\there"}"#,
-            r#"{"text":"quote\"inside"}"#,
-            r#"{"path":"C:\\Slim"}"#,
-            r#"{"text":"slash\/here"}"#,
-            r#"{"text":"caf\u00e9"}"#,
-        ] {
-            assert_eq!(normalized(valid), valid, "{valid}");
-        }
-    }
-
-    #[test]
-    fn fenced_and_double_encoded_escapes_are_repaired_at_the_inner_layer() {
-        assert_eq!(
-            normalize_tool_arguments("```json\n{\"path\":\"a.txt\"}\n```").as_ref(),
-            r#"{"path":"a.txt"}"#
-        );
-        let double_encoded = r#""{\"content\":\"literal \\* star\"}""#;
-        assert_eq!(
-            normalize_tool_arguments(double_encoded).as_ref(),
-            r#"{"content":"literal \\* star"}"#
-        );
-    }
-
-    #[test]
-    fn anthropic_duplicate_completed_call_ids_reject_the_entire_batch() {
-        for duplicate in [false, true] {
-            let mut app = AppHandle::fake();
-            let mut normalizer = ProviderStreamNormalizer::new(ProviderKind::Anthropic, 1, vec![]);
-            for index in 0..2 {
-                normalizer.push(
-                    &mut app,
-                    ProviderEvent::ToolCallStart {
-                        index,
-                        id: if duplicate {
-                            "same-call".into()
-                        } else {
-                            format!("call-{index}")
-                        },
-                        name: "read".into(),
-                    },
-                );
-                normalizer.push(
-                    &mut app,
-                    ProviderEvent::ToolCallInputDelta {
-                        index,
-                        partial_json: format!(r#"{{"path":"file-{index}"}}"#),
-                    },
-                );
-                normalizer.push(&mut app, ProviderEvent::ContentBlockStop { index });
-            }
-            normalizer.push(
-                &mut app,
-                ProviderEvent::Stopped {
-                    reason: "tool_use".into(),
-                },
-            );
-            let result = normalizer.finish(&mut app);
-            let published = app
-                .events()
-                .iter()
-                .filter(|event| matches!(event.kind, crate::EventKind::ProviderToolCall { .. }))
-                .count();
-            if duplicate {
-                assert!(matches!(result, Err(ProviderError::MalformedToolCall)));
-                assert_eq!(published, 0, "no member of an invalid batch may execute");
-            } else {
-                assert!(
-                    result.is_ok(),
-                    "same-name calls with distinct IDs remain valid"
-                );
-                assert_eq!(published, 2);
-            }
-        }
-    }
-
-    #[test]
-    fn protocol_failure_retains_later_usage_without_publishing_more_content() {
-        for partial in [false, true] {
-            let mut app = AppHandle::fake();
-            app.push_event(crate::SessionEvent::new(
-                1,
-                crate::EventKind::ContextSnapshot {
-                    request_kind: crate::RequestKind::ProviderTurn,
-                    provider: "fixture".into(),
-                    model: "fixture".into(),
-                    system_bytes: 0,
-                    tool_schema_bytes: 0,
-                    history_bytes: 0,
-                    tool_result_bytes: 0,
-                    serialized_chars: 0,
-                    estimated_tokens: 0,
-                    context_window_tokens: 0,
-                },
-            ))
-            .unwrap();
-            let mut normalizer =
-                ProviderStreamNormalizer::new(ProviderKind::OpenAiCodex, 2, vec![]);
-            normalizer.push(&mut app, ProviderEvent::TextDelta("Preserved text".into()));
-            normalizer.push(
-                &mut app,
-                ProviderEvent::ToolCallDelta {
-                    index: Some(0),
-                    id: Some("call-a".into()),
-                    name: Some("read".into()),
-                    arguments: r#"{"path":"a"}"#.into(),
-                },
-            );
-            normalizer.push(
-                &mut app,
-                ProviderEvent::ToolCallComplete {
-                    index: 0,
-                    id: "call-a".into(),
-                    name: "read".into(),
-                    arguments: r#"{"path":"b"}"#.into(),
-                },
-            );
-            assert_eq!(normalizer.error, Some(ProviderError::MalformedToolCall));
-            normalizer.push(&mut app, ProviderEvent::TextDelta("Rejected text".into()));
-            normalizer.push(
-                &mut app,
-                ProviderEvent::UsageBreakdown {
-                    usage: crate::provider::UsageBreakdown {
-                        uncached_input_tokens: 7,
-                        output_tokens: 3,
-                        ..crate::provider::UsageBreakdown::default()
-                    },
-                },
-            );
-            if partial {
-                normalizer.push(
-                    &mut app,
-                    ProviderEvent::UsagePartial {
-                        input_tokens: 7,
-                        output_tokens: 0,
-                        input_complete: true,
-                        output_complete: false,
-                    },
-                );
-                normalizer.push(
-                    &mut app,
-                    ProviderEvent::UsagePartial {
-                        input_tokens: 0,
-                        output_tokens: 3,
-                        input_complete: false,
-                        output_complete: true,
-                    },
-                );
-            }
-            let terminal = ProviderEvent::Usage {
-                input_tokens: if partial { 0 } else { 7 },
-                output_tokens: if partial { 0 } else { 3 },
-            };
-            normalizer.push(&mut app, terminal.clone());
-            normalizer.push(&mut app, terminal);
-            normalizer.push(
-                &mut app,
-                ProviderEvent::Stopped {
-                    reason: "completed".into(),
-                },
-            );
-            let next_seq = normalizer.next_seq();
-            assert!(matches!(
-                normalizer.finish(&mut app),
-                Err(ProviderError::MalformedToolCall)
-            ));
-            app.push_event(crate::SessionEvent::new(
-                next_seq,
-                crate::EventKind::RequestCompleted {
-                    provider_latency_ms: 1,
-                    cancelled: false,
-                    failed: true,
-                },
-            ))
-            .unwrap();
-            let usage = UsageTotals::from_events(app.events(), false);
-            assert_eq!(usage.uncached_input_tokens, 7);
-            assert_eq!(usage.output_tokens, 3);
-            assert!(!usage.usage_unknown);
-            assert!(usage.requests[0].failed);
-            assert!(!usage.validated_completion);
-            assert!(app.events().iter().any(|event| matches!(
-                &event.kind, crate::EventKind::AssistantTextDelta { text }
-                    if text == "Preserved text"
-            )));
-            assert!(!app.events().iter().any(|event| matches!(
-                &event.kind,
-                crate::EventKind::ProviderToolCall { .. }
-                    | crate::EventKind::ToolStarted { .. }
-                    | crate::EventKind::AssistantEnded { .. }
-            ) || matches!(&event.kind, crate::EventKind::AssistantTextDelta { text }
-                if text.contains("Rejected text"))));
-        }
-    }
-
-    #[tokio::test]
-    async fn cancellation_waits_for_detached_native_work_to_finish() {
-        let cancellation = CancellationToken::new();
-        let native_work = cancellation.track_native_work();
-        cancellation.cancel();
-        assert!(tokio::time::timeout(
-            std::time::Duration::ZERO,
-            cancellation.wait_for_native_work()
-        )
-        .await
-        .is_err());
-        drop(native_work);
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            cancellation.wait_for_native_work(),
-        )
-        .await
-        .unwrap();
-    }
-
-    #[test]
-    fn argument_repair_requires_a_complete_identified_batch_on_each_wire() {
-        let bad = "{\"path\":\"secret-value\"".to_owned();
-        for kind in [
-            ProviderKind::OpenAiCompatible,
-            ProviderKind::OpenAiCodex,
-            ProviderKind::Anthropic,
-        ] {
-            let mut app = AppHandle::fake();
-            let mut normalizer =
-                ProviderStreamNormalizer::new(kind, 1, vec!["secret-value".into()]);
-            let events = match kind {
-                ProviderKind::Anthropic => vec![
-                    ProviderEvent::ToolCallStart {
-                        index: 0,
-                        id: "known".into(),
-                        name: "read".into(),
-                    },
-                    ProviderEvent::ToolCallInputDelta {
-                        index: 0,
-                        partial_json: bad.clone(),
-                    },
-                    ProviderEvent::ContentBlockStop { index: 0 },
-                ],
-                ProviderKind::OpenAiCodex => vec![ProviderEvent::ToolCallComplete {
-                    index: 0,
-                    id: "known".into(),
-                    name: "read".into(),
-                    arguments: bad.clone(),
-                }],
-                _ => vec![ProviderEvent::ToolCallDelta {
-                    index: Some(0),
-                    id: Some("known".into()),
-                    name: Some("read".into()),
-                    arguments: bad.clone(),
-                }],
-            };
-            for event in events {
-                normalizer.push(&mut app, event);
-            }
-            assert!(
-                normalizer.argument_repair_note().is_none(),
-                "incomplete transport cannot be repaired"
-            );
-            let reason = match kind {
-                ProviderKind::Anthropic => "tool_use",
-                ProviderKind::OpenAiCodex => "completed",
-                _ => "tool_calls",
-            };
-            normalizer.push(
-                &mut app,
-                ProviderEvent::Stopped {
-                    reason: reason.into(),
-                },
-            );
-            let note = normalizer
-                .argument_repair_note()
-                .expect("identified invalid JSON");
-            assert!(note.contains("known") && note.contains("[REDACTED]"));
-            assert!(!note.contains("secret-value"));
-            assert!(
-                matches!(
-                    normalizer.finish(&mut app),
-                    Err(ProviderError::MalformedToolCall)
-                ),
-                "one-shot API remains fail closed"
-            );
-            assert!(app
-                .events()
-                .iter()
-                .all(|event| !matches!(event.kind, crate::EventKind::ProviderToolCall { .. })));
-        }
-    }
-
-    #[test]
-    fn anthropic_repairs_identified_invalid_json_after_end_turn_without_block_stop() {
-        let mut app = AppHandle::fake();
-        let mut normalizer =
-            ProviderStreamNormalizer::new(ProviderKind::Anthropic, 1, vec!["secret-value".into()]);
-        for event in [
-            ProviderEvent::ToolCallStart {
-                index: 0,
-                id: "known".into(),
-                name: "read".into(),
-            },
-            ProviderEvent::ToolCallInputDelta {
-                index: 0,
-                partial_json: "{\"path\":\"secret-value\"".into(),
-            },
-            ProviderEvent::Stopped {
-                reason: "end_turn".into(),
-            },
-        ] {
-            normalizer.push(&mut app, event);
-        }
-        let note = normalizer
-            .argument_repair_note()
-            .expect("terminal Anthropic call can be repaired");
-        assert!(note.contains("known") && note.contains("[REDACTED]"));
-        assert!(!note.contains("secret-value"));
-        assert!(matches!(
-            normalizer.finish(&mut app),
-            Err(ProviderError::MalformedToolCall)
-        ));
-        assert!(app
-            .events()
-            .iter()
-            .all(|event| !matches!(event.kind, crate::EventKind::ProviderToolCall { .. })));
-    }
-
-    #[test]
-    fn context_overflow_does_not_match_auth_usage_or_output_limits() {
-        for (status, message) in [
-            (401, "Access token expired"),
-            (403, "Token does not have permission"),
-            (429, "Token rate limit exceeded"),
-            (400, "max_tokens must be at least 1"),
-            (400, "Invalid content length"),
-        ] {
-            let error = ProviderError::Http {
-                status,
-                retry_after: None,
-                message: message.into(),
-            };
-            assert!(
-                !is_context_overflow_error(&error),
-                "not context overflow: {error:?}"
-            );
-        }
-        assert!(is_context_overflow_error(&ProviderError::Http {
-            status: 400,
-            retry_after: None,
-            message: "This model's maximum context length is 1000 tokens".into(),
-        }));
-    }
-
-    #[test]
-    fn retry_wait_budget_is_shared_across_attempts() {
-        let delay = std::time::Duration::from_secs(40);
-        let error = ProviderError::Http {
-            status: 429,
-            retry_after: Some(delay),
-            message: "rate limited".into(),
-        };
-        assert_eq!(
-            provider_recovery_delay(&error, 1, std::time::Duration::ZERO).unwrap(),
-            delay
-        );
-        assert_eq!(
-            provider_recovery_delay(&error, 2, delay).unwrap(),
-            MAX_PROVIDER_RECOVERY_WAIT.saturating_sub(delay)
-        );
-        assert!(provider_recovery_delay(&error, 2, MAX_PROVIDER_RECOVERY_WAIT).is_err());
-        assert!(!recoverable_provider_error(&ProviderError::Remote {
-            message: "http 429: payload text".into()
-        }));
-    }
-
-    #[test]
-    fn retry_after_over_budget_is_capped_instead_of_skipping_retry() {
-        let error = ProviderError::Http {
-            status: 429,
-            retry_after: Some(std::time::Duration::from_secs(3600)),
-            message: "slow down".into(),
-        };
-        assert_eq!(
-            provider_recovery_delay(&error, 1, std::time::Duration::ZERO).unwrap(),
-            MAX_PROVIDER_RECOVERY_WAIT
-        );
-        let blocked = provider_recovery_delay(&error, 2, MAX_PROVIDER_RECOVERY_WAIT).unwrap_err();
-        assert!(
-            matches!(blocked, ProviderError::Http { status: 429, message, .. } if message.contains("exceeding") && message.contains("work remains pending"))
-        );
-    }
-
-    #[test]
-    fn recoverable_errors_include_timeouts_and_rate_limits_not_auth() {
-        assert!(recoverable_provider_error(&ProviderError::Transport {
-            safe_to_retry: false,
-            message: "provider request timed out before response headers".into(),
-        }));
-        assert!(recoverable_provider_error(&ProviderError::Transport {
-            safe_to_retry: false,
-            message: "provider stream idle timeout".into(),
-        }));
-        assert!(recoverable_provider_error(&ProviderError::Transport {
-            safe_to_retry: false,
-            message: "provider stream interrupted: connection reset".into(),
-        }));
-        assert!(recoverable_provider_error(&ProviderError::Http {
-            status: 408,
-            retry_after: None,
-            message: "request timeout".into(),
-        }));
-        assert!(recoverable_provider_error(&ProviderError::Http {
-            status: 429,
-            retry_after: None,
-            message: "slow down".into(),
-        }));
-        assert!(!recoverable_provider_error(&ProviderError::Http {
-            status: 401,
-            retry_after: None,
-            message: "unauthorized".into(),
-        }));
-        assert!(!recoverable_provider_error(&ProviderError::Cancelled));
-        assert!(!recoverable_provider_error(
-            &ProviderError::MalformedToolCall
-        ));
-    }
-
-    #[test]
-    fn evidence_dedup_requires_the_original_tool_content_in_active_history() {
-        let output = "retained evidence ".repeat(20);
-        let original = ProviderMessage::tool("read", "original", &output);
-        assert!(tool_output_already_in_context(
-            std::slice::from_ref(&original),
-            "read",
-            &output
-        ));
-        assert!(!tool_output_already_in_context(
-            std::slice::from_ref(&original),
-            "search",
-            &output
-        ));
-        assert!(!tool_output_already_in_context(
-            std::slice::from_ref(&original),
-            "read",
-            "changed"
-        ));
-        let pointer = "[duplicate read result omitted; identical output already in context]";
-        let messages = vec![
-            ProviderMessage::user("read the file"),
-            ProviderMessage::assistant(
-                "",
-                vec![ProviderToolCall {
-                    id: "original".into(),
-                    name: "read".into(),
-                    arguments: r#"{"path":"file.txt"}"#.into(),
-                }],
-            ),
-            original,
-            ProviderMessage::assistant("done", vec![]),
-            ProviderMessage::user("read it again"),
-        ];
-        let selection = select_compaction_history(
-            &messages,
-            &CompactionPolicy {
-                keep_recent_tokens: 1,
-                ..CompactionPolicy::default()
-            },
-        )
-        .expect("compaction selection");
-        assert_eq!(selection.first_kept_index, 4);
-        let mut compacted =
-            apply_compaction_selection(&messages, &selection, &output).expect("compacted history");
-        assert!(compacted.iter().all(|message| message.role != "tool"));
-        compacted.push(ProviderMessage::tool("read", "pointer", pointer));
-        assert!(!tool_output_already_in_context(&compacted, "read", &output));
-        assert!(!tool_output_already_in_context(&compacted, "read", pointer));
-    }
-
-    fn call(id: &str, name: &str, path: &str) -> ProviderToolCall {
-        ProviderToolCall {
-            id: id.into(),
-            name: name.into(),
-            arguments: format!(r#"{{"path":"{path}"}}"#),
-        }
-    }
-
-    #[test]
-    fn elision_replaces_evidence_superseded_by_a_later_successful_write() {
-        let read_output = "old bytes ".repeat(40);
-        let recovery = format!(
-            "stale read: a.txt; the precondition differs. No write applied.\nCurrent file is below:\n{}",
-            "x".repeat(400)
-        );
-        let mut messages = vec![
-            ProviderMessage::user("fix a"),
-            ProviderMessage::assistant("", vec![call("r1", "read", "a.txt")]),
-            ProviderMessage::tool("read", "r1", &read_output),
-            ProviderMessage::assistant("", vec![call("w1", "write", "a.txt")]),
-            ProviderMessage::tool("write", "w1", &recovery),
-            ProviderMessage::assistant("", vec![call("w2", "write", "a.txt")]),
-            ProviderMessage::tool(
-                "write",
-                "w2",
-                "written a.txt; bytes=5; sha256=abc; exists=true; do not re-read",
-            ),
-        ];
-        let stats = elide_superseded_tool_outputs(&mut messages);
-        assert_eq!(stats.elided, 2);
-        assert_eq!(
-            stats.original_bytes as usize,
-            read_output.len() + recovery.len()
-        );
-        assert_eq!(
-            messages[2].content,
-            "[superseded read output elided; a.txt was overwritten by a later write]"
-        );
-        assert_eq!(
-            messages[4].content,
-            "[superseded write failure output elided; a.txt was updated by a later mutation]"
-        );
-        assert_eq!(
-            messages[6].content,
-            "written a.txt; bytes=5; sha256=abc; exists=true; do not re-read"
-        );
-    }
-
-    #[test]
-    fn elision_keeps_reads_after_patch_but_elides_the_superseded_recovery_body() {
-        let read_output = "still current except the edited span ".repeat(20);
-        let patch_recovery = format!(
-            "a.txt: file unchanged. Matches start at lines 2.\nCurrent file is below:\n{}",
-            "y".repeat(400)
-        );
-        let mut messages = vec![
-            ProviderMessage::user("fix a"),
-            ProviderMessage::assistant("", vec![call("r1", "read", "a.txt")]),
-            ProviderMessage::tool("read", "r1", &read_output),
-            ProviderMessage::assistant("", vec![call("p1", "patch", "a.txt")]),
-            ProviderMessage::tool("patch", "p1", &patch_recovery),
-            ProviderMessage::assistant("", vec![call("p2", "patch", "a.txt")]),
-            ProviderMessage::tool(
-                "patch",
-                "p2",
-                "patched a.txt; 1 edits applied atomically; bytes=9; sha256=def; do not re-read",
-            ),
-        ];
-        let stats = elide_superseded_tool_outputs(&mut messages);
-        // Partial staleness is still evidence: the read survives a patch.
-        assert_eq!(stats.elided, 1);
-        assert_eq!(messages[2].content, read_output);
-        assert_eq!(
-            messages[4].content,
-            "[superseded patch failure output elided; a.txt was updated by a later mutation]"
-        );
-    }
-
-    #[test]
-    fn elision_recognizes_current_and_legacy_ambiguous_patch_context() {
-        for marker in [
-            "Suggested unique expected:",
-            "Example context only for the first match at line 2; choose the intended occurrence explicitly:",
-        ] {
-            let recovery = format!("file unchanged.\n{marker}\n{}", "context\n".repeat(80));
-            let mut messages = vec![
-                ProviderMessage::assistant("", vec![call("p1", "patch", "a.txt")]),
-                ProviderMessage::tool("patch", "p1", &recovery),
-                ProviderMessage::assistant("", vec![call("p2", "patch", "a.txt")]),
-                ProviderMessage::tool(
-                    "patch", "p2",
-                    "patched a.txt; 1 edits applied atomically; bytes=9; sha256=def; do not re-read",
-                ),
-            ];
-            assert_eq!(elide_superseded_tool_outputs(&mut messages).elided, 1);
-            assert!(messages[1].content.starts_with("[superseded patch failure output elided;"));
-            assert!(messages[3].content.starts_with("patched a.txt;"));
-        }
-    }
-
-    #[test]
-    fn elision_keeps_the_read_taken_after_the_last_write() {
-        let stale = "first version ".repeat(30);
-        let current = "second version ".repeat(30);
-        let mut messages = vec![
-            ProviderMessage::assistant("", vec![call("r1", "read", "a.txt")]),
-            ProviderMessage::tool("read", "r1", &stale),
-            ProviderMessage::assistant("", vec![call("w1", "write", "a.txt")]),
-            ProviderMessage::tool(
-                "write",
-                "w1",
-                "written a.txt; bytes=9; sha256=abc; exists=true; do not re-read",
-            ),
-            ProviderMessage::assistant("", vec![call("r2", "read", "a.txt")]),
-            ProviderMessage::tool("read", "r2", &current),
-        ];
-        let stats = elide_superseded_tool_outputs(&mut messages);
-        assert_eq!(stats.elided, 1);
-        assert!(messages[1].content.starts_with("[superseded read"));
-        assert_eq!(messages[5].content, current);
-    }
-
-    #[test]
-    fn elision_ignores_other_paths_failed_mutations_and_reruns_idempotently() {
-        let output = "content ".repeat(50);
-        let mut messages = vec![
-            ProviderMessage::assistant("", vec![call("r1", "read", "a.txt")]),
-            ProviderMessage::tool("read", "r1", &output),
-            ProviderMessage::assistant("", vec![call("w1", "write", "b.txt")]),
-            ProviderMessage::tool(
-                "write",
-                "w1",
-                "written b.txt; bytes=1; sha256=x; exists=true; do not re-read",
-            ),
-            ProviderMessage::assistant("", vec![call("w2", "write", "c.txt")]),
-            ProviderMessage::tool("write", "w2", "stale read: c.txt; no write applied"),
-            // No path in the arguments: nothing to key on, never elides.
-            ProviderMessage::assistant(
-                "",
-                vec![ProviderToolCall {
-                    id: "r2".into(),
-                    name: "read".into(),
-                    arguments: "invalid".into(),
-                }],
-            ),
-            ProviderMessage::tool("read", "r2", &output),
-        ];
-        let stats = elide_superseded_tool_outputs(&mut messages);
-        assert_eq!(stats, ElisionStats::default());
-        assert_eq!(messages[1].content, output);
-        // The failed write carries no recovery body and no later mutation.
-        assert_eq!(messages[5].content, "stale read: c.txt; no write applied");
-        assert_eq!(messages[7].content, output);
-        assert_eq!(
-            elide_superseded_tool_outputs(&mut messages),
-            ElisionStats::default()
-        );
-    }
-
-    #[test]
-    fn codex_completion_rejects_conflicting_identity_or_arguments() {
-        for (index, id, name, arguments) in [
-            (0, "other-id", "read", r#"{"path":"a"}"#),
-            (1, "call-a", "read", r#"{"path":"a"}"#),
-            (0, "call-a", "write", r#"{"path":"a"}"#),
-            (0, "call-a", "read", r#"{"path":"b"}"#),
-            (0, "call-a", "read", "invalid JSON"),
-        ] {
-            let mut normalizer =
-                ProviderStreamNormalizer::new(ProviderKind::OpenAiCodex, 1, vec![]);
-            let mut app = AppHandle::fake();
-            normalizer.push(
-                &mut app,
-                ProviderEvent::ToolCallDelta {
-                    index: Some(0),
-                    id: Some("call-a".into()),
-                    name: Some("read".into()),
-                    arguments: r#"{"path":"a"}"#.into(),
-                },
-            );
-            normalizer.push(
-                &mut app,
-                ProviderEvent::ToolCallComplete {
-                    index,
-                    id: id.into(),
-                    name: name.into(),
-                    arguments: arguments.into(),
-                },
-            );
-            normalizer.push(
-                &mut app,
-                ProviderEvent::Stopped {
-                    reason: "completed".into(),
-                },
-            );
-            assert!(matches!(
-                normalizer.finish(&mut app),
-                Err(ProviderError::MalformedToolCall)
-            ));
-            assert!(!app
-                .events()
-                .iter()
-                .any(|event| matches!(event.kind, crate::EventKind::ProviderToolCall { .. })));
-        }
-    }
-
-    #[derive(Default)]
-    struct FixtureCodeIntel {
-        fail: bool,
-        rejects_workspace: bool,
-        scoped_queries: std::sync::Mutex<Vec<Option<std::path::PathBuf>>>,
-        updates: std::sync::Mutex<Vec<crate::codeintel::CodeIntelFileUpdate>>,
-        sync_blocked: bool,
-        sync_started: tokio::sync::Notify,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::codeintel::CodeIntelligence for FixtureCodeIntel {
-        fn supports_workspace(&self, _workspace: &Path) -> bool {
-            !self.rejects_workspace
-        }
-
-        async fn status(&self, _workspace: &Path) -> crate::codeintel::CodeIntelOutcome {
-            if self.fail {
-                return crate::codeintel::CodeIntelOutcome::unavailable(
-                    "fixture",
-                    "request timed out",
-                );
-            }
-            crate::codeintel::CodeIntelOutcome {
-                meta: crate::codeintel::CodeIntelMeta {
-                    server: "fixture".into(),
-                    state: crate::codeintel::CodeIntelServerState::Ready,
-                    completeness: crate::codeintel::CodeIntelCompleteness::Complete,
-                    document_version: None,
-                    stale: false,
-                    elapsed_ms: 0,
-                },
-                payload: json!({ "servers": [], "summary": "ok" }),
-            }
-        }
-
-        async fn definition(
-            &self,
-            _query: &crate::codeintel::CodeIntelPositionQuery,
-        ) -> crate::codeintel::CodeIntelOutcome {
-            if self.fail {
-                return crate::codeintel::CodeIntelOutcome::unavailable(
-                    "fixture",
-                    "request timed out",
-                );
-            }
-            crate::codeintel::CodeIntelOutcome {
-                meta: crate::codeintel::CodeIntelMeta {
-                    server: "fixture".into(),
-                    state: crate::codeintel::CodeIntelServerState::Ready,
-                    completeness: crate::codeintel::CodeIntelCompleteness::Complete,
-                    document_version: Some(1),
-                    stale: false,
-                    elapsed_ms: 0,
-                },
-                payload: json!({ "found": false, "file": "", "line": 0, "column": 0 }),
-            }
-        }
-
-        async fn references(
-            &self,
-            _query: &crate::codeintel::CodeIntelPositionQuery,
-        ) -> crate::codeintel::CodeIntelOutcome {
-            crate::codeintel::CodeIntelOutcome::unavailable("fixture", "unused")
-        }
-
-        async fn hover(
-            &self,
-            _query: &crate::codeintel::CodeIntelPositionQuery,
-        ) -> crate::codeintel::CodeIntelOutcome {
-            crate::codeintel::CodeIntelOutcome::unavailable("fixture", "unused")
-        }
-
-        async fn symbols(
-            &self,
-            query: &crate::codeintel::CodeIntelSymbolQuery,
-        ) -> crate::codeintel::CodeIntelOutcome {
-            self.scoped_queries.lock().unwrap().push(query.path.clone());
-            crate::codeintel::CodeIntelOutcome::unavailable("fixture", "unused")
-        }
-
-        async fn diagnostics(
-            &self,
-            query: &crate::codeintel::CodeIntelDiagnosticsQuery,
-        ) -> crate::codeintel::CodeIntelOutcome {
-            self.scoped_queries.lock().unwrap().push(query.path.clone());
-            crate::codeintel::CodeIntelOutcome::unavailable("fixture", "unused")
-        }
-
-        async fn notify_file_changed(
-            &self,
-            _workspace: &Path,
-            _path: &Path,
-            _text: Option<String>,
-        ) {
-        }
-        async fn notify_file_updated(
-            &self,
-            _workspace: &Path,
-            _path: &Path,
-            update: crate::codeintel::CodeIntelFileUpdate,
-        ) {
-            self.updates.lock().unwrap().push(update);
-            if self.sync_blocked {
-                self.sync_started.notify_one();
-                std::future::pending::<()>().await;
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn native_patch_passes_sequential_ranges_through_runtime() {
-        let root = std::env::temp_dir().join(format!(
-            "slim-runtime-patch-sync-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let original = "fn \u{e9}\u{1f680}e\u{301}first() {}\r\nfn second() {}\r\n";
-        std::fs::write(root.join("main.rs"), original).unwrap();
-        let backend = Arc::new(FixtureCodeIntel::default());
-        let mut runtime = Runtime::new();
-        runtime.set_code_intelligence(backend.clone());
-        let calls = vec![ProviderToolCall {
-            id: "patch".into(),
-            name: "patch".into(),
-            arguments: json!({"path":"main.rs", "edits":[
-                {"expected":"first", "replacement":"first_longer() {}\nfn inserted"},
-                {"expected":"second", "replacement":"updated"}
-            ]})
-            .to_string(),
-        }];
-        let (results, _) = runtime
-            .execute_provider_tool_batch(
-                crate::OperatingMode::Auto,
-                &root,
-                "batch",
-                &calls,
-                1,
-                &mut CausalGovernor::default(),
-            )
-            .await
-            .unwrap();
-        assert!(results[0].success, "{}", results[0].output);
-        let updates = backend.updates.lock().unwrap();
-        assert_eq!(updates.len(), 1);
-        let update = &updates[0];
-        assert_eq!(
-            update.text,
-            std::fs::read_to_string(root.join("main.rs")).unwrap()
-        );
-        let patch = update.patch.as_ref().unwrap();
-        assert!(patch.matches_before(original));
-        assert_eq!(patch.edits.len(), 2);
-        assert_eq!(patch.edits[0].start.line, 0);
-        assert_eq!(patch.edits[0].start.prefix, "fn \u{e9}\u{1f680}e\u{301}");
-        assert_eq!(patch.edits[0].end.prefix, "fn \u{e9}\u{1f680}e\u{301}first");
-        assert_eq!(patch.edits[0].text, "first_longer() {}\r\nfn inserted");
-        assert_eq!(
-            patch.edits[1].start.line, 2,
-            "second range uses the new line layout"
-        );
-        assert_eq!(patch.edits[1].start.prefix, "fn ");
-        drop(updates);
-        drop(runtime);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancellation_interrupts_post_patch_synchronization() {
-        let root = std::env::temp_dir().join(format!(
-            "slim-runtime-sync-cancel-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("main.rs"), "old").unwrap();
-        let backend = Arc::new(FixtureCodeIntel {
-            sync_blocked: true,
-            ..Default::default()
-        });
-        let cancellation = CancellationToken::new();
-        let mut runtime = Runtime::new();
-        runtime.set_code_intelligence(backend.clone());
-        runtime.set_cancellation_token(cancellation.clone());
-        let calls = vec![ProviderToolCall {
-            id: "patch".into(),
-            name: "patch".into(),
-            arguments: json!({"path":"main.rs", "edits":[{"expected":"old", "replacement":"new"}]})
-                .to_string(),
-        }];
-        let mut governor = CausalGovernor::default();
-        let execute = runtime.execute_provider_tool_batch(
-            crate::OperatingMode::Auto,
-            &root,
-            "batch",
-            &calls,
-            1,
-            &mut governor,
-        );
-        tokio::pin!(execute);
-        tokio::select! {
-            _ = &mut execute => panic!("sync should be blocked"),
-            _ = backend.sync_started.notified() => {},
-        }
-        cancellation.cancel();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), execute)
-            .await
-            .expect("cancel unblocks runtime sync");
-        assert_eq!(
-            std::fs::read_to_string(root.join("main.rs")).unwrap(),
-            "new"
-        );
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn code_intel_error_payload_reports_failure() {
-        let request = Ok(CodeIntelRequest::Status {
-            workspace: std::path::PathBuf::from("D:/demo"),
-        });
-        let (result, _) = run_code_intel_request(
-            Some(Arc::new(FixtureCodeIntel {
-                fail: true,
-                ..Default::default()
-            })),
-            request,
-            None,
-        )
-        .await;
-        assert!(!result.success);
-        assert!(result.output.contains("request timed out"));
-    }
-
-    #[tokio::test]
-    async fn code_intel_completed_negative_answer_stays_successful() {
-        let request = Ok(CodeIntelRequest::Definition(
-            crate::codeintel::CodeIntelPositionQuery {
-                workspace: std::path::PathBuf::from("D:/demo"),
-                path: std::path::PathBuf::from("D:/demo/main.rs"),
-                line: 1,
-                column: 1,
-                symbol: None,
-                max_results: 20,
-                offset: 0,
-                revision: None,
-                cancellation: None,
-            },
-        ));
-        let (result, _) =
-            run_code_intel_request(Some(Arc::new(FixtureCodeIntel::default())), request, None)
-                .await;
-        assert!(result.success);
-        assert!(result.output.contains("not found"));
-    }
-
-    #[tokio::test]
-    async fn code_intel_invalid_path_never_reaches_backend_and_valid_scope_is_preserved() {
-        let root = batch_fixture_root("code-intel-path-types");
-        let path = root.join("ação com espaço.rs");
-        std::fs::write(&path, "fn target() {}\n").unwrap();
-        let backend = Arc::new(FixtureCodeIntel::default());
-        let mut runtime = Runtime::new();
-        runtime.set_code_intelligence(backend.clone());
-        let mut calls = Vec::new();
-        for action in ["symbol", "diagnostics"] {
-            for (index, invalid) in [json!(42), json!(true), json!([]), json!({})]
-                .into_iter()
-                .enumerate()
-            {
-                calls.push(provider_call(
-                    &format!("{action}-{index}"),
-                    "code_intel",
-                    json!({"action":action,"path":invalid,"query":"target"}),
-                ));
-            }
-        }
-        let (results, next) = runtime
-            .execute_provider_tool_batch(
-                crate::OperatingMode::Auto,
-                &root,
-                "invalid-paths",
-                &calls,
-                1,
-                &mut CausalGovernor::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(results.len(), calls.len());
-        assert!(results
-            .iter()
-            .all(|result| !result.success && result.output.contains("path must be a string")));
-        assert!(backend.scoped_queries.lock().unwrap().is_empty());
-
-        let mut valid_calls = Vec::new();
-        for action in ["symbol", "diagnostics"] {
-            valid_calls.push(provider_call(
-                &format!("valid-{action}"),
-                "code_intel",
-                json!({"action":action,"path":"ação com espaço.rs","query":"target"}),
-            ));
-        }
-        runtime
-            .execute_provider_tool_batch(
-                crate::OperatingMode::Auto,
-                &root,
-                "valid-paths",
-                &valid_calls,
-                next,
-                &mut CausalGovernor::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            *backend.scoped_queries.lock().unwrap(),
-            vec![Some(std::fs::canonicalize(&path).unwrap()); 2]
-        );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn target() {}\n");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn code_intel_batch_preserves_admission_feedback_in_output_event() {
-        let root = batch_fixture_root("code-intel-admission");
-        std::fs::write(root.join("main.rs"), "fn target() {}\n").unwrap();
-        let mut runtime = Runtime::new();
-        runtime.set_code_intelligence(Arc::new(FixtureCodeIntel::default()));
-        let calls = vec![provider_call(
-            "code-intel",
-            "code_intel",
-            serde_json::json!({
-                "action":"definition",
-                "path":"main.rs",
-                "line":1,
-                "column":4,
-                "max_results":0
-            }),
-        )];
-        let prepared = runtime
-            .prepare_provider_tool_invocations(crate::OperatingMode::Auto, &root, &calls)
-            .await
-            .expect("code_intel preparation");
-        let prefix = crate::tools::admission_output_prefix(&prepared[0].admission_notes)
-            .expect("saturated max_results should be visible");
-        assert!(prefix.contains("code_intel max_results 0 -> 1"));
-        let (results, _) = runtime
-            .execute_provider_tool_batch(
-                crate::OperatingMode::Auto,
-                &root,
-                "code-intel-batch",
-                &calls,
-                1,
-                &mut CausalGovernor::default(),
-            )
-            .await
-            .expect("code_intel batch");
-        assert_eq!(results.len(), 1);
-        assert!(
-            results[0].output.starts_with(&prefix),
-            "{}",
-            results[0].output
-        );
-        let event_output = runtime
-            .app
-            .events()
-            .iter()
-            .find_map(|event| match &event.kind {
-                crate::EventKind::ToolOutput {
-                    call_id, output, ..
-                } if call_id == "code-intel" => Some(output),
-                _ => None,
-            });
-        assert_eq!(event_output, Some(&results[0].output));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn native_shell_process_facts_keep_nonterminating_error_boundary() {
-        let root = batch_fixture_root("shell-process-facts");
-        let mut runtime = Runtime::new();
-        let (result, _) = runtime
-            .execute_tool(
-                crate::OperatingMode::Auto,
-                &root,
-                "shell",
-                r#"{"command":"Write-Error 'SLIM_TEST_NONTERMINATING'; Write-Output 'continued'"}"#,
-                1,
-            )
-            .expect("native shell execution");
-        assert!(result.success, "{}", result.output);
-        assert!(result.output.contains("continued"), "{}", result.output);
-
-        let process = runtime
-            .app
-            .events()
-            .iter()
-            .find_map(|event| match &event.kind {
-                crate::EventKind::ToolProcessFinished { process, .. } => Some(process),
-                _ => None,
-            });
-        let process = process.expect("native shell must publish process facts");
-        assert_eq!(process.exit_code, Some(0));
-        assert!(process.stdout_bytes > 0, "{process:?}");
-        assert!(process.stderr_bytes > 0, "{process:?}");
-        assert!(!process.timed_out, "{process:?}");
-        assert!(!process.cancelled, "{process:?}");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn tool_definition_sets_are_shared_per_semantic_key() {
-        let cwd = std::env::temp_dir();
-        let runtime = Runtime::new();
-        let first = runtime.workspace_tool_definitions(crate::OperatingMode::Auto, &cwd);
-        let second = runtime.workspace_tool_definitions(crate::OperatingMode::Auto, &cwd);
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(
-            runtime.advertised_tool_definitions(crate::OperatingMode::Auto),
-            first.as_ref()
-        );
-
-        let read_only = runtime.workspace_tool_definitions(crate::OperatingMode::ReadOnly, &cwd);
-        assert!(!Arc::ptr_eq(&first, &read_only));
-        assert!(Arc::ptr_eq(
-            &read_only,
-            &runtime.workspace_tool_definitions(crate::OperatingMode::ReadOnly, &cwd)
-        ));
-
-        let mut with_intel = Runtime::new();
-        with_intel.set_code_intelligence(Arc::new(FixtureCodeIntel::default()));
-        let enabled = with_intel.workspace_tool_definitions(crate::OperatingMode::Auto, &cwd);
-        assert!(!Arc::ptr_eq(&first, &enabled));
-        assert!(enabled.iter().any(|tool| tool["name"] == "code_intel"));
-
-        with_intel.set_code_intelligence(Arc::new(FixtureCodeIntel {
-            rejects_workspace: true,
-            ..Default::default()
-        }));
-        let rejected = with_intel.workspace_tool_definitions(crate::OperatingMode::Auto, &cwd);
-        assert!(Arc::ptr_eq(&first, &rejected));
-        assert!(!rejected.iter().any(|tool| tool["name"] == "code_intel"));
-
-        let mut interactive = Runtime::new();
-        let (route, _responder) = crate::interaction_route();
-        interactive.set_interaction_route(route);
-        let asked = interactive.workspace_tool_definitions(crate::OperatingMode::Auto, &cwd);
-        assert!(!Arc::ptr_eq(&first, &asked));
-        assert!(asked.iter().any(|tool| tool["name"] == "ask_question"));
-        assert!(Arc::ptr_eq(
-            &asked,
-            &interactive.workspace_tool_definitions(crate::OperatingMode::Auto, &cwd)
-        ));
-        let interactive_readonly =
-            interactive.workspace_tool_definitions(crate::OperatingMode::ReadOnly, &cwd);
-        assert!(interactive_readonly
-            .iter()
-            .any(|tool| tool["name"] == "ask_question"));
-        assert!(!Arc::ptr_eq(&interactive_readonly, &read_only));
-        let plan = interactive.workspace_tool_definitions(crate::OperatingMode::Plan, &cwd);
-        assert!(Arc::ptr_eq(
-            &plan,
-            &runtime.workspace_tool_definitions(crate::OperatingMode::Plan, &cwd),
-        ));
-    }
-
-    #[test]
-    fn todo_tool_keeps_initial_status_and_updates_the_requested_id() {
-        // The advertised contract has one batch form; legacy calls still parse.
-        let definition = todo_tool_definition();
-        let schema = &definition["input_schema"];
-        assert_eq!(schema["required"], json!(["todos"]));
-        assert_eq!(schema["properties"].as_object().unwrap().len(), 1);
-        assert_eq!(schema["properties"]["todos"]["minItems"], 1);
-        let mut runtime = Runtime::new();
-        let cwd = std::env::temp_dir();
-        runtime.prepare_loop_capabilities(&cwd).unwrap();
-        let (created, seq) = runtime
-            .execute_todo(
-                crate::OperatingMode::Auto,
-                ToolInvocation {
-                    batch_id: "todo-test",
-                    call_id: "create",
-                    name: "todo",
-                    arguments: &json!({"todos":[
-                        {"title":"inspect", "status":"in_progress"},
-                        {"title":"implement", "status":"pending"},
-                        {"title":"verify", "status":"pending"}
-                    ]})
-                    .to_string(),
-                },
-                1,
-            )
-            .unwrap();
-        assert!(created.success, "{}", created.output);
-        let items = runtime
-            .capability_bridge
-            .as_ref()
-            .unwrap()
-            .todo("session")
-            .unwrap()
-            .items();
-        let first = items[0].id;
-        let second = items[1].id;
-        assert_eq!(items[0].status, crate::task::TodoStatus::InProgress);
-        assert!(created
-            .output
-            .contains(&format!("todo {first} [in_progress]: inspect")));
-        // A follow-up turn must retain IDs, status and task revisions.
-        runtime.prepare_loop_capabilities(&cwd).unwrap();
-        let persisted = serde_json::to_string(&runtime.task_facts()).unwrap();
-        let facts: Vec<DurableFact> = serde_json::from_str(&persisted).unwrap();
-        runtime = Runtime::new();
-        runtime.restore_task_facts(&facts, &cwd).unwrap();
-        assert!(
-            runtime.app.events().is_empty(),
-            "restoration must not execute tools"
-        );
-        let (updated, _) = runtime
-            .execute_todo(
-                crate::OperatingMode::Auto,
-                ToolInvocation {
-                    batch_id: "todo-test",
-                    call_id: "update",
-                    name: "todo",
-                    arguments: &json!({"todos":[
-                        {"id":first.to_string(), "title":"inspect", "status":"completed"},
-                        {"id":second, "status":"in_progress"}
-                    ]})
-                    .to_string(),
-                },
-                seq,
-            )
-            .unwrap();
-        assert!(updated.success, "{}", updated.output);
-        let items = runtime
-            .capability_bridge
-            .as_ref()
-            .unwrap()
-            .todo("session")
-            .unwrap()
-            .items();
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0].status, crate::task::TodoStatus::Completed);
-        assert_eq!(items[1].status, crate::task::TodoStatus::InProgress);
-        assert_eq!(items[2].status, crate::task::TodoStatus::Pending);
-    }
-
-    #[test]
-    fn todo_tool_reports_invalid_entries_and_publishes_partial_progress() {
-        let mut runtime = Runtime::new();
-        runtime
-            .prepare_loop_capabilities(&std::env::temp_dir())
-            .unwrap();
-        let call = |runtime: &mut Runtime, id: &str, args: Value, seq| {
-            runtime
-                .execute_todo(
-                    crate::OperatingMode::Auto,
-                    ToolInvocation {
-                        batch_id: "todo-test",
-                        call_id: id,
-                        name: "todo",
-                        arguments: &args.to_string(),
-                    },
-                    seq,
-                )
-                .unwrap()
-        };
-        let (result, mut seq) = call(
-            &mut runtime,
-            "create",
-            json!({"todos":[
-                {"title":"first", "status":"in_progress"}, {"title":"second"}
-            ]}),
-            1,
-        );
-        assert!(result.success, "{}", result.output);
-        let before = runtime
-            .capability_bridge
-            .as_ref()
-            .unwrap()
-            .todo("session")
-            .unwrap()
-            .items()
-            .to_vec();
-        let first = before[0].id;
-        let second = before[1].id;
-        let cases = [
-            (
-                json!({"todos":[{"id":first,"status":"completed"},{"title":"bad","status":"invalid"}]}),
-                "entry 2",
-            ),
-            (json!({"id":99,"status":"completed"}), "todo 99"),
-            (
-                json!({"id":second,"status":"in_progress"}),
-                "only one todo may be in progress",
-            ),
-        ];
-        for (index, (args, expected)) in cases.into_iter().enumerate() {
-            let (result, next) = call(&mut runtime, &format!("invalid-{index}"), args, seq);
-            seq = next;
-            assert!(!result.success);
-            assert!(result.output.contains(expected), "{}", result.output);
-            assert_eq!(
-                runtime
-                    .capability_bridge
-                    .as_ref()
-                    .unwrap()
-                    .todo("session")
-                    .unwrap()
-                    .items(),
-                before
-            );
-        }
-        let (result, seq) = call(
-            &mut runtime,
-            "partial",
-            json!({"todos":[
-                {"id":first,"status":"completed"}, {"id":99,"status":"in_progress"}
-            ]}),
-            seq,
-        );
-        assert!(!result.success);
-        assert!(result
-            .output
-            .contains(&format!("todo {first} [completed]: first")));
-        let items = runtime
-            .app
-            .events()
-            .iter()
-            .rev()
-            .find_map(|event| match &event.kind {
-                crate::EventKind::TodoChanged { items } => Some(items),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(
-            items[0].status, "completed",
-            "UI must reflect a mutation even when a later entry fails"
-        );
-        let (result, _) = call(
-            &mut runtime,
-            "recover",
-            json!({"id":second,"status":"in_progress"}),
-            seq,
-        );
-        assert!(result.success, "{}", result.output);
-    }
-
-    #[test]
-    fn todo_parser_accepts_content_numeric_id_and_string_list() {
-        let content = parse_todo_mutations(&json!({"content": "map the leak"})).unwrap();
-        assert_eq!(content.len(), 1);
-        assert!(matches!(
-            &content[0].1,
-            TaskMutation::TodoAdd { title, .. } if title == "map the leak"
-        ));
-
-        let numbered = parse_todo_mutations(&json!({
-            "todos": [{"id": 1, "status": "inProgress"}]
-        }))
-        .unwrap();
-        assert_eq!(numbered.len(), 1);
-        assert!(matches!(
-            numbered[0].1,
-            TaskMutation::TodoSetStatus {
-                id: Some(1),
-                status: TaskTodoStatus::InProgress
-            }
-        ));
-
-        let listed = parse_todo_mutations(&json!({"todos": ["ship n2", "verify gate"]})).unwrap();
-        assert_eq!(listed.len(), 2);
-        assert_eq!(listed[0].0, "ship n2");
-        assert_eq!(listed[1].0, "verify gate");
-    }
-
-    #[test]
-    fn todo_full_list_resend_updates_matching_titles_in_place() {
-        let mut runtime = Runtime::new();
-        let cwd = std::env::temp_dir();
-        runtime.prepare_loop_capabilities(&cwd).unwrap();
-        let mut seq = 1;
-        let mut call = |call_id: &str, args: Value| {
-            let (result, next) = runtime
-                .execute_todo(
-                    crate::OperatingMode::Auto,
-                    ToolInvocation {
-                        batch_id: "todo-test",
-                        call_id,
-                        name: "todo",
-                        arguments: &args.to_string(),
-                    },
-                    seq,
-                )
-                .unwrap();
-            seq = next;
-            result
-        };
-        let created = call(
-            "create",
-            json!({"todos":[
-                {"title":"inspect", "status":"in_progress"},
-                {"title":"implement"},
-                {"title":"verify"}
-            ]}),
-        );
-        assert!(created.success, "{}", created.output);
-        // Full-list resend without ids: an entry whose title matches exactly
-        // one existing item is that item's status update, not a duplicate.
-        let resent = call(
-            "resend",
-            json!({"todos":[
-                {"title":"inspect", "status":"completed"},
-                {"title":"implement", "status":"in_progress"},
-                {"title":"verify", "status":"pending"},
-                {"title":"deploy", "status":"pending"}
-            ]}),
-        );
-        assert!(resent.success, "{}", resent.output);
-        let items = runtime
-            .capability_bridge
-            .as_ref()
-            .unwrap()
-            .todo("session")
-            .unwrap()
-            .items()
-            .to_vec();
-        assert_eq!(items.len(), 4, "{:?}", items);
-        assert_eq!(items[0].status, crate::task::TodoStatus::Completed);
-        assert_eq!(items[1].status, crate::task::TodoStatus::InProgress);
-        assert_eq!(items[2].status, crate::task::TodoStatus::Pending);
-        assert_eq!(items[3].title, "deploy");
-    }
-
-    #[test]
-    fn single_redact_removes_sensitive_values_before_governor_relay() {
-        let mut runtime = Runtime::new();
-        runtime.register_sensitive_value("private-answer");
-        let once = runtime.redact_sensitive("selected private-answer");
-        assert_eq!(once, "selected [REDACTED]");
-        assert_eq!(runtime.redact_sensitive(&once), once);
-    }
-
-    #[tokio::test]
-    async fn batch_prepare_dedups_identical_raw_calls_in_order() {
-        let runtime = Runtime::new();
-        let calls = vec![
-            ProviderToolCall {
-                id: "one".into(),
-                name: "read".into(),
-                arguments: r#"{"path":".","max_lines":1}"#.into(),
-            },
-            ProviderToolCall {
-                id: "two".into(),
-                name: "read".into(),
-                arguments: r#"{"path":".","max_lines":1}"#.into(),
-            },
-            ProviderToolCall {
-                id: "three".into(),
-                name: "list".into(),
-                arguments: r#"{"path":".","max_entries":1}"#.into(),
-            },
-        ];
-        let prepared = runtime
-            .prepare_provider_tool_invocations(
-                crate::OperatingMode::Auto,
-                std::env::temp_dir().as_path(),
-                &calls,
-            )
-            .await
-            .expect("batch prepare");
-        assert_eq!(prepared.len(), 3);
-        assert_eq!(
-            prepared[0].canonical_fingerprint,
-            prepared[1].canonical_fingerprint
-        );
-        assert_eq!(prepared[0].target_paths, prepared[1].target_paths);
-        assert_ne!(
-            prepared[0].canonical_fingerprint,
-            prepared[2].canonical_fingerprint
-        );
-    }
-
-    #[tokio::test]
-    async fn search_context_identity_results_and_response_budget() {
-        let root = std::env::temp_dir().join(format!(
-            "slim-context-runtime-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(
-            root.join("data.txt"),
-            format!(
-                "{}\nneedle\n{}\n",
-                "prefix".repeat(200),
-                "suffix".repeat(200)
-            ),
-        )
-        .unwrap();
-        let mut runtime = Runtime::with_artifact_store(root.join(".slim/artifacts")).unwrap();
-        let calls = [None, Some(0), Some(1), Some(3)]
-            .into_iter()
-            .enumerate()
-            .map(|(index, context)| {
-                let mut arguments = serde_json::json!({"path":"data.txt", "query":"needle"});
-                if let Some(context) = context {
-                    arguments["context_lines"] = serde_json::json!(context);
-                }
-                ProviderToolCall {
-                    id: format!("search-{index}"),
-                    name: "search".into(),
-                    arguments: arguments.to_string(),
-                }
-            })
-            .collect::<Vec<_>>();
-        let prepared = runtime
-            .prepare_provider_tool_invocations(crate::OperatingMode::Auto, &root, &calls)
-            .await
-            .unwrap();
-        assert_eq!(evidence_reuse_aliases(&prepared), vec![0, 0, 2, 3]);
-        assert!(prepared.iter().all(|call| call.error.is_none()));
-        let mut outputs = Vec::new();
-        let mut seq = 1;
-        for (call, prepared) in calls.iter().zip(&prepared) {
-            let (outcome, next) = runtime
-                .execute_tool_call_async(ToolInvocation::provider("fixture", call), prepared, seq)
-                .await
-                .unwrap();
-            seq = next;
-            assert!(outcome.result.success);
-            assert!(
-                outcome.receipt.bytes_read > 0,
-                "fresh search must still observe the file"
-            );
-            outputs.push(outcome.result);
-        }
-        assert_eq!(outputs[0].output, outputs[1].output);
-        assert!(!outputs[0].output.contains("prefix"));
-        assert!(outputs[2].output.contains("prefix"));
-        assert!(outputs[2].output.contains("[truncated "));
-        assert_ne!(outputs[2].output, outputs[3].output);
-        let budget = 256;
-        runtime
-            .materialize_results(&mut outputs, budget, None, seq)
-            .await
-            .unwrap();
-        let context = &outputs[2];
-        let handle = context.artifact.as_ref().unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&handle.path).unwrap(),
-            context.output
-        );
-        let preview = present_unstructured(
-            "search",
-            &context.output,
-            PresentationBudget { max_bytes: budget },
-        )
-        .text;
-        assert!(preview.contains("truncated"));
-        assert!(preview.len() < context.output.len());
-        assert!(preview.contains("aggregate presentation budget"));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn read_only_alias_keeps_the_current_admission_note() {
-        let root = batch_fixture_root("admission-alias");
-        std::fs::write(root.join("data.txt"), "before\nneedle\nafter\n").unwrap();
-
-        for (label, calls, expected_prefix) in [
-            (
-                "canonical-first",
-                vec![
-                    provider_call(
-                        "canonical",
-                        "search",
-                        serde_json::json!({
-                            "path":"data.txt",
-                            "query":"needle",
-                            "context_lines":3
-                        }),
-                    ),
-                    provider_call(
-                        "saturated",
-                        "search",
-                        serde_json::json!({
-                            "path":"data.txt",
-                            "query":"needle",
-                            "context_lines":4
-                        }),
-                    ),
-                ],
-                (false, true),
-            ),
-            (
-                "saturated-first",
-                vec![
-                    provider_call(
-                        "saturated",
-                        "search",
-                        serde_json::json!({
-                            "path":"data.txt",
-                            "query":"needle",
-                            "context_lines":4
-                        }),
-                    ),
-                    provider_call(
-                        "canonical",
-                        "search",
-                        serde_json::json!({
-                            "path":"data.txt",
-                            "query":"needle",
-                            "context_lines":3
-                        }),
-                    ),
-                ],
-                (true, false),
-            ),
-        ] {
-            let mut runtime = Runtime::new();
-            let prepared = runtime
-                .prepare_provider_tool_invocations(crate::OperatingMode::Auto, &root, &calls)
-                .await
-                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
-            assert_eq!(evidence_reuse_aliases(&prepared), vec![0, 0], "{label}");
-            let prefixes = prepared
-                .iter()
-                .map(|call| crate::tools::admission_output_prefix(&call.admission_notes))
-                .collect::<Vec<_>>();
-            assert_eq!(prefixes[0].is_some(), expected_prefix.0, "{label}");
-            assert_eq!(prefixes[1].is_some(), expected_prefix.1, "{label}");
-
-            let (results, _) = runtime
-                .execute_provider_tool_batch(
-                    crate::OperatingMode::Auto,
-                    &root,
-                    label,
-                    &calls,
-                    1,
-                    &mut CausalGovernor::default(),
-                )
-                .await
-                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
-            assert_eq!(results.len(), 2, "{label}");
-            assert_eq!(
-                results[0].output.starts_with("[admission: "),
-                expected_prefix.0,
-                "{label}"
-            );
-            assert_eq!(
-                results[1].output.starts_with("[admission: "),
-                expected_prefix.1,
-                "{label}"
-            );
-            let plain = results
-                .iter()
-                .map(|result| {
-                    result
-                        .output
-                        .strip_prefix("[admission: ")
-                        .and_then(|rest| rest.split_once("]\n"))
-                        .map(|(_, output)| output)
-                        .unwrap_or(result.output.as_str())
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                plain[0], plain[1],
-                "{label}: aliases must reuse the same evidence"
-            );
-        }
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn skill_discovery_is_memoized_per_cwd_for_the_run() {
-        fn write_skill(root: &std::path::Path, name: &str) {
-            let dir = root.join(name);
-            std::fs::create_dir_all(&dir).expect("skill dir");
-            std::fs::write(
-                dir.join("SKILL.md"),
-                format!("---\nname: {name}\ndescription: fixture\n---\nbody\n"),
-            )
-            .expect("skill fixture");
-        }
-
-        let root = std::env::temp_dir().join(format!(
-            "slim-skill-memo-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        let workspace = root.join("workspace");
-        write_skill(&workspace.join(".slim").join("skills"), "first");
-        let mut runtime = Runtime::new();
-        let first = runtime
-            .cached_skill_discovery(&workspace)
-            .expect("first discovery");
-        assert!(first.active("first").is_some());
-        write_skill(&workspace.join(".slim").join("skills"), "second");
-        let second = runtime
-            .cached_skill_discovery(&workspace)
-            .expect("memoized discovery");
-        assert!(second.active("second").is_none());
-        let elsewhere = root.join("elsewhere");
-        std::fs::create_dir_all(&elsewhere).expect("other cwd");
-        let other = runtime
-            .cached_skill_discovery(&elsewhere)
-            .expect("other cwd discovery");
-        assert!(other.active("first").is_none());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn skill_dispatch_validates_list_and_script_types_before_dispatch() {
-        let root = std::env::temp_dir().join(format!(
-            "slim-skill-dispatch-types-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        let skill_dir = root.join(".slim").join("skills").join("fixture");
-        std::fs::create_dir_all(&skill_dir).expect("skill dir");
-        std::fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: fixture\ndescription: dispatch fixture\n---\nfallback body\n",
-        )
-        .expect("skill metadata");
-        let discovery = discover_workspace(&root).expect("skill discovery");
-        let runner = crate::process::ProcessRunner::default();
-        let dispatch = |arguments: Value| {
-            run_skill_dispatch(
-                crate::OperatingMode::Auto,
-                &root,
-                &arguments.to_string(),
-                None,
-                &runner,
-                Some(discovery.clone()),
-            )
-        };
-
-        for value in [json!("true"), Value::Null, json!(1), json!([]), json!({})] {
-            let result = dispatch(json!({"list": value, "name": "fixture"}));
-            assert!(
-                !result.success,
-                "invalid list value was dispatched: {result:?}"
-            );
-            assert_eq!(
-                result.output,
-                "invalid skill arguments: list must be a boolean"
-            );
-        }
-
-        for value in [json!(true), Value::Null, json!(1), json!([]), json!({})] {
-            let result = dispatch(json!({"list": true, "script": value}));
-            assert!(
-                !result.success,
-                "invalid script value was dispatched: {result:?}"
-            );
-            assert_eq!(
-                result.output,
-                "invalid skill arguments: script must be a string"
-            );
-        }
-
-        for value in [json!(true), Value::Null, json!(1), json!([]), json!({})] {
-            let result = dispatch(json!({"name": "fixture", "script": value}));
-            assert!(
-                !result.success,
-                "invalid script value was dispatched: {result:?}"
-            );
-            assert_eq!(
-                result.output,
-                "invalid skill arguments: script must be a string"
-            );
-        }
-
-        let listed = dispatch(json!({"list": true}));
-        assert!(listed.success, "list:true failed: {listed:?}");
-        assert!(listed.output.contains("fixture: dispatch fixture"));
-        assert!(!listed.output.contains("fallback body"));
-
-        for arguments in [
-            json!({"name": "fixture"}),
-            json!({"list": false, "name": "fixture"}),
-            json!({"name": "fixture", "script": ""}),
-            json!({"name": "fixture", "script": "run.ps1"}),
-            json!({"name": "fixture", "script": "./run.ps1"}),
-        ] {
-            let result = dispatch(arguments);
-            assert!(result.success, "valid skill arguments failed: {result:?}");
-            assert!(result.output.contains("fallback body"));
-        }
-
-        std::fs::remove_dir_all(root).expect("cleanup");
-    }
-
-    #[test]
-    fn compaction_summary_rejects_missing_required_headings() {
-        let summary = CompactionSummary {
-            text: "plain summary".into(),
-            stop_reason: Some("stop".into()),
-            ..CompactionSummary::default()
-        };
-
-        assert!(matches!(
-            summary.validate(64 * 1024),
-            Err(ProviderError::InvalidResponse { ref message })
-                if message.contains("required heading")
-        ));
-    }
-
-    #[test]
-    fn compaction_summary_retains_first_response_timings() {
-        let mut summary = CompactionSummary::default();
-        summary.push(ProviderEvent::Phase {
-            phase: ProviderPhase::FirstByte,
-            elapsed_ms: 12,
-        });
-        summary.push(ProviderEvent::Phase {
-            phase: ProviderPhase::FirstSemantic,
-            elapsed_ms: 20,
-        });
-
-        assert_eq!(summary.time_to_first_byte_ms, Some(12));
-        assert_eq!(summary.time_to_first_semantic_ms, Some(20));
-    }
-
-    #[test]
-    fn multimodal_requests_are_not_eligible_for_text_estimator_calibration() {
-        let text = ProviderMessage::user("hello");
-        let image = ProviderMessage::user("").with_content_blocks(vec![
-            crate::provider::ProviderContentBlock::image("image/png", "aGVsbG8="),
-        ]);
-
-        assert!(messages_are_text_only(&[text]));
-        assert!(!messages_are_text_only(&[image]));
-    }
-
-    #[test]
-    fn request_component_bytes_follow_serialized_wire_values() {
-        let system = json!({"role": "system", "content": "rules 日本語\n"});
-        let history = json!({"role": "user", "content": "ação a\"b"});
-        let tool_result = json!({"role": "tool", "content": "linha 👩‍💻\n\\"});
-        let tools = json!([{"type": "function", "name": "read", "description": "ler ação\t"}]);
-        let body = json!({
-            "messages": [&system, &history, &tool_result],
-            "tools": &tools,
-        })
-        .to_string();
-
-        assert_eq!(
-            request_component_bytes(&body),
-            (
-                serde_json::to_vec(&system).expect("system").len() as u64,
-                serde_json::to_vec(&tools).expect("tools").len() as u64,
-                serde_json::to_vec(&history).expect("history").len() as u64,
-                serde_json::to_vec(&tool_result).expect("tool result").len() as u64,
-            )
-        );
-    }
-
-    #[test]
-    fn runtime_goal_assurance_requires_validation_after_the_latest_mutation() {
-        let progress = |seq, kind, revision| {
-            crate::SessionEvent::new(
-                seq,
-                crate::EventKind::CausalProgressObserved {
-                    batch_id: "batch".into(),
-                    call_id: format!("call-{seq}").into(),
-                    kind,
-                    tool_name: "shell".into(),
-                    call_fingerprint: "fingerprint".into(),
-                    evidence_id: "evidence".into(),
-                    workspace_revision: revision,
-                },
-            )
-        };
-        assert!(!runtime_goal_assurance(&[]));
-        assert!(runtime_goal_assurance(&[progress(
-            1,
-            crate::CausalProgressKind::ValidationGreen,
-            0,
-        )]));
-        assert!(!runtime_goal_assurance(&[
-            progress(1, crate::CausalProgressKind::ValidationGreen, 0),
-            progress(2, crate::CausalProgressKind::WorkspaceChanged, 1),
-        ]));
-    }
-
-    #[test]
-    fn cancel_pending_background_harvests_finished_task() {
-        tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(async {
-                let plan = BackgroundCompactionPlan {
-                    selection: CompactionSelection {
-                        root_instruction: "root".into(),
-                        summarized: vec![ProviderMessage::user("root")],
-                        pinned: Vec::new(),
-                        kept: Vec::new(),
-                        first_kept_index: 1,
-                        recent_tokens: 0,
-                    },
-                    request: None,
-                    provider: "provider".into(),
-                    model: "model".into(),
-                    provider_identity: "provider:model".into(),
-                    strategy: crate::context::CompactionStrategy::Summary,
-                    previous_checkpoint: None,
-                    context_window_tokens: 1,
-                    reserve_tokens: 0,
-                    serialized_chars: 1,
-                    system_bytes: 0,
-                    history_bytes: 0,
-                    summary_max_bytes: 64 * 1024,
-                    source_len: 1,
-                    tokens_before: 1,
-                    projected_tokens_after: 1,
-                    request_bytes: 1,
-                    estimated_input_tokens: 1,
-                    projected_savings_tokens: 1,
-                    estimated_cost_tokens: 1,
-                    safety_margin_tokens: 1,
-                    future_turns: 1,
-                    profitable: true,
-                };
-                let task = tokio::spawn(async move {
-                    BackgroundCompactionResult {
-                        plan,
-                        summary: String::new(),
-                        usage: UsageTotals::default(),
-                        time_to_first_byte_ms: None,
-                        time_to_first_semantic_ms: None,
-                        duration_ms: 1,
-                        valid: false,
-                        usage_known: false,
-                        cancelled: false,
-                    }
-                });
-                while !task.is_finished() {
-                    tokio::task::yield_now().await;
-                }
-                let progress = Arc::new(Mutex::new(CompactionAttemptProgress::default()));
-                let mut pending = Some(PendingBackgroundCompaction {
-                    task,
-                    cancellation: CancellationToken::new(),
-                    progress,
-                    jev_outcome: Arc::new(Mutex::new(None)),
-                    usage_request: RequestUsage {
-                        request_kind: crate::RequestKind::Compaction,
-                        provider: "provider".into(),
-                        model: "model".into(),
-                        history_bytes: 1,
-                        estimated_input_tokens: 1,
-                        ..RequestUsage::default()
-                    },
-                    request_bytes: 1,
-                    estimated_input_tokens: 1,
-                    tokens_before: 1,
-                    started: Instant::now(),
-                });
-                let mut runtime = Runtime::new();
-                let mut next_seq = 1;
-
-                let usage = runtime
-                    .cancel_pending_background(&mut pending, &mut next_seq, "loop_finished")
-                    .await
-                    .expect("settle finished task");
-
-                assert!(pending.is_none());
-                assert_eq!(usage.provider_turns, 0);
-                assert_eq!(usage.requests.len(), 1);
-                assert_eq!(
-                    usage.requests[0].request_kind,
-                    crate::RequestKind::Compaction
-                );
-                assert!(usage.requests[0].usage_unknown);
-                assert!(runtime.app.events().iter().any(|event| matches!(
-                    event.kind,
-                    crate::EventKind::CompactionAttemptCompleted { .. }
-                )));
-                assert!(!runtime.app.events().iter().any(|event| matches!(
-                    event.kind,
-                    crate::EventKind::CompactionAttemptCancelled { .. }
-                )));
-            });
-    }
-
-    #[tokio::test]
-    async fn completed_background_usage_reports_the_rebuilt_pruned_request() {
-        let plan = BackgroundCompactionPlan {
-            selection: CompactionSelection {
-                root_instruction: "root".into(),
-                summarized: vec![ProviderMessage::user("root")],
-                pinned: Vec::new(),
-                kept: Vec::new(),
-                first_kept_index: 1,
-                recent_tokens: 0,
-            },
-            request: None,
-            provider: "provider".into(),
-            model: "model".into(),
-            provider_identity: "provider:model".into(),
-            strategy: crate::context::CompactionStrategy::Jev,
-            previous_checkpoint: None,
-            context_window_tokens: 1,
-            reserve_tokens: 0,
-            serialized_chars: 11,
-            system_bytes: 22,
-            history_bytes: 33,
-            summary_max_bytes: 64 * 1024,
-            source_len: 1,
-            tokens_before: 1,
-            projected_tokens_after: 1,
-            request_bytes: 44,
-            estimated_input_tokens: 55,
-            projected_savings_tokens: 1,
-            estimated_cost_tokens: 1,
-            safety_margin_tokens: 1,
-            future_turns: 1,
-            profitable: true,
-        };
-        let result = BackgroundCompactionResult {
-            plan,
-            summary: "summary".into(),
-            usage: UsageTotals::default(),
-            time_to_first_byte_ms: None,
-            time_to_first_semantic_ms: None,
-            duration_ms: 1,
-            valid: true,
-            usage_known: true,
-            cancelled: false,
-        };
-        let attempt = PendingBackgroundCompaction {
-            task: tokio::spawn(std::future::pending::<BackgroundCompactionResult>()),
-            cancellation: CancellationToken::new(),
-            progress: Arc::new(Mutex::new(CompactionAttemptProgress::default())),
-            jev_outcome: Arc::new(Mutex::new(None)),
-            usage_request: RequestUsage {
-                request_kind: crate::RequestKind::Compaction,
-                system_bytes: 99,
-                history_bytes: 99,
-                estimated_input_tokens: 99,
-                ..RequestUsage::default()
-            },
-            request_bytes: 99,
-            estimated_input_tokens: 99,
-            tokens_before: 1,
-            started: Instant::now(),
-        };
-        let usage = background_compaction_completed_usage(&attempt, &result);
-        let request = usage
-            .requests
-            .iter()
-            .find(|request| request.request_kind == crate::RequestKind::Compaction)
-            .expect("compaction request");
-        assert_eq!(request.system_bytes, 22);
-        assert_eq!(request.history_bytes, 33);
-        assert_eq!(request.estimated_input_tokens, 55);
-
-        let usage = background_compaction_cancellation_usage(&attempt, Some(&result.plan), 7);
-        let request = usage
-            .requests
-            .iter()
-            .find(|request| request.request_kind == crate::RequestKind::Compaction)
-            .expect("cancelled compaction request");
-        assert_eq!(request.system_bytes, 22);
-        assert_eq!(request.history_bytes, 33);
-        assert_eq!(request.estimated_input_tokens, 55);
-        let usage = background_compaction_cancellation_usage(&attempt, None, 7);
-        let request = usage
-            .requests
-            .iter()
-            .find(|request| request.request_kind == crate::RequestKind::Compaction)
-            .expect("aborted compaction request");
-        assert_eq!(request.estimated_input_tokens, 99);
-    }
-
-    #[tokio::test]
-    async fn dropping_pending_background_compaction_aborts_its_task() {
-        let probe = std::sync::Arc::new(());
-        let weak = std::sync::Arc::downgrade(&probe);
-        let task = tokio::spawn(async move {
-            let _held = probe;
-            std::future::pending::<()>().await;
-            unreachable!("background compaction task must be aborted on drop");
-        });
-        drop(PendingBackgroundCompaction {
-            task,
-            cancellation: CancellationToken::new(),
-            progress: Arc::new(Mutex::new(CompactionAttemptProgress::default())),
-            jev_outcome: Arc::new(Mutex::new(None)),
-            usage_request: RequestUsage {
-                ..RequestUsage::default()
-            },
-            request_bytes: 0,
-            estimated_input_tokens: 0,
-            tokens_before: 0,
-            started: Instant::now(),
-        });
-        for _ in 0..100 {
-            if weak.upgrade().is_none() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            weak.upgrade().is_none(),
-            "dropping the handle must abort the task and free its state"
-        );
-    }
-
-    #[test]
-    fn per_turn_overflow_is_not_a_run_total_hit() {
-        let config = AgentLoopConfig {
-            max_mutating_tool_calls: 1,
-            ..AgentLoopConfig::default()
-        };
-        let mut calls = vec![
-            provider_call("w1", "write", serde_json::json!({"path":"a.txt"})),
-            provider_call("w2", "write", serde_json::json!({"path":"b.txt"})),
-        ];
-        let cut = truncate_calls_for_budget(&mut calls, config, 0);
-        assert_eq!(cut.suppressed, 1);
-        assert!(!cut.hit_run_total);
-        assert_eq!(calls.len(), 1);
-        assert!(!should_stop_after_tool_budget_cut(cut, 0, 3));
-        assert!(should_stop_after_tool_budget_cut(cut, 0, 1));
-    }
-
-    #[test]
-    fn run_total_overflow_stops_even_when_turns_remain() {
-        let config = AgentLoopConfig {
-            max_total_tool_calls: 1,
-            ..AgentLoopConfig::default()
-        };
-        let mut calls = vec![
-            provider_call("r1", "read", serde_json::json!({"path":"a.txt"})),
-            provider_call("r2", "read", serde_json::json!({"path":"b.txt"})),
-        ];
-        let cut = truncate_calls_for_budget(&mut calls, config, 1);
-        assert_eq!(cut.suppressed, 2);
-        assert!(cut.hit_run_total);
-        assert!(calls.is_empty());
-        assert!(should_stop_after_tool_budget_cut(cut, 0, 8));
-    }
-
-    fn batch_fixture_root(label: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "slim-runtime-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        root
-    }
-
-    fn prepared_calls(
-        root: &std::path::Path,
-        calls: &[(&str, &str)],
-    ) -> Vec<PreparedToolInvocation> {
-        let tools = ToolRegistry::default();
-        let owned = calls
-            .iter()
-            .map(|(name, arguments)| ((*name).to_owned(), (*arguments).to_owned()))
-            .collect::<Vec<_>>();
-        tools.prepare_invocations(crate::OperatingMode::Auto, root, &owned)
-    }
-
-    #[test]
-    fn phase1_excludes_reads_after_a_same_file_write_or_shell() {
-        let root = batch_fixture_root("phase1");
-        std::fs::write(root.join("a.txt"), "a\n").unwrap();
-        std::fs::write(root.join("b.txt"), "b\n").unwrap();
-        let tools = ToolRegistry::default();
-        let prepared = prepared_calls(
-            &root,
-            &[
-                ("write", r#"{"path":"a.txt","content":"A\n"}"#),
-                ("read", r#"{"path":"a.txt"}"#),
-                ("read", r#"{"path":"b.txt"}"#),
-                ("search", r#"{"path":".","query":"A"}"#),
-            ],
-        );
-        assert_eq!(phase1_snapshot_indices(&tools, &prepared), vec![2]);
-
-        let prepared = prepared_calls(
-            &root,
-            &[
-                ("read", r#"{"path":"b.txt"}"#),
-                ("shell", r#"{"command":"echo x"}"#),
-                ("read", r#"{"path":"a.txt"}"#),
-            ],
-        );
-        assert_eq!(phase1_snapshot_indices(&tools, &prepared), vec![0]);
-
-        let prepared = prepared_calls(
-            &root,
-            &[
-                ("read", r#"{"path":"a.txt"}"#),
-                ("read", r#"{"path":"b.txt"}"#),
-                ("write", r#"{"path":"a.txt","content":"A\n"}"#),
-            ],
-        );
-        assert_eq!(phase1_snapshot_indices(&tools, &prepared), vec![0, 1]);
-
-        let prepared = prepared_calls(
-            &root,
-            &[
-                ("write", r#"{"path":"a.txt","content":"A\n"}"#),
-                ("read", r#"{"path":"b.txt"}"#),
-            ],
-        );
-        assert_eq!(phase1_snapshot_indices(&tools, &prepared), vec![1]);
-
-        let prepared = prepared_calls(
-            &root,
-            &[
-                ("shell", r#"{"command":"echo x"}"#),
-                ("read", r#"{"path":"a.txt"}"#),
-                ("read", r#"{"path":"b.txt"}"#),
-            ],
-        );
-        assert_eq!(
-            phase1_snapshot_indices(&tools, &prepared),
-            Vec::<usize>::new()
-        );
-        assert_eq!(
-            phase1_snapshot_indices_from(&tools, &prepared, 1),
-            vec![1, 2]
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn phase1_excludes_code_intel_after_any_workspace_mutation() {
-        let root = batch_fixture_root("phase1-code-intel");
-        std::fs::write(root.join("a.rs"), "fn target() {}\n").unwrap();
-        std::fs::write(root.join("b.rs"), "fn caller() { target(); }\n").unwrap();
-        let tools = ToolRegistry::default();
-        // A mutation on b.rs must block a semantic query on a.rs: editing the
-        // caller changes the references of the symbol being queried. The
-        // plain read of a.rs stays lifted: file bytes are path-scoped.
-        let prepared = prepared_calls(
-            &root,
-            &[
-                ("write", r#"{"path":"b.rs","content":"fn caller() {}\n"}"#),
-                (
-                    "code_intel",
-                    r#"{"action":"references","path":"a.rs","line":1,"column":4}"#,
-                ),
-                ("read", r#"{"path":"a.rs"}"#),
-            ],
-        );
-        assert_eq!(phase1_snapshot_indices(&tools, &prepared), vec![2]);
-
-        // With no prior mutation, independent code_intel calls stay parallel.
-        let prepared = prepared_calls(
-            &root,
-            &[
-                (
-                    "code_intel",
-                    r#"{"action":"definition","path":"a.rs","line":1,"column":4}"#,
-                ),
-                (
-                    "code_intel",
-                    r#"{"action":"references","path":"b.rs","line":1,"column":14}"#,
-                ),
-            ],
-        );
-        assert_eq!(phase1_snapshot_indices(&tools, &prepared), vec![0, 1]);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    fn provider_call(id: &str, name: &str, arguments: serde_json::Value) -> ProviderToolCall {
-        ProviderToolCall {
-            id: id.into(),
-            name: name.into(),
-            arguments: arguments.to_string(),
-        }
-    }
-
-    #[tokio::test]
-    async fn independent_writes_apply_and_same_file_stays_ordered() {
-        let root = batch_fixture_root("mut-batch");
-        std::fs::write(root.join("a.txt"), "old-a\n").unwrap();
-        std::fs::write(root.join("b.txt"), "old-b\n").unwrap();
-        let mut runtime = Runtime::new();
-        let (results, next_seq) = runtime
-            .execute_provider_tool_batch(
-                crate::OperatingMode::Auto,
-                &root,
-                "batch",
-                &[
-                    provider_call(
-                        "wa",
-                        "write",
-                        json!({"path":"a.txt","content":"new-a\n","expected":"old-a\n"}),
-                    ),
-                    provider_call(
-                        "wb",
-                        "write",
-                        json!({"path":"b.txt","content":"new-b\n","expected":"old-b\n"}),
-                    ),
-                ],
-                1,
-                &mut CausalGovernor::default(),
-            )
-            .await
-            .unwrap();
-        assert!(results[0].success, "{}", results[0].output);
-        assert!(results[1].success, "{}", results[1].output);
-        assert_eq!(
-            std::fs::read_to_string(root.join("a.txt")).unwrap(),
-            "new-a\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join("b.txt")).unwrap(),
-            "new-b\n"
-        );
-
-        let (results, _) = runtime
-            .execute_provider_tool_batch(
-                crate::OperatingMode::Auto,
-                &root,
-                "batch2",
-                &[
-                    provider_call(
-                        "w1",
-                        "write",
-                        json!({"path":"a.txt","content":"mid-a\n","expected":"new-a\n"}),
-                    ),
-                    provider_call(
-                        "w2",
-                        "write",
-                        json!({"path":"a.txt","content":"final-a\n","expected":"mid-a\n"}),
-                    ),
-                ],
-                next_seq,
-                &mut CausalGovernor::default(),
-            )
-            .await
-            .unwrap();
-        assert!(results[0].success, "{}", results[0].output);
-        assert!(results[1].success, "{}", results[1].output);
-        assert_eq!(
-            std::fs::read_to_string(root.join("a.txt")).unwrap(),
-            "final-a\n"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn same_file_read_after_write_sees_new_bytes_when_other_reads_are_lifted() {
-        let root = batch_fixture_root("phase1-order");
-        std::fs::write(root.join("a.txt"), "old-a\n").unwrap();
-        std::fs::write(root.join("b.txt"), "keep-b\n").unwrap();
-        let mut runtime = Runtime::new();
-        let (results, _) = runtime
-            .execute_provider_tool_batch(
-                crate::OperatingMode::Auto,
-                &root,
-                "batch",
-                &[
-                    provider_call(
-                        "w",
-                        "write",
-                        json!({"path":"a.txt","content":"new-a\n","expected":"old-a\n"}),
-                    ),
-                    provider_call("ra", "read", json!({"path":"a.txt"})),
-                    provider_call("rb", "read", json!({"path":"b.txt"})),
-                ],
-                1,
-                &mut CausalGovernor::default(),
-            )
-            .await
-            .unwrap();
-        assert!(results[0].success, "{}", results[0].output);
-        assert!(results[1].success, "{}", results[1].output);
-        assert!(results[2].success, "{}", results[2].output);
-        assert_eq!(results[1].output, "new-a\n");
-        assert_eq!(results[2].output, "keep-b\n");
-        let _ = std::fs::remove_dir_all(root);
-    }
-}
+mod tests;

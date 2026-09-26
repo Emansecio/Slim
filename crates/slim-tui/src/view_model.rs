@@ -51,7 +51,9 @@ pub(crate) fn is_trivial_cwd(cwd: &str) -> bool {
 }
 
 pub(crate) fn run_status_label(state: &AppState) -> &'static str {
-    if state.working {
+    if state.prompt_is_busy() {
+        "PREPARANDO PROMPT"
+    } else if state.working {
         "EM EXECUÇÃO"
     } else if state.authenticated {
         "PRONTO"
@@ -61,6 +63,9 @@ pub(crate) fn run_status_label(state: &AppState) -> &'static str {
 }
 
 pub(crate) fn activity_label(state: &AppState) -> String {
+    if state.prompt_is_busy() {
+        return "Preparando prompt".into();
+    }
     if let Some(cancel) = &state.cancellation {
         return match cancel.phase {
             crate::app::CancellationPhase::Requested => "Interrupção solicitada",
@@ -102,7 +107,7 @@ pub(crate) fn activity_label(state: &AppState) -> String {
 fn external_activity_label(label: &str) -> String {
     let label = label.trim();
     let known = match label {
-        "Connecting to provider" => Some("Conectando ao provedor"),
+        "Connecting to provider" => Some("Aguardando resposta do provedor"),
         "Waiting for first byte" => Some("Aguardando primeiro byte"),
         "Stream open · waiting for content" => Some("Conexão aberta · aguardando conteúdo"),
         "Provider responding" => Some("Provedor respondendo"),
@@ -229,6 +234,45 @@ fn tool_phrase(names: &[&str], completed: bool) -> String {
         }
     }
     parts.join(", ")
+}
+
+/// Row title: a verb in the progressive while the call runs (or was
+/// cancelled) and in the past once it settled. Other tools keep their name.
+pub(crate) fn tool_title(name: &str, lifecycle: BlockLifecycle) -> String {
+    let settled = matches!(lifecycle, BlockLifecycle::Complete | BlockLifecycle::Failed);
+    let verb = match name {
+        "read" => ("Lendo", "Leu"),
+        "search" => ("Buscando", "Buscou"),
+        "list" => ("Listando", "Listou"),
+        "patch" => ("Editando", "Editou"),
+        "write" => ("Escrevendo", "Escreveu"),
+        "shell" => ("Executando", "Executou"),
+        "code_intel" => ("Analisando", "Analisou"),
+        _ => return name.to_owned(),
+    };
+    if settled { verb.1 } else { verb.0 }.to_owned()
+}
+
+/// Argument summary segment as read on a tool row: the `key=` prefix of
+/// the projected summary is dropped and commands read as `$ command`.
+pub(crate) fn tool_target(segment: &str) -> String {
+    if let Some(command) = segment
+        .strip_prefix("command=")
+        .or_else(|| segment.strip_prefix("program="))
+    {
+        return format!("$ {command}");
+    }
+    for key in ["path=", "file=", "target=", "url=", "name=", "id="] {
+        if let Some(value) = segment.strip_prefix(key) {
+            return value.to_owned();
+        }
+    }
+    for key in ["pattern=", "query=", "glob="] {
+        if let Some(value) = segment.strip_prefix(key) {
+            return format!("\"{value}\"");
+        }
+    }
+    segment.to_owned()
 }
 
 pub(crate) fn budget_near_limit(used: usize, limit: usize) -> bool {
@@ -377,8 +421,8 @@ impl ViewModel {
         if session_rail_visible {
             lines.push(session_rail_projection(state, width as usize, state.working).line());
         }
-        for block in state.blocks() {
-            if block.turn_boundary_before() {
+        for (index, block) in state.blocks().iter().enumerate() {
+            if block.turn_boundary_before() || crate::block::transition_gap(state.blocks(), index) {
                 lines.push(String::new());
             }
             match block.kind() {
@@ -387,10 +431,25 @@ impl ViewModel {
                     lines.push(format!("> {}", safe(text)));
                 }
                 BlockKind::Assistant(text) => {
-                    if !lines.is_empty() {
-                        lines.push(String::new());
+                    let chrome = crate::block::assistant_chrome(state.blocks(), index);
+                    if chrome.is_none_or(|chrome| chrome.shows_header()) {
+                        if !lines.is_empty() {
+                            lines.push(String::new());
+                        }
+                        let cancelled = matches!(
+                            chrome,
+                            Some(crate::block::AssistantChrome::Header {
+                                cancelled: true,
+                                ..
+                            })
+                        );
+                        let lifecycle = if cancelled {
+                            BlockLifecycle::Cancelled
+                        } else {
+                            block.lifecycle
+                        };
+                        lines.push(assistant_label(lifecycle).into());
                     }
-                    lines.push(assistant_label(block.lifecycle).into());
                     lines.push(safe(text));
                 }
                 BlockKind::Thinking(text) if block.fold == FoldState::Collapsed => {
@@ -400,7 +459,11 @@ impl ViewModel {
                 }
                 BlockKind::Thinking(text) => lines.push(format!("Pensamento: {}", safe(text))),
                 BlockKind::Tool(state) => {
-                    let name = safe(&state.name);
+                    let name = if state.historical {
+                        safe(&state.name)
+                    } else {
+                        tool_title(&safe(&state.name), block.lifecycle)
+                    };
                     let preview = safe(&state.preview);
                     let line = match block.lifecycle {
                         BlockLifecycle::Pending => format!("○ {name}: {preview}"),
@@ -434,20 +497,8 @@ impl ViewModel {
         for notification in state.visible_toast_tail(3) {
             lines.push(format!("notice: {}", safe(notification)));
         }
-        if state.todo_dock_open {
-            let total = state.todo_items.len();
-            let done = state
-                .todo_items
-                .iter()
-                .filter(|item| item.status == crate::api::TodoItemStatus::Completed)
-                .count();
-            let active = state
-                .todo_items
-                .iter()
-                .find(|item| item.status == crate::api::TodoItemStatus::InProgress)
-                .map(|item| safe(&item.title))
-                .unwrap_or_else(|| "sem tarefa ativa".into());
-            lines.push(format!("todo: {done}/{total} {active}"));
+        if !state.todo_items.is_empty() {
+            lines.push(crate::todo::compact_summary(state));
         }
         lines.push(format!(
             "composer: {}",
@@ -533,7 +584,13 @@ pub(crate) fn footer_lines(
             .unwrap_or_default()
     };
     let mode = mode_name(state.mode);
-    let controls = if state.working {
+    let controls = if state.prompt_is_busy() {
+        fit(vec![
+            "Esc cancelar preparação · Ctrl+C cancelar".into(),
+            "Esc cancelar preparação".into(),
+            "Esc cancelar".into(),
+        ])
+    } else if state.working {
         let phase = if activity_visible {
             String::new()
         } else {
@@ -810,7 +867,7 @@ mod activity_label_tests {
     #[test]
     fn provider_phase_labels_do_not_fake_reasoning() {
         for (phase, expected) in [
-            ("Connecting to provider", "Conectando ao provedor"),
+            ("Connecting to provider", "Aguardando resposta do provedor"),
             ("Waiting for first byte", "Aguardando primeiro byte"),
             (
                 "Stream open · waiting for content",

@@ -94,6 +94,7 @@ fn tui_turn_projects_prompt_tool_stream_final_text_and_usage() {
             timeout: Duration::from_secs(2),
         },
         ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
             .with_workspace_root(&root)
             .with_artifact_root(root.join("artifacts")),
     )
@@ -199,6 +200,7 @@ fn tui_plan_runs_the_read_only_loop_instead_of_approval_required() {
             timeout: Duration::from_secs(2),
         },
         ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
             .with_allow_plan_loop(true)
             .with_workspace_root(&root)
             .with_artifact_root(root.join("artifacts")),

@@ -14,6 +14,7 @@ mod model_overlay_golden;
 mod motion_activity_golden;
 mod multi_tool_golden;
 mod navigation_visibility;
+mod overlay_polish_golden;
 mod poc2_golden;
 mod scroll_golden;
 mod thinking_expansion_golden;

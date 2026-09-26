@@ -1,18 +1,18 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use base64::Engine;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use slim_core::context::{latest_user_instruction_before_boundary, CompactionHandle};
 use slim_core::provider::{
     clinepass_model, codex_model, command_code_model, history_response_cache_scope,
-    open_code_model, resolve_codex_context_window, xai_model, zen_model, AnthropicAdapter,
-    ClinePassAdapter, CommandCodeAdapter, HttpProviderClient, OpenAiCodexAdapter,
-    OpenAiCompatibleAdapter, OpenCodeGoAdapter, OpenCodeZenAdapter, ProviderAdapter,
-    ProviderConfig, ProviderContentBlock, ProviderError, ProviderKind, ProviderPricing,
-    ProviderTimeouts, XaiAdapter, DEFAULT_MAX_OUTPUT_TOKENS,
+    open_code_model, xai_model, zen_model, AnthropicAdapter, ClinePassAdapter, CommandCodeAdapter,
+    HttpProviderClient, OpenAiCodexAdapter, OpenAiCompatibleAdapter, OpenCodeGoAdapter,
+    OpenCodeZenAdapter, ProviderAdapter, ProviderConfig, ProviderContentBlock, ProviderError,
+    ProviderKind, ProviderPricing, ProviderTimeouts, XaiAdapter, DEFAULT_MAX_OUTPUT_TOKENS,
 };
 use slim_core::runtime::{
     tool_call_is_read_only, AgentLoopConfig, AgentLoopStop, CancellationToken,
@@ -68,6 +68,46 @@ pub struct ProviderRequest {
 pub const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 pub(crate) const MAX_SLASH_SKILL_BODY_BYTES: usize = 8 * 1024;
 const MAX_SLASH_SKILL_SYSTEM_PROMPT_BYTES: usize = 10_000;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExecutableIdentity {
+    sha256: Option<String>,
+    error: Option<String>,
+}
+
+static EXECUTABLE_IDENTITY: OnceLock<ExecutableIdentity> = OnceLock::new();
+
+fn executable_identity() -> &'static ExecutableIdentity {
+    EXECUTABLE_IDENTITY.get_or_init(|| {
+        let path = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(_) => {
+                return ExecutableIdentity {
+                    sha256: None,
+                    error: Some("current_exe_unavailable".into()),
+                };
+            }
+        };
+        executable_identity_from_path(&path)
+    })
+}
+
+fn executable_identity_from_path(path: &Path) -> ExecutableIdentity {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return ExecutableIdentity {
+                sha256: None,
+                error: Some("executable_read_failed".into()),
+            };
+        }
+    };
+    let digest = Sha256::digest(bytes);
+    ExecutableIdentity {
+        sha256: Some(format!("{digest:x}")),
+        error: None,
+    }
+}
 
 /// Cloneable identity for one application-scoped LSP manager. Equality is
 /// pointer identity so ProviderRunOptions remains deterministic in tests.
@@ -181,6 +221,7 @@ pub struct ProviderRunOptions {
     pub content_blocks: Vec<ProviderContentBlock>,
     pub history: Vec<ProviderMessage>,
     pub task_facts: Vec<slim_core::session::DurableFact>,
+    pub artifact_ids: Vec<String>,
     pub workspace_root: Option<PathBuf>,
     pub artifact_root: Option<PathBuf>,
     pub context_window_tokens: Option<u64>,
@@ -195,6 +236,8 @@ pub struct ProviderRunOptions {
     pub max_result_bytes: Option<usize>,
     pub cancellation: Option<CancellationToken>,
     pub compaction: Option<CompactionHandle>,
+    /// Interactive-only retry, scoped to one active run. Never persisted.
+    pub manual_retry: Option<slim_core::runtime::ManualRetryHandle>,
     /// TypeSafe credential for the Jev pruning compaction strategy. `None`
     /// keeps every run on the LLM summary path; the runtime never calls
     /// TypeSafe without it.
@@ -336,6 +379,8 @@ pub struct ProviderHeadlessResult {
     /// Typed process observations emitted by native tool executions. These
     /// remain separate from the legacy tool result/success fields.
     pub tool_process_facts: Vec<ToolProcessFact>,
+    /// Final outputs of background shell jobs, keyed to the original call.
+    pub tool_job_outputs: Vec<ToolJobOutputFact>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -344,6 +389,14 @@ pub struct ToolProcessFact {
     pub call_id: String,
     pub name: String,
     pub process: slim_core::process::ProcessExecutionFacts,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ToolJobOutputFact {
+    pub batch_id: String,
+    pub call_id: String,
+    pub name: String,
+    pub output: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -540,12 +593,29 @@ async fn run_provider_resume_with_preflight_events_inner(
         .await;
     }
 
+    // Replay and validation can scan a large JSONL. Keep that work off the
+    // async executor while preserving the expected-prefix check under its lock.
+    let (history, repo, preflight) = tokio::task::spawn_blocking(move || {
+        let history = durable_provider_history(&preflight)?;
+        let repo = JsonlRepo::open_no_repair_expected(
+            &preflight.path,
+            preflight
+                .header
+                .as_ref()
+                .ok_or_else(|| resume_error("missing durable session header"))?,
+            &preflight.records,
+        )
+        .map_err(|error| resume_error(error.to_string()))?;
+        Ok::<_, ProviderError>((history, repo, preflight))
+    })
+    .await
+    .map_err(|error| resume_error(format!("session replay worker failed: {error}")))??;
     let DurableProviderHistory {
         messages: history,
         parent_entry_id,
         entry_ids: _,
         applied_checkpoint_id: _,
-    } = durable_provider_history(&preflight)?;
+    } = history;
     let workspace = PathBuf::from(
         &preflight
             .header
@@ -567,15 +637,6 @@ async fn run_provider_resume_with_preflight_events_inner(
     // The journal drives its own records; building the full ResumePlan
     // (reducer + attempt/tool/queue ledgers) here would be discarded work on
     // every prompt. ensure_resume_preflight already covered the same gates.
-    let repo = JsonlRepo::open_no_repair_expected(
-        &preflight.path,
-        preflight
-            .header
-            .as_ref()
-            .ok_or_else(|| resume_error("missing durable session header"))?,
-        &preflight.records,
-    )
-    .map_err(|error| resume_error(error.to_string()))?;
     let first_seq = repo
         .next_seq()
         .map_err(|error| resume_error(error.to_string()))?;
@@ -613,6 +674,7 @@ async fn run_provider_resume_with_preflight_events_inner(
         options.history = history;
     }
     options.task_facts = session_task_facts(&preflight);
+    options.artifact_ids = session_artifact_ids(&preflight);
     spec = spec.with_run_telemetry(durable_run_telemetry_context(&request, &options)?);
     let compaction_handle = options.compaction.clone();
     let journal = std::sync::Arc::new(std::sync::Mutex::new(
@@ -788,6 +850,21 @@ pub(crate) fn session_task_facts(
         .collect()
 }
 
+pub(crate) fn session_artifact_ids(preflight: &SessionPreflight) -> Vec<String> {
+    preflight
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            slim_core::session::DurableRecord::Fact { fact, .. }
+                if fact.namespace == "artifact.v1" =>
+            {
+                Some(fact.key.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 struct DurableProviderHistory {
     messages: Vec<ProviderMessage>,
     parent_entry_id: Option<String>,
@@ -887,6 +964,9 @@ fn redact_secret(input: &str, secrets: &[String]) -> String {
 /// anything persisted to the durable journal.
 fn durable_secrets(request: &ProviderRequest, options: &ProviderRunOptions) -> Vec<String> {
     let mut secrets = vec![request.api_key.clone()];
+    if let Some(jev) = options.jev_prune.as_ref() {
+        secrets.push(jev.api_key.clone());
+    }
     if let Some(mcp) = options.mcp.as_ref() {
         secrets.extend(mcp.manager().sensitive_values());
     }
@@ -934,15 +1014,92 @@ fn redact_durable_message(mut message: ProviderMessage, secrets: &[String]) -> P
         call.arguments = redact_secret(&call.arguments, secrets);
     }
     for block in &mut message.content_blocks {
+        if let ProviderContentBlock::Image { data, .. }
+        | ProviderContentBlock::Audio { data, .. }
+        | ProviderContentBlock::File { data, .. } = block
+        {
+            if base64::engine::general_purpose::STANDARD
+                .decode(data.as_bytes())
+                .is_ok_and(|bytes| {
+                    secrets.iter().any(|secret| {
+                        !secret.is_empty()
+                            && bytes
+                                .windows(secret.len())
+                                .any(|window| window == secret.as_bytes())
+                    })
+                })
+            {
+                *block = ProviderContentBlock::Text("[REDACTED attachment]".into());
+                continue;
+            }
+        }
         match block {
             ProviderContentBlock::Text(text) => *text = redact_secret(text, secrets),
             ProviderContentBlock::Unsupported { kind } => *kind = redact_secret(kind, secrets),
-            _ => {}
+            ProviderContentBlock::Image { media_type, data }
+            | ProviderContentBlock::Audio { media_type, data }
+            | ProviderContentBlock::File { media_type, data } => {
+                *media_type = redact_secret(media_type, secrets);
+                *data = redact_secret(data, secrets);
+            }
         }
     }
     message.responses_reasoning.clear();
     message.chat_reasoning = None;
     message
+}
+
+#[cfg(test)]
+#[test]
+fn durable_redaction_covers_jev_key_and_attachment_fields() {
+    let request = ProviderRequest {
+        prompt: String::new(),
+        mode: slim_core::OperatingMode::Auto,
+        kind: ProviderKind::OpenAiCompatible,
+        endpoint: "http://127.0.0.1:1".into(),
+        model: "fixture".into(),
+        api_key: "provider-secret".into(),
+        account_id: None,
+        timeout: std::time::Duration::from_secs(1),
+    };
+    let options =
+        ProviderRunOptions::default().with_jev_prune(slim_core::context::JevPruneConfig::new(
+            slim_core::context::JevBackend::Typesafe,
+            "jev-secret",
+        ));
+    let mut message = ProviderMessage::user("provider-secret jev-secret");
+    message.content_blocks = vec![
+        ProviderContentBlock::Image {
+            media_type: "image/jev-secret".into(),
+            data: "provider-secret".into(),
+        },
+        ProviderContentBlock::Audio {
+            media_type: "audio/provider-secret".into(),
+            data: "jev-secret".into(),
+        },
+        ProviderContentBlock::File {
+            media_type: "file/provider-secret".into(),
+            data: "jev-secret".into(),
+        },
+        ProviderContentBlock::File {
+            media_type: "application/octet-stream".into(),
+            data: encode_base64(b"prefix jev-secret suffix"),
+        },
+    ];
+    let redacted = redact_durable_message(message, &durable_secrets(&request, &options));
+    let entry = slim_core::session::DurableEntry::from_provider_message(
+        "test".into(),
+        None,
+        "op".into(),
+        redacted,
+    )
+    .unwrap();
+    let serialized = serde_json::to_string(&entry).unwrap();
+    assert!(!serialized.contains("provider-secret"));
+    assert!(!serialized.contains("jev-secret"));
+    assert!(!serialized.contains(&encode_base64(b"prefix jev-secret suffix")));
+    assert!(serialized.contains("[REDACTED]"));
+    assert!(serialized.contains("[REDACTED attachment]"));
 }
 
 fn resume_error(message: impl Into<String>) -> ProviderError {
@@ -969,6 +1126,7 @@ fn input_required_result(request: &ProviderRequest) -> ProviderHeadlessResult {
         validation_source: None,
         tool_summary_lines: Vec::new(),
         tool_process_facts: Vec::new(),
+        tool_job_outputs: Vec::new(),
         stop_message: None,
     }
 }
@@ -1141,6 +1299,7 @@ fn durable_run_telemetry_context(
         })?;
     let experiment_id = validate_run_telemetry_id(options.experiment_id.as_deref(), "experiment")?;
     let task_id = validate_run_telemetry_id(options.task_id.as_deref(), "task")?;
+    let executable_identity = executable_identity();
     Ok(RunTelemetryContext {
         experiment_id,
         task_id,
@@ -1150,6 +1309,8 @@ fn durable_run_telemetry_context(
         build_revision: option_env!("SLIM_BUILD_REVISION")
             .unwrap_or(env!("CARGO_PKG_VERSION"))
             .into(),
+        executable_sha256: executable_identity.sha256.clone(),
+        executable_identity_error: executable_identity.error.clone(),
         started_at,
         limits: serde_json::json!({
             "resolved": false,
@@ -1398,28 +1559,33 @@ async fn execute_provider_turn_with_local_lsp(
 fn block_on_provider<T>(
     future: impl std::future::Future<Output = Result<T, ProviderError>>,
 ) -> Result<T, ProviderError> {
-    shared_provider_runtime()?.block_on(future)
+    provider_runtime_block_on(future)?
+}
+
+pub(crate) fn provider_runtime_block_on<T>(
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, ProviderError> {
+    Ok(shared_provider_runtime()?.block_on(future))
 }
 
 /// Process-wide Tokio runtime for synchronous headless entry points.
 /// Building one runtime per provider call paid thread-pool spawn on every
 /// run; the runtime is thread-safe and `block_on` may be shared.
 fn shared_provider_runtime() -> Result<&'static tokio::runtime::Runtime, ProviderError> {
-    static PROVIDER_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> =
+    static PROVIDER_RUNTIME: std::sync::OnceLock<Result<tokio::runtime::Runtime, String>> =
         std::sync::OnceLock::new();
-    if let Some(runtime) = PROVIDER_RUNTIME.get() {
-        return Ok(runtime);
-    }
-    let runtime =
-        tokio::runtime::Runtime::new().map_err(|error| ProviderError::InvalidResponse {
+    match PROVIDER_RUNTIME
+        .get_or_init(|| tokio::runtime::Runtime::new().map_err(|error| error.to_string()))
+    {
+        Ok(runtime) => Ok(runtime),
+        Err(error) => Err(ProviderError::InvalidResponse {
             message: format!("runtime: {error}"),
-        })?;
-    let _ = PROVIDER_RUNTIME.set(runtime);
-    PROVIDER_RUNTIME
-        .get()
-        .ok_or_else(|| ProviderError::InvalidResponse {
-            message: "runtime: shared provider runtime unavailable".into(),
-        })
+        }),
+    }
+}
+
+pub(crate) fn provider_runtime_handle() -> Result<tokio::runtime::Handle, ProviderError> {
+    shared_provider_runtime().map(|runtime| runtime.handle().clone())
 }
 
 fn attach_local_code_intelligence(
@@ -1483,6 +1649,7 @@ pub(crate) async fn execute_provider_turn_async(
             validation_source: None,
             tool_summary_lines: Vec::new(),
             tool_process_facts: Vec::new(),
+            tool_job_outputs: Vec::new(),
             stop_message: None,
         }));
     }
@@ -1534,12 +1701,13 @@ pub(crate) async fn execute_provider_turn_async(
     }
     let context_window_tokens = if catalog_override_absent {
         if let Some(model) = open_code_spec {
-            model
-                .context_window
-                .unwrap_or(AgentLoopConfig::default().context_window_tokens)
+            require_model_context_window(model.context_window)?
         } else {
-            known_model_context_window(request.kind, &request.model, live_codex.as_deref())
-                .unwrap_or(resolve_context_window_tokens(None)?)
+            require_model_context_window(known_model_context_window(
+                request.kind,
+                &request.model,
+                live_codex.as_deref(),
+            ))?
         }
     } else {
         resolve_context_window_tokens(options.context_window_tokens)?
@@ -1591,6 +1759,13 @@ pub(crate) async fn execute_provider_turn_async(
             message: format!("artifact store: {error}"),
         }
     })?;
+    if let Some(bytes) = parse_positive_env_usize("SLIM_READ_PRESENTATION_BYTES")
+        .map_err(|message| ProviderError::InvalidResponse { message })?
+    {
+        runtime
+            .set_read_presentation_bytes(bytes)
+            .map_err(|message| ProviderError::InvalidResponse { message })?;
+    }
     match capture_transcript.into() {
         TranscriptCapture::None => {}
         TranscriptCapture::Memory => runtime.capture_turn_transcript(),
@@ -1613,11 +1788,27 @@ pub(crate) async fn execute_provider_turn_async(
     }
     if let Some(handle) = options.compaction.clone() {
         runtime.set_compaction_handle(handle);
+        runtime.set_compaction_pricing(resolve_pricing().and_then(|pricing| {
+            Some(slim_core::runtime::CompactionPricing {
+                input: pricing.provider.input_micros_per_million,
+                output: pricing.provider.output_micros_per_million,
+                cache_read: pricing.cache_read_micros_per_million?,
+                cache_write: pricing.cache_write_micros_per_million?,
+            })
+        }));
+        runtime.set_compaction_input_cost_micros_per_million(
+            std::env::var("SLIM_INPUT_COST_MICROS_PER_MILLION")
+                .ok()
+                .and_then(|value| value.parse().ok()),
+        );
         // Background summaries are break-even-gated by the loop and still
         // honor `[compaction] background = false`; headless runs overlap
         // them like interactive ones instead of stalling foreground at the
         // hard threshold.
         runtime.set_background_compaction_enabled(true);
+    }
+    if let Some(handle) = options.manual_retry.clone() {
+        runtime.set_manual_retry_handle(handle);
     }
     if let Some(config) = &options.jev_prune {
         runtime.set_jev_judge(Some(std::sync::Arc::new(
@@ -1627,6 +1818,7 @@ pub(crate) async fn execute_provider_turn_async(
     }
     runtime.register_sensitive_value(&request.api_key);
     runtime.restore_task_facts(&options.task_facts, &cwd)?;
+    runtime.restore_artifact_ids(&options.artifact_ids);
     // Per-turn Runtime, application-scoped language-server pool.
     if let Some(code_intelligence) = options.code_intelligence.as_ref() {
         runtime.set_code_intelligence(code_intelligence.manager().clone());
@@ -1917,7 +2109,8 @@ pub(crate) async fn execute_provider_turn_async(
     for event in &events {
         match &event.kind {
             EventKind::AssistantTextDelta { text: delta } => text.push_str(delta),
-            EventKind::ToolOutput { name, output, .. } => {
+            EventKind::ToolOutput { name, output, .. }
+            | EventKind::ToolJobOutput { name, output, .. } => {
                 tool_text.push(format!("tool {name}: {output}"))
             }
             EventKind::AssistantEnded { reason } => stop_reason = Some(reason.clone()),
@@ -1993,6 +2186,7 @@ pub(crate) async fn execute_provider_turn_async(
     }
     let tool_summary_lines = summarize_tool_events(&events);
     let tool_process_facts = collect_tool_process_facts(&events);
+    let tool_job_outputs = collect_tool_job_outputs(&events);
     Ok(ProviderExecution {
         result: ProviderHeadlessResult {
             code,
@@ -2011,6 +2205,7 @@ pub(crate) async fn execute_provider_turn_async(
             validation_source: validated_completion.then(|| "derived_runtime".into()),
             tool_summary_lines,
             tool_process_facts,
+            tool_job_outputs,
             stop_message,
         },
         history: Some(history),
@@ -2054,47 +2249,7 @@ fn validated_skill_user_prefix(skill: &SkillInstructions) -> Result<String, Prov
 }
 
 #[cfg(test)]
-mod skill_prompt_tests {
-    use slim_core::provider::ProviderError;
-
-    use super::{
-        skill_user_message_prefix, validated_skill_user_prefix, SkillInstructions,
-        MAX_SLASH_SKILL_BODY_BYTES,
-    };
-
-    #[test]
-    fn invoked_skill_prefix_is_suitable_for_the_first_user_message() {
-        let skill = SkillInstructions {
-            name: "review-code".into(),
-            body: "Inspect the change carefully.".into(),
-            source: "D:/Slim/.slim/skills/review-code/SKILL.md".into(),
-        };
-        let prefix = skill_user_message_prefix(&skill);
-        let user_text = format!("{prefix}Fix this PR.");
-
-        assert!(prefix.starts_with("[Skill: review-code]"));
-        assert!(prefix.contains("D:/Slim/.slim/skills/review-code/SKILL.md"));
-        assert!(prefix.contains(&skill.body));
-        assert!(user_text.ends_with("Fix this PR."));
-    }
-
-    #[test]
-    fn invoked_skill_rejects_a_user_prefix_above_the_context_safe_limit() {
-        let skill = SkillInstructions {
-            name: "review-code".into(),
-            body: "x".repeat(MAX_SLASH_SKILL_BODY_BYTES),
-            source: "p".repeat(3_000).into(),
-        };
-
-        let error = validated_skill_user_prefix(&skill).expect_err("oversized prefix");
-
-        assert!(matches!(
-            error,
-            ProviderError::InvalidResponse { message }
-                if message.contains("context-safe limit")
-        ));
-    }
-}
+mod skill_prompt_tests;
 
 fn derive_validated_completion(stop: AgentLoopStop, events: &[SessionEvent]) -> bool {
     if stop != AgentLoopStop::ProviderCompleted
@@ -2191,6 +2346,26 @@ fn collect_tool_process_facts(events: &[SessionEvent]) -> Vec<ToolProcessFact> {
         .collect()
 }
 
+fn collect_tool_job_outputs(events: &[SessionEvent]) -> Vec<ToolJobOutputFact> {
+    events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ToolJobOutput {
+                batch_id,
+                call_id,
+                name,
+                output,
+            } => Some(ToolJobOutputFact {
+                batch_id: batch_id.clone(),
+                call_id: call_id.clone(),
+                name: name.clone(),
+                output: output.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 struct FinishedToolSummary {
     batch_id: String,
     name: String,
@@ -2211,6 +2386,9 @@ fn summarize_tool_events(events: &[SessionEvent]) -> Vec<String> {
     for event in events {
         match &event.kind {
             EventKind::ToolOutput {
+                call_id, output, ..
+            }
+            | EventKind::ToolJobOutput {
                 call_id, output, ..
             } if !call_id.is_empty() => {
                 reasons.insert(call_id.as_str(), output.as_str());
@@ -2336,6 +2514,9 @@ fn process_status_text(process: &slim_core::process::ProcessExecutionFacts) -> S
     if process.cancelled {
         parts.push("cancelled".into());
     }
+    if process.capture_may_be_incomplete {
+        parts.push("capture may be incomplete".into());
+    }
     let discarded = process
         .stdout_discarded_bytes
         .saturating_add(process.stderr_discarded_bytes);
@@ -2400,242 +2581,13 @@ fn summarize_timeline_names<'a>(names: impl Iterator<Item = &'a str>) -> String 
 }
 
 #[cfg(test)]
-mod durable_checkpoint_tests {
-    use slim_core::ProviderMessage;
-
-    use super::durable_checkpoint_anchor;
-
-    #[test]
-    fn checkpoint_anchor_requires_an_exact_durable_prefix() {
-        let messages = vec![
-            ProviderMessage::user("root"),
-            ProviderMessage::assistant("answer", Vec::new()),
-            ProviderMessage::user("next"),
-        ];
-        let entry_ids = vec![Some("u1".into()), Some("a1".into()), Some("u2".into())];
-        let fingerprint = slim_core::context::compaction_prefix_fingerprint(&messages[..2]);
-
-        assert_eq!(
-            durable_checkpoint_anchor(&messages, &entry_ids, 2, &fingerprint).as_deref(),
-            Some("u2")
-        );
-        let compacted_ids = [Some("u1".into()), None, Some("u2".into())];
-        assert_eq!(
-            durable_checkpoint_anchor(&messages, &compacted_ids, 2, &fingerprint).as_deref(),
-            Some("u2")
-        );
-        assert!(durable_checkpoint_anchor(
-            &messages,
-            &compacted_ids,
-            1,
-            &slim_core::context::compaction_prefix_fingerprint(&messages[..1]),
-        )
-        .is_none());
-        assert!(
-            durable_checkpoint_anchor(&messages, &entry_ids, messages.len(), &fingerprint,)
-                .is_none()
-        );
-    }
-}
+mod durable_checkpoint_tests;
 
 #[cfg(test)]
-mod tool_timeline_tests {
-    use super::summarize_tool_events;
-    use slim_core::{EventKind, SessionEvent};
-
-    fn finished(
-        seq: u64,
-        batch_id: &str,
-        name: &str,
-        success: bool,
-        duration_ms: u64,
-    ) -> SessionEvent {
-        SessionEvent::new(
-            seq,
-            EventKind::ToolFinished {
-                batch_id: batch_id.into(),
-                call_id: format!("call-{seq}"),
-                name: name.into(),
-                success,
-                duration_ms,
-            },
-        )
-    }
-
-    #[test]
-    fn groups_only_consecutive_successful_members_of_one_batch() {
-        let events = vec![
-            finished(1, "a", "read", true, 7),
-            finished(2, "a", "read", true, 8),
-            finished(3, "a", "shell", true, 9),
-            finished(4, "a", "write", false, 4),
-            finished(5, "a", "read", true, 5),
-            finished(6, "b", "search", true, 6),
-        ];
-        assert_eq!(
-            summarize_tool_events(&events),
-            [
-                "✓ 3 tools · read ×2, shell · 24ms",
-                "✕ write · failed · 4ms",
-                "✓ read · 5ms",
-                "✓ search · 6ms",
-            ]
-        );
-    }
-
-    #[test]
-    fn timeline_never_includes_arguments_or_output_events() {
-        let events = vec![
-            SessionEvent::new(
-                1,
-                EventKind::ToolStarted {
-                    batch_id: "a".into(),
-                    call_id: "call-1".into(),
-                    name: "read".into(),
-                    arguments: "secret-path".into(),
-                },
-            ),
-            SessionEvent::new(
-                2,
-                EventKind::ToolOutput {
-                    batch_id: "a".into(),
-                    call_id: "call-1".into(),
-                    name: "read".into(),
-                    output: "secret-output".into(),
-                },
-            ),
-            finished(3, "a", "read", true, 2),
-        ];
-        let timeline = summarize_tool_events(&events).join("\n");
-        assert_eq!(timeline, "✓ read · 2ms");
-        assert!(!timeline.contains("secret"));
-    }
-
-    #[test]
-    fn failed_tool_line_carries_first_output_line_as_reason() {
-        let events = vec![
-            SessionEvent::new(
-                1,
-                EventKind::ToolOutput {
-                    batch_id: "a".into(),
-                    call_id: "call-9".into(),
-                    name: "shell".into(),
-                    output: "exit 1: file not found\nmore details here".into(),
-                },
-            ),
-            SessionEvent::new(
-                2,
-                EventKind::ToolFinished {
-                    batch_id: "a".into(),
-                    call_id: "call-9".into(),
-                    name: "shell".into(),
-                    success: false,
-                    duration_ms: 3,
-                },
-            ),
-        ];
-        assert_eq!(
-            summarize_tool_events(&events),
-            ["✕ shell · failed · exit 1: file not found · 3ms"]
-        );
-    }
-
-    #[test]
-    fn process_facts_add_bounded_status_to_timeline_without_output_text() {
-        let events = vec![
-            SessionEvent::new(
-                1,
-                EventKind::ToolOutput {
-                    batch_id: "a".into(),
-                    call_id: "call-1".into(),
-                    name: "shell".into(),
-                    output: "secret output".into(),
-                },
-            ),
-            SessionEvent::new(
-                2,
-                EventKind::ToolProcessFinished {
-                    batch_id: "a".into(),
-                    call_id: "call-1".into(),
-                    name: "shell".into(),
-                    process: slim_core::process::ProcessExecutionFacts {
-                        exit_code: Some(3),
-                        timed_out: false,
-                        cancelled: true,
-                        stdout_bytes: 4,
-                        stderr_bytes: 2,
-                        stdout_discarded_bytes: 1,
-                        stderr_discarded_bytes: 2,
-                    },
-                },
-            ),
-            SessionEvent::new(
-                3,
-                EventKind::ToolFinished {
-                    batch_id: "a".into(),
-                    call_id: "call-1".into(),
-                    name: "shell".into(),
-                    success: false,
-                    duration_ms: 4,
-                },
-            ),
-        ];
-        let timeline = summarize_tool_events(&events).join("\n");
-        assert_eq!(
-            timeline,
-            "✕ shell · failed · secret output · process: exit 3 · cancelled · discarded 3 B · 4ms"
-        );
-        assert!(!timeline.contains("stdout"));
-    }
-}
+mod tool_timeline_tests;
 
 #[cfg(test)]
-mod validation_derivation_tests {
-    use super::derive_validated_completion;
-    use slim_core::{runtime::AgentLoopStop, CausalProgressKind, EventKind, SessionEvent};
-
-    fn progress(seq: u64, kind: CausalProgressKind) -> SessionEvent {
-        SessionEvent::new(
-            seq,
-            EventKind::CausalProgressObserved {
-                batch_id: "batch".into(),
-                call_id: format!("call-{seq}").into(),
-                kind,
-                tool_name: "shell".into(),
-                call_fingerprint: "fingerprint".into(),
-                evidence_id: "evidence".into(),
-                workspace_revision: seq,
-            },
-        )
-    }
-
-    #[test]
-    fn validation_must_follow_the_last_workspace_mutation() {
-        let mut events = vec![
-            progress(1, CausalProgressKind::WorkspaceChanged),
-            progress(2, CausalProgressKind::ValidationGreen),
-        ];
-        assert!(!derive_validated_completion(
-            AgentLoopStop::ProviderCompleted,
-            &events
-        ));
-
-        events.push(SessionEvent::new(
-            3,
-            EventKind::GoalAssurance { verified: true },
-        ));
-        assert!(derive_validated_completion(
-            AgentLoopStop::ProviderCompleted,
-            &events
-        ));
-
-        events.push(progress(4, CausalProgressKind::WorkspaceChanged));
-        assert!(!derive_validated_completion(
-            AgentLoopStop::ProviderCompleted,
-            &events
-        ));
-    }
-}
+mod validation_derivation_tests;
 
 #[derive(Clone, Copy)]
 struct UsagePricing {
@@ -2643,11 +2595,6 @@ struct UsagePricing {
     cache_write_micros_per_million: Option<u64>,
     cache_read_micros_per_million: Option<u64>,
 }
-
-/// TypeSafe's published Jev price: $0.042 per million input tokens. Jev
-/// output is free. Vercel and caller-selected models stay explicitly
-/// unpriced until their backend supplies a current catalogue entry.
-const TYPESAFE_JEV_INPUT_MICROS_PER_MILLION: u64 = 42_000;
 
 fn cost_summary_for_usage(usage: &UsageTotals, pricing: Option<UsagePricing>) -> UsageCostSummary {
     let has_jev_tokens = usage.jev_input_tokens > 0 || usage.jev_output_tokens > 0;
@@ -2775,7 +2722,9 @@ fn jev_weighted_cost(usage: &UsageTotals, failed: bool) -> Option<u128> {
     if usage_unknown || pricing_unknown {
         return None;
     }
-    u128::from(tokens).checked_mul(u128::from(TYPESAFE_JEV_INPUT_MICROS_PER_MILLION))
+    u128::from(tokens).checked_mul(u128::from(
+        slim_core::context::TYPESAFE_JEV_INPUT_MICROS_PER_MILLION,
+    ))
 }
 
 fn request_weighted_cost(request: &slim_core::RequestUsage, pricing: UsagePricing) -> Option<u128> {
@@ -2808,211 +2757,7 @@ fn weighted_cost_micros(weighted: u128) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod usage_cost_tests {
-    use super::{cost_summary_for_usage, UsagePricing};
-    use slim_core::{ProviderPricing, RequestKind, RequestUsage, UsageTotals};
-
-    #[test]
-    fn costs_separate_failed_compaction_cancelled_and_validated_work() {
-        let pricing = UsagePricing {
-            provider: ProviderPricing {
-                input_micros_per_million: 1_000_000,
-                output_micros_per_million: 2_000_000,
-            },
-            cache_write_micros_per_million: Some(3_000_000),
-            cache_read_micros_per_million: Some(500_000),
-        };
-        let usage = UsageTotals {
-            validated_completion: true,
-            requests: vec![
-                RequestUsage {
-                    request_kind: RequestKind::ProviderTurn,
-                    uncached_input_tokens: 10,
-                    cache_write_tokens: 2,
-                    cache_read_tokens: 4,
-                    output_tokens: 3,
-                    ..RequestUsage::default()
-                },
-                RequestUsage {
-                    request_kind: RequestKind::ProviderTurn,
-                    uncached_input_tokens: 5,
-                    output_tokens: 1,
-                    failed: true,
-                    ..RequestUsage::default()
-                },
-                RequestUsage {
-                    request_kind: RequestKind::Compaction,
-                    uncached_input_tokens: 4,
-                    output_tokens: 2,
-                    ..RequestUsage::default()
-                },
-            ],
-            ..UsageTotals::default()
-        };
-
-        let costs = cost_summary_for_usage(&usage, Some(pricing));
-        assert_eq!(costs.total_micros, Some(39));
-        assert_eq!(costs.cost_per_validated_completion_micros, Some(39));
-        assert_eq!(costs.failed_attempts_micros, Some(7));
-        assert_eq!(costs.compaction_micros, Some(8));
-
-        let cancelled = UsageTotals {
-            requests: vec![RequestUsage {
-                request_kind: RequestKind::ProviderTurn,
-                usage_unknown: true,
-                cancelled: true,
-                estimated_input_tokens: 6,
-                ..RequestUsage::default()
-            }],
-            usage_unknown: true,
-            ..UsageTotals::default()
-        };
-        let costs = cost_summary_for_usage(&cancelled, Some(pricing));
-        assert_eq!(costs.total_micros, None);
-        assert_eq!(costs.cancelled_estimated_micros, Some(6));
-
-        let overflowed = UsageTotals {
-            requests: usage.requests,
-            overflowed: true,
-            ..UsageTotals::default()
-        };
-        let costs = cost_summary_for_usage(&overflowed, Some(pricing));
-        assert_eq!(costs.total_micros, None);
-        assert_eq!(costs.failed_attempts_micros, None);
-        assert_eq!(costs.compaction_micros, None);
-    }
-    #[test]
-    fn request_costs_round_after_aggregation() {
-        let pricing = UsagePricing {
-            provider: ProviderPricing {
-                input_micros_per_million: 1_500_000,
-                output_micros_per_million: 0,
-            },
-            cache_write_micros_per_million: Some(0),
-            cache_read_micros_per_million: Some(0),
-        };
-        let usage = UsageTotals {
-            requests: vec![
-                RequestUsage {
-                    uncached_input_tokens: 1,
-                    ..RequestUsage::default()
-                },
-                RequestUsage {
-                    uncached_input_tokens: 1,
-                    ..RequestUsage::default()
-                },
-            ],
-            ..UsageTotals::default()
-        };
-
-        let costs = cost_summary_for_usage(&usage, Some(pricing));
-
-        assert_eq!(costs.total_micros, Some(3));
-    }
-
-    #[test]
-    fn unpriced_jev_usage_does_not_produce_partial_total_or_compaction_cost() {
-        let pricing = UsagePricing {
-            provider: ProviderPricing {
-                input_micros_per_million: 1_000_000,
-                output_micros_per_million: 2_000_000,
-            },
-            cache_write_micros_per_million: Some(0),
-            cache_read_micros_per_million: Some(0),
-        };
-        let provider_request = RequestUsage {
-            request_kind: RequestKind::Compaction,
-            uncached_input_tokens: 4,
-            output_tokens: 2,
-            ..RequestUsage::default()
-        };
-        let with_reported_jev_usage = UsageTotals {
-            requests: vec![provider_request.clone()],
-            jev_input_tokens: 3,
-            jev_output_tokens: 1,
-            jev_pricing_unknown: true,
-            ..UsageTotals::default()
-        };
-
-        let costs = cost_summary_for_usage(&with_reported_jev_usage, Some(pricing));
-        assert_eq!(costs.total_micros, None);
-        assert_eq!(costs.compaction_micros, None);
-
-        let with_unknown_jev_usage = UsageTotals {
-            requests: vec![provider_request],
-            jev_usage_unknown: true,
-            ..UsageTotals::default()
-        };
-        let costs = cost_summary_for_usage(&with_unknown_jev_usage, Some(pricing));
-        assert_eq!(costs.total_micros, None);
-        assert_eq!(costs.compaction_micros, None);
-    }
-
-    #[test]
-    fn known_typesafe_jev_cost_is_added_without_charging_output_tokens() {
-        let pricing = UsagePricing {
-            provider: ProviderPricing {
-                input_micros_per_million: 1_000_000,
-                output_micros_per_million: 2_000_000,
-            },
-            cache_write_micros_per_million: Some(0),
-            cache_read_micros_per_million: Some(0),
-        };
-        let usage = UsageTotals {
-            validated_completion: true,
-            requests: vec![RequestUsage {
-                request_kind: RequestKind::Compaction,
-                uncached_input_tokens: 4,
-                output_tokens: 2,
-                ..RequestUsage::default()
-            }],
-            jev_input_tokens: 1_000,
-            jev_output_tokens: 30,
-            jev_priced_input_tokens: 1_000,
-            jev_failed_priced_input_tokens: 1_000,
-            ..UsageTotals::default()
-        };
-
-        let costs = cost_summary_for_usage(&usage, Some(pricing));
-        // Provider compaction: 4 + (2 * 2) = 8 micros. Jev: 1,000 *
-        // 42,000 / 1,000,000 = 42 micros; output is free.
-        assert_eq!(costs.total_micros, Some(50));
-        assert_eq!(costs.compaction_micros, Some(50));
-        assert_eq!(costs.failed_attempts_micros, Some(42));
-        assert!(!costs.pricing_unknown);
-        assert!(!costs.usage_unknown);
-    }
-
-    #[test]
-    fn cancelled_cost_combines_observed_usage_with_unknown_input_remainder() {
-        let pricing = UsagePricing {
-            provider: ProviderPricing {
-                input_micros_per_million: 1_000_000,
-                output_micros_per_million: 2_000_000,
-            },
-            cache_write_micros_per_million: Some(3_000_000),
-            cache_read_micros_per_million: Some(500_000),
-        };
-        let usage = UsageTotals {
-            requests: vec![RequestUsage {
-                uncached_input_tokens: 2,
-                cache_write_tokens: 1,
-                cache_read_tokens: 3,
-                output_tokens: 4,
-                estimated_input_tokens: 10,
-                usage_unknown: true,
-                cancelled: true,
-                ..RequestUsage::default()
-            }],
-            usage_unknown: true,
-            ..UsageTotals::default()
-        };
-
-        let costs = cost_summary_for_usage(&usage, Some(pricing));
-
-        assert_eq!(costs.cancelled_estimated_micros, Some(18));
-    }
-}
+mod usage_cost_tests;
 
 fn next_session_suffix() -> u128 {
     std::time::SystemTime::now()
@@ -3061,6 +2806,8 @@ struct ProviderJsonlResult<'a> {
     validation_source: Option<&'a str>,
     #[serde(skip_serializing_if = "slice_is_empty")]
     tool_process_facts: &'a [ToolProcessFact],
+    #[serde(skip_serializing_if = "slice_is_empty")]
+    tool_job_outputs: &'a [ToolJobOutputFact],
 }
 
 fn slice_is_empty<T>(slice: &[T]) -> bool {
@@ -3207,6 +2954,7 @@ pub fn render_provider_jsonl(result: &ProviderHeadlessResult) -> Result<String, 
         cache_hit_ratio: cache_hit_ratio(&result.usage),
         validation_source: result.validation_source.as_deref(),
         tool_process_facts: &result.tool_process_facts,
+        tool_job_outputs: &result.tool_job_outputs,
     })?;
     Ok(format!("{line}\n"))
 }
@@ -3277,8 +3025,14 @@ fn resolve_context_window_tokens(explicit: Option<u64>) -> Result<u64, ProviderE
     }
     parse_positive_env_u64("SLIM_CONTEXT_WINDOW_TOKENS").map_or_else(
         |message| Err(ProviderError::InvalidResponse { message }),
-        |value| Ok(value.unwrap_or(AgentLoopConfig::default().context_window_tokens)),
+        require_model_context_window,
     )
+}
+
+fn require_model_context_window(value: Option<u64>) -> Result<u64, ProviderError> {
+    value.filter(|value| *value > 0).ok_or_else(|| ProviderError::InvalidResponse {
+        message: "Model context window is unknown. Set SLIM_CONTEXT_WINDOW_TOKENS to the provider's documented limit (or supply context_window_tokens explicitly).".into(),
+    })
 }
 
 /// Resolves a Command Code model's context window from the catalog's disk
@@ -3304,7 +3058,10 @@ fn known_model_context_window(
     live_codex: Option<&[slim_core::provider::CodexCatalogEntry]>,
 ) -> Option<u64> {
     match kind {
-        ProviderKind::OpenAiCodex => Some(resolve_codex_context_window(model, live_codex)),
+        ProviderKind::OpenAiCodex => live_codex
+            .and_then(|entries| entries.iter().find(|entry| entry.slug == model))
+            .map(|entry| entry.context_window)
+            .or_else(|| slim_core::provider::codex_model(model).map(|entry| entry.context_window)),
         ProviderKind::ClinePass => clinepass_model(model).map(|model| model.context_window),
         ProviderKind::CommandCode => command_code_context_window(model),
         ProviderKind::Xai => xai_model(model).map(|model| model.context_window),
@@ -3659,6 +3416,12 @@ fn stopped_context(mut message: String, runtime: &Runtime, events: &[SessionEven
                 call_id: call,
                 output,
                 ..
+            }
+            | EventKind::ToolJobOutput {
+                batch_id: batch,
+                call_id: call,
+                output,
+                ..
             } if batch == batch_id && call == call_id => Some(output),
             _ => None,
         }) {
@@ -3894,1285 +3657,22 @@ fn resolve_pricing() -> Option<UsagePricing> {
 }
 
 #[cfg(test)]
-mod stop_message_tests {
-    use super::{format_run_stop_message, ToolLoopLimits};
-    use slim_core::tool_call_is_read_only;
-    use slim_core::tools::ToolResult;
-
-    fn tool_result(name: &str) -> ToolResult {
-        ToolResult {
-            name: name.into(),
-            success: true,
-            output: "ok".into(),
-            artifact: None,
-        }
-    }
-
-    #[test]
-    fn tool_limit_message_includes_bucket_counts_and_breakdown() {
-        let results = vec![
-            tool_result("search"),
-            tool_result("read"),
-            tool_result("write"),
-        ];
-        let message = format_run_stop_message(
-            "tool_limit",
-            &results,
-            ToolLoopLimits {
-                max_mutating_tool_calls: 32,
-                max_read_tool_calls: 96,
-                max_total_tool_calls: 256,
-                max_turns: 128,
-                max_output_tokens: 4096,
-                max_result_bytes: 16 * 1024,
-                context_window_tokens: 32_000,
-            },
-        );
-        assert!(message.starts_with("Tool budget exhausted (read 2/96, mutating 1/32):"));
-        assert!(message.contains("1 read, 1 search, 1 write"));
-        assert!(message.contains("Send a follow-up to continue."));
-        assert!(tool_call_is_read_only("search"));
-    }
-
-    #[test]
-    fn turn_limit_and_repeated_failed_tool_messages_are_humanized() {
-        let limits = ToolLoopLimits {
-            max_mutating_tool_calls: 32,
-            max_read_tool_calls: 96,
-            max_total_tool_calls: 256,
-            max_turns: 128,
-            max_output_tokens: 4096,
-            max_result_bytes: 16 * 1024,
-            context_window_tokens: 32_000,
-        };
-        assert_eq!(
-            format_run_stop_message("turn_limit", &[], limits),
-            "Turn limit reached (128/128). Send a follow-up to continue."
-        );
-        assert_eq!(
-            format_run_stop_message("repeated_failed_tool", &[], limits),
-            "Repeated failed tool blocked."
-        );
-        assert_eq!(
-            format_run_stop_message("no_progress", &[], limits),
-            "Stopped: no progress in recent turns. Send a follow-up to continue."
-        );
-        assert_eq!(
-            format_run_stop_message("provider_truncated", &[], limits),
-            "Output truncated (initial max_output_tokens=4096). Automatic recovery is bounded by retry, turn, model and context limits. Progress is preserved. Increase max_output_tokens within the model limit or request a smaller next step before continuing."
-        );
-        assert_eq!(
-            format_run_stop_message(
-                "tool_limit",
-                &[],
-                ToolLoopLimits {
-                    max_mutating_tool_calls: 0,
-                    max_read_tool_calls: 0,
-                    max_total_tool_calls: 0,
-                    max_turns: 128,
-                    max_output_tokens: 4096,
-                    max_result_bytes: 16 * 1024,
-                    context_window_tokens: 32_000,
-                },
-            ),
-            "Configured tool budgets are zero. Increase the tool limits to continue with tools."
-        );
-    }
-}
+mod stop_message_tests;
 
 #[cfg(test)]
-mod run_telemetry_tests {
-    use super::{
-        durable_run_telemetry_context, empty_provider_execution, input_required_result,
-        run_provider_headless_with_session_and_options, run_telemetry_terminal, ExitCode,
-        ProviderRequest, ProviderRunOptions, ToolLoopLimits,
-    };
-    use slim_core::runtime::CancellationToken;
-    use slim_core::session::{
-        preflight_session, DurableOperationKind, DurableOutcome, DurableRecord,
-    };
-    use slim_core::{OperatingMode, ProviderKind, RequestKind, RequestUsage};
-    use std::fs;
-    use std::time::Duration;
-
-    fn request() -> ProviderRequest {
-        ProviderRequest {
-            prompt: "prompt-marker".into(),
-            mode: OperatingMode::Auto,
-            kind: ProviderKind::OpenAiCompatible,
-            endpoint: "http://127.0.0.1:1".into(),
-            model: "fixture-main".into(),
-            api_key: "secret-marker".into(),
-            account_id: None,
-            timeout: Duration::from_secs(1),
-        }
-    }
-
-    #[test]
-    fn context_exposes_explicit_benchmark_ids_without_prompt_data() {
-        let options = ProviderRunOptions::default()
-            .with_experiment_id("exp-a")
-            .with_task_id("task-7");
-        let context = durable_run_telemetry_context(&request(), &options).unwrap();
-        assert_eq!(context.experiment_id.as_deref(), Some("exp-a"));
-        assert_eq!(context.task_id.as_deref(), Some("task-7"));
-        assert_eq!(context.mode, OperatingMode::Auto);
-        assert_eq!(context.provider, "openai-compatible");
-        assert_eq!(context.model, "fixture-main");
-        assert_eq!(context.limits["resolved"], false);
-        let debug = format!("{context:?}");
-        assert!(!debug.contains("secret-marker"));
-        assert!(!debug.contains("prompt-marker"));
-    }
-
-    #[test]
-    fn terminal_usage_is_aggregate_and_records_limits() {
-        let request = request();
-        let mut execution = empty_provider_execution(input_required_result(&request));
-        execution.result.stop = "provider_completed".into();
-        execution.result.validation_source = Some("derived_runtime".into());
-        execution.result.usage.requests.push(RequestUsage {
-            request_kind: RequestKind::ProviderTurn,
-            provider: "openai-compatible".into(),
-            model: "fixture-main".into(),
-            uncached_input_tokens: 13,
-            ..RequestUsage::default()
-        });
-        execution.result.usage.uncached_input_tokens = 13;
-        execution.result.usage.output_tokens = 5;
-        execution.result.usage.provider_turns = 2;
-        execution.result.usage.validated_completion = true;
-        execution.limits = ToolLoopLimits {
-            max_mutating_tool_calls: 3,
-            max_read_tool_calls: 4,
-            max_total_tool_calls: 5,
-            max_turns: 6,
-            max_output_tokens: 7,
-            max_result_bytes: 8,
-            context_window_tokens: 9,
-        };
-
-        let terminal = run_telemetry_terminal(&execution, DurableOutcome::Success).unwrap();
-        assert_eq!(terminal.usage["request_count"], 1);
-        assert_eq!(terminal.usage["total_input_tokens"], 13);
-        assert_eq!(terminal.usage["total_tokens"], 18);
-        assert_eq!(terminal.usage["provider_turns"], 2);
-        assert!(terminal.usage.get("requests").is_none());
-        assert_eq!(terminal.limits["resolved"], true);
-        assert_eq!(terminal.limits["context_window_tokens"], 9);
-        assert_eq!(terminal.limits["max_result_bytes"], 8);
-        assert!(terminal.validated_completion);
-    }
-
-    #[test]
-    fn cancelled_durable_run_writes_start_and_terminal_envelopes_end_to_end() {
-        let root = std::env::temp_dir().join(format!(
-            "slim-run-telemetry-cli-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&root).unwrap();
-        let session_path = root.join("session.jsonl");
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let mut options = ProviderRunOptions::default()
-            .with_workspace_root(&root)
-            .with_experiment_id("cancel-exp")
-            .with_task_id("cancel-task");
-        options.cancellation = Some(cancellation);
-        let mut request = request();
-        request.mode = OperatingMode::Auto;
-        request.api_key = "must-not-be-persisted".into();
-
-        let result =
-            run_provider_headless_with_session_and_options(request, &session_path, options)
-                .unwrap();
-        assert_eq!(result.code, ExitCode::Cancelled);
-
-        let report = preflight_session(&session_path).unwrap();
-        let telemetry = report
-            .records
-            .iter()
-            .filter_map(|record| match record {
-                DurableRecord::Fact { fact, .. } if fact.namespace == "run.telemetry.v1" => {
-                    Some(fact)
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(telemetry.len(), 2);
-        assert_eq!(telemetry[0].value["phase"], "started");
-        assert_eq!(telemetry[0].value["mode"], "auto");
-        assert_eq!(telemetry[0].value["experiment_id"], "cancel-exp");
-        assert_eq!(telemetry[0].value["task_id"], "cancel-task");
-        assert_eq!(telemetry[1].value["phase"], "terminal");
-        assert_eq!(telemetry[1].value["outcome"], "cancelled");
-        assert_eq!(telemetry[1].value["stop"], "cancelled");
-        assert!(telemetry[1].value["limits"]["resolved"].as_bool().unwrap());
-        let aborted = report
-            .records
-            .iter()
-            .position(|record| {
-                matches!(record, DurableRecord::Operation { operation, .. }
-                if matches!(&operation.kind, DurableOperationKind::Aborted))
-            })
-            .unwrap();
-        let terminal_fact = report
-            .records
-            .iter()
-            .position(|record| {
-                matches!(record, DurableRecord::Fact { fact, .. }
-                if fact.namespace == "run.telemetry.v1"
-                    && fact.value["phase"] == "terminal")
-            })
-            .unwrap();
-        assert!(aborted < terminal_fact);
-        assert!(!fs::read_to_string(&session_path)
-            .unwrap()
-            .contains("must-not-be-persisted"));
-
-        fs::remove_dir_all(root).unwrap();
-    }
-}
+mod run_telemetry_tests;
 
 #[cfg(test)]
-mod resolve_budget_tests {
-    use super::{
-        command_code_context_window, command_code_zero_data_retention, execute_provider_turn,
-        resolve_max_mutating_tool_calls, resolve_max_output_tokens, resolve_max_read_tool_calls,
-        resolve_max_result_bytes, resolve_max_turns, resolve_timeout_secs, ProviderRequest,
-        ProviderRunOptions, DEFAULT_PROVIDER_TIMEOUT_SECS,
-    };
-    use slim_core::runtime::AgentLoopConfig;
-    use std::sync::{Mutex, OnceLock};
-
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
-        let _guard = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("lock");
-        let saved = vars
-            .iter()
-            .map(|(name, _)| (*name, std::env::var_os(name)))
-            .collect::<Vec<_>>();
-        for (name, value) in vars {
-            match value {
-                Some(value) => unsafe { std::env::set_var(name, value) },
-                None => unsafe { std::env::remove_var(name) },
-            }
-        }
-        f();
-        for (name, prior) in saved {
-            match prior {
-                Some(value) => unsafe { std::env::set_var(name, value) },
-                None => unsafe { std::env::remove_var(name) },
-            }
-        }
-    }
-
-    #[test]
-    fn explicit_options_override_env_defaults() {
-        with_env(
-            &[
-                ("SLIM_MAX_MUTATING_TOOL_CALLS", Some("64")),
-                ("SLIM_MAX_READ_TOOL_CALLS", Some("128")),
-                ("SLIM_MAX_TURNS", Some("32")),
-            ],
-            || {
-                let options = ProviderRunOptions::default()
-                    .with_max_tool_calls(8)
-                    .with_max_read_tool_calls(24)
-                    .with_max_turns(4);
-                assert_eq!(
-                    resolve_max_mutating_tool_calls(&options).expect("mutating"),
-                    8
-                );
-                assert_eq!(resolve_max_read_tool_calls(&options).expect("read"), 24);
-                assert_eq!(resolve_max_turns(&options).expect("turns"), 4);
-            },
-        );
-    }
-
-    #[test]
-    fn env_vars_apply_when_options_unset() {
-        with_env(
-            &[
-                ("SLIM_MAX_MUTATING_TOOL_CALLS", Some("48")),
-                ("SLIM_MAX_READ_TOOL_CALLS", Some("120")),
-                ("SLIM_MAX_TURNS", Some("64")),
-            ],
-            || {
-                let options = ProviderRunOptions::default();
-                assert_eq!(
-                    resolve_max_mutating_tool_calls(&options).expect("mutating"),
-                    48
-                );
-                assert_eq!(resolve_max_read_tool_calls(&options).expect("read"), 120);
-                assert_eq!(resolve_max_turns(&options).expect("turns"), 64);
-            },
-        );
-    }
-
-    #[test]
-    fn defaults_apply_without_env_or_options() {
-        with_env(
-            &[
-                ("SLIM_MAX_MUTATING_TOOL_CALLS", None),
-                ("SLIM_MAX_READ_TOOL_CALLS", None),
-                ("SLIM_MAX_TURNS", None),
-            ],
-            || {
-                let options = ProviderRunOptions::default();
-                assert_eq!(
-                    resolve_max_mutating_tool_calls(&options).expect("mutating"),
-                    AgentLoopConfig::DEFAULT_MAX_MUTATING_TOOL_CALLS
-                );
-                assert_eq!(
-                    resolve_max_read_tool_calls(&options).expect("read"),
-                    AgentLoopConfig::DEFAULT_MAX_READ_TOOL_CALLS
-                );
-                assert_eq!(
-                    resolve_max_turns(&options).expect("turns"),
-                    AgentLoopConfig::DEFAULT_MAX_TURNS
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn max_turns_hard_cap_clamps_options_and_env() {
-        with_env(&[("SLIM_MAX_TURNS", Some("4096"))], || {
-            assert_eq!(
-                resolve_max_turns(&ProviderRunOptions::default()).expect("env clamp"),
-                1024
-            );
-            let options = ProviderRunOptions::default().with_max_turns(2048);
-            assert_eq!(resolve_max_turns(&options).expect("options clamp"), 1024);
-        });
-    }
-
-    #[test]
-    fn max_turns_env_zero_is_rejected() {
-        with_env(&[("SLIM_MAX_TURNS", Some("0"))], || {
-            let error = resolve_max_turns(&ProviderRunOptions::default()).expect_err("zero");
-            assert!(matches!(
-                error,
-                slim_core::ProviderError::InvalidResponse { .. }
-            ));
-        });
-    }
-
-    #[test]
-    fn explicit_zero_max_turns_is_preserved() {
-        with_env(&[("SLIM_MAX_TURNS", Some("64"))], || {
-            let options = ProviderRunOptions::default().with_max_turns(0);
-            assert_eq!(resolve_max_turns(&options).expect("zero option"), 0);
-        });
-    }
-
-    #[test]
-    fn default_max_output_uses_catalog_when_the_window_is_known() {
-        with_env(&[("SLIM_MAX_OUTPUT_TOKENS", None)], || {
-            let tokens = resolve_max_output_tokens(
-                None,
-                slim_core::provider::ProviderKind::OpenAiCodex,
-                "gpt-5.6-sol",
-            )
-            .expect("default output cap");
-            assert_eq!(tokens, 128_000);
-            assert_eq!(
-                resolve_max_output_tokens(
-                    None,
-                    slim_core::provider::ProviderKind::Xai,
-                    "grok-4.3",
-                )
-                .expect("xai"),
-                30_000
-            );
-        });
-    }
-
-    #[test]
-    fn explicit_and_env_max_output_are_bounded_by_catalog() {
-        with_env(&[("SLIM_MAX_OUTPUT_TOKENS", Some("128001"))], || {
-            assert!(resolve_max_output_tokens(
-                None,
-                slim_core::provider::ProviderKind::OpenAiCodex,
-                "gpt-5.6-sol",
-            )
-            .is_err());
-        });
-        assert!(resolve_max_output_tokens(
-            Some(128_001),
-            slim_core::provider::ProviderKind::OpenAiCodex,
-            "gpt-5.6-sol",
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn max_output_options_and_env_beat_catalog() {
-        with_env(&[("SLIM_MAX_OUTPUT_TOKENS", Some("2048"))], || {
-            assert_eq!(
-                resolve_max_output_tokens(
-                    None,
-                    slim_core::provider::ProviderKind::OpenAiCodex,
-                    "gpt-5.6-sol",
-                )
-                .expect("env"),
-                2048
-            );
-            assert_eq!(
-                resolve_max_output_tokens(
-                    Some(512),
-                    slim_core::provider::ProviderKind::OpenAiCodex,
-                    "gpt-5.6-sol",
-                )
-                .expect("options"),
-                512
-            );
-        });
-    }
-
-    #[test]
-    fn compatible_and_command_code_fall_back_to_default_max_output() {
-        with_env(&[("SLIM_MAX_OUTPUT_TOKENS", None)], || {
-            assert_eq!(
-                resolve_max_output_tokens(
-                    None,
-                    slim_core::provider::ProviderKind::OpenAiCompatible,
-                    "gpt-4o-mini",
-                )
-                .expect("compat"),
-                slim_core::provider::DEFAULT_MAX_OUTPUT_TOKENS
-            );
-            assert_eq!(
-                resolve_max_output_tokens(
-                    None,
-                    slim_core::provider::ProviderKind::CommandCode,
-                    slim_core::provider::COMMANDCODE_DEFAULT_MODEL,
-                )
-                .expect("command-code"),
-                slim_core::provider::DEFAULT_MAX_OUTPUT_TOKENS
-            );
-        });
-    }
-
-    #[test]
-    fn timeout_zero_is_rejected_and_idle_clamps_to_one_hour() {
-        with_env(&[("SLIM_TIMEOUT_SECS", None)], || {
-            let error = resolve_timeout_secs(Some(0)).expect_err("zero");
-            assert!(matches!(
-                error,
-                slim_core::ProviderError::InvalidResponse { .. }
-            ));
-            assert_eq!(
-                resolve_timeout_secs(None).expect("default").as_secs(),
-                DEFAULT_PROVIDER_TIMEOUT_SECS
-            );
-            assert_eq!(
-                resolve_timeout_secs(Some(9_000)).expect("clamp").as_secs(),
-                3600
-            );
-        });
-        with_env(&[("SLIM_TIMEOUT_SECS", Some("0"))], || {
-            assert!(resolve_timeout_secs(None).is_err());
-        });
-    }
-
-    #[test]
-    fn command_code_context_window_uses_cached_live_only_models() {
-        let cache = std::env::temp_dir().join(format!(
-            "slim-cmd-models-{}-cached.json",
-            std::process::id()
-        ));
-        std::fs::write(
-            &cache,
-            br#"{"version":1,"models":[
-                {"id":"live-only/model","name":"Live Only","context_window":777000},
-                {"id":"claude-sonnet-5","name":"Claude Sonnet 5","context_window":111111}
-            ]}"#,
-        )
-        .expect("cache");
-        let cache_str = cache.to_string_lossy().into_owned();
-        with_env(
-            &[("SLIM_COMMANDCODE_MODELS_FILE", Some(&cache_str))],
-            || {
-                // A model absent from the static registry resolves through the
-                // cached live snapshot.
-                assert_eq!(
-                    command_code_context_window("live-only/model"),
-                    Some(777_000)
-                );
-                // The cache wins over the static registry for shared ids.
-                assert_eq!(
-                    command_code_context_window("claude-sonnet-5"),
-                    Some(111_111)
-                );
-            },
-        );
-        let _ = std::fs::remove_file(&cache);
-    }
-
-    #[test]
-    fn command_code_context_window_falls_back_to_static_registry() {
-        let missing = std::env::temp_dir().join(format!(
-            "slim-cmd-models-{}-missing.json",
-            std::process::id()
-        ));
-        let missing_str = missing.to_string_lossy().into_owned();
-        with_env(
-            &[("SLIM_COMMANDCODE_MODELS_FILE", Some(&missing_str))],
-            || {
-                assert_eq!(
-                    command_code_context_window("deepseek/deepseek-v4.1-flash"),
-                    Some(1_000_000)
-                );
-                assert_eq!(command_code_context_window("totally/unknown"), None);
-            },
-        );
-    }
-
-    #[test]
-    fn command_code_zdr_requires_explicit_affirmative() {
-        with_env(&[("SLIM_CMD_ZDR", None), ("CMD_ZDR", None)], || {
-            assert!(!command_code_zero_data_retention());
-        });
-        for value in ["1", "true", "TRUE", " yes ", "on"] {
-            with_env(&[("SLIM_CMD_ZDR", Some(value)), ("CMD_ZDR", None)], || {
-                assert!(command_code_zero_data_retention(), "value {value}")
-            });
-        }
-        for value in ["0", "false", "no", "yess", ""] {
-            with_env(&[("SLIM_CMD_ZDR", Some(value)), ("CMD_ZDR", None)], || {
-                assert!(!command_code_zero_data_retention(), "value {value}")
-            });
-        }
-        with_env(&[("SLIM_CMD_ZDR", None), ("CMD_ZDR", Some("1"))], || {
-            assert!(command_code_zero_data_retention());
-        });
-    }
-
-    #[test]
-    fn max_result_bytes_zero_is_rejected_and_hard_cap_is_one_mib() {
-        with_env(&[("SLIM_MAX_RESULT_BYTES", None)], || {
-            let error = resolve_max_result_bytes(Some(0)).expect_err("zero");
-            assert!(matches!(
-                error,
-                slim_core::ProviderError::InvalidResponse { .. }
-            ));
-            assert_eq!(resolve_max_result_bytes(None).expect("default"), 16 * 1024);
-            assert_eq!(
-                resolve_max_result_bytes(Some(2 * 1024 * 1024)).expect("clamp"),
-                1024 * 1024
-            );
-        });
-    }
-
-    #[test]
-    fn opencode_rejects_max_output_above_model_metadata() {
-        with_env(
-            &[
-                ("SLIM_MAX_OUTPUT_TOKENS", None),
-                ("SLIM_CONTEXT_WINDOW_TOKENS", None),
-            ],
-            || {
-                let request = ProviderRequest {
-                    prompt: "hi".into(),
-                    mode: slim_core::OperatingMode::Auto,
-                    kind: slim_core::provider::ProviderKind::OpenCodeGo,
-                    endpoint: slim_core::provider::OPENCODE_GO_BASE_URL.into(),
-                    model: slim_core::provider::OPENCODE_GO_DEFAULT_MODEL.into(),
-                    api_key: "key".into(),
-                    account_id: None,
-                    timeout: std::time::Duration::from_secs(1),
-                };
-                match execute_provider_turn(
-                    request,
-                    None,
-                    ProviderRunOptions::default().with_max_output_tokens(384_001),
-                ) {
-                    Err(error) => assert!(
-                        matches!(
-                            error,
-                            slim_core::ProviderError::InvalidResponse { ref message }
-                                if message.contains("OpenCode Go context or output limit")
-                        ),
-                        "{error:?}"
-                    ),
-                    Ok(_) => panic!("OpenCode overflow must reject before the network"),
-                }
-            },
-        );
-    }
-}
+mod resolve_budget_tests;
 
 #[cfg(test)]
-mod plan_loop_tests {
-    use super::{execute_provider_turn, ProviderRequest, ProviderRunOptions};
-    use crate::exit_codes::ExitCode;
-    use slim_core::provider::ProviderKind;
-    use slim_core::OperatingMode;
-
-    #[test]
-    fn headless_plan_still_aborts_without_allow_plan_loop() {
-        let execution = execute_provider_turn(
-            ProviderRequest {
-                prompt: "plan this".into(),
-                mode: OperatingMode::Plan,
-                kind: ProviderKind::OpenAiCompatible,
-                endpoint: "http://127.0.0.1:1".into(),
-                model: "unused".into(),
-                api_key: "secret".into(),
-                account_id: None,
-                timeout: std::time::Duration::from_secs(1),
-            },
-            None,
-            ProviderRunOptions::default(),
-        )
-        .expect("plan abort");
-        assert_eq!(execution.result.code, ExitCode::ApprovalRequired);
-        assert_eq!(execution.result.text, "approval_required");
-        assert!(execution.events.is_empty());
-    }
-}
+mod plan_loop_tests;
 
 #[cfg(test)]
-mod compaction_resume_tests {
-    use super::{durable_provider_history, DurableProviderHistory};
-    use slim_core::context::{compaction_prefix_fingerprint, CompactionReason};
-    use slim_core::session::{
-        preflight_session, CompactionCheckpoint, DurableEntry, DurableEntryRole, DurableRecord,
-        DurableRepo, DurableSessionHeader, JsonlRepo,
-    };
-    use slim_core::ProviderMessage;
-
-    #[test]
-    fn checkpoint_cannot_separate_a_tool_result_from_its_call() {
-        let path = fixture_path("tool-boundary");
-        let mut repo = JsonlRepo::create(
-            &path,
-            DurableSessionHeader::new("session", "now", "D:\\Slim", None, None),
-        )
-        .unwrap();
-        let messages = vec![
-            ProviderMessage::user("inspect"),
-            ProviderMessage::assistant(
-                "",
-                vec![slim_core::provider::ProviderToolCall {
-                    id: "read-1".into(),
-                    name: "read".into(),
-                    arguments: "{}".into(),
-                }],
-            ),
-            ProviderMessage::tool("read", "read-1", "contents"),
-            ProviderMessage::assistant("done", vec![]),
-        ];
-        for (index, message) in messages.iter().cloned().enumerate() {
-            repo.append(DurableRecord::Entry {
-                seq: index as u64,
-                entry: DurableEntry::from_provider_message(
-                    index.to_string(),
-                    index.checked_sub(1).map(|i| i.to_string()),
-                    "op".into(),
-                    message,
-                )
-                .unwrap(),
-            })
-            .unwrap();
-        }
-        repo.append(DurableRecord::Compaction {
-            seq: 4,
-            checkpoint: CompactionCheckpoint {
-                checkpoint_id: "unsafe".into(),
-                summary: "summary".into(),
-                first_kept_entry_id: "2".into(),
-                prefix_fingerprint: compaction_prefix_fingerprint(&messages[..2]),
-                previous_checkpoint_id: None,
-                tokens_before: 100,
-                tokens_after: 10,
-                input_tokens: None,
-                output_tokens: None,
-                duration_ms: 0,
-                reason: CompactionReason::HardThreshold,
-                read_files: vec![],
-                modified_files: vec![],
-            },
-        })
-        .unwrap();
-        let restored =
-            durable_provider_history(&super::SessionPreflight::from_open_repo(&repo)).unwrap();
-        assert_eq!(restored.messages, messages);
-        assert_eq!(restored.applied_checkpoint_id, None);
-        let ids = (0..4).map(|i| Some(i.to_string())).collect::<Vec<_>>();
-        assert_eq!(
-            super::durable_checkpoint_anchor(
-                &messages,
-                &ids,
-                2,
-                &compaction_prefix_fingerprint(&messages[..2])
-            ),
-            None
-        );
-        assert_eq!(
-            super::durable_checkpoint_anchor(
-                &messages,
-                &ids,
-                3,
-                &compaction_prefix_fingerprint(&messages[..3])
-            ),
-            Some("3".into())
-        );
-        drop(repo);
-        std::fs::remove_file(&path).unwrap();
-        let _ = std::fs::remove_file(path.with_extension("jsonl.lock"));
-    }
-
-    fn fixture_path(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "slim-compaction-resume-{label}-{}-{}.jsonl",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ))
-    }
-
-    #[test]
-    fn durable_history_uses_only_a_matching_checkpoint_prefix() {
-        for (label, fingerprint_matches) in [("valid", true), ("stale", false)] {
-            let path = fixture_path(label);
-            let mut repo = JsonlRepo::create(
-                &path,
-                DurableSessionHeader::new("session", "now", "D:\\Slim", None, None),
-            )
-            .expect("create");
-            let entries = [
-                ("root", DurableEntryRole::User, "root instruction", None),
-                (
-                    "old",
-                    DurableEntryRole::Assistant,
-                    "old answer",
-                    Some("root"),
-                ),
-                (
-                    "kept",
-                    DurableEntryRole::User,
-                    "recent question",
-                    Some("old"),
-                ),
-            ];
-            for (seq, (id, role, content, parent)) in entries.into_iter().enumerate() {
-                repo.append(DurableRecord::Entry {
-                    seq: seq as u64,
-                    entry: DurableEntry {
-                        entry_id: id.into(),
-                        role,
-                        content: content.into(),
-                        parent_entry_id: parent.map(str::to_owned),
-                        operation_id: format!("op-{id}"),
-                        tool_call_id: None,
-                        tool_calls: Vec::new(),
-                        content_blocks: Vec::new(),
-                    },
-                })
-                .expect("append entry");
-            }
-            let prefix = [
-                ProviderMessage::user("root instruction"),
-                ProviderMessage::assistant("old answer", Vec::new()),
-            ];
-            repo.append(DurableRecord::Compaction {
-                seq: 3,
-                checkpoint: CompactionCheckpoint {
-                    checkpoint_id: "compact-1".into(),
-                    summary: "## Goal\nContinue".into(),
-                    first_kept_entry_id: "kept".into(),
-                    prefix_fingerprint: if fingerprint_matches {
-                        compaction_prefix_fingerprint(&prefix)
-                    } else {
-                        "0000000000000000".into()
-                    },
-                    previous_checkpoint_id: None,
-                    tokens_before: 100,
-                    tokens_after: 20,
-                    input_tokens: Some(5),
-                    output_tokens: Some(2),
-                    duration_ms: 1,
-                    reason: CompactionReason::HardThreshold,
-                    read_files: vec![],
-                    modified_files: vec![],
-                },
-            })
-            .expect("append checkpoint");
-            repo.append(DurableRecord::Entry {
-                seq: 4,
-                entry: DurableEntry {
-                    entry_id: "kept-2".into(),
-                    role: DurableEntryRole::Assistant,
-                    content: "recent answer".into(),
-                    parent_entry_id: Some("kept".into()),
-                    operation_id: "op-kept-2".into(),
-                    tool_call_id: None,
-                    tool_calls: Vec::new(),
-                    content_blocks: Vec::new(),
-                },
-            })
-            .expect("append second kept entry");
-            if fingerprint_matches {
-                let chained_prefix = [
-                    ProviderMessage::user("root instruction"),
-                    ProviderMessage::user("[Compacted context]\n## Goal\nContinue"),
-                    ProviderMessage::user("recent question"),
-                ];
-                repo.append(DurableRecord::Compaction {
-                    seq: 5,
-                    checkpoint: CompactionCheckpoint {
-                        checkpoint_id: "compact-2".into(),
-                        summary: "## Goal\nSecond".into(),
-                        first_kept_entry_id: "kept-2".into(),
-                        prefix_fingerprint: compaction_prefix_fingerprint(&chained_prefix),
-                        previous_checkpoint_id: Some("compact-1".into()),
-                        tokens_before: 80,
-                        tokens_after: 15,
-                        input_tokens: Some(4),
-                        output_tokens: Some(2),
-                        duration_ms: 1,
-                        reason: CompactionReason::HardThreshold,
-                        read_files: vec![],
-                        modified_files: vec![],
-                    },
-                })
-                .expect("append chained checkpoint");
-                repo.append(DurableRecord::Compaction {
-                    seq: 6,
-                    checkpoint: CompactionCheckpoint {
-                        checkpoint_id: "compact-invalid".into(),
-                        summary: "ignored".into(),
-                        first_kept_entry_id: "kept-2".into(),
-                        prefix_fingerprint: "0000000000000000".into(),
-                        previous_checkpoint_id: Some("compact-2".into()),
-                        tokens_before: 15,
-                        tokens_after: 10,
-                        input_tokens: Some(1),
-                        output_tokens: Some(1),
-                        duration_ms: 1,
-                        reason: CompactionReason::HardThreshold,
-                        read_files: vec![],
-                        modified_files: vec![],
-                    },
-                })
-                .expect("append invalid checkpoint");
-            }
-            drop(repo);
-
-            let preflight = preflight_session(&path).expect("preflight");
-            let DurableProviderHistory {
-                messages: history,
-                parent_entry_id: parent,
-                entry_ids: ids,
-                applied_checkpoint_id,
-            } = durable_provider_history(&preflight).expect("history");
-            assert_eq!(parent.as_deref(), Some("kept-2"));
-            if fingerprint_matches {
-                assert_eq!(history.len(), 4);
-                assert_eq!(history[0].content, "root instruction");
-                assert!(history[1].content.contains("Second"));
-                assert_eq!(history[2].content, "recent question");
-                assert_eq!(history[3].content, "recent answer");
-                assert_eq!(
-                    ids,
-                    vec![
-                        Some("root".into()),
-                        None,
-                        Some("kept".into()),
-                        Some("kept-2".into())
-                    ]
-                );
-                assert_eq!(applied_checkpoint_id.as_deref(), Some("compact-2"));
-            } else {
-                assert_eq!(history.len(), 4);
-                assert_eq!(history[1].content, "old answer");
-                assert_eq!(applied_checkpoint_id, None);
-            }
-            std::fs::remove_file(&path).expect("cleanup data");
-            let lock = path.with_extension("jsonl.lock");
-            if lock.exists() {
-                std::fs::remove_file(lock).expect("cleanup lock");
-            }
-        }
-    }
-}
+mod compaction_resume_tests;
 
 #[cfg(test)]
-mod resume_preflight_transport_tests {
-    use super::{run_provider_resume_with_preflight_events, ProviderRequest, ProviderRunOptions};
-    use slim_core::provider::{ProviderError, ProviderKind};
-    use slim_core::session::{preflight_session, DurableSessionHeader, JsonlRepo};
-    use slim_core::OperatingMode;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-    fn fixture_path() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "slim-resume-preflight-transport-{}-{}.jsonl",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ))
-    }
-
-    #[test]
-    fn transported_preflight_remains_the_snapshot_used_by_resume() {
-        let path = fixture_path();
-        JsonlRepo::create(
-            &path,
-            DurableSessionHeader::new("first", "now", "D:\\Slim", None, None),
-        )
-        .expect("first repo");
-        let preflight = preflight_session(&path).expect("preflight");
-        std::fs::remove_file(&path).expect("replace fixture");
-        JsonlRepo::create(
-            &path,
-            DurableSessionHeader::new("replacement", "later", "D:\\Slim", None, None),
-        )
-        .expect("replacement repo");
-
-        let error = match run_provider_resume_with_preflight_events(
-            ProviderRequest {
-                prompt: "continue".into(),
-                mode: OperatingMode::Auto,
-                kind: ProviderKind::OpenAiCompatible,
-                endpoint: "http://127.0.0.1:1".into(),
-                model: "offline".into(),
-                api_key: "local-fixture".into(),
-                account_id: None,
-                timeout: Duration::from_millis(50),
-            },
-            preflight,
-            ProviderRunOptions::default(),
-            None,
-        ) {
-            Ok(_) => panic!("replacement after preflight must fail closed"),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            error,
-            ProviderError::InvalidResponse { ref message }
-                if message.contains("changed after read-only preflight")
-        ));
-
-        let _ = std::fs::remove_file(path);
-    }
-}
+mod resume_preflight_transport_tests;
 
 #[cfg(test)]
-mod live_history_resume_tests {
-    use super::{
-        keep_live_history, run_provider_resume_with_preflight_events, ProviderRequest,
-        ProviderRunOptions,
-    };
-    use slim_core::provider::ProviderKind;
-    use slim_core::session::{
-        preflight_session, DurableEntry, DurableEntryRole, DurableRecord, DurableRepo,
-        DurableSessionHeader, JsonlRepo,
-    };
-    use slim_core::{OperatingMode, ProviderMessage};
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
-    use std::thread;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-    fn temp_session(label: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "slim-live-history-{label}-{}-{stamp}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("workspace");
-        dir.join("session.jsonl")
-    }
-
-    fn create_empty_v2(path: &Path) {
-        let cwd = path.parent().expect("parent").to_str().expect("unicode");
-        drop(
-            JsonlRepo::create(
-                path,
-                DurableSessionHeader::new("live-history", "now", cwd, None, None),
-            )
-            .expect("empty v2"),
-        );
-    }
-
-    fn create_v2_with_visible_history(path: &Path) {
-        let cwd = path.parent().expect("parent").to_str().expect("unicode");
-        let mut repo = JsonlRepo::create(
-            path,
-            DurableSessionHeader::new("visible", "now", cwd, None, None),
-        )
-        .expect("v2");
-        repo.append(DurableRecord::Entry {
-            seq: 0,
-            entry: DurableEntry {
-                entry_id: "user-1".into(),
-                role: DurableEntryRole::User,
-                content: "seed question".into(),
-                parent_entry_id: None,
-                operation_id: "seed".into(),
-                tool_call_id: None,
-                tool_calls: Vec::new(),
-                content_blocks: Vec::new(),
-            },
-        })
-        .expect("user");
-        repo.append(DurableRecord::Entry {
-            seq: 1,
-            entry: DurableEntry {
-                entry_id: "asst-1".into(),
-                role: DurableEntryRole::Assistant,
-                content: "seed answer".into(),
-                parent_entry_id: Some("user-1".into()),
-                operation_id: "seed".into(),
-                tool_call_id: None,
-                tool_calls: Vec::new(),
-                content_blocks: Vec::new(),
-            },
-        })
-        .expect("assistant");
-    }
-
-    fn request(endpoint: String, prompt: &str) -> ProviderRequest {
-        ProviderRequest {
-            prompt: prompt.into(),
-            mode: OperatingMode::Auto,
-            kind: ProviderKind::OpenAiCompatible,
-            endpoint,
-            model: "deepseek-v4-flash".into(),
-            api_key: "fixture-secret".into(),
-            account_id: None,
-            timeout: Duration::from_secs(5),
-        }
-    }
-
-    fn read_http_body(stream: &mut std::net::TcpStream) -> String {
-        stream.set_nonblocking(false).expect("blocking");
-        let mut raw = Vec::new();
-        let mut chunk = [0_u8; 16 * 1024];
-        loop {
-            let size = stream.read(&mut chunk).expect("request");
-            assert!(size > 0, "request closed before body");
-            raw.extend_from_slice(&chunk[..size]);
-            let text = String::from_utf8_lossy(&raw);
-            let Some(header_end) = text.find("\r\n\r\n").map(|index| index + 4) else {
-                continue;
-            };
-            let Some(content_length) = text.lines().find_map(|line| {
-                line.strip_prefix("Content-Length:")
-                    .or_else(|| line.strip_prefix("content-length:"))
-                    .and_then(|value| value.trim().parse::<usize>().ok())
-            }) else {
-                continue;
-            };
-            if raw.len() >= header_end + content_length {
-                return String::from_utf8_lossy(&raw[header_end..header_end + content_length])
-                    .into_owned();
-            }
-        }
-    }
-
-    fn write_sse(stream: &mut std::net::TcpStream, payload: &[u8]) {
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-            )
-            .expect("headers");
-        stream.write_all(payload).expect("events");
-    }
-
-    fn spawn_turns(
-        payloads: Vec<&'static [u8]>,
-    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
-        let bodies = Arc::new(Mutex::new(Vec::new()));
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        listener.set_nonblocking(true).expect("nonblocking");
-        let address = listener.local_addr().expect("address");
-        let captured = Arc::clone(&bodies);
-        let server = thread::spawn(move || {
-            for payload in payloads {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                let (mut stream, _) = loop {
-                    match listener.accept() {
-                        Ok(pair) => break pair,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            assert!(Instant::now() < deadline, "fixture accept timed out");
-                            thread::yield_now();
-                        }
-                        Err(error) => panic!("fixture accept: {error}"),
-                    }
-                };
-                let body = read_http_body(&mut stream);
-                captured.lock().expect("bodies").push(body);
-                write_sse(&mut stream, payload);
-            }
-        });
-        (format!("http://{address}"), bodies, server)
-    }
-
-    #[test]
-    fn keep_live_history_requires_visible_identity() {
-        let durable = vec![
-            ProviderMessage::user("a"),
-            ProviderMessage::assistant("b", vec![]),
-        ];
-        assert!(keep_live_history(&durable, &durable));
-        assert!(!keep_live_history(&[], &durable));
-        assert!(!keep_live_history(
-            &[
-                ProviderMessage::user("z"),
-                ProviderMessage::assistant("b", vec![])
-            ],
-            &durable
-        ));
-        assert!(!keep_live_history(&[ProviderMessage::user("a")], &durable));
-        let snapshot = format!(
-            "a{} (partial):\nfile.txt\n",
-            "\n\nWorkspace paths observed before this turn"
-        );
-        assert!(keep_live_history(
-            &[
-                ProviderMessage::user(snapshot),
-                ProviderMessage::assistant("b", vec![]),
-            ],
-            &durable
-        ));
-        let channel = "a\n\nHarness channel: Auto, unattended.".to_string();
-        assert!(keep_live_history(
-            &[
-                ProviderMessage::user(channel),
-                ProviderMessage::assistant("b", vec![]),
-            ],
-            &durable
-        ));
-    }
-
-    #[test]
-    fn mismatched_live_history_is_replaced_by_durable_prefix() {
-        let path = temp_session("mismatch");
-        create_v2_with_visible_history(&path);
-        let (endpoint, bodies, server) = spawn_turns(vec![
-            b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
-        ]);
-        let preflight = preflight_session(&path).expect("preflight");
-        let options = ProviderRunOptions::default()
-            .with_workspace_root(path.parent().expect("parent"))
-            .with_history(vec![
-                ProviderMessage::user("stale live question"),
-                ProviderMessage::assistant("stale live answer", vec![]),
-            ]);
-        let execution = run_provider_resume_with_preflight_events(
-            request(endpoint, "continue"),
-            preflight,
-            options,
-            None,
-        )
-        .expect("resume");
-        server.join().expect("server");
-        assert_eq!(execution.result.code, super::ExitCode::Success);
-        let body = bodies.lock().expect("bodies")[0].clone();
-        assert!(body.contains("seed question"), "{body}");
-        assert!(body.contains("seed answer"), "{body}");
-        assert!(!body.contains("stale live question"), "{body}");
-        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
-    }
-
-    #[test]
-    fn same_process_resume_resends_chat_reasoning() {
-        let path = temp_session("thought");
-        create_empty_v2(&path);
-        let first = b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hold this thought\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"first answer\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-        let second = b"data: {\"choices\":[{\"delta\":{\"content\":\"second answer\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-        let (endpoint, bodies, server) = spawn_turns(vec![first, second]);
-        let workspace = path.parent().expect("parent").to_path_buf();
-        let first_options = ProviderRunOptions::default()
-            .with_workspace_root(&workspace)
-            .with_reasoning_effort("high");
-        let first_execution = run_provider_resume_with_preflight_events(
-            request(endpoint.clone(), "first prompt"),
-            preflight_session(&path).expect("first preflight"),
-            first_options,
-            None,
-        )
-        .expect("first resume");
-        assert_eq!(first_execution.result.code, super::ExitCode::Success);
-        assert_eq!(first_execution.result.text, "first answer");
-        let history = first_execution.history.expect("live history");
-        assert!(
-            history.iter().any(|message| {
-                message.response_cache_scope_id().is_some()
-                    && message.role == "assistant"
-                    && message.content == "first answer"
-            }),
-            "first turn must retain chat reasoning: {history:?}"
-        );
-
-        let second_options = ProviderRunOptions::default()
-            .with_workspace_root(&workspace)
-            .with_reasoning_effort("high")
-            .with_history(history);
-        let second_execution = run_provider_resume_with_preflight_events(
-            request(endpoint, "second prompt"),
-            first_execution.resume_preflight.expect("updated preflight"),
-            second_options,
-            None,
-        )
-        .expect("second resume");
-        server.join().expect("server");
-        assert_eq!(second_execution.result.code, super::ExitCode::Success);
-        assert_eq!(second_execution.result.text, "second answer");
-        let captured = bodies.lock().expect("bodies");
-        assert_eq!(captured.len(), 2, "{captured:?}");
-        assert!(
-            captured[1].contains("hold this thought"),
-            "second request must resend live thought: {}",
-            captured[1]
-        );
-        let _ = std::fs::remove_dir_all(workspace);
-    }
-
-    #[test]
-    fn cold_resume_does_not_invent_reasoning() {
-        let path = temp_session("cold");
-        create_v2_with_visible_history(&path);
-        let (endpoint, bodies, server) = spawn_turns(vec![
-            b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
-        ]);
-        let options = ProviderRunOptions::default()
-            .with_workspace_root(path.parent().expect("parent"))
-            .with_reasoning_effort("high");
-        let execution = run_provider_resume_with_preflight_events(
-            request(endpoint, "continue"),
-            preflight_session(&path).expect("preflight"),
-            options,
-            None,
-        )
-        .expect("cold resume");
-        server.join().expect("server");
-        assert_eq!(execution.result.code, super::ExitCode::Success);
-        let body = bodies.lock().expect("bodies")[0].clone();
-        assert!(body.contains("seed question"), "{body}");
-        assert!(!body.contains("hold this thought"), "{body}");
-        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
-    }
-}
+mod live_history_resume_tests;

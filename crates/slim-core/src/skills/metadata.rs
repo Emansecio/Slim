@@ -52,8 +52,12 @@ pub fn read_metadata(path: impl AsRef<Path>) -> io::Result<SkillMetadata> {
         }
     }
     Ok(SkillMetadata {
-        name: name.ok_or_else(|| invalid("missing name"))?,
-        description: description.ok_or_else(|| invalid("missing description"))?,
+        name: name
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| invalid("missing or empty name"))?,
+        description: description
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| invalid("missing or empty description"))?,
     })
 }
 

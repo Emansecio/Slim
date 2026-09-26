@@ -28,7 +28,7 @@ pub use headless::{
     run_provider_headless_with_resume, run_provider_headless_with_resume_and_options,
     run_provider_headless_with_session, run_provider_headless_with_session_and_options,
     HeadlessRequest, HeadlessResult, OutputFormat, ProviderHeadlessResult, ProviderRequest,
-    ProviderRunOptions, ToolProcessFact, UsageCostSummary, MAX_IMAGE_BYTES,
+    ProviderRunOptions, ToolJobOutputFact, ToolProcessFact, UsageCostSummary, MAX_IMAGE_BYTES,
 };
 pub use jsonl::render_jsonl;
 pub use tui::{

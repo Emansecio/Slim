@@ -14,6 +14,7 @@ pub mod inspector;
 pub mod layout;
 mod markdown;
 pub mod picker;
+mod prompt_queue;
 pub mod reducer;
 pub mod render;
 pub mod runtime;
@@ -22,6 +23,7 @@ pub mod selection;
 pub mod terminal;
 pub mod testkit;
 pub mod theme;
+pub mod todo;
 pub mod view_model;
 
-pub use runtime::run_app;
+pub use runtime::{run_app, run_app_with_initial_prompt};

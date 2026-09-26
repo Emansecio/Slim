@@ -749,6 +749,7 @@ fn drive_case(
         ]);
         command.cwd(&workspace.root);
         command.env("SLIM_API_KEY", SENTINEL_KEY);
+        command.env("SLIM_CONTEXT_WINDOW_TOKENS", "32000");
         command.env("SLIM_AUTH_FILE", &auth);
         command.env("NO_PROXY", "127.0.0.1,localhost");
         command.env_remove("NO_COLOR");
@@ -926,6 +927,7 @@ fn loopback_fixture_exercises_reasoning_homonymous_tools_and_answer_offline() {
             timeout: PHASE_TIMEOUT,
         },
         ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
             .with_workspace_root(&workspace.root)
             .with_artifact_root(workspace.root.join("artifacts")),
     ) {

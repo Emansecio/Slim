@@ -1,5 +1,8 @@
 # Slim — avaliação agentic de code_intel
 
+> Caminhos em `results/` exibidos em código são artefatos locais ignorados pelo
+> Git; este relatório preserva as conclusões datadas sem simular links duráveis.
+
 ## Resultado
 
 **10/10 tarefas corretas; nenhuma chamada `code_intel`. Ganho de exploração ou
@@ -16,7 +19,7 @@ Não são respostas predeterminadas nem execuções do agente Pi no lugar do Sli
 ## Baseline e condições
 
 - HEAD `972b46e4e445de05b4021554b277710f3cfe9243`, **checkout sujo**. HEAD sozinho não identifica execução.
-- [Manifesto](results/baseline.json): arquivos de crates/testes/Cargo com hashes;
+- Manifesto (`results/baseline.json`, artefato local n?o versionado): arquivos de crates/testes/Cargo com hashes;
   digest `1a7bd78580f9335f2e730520fc48ec2f3dff31fd2ae7c5c3e419b3857a81d4ea`.
 - Build atual: `target/release/slim.exe`, SHA-256
   `8e3b6dd650e4656f00b60165d93210b2ec1e3698c905f3f7e36c532306bf27c0`.
@@ -29,7 +32,7 @@ Não são respostas predeterminadas nem execuções do agente Pi no lugar do Sli
   defaults da mesma implementação. Mesmo prompt de sistema nativo v1.7.
 - Todas as 68 requisições registraram `system_bytes=1784`, `tool_schema_bytes=5904`;
   bytes iguais não provam conteúdo igual, mas fontes/binário/config ficaram congelados.
-  [Probe local](results/schema-probe.json) confirmou payload Codex com modelo Luna,
+  Probe local (`results/schema-probe.json`, artefato local n?o versionado) confirmou payload Codex com modelo Luna,
   effort high e ferramentas `read/list/search/write/patch/shell/code_intel/todo/skill`.
   Esse probe não chama modelo comercial, usa credencial dummy e HTTP loopback.
   É evidência separada de disponibilidade do schema; não prova saúde do LSP nem
@@ -61,7 +64,7 @@ Testes adicionais do agente são permitidos em `tests/`.
 
 Autoteste do oráculo: **5 bases iniciais rejeitadas, 5 soluções canônicas aceitas,
 5 corrupções de documentação protegida rejeitadas**. Não são resultados agentic.
-[Detalhes](results/oracle-tests.json). Os 10 resultados reais passaram todos os
+Detalhes (`results/oracle-tests.json`, artefato local n?o versionado). Os 10 resultados reais passaram todos os
 checks e testes externos; exit 0 do agente não foi usado sozinho como correção.
 
 ## Escolha de ferramentas
@@ -89,7 +92,7 @@ Total: **150 calls, 58 rodadas, 68 provider turns**. Ferramentas: 82 read,
 Contadores do Slim: 150 executadas, nenhuma reutilizada/suprimida; nenhum resultado
 faltante. Em A-1, seis reads iniciais custam **uma** rodada, não seis.
 Argumentos e resultados completos: `results/<caso>-<repetição>/metrics.json`;
-[resumo mecânico](results/summary.json), [sequência observável](results/observable-calls.txt).
+resumo mecânico (`results/summary.json`, artefato local n?o versionado), sequência observável (`results/observable-calls.txt`, artefato local n?o versionado).
 
 ## Capacidades recentes: utilização real
 
@@ -231,6 +234,23 @@ python -m unittest discover -s bench/agentic-code-intel -p test_harness.py -v
 python bench/agentic-code-intel/analyze.py
 ```
 
+O analyzer atual também informa `adjacent_edit_cargo_validation_pairs` (chamadas
+adjacentes de `write`/`patch` seguidas de validação Cargo) e
+`large_tool_results_gt_10k` (resultados acima de 10 KiB). Os dois campos são
+`null` quando falta algum resultado durável; representam oportunidades, não
+redução de chamadas ou tokens medida. Os resultados históricos desta página
+não foram recalculados com esses campos.
+
+`cross_round_edit_cargo_validation_pairs` restringe a contagem aos pares em
+batches diferentes; `fused_edit_cargo_validation_calls` conta validações Cargo
+em `then_run` de `write`/`patch`. Quando `tool_process_facts` está presente no
+resultado, `shell_truncated_calls` e `shell_preview_omitted_bytes` medem a perda
+da prévia de 8 KiB por stream, inclusive no `then_run`;
+`shell_capture_discarded_bytes` mede bytes perdidos também pela captura bruta.
+Campos sem fatos de processo ficam `null`, não zero.
+Nenhum desses contadores demonstra economia, correção ou reacesso após recall;
+isso exige uma nova campanha com oráculos e custos por tarefa.
+
 `prepare` gera bases e manifestos uma vez, recusando bases existentes.
 `run --authorized --case A --rep 1` só aceita autorização explícita e diretório de
 resultado novo; as tentativas desta rodada já existem e não serão sobrescritas.
@@ -245,10 +265,10 @@ novo manifesto e autorização correspondente. O probe local não entra na amost
   das 10 execuções reais e do probe offline.
 - `cargo --config 'build.rustc-wrapper=""' build --release -p slim-cli --locked`:
   **exit 0**, com rustc/rustdoc do mesmo toolchain, jobs=1, overrides só no processo.
-  [Log](results/build.log). Sem alterações de produto; suíte completa/clippy/TUI
+  Log (`results/build.log`, artefato local n?o versionado). Sem alterações de produto; suíte completa/clippy/TUI
   **não aplicáveis**. Nenhuma contagem histórica reutilizada como check atual.
 - Oráculo: 15 verificações descritas acima; execução real: 10/10 checks externos
-  aprovados. [Unittest](results/harness-tests.log): **3 passaram**, incluindo
+  aprovados. Unittest (`results/harness-tests.log`, artefato local n?o versionado): **3 passaram**, incluindo
   batch paralelo≠duas rodadas, join de resultados fora de ordem, bytes UTF-8,
   resultados ausentes e prompts sem prescrição de ferramenta.
 - Falhas de preparação preservadas: hash LF versus arquivo CRLF antes de lançar
@@ -256,7 +276,7 @@ novo manifesto e autorização correspondente. O probe local não entra na amost
   (exit 20, zero requests), seguido de probe local correto encerrado por HTTP 400
   intencional (exit 21, uma request). Utilitários de impressão sofreram cp1252;
   análise durável usa UTF-8 explícito. Nenhuma tentativa comercial descartada.
-- `git diff --check`: **exit 0**. [Preservação](results/preservation.json):
+- `git diff --check`: **exit 0**. Preservação (`results/preservation.json`, artefato local n?o versionado):
   **18.329 arquivos preexistentes verificados por hash, zero alterados**.
   Snapshot não transacional; não abrange arquivos ignorados/bancos externos.
 - Novos arquivos somente em `bench/agentic-code-intel/`; builds em target e tarefas

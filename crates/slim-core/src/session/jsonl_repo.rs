@@ -40,11 +40,29 @@ pub struct JsonlRepo {
 
 impl JsonlRepo {
     pub fn create(path: impl AsRef<Path>, header: DurableSessionHeader) -> io::Result<Self> {
-        let path = resolve_session_path(path.as_ref())?;
-        Self::create_impl(path, header)
+        Self::create_with_records(path, header, Vec::new())
     }
 
-    fn create_impl(path: PathBuf, header: DurableSessionHeader) -> io::Result<Self> {
+    pub(crate) fn create_with_records(
+        path: impl AsRef<Path>,
+        header: DurableSessionHeader,
+        records: Vec<DurableRecord>,
+    ) -> io::Result<Self> {
+        let path = resolve_session_path(path.as_ref())?;
+        Self::create_impl(path, header, records, |_| Ok(()))
+    }
+
+    fn create_impl(
+        path: PathBuf,
+        header: DurableSessionHeader,
+        records: Vec<DurableRecord>,
+        before_publish: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        let validator = if records.is_empty() {
+            DurableAppendValidator::empty()
+        } else {
+            DurableAppendValidator::from_records(&records)?
+        };
         let lock = acquire_lock(&path)?;
         if path.exists() {
             return Err(io::Error::new(
@@ -58,7 +76,15 @@ impl JsonlRepo {
             let encoded = encode_line(&header)?;
             ensure_line_fits(0, encoded.len())?;
             write_line(&mut file, &encoded)?;
+            let mut length = encoded.len() as u64 + 1;
+            for record in &records {
+                let encoded = encode_line(record)?;
+                ensure_line_fits(length, encoded.len())?;
+                write_line(&mut file, &encoded)?;
+                length += encoded.len() as u64 + 1;
+            }
             file.sync_data()?;
+            before_publish(&temp_path)?;
             let temp_identity = file_identity(&file)?;
             publish_temp_file(&file, &temp_path, &path)?;
             if file_identity(&file)? != temp_identity {
@@ -78,8 +104,8 @@ impl JsonlRepo {
             file,
             _lock: lock,
             header,
-            records: Vec::new(),
-            validator: DurableAppendValidator::empty(),
+            records,
+            validator,
             poisoned: false,
         })
     }
@@ -620,6 +646,87 @@ mod tests {
     }
 
     #[test]
+    fn initial_records_are_complete_before_publication() {
+        let path = test_path();
+        let records: Vec<_> = (0..3)
+            .map(|seq| DurableRecord::Fact {
+                seq,
+                fact: super::super::schema_v2::DurableFact {
+                    namespace: "initial".into(),
+                    key: format!("k-{seq}"),
+                    value: Value::Null,
+                },
+            })
+            .collect();
+        let mut repo = JsonlRepo::create_impl(
+            path.clone(),
+            DurableSessionHeader::new("initial", "now", "D:\\Slim", None, None),
+            records.clone(),
+            |staged| {
+                assert!(!path.exists(), "no partial session at its final path");
+                let data = fs::read_to_string(staged)?;
+                let actual: Vec<DurableRecord> = data
+                    .lines()
+                    .skip(1)
+                    .map(|line| serde_json::from_str(line).expect("staged record"))
+                    .collect();
+                assert_eq!(actual, records);
+                Ok(())
+            },
+        )
+        .expect("publish initial records");
+        assert_eq!(repo.records(), records.as_slice());
+        let mut next = records[2].clone();
+        if let DurableRecord::Fact { seq, .. } = &mut next {
+            *seq = 3;
+        }
+        repo.append(next).expect("validator retains initial prefix");
+        drop(repo);
+        let reopened = JsonlRepo::open_no_repair(&path).expect("complete session");
+        assert_eq!(reopened.records().len(), 4);
+        drop(reopened);
+        fs::remove_dir_all(path.parent().unwrap()).expect("cleanup");
+    }
+
+    #[test]
+    fn failed_initial_publication_leaves_no_partial_session_or_overwrite() {
+        for race_destination in [false, true] {
+            let path = test_path();
+            let mut staged_path = None;
+            let result = JsonlRepo::create_impl(
+                path.clone(),
+                DurableSessionHeader::new("initial", "now", "D:\\Slim", None, None),
+                Vec::new(),
+                |staged| {
+                    staged_path = Some(staged.to_owned());
+                    assert!(!path.exists());
+                    if race_destination {
+                        fs::write(&path, b"existing destination")?;
+                        Ok(())
+                    } else {
+                        Err(io::Error::other("injected failure before publish"))
+                    }
+                },
+            );
+            assert!(result.is_err());
+            assert!(!staged_path.unwrap().exists(), "failed staging is removed");
+            if race_destination {
+                assert_eq!(fs::read(&path).unwrap(), b"existing destination");
+            } else {
+                assert!(!path.exists());
+                drop(
+                    JsonlRepo::create(
+                        &path,
+                        DurableSessionHeader::new("retry", "now", "D:\\Slim", None, None),
+                    )
+                    .expect("released lock permits retry"),
+                );
+            }
+            fs::remove_dir_all(path.parent().unwrap()).expect("cleanup");
+        }
+    }
+
+    #[test]
     fn publish_keeps_the_original_handle_published() {
         let requested = test_path();
         let path = resolve_session_path(&requested).expect("resolve path");
@@ -828,7 +935,10 @@ mod tests {
         drop(repo_b);
         match symlink_file(&target_a, &alias) {
             Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314) =>
+            {
                 fs::remove_dir_all(parent).expect("remove test directory");
                 return;
             }

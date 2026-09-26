@@ -154,6 +154,29 @@ fn shell_direct_arguments_are_literal_and_legacy_scripts_stay_available() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn script_shell_uses_utf8_for_native_pipeline_input_and_output() {
+    let root = Workspace::new();
+    let powershell = slim_core::process::ProcessRunner::default()
+        .resolve_powershell()
+        .unwrap()
+        .expect("PowerShell test runtime");
+    let powershell = powershell.to_string_lossy().replace('\'', "''");
+    let result = root.call(
+        "shell",
+        json!({
+            "command": format!(
+                "$payload = 'ação日本語'; $payload | & '{powershell}' -NoLogo -NoProfile -NonInteractive -Command '$input | ForEach-Object {{ $_ }}'; exit 17"
+            )
+        }),
+    );
+
+    assert!(!result.success, "{}", result.output);
+    assert!(result.output.contains("exit 17"), "{}", result.output);
+    assert!(result.output.contains("ação日本語"), "{}", result.output);
+}
+
 #[test]
 fn default_read_finishes_medium_files_and_preserves_explicit_pagination() {
     let root = Workspace::new();
@@ -747,10 +770,19 @@ fn shared_native_contracts_reach_chat_messages_and_responses() {
         read["input_schema"]["properties"]["max_lines"]["maximum"],
         slim_core::tools::MAX_READ_LINES_CAP
     );
-    let lines = &read["input_schema"]["properties"]["lines"];
-    assert_eq!(lines["type"], "integer");
-    assert_eq!(lines["minimum"], 1);
-    assert_eq!(lines["maximum"], slim_core::tools::MAX_READ_LINES_CAP);
+    assert!(read["input_schema"]["properties"].get("lines").is_none());
+    let patch = advertised
+        .iter()
+        .find(|tool| tool["name"] == "patch")
+        .unwrap();
+    assert_eq!(patch["input_schema"]["required"], json!(["path", "edits"]));
+    assert!(patch["input_schema"]["properties"]
+        .get("expected")
+        .is_none());
+    assert!(patch["input_schema"]["properties"]
+        .get("replacement")
+        .is_none());
+    assert!(patch["input_schema"].get("oneOf").is_none());
     let search = advertised
         .iter()
         .find(|tool| tool["name"] == "search")
@@ -848,7 +880,7 @@ fn shared_native_contracts_reach_chat_messages_and_responses() {
             .unwrap();
         let body: Value = serde_json::from_slice(request.body()).unwrap();
         let wire_tools = body["tools"].as_array().unwrap();
-        for name in ["write", "shell", "search", "code_intel"] {
+        for name in ["read", "patch", "write", "shell", "search", "code_intel"] {
             let original = tools.iter().find(|tool| tool["name"] == name).unwrap();
             let wire = wire_tools
                 .iter()
@@ -871,15 +903,10 @@ fn shared_native_contracts_reach_chat_messages_and_responses() {
         }
         let write = tools.iter().find(|tool| tool["name"] == "write").unwrap();
         let patch = tools.iter().find(|tool| tool["name"] == "patch").unwrap();
-        assert_eq!(patch["input_schema"]["required"], json!(["path"]));
+        assert_eq!(patch["input_schema"]["required"], json!(["path", "edits"]));
         assert_eq!(patch["input_schema"]["properties"]["edits"]["minItems"], 1);
-        let patch_variants = patch["input_schema"]["oneOf"]
-            .as_array()
-            .expect("patch schema alternatives");
-        assert_eq!(patch_variants.len(), 2);
-        assert_eq!(patch_variants[0]["required"], json!(["edits"]));
         assert_eq!(
-            patch_variants[1]["required"],
+            patch["input_schema"]["properties"]["edits"]["items"]["required"],
             json!(["expected", "replacement"])
         );
         if body.get("input").is_some() {
@@ -899,9 +926,48 @@ fn shared_native_contracts_reach_chat_messages_and_responses() {
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            vec!["content", "expected", "path"]
+            vec!["content", "expected", "path", "then_run"]
         );
     }
+}
+
+#[test]
+fn unadvertised_legacy_arguments_remain_compatible() {
+    let root = Workspace::new();
+    fs::write(root.0.join("data.txt"), "first\nsecond\n").unwrap();
+    let legacy_read = root.call("read", json!({"path":"data.txt", "lines":1}));
+    let canonical_read = root.call("read", json!({"path":"data.txt", "max_lines":1}));
+    assert!(legacy_read.success, "{}", legacy_read.output);
+    assert!(canonical_read.success, "{}", canonical_read.output);
+    assert_eq!(
+        legacy_read
+            .output
+            .strip_prefix("[admission: lines -> max_lines; limit 1]\n"),
+        Some(canonical_read.output.as_str())
+    );
+    for args in [
+        json!({"path":"data.txt", "expected":"first", "replacement":"changed"}),
+        json!({"path":"data.txt", "edits":[{"expected":"changed", "replacement":"final"}]}),
+    ] {
+        let result = root.call("patch", args);
+        assert!(result.success, "{}", result.output);
+    }
+    assert_eq!(
+        fs::read_to_string(root.0.join("data.txt")).unwrap(),
+        "final\nsecond\n"
+    );
+    let mixed = root.call(
+        "patch",
+        json!({
+            "path":"data.txt", "expected":"final", "replacement":"bad",
+            "edits":[{"expected":"final", "replacement":"bad"}]
+        }),
+    );
+    assert!(!mixed.success);
+    assert_eq!(
+        fs::read_to_string(root.0.join("data.txt")).unwrap(),
+        "final\nsecond\n"
+    );
 }
 
 #[test]

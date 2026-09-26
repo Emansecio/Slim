@@ -186,6 +186,28 @@ pub struct MessageId(pub Arc<str>);
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct RunId(pub Arc<str>);
 
+/// Identity carried from prompt admission through OAuth preparation and the
+/// resulting run. IDs are local to one TUI process; the journal stores text,
+/// never these transient identities.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PromptId(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PromptGeneration(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PromptOrigin {
+    Direct,
+    Queued,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PromptAdmission {
+    pub id: PromptId,
+    pub generation: PromptGeneration,
+    pub origin: PromptOrigin,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct InteractionRequestId(pub Arc<str>);
 
@@ -271,6 +293,8 @@ impl TodoItemStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TodoItemView {
+    pub reason: Option<String>,
+    pub id: Option<u64>,
     pub title: String,
     pub status: TodoItemStatus,
 }
@@ -381,6 +405,46 @@ pub enum UiEvent {
         max_read_tool_calls: usize,
         max_turns: usize,
     },
+    /// A prompt admitted by the reducer has completed authentication and is
+    /// now entering the normal run lifecycle.
+    PromptRunStarted {
+        admission: PromptAdmission,
+        run_id: u64,
+        max_mutating_tool_calls: usize,
+        max_read_tool_calls: usize,
+        max_turns: usize,
+    },
+    /// Preparation ended before a run was admitted. The reducer uses the
+    /// matching admission to recover exactly one prompt.
+    PromptPreparationCancelled {
+        admission: PromptAdmission,
+    },
+    PromptPreparationFailed {
+        admission: PromptAdmission,
+        message: String,
+    },
+    PromptPreparationHandled {
+        admission: PromptAdmission,
+        restore_draft: Option<String>,
+    },
+    PromptRunCompleted {
+        admission: PromptAdmission,
+        run_id: u64,
+    },
+    PromptRunStopped {
+        admission: PromptAdmission,
+        run_id: u64,
+        message: String,
+    },
+    PromptRunCancelled {
+        admission: PromptAdmission,
+        run_id: u64,
+    },
+    PromptRunFailed {
+        admission: PromptAdmission,
+        run_id: Option<u64>,
+        message: String,
+    },
     RunCompleted {
         run_id: u64,
     },
@@ -472,6 +536,15 @@ pub enum UiEvent {
         batch_id: ToolBatchId,
         call_id: ToolCallId,
         name: String,
+    },
+    /// Final executor output. Unlike transient `ToolProgress`, this carries
+    /// the result that must remain visible when cancellation closes a run.
+    ToolOutput {
+        batch_id: ToolBatchId,
+        call_id: ToolCallId,
+        name: String,
+        output: String,
+        content_handle: Option<ContentHandle>,
     },
     ToolProgress {
         batch_id: ToolBatchId,
@@ -651,6 +724,7 @@ impl UiEvent {
                 Self::ToolStarted { .. }
                     | Self::ToolPrepared { .. }
                     | Self::ToolAdmitted { .. }
+                    | Self::ToolOutput { .. }
                     | Self::ToolEnded { .. }
                     | Self::ApprovalRequired { .. }
                     | Self::InputRequired { .. }
@@ -752,8 +826,15 @@ impl UiEvent {
                 arguments,
             } => {
                 let (batch_id, call_id) = projected_tool_identity(request_id, 0, batch_id, call_id);
-                let arguments_summary =
+                let mut arguments_summary =
                     slim_core::tools::summarize_tool_arguments_for(&name, &arguments);
+                // Edit size travels as one more summary segment; the tool
+                // row styles it (see `edit_stats_segment`).
+                if let Some((added, removed)) =
+                    slim_core::tools::edit_line_stats(&name, &arguments)
+                {
+                    arguments_summary.push_str(&format!(" · +{added} -{removed}"));
+                }
                 Some(Self::ToolStarted {
                     batch_id,
                     call_id,
@@ -794,15 +875,21 @@ impl UiEvent {
                 call_id,
                 name,
                 output,
+            }
+            | slim_core::EventKind::ToolJobOutput {
+                batch_id,
+                call_id,
+                name,
+                output,
             } => {
                 let (batch_id, call_id) = projected_tool_identity(request_id, 1, batch_id, call_id);
-                Some(Self::ToolProgress {
+                Some(Self::ToolOutput {
                     // A handle is attached only by a bridge that has actually
                     // registered this output in its bounded content store.
                     content_handle: None,
                     batch_id,
                     call_id,
-                    preview: tool_output_preview(&name, &output),
+                    output: tool_output_preview(&name, &output),
                     name,
                 })
             }
@@ -978,6 +1065,8 @@ impl UiEvent {
                 items: items
                     .into_iter()
                     .map(|item| TodoItemView {
+                        reason: item.reason,
+                        id: item.id,
                         title: item.title,
                         status: match item.status.as_str() {
                             "in_progress" => TodoItemStatus::InProgress,
@@ -1044,6 +1133,9 @@ fn process_preview(process: &slim_core::process::ProcessExecutionFacts) -> Strin
     if process.cancelled {
         parts.push("cancelled".into());
     }
+    if process.capture_may_be_incomplete {
+        parts.push("capture may be incomplete".into());
+    }
     let discarded = process
         .stdout_discarded_bytes
         .saturating_add(process.stderr_discarded_bytes);
@@ -1104,6 +1196,17 @@ fn projected_interaction_id(value: &str) -> Option<InteractionRequestId> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UiCommand {
     SendPrompt(String),
+    /// Admission-aware prompt path used by the reducer. The legacy
+    /// `SendPrompt` remains for existing programmatic bridge callers.
+    PreparePrompt {
+        prompt: String,
+        admission: PromptAdmission,
+    },
+    CancelPromptPreparation {
+        admission: PromptAdmission,
+    },
+    RetryProvider,
+    SaveModelDefault,
     ResumePrevious,
     AttachImage(String),
     Compact {
@@ -1422,6 +1525,10 @@ impl Default for WakeSignal {
     }
 }
 
+/// Capacity of the ordered stream lane. Runtime barriers account for one
+/// additional event held in their prefetch slot.
+pub const STREAM_EVENT_CAPACITY: usize = 1_024;
+
 pub struct UiChannels {
     pub commands: mpsc::Sender<UiCommand>,
     pub wake: WakeSignal,
@@ -1447,7 +1554,12 @@ impl UiEvent {
         !matches!(
             self,
             Self::RunStarted { .. }
+                | Self::PromptRunStarted { .. }
                 | Self::SessionRestored { .. }
+                | Self::PromptRunCompleted { .. }
+                | Self::PromptRunStopped { .. }
+                | Self::PromptRunCancelled { .. }
+                | Self::PromptRunFailed { .. }
                 | Self::RunCompleted { .. }
                 | Self::RunStopped { .. }
                 | Self::RunFailed { .. }
@@ -1466,6 +1578,7 @@ impl UiEvent {
                 | Self::ToolStarted { .. }
                 | Self::ToolPrepared { .. }
                 | Self::ToolAdmitted { .. }
+                | Self::ToolOutput { .. }
                 | Self::ToolProgress { .. }
                 | Self::ToolEnded { .. }
                 | Self::ActivityChanged { .. }
@@ -1617,6 +1730,7 @@ mod tests {
                     exit_code: Some(7),
                     timed_out: true,
                     cancelled: false,
+                    capture_may_be_incomplete: false,
                     stdout_bytes: 12,
                     stderr_bytes: 8,
                     stdout_discarded_bytes: 3,
@@ -1634,6 +1748,26 @@ mod tests {
                 preview: "exit 7 · timed out · discarded 7 B".into(),
             })
         );
+    }
+
+    #[test]
+    fn terminal_tool_output_survives_cancellation_but_progress_does_not() {
+        let output = UiEvent::ToolOutput {
+            batch_id: ToolBatchId("batch-1".into()),
+            call_id: ToolCallId("call-1".into()),
+            name: "mcp".into(),
+            output: "mcp operation outcome is uncertain".into(),
+            content_handle: None,
+        };
+        let progress = UiEvent::ToolProgress {
+            batch_id: ToolBatchId("batch-1".into()),
+            call_id: ToolCallId("call-1".into()),
+            name: "mcp".into(),
+            preview: "connecting".into(),
+            content_handle: None,
+        };
+        assert!(output.survives_cancellation());
+        assert!(!progress.survives_cancellation());
     }
 
     #[test]
@@ -1721,6 +1855,8 @@ mod tests {
             9,
             EventKind::TodoChanged {
                 items: vec![slim_core::TodoChangedItem {
+                    reason: None,
+                    id: None,
                     title: "ship n2".into(),
                     status: "in_progress".into(),
                 }],
@@ -1730,6 +1866,8 @@ mod tests {
             UiEvent::from_core(event),
             Some(UiEvent::TodoChanged {
                 items: vec![TodoItemView {
+                    reason: None,
+                    id: None,
                     title: "ship n2".into(),
                     status: TodoItemStatus::InProgress,
                 }],
@@ -1778,6 +1916,9 @@ mod tests {
             .iter()
             .map(|event| match event {
                 UiEvent::ToolStarted {
+                    batch_id, call_id, ..
+                }
+                | UiEvent::ToolOutput {
                     batch_id, call_id, ..
                 }
                 | UiEvent::ToolProgress {
@@ -1959,6 +2100,13 @@ mod tests {
                 call_id: ToolCallId("call".into()),
                 name: "read".into(),
                 arguments_summary: String::new(),
+            },
+            UiEvent::ToolOutput {
+                batch_id: ToolBatchId("batch".into()),
+                call_id: ToolCallId("call".into()),
+                name: "read".into(),
+                output: "complete".into(),
+                content_handle: None,
             },
             UiEvent::ToolProgress {
                 batch_id: ToolBatchId("batch".into()),

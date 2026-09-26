@@ -299,32 +299,173 @@ fn is_tool_group_bridge(block: &Block) -> bool {
     is_collapsed_complete_thinking(block)
 }
 
-/// Presentation-only span of consecutive successful tools (DESIGN §11.4.1).
-/// Collapsed complete thinking between those tools is a bridge, not a split,
-/// so a think→tools→think→tools streak collapses to one group.
-pub fn consecutive_complete_tool_span(blocks: &[Block], index: usize) -> Option<(usize, usize)> {
-    if index >= blocks.len() || !is_complete_tool(&blocks[index]) {
+/// How long a just-finished tool keeps its own row before joining a group.
+/// Matches the 249 ms emphasis so the row the eye is following does not
+/// vanish in the same frame it turns bold.
+pub const TOOL_GROUP_HOLD_MS: u64 = 249;
+
+pub fn tool_hold_pending(block: &Block, now_ms: u64, reduced_motion: bool) -> bool {
+    !reduced_motion
+        && is_complete_tool(block)
+        && block
+            .ended_ms
+            .is_some_and(|ended| now_ms.saturating_sub(ended) < TOOL_GROUP_HOLD_MS)
+}
+
+pub fn is_presented_complete_tool(block: &Block, now_ms: u64, reduced_motion: bool) -> bool {
+    is_complete_tool(block) && !tool_hold_pending(block, now_ms, reduced_motion)
+}
+
+/// Stable while the set of tools still inside [`TOOL_GROUP_HOLD_MS`] does not
+/// change. Height and leader memos key on it so a motion frame does not
+/// rebuild the transcript.
+pub fn tool_hold_epoch(blocks: &[Block], now_ms: u64, reduced_motion: bool) -> u64 {
+    if reduced_motion {
+        return 0;
+    }
+    let mut epoch = 0u64;
+    for block in blocks {
+        if tool_hold_pending(block, now_ms, false) {
+            epoch = epoch.wrapping_mul(31).wrapping_add(block.cache_identity());
+        }
+    }
+    epoch
+}
+
+fn consecutive_tool_span(
+    blocks: &[Block],
+    index: usize,
+    is_member: impl Fn(&Block) -> bool,
+) -> Option<(usize, usize)> {
+    if index >= blocks.len() || !is_member(&blocks[index]) {
         return None;
     }
+    let continues = |block: &Block| is_member(block) || is_tool_group_bridge(block);
     let mut start = index;
-    while start > 0
-        && (is_complete_tool(&blocks[start - 1]) || is_tool_group_bridge(&blocks[start - 1]))
-    {
+    while start > 0 && continues(&blocks[start - 1]) {
         start -= 1;
     }
     while start < index && is_tool_group_bridge(&blocks[start]) {
         start += 1;
     }
     let mut end = index + 1;
-    while end < blocks.len()
-        && (is_complete_tool(&blocks[end]) || is_tool_group_bridge(&blocks[end]))
-    {
+    while end < blocks.len() && continues(&blocks[end]) {
         end += 1;
     }
     while end > start && is_tool_group_bridge(&blocks[end - 1]) {
         end -= 1;
     }
     Some((start, end))
+}
+
+/// Presentation-only span of consecutive successful tools (DESIGN §11.4.1).
+/// Collapsed complete thinking between those tools is a bridge, not a split,
+/// so a think→tools→think→tools streak collapses to one group.
+pub fn consecutive_complete_tool_span(blocks: &[Block], index: usize) -> Option<(usize, usize)> {
+    consecutive_tool_span(blocks, index, is_complete_tool)
+}
+
+/// Same span as [`consecutive_complete_tool_span`], excluding tools still
+/// inside the completion emphasis. Those keep a row of their own until the
+/// hold expires. Reduced motion settles immediately.
+pub fn consecutive_presented_tool_span(
+    blocks: &[Block],
+    index: usize,
+    now_ms: u64,
+    reduced_motion: bool,
+) -> Option<(usize, usize)> {
+    consecutive_tool_span(blocks, index, |block| {
+        is_presented_complete_tool(block, now_ms, reduced_motion)
+    })
+}
+
+/// Chrome for one assistant segment inside a user turn. Only the first
+/// segment after a user message opens the breathing row and the `Slim`
+/// header; later segments stay in the flow. A queued draft does not open
+/// another group. Cancellation or failure of any segment stays on that header.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssistantChrome {
+    Continuation,
+    Header { cancelled: bool, failed: bool },
+}
+
+impl AssistantChrome {
+    pub fn shows_header(self) -> bool {
+        matches!(self, Self::Header { .. })
+    }
+
+    pub fn cache_tag(self) -> u64 {
+        match self {
+            Self::Continuation => 1,
+            Self::Header {
+                cancelled: false,
+                failed: false,
+            } => 2,
+            Self::Header {
+                cancelled: false,
+                failed: true,
+            } => 3,
+            Self::Header {
+                cancelled: true, ..
+            } => 4,
+        }
+    }
+}
+
+pub fn assistant_chrome(blocks: &[Block], index: usize) -> Option<AssistantChrome> {
+    if !matches!(blocks.get(index)?.kind(), BlockKind::Assistant(_)) {
+        return None;
+    }
+    let mut cursor = index;
+    while cursor > 0 {
+        cursor -= 1;
+        match blocks[cursor].kind() {
+            BlockKind::User(_) => break,
+            BlockKind::Assistant(_) => return Some(AssistantChrome::Continuation),
+            _ => {}
+        }
+    }
+    let mut cancelled = false;
+    let mut failed = false;
+    for block in blocks.iter().skip(index) {
+        match block.kind() {
+            BlockKind::User(_) => break,
+            BlockKind::Assistant(_) => match block.lifecycle {
+                BlockLifecycle::Cancelled => cancelled = true,
+                BlockLifecycle::Failed => failed = true,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    Some(AssistantChrome::Header { cancelled, failed })
+}
+
+/// One breathing row where the agent switches between prose and work inside
+/// a turn: before tools/thinking that follow assistant text, and before an
+/// assistant continuation that follows them. Derived from neighbors at layout
+/// time, so it needs no per-block state; the first assistant segment already
+/// opens with its own breathing row and header.
+pub fn transition_gap(blocks: &[Block], index: usize) -> bool {
+    let Some(block) = blocks.get(index) else {
+        return false;
+    };
+    if index == 0 || block.turn_boundary_before() {
+        return false;
+    }
+    let is_work =
+        |block: &Block| matches!(block.kind(), BlockKind::Tool(_) | BlockKind::Thinking(_));
+    let previous = &blocks[index - 1];
+    match block.kind() {
+        BlockKind::Assistant(_) => {
+            is_work(previous)
+                && assistant_chrome(blocks, index) == Some(AssistantChrome::Continuation)
+        }
+        _ if is_work(block) => {
+            matches!(previous.kind(), BlockKind::Assistant(text) if !text.trim().is_empty())
+        }
+        _ => false,
+    }
 }
 
 pub fn complete_tool_count(blocks: &[Block], start: usize, end: usize) -> usize {

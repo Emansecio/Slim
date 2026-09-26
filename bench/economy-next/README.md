@@ -1,5 +1,8 @@
 # Economia de tokens — ciclo de contrato shell, 05/09/2026
 
+> Caminhos de manifesto ou ciclos exibidos em código são artefatos locais não
+> versionados; o texto preserva o registro histórico sem links quebrados.
+
 ## Protocolo fixado antes das chamadas
 
 Hipótese: exemplos explícitos distinguindo programa/argumentos literais de script
@@ -16,7 +19,7 @@ adicional da descrição será contado em todas as requisições.
 
 Três braços: Slim anterior compilado do checkout inicial sujo; candidato do mesmo
 checkout com essa única alteração; Pi nativo instalado. Versões e SHA256 estão em
-[manifest.json](manifest.json). Nenhum reset/checkout/stash/commit. Os dois executáveis
+manifest.json (`manifest.json`, artefato local n?o versionado). Nenhum reset/checkout/stash/commit. Os dois executáveis
 Slim preservados aqui são artefatos da comparação, não instalações alternativas.
 
 Quatro cenários, duas rodadas, dois modelos: **48 tentativas**, das quais 12 são
@@ -60,7 +63,7 @@ Validação local já executada antes das medições: `cargo test -p slim-core -
 native_tool_recovery --test tool_contracts`: 37 passed / 0 failed; build release
 do baseline e candidato concluídos. Gate completo e refresh só na decisão final.
 
-O [ciclo seguinte de leitura numerada](numbered/README.md#resultado-final) foi
+O ciclo seguinte de leitura numerada (`numbered/README.md#resultado-final`, artefato local n?o versionado) foi
 concluído: candidato descartado por aumento agregado de tokens nos pares válidos;
 contrato anterior restaurado, suíte completa e refresh aprovados. Os dois
 experimentos não produziram uma nova otimização aceita.

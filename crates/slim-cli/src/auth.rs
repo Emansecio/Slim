@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use slim_core::provider::ProviderKind;
 
 const MAX_AUTH_FILE_BYTES: usize = 1024 * 1024;
@@ -24,7 +25,8 @@ const MAX_AUTH_FILE_BYTES: usize = 1024 * 1024;
 /// ```
 ///
 /// `SLIM_API_KEY` and the provider-specific environment variable always win
-/// over this file. Slim never writes this file.
+/// over this file. Explicit credential saves preserve sibling providers and
+/// record the selected method in the provider entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthError {
     InvalidPath,
@@ -127,6 +129,65 @@ struct AuthProvider {
     api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     oauth: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "PreferredAuthMethodConfig::is_unset")]
+    preferred_method: PreferredAuthMethodConfig,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) enum PreferredAuthMethod {
+    #[serde(rename = "oauth")]
+    OAuth,
+    #[serde(rename = "api_key")]
+    ApiKey,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PreferredAuthMethodConfig {
+    #[default]
+    Unset,
+    Selected(PreferredAuthMethod),
+}
+
+impl PreferredAuthMethodConfig {
+    fn is_unset(&self) -> bool {
+        matches!(self, Self::Unset)
+    }
+
+    fn as_option(self) -> Option<PreferredAuthMethod> {
+        match self {
+            Self::Unset => None,
+            Self::Selected(method) => Some(method),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PreferredAuthMethodConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "oauth" => Ok(Self::Selected(PreferredAuthMethod::OAuth)),
+            "api_key" => Ok(Self::Selected(PreferredAuthMethod::ApiKey)),
+            _ => Err(serde::de::Error::unknown_variant(
+                &value,
+                &["oauth", "api_key"],
+            )),
+        }
+    }
+}
+
+impl Serialize for PreferredAuthMethodConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Unset => serializer.serialize_none(),
+            Self::Selected(method) => method.serialize(serializer),
+        }
+    }
 }
 
 mod secret_debug_contract {
@@ -167,7 +228,8 @@ pub fn resolve_api_key(kind: ProviderKind) -> Result<Option<String>, AuthError> 
 
 /// Resolve access, optional account id, and whether the token came from TUI OAuth.
 ///
-/// Precedence: `SLIM_API_KEY` / provider env → file `oauth` → file `api_key`.
+/// Precedence: `SLIM_API_KEY` / provider env → explicit file method, or the
+/// legacy file order `oauth` before `api_key` when no method is recorded.
 pub fn resolve_provider_credential(
     kind: ProviderKind,
 ) -> Result<Option<ProviderCredential>, AuthError> {
@@ -222,8 +284,6 @@ pub fn load_auth_credential(
     let Some(document) = read_auth_document(path)? else {
         return Ok(None);
     };
-    let _ = document.active_provider.as_deref();
-
     let provider = match kind {
         ProviderKind::OpenAiCompatible => document.providers.openai_compatible,
         ProviderKind::OpenAiCodex => document.providers.openai_codex,
@@ -237,19 +297,36 @@ pub fn load_auth_credential(
     let Some(provider) = provider else {
         return Ok(None);
     };
-    if let Some(oauth_value) = provider.oauth {
-        let oauth: crate::oauth::OAuthCredential =
-            serde_json::from_value(oauth_value).map_err(|_| AuthError::InvalidSchema)?;
-        if oauth.access.trim().is_empty() {
-            return Err(AuthError::InvalidSchema);
-        }
-        return Ok(Some(ProviderCredential {
-            access: oauth.access,
-            account_id: oauth.account_id,
-            oauth: true,
-        }));
+    match provider.preferred_method.as_option() {
+        Some(PreferredAuthMethod::OAuth) => auth_oauth_credential(provider.oauth),
+        Some(PreferredAuthMethod::ApiKey) => auth_api_key_credential(provider.api_key),
+        None => auth_oauth_credential(provider.oauth).and_then(|credential| match credential {
+            Some(credential) => Ok(Some(credential)),
+            None => auth_api_key_credential(provider.api_key),
+        }),
     }
-    let Some(key) = provider.api_key else {
+}
+
+fn auth_oauth_credential(
+    oauth_value: Option<serde_json::Value>,
+) -> Result<Option<ProviderCredential>, AuthError> {
+    let Some(oauth_value) = oauth_value else {
+        return Ok(None);
+    };
+    let oauth: crate::oauth::OAuthCredential =
+        serde_json::from_value(oauth_value).map_err(|_| AuthError::InvalidSchema)?;
+    if oauth.access.trim().is_empty() {
+        return Err(AuthError::InvalidSchema);
+    }
+    Ok(Some(ProviderCredential {
+        access: oauth.access,
+        account_id: oauth.account_id,
+        oauth: true,
+    }))
+}
+
+fn auth_api_key_credential(key: Option<String>) -> Result<Option<ProviderCredential>, AuthError> {
+    let Some(key) = key else {
         return Ok(None);
     };
     if key.trim().is_empty() {
@@ -270,14 +347,15 @@ pub fn save_api_key_file(path: &Path, kind: ProviderKind, api_key: &str) -> Resu
         return Err(AuthError::InvalidSchema);
     }
     update_auth_file(path, |document| {
-        set_provider(
-            &mut document.providers,
-            kind,
-            Some(AuthProvider {
-                api_key: Some(api_key.to_owned()),
+        let provider =
+            provider_slot_mut(&mut document.providers, kind).get_or_insert_with(|| AuthProvider {
+                api_key: None,
                 oauth: None,
-            }),
-        );
+                preferred_method: PreferredAuthMethodConfig::Unset,
+            });
+        provider.api_key = Some(api_key.to_owned());
+        provider.preferred_method =
+            PreferredAuthMethodConfig::Selected(PreferredAuthMethod::ApiKey);
         document.active_provider = Some(provider_name(kind).to_owned());
     })
 }
@@ -292,8 +370,21 @@ pub fn delete_api_key_file(path: &Path, kind: ProviderKind) -> Result<(), AuthEr
         return Ok(());
     }
     update_auth_file(path, |document| {
-        set_provider(&mut document.providers, kind, None);
-        if document.active_provider.as_deref() == Some(provider_name(kind)) {
+        let provider_slot = provider_slot_mut(&mut document.providers, kind);
+        if let Some(provider) = provider_slot.as_mut() {
+            provider.api_key = None;
+        }
+        if provider_slot.as_ref().is_some_and(|provider| {
+            provider.oauth.is_none() && provider.preferred_method.is_unset()
+        }) {
+            *provider_slot = None;
+        }
+        let selected_credential_exists = provider_slot
+            .as_ref()
+            .is_some_and(provider_has_selected_credential);
+        if !selected_credential_exists
+            && document.active_provider.as_deref() == Some(provider_name(kind))
+        {
             document.active_provider = None;
         }
     })
@@ -332,6 +423,21 @@ fn read_auth_document(path: &Path) -> Result<Option<AuthDocument>, AuthError> {
     Ok(Some(document))
 }
 
+pub(crate) fn validate_auth_document_value(value: &serde_json::Value) -> Result<(), AuthError> {
+    let document: AuthDocument =
+        serde_json::from_value(value.clone()).map_err(|error| match error.classify() {
+            serde_json::error::Category::Data | serde_json::error::Category::Eof => {
+                AuthError::InvalidSchema
+            }
+            serde_json::error::Category::Syntax => AuthError::MalformedJson,
+            serde_json::error::Category::Io => AuthError::Read,
+        })?;
+    if document.version != 1 {
+        return Err(AuthError::UnsupportedVersion);
+    }
+    Ok(())
+}
+
 fn provider_name(kind: ProviderKind) -> &'static str {
     match kind {
         ProviderKind::OpenAiCompatible => "openai-compatible",
@@ -345,16 +451,27 @@ fn provider_name(kind: ProviderKind) -> &'static str {
     }
 }
 
-fn set_provider(providers: &mut AuthProviders, kind: ProviderKind, provider: Option<AuthProvider>) {
+fn provider_slot_mut(
+    providers: &mut AuthProviders,
+    kind: ProviderKind,
+) -> &mut Option<AuthProvider> {
     match kind {
-        ProviderKind::OpenAiCompatible => providers.openai_compatible = provider,
-        ProviderKind::OpenAiCodex => providers.openai_codex = provider,
-        ProviderKind::Anthropic => providers.anthropic = provider,
-        ProviderKind::OpenCodeGo => providers.opencode_go = provider,
-        ProviderKind::OpenCodeZen => providers.opencode_zen = provider,
-        ProviderKind::ClinePass => providers.clinepass = provider,
-        ProviderKind::CommandCode => providers.command_code = provider,
-        ProviderKind::Xai => providers.xai = provider,
+        ProviderKind::OpenAiCompatible => &mut providers.openai_compatible,
+        ProviderKind::OpenAiCodex => &mut providers.openai_codex,
+        ProviderKind::Anthropic => &mut providers.anthropic,
+        ProviderKind::OpenCodeGo => &mut providers.opencode_go,
+        ProviderKind::OpenCodeZen => &mut providers.opencode_zen,
+        ProviderKind::ClinePass => &mut providers.clinepass,
+        ProviderKind::CommandCode => &mut providers.command_code,
+        ProviderKind::Xai => &mut providers.xai,
+    }
+}
+
+fn provider_has_selected_credential(provider: &AuthProvider) -> bool {
+    match provider.preferred_method.as_option() {
+        Some(PreferredAuthMethod::OAuth) => provider.oauth.is_some(),
+        Some(PreferredAuthMethod::ApiKey) => provider.api_key.is_some(),
+        None => provider.oauth.is_some() || provider.api_key.is_some(),
     }
 }
 
@@ -422,6 +539,22 @@ pub(crate) struct AuthStoreLock {
     _file: File,
 }
 
+pub(crate) struct OAuthRefreshLock {
+    #[cfg(windows)]
+    _file: File,
+}
+
+pub(crate) enum OAuthRefreshLockError {
+    Cancelled,
+    Auth(AuthError),
+}
+
+impl From<AuthError> for OAuthRefreshLockError {
+    fn from(error: AuthError) -> Self {
+        Self::Auth(error)
+    }
+}
+
 pub(crate) fn auth_lock_path(auth_file: &Path) -> Result<PathBuf, AuthError> {
     Ok(auth_file
         .parent()
@@ -430,14 +563,29 @@ pub(crate) fn auth_lock_path(auth_file: &Path) -> Result<PathBuf, AuthError> {
 }
 
 pub(crate) fn lock_auth_store(auth_file: &Path) -> Result<AuthStoreLock, AuthError> {
-    let parent = auth_file.parent().ok_or(AuthError::InvalidPath)?;
+    lock_auth_store_until(auth_file, Instant::now() + Duration::from_secs(30), || {
+        false
+    })
+}
+
+pub(crate) fn lock_auth_store_until(
+    auth_file: &Path,
+    deadline: Instant,
+    cancelled: impl Fn() -> bool,
+) -> Result<AuthStoreLock, AuthError> {
+    let parent = auth_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|_| AuthError::Write)?;
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         let lock_path = auth_lock_path(auth_file)?;
-        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
+            if cancelled() || Instant::now() >= deadline {
+                return Err(AuthError::Locked);
+            }
             match OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -446,17 +594,99 @@ pub(crate) fn lock_auth_store(auth_file: &Path) -> Result<AuthStoreLock, AuthErr
                 .share_mode(0)
                 .open(&lock_path)
             {
-                Ok(file) => return Ok(AuthStoreLock { _file: file }),
-                Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
-                Err(_) => return Err(AuthError::Locked),
+                Ok(file) => {
+                    if cancelled() || Instant::now() >= deadline {
+                        drop(file);
+                        return Err(AuthError::Locked);
+                    }
+                    return Ok(AuthStoreLock { _file: file });
+                }
+                Err(_) => thread::sleep(Duration::from_millis(50)),
             }
         }
     }
     #[cfg(not(windows))]
     {
         let _ = parent;
-        Ok(AuthStoreLock {})
+        if cancelled() || Instant::now() >= deadline {
+            Err(AuthError::Locked)
+        } else {
+            Ok(AuthStoreLock {})
+        }
     }
+}
+
+pub(crate) fn lock_oauth_refresh(
+    auth_file: &Path,
+    provider: &str,
+    cancelled: impl Fn() -> bool,
+) -> Result<OAuthRefreshLock, OAuthRefreshLockError> {
+    if cancelled() {
+        return Err(OAuthRefreshLockError::Cancelled);
+    }
+    let lock_path = oauth_refresh_lock_path(auth_file, provider)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if cancelled() {
+                return Err(OAuthRefreshLockError::Cancelled);
+            }
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .share_mode(0)
+                .open(&lock_path)
+            {
+                Ok(file) => {
+                    if cancelled() {
+                        drop(file);
+                        return Err(OAuthRefreshLockError::Cancelled);
+                    }
+                    return Ok(OAuthRefreshLock { _file: file });
+                }
+                Err(_) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => return Err(OAuthRefreshLockError::Auth(AuthError::Locked)),
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = lock_path;
+        if cancelled() {
+            return Err(OAuthRefreshLockError::Cancelled);
+        }
+        Ok(OAuthRefreshLock {})
+    }
+}
+
+fn oauth_refresh_lock_path(auth_file: &Path, provider: &str) -> Result<PathBuf, AuthError> {
+    if !matches!(provider, "anthropic" | "openai-codex" | "xai") {
+        return Err(AuthError::InvalidPath);
+    }
+    let parent = auth_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|_| AuthError::Write)?;
+    let canonical_parent = fs::canonicalize(parent).map_err(|_| AuthError::InvalidPath)?;
+    let file_name = auth_file.file_name().ok_or(AuthError::InvalidPath)?;
+    let mut identity = canonical_parent
+        .join(file_name)
+        .to_string_lossy()
+        .into_owned();
+    if cfg!(windows) {
+        identity = identity.replace('/', "\\").to_lowercase();
+    }
+    identity.push('\0');
+    identity.push_str(provider);
+    let digest = Sha256::digest(identity.as_bytes());
+    Ok(canonical_parent.join(format!(".oauth-refresh-{digest:x}.lock")))
 }
 
 #[cfg(windows)]
@@ -1178,7 +1408,7 @@ mod tests {
 
     #[test]
     fn redact_with_secrets_ignores_empty_and_dedups() {
-        let secrets = vec!["".to_string(), "dup".to_string(), "dup".to_string()];
+        let secrets = vec![String::new(), "dup".to_string(), "dup".to_string()];
         assert_eq!(redact_with_secrets("a dup b", &secrets), "a [REDACTED] b");
     }
 

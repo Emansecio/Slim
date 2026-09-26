@@ -6,8 +6,8 @@ use slim_core::OperatingMode;
 use crate::api::{
     BlockId, ClinePassCatalogSource, CommandCodeCatalogSource, ContentRequestId,
     InteractionRequestId, LoginProvider, ModelAlias, OpenCodeCatalogSource, OpenCodeModelView,
-    ReasoningEffort, SensitiveText, SessionId, TranscriptMessage, TranscriptRole, UiCommand,
-    UiEvent, ZenCatalogSource,
+    PromptAdmission, PromptGeneration, PromptId, PromptOrigin, ReasoningEffort, SensitiveText,
+    SessionId, TranscriptMessage, TranscriptRole, UiCommand, UiEvent, ZenCatalogSource,
 };
 use crate::block::{
     Block, BlockKind, BlockLifecycle, FoldState, InteractionRequestKind, InteractionRequestState,
@@ -46,7 +46,13 @@ fn default_clinepass_models() -> Vec<OpenCodeModelView> {
             name: m.name.to_owned(),
             context_window_tokens: m.context_window,
             max_output_tokens: m.max_output_tokens as u64,
-            reasoning_levels: Vec::new(),
+            reasoning_levels: slim_core::provider::gateway_reasoning_levels(
+                slim_core::provider::ProviderKind::ClinePass,
+                m.id,
+            )
+            .iter()
+            .filter_map(|level| ReasoningEffort::parse(level))
+            .collect(),
             accepts_images: m.accepts_images,
         })
         .collect()
@@ -60,7 +66,13 @@ fn default_command_code_models() -> Vec<OpenCodeModelView> {
             name: m.name.to_owned(),
             context_window_tokens: m.context_window,
             max_output_tokens: 0,
-            reasoning_levels: Vec::new(),
+            reasoning_levels: slim_core::provider::gateway_reasoning_levels(
+                slim_core::provider::ProviderKind::CommandCode,
+                m.id,
+            )
+            .iter()
+            .filter_map(|level| ReasoningEffort::parse(level))
+            .collect(),
             accepts_images: false,
         })
         .collect()
@@ -570,19 +582,86 @@ pub struct SlashSuggestions {
     pub selected: usize,
 }
 
+/// Destination of a confirmed effort choice. Codex aliases also carry the
+/// Normal/Fast speed toggle; provider-catalog models send model + effort only,
+/// because speed is a Codex service tier.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EffortTarget {
+    Alias(ModelAlias),
+    /// OpenCode Go catalog model (`UiCommand::SetOpenCodeModel`).
+    OpenCodeGo(String),
+    /// OpenCode Zen catalog model (`UiCommand::SetZenModel`).
+    Zen(String),
+    ClinePass(String),
+    CommandCode(String),
+    Xai(String),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EffortOverlay {
-    pub model: ModelAlias,
+    pub target: EffortTarget,
+    /// Levels offered for this target, snapshotted when the step opens so a
+    /// catalog refresh underneath cannot desync the list from `selected`.
+    pub levels: Vec<ReasoningEffort>,
     pub selected: usize,
     pub fast: bool,
 }
 
 impl EffortOverlay {
+    /// Step for a built-in Codex alias: Tab toggles Normal/Fast (G239: the
+    /// parent model overlay stays alive so Esc returns to it).
+    pub fn for_alias(model: ModelAlias, preferred: ReasoningEffort, fast: bool) -> Self {
+        Self::with_levels(
+            EffortTarget::Alias(model),
+            ReasoningEffort::supported(model).to_vec(),
+            preferred,
+            fast,
+        )
+    }
+
+    /// Step for a provider catalog model whose declared levels are not empty;
+    /// models without a reasoning knob keep the direct selection path.
+    pub fn for_catalog(
+        target: EffortTarget,
+        levels: Vec<ReasoningEffort>,
+        preferred: ReasoningEffort,
+    ) -> Self {
+        Self::with_levels(target, levels, preferred, false)
+    }
+
+    fn with_levels(
+        target: EffortTarget,
+        levels: Vec<ReasoningEffort>,
+        preferred: ReasoningEffort,
+        fast: bool,
+    ) -> Self {
+        let selected = levels
+            .iter()
+            .position(|level| *level == preferred)
+            .unwrap_or(0);
+        Self {
+            target,
+            levels,
+            selected,
+            fast,
+        }
+    }
+
+    pub fn levels(&self) -> &[ReasoningEffort] {
+        &self.levels
+    }
+
     pub fn effort(&self) -> ReasoningEffort {
-        ReasoningEffort::supported(self.model)
+        self.levels
             .get(self.selected)
             .copied()
-            .unwrap_or_else(|| ReasoningEffort::default_for(self.model))
+            .unwrap_or(ReasoningEffort::High)
+    }
+
+    /// Codex-only Normal/Fast toggle: catalog models have no service tier, so
+    /// the step must not offer Tab for them.
+    pub fn speed_toggle(&self) -> bool {
+        matches!(self.target, EffortTarget::Alias(_))
     }
 }
 
@@ -655,6 +734,12 @@ pub struct AppState {
     request_usage_overflowed: bool,
     request_estimate_open: bool,
     pub working: bool,
+    prompt_preparation: Option<PromptPreparationState>,
+    cancelling_preparation: Option<PromptPreparationState>,
+    active_prompt_admission: Option<PromptAdmission>,
+    prompt_generation: u64,
+    next_prompt_id: u64,
+    cancel_run_after_prompt_start: Option<u64>,
     active_run_id: Option<u64>,
     latest_run_assistant: Option<BlockId>,
     terminal_tail: Option<TerminalTail>,
@@ -665,6 +750,11 @@ pub struct AppState {
     /// `None` keeps the historical auto-open behavior until the user makes a
     /// deliberate Ctrl+T choice; thereafter content updates preserve it.
     pub todo_dock_user_preference: Option<bool>,
+    pub todo_focused: bool,
+    pub todo_selected: usize,
+    pub todo_title_offset: usize,
+    /// Reception time of the last actual change, not a heartbeat.
+    pub todo_updated_ms: Option<u64>,
     /// Scroll position for the currently pending approval/question block.
     /// This is separate from the inspector scroll so a decision stays tied to
     /// its own viewport while the transcript continues to move.
@@ -716,6 +806,15 @@ pub struct AppState {
     pub selection: Option<crate::selection::ScreenSelection>,
     pub selection_area: Option<ratatui::layout::Rect>,
     pub selection_text: String,
+}
+
+/// Admission currently preparing credentials. The reducer installs this
+/// before emitting the worker command so another Enter cannot send the same
+/// prompt again before the worker round-trip.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PromptPreparationState {
+    pub admission: PromptAdmission,
+    pub prompt: String,
 }
 
 impl Default for AppState {
@@ -777,6 +876,12 @@ impl Default for AppState {
             request_usage_overflowed: false,
             request_estimate_open: false,
             working: false,
+            prompt_preparation: None,
+            cancelling_preparation: None,
+            active_prompt_admission: None,
+            prompt_generation: 1,
+            next_prompt_id: 1,
+            cancel_run_after_prompt_start: None,
             queued_prompts: VecDeque::new(),
             queue_paused: false,
             admitted_tool_calls: Vec::new(),
@@ -788,6 +893,10 @@ impl Default for AppState {
             run_started_ms: None,
             todo_dock_open: false,
             todo_dock_user_preference: None,
+            todo_focused: false,
+            todo_selected: 0,
+            todo_title_offset: 0,
+            todo_updated_ms: None,
             approval_scroll: InspectorScroll::default(),
             approval_content_accessible: true,
             scroll: ScrollState::default(),
@@ -828,6 +937,126 @@ impl AppState {
         Self::default()
     }
 
+    pub fn prompt_preparation(&self) -> Option<&PromptPreparationState> {
+        self.prompt_preparation.as_ref()
+    }
+
+    pub(crate) fn current_prompt_preparation(&self) -> Option<&PromptPreparationState> {
+        self.prompt_preparation
+            .as_ref()
+            .or(self.cancelling_preparation.as_ref())
+    }
+
+    pub fn prompt_is_busy(&self) -> bool {
+        self.prompt_preparation.is_some() || self.cancelling_preparation.is_some()
+    }
+
+    pub(crate) fn begin_prompt_preparation(
+        &mut self,
+        prompt: String,
+        origin: PromptOrigin,
+    ) -> Option<PromptAdmission> {
+        if self.prompt_is_busy() || self.working {
+            return None;
+        }
+        let next_prompt_id = self.next_prompt_id.checked_add(1)?;
+        let next_generation = self.prompt_generation.checked_add(1)?;
+        let admission = PromptAdmission {
+            id: PromptId(self.next_prompt_id),
+            generation: PromptGeneration(self.prompt_generation),
+            origin,
+        };
+        self.next_prompt_id = next_prompt_id;
+        self.prompt_generation = next_generation;
+        self.prompt_preparation = Some(PromptPreparationState { admission, prompt });
+        self.revisions.status += 1;
+        Some(admission)
+    }
+
+    pub(crate) fn cancel_prompt_preparation(&mut self) -> Option<PromptAdmission> {
+        let preparation = self.prompt_preparation.take()?;
+        let admission = preparation.admission;
+        self.cancelling_preparation = Some(preparation);
+        self.revisions.status += 1;
+        Some(admission)
+    }
+
+    fn finish_prompt_preparation(
+        &mut self,
+        admission: PromptAdmission,
+        failure: Option<String>,
+    ) -> bool {
+        let preparation = if self
+            .prompt_preparation
+            .as_ref()
+            .is_some_and(|preparation| preparation.admission == admission)
+        {
+            self.prompt_preparation.take()
+        } else if self
+            .cancelling_preparation
+            .as_ref()
+            .is_some_and(|preparation| preparation.admission == admission)
+        {
+            self.cancelling_preparation.take()
+        } else {
+            return false;
+        };
+        let Some(preparation) = preparation else {
+            return false;
+        };
+        if preparation.admission.origin == PromptOrigin::Direct && self.composer.is_empty() {
+            self.composer.insert_text(preparation.prompt);
+            self.revisions.content += 1;
+        } else {
+            self.enqueue_queued_prompt_front(preparation.prompt);
+            self.queue_paused = true;
+        }
+        if let Some(message) = failure {
+            self.push_notification_with_priority(message, NotificationPriority::Error);
+        }
+        self.activity = None;
+        self.activity_timeline.clear();
+        self.revisions.status += 1;
+        true
+    }
+
+    fn accept_prompt_run_terminal(&mut self, admission: PromptAdmission, run_id: u64) -> bool {
+        if self
+            .active_run_id
+            .is_some_and(|active_run_id| active_run_id != run_id)
+            || self
+                .terminal_tail
+                .is_some_and(|terminal| terminal.run_id >= run_id)
+        {
+            return false;
+        }
+        if self.active_prompt_admission == Some(admission) {
+            self.active_prompt_admission = None;
+            return true;
+        }
+        let cancelled = self
+            .cancelling_preparation
+            .as_ref()
+            .is_some_and(|preparation| preparation.admission == admission);
+        let preparing = self
+            .prompt_preparation
+            .as_ref()
+            .is_some_and(|preparation| preparation.admission == admission);
+        if !cancelled && !preparing {
+            return false;
+        }
+        self.prompt_preparation = None;
+        self.cancelling_preparation = None;
+        if cancelled {
+            self.queue_paused = true;
+        }
+        true
+    }
+
+    pub(crate) fn take_cancelled_prompt_run_start(&mut self) -> Option<u64> {
+        self.cancel_run_after_prompt_start.take()
+    }
+
     pub(crate) fn skill_names(&self) -> &[String] {
         &self.skill_names
     }
@@ -852,6 +1081,25 @@ impl AppState {
             self.skill_names = skill_names;
             self.skills_revision = self.skills_revision.wrapping_add(1);
         }
+    }
+
+    pub(crate) fn enqueue_queued_prompt_front(&mut self, text: String) {
+        let id = self.fresh_id("queued");
+        let mut block = Block::new(
+            id,
+            BlockKind::QueuedUser(text.clone()),
+            BlockLifecycle::Complete,
+        );
+        block.started_ms = Some(self.clock.elapsed_ms);
+        let insertion = self
+            .blocks
+            .iter()
+            .position(|existing| matches!(existing.kind(), BlockKind::QueuedUser(_)))
+            .unwrap_or(self.blocks.len());
+        self.blocks.insert(insertion, block);
+        self.queued_prompts.push_front(text);
+        self.note_new_content();
+        self.revisions.content += 1;
     }
 
     pub fn apply_snapshot(&mut self, session_id: SessionId, cwd: String, skill_names: Vec<String>) {
@@ -896,10 +1144,19 @@ impl AppState {
         self.todo_items.clear();
         self.todo_dock_open = false;
         self.todo_dock_user_preference = None;
+        self.todo_focused = false;
+        self.todo_selected = 0;
+        self.todo_title_offset = 0;
+        self.todo_updated_ms = None;
         self.inspector = InspectorState::default();
         self.search = None;
         self.slash_suggestions = None;
         self.working = false;
+        self.prompt_preparation = None;
+        self.cancelling_preparation = None;
+        self.active_prompt_admission = None;
+        self.cancel_run_after_prompt_start = None;
+        self.prompt_generation = self.prompt_generation.saturating_add(1);
         self.active_run_id = None;
         self.latest_run_assistant = None;
         self.terminal_tail = None;
@@ -2014,6 +2271,116 @@ impl AppState {
                 self.attachment_labels = labels;
                 self.revisions.content += 1;
             }
+            UiEvent::PromptPreparationCancelled { admission } => {
+                self.finish_prompt_preparation(admission, None);
+            }
+            UiEvent::PromptPreparationFailed { admission, message } => {
+                self.finish_prompt_preparation(admission, Some(message));
+            }
+            UiEvent::PromptPreparationHandled {
+                admission,
+                restore_draft,
+            } => {
+                if self
+                    .cancelling_preparation
+                    .as_ref()
+                    .is_some_and(|preparation| preparation.admission == admission)
+                {
+                    self.finish_prompt_preparation(admission, None);
+                } else if self
+                    .prompt_preparation
+                    .as_ref()
+                    .is_some_and(|preparation| preparation.admission == admission)
+                {
+                    self.prompt_preparation = None;
+                    self.activity = None;
+                    self.activity_timeline.clear();
+                    if let Some(text) = restore_draft.filter(|_| self.composer.is_empty()) {
+                        self.composer.insert_text(text);
+                        self.revisions.content += 1;
+                    }
+                    self.revisions.status += 1;
+                }
+            }
+            UiEvent::PromptRunStarted {
+                admission,
+                run_id,
+                max_mutating_tool_calls,
+                max_read_tool_calls,
+                max_turns,
+            } => {
+                let cancelled = self
+                    .cancelling_preparation
+                    .as_ref()
+                    .is_some_and(|preparation| preparation.admission == admission);
+                let active = self
+                    .prompt_preparation
+                    .as_ref()
+                    .is_some_and(|preparation| preparation.admission == admission);
+                if active || cancelled {
+                    self.prompt_preparation = None;
+                    self.cancelling_preparation = None;
+                    self.active_prompt_admission = Some(admission);
+                    if cancelled {
+                        self.queue_paused = true;
+                        self.cancel_run_after_prompt_start = Some(run_id);
+                    }
+                    self.apply_event(UiEvent::RunStarted {
+                        run_id,
+                        max_mutating_tool_calls,
+                        max_read_tool_calls,
+                        max_turns,
+                    });
+                } else if self
+                    .terminal_tail
+                    .is_some_and(|terminal| terminal.run_id >= run_id)
+                {
+                    // An expedited correlated terminal may overtake this start
+                    // on the control lane. Reuse the run tombstone so the late
+                    // start cannot reopen the completed run.
+                    self.apply_event(UiEvent::RunStarted {
+                        run_id,
+                        max_mutating_tool_calls,
+                        max_read_tool_calls,
+                        max_turns,
+                    });
+                }
+            }
+            UiEvent::PromptRunCompleted { admission, run_id } => {
+                if self.accept_prompt_run_terminal(admission, run_id) {
+                    self.apply_event(UiEvent::RunCompleted { run_id });
+                }
+            }
+            UiEvent::PromptRunStopped {
+                admission,
+                run_id,
+                message,
+            } => {
+                if self.accept_prompt_run_terminal(admission, run_id) {
+                    self.apply_event(UiEvent::RunStopped { run_id, message });
+                }
+            }
+            UiEvent::PromptRunCancelled { admission, run_id } => {
+                if self.accept_prompt_run_terminal(admission, run_id) {
+                    self.apply_event(UiEvent::RunCancelled { run_id });
+                }
+            }
+            UiEvent::PromptRunFailed {
+                admission,
+                run_id,
+                message,
+            } => {
+                if let Some(run_id) = run_id {
+                    if self.accept_prompt_run_terminal(admission, run_id) {
+                        self.apply_event(UiEvent::RunFailed {
+                            run_id: Some(run_id),
+                            message,
+                        });
+                    }
+                } else {
+                    self.finish_prompt_preparation(admission, Some(message));
+                }
+            }
             UiEvent::RunStarted {
                 run_id,
                 max_mutating_tool_calls,
@@ -2205,9 +2572,14 @@ impl AppState {
                         self.queue_paused = true;
                     }
                     let id = self.fresh_id("error");
+                    let failure_message = if terminal_run_id.is_some() {
+                        format_run_failure_message(&message)
+                    } else {
+                        message
+                    };
                     self.blocks.push(Block::new(
                         id,
-                        BlockKind::Error(message),
+                        BlockKind::Error(failure_message),
                         BlockLifecycle::Failed,
                     ));
                     self.note_new_content();
@@ -2739,7 +3111,14 @@ impl AppState {
                 }
                 self.last_tool_progress_ms = Some(self.clock.elapsed_ms);
             }
-            UiEvent::ToolProgress {
+            UiEvent::ToolOutput {
+                batch_id,
+                call_id,
+                name: _,
+                output: preview,
+                content_handle,
+            }
+            | UiEvent::ToolProgress {
                 batch_id,
                 call_id,
                 name: _,
@@ -2757,6 +3136,12 @@ impl AppState {
                         // means "leave the existing inspector attachment";
                         // only a newly supplied handle replaces it.
                         if content_handle.is_some() {
+                            // A shell job can publish its final output through
+                            // the same handle as its launch acknowledgment.
+                            // Discard any page already loaded from that handle.
+                            state.materialized_output.clear();
+                            state.next_cursor = None;
+                            state.pending_page = None;
                             state.content_handle = content_handle;
                         }
                     }
@@ -2965,7 +3350,24 @@ impl AppState {
                 self.revisions.content += 1;
             }
             UiEvent::TodoChanged { items } => {
+                let selected_id = self
+                    .todo_items
+                    .get(self.todo_selected)
+                    .and_then(|item| item.id);
+                if self.todo_items != items {
+                    self.todo_updated_ms = Some(self.clock.elapsed_ms);
+                }
                 self.todo_items = items;
+                self.todo_selected = selected_id
+                    .and_then(|id| self.todo_items.iter().position(|item| item.id == Some(id)))
+                    .unwrap_or(
+                        self.todo_selected
+                            .min(self.todo_items.len().saturating_sub(1)),
+                    );
+                if self.todo_items.is_empty() {
+                    self.todo_focused = false;
+                    self.todo_title_offset = 0;
+                }
                 if let Some(preference) = self.todo_dock_user_preference {
                     self.todo_dock_open = preference;
                 } else {
@@ -3101,4 +3503,8 @@ impl AppState {
             UiEvent::Shutdown => self.shutdown = true,
         }
     }
+}
+
+fn format_run_failure_message(message: &str) -> String {
+    format!("{message}\nEnvie uma nova mensagem nesta conversa para continuar.")
 }

@@ -605,14 +605,17 @@ pub(crate) enum PreparedToolArguments {
     Write {
         content: String,
         expected: Option<String>,
+        then_run: Option<Box<PreparedToolInvocation>>,
     },
     Patch {
         edits: Vec<(String, String)>,
+        then_run: Option<Box<PreparedToolInvocation>>,
     },
     Shell {
         command: String,
         args: Option<Vec<String>>,
         timeout_ms: u64,
+        yield_ms: u64,
     },
     CodeIntel(CodeIntelRequest),
     External,
@@ -717,6 +720,7 @@ impl PreparedToolInvocation {
         }
         let typed_arguments = if error.is_none() {
             match typed_arguments(
+                mode,
                 name,
                 &mut arguments,
                 &canonical_workspace,
@@ -793,6 +797,7 @@ pub(crate) struct ToolExecutionReceipt {
     pub(crate) finalization_us: u64,
     pub(crate) synced_text: Option<crate::codeintel::CodeIntelFileUpdate>,
     pub(crate) process: Option<crate::process::ProcessExecutionFacts>,
+    pub(crate) fused_shell: Option<Box<(PreparedToolInvocation, ToolResult)>>,
     pub(crate) presentation: Option<ToolPresentationSource>,
 }
 
@@ -816,6 +821,7 @@ impl ToolExecutionReceipt {
             finalization_us: 0,
             synced_text: None,
             process: None,
+            fused_shell: None,
             presentation: None,
         }
     }
@@ -925,6 +931,13 @@ fn materialize_defaults_and_paths(
     let object = arguments
         .as_object_mut()
         .ok_or_else(|| "tool arguments must be a JSON object".to_owned())?;
+    if tool_name == "patch" {
+        if let Some(edits) = object.get_mut("edits").filter(|edits| edits.is_object()) {
+            let edit = edits.take();
+            *edits = Value::Array(vec![edit]);
+            admission_notes.push("patch single edit normalized to edits array".into());
+        }
+    }
     reject_unknown_native_fields(tool_name, object)?;
     match tool_name {
         "read" => {
@@ -944,6 +957,7 @@ fn materialize_defaults_and_paths(
             normalize_cursor(object, "list", admission_notes)?;
         }
         "search" => {
+            normalize_search_limit_alias(object, admission_notes)?;
             insert_default(object, "context_lines", Value::from(0));
             insert_default_path(object, ".")?;
             insert_default(object, "offset", Value::from(1));
@@ -1011,7 +1025,12 @@ fn materialize_defaults_and_paths(
             );
         }
         "shell" => {
-            insert_default(object, "timeout_ms", Value::from(30_000));
+            insert_default(
+                object,
+                "timeout_ms",
+                Value::from(super::DEFAULT_SHELL_TIMEOUT_MS),
+            );
+            insert_default(object, "yield_ms", Value::from(1000));
             if object.get("args").is_some_and(Value::is_null) {
                 object.remove("args");
             }
@@ -1054,12 +1073,13 @@ fn native_argument_keys(tool_name: &str) -> Option<&'static [&'static str]> {
             "patterns",
             "context_lines",
             "max_hits",
+            "max_entries",
             "offset",
             "cursor",
         ]),
-        "write" => Some(&["path", "content", "expected"]),
-        "patch" => Some(&["path", "edits", "expected", "replacement"]),
-        "shell" => Some(&["command", "args", "timeout_ms"]),
+        "write" => Some(&["path", "content", "expected", "then_run"]),
+        "patch" => Some(&["path", "edits", "expected", "replacement", "then_run"]),
+        "shell" => Some(&["command", "args", "timeout_ms", "yield_ms"]),
         "code_intel" => Some(&[
             "action",
             "path",
@@ -1103,6 +1123,29 @@ fn reject_unknown_native_fields(
             }
         }
     }
+    Ok(())
+}
+
+fn normalize_search_limit_alias(
+    object: &mut serde_json::Map<String, Value>,
+    admission_notes: &mut Vec<String>,
+) -> Result<(), String> {
+    let Some(value) = object.get("max_entries") else {
+        return Ok(());
+    };
+    let limit = integer_value(Some(value), "max_entries")?;
+    if !(1..=MAX_HITS_CAP).contains(&limit) {
+        return Err(format!("search max_entries must be 1..={MAX_HITS_CAP}"));
+    }
+    if let Some(value) = object.get("max_hits") {
+        if integer_value(Some(value), "max_hits")? != limit {
+            return Err("search max_entries conflicts with max_hits".into());
+        }
+    } else {
+        object.insert("max_hits".into(), Value::from(limit));
+    }
+    object.remove("max_entries");
+    admission_notes.push(format!("max_entries -> max_hits; limit {limit}"));
     Ok(())
 }
 
@@ -1281,6 +1324,7 @@ fn canonicalize_code_intel_arguments(
 }
 
 fn typed_arguments(
+    mode: OperatingMode,
     tool_name: &str,
     arguments: &mut Value,
     canonical_workspace: &Path,
@@ -1391,9 +1435,11 @@ fn typed_arguments(
                     "write expected exceeds the {MAX_MUTATING_FILE_BYTES}-byte mutation safety limit; use patch for a local edit, or write after a complete read without expected"
                 ));
             }
+            let content = string_argument("content")?;
             Ok(PreparedToolArguments::Write {
-                content: string_argument("content")?,
+                content,
                 expected,
+                then_run: prepare_then_run(mode, arguments, canonical_workspace, admission_notes)?,
             })
         }
         "patch" => {
@@ -1401,7 +1447,9 @@ fn typed_arguments(
                 if arguments.get("expected").is_some() || arguments.get("replacement").is_some() {
                     return Err("patch accepts edits or expected/replacement, not both".into());
                 }
-                let edits = edits.as_array().ok_or("patch edits must be an array")?;
+                let edits = edits
+                    .as_array()
+                    .ok_or("patch edits must be an array or a single edit object")?;
                 if edits.is_empty() || edits.len() > super::patch::MAX_PATCH_EDITS {
                     return Err(format!(
                         "patch edits must contain 1..={} entries",
@@ -1450,12 +1498,22 @@ fn typed_arguments(
                     admission_notes.push("patch legacy fields normalized to edits".into());
                 }
             }
-            Ok(PreparedToolArguments::Patch { edits })
+            Ok(PreparedToolArguments::Patch {
+                edits,
+                then_run: prepare_then_run(mode, arguments, canonical_workspace, admission_notes)?,
+            })
         }
         "shell" => {
             let timeout_ms = u64_argument(arguments, "timeout_ms")?;
-            if !(1..=120_000).contains(&timeout_ms) {
-                return Err("shell timeout_ms must be 1..=120000".into());
+            if !(1..=super::MAX_SHELL_TIMEOUT_MS).contains(&timeout_ms) {
+                return Err(format!(
+                    "shell timeout_ms must be 1..={}",
+                    super::MAX_SHELL_TIMEOUT_MS
+                ));
+            }
+            let yield_ms = u64_argument(arguments, "yield_ms")?;
+            if yield_ms > 10_000 {
+                return Err("shell yield_ms must be 0..=10000".into());
             }
             let command = nonempty_string_argument("command")?;
             // Decode exactly one JSON layer; never split a command line or
@@ -1493,6 +1551,7 @@ fn typed_arguments(
                 command,
                 args,
                 timeout_ms,
+                yield_ms,
             })
         }
         "code_intel" => {
@@ -1506,6 +1565,66 @@ fn typed_arguments(
         }
         _ => Ok(PreparedToolArguments::External),
     }
+}
+
+fn prepare_then_run(
+    mode: OperatingMode,
+    arguments: &mut Value,
+    workspace: &Path,
+    admission_notes: &mut Vec<String>,
+) -> Result<Option<Box<PreparedToolInvocation>>, String> {
+    let raw = match arguments.get("then_run") {
+        None => return Ok(None),
+        Some(value) => {
+            let object = value
+                .as_object()
+                .ok_or("then_run must be a shell argument object")?;
+            if object.contains_key("yield_ms") {
+                return Err("then_run waits for completion; yield_ms is not allowed".into());
+            }
+            value.to_string()
+        }
+    };
+    let canonical_workspace = Ok(workspace.to_path_buf());
+    let prepared = PreparedToolInvocation::from_workspace(
+        mode,
+        workspace,
+        &canonical_workspace,
+        0,
+        "shell",
+        &raw,
+        Some(ToolOperationalSpec {
+            effect_class: ToolEffectClass::PotentiallyVolatile,
+            cacheability: ToolCacheability::None,
+            volatility: ToolVolatility::Volatile,
+            dependency_scope: ToolDependencyScope::Unknown,
+            replay_policy: ToolReplayPolicy::Never,
+        }),
+    );
+    if let Some(error) = &prepared.error {
+        return Err(format!("then_run: {error}"));
+    }
+    let PreparedToolArguments::Shell {
+        command,
+        args,
+        timeout_ms,
+        ..
+    } = &prepared.arguments
+    else {
+        return Err("then_run must be a shell argument object".into());
+    };
+    arguments["then_run"] = serde_json::json!({
+        "command": command,
+        "args": args,
+        "timeout_ms": timeout_ms,
+    });
+    admission_notes.extend(
+        prepared
+            .admission_notes
+            .iter()
+            .map(|note| format!("then_run {note}")),
+    );
+    Ok(Some(Box::new(prepared)))
 }
 
 /// Shell command admission for common model slips. A serialized tool-call
@@ -1717,7 +1836,7 @@ fn effective_spec(
             dependency_scope: ToolDependencyScope::Internal,
             replay_policy: ToolReplayPolicy::Never,
         }),
-        "skill" => Some(ToolOperationalSpec {
+        "skill" | "shell_job" => Some(ToolOperationalSpec {
             effect_class: ToolEffectClass::PotentiallyVolatile,
             cacheability: ToolCacheability::None,
             volatility: ToolVolatility::Volatile,
@@ -1987,6 +2106,47 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn read_presentation_caps_preserve_source_and_continuation() {
+        let source = include_str!("../runtime/mod.rs");
+        let records = source
+            .split_inclusive('\n')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        for cap in [16, 24, 32, 64].map(|kib| kib * 1024) {
+            let (mut offset, mut pages, mut bytes) = (0, 0, 0);
+            let mut recovered = String::new();
+            let mut first_bytes = 0;
+            while offset < records.len() {
+                let end = (offset + MAX_READ_LINES_CAP).min(records.len());
+                let presentation = present_read_records(
+                    offset + 1,
+                    &records[offset..end],
+                    (end < records.len()).then_some(end + 1),
+                    PresentationBudget { max_bytes: cap },
+                );
+                assert!(presentation.delivered_records > 0);
+                assert!(presentation.text.len() <= cap);
+                let delivered = records[offset..offset + presentation.delivered_records].concat();
+                assert!(presentation.text.starts_with(&delivered));
+                recovered.push_str(&delivered);
+                offset += presentation.delivered_records;
+                if !presentation.complete {
+                    assert!(presentation
+                        .text
+                        .contains(&format!("\"offset\": {}", offset + 1)));
+                }
+                if pages == 0 {
+                    first_bytes = presentation.text.len();
+                }
+                pages += 1;
+                bytes += presentation.text.len();
+            }
+            assert_eq!(recovered, source);
+            eprintln!("read cap={cap} first_bytes={first_bytes} pages={pages} delivered_bytes={bytes} source_bytes={}", source.len());
+        }
+    }
+
     fn workspace(label: &str) -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2152,6 +2312,53 @@ mod tests {
     }
 
     #[test]
+    fn search_max_entries_alias_is_bounded_and_conflict_checked() {
+        let root = workspace("search-limit-alias");
+        let canonical = prepare(&root, "search", json!({"query":"needle", "max_hits":2}));
+        for args in [
+            json!({"query":"needle", "max_entries":2}),
+            json!({"query":"needle", "max_entries":2, "max_hits":2}),
+        ] {
+            let alias = prepare(&root, "search", args);
+            assert!(alias.error.is_none(), "{:?}", alias.error);
+            assert_eq!(alias.canonical_fingerprint, canonical.canonical_fingerprint);
+            assert!(alias
+                .admission_notes
+                .iter()
+                .any(|note| note.contains("max_entries -> max_hits")));
+        }
+        for value in [
+            json!(0),
+            json!(-1),
+            json!(MAX_HITS_CAP + 1),
+            json!("2"),
+            json!(null),
+        ] {
+            assert!(prepare(
+                &root,
+                "search",
+                json!({"query":"needle", "max_entries":value})
+            )
+            .error
+            .is_some());
+        }
+        assert!(prepare(
+            &root,
+            "search",
+            json!({"query":"needle", "max_entries":2, "max_hits":3})
+        )
+        .error
+        .is_some());
+        assert!(prepare(
+            &root,
+            "search",
+            json!({"query":"needle", "invented_limit":2})
+        )
+        .error
+        .is_some());
+    }
+
+    #[test]
     fn read_lines_alias_is_bounded_conflict_checked_and_identity_stable() {
         let root = workspace("read-lines");
         fs::write(root.join("text.txt"), "one\ntwo\n").expect("fixture");
@@ -2219,6 +2426,13 @@ mod tests {
         );
         assert!(legacy.error.is_none(), "{:?}", legacy.error);
         assert_eq!(legacy.canonical_fingerprint, batch.canonical_fingerprint);
+        let single = prepare(
+            &root,
+            "patch",
+            json!({"path":"text.txt", "edits":{"expected":"one", "replacement":"two"}}),
+        );
+        assert!(single.error.is_none(), "{:?}", single.error);
+        assert_eq!(single.canonical_fingerprint, batch.canonical_fingerprint);
         let mcp = prepare(&root, "mcp", json!({"server":"fixture", "extra":true}));
         assert!(
             mcp.error.is_none(),
@@ -2280,7 +2494,7 @@ mod tests {
             canonical_cursor.canonical_fingerprint
         );
 
-        for timeout in [json!(0), json!(120_001)] {
+        for timeout in [json!(0), json!(super::super::MAX_SHELL_TIMEOUT_MS + 1)] {
             let rejected = prepare(
                 &root,
                 "shell",

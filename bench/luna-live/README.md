@@ -1,5 +1,8 @@
 # Pi × Slim — uma tarefa real com GPT‑5.6 Luna
 
+> Caminhos de campanhas/runs exibidos em código são artefatos locais ignorados
+> pelo Git; relatórios e resumos versionados continuam linkados normalmente.
+
 ## Implementações nativas — 15/09/2026
 
 O checkout reduz descrições das ferramentas sem mudar seus parâmetros, exclui
@@ -319,14 +322,14 @@ no Pi, incluindo rede e processamento do stream, não só inferência remota.
 
 ## Evidências e reprodução
 
-- [Resumo normalizado, todas as chamadas e resultados](summary.json).
-- [Slim: sessão completa](20260905-045329Z/slim.session.jsonl),
-  [ledger](20260905-045329Z/slim.stdout.jsonl),
-  [validação independente](20260905-045329Z/slim.validation.json).
-- [Pi concluído: eventos e payloads](20260905-045558Z/pi.audit.jsonl),
-  [stdout nativo](20260905-045558Z/pi.stdout.jsonl),
-  [validação independente](20260905-045558Z/pi.validation.json).
-- [Pi rejeitado: tentativa preservada](20260905-045329Z/pi.stdout.jsonl).
+- Resumo normalizado, todas as chamadas e resultados (`summary.json`, artefato local n?o versionado).
+- Slim: sessão completa (`20260905-045329Z/slim.session.jsonl`, artefato local n?o versionado),
+  ledger (`20260905-045329Z/slim.stdout.jsonl`, artefato local n?o versionado),
+  validação independente (`20260905-045329Z/slim.validation.json`, artefato local n?o versionado).
+- Pi concluído: eventos e payloads (`20260905-045558Z/pi.audit.jsonl`, artefato local n?o versionado),
+  stdout nativo (`20260905-045558Z/pi.stdout.jsonl`, artefato local n?o versionado),
+  validação independente (`20260905-045558Z/pi.validation.json`, artefato local n?o versionado).
+- Pi rejeitado: tentativa preservada (`20260905-045329Z/pi.stdout.jsonl`, artefato local n?o versionado).
 - Cada campanha contém manifesto com versões/hashes, argv, variáveis de
   controle sem credenciais, tempos monotônicos, fixtures e código produzido.
 
@@ -730,14 +733,14 @@ substituir um resultado. Os oito manifests identificam o SHA-256 instalado
 
 | Rodada | Cenário / evidência | Slim | Pi |
 |---|---|---:|---:|
-| 1 | [merge_ranges](20260905-080555Z/summary.json) | 21.915 s | 31.440 s |
-| 1 | [repair_catalog](20260905-080649Z-repair_catalog/summary.json) | 19.933 s | 24.460 s |
-| 1 | [json_cli](20260905-080734Z-json_cli/summary.json) | 47.468 s | 51.193 s |
-| 1 | [js_pagination](20260905-080915Z-js_pagination/summary.json) | 19.063 s | 28.997 s |
-| 2 | [merge_ranges](20260905-081003Z/summary.json) | 21.741 s | 24.081 s |
-| 2 | [repair_catalog](20260905-081049Z-repair_catalog/summary.json) | 22.658 s | 22.263 s |
-| 2 | [json_cli](20260905-081135Z-json_cli/summary.json) | 45.326 s | 51.227 s |
-| 2 | [js_pagination](20260905-081313Z-js_pagination/summary.json) | 21.677 s | 26.224 s |
+| 1 | merge_ranges (`20260905-080555Z/summary.json`, artefato local n?o versionado) | 21.915 s | 31.440 s |
+| 1 | repair_catalog (`20260905-080649Z-repair_catalog/summary.json`, artefato local n?o versionado) | 19.933 s | 24.460 s |
+| 1 | json_cli (`20260905-080734Z-json_cli/summary.json`, artefato local n?o versionado) | 47.468 s | 51.193 s |
+| 1 | js_pagination (`20260905-080915Z-js_pagination/summary.json`, artefato local n?o versionado) | 19.063 s | 28.997 s |
+| 2 | merge_ranges (`20260905-081003Z/summary.json`, artefato local n?o versionado) | 21.741 s | 24.081 s |
+| 2 | repair_catalog (`20260905-081049Z-repair_catalog/summary.json`, artefato local n?o versionado) | 22.658 s | 22.263 s |
+| 2 | json_cli (`20260905-081135Z-json_cli/summary.json`, artefato local n?o versionado) | 45.326 s | 51.227 s |
+| 2 | js_pagination (`20260905-081313Z-js_pagination/summary.json`, artefato local n?o versionado) | 21.677 s | 26.224 s |
 
 | Agregado de oito tarefas | Slim | Pi |
 |---|---:|---:|
@@ -824,14 +827,14 @@ Oito pares, todos preservados e auditados; oráculos externos e fixtures intacto
 
 | Rodada | Cenário / evidência | Tokens Slim | Tokens Pi | Calls Slim/Pi |
 |---|---|---:|---:|---:|
-| 1 | [merge_ranges](20260905-083619Z/summary.json) | 9486 | 8884 | 4/4 |
-| 1 | [repair_catalog](20260905-083709Z-repair_catalog/summary.json) | 10749 | 11293 | 5/7 |
-| 1 | [json_cli](20260905-083756Z-json_cli/summary.json) | 25795 | 12390 | 8/5 |
-| 1 | [js_pagination](20260905-083938Z-js_pagination/summary.json) | 11620 | 10701 | 5/5 |
-| 2 | [merge_ranges](20260905-084031Z/summary.json) | 11008 | 8937 | 5/4 |
-| 2 | [repair_catalog](20260905-084124Z-repair_catalog/summary.json) | 17290 | 9895 | 7/5 |
-| 2 | [json_cli](20260905-084218Z-json_cli/summary.json) | 17661 | 21267 | 6/7 |
-| 2 | [js_pagination](20260905-084418Z-js_pagination/summary.json) | 11046 | 12772 | 5/6 |
+| 1 | merge_ranges (`20260905-083619Z/summary.json`, artefato local n?o versionado) | 9486 | 8884 | 4/4 |
+| 1 | repair_catalog (`20260905-083709Z-repair_catalog/summary.json`, artefato local n?o versionado) | 10749 | 11293 | 5/7 |
+| 1 | json_cli (`20260905-083756Z-json_cli/summary.json`, artefato local n?o versionado) | 25795 | 12390 | 8/5 |
+| 1 | js_pagination (`20260905-083938Z-js_pagination/summary.json`, artefato local n?o versionado) | 11620 | 10701 | 5/5 |
+| 2 | merge_ranges (`20260905-084031Z/summary.json`, artefato local n?o versionado) | 11008 | 8937 | 5/4 |
+| 2 | repair_catalog (`20260905-084124Z-repair_catalog/summary.json`, artefato local n?o versionado) | 17290 | 9895 | 7/5 |
+| 2 | json_cli (`20260905-084218Z-json_cli/summary.json`, artefato local n?o versionado) | 17661 | 21267 | 6/7 |
+| 2 | js_pagination (`20260905-084418Z-js_pagination/summary.json`, artefato local n?o versionado) | 11046 | 12772 | 5/6 |
 
 **A meta ainda não foi atingida:** Slim 114,655 tokens, Pi 96,139; diferença de 19.3%.
 O primeiro request de repair_catalog caiu de 1.709 para 1.262 tokens, com
@@ -867,7 +870,7 @@ O par falho foi preservado; não se substitui o resultado por uma repetição.
 Uma captura diagnóstica direta no mesmo endpoint, usando o prompt/payload da
 fixture gravada e a autenticação local do Slim, confirmou o formato emitido:
 primeiro fragmento com ID string; seguintes com o mesmo índice e `id:null`,
-`name:null`. O arquivo [protocol-probe.sse](20260905-084558Z-repair_catalog/protocol-probe.sse)
+`name:null`. O arquivo protocol-probe.sse (`20260905-084558Z-repair_catalog/protocol-probe.sse`, artefato local n?o versionado)
 contém a resposta sem headers/credenciais. Isso foi diagnóstico, não uma
 execução equivalente dos agentes. A tentativa inicial com urllib recebeu 403;
 Node fetch conseguiu capturar o stream. Nenhum proxy foi introduzido.
@@ -906,8 +909,8 @@ com fixtures intactos (`slim-null-id-deepseek.log`, exit 0):
 
 | Evidência | Tokens Slim/Pi | Calls Slim/Pi | Falhas de ferramenta Slim/Pi |
 |---|---:|---:|---:|
-| [085715](20260905-085715Z-repair_catalog/summary.json) | 18414 / 14315 | 6 / 5 | 1 / 0 |
-| [085750](20260905-085750Z-repair_catalog/summary.json) | 18147 / 15338 | 6 / 5 | 1 / 0 |
+| 085715 (`20260905-085715Z-repair_catalog/summary.json`, artefato local n?o versionado) | 18414 / 14315 | 6 / 5 | 1 / 0 |
+| 085750 (`20260905-085750Z-repair_catalog/summary.json`, artefato local n?o versionado) | 18147 / 15338 | 6 / 5 | 1 / 0 |
 
 Total: 36561 / 29653 tokens, Slim 23,3% acima. Nas duas, write foi chamado sem
 expected depois de read e rejeitado por falta de precondição. O modelo recuperou
@@ -1005,11 +1008,11 @@ o par falho. A tabela contém somente os pares completos; não é uma bateria 6/
 
 | Evidência | Tokens Slim/Pi | Calls Slim/Pi |
 |---|---:|---:|
-| [merge_ranges](20260905-093618Z/summary.json) | 9054 / 11011 | 4 / 5 |
-| [repair_catalog](20260905-093712Z-repair_catalog/summary.json) | 10077 / 9893 | 5 / 5 |
-| [js_pagination](20260905-094237Z-js_pagination/summary.json) | 10784 / 10561 | 5 / 5 |
-| [ledger_audit](20260905-094329Z-ledger_audit/summary.json) | 18457 / 17409 | 6 / 6 |
-| [config_migration](20260905-094429Z-config_migration/summary.json) | 25722 / 23175 | 10 / 9 |
+| merge_ranges (`20260905-093618Z/summary.json`, artefato local n?o versionado) | 9054 / 11011 | 4 / 5 |
+| repair_catalog (`20260905-093712Z-repair_catalog/summary.json`, artefato local n?o versionado) | 10077 / 9893 | 5 / 5 |
+| js_pagination (`20260905-094237Z-js_pagination/summary.json`, artefato local n?o versionado) | 10784 / 10561 | 5 / 5 |
+| ledger_audit (`20260905-094329Z-ledger_audit/summary.json`, artefato local n?o versionado) | 18457 / 17409 | 6 / 6 |
+| config_migration (`20260905-094429Z-config_migration/summary.json`, artefato local n?o versionado) | 25722 / 23175 | 10 / 9 |
 
 Total dos pares completos: 74094 / 72049 tokens, Slim 2.84% acima.
 
@@ -1042,12 +1045,12 @@ coluna não significa thinking desligado. Input/output completos são contabiliz
 
 | Evidência | Tokens Slim/Pi | Calls Slim/Pi |
 |---|---:|---:|
-| [merge_ranges](20260905-094835Z/summary.json) | 16707 / 15066 | 5 / 5 |
-| [repair_catalog](20260905-094914Z-repair_catalog/summary.json) | 15485 / 13014 | 5 / 5 |
-| [json_cli](20260905-094939Z-json_cli/summary.json) | 19156 / 33799 | 5 / 7 |
-| [js_pagination](20260905-095051Z-js_pagination/summary.json) | 14953 / 13241 | 5 / 5 |
-| [ledger_audit](20260905-095120Z-ledger_audit/summary.json) | 38732 / 31107 | 7 / 6 |
-| [config_migration](20260905-095251Z-config_migration/summary.json) | 32593 / 15254 | 8 / 5 |
+| merge_ranges (`20260905-094835Z/summary.json`, artefato local n?o versionado) | 16707 / 15066 | 5 / 5 |
+| repair_catalog (`20260905-094914Z-repair_catalog/summary.json`, artefato local n?o versionado) | 15485 / 13014 | 5 / 5 |
+| json_cli (`20260905-094939Z-json_cli/summary.json`, artefato local n?o versionado) | 19156 / 33799 | 5 / 7 |
+| js_pagination (`20260905-095051Z-js_pagination/summary.json`, artefato local n?o versionado) | 14953 / 13241 | 5 / 5 |
+| ledger_audit (`20260905-095120Z-ledger_audit/summary.json`, artefato local n?o versionado) | 38732 / 31107 | 7 / 6 |
+| config_migration (`20260905-095251Z-config_migration/summary.json`, artefato local n?o versionado) | 32593 / 15254 | 8 / 5 |
 
 Todos os seis pares passaram nos oráculos, fixtures intactos; daily e auditor,
 exit 0. Total 137626 / 121481 tokens: Slim 13,29% acima. A meta ainda não foi
@@ -1112,35 +1115,35 @@ Binário B3CE3A4D0F95807AD5DEF509207EFE8E412971B1066D349A0505F0DC36C8F9CC. Seis 
 
 | Modelo | Rodada | Cenário | Slim | Pi | Chamadas Slim/Pi | Campanha |
 |---|---:|---|---:|---:|---|---|
-| luna | 1 | merge_ranges | 8835 | 8358 | 4/4 | [20260905-100929Z](20260905-100929Z/summary.json) |
-| luna | 1 | repair_catalog | 9774 | 9866 | 5/5 | [20260905-101021Z-repair_catalog](20260905-101021Z-repair_catalog/summary.json) |
-| luna | 1 | json_cli | 17609 | 14214 | 6/5 | [20260905-101110Z-json_cli](20260905-101110Z-json_cli/summary.json) |
-| luna | 1 | js_pagination | 10075 | 12662 | 5/6 | [20260905-101304Z-js_pagination](20260905-101304Z-js_pagination/summary.json) |
-| luna | 1 | ledger_audit | 24662 | 18242 | 7/6 | [20260905-101403Z-ledger_audit](20260905-101403Z-ledger_audit/summary.json) |
-| luna | 1 | config_migration | 12227 | 10733 | 6/5 | [20260905-101518Z-config_migration](20260905-101518Z-config_migration/summary.json) |
-| luna | 2 | merge_ranges | 9067 | 8743 | 4/4 | [20260905-101610Z](20260905-101610Z/summary.json) |
-| luna | 2 | repair_catalog | 9295 | 9808 | 5/5 | [20260905-101701Z-repair_catalog](20260905-101701Z-repair_catalog/summary.json) |
-| luna | 2 | json_cli | 12696 | 14573 | 5/5 | [20260905-101745Z-json_cli](20260905-101745Z-json_cli/summary.json) |
-| luna | 2 | js_pagination | 10132 | 10766 | 5/5 | [20260905-101924Z-js_pagination](20260905-101924Z-js_pagination/summary.json) |
-| luna | 2 | ledger_audit | 17205 | 17895 | 6/6 | [20260905-102017Z-ledger_audit](20260905-102017Z-ledger_audit/summary.json) |
-| luna | 2 | config_migration | 27221 | 19478 | 10/9 | [20260905-102116Z-config_migration](20260905-102116Z-config_migration/summary.json) |
+| luna | 1 | merge_ranges | 8835 | 8358 | 4/4 | 20260905-100929Z (`20260905-100929Z/summary.json`, artefato local n?o versionado) |
+| luna | 1 | repair_catalog | 9774 | 9866 | 5/5 | 20260905-101021Z-repair_catalog (`20260905-101021Z-repair_catalog/summary.json`, artefato local n?o versionado) |
+| luna | 1 | json_cli | 17609 | 14214 | 6/5 | 20260905-101110Z-json_cli (`20260905-101110Z-json_cli/summary.json`, artefato local n?o versionado) |
+| luna | 1 | js_pagination | 10075 | 12662 | 5/6 | 20260905-101304Z-js_pagination (`20260905-101304Z-js_pagination/summary.json`, artefato local n?o versionado) |
+| luna | 1 | ledger_audit | 24662 | 18242 | 7/6 | 20260905-101403Z-ledger_audit (`20260905-101403Z-ledger_audit/summary.json`, artefato local n?o versionado) |
+| luna | 1 | config_migration | 12227 | 10733 | 6/5 | 20260905-101518Z-config_migration (`20260905-101518Z-config_migration/summary.json`, artefato local n?o versionado) |
+| luna | 2 | merge_ranges | 9067 | 8743 | 4/4 | 20260905-101610Z (`20260905-101610Z/summary.json`, artefato local n?o versionado) |
+| luna | 2 | repair_catalog | 9295 | 9808 | 5/5 | 20260905-101701Z-repair_catalog (`20260905-101701Z-repair_catalog/summary.json`, artefato local n?o versionado) |
+| luna | 2 | json_cli | 12696 | 14573 | 5/5 | 20260905-101745Z-json_cli (`20260905-101745Z-json_cli/summary.json`, artefato local n?o versionado) |
+| luna | 2 | js_pagination | 10132 | 10766 | 5/5 | 20260905-101924Z-js_pagination (`20260905-101924Z-js_pagination/summary.json`, artefato local n?o versionado) |
+| luna | 2 | ledger_audit | 17205 | 17895 | 6/6 | 20260905-102017Z-ledger_audit (`20260905-102017Z-ledger_audit/summary.json`, artefato local n?o versionado) |
+| luna | 2 | config_migration | 27221 | 19478 | 10/9 | 20260905-102116Z-config_migration (`20260905-102116Z-config_migration/summary.json`, artefato local n?o versionado) |
 
 luna: 168798 / 155338 tokens (+8.66% Slim); 6/12 vitórias em tokens. Todos os 12 pares passaram, fixtures intactos, uso completo, auditor e daily exit 0.
 
 | Modelo | Rodada | Cenário | Slim | Pi | Chamadas Slim/Pi | Campanha |
 |---|---:|---|---:|---:|---|---|
-| deepseek | 1 | merge_ranges | 16784 | 24840 | 5/6 | [20260905-100929Z-opencode-go](20260905-100929Z-opencode-go/summary.json) |
-| deepseek | 1 | repair_catalog | 14581 | 15215 | 5/5 | [20260905-101025Z-opencode-go-repair_catalog](20260905-101025Z-opencode-go-repair_catalog/summary.json) |
-| deepseek | 1 | json_cli | 24608 | 27220 | 6/7 | [20260905-101051Z-opencode-go-json_cli](20260905-101051Z-opencode-go-json_cli/summary.json) |
-| deepseek | 1 | js_pagination | 14536 | 16219 | 5/5 | [20260905-101159Z-opencode-go-js_pagination](20260905-101159Z-opencode-go-js_pagination/summary.json) |
-| deepseek | 1 | ledger_audit | 32684 | 24853 | 6/6 | [20260905-101227Z-opencode-go-ledger_audit](20260905-101227Z-opencode-go-ledger_audit/summary.json) |
-| deepseek | 1 | config_migration | 18717 | 14557 | 6/5 | [20260905-101344Z-opencode-go-config_migration](20260905-101344Z-opencode-go-config_migration/summary.json) |
-| deepseek | 2 | merge_ranges | 18935 | 22351 | 5/6 | [20260905-101413Z-opencode-go](20260905-101413Z-opencode-go/summary.json) |
-| deepseek | 2 | repair_catalog | 15256 | 14684 | 5/5 | [20260905-101510Z-opencode-go-repair_catalog](20260905-101510Z-opencode-go-repair_catalog/summary.json) |
-| deepseek | 2 | json_cli | 25418 | 17217 | 6/6 | [20260905-101541Z-opencode-go-json_cli](20260905-101541Z-opencode-go-json_cli/summary.json) |
-| deepseek | 2 | js_pagination | 16260 | 15754 | 5/5 | [20260905-101637Z-opencode-go-js_pagination](20260905-101637Z-opencode-go-js_pagination/summary.json) |
-| deepseek | 2 | ledger_audit | 25343 | 36501 | 6/7 | [20260905-101703Z-opencode-go-ledger_audit](20260905-101703Z-opencode-go-ledger_audit/summary.json) |
-| deepseek | 2 | config_migration | 17859 | 22388 | 6/7 | [20260905-101759Z-opencode-go-config_migration](20260905-101759Z-opencode-go-config_migration/summary.json) |
+| deepseek | 1 | merge_ranges | 16784 | 24840 | 5/6 | 20260905-100929Z-opencode-go (`20260905-100929Z-opencode-go/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | repair_catalog | 14581 | 15215 | 5/5 | 20260905-101025Z-opencode-go-repair_catalog (`20260905-101025Z-opencode-go-repair_catalog/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | json_cli | 24608 | 27220 | 6/7 | 20260905-101051Z-opencode-go-json_cli (`20260905-101051Z-opencode-go-json_cli/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | js_pagination | 14536 | 16219 | 5/5 | 20260905-101159Z-opencode-go-js_pagination (`20260905-101159Z-opencode-go-js_pagination/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | ledger_audit | 32684 | 24853 | 6/6 | 20260905-101227Z-opencode-go-ledger_audit (`20260905-101227Z-opencode-go-ledger_audit/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | config_migration | 18717 | 14557 | 6/5 | 20260905-101344Z-opencode-go-config_migration (`20260905-101344Z-opencode-go-config_migration/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | merge_ranges | 18935 | 22351 | 5/6 | 20260905-101413Z-opencode-go (`20260905-101413Z-opencode-go/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | repair_catalog | 15256 | 14684 | 5/5 | 20260905-101510Z-opencode-go-repair_catalog (`20260905-101510Z-opencode-go-repair_catalog/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | json_cli | 25418 | 17217 | 6/6 | 20260905-101541Z-opencode-go-json_cli (`20260905-101541Z-opencode-go-json_cli/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | js_pagination | 16260 | 15754 | 5/5 | 20260905-101637Z-opencode-go-js_pagination (`20260905-101637Z-opencode-go-js_pagination/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | ledger_audit | 25343 | 36501 | 6/7 | 20260905-101703Z-opencode-go-ledger_audit (`20260905-101703Z-opencode-go-ledger_audit/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | config_migration | 17859 | 22388 | 6/7 | 20260905-101759Z-opencode-go-config_migration (`20260905-101759Z-opencode-go-config_migration/summary.json`, artefato local n?o versionado) |
 
 deepseek: 240981 / 251799 tokens (-4.30% Slim); 7/12 vitórias em tokens. Todos os 12 pares passaram, fixtures intactos, uso completo, auditor e daily exit 0.
 
@@ -1188,36 +1191,36 @@ Clippy `--workspace --all-targets -- -D warnings`: exit 0; log `%TEMP%/slim-exec
 
 | Modelo | Rodada | Cenário | Slim | Pi | Chamadas Slim/Pi | Campanha |
 |---|---:|---|---:|---:|---|---|
-| luna | 1 | merge_ranges | 9046 | 10307 | 4/5 | [20260905-103207Z](20260905-103207Z/summary.json) |
-| luna | 1 | repair_catalog | 10048 | 9759 | 5/5 | [20260905-103310Z-repair_catalog](20260905-103310Z-repair_catalog/summary.json) |
-| luna | 1 | json_cli | 15095 | 21391 | 5/7 | [20260905-103358Z-json_cli](20260905-103358Z-json_cli/summary.json) |
-| luna | 1 | js_pagination | 10449 | 10387 | 5/5 | [20260905-103556Z-js_pagination](20260905-103556Z-js_pagination/summary.json) |
-| luna | 1 | ledger_audit | 18694 | 17655 | 6/6 | [20260905-103650Z-ledger_audit](20260905-103650Z-ledger_audit/summary.json) |
-| luna | 1 | config_migration | 34510 | 21394 | 11/8 | [20260905-103749Z-config_migration](20260905-103749Z-config_migration/summary.json) |
-| luna | 2 | merge_ranges | 10578 | 10500 | 5/5 | [20260905-103918Z](20260905-103918Z/summary.json) |
-| luna | 2 | repair_catalog | 9852 | 11055 | 5/6 | [20260905-104023Z-repair_catalog](20260905-104023Z-repair_catalog/summary.json) |
-| luna | 2 | json_cli | 19572 | 23402 | 6/7 | [20260905-104114Z-json_cli](20260905-104114Z-json_cli/summary.json) |
-| luna | 2 | js_pagination | 10335 | 11009 | 5/5 | [20260905-104335Z-js_pagination](20260905-104335Z-js_pagination/summary.json) |
-| luna | 2 | ledger_audit | 13486 | 17832 | 5/6 | [20260905-104429Z-ledger_audit](20260905-104429Z-ledger_audit/summary.json) |
-| luna | 2 | config_migration | 23711 | 13034 | 9/6 | [20260905-104534Z-config_migration](20260905-104534Z-config_migration/summary.json) |
+| luna | 1 | merge_ranges | 9046 | 10307 | 4/5 | 20260905-103207Z (`20260905-103207Z/summary.json`, artefato local n?o versionado) |
+| luna | 1 | repair_catalog | 10048 | 9759 | 5/5 | 20260905-103310Z-repair_catalog (`20260905-103310Z-repair_catalog/summary.json`, artefato local n?o versionado) |
+| luna | 1 | json_cli | 15095 | 21391 | 5/7 | 20260905-103358Z-json_cli (`20260905-103358Z-json_cli/summary.json`, artefato local n?o versionado) |
+| luna | 1 | js_pagination | 10449 | 10387 | 5/5 | 20260905-103556Z-js_pagination (`20260905-103556Z-js_pagination/summary.json`, artefato local n?o versionado) |
+| luna | 1 | ledger_audit | 18694 | 17655 | 6/6 | 20260905-103650Z-ledger_audit (`20260905-103650Z-ledger_audit/summary.json`, artefato local n?o versionado) |
+| luna | 1 | config_migration | 34510 | 21394 | 11/8 | 20260905-103749Z-config_migration (`20260905-103749Z-config_migration/summary.json`, artefato local n?o versionado) |
+| luna | 2 | merge_ranges | 10578 | 10500 | 5/5 | 20260905-103918Z (`20260905-103918Z/summary.json`, artefato local n?o versionado) |
+| luna | 2 | repair_catalog | 9852 | 11055 | 5/6 | 20260905-104023Z-repair_catalog (`20260905-104023Z-repair_catalog/summary.json`, artefato local n?o versionado) |
+| luna | 2 | json_cli | 19572 | 23402 | 6/7 | 20260905-104114Z-json_cli (`20260905-104114Z-json_cli/summary.json`, artefato local n?o versionado) |
+| luna | 2 | js_pagination | 10335 | 11009 | 5/5 | 20260905-104335Z-js_pagination (`20260905-104335Z-js_pagination/summary.json`, artefato local n?o versionado) |
+| luna | 2 | ledger_audit | 13486 | 17832 | 5/6 | 20260905-104429Z-ledger_audit (`20260905-104429Z-ledger_audit/summary.json`, artefato local n?o versionado) |
+| luna | 2 | config_migration | 23711 | 13034 | 9/6 | 20260905-104534Z-config_migration (`20260905-104534Z-config_migration/summary.json`, artefato local n?o versionado) |
 
 luna: 185376 / 177725 tokens (+4.30% Slim); 6/12 vitórias. Todos os 12 pares passaram, fixtures intactos, uso completo, auditor e daily exit 0.
 
 
 | Modelo | Rodada | Cenário | Slim | Pi | Chamadas Slim/Pi | Campanha |
 |---|---:|---|---:|---:|---|---|
-| deepseek | 1 | merge_ranges | 19882 | 20101 | 5/6 | [20260905-103217Z-opencode-go](20260905-103217Z-opencode-go/summary.json) |
-| deepseek | 1 | repair_catalog | 15283 | 14920 | 5/5 | [20260905-103318Z-opencode-go-repair_catalog](20260905-103318Z-opencode-go-repair_catalog/summary.json) |
-| deepseek | 1 | json_cli | 21129 | 50618 | 6/8 | [20260905-103400Z-opencode-go-json_cli](20260905-103400Z-opencode-go-json_cli/summary.json) |
-| deepseek | 1 | js_pagination | 14616 | 15233 | 5/5 | [20260905-103527Z-opencode-go-js_pagination](20260905-103527Z-opencode-go-js_pagination/summary.json) |
-| deepseek | 1 | ledger_audit | 37879 | 34763 | 7/7 | [20260905-103604Z-opencode-go-ledger_audit](20260905-103604Z-opencode-go-ledger_audit/summary.json) |
-| deepseek | 1 | config_migration | 25311 | 65577 | 7/11 | [20260905-103721Z-opencode-go-config_migration](20260905-103721Z-opencode-go-config_migration/summary.json) |
-| deepseek | 2 | merge_ranges | 15956 | 22110 | 5/6 | [20260905-103833Z-opencode-go](20260905-103833Z-opencode-go/summary.json) |
-| deepseek | 2 | repair_catalog | 15397 | 14573 | 5/5 | [20260905-103925Z-opencode-go-repair_catalog](20260905-103925Z-opencode-go-repair_catalog/summary.json) |
-| deepseek | 2 | json_cli | 29584 | 37804 | 7/7 | [20260905-104003Z-opencode-go-json_cli](20260905-104003Z-opencode-go-json_cli/summary.json) |
-| deepseek | 2 | js_pagination | 16292 | 16109 | 5/5 | [20260905-104146Z-opencode-go-js_pagination](20260905-104146Z-opencode-go-js_pagination/summary.json) |
-| deepseek | 2 | ledger_audit | 20859 | 25824 | 5/6 | [20260905-104221Z-opencode-go-ledger_audit](20260905-104221Z-opencode-go-ledger_audit/summary.json) |
-| deepseek | 2 | config_migration | 19540 | 19139 | 6/6 | [20260905-104307Z-opencode-go-config_migration](20260905-104307Z-opencode-go-config_migration/summary.json) |
+| deepseek | 1 | merge_ranges | 19882 | 20101 | 5/6 | 20260905-103217Z-opencode-go (`20260905-103217Z-opencode-go/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | repair_catalog | 15283 | 14920 | 5/5 | 20260905-103318Z-opencode-go-repair_catalog (`20260905-103318Z-opencode-go-repair_catalog/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | json_cli | 21129 | 50618 | 6/8 | 20260905-103400Z-opencode-go-json_cli (`20260905-103400Z-opencode-go-json_cli/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | js_pagination | 14616 | 15233 | 5/5 | 20260905-103527Z-opencode-go-js_pagination (`20260905-103527Z-opencode-go-js_pagination/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | ledger_audit | 37879 | 34763 | 7/7 | 20260905-103604Z-opencode-go-ledger_audit (`20260905-103604Z-opencode-go-ledger_audit/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | config_migration | 25311 | 65577 | 7/11 | 20260905-103721Z-opencode-go-config_migration (`20260905-103721Z-opencode-go-config_migration/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | merge_ranges | 15956 | 22110 | 5/6 | 20260905-103833Z-opencode-go (`20260905-103833Z-opencode-go/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | repair_catalog | 15397 | 14573 | 5/5 | 20260905-103925Z-opencode-go-repair_catalog (`20260905-103925Z-opencode-go-repair_catalog/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | json_cli | 29584 | 37804 | 7/7 | 20260905-104003Z-opencode-go-json_cli (`20260905-104003Z-opencode-go-json_cli/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | js_pagination | 16292 | 16109 | 5/5 | 20260905-104146Z-opencode-go-js_pagination (`20260905-104146Z-opencode-go-js_pagination/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | ledger_audit | 20859 | 25824 | 5/6 | 20260905-104221Z-opencode-go-ledger_audit (`20260905-104221Z-opencode-go-ledger_audit/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | config_migration | 19540 | 19139 | 6/6 | 20260905-104307Z-opencode-go-config_migration (`20260905-104307Z-opencode-go-config_migration/summary.json`, artefato local n?o versionado) |
 
 deepseek: 251728 / 336771 tokens (-25.25% Slim); 7/12 vitórias. Todos os 12 pares passaram, fixtures intactos, uso completo, auditor e daily exit 0.
 
@@ -1256,40 +1259,40 @@ falhas ou lacunas desta bateria. Gate: `%TEMP%/slim-patch-crlf-gate.log`.
 
 | Modelo | Rodada | Cenário | Slim | Pi | Chamadas Slim/Pi | Campanha |
 |---|---:|---|---:|---:|---|---|
-| luna | 1 | config_migration | 12974 | 27094 | 6/9 | [20260905-105833Z-config_migration](20260905-105833Z-config_migration/summary.json) |
-| luna | 2 | config_migration | 12057 | 13178 | 6/6 | [20260905-105943Z-config_migration](20260905-105943Z-config_migration/summary.json) |
-| luna | 1 | js_pagination | 10424 | 10706 | 5/5 | [20260905-105506Z-js_pagination](20260905-105506Z-js_pagination/summary.json) |
-| luna | 2 | js_pagination | 10506 | 10215 | 5/5 | [20260905-105555Z-js_pagination](20260905-105555Z-js_pagination/summary.json) |
-| luna | 1 | json_cli | 15362 | 16424 | 6/6 | [20260905-105502Z-json_cli](20260905-105502Z-json_cli/summary.json) |
-| luna | 2 | json_cli | 15620 | 13157 | 5/5 | [20260905-105646Z-json_cli](20260905-105646Z-json_cli/summary.json) |
-| luna | 1 | ledger_audit | 22637 | 14109 | 7/5 | [20260905-105651Z-ledger_audit](20260905-105651Z-ledger_audit/summary.json) |
-| luna | 2 | ledger_audit | 16962 | 17628 | 6/6 | [20260905-105800Z-ledger_audit](20260905-105800Z-ledger_audit/summary.json) |
-| luna | 1 | merge_ranges | 8603 | 8762 | 4/4 | [20260905-105319Z](20260905-105319Z/summary.json) |
-| luna | 2 | merge_ranges | 9170 | 10759 | 4/5 | [20260905-105407Z](20260905-105407Z/summary.json) |
-| luna | 1 | repair_catalog | 9832 | 9812 | 5/5 | [20260905-105319Z-repair_catalog](20260905-105319Z-repair_catalog/summary.json) |
-| luna | 2 | repair_catalog | 9351 | 10884 | 5/6 | [20260905-105408Z-repair_catalog](20260905-105408Z-repair_catalog/summary.json) |
+| luna | 1 | config_migration | 12974 | 27094 | 6/9 | 20260905-105833Z-config_migration (`20260905-105833Z-config_migration/summary.json`, artefato local n?o versionado) |
+| luna | 2 | config_migration | 12057 | 13178 | 6/6 | 20260905-105943Z-config_migration (`20260905-105943Z-config_migration/summary.json`, artefato local n?o versionado) |
+| luna | 1 | js_pagination | 10424 | 10706 | 5/5 | 20260905-105506Z-js_pagination (`20260905-105506Z-js_pagination/summary.json`, artefato local n?o versionado) |
+| luna | 2 | js_pagination | 10506 | 10215 | 5/5 | 20260905-105555Z-js_pagination (`20260905-105555Z-js_pagination/summary.json`, artefato local n?o versionado) |
+| luna | 1 | json_cli | 15362 | 16424 | 6/6 | 20260905-105502Z-json_cli (`20260905-105502Z-json_cli/summary.json`, artefato local n?o versionado) |
+| luna | 2 | json_cli | 15620 | 13157 | 5/5 | 20260905-105646Z-json_cli (`20260905-105646Z-json_cli/summary.json`, artefato local n?o versionado) |
+| luna | 1 | ledger_audit | 22637 | 14109 | 7/5 | 20260905-105651Z-ledger_audit (`20260905-105651Z-ledger_audit/summary.json`, artefato local n?o versionado) |
+| luna | 2 | ledger_audit | 16962 | 17628 | 6/6 | 20260905-105800Z-ledger_audit (`20260905-105800Z-ledger_audit/summary.json`, artefato local n?o versionado) |
+| luna | 1 | merge_ranges | 8603 | 8762 | 4/4 | 20260905-105319Z (`20260905-105319Z/summary.json`, artefato local n?o versionado) |
+| luna | 2 | merge_ranges | 9170 | 10759 | 4/5 | 20260905-105407Z (`20260905-105407Z/summary.json`, artefato local n?o versionado) |
+| luna | 1 | repair_catalog | 9832 | 9812 | 5/5 | 20260905-105319Z-repair_catalog (`20260905-105319Z-repair_catalog/summary.json`, artefato local n?o versionado) |
+| luna | 2 | repair_catalog | 9351 | 10884 | 5/6 | 20260905-105408Z-repair_catalog (`20260905-105408Z-repair_catalog/summary.json`, artefato local n?o versionado) |
 
 luna: 12 pares completos, 153498 / 162728 tokens (-5.67% Slim); 8/12 vitórias. Estes pares passaram nos oráculos, fixtures intactos e uso completo.
 
 
 | Modelo | Rodada | Cenário | Slim | Pi | Chamadas Slim/Pi | Campanha |
 |---|---:|---|---:|---:|---|---|
-| deepseek | 2 | config_migration | 19011 | 16717 | 6/5 | [20260905-105919Z-opencode-go-config_migration](20260905-105919Z-opencode-go-config_migration/summary.json) |
-| deepseek | 1 | js_pagination | 24041 | 13789 | 7/5 | [20260905-105456Z-opencode-go-js_pagination](20260905-105456Z-opencode-go-js_pagination/summary.json) |
-| deepseek | 2 | js_pagination | 16619 | 14751 | 5/5 | [20260905-105528Z-opencode-go-js_pagination](20260905-105528Z-opencode-go-js_pagination/summary.json) |
-| deepseek | 1 | json_cli | 34991 | 35589 | 7/8 | [20260905-105434Z-opencode-go-json_cli](20260905-105434Z-opencode-go-json_cli/summary.json) |
-| deepseek | 2 | json_cli | 20349 | 26997 | 6/7 | [20260905-105611Z-opencode-go-json_cli](20260905-105611Z-opencode-go-json_cli/summary.json) |
-| deepseek | 1 | ledger_audit | 25431 | 32511 | 6/6 | [20260905-105558Z-opencode-go-ledger_audit](20260905-105558Z-opencode-go-ledger_audit/summary.json) |
-| deepseek | 2 | ledger_audit | 24335 | 31960 | 5/6 | [20260905-105718Z-opencode-go-ledger_audit](20260905-105718Z-opencode-go-ledger_audit/summary.json) |
-| deepseek | 1 | merge_ranges | 14775 | 15291 | 4/5 | [20260905-105319Z-opencode-go](20260905-105319Z-opencode-go/summary.json) |
-| deepseek | 2 | merge_ranges | 17595 | 23900 | 5/6 | [20260905-105403Z-opencode-go](20260905-105403Z-opencode-go/summary.json) |
-| deepseek | 1 | repair_catalog | 13984 | 14393 | 5/5 | [20260905-105319Z-opencode-go-repair_catalog](20260905-105319Z-opencode-go-repair_catalog/summary.json) |
-| deepseek | 2 | repair_catalog | 15465 | 14864 | 5/5 | [20260905-105344Z-opencode-go-repair_catalog](20260905-105344Z-opencode-go-repair_catalog/summary.json) |
+| deepseek | 2 | config_migration | 19011 | 16717 | 6/5 | 20260905-105919Z-opencode-go-config_migration (`20260905-105919Z-opencode-go-config_migration/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | js_pagination | 24041 | 13789 | 7/5 | 20260905-105456Z-opencode-go-js_pagination (`20260905-105456Z-opencode-go-js_pagination/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | js_pagination | 16619 | 14751 | 5/5 | 20260905-105528Z-opencode-go-js_pagination (`20260905-105528Z-opencode-go-js_pagination/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | json_cli | 34991 | 35589 | 7/8 | 20260905-105434Z-opencode-go-json_cli (`20260905-105434Z-opencode-go-json_cli/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | json_cli | 20349 | 26997 | 6/7 | 20260905-105611Z-opencode-go-json_cli (`20260905-105611Z-opencode-go-json_cli/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | ledger_audit | 25431 | 32511 | 6/6 | 20260905-105558Z-opencode-go-ledger_audit (`20260905-105558Z-opencode-go-ledger_audit/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | ledger_audit | 24335 | 31960 | 5/6 | 20260905-105718Z-opencode-go-ledger_audit (`20260905-105718Z-opencode-go-ledger_audit/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | merge_ranges | 14775 | 15291 | 4/5 | 20260905-105319Z-opencode-go (`20260905-105319Z-opencode-go/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | merge_ranges | 17595 | 23900 | 5/6 | 20260905-105403Z-opencode-go (`20260905-105403Z-opencode-go/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | repair_catalog | 13984 | 14393 | 5/5 | 20260905-105319Z-opencode-go-repair_catalog (`20260905-105319Z-opencode-go-repair_catalog/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | repair_catalog | 15465 | 14864 | 5/5 | 20260905-105344Z-opencode-go-repair_catalog (`20260905-105344Z-opencode-go-repair_catalog/summary.json`, artefato local n?o versionado) |
 
 deepseek: 11 pares completos, 226596 / 240762 tokens (-5.88% Slim); 7/11 vitórias. Estes pares passaram nos oráculos, fixtures intactos e uso completo.
 
 
-**Falha planejada e preservada:** DeepSeek, config_migration, rodada 1: [20260905-105700Z-opencode-go-config_migration](20260905-105700Z-opencode-go-config_migration/slim.stdout.jsonl). Slim exit 21, oráculo exit 1; Pi passou. Terceira requisição recebeu cabeçalhos/primeiro byte aos 869 ms, nenhum evento semântico, e falhou em transporte após 120009 ms. Só quatro ferramentas de leitura/listagem tinham rodado. Uso da requisição é desconhecido; não foi contado como zero nem substituído pelo segundo round. A origem do timeout (gateway/rede) não foi isolada. Daily DeepSeek exit 1; Luna exit 0.
+**Falha planejada e preservada:** DeepSeek, config_migration, rodada 1: 20260905-105700Z-opencode-go-config_migration (`20260905-105700Z-opencode-go-config_migration/slim.stdout.jsonl`, artefato local n?o versionado). Slim exit 21, oráculo exit 1; Pi passou. Terceira requisição recebeu cabeçalhos/primeiro byte aos 869 ms, nenhum evento semântico, e falhou em transporte após 120009 ms. Só quatro ferramentas de leitura/listagem tinham rodado. Uso da requisição é desconhecido; não foi contado como zero nem substituído pelo segundo round. A origem do timeout (gateway/rede) não foi isolada. Daily DeepSeek exit 1; Luna exit 0.
 
 A economia é agregada, não ampla por cenário: Luna ainda perde em JSON CLI e ledger; DeepSeek perde em JavaScript e alguns pares de reparo/migração. Não é válido concluir superioridade universal ou 24/24 de qualidade. O caminho de patch foi corrigido com RED/GREEN; o comportamento do modelo ainda cria chamadas evitáveis para executar scripts.
 
@@ -1322,44 +1325,44 @@ inalterados. Logs `%TEMP%/slim-economy-direct-{luna,deepseek}-{scenario}.log`.
 
 | Modelo | Rodada | Cenário | Slim | Pi | Chamadas Slim/Pi | Campanha |
 |---|---:|---|---:|---:|---|---|
-| luna | 1 | config_migration | 12598 | 11896 | 6/6 | [20260905-112702Z-config_migration](20260905-112702Z-config_migration/summary.json) |
-| luna | 2 | config_migration | 27581 | 12414 | 10/5 | [20260905-112801Z-config_migration](20260905-112801Z-config_migration/summary.json) |
-| luna | 1 | js_pagination | 10225 | 10471 | 5/5 | [20260905-112547Z-js_pagination](20260905-112547Z-js_pagination/summary.json) |
-| luna | 2 | js_pagination | 10193 | 10936 | 5/5 | [20260905-112637Z-js_pagination](20260905-112637Z-js_pagination/summary.json) |
-| luna | 1 | json_cli | 14795 | 16579 | 5/6 | [20260905-112156Z-json_cli](20260905-112156Z-json_cli/summary.json) |
-| luna | 2 | json_cli | 14310 | 14644 | 5/5 | [20260905-112340Z-json_cli](20260905-112340Z-json_cli/summary.json) |
-| luna | 1 | ledger_audit | 14357 | 10231 | 5/4 | [20260905-112156Z-ledger_audit](20260905-112156Z-ledger_audit/summary.json) |
-| luna | 2 | ledger_audit | 21481 | 17480 | 7/6 | [20260905-112246Z-ledger_audit](20260905-112246Z-ledger_audit/summary.json) |
-| luna | 1 | merge_ranges | 8677 | 8147 | 4/4 | [20260905-112356Z](20260905-112356Z/summary.json) |
-| luna | 2 | merge_ranges | 9324 | 10400 | 4/5 | [20260905-112444Z](20260905-112444Z/summary.json) |
-| luna | 1 | repair_catalog | 9344 | 9687 | 5/5 | [20260905-112533Z-repair_catalog](20260905-112533Z-repair_catalog/summary.json) |
+| luna | 1 | config_migration | 12598 | 11896 | 6/6 | 20260905-112702Z-config_migration (`20260905-112702Z-config_migration/summary.json`, artefato local n?o versionado) |
+| luna | 2 | config_migration | 27581 | 12414 | 10/5 | 20260905-112801Z-config_migration (`20260905-112801Z-config_migration/summary.json`, artefato local n?o versionado) |
+| luna | 1 | js_pagination | 10225 | 10471 | 5/5 | 20260905-112547Z-js_pagination (`20260905-112547Z-js_pagination/summary.json`, artefato local n?o versionado) |
+| luna | 2 | js_pagination | 10193 | 10936 | 5/5 | 20260905-112637Z-js_pagination (`20260905-112637Z-js_pagination/summary.json`, artefato local n?o versionado) |
+| luna | 1 | json_cli | 14795 | 16579 | 5/6 | 20260905-112156Z-json_cli (`20260905-112156Z-json_cli/summary.json`, artefato local n?o versionado) |
+| luna | 2 | json_cli | 14310 | 14644 | 5/5 | 20260905-112340Z-json_cli (`20260905-112340Z-json_cli/summary.json`, artefato local n?o versionado) |
+| luna | 1 | ledger_audit | 14357 | 10231 | 5/4 | 20260905-112156Z-ledger_audit (`20260905-112156Z-ledger_audit/summary.json`, artefato local n?o versionado) |
+| luna | 2 | ledger_audit | 21481 | 17480 | 7/6 | 20260905-112246Z-ledger_audit (`20260905-112246Z-ledger_audit/summary.json`, artefato local n?o versionado) |
+| luna | 1 | merge_ranges | 8677 | 8147 | 4/4 | 20260905-112356Z (`20260905-112356Z/summary.json`, artefato local n?o versionado) |
+| luna | 2 | merge_ranges | 9324 | 10400 | 4/5 | 20260905-112444Z (`20260905-112444Z/summary.json`, artefato local n?o versionado) |
+| luna | 1 | repair_catalog | 9344 | 9687 | 5/5 | 20260905-112533Z-repair_catalog (`20260905-112533Z-repair_catalog/summary.json`, artefato local n?o versionado) |
 
 luna: 11 pares completos; 152885 / 132885 tokens (+15.05% Slim), 6/11 vitórias. Os pares tabulados passaram nos oráculos, com fixtures preservados e uso completo.
 
 | Modelo | Rodada | Cenário | Slim | Pi | Chamadas Slim/Pi | Campanha |
 |---|---:|---|---:|---:|---|---|
-| deepseek | 1 | config_migration | 19863 | 62385 | 6/12 | [20260905-112536Z-opencode-go-config_migration](20260905-112536Z-opencode-go-config_migration/summary.json) |
-| deepseek | 2 | config_migration | 19175 | 14362 | 6/5 | [20260905-112635Z-opencode-go-config_migration](20260905-112635Z-opencode-go-config_migration/summary.json) |
-| deepseek | 1 | js_pagination | 14994 | 15052 | 5/5 | [20260905-112529Z-opencode-go-js_pagination](20260905-112529Z-opencode-go-js_pagination/summary.json) |
-| deepseek | 2 | js_pagination | 16799 | 15873 | 5/5 | [20260905-112552Z-opencode-go-js_pagination](20260905-112552Z-opencode-go-js_pagination/summary.json) |
-| deepseek | 1 | json_cli | 19260 | 25723 | 6/6 | [20260905-112156Z-opencode-go-json_cli](20260905-112156Z-opencode-go-json_cli/summary.json) |
-| deepseek | 2 | json_cli | 24227 | 15862 | 6/5 | [20260905-112249Z-opencode-go-json_cli](20260905-112249Z-opencode-go-json_cli/summary.json) |
-| deepseek | 1 | ledger_audit | 25403 | 38231 | 5/7 | [20260905-112156Z-opencode-go-ledger_audit](20260905-112156Z-opencode-go-ledger_audit/summary.json) |
-| deepseek | 2 | ledger_audit | 30112 | 24198 | 6/6 | [20260905-112337Z-opencode-go-ledger_audit](20260905-112337Z-opencode-go-ledger_audit/summary.json) |
-| deepseek | 1 | merge_ranges | 16127 | 16300 | 5/5 | [20260905-112419Z-opencode-go](20260905-112419Z-opencode-go/summary.json) |
-| deepseek | 2 | merge_ranges | 18757 | 15137 | 5/5 | [20260905-112454Z-opencode-go](20260905-112454Z-opencode-go/summary.json) |
-| deepseek | 1 | repair_catalog | 15310 | 13471 | 5/5 | [20260905-112429Z-opencode-go-repair_catalog](20260905-112429Z-opencode-go-repair_catalog/summary.json) |
-| deepseek | 2 | repair_catalog | 15587 | 14393 | 5/5 | [20260905-112453Z-opencode-go-repair_catalog](20260905-112453Z-opencode-go-repair_catalog/summary.json) |
+| deepseek | 1 | config_migration | 19863 | 62385 | 6/12 | 20260905-112536Z-opencode-go-config_migration (`20260905-112536Z-opencode-go-config_migration/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | config_migration | 19175 | 14362 | 6/5 | 20260905-112635Z-opencode-go-config_migration (`20260905-112635Z-opencode-go-config_migration/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | js_pagination | 14994 | 15052 | 5/5 | 20260905-112529Z-opencode-go-js_pagination (`20260905-112529Z-opencode-go-js_pagination/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | js_pagination | 16799 | 15873 | 5/5 | 20260905-112552Z-opencode-go-js_pagination (`20260905-112552Z-opencode-go-js_pagination/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | json_cli | 19260 | 25723 | 6/6 | 20260905-112156Z-opencode-go-json_cli (`20260905-112156Z-opencode-go-json_cli/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | json_cli | 24227 | 15862 | 6/5 | 20260905-112249Z-opencode-go-json_cli (`20260905-112249Z-opencode-go-json_cli/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | ledger_audit | 25403 | 38231 | 5/7 | 20260905-112156Z-opencode-go-ledger_audit (`20260905-112156Z-opencode-go-ledger_audit/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | ledger_audit | 30112 | 24198 | 6/6 | 20260905-112337Z-opencode-go-ledger_audit (`20260905-112337Z-opencode-go-ledger_audit/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | merge_ranges | 16127 | 16300 | 5/5 | 20260905-112419Z-opencode-go (`20260905-112419Z-opencode-go/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | merge_ranges | 18757 | 15137 | 5/5 | 20260905-112454Z-opencode-go (`20260905-112454Z-opencode-go/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | repair_catalog | 15310 | 13471 | 5/5 | 20260905-112429Z-opencode-go-repair_catalog (`20260905-112429Z-opencode-go-repair_catalog/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | repair_catalog | 15587 | 14393 | 5/5 | 20260905-112453Z-opencode-go-repair_catalog (`20260905-112453Z-opencode-go-repair_catalog/summary.json`, artefato local n?o versionado) |
 
 deepseek: 12 pares completos; 235614 / 270987 tokens (-13.05% Slim), 5/12 vitórias. Os pares tabulados passaram nos oráculos, com fixtures preservados e uso completo.
 
-**Falha preservada:** Luna, repair_catalog, rodada 2: [20260905-112630Z-repair_catalog](20260905-112630Z-repair_catalog/slim.stdout.jsonl). Slim exit 21/oráculo 1; Pi passou. A primeira resposta terminou em MalformedToolCall antes de qualquer ferramenta; uso desconhecido, não contado como zero nem substituído. Daily Luna exit 1; DeepSeek exit 0.
+**Falha preservada:** Luna, repair_catalog, rodada 2: 20260905-112630Z-repair_catalog (`20260905-112630Z-repair_catalog/slim.stdout.jsonl`, artefato local n?o versionado). Slim exit 21/oráculo 1; Pi passou. A primeira resposta terminou em MalformedToolCall antes de qualquer ferramenta; uso desconhecido, não contado como zero nem substituído. Daily Luna exit 1; DeepSeek exit 0.
 
 Não houve economia ampla: Luna consumiu mais nos pares completos; o ganho agregado DeepSeek depende principalmente da primeira migração cara do Pi (62385 tokens). Args foi utilizado em execuções reais e sua passagem literal funciona, mas esta bateria não demonstra redução consistente de chamadas ou tokens atribuível ao recurso.
 
 ### Identidade na conclusão de chamadas Responses e prefixo v1.6
 
-A falha Luna foi reproduzida na tentativa 13 de uma captura limitada ao primeiro turno do adapter/runtime nativos. Evidência primária: [eventos brutos capturados](20260905-114011Z-protocol-capture/13.events.jsonl), com encrypted_content omitido; nenhum cabeçalho ou credencial foi registrado. O código temporário de captura foi removido após o diagnóstico.
+A falha Luna foi reproduzida na tentativa 13 de uma captura limitada ao primeiro turno do adapter/runtime nativos. Evidência primária: eventos brutos capturados (`20260905-114011Z-protocol-capture/13.events.jsonl`, artefato local n?o versionado), com encrypted_content omitido; nenhum cabeçalho ou credencial foi registrado. O código temporário de captura foi removido após o diagnóstico.
 
 O stream contém list, read e outro list com argumentos idênticos ao primeiro, mas call_id e output_index distintos. O adapter preservava identidade nos deltas, porém emitia conclusão legada apenas com nome/argumentos; attach_legacy_call encontrava duas correspondências e rejeitava uma resposta válida. ToolCallComplete agora preserva index/id até a associação com o buffer correspondente. Conclusão sem deltas continua suportada. Identidade conflitante, JSON inválido e argumentos divergentes continuam rejeitados antes de publicar ferramentas.
 
@@ -1395,30 +1398,30 @@ OK: Slim slim 0.1.0 implantado em C:\Users\User\bin\Slim.exe (build de 09/05/202
 
 | Modelo | Rodada | Cenário | Slim | Pi | Chamadas Slim/Pi | Campanha |
 |---|---:|---|---:|---:|---|---|
-| luna | 1 | config_migration | 33318 | 13042 | 12/6 | [20260905-121619Z-config_migration](20260905-121619Z-config_migration/summary.json) |
-| luna | 2 | config_migration | 23205 | 13884 | 9/6 | [20260905-121737Z-config_migration](20260905-121737Z-config_migration/summary.json) |
-| luna | 3 | config_migration | 13410 | 12838 | 7/6 | [20260905-121854Z-config_migration](20260905-121854Z-config_migration/summary.json) |
-| luna | 4 | config_migration | 32880 | 13744 | 11/6 | [20260905-121956Z-config_migration](20260905-121956Z-config_migration/summary.json) |
-| luna | 1 | js_pagination | 9724 | 11054 | 5/5 | [20260905-121237Z-js_pagination](20260905-121237Z-js_pagination/summary.json) |
-| luna | 2 | js_pagination | 9762 | 10332 | 5/5 | [20260905-121339Z-js_pagination](20260905-121339Z-js_pagination/summary.json) |
-| luna | 3 | js_pagination | 9447 | 10794 | 5/5 | [20260905-121428Z-js_pagination](20260905-121428Z-js_pagination/summary.json) |
-| luna | 4 | js_pagination | 10002 | 12302 | 5/6 | [20260905-121524Z-js_pagination](20260905-121524Z-js_pagination/summary.json) |
-| luna | 1 | json_cli | 33395 | 29654 | 9/8 | [20260905-120408Z-json_cli](20260905-120408Z-json_cli/summary.json) |
-| luna | 2 | json_cli | 14417 | 15021 | 5/5 | [20260905-120632Z-json_cli](20260905-120632Z-json_cli/summary.json) |
-| luna | 3 | json_cli | 22733 | 16586 | 8/6 | [20260905-120833Z-json_cli](20260905-120833Z-json_cli/summary.json) |
-| luna | 4 | json_cli | 16156 | 13793 | 6/5 | [20260905-121045Z-json_cli](20260905-121045Z-json_cli/summary.json) |
-| luna | 1 | ledger_audit | 22466 | 30620 | 7/7 | [20260905-120408Z-ledger_audit](20260905-120408Z-ledger_audit/summary.json) |
-| luna | 2 | ledger_audit | 16272 | 18021 | 6/6 | [20260905-120526Z-ledger_audit](20260905-120526Z-ledger_audit/summary.json) |
-| luna | 3 | ledger_audit | 16283 | 26713 | 6/8 | [20260905-120629Z-ledger_audit](20260905-120629Z-ledger_audit/summary.json) |
-| luna | 4 | ledger_audit | 17021 | 10929 | 6/5 | [20260905-120739Z-ledger_audit](20260905-120739Z-ledger_audit/summary.json) |
-| luna | 1 | merge_ranges | 8571 | 11694 | 4/5 | [20260905-120836Z](20260905-120836Z/summary.json) |
-| luna | 2 | merge_ranges | 8264 | 9186 | 4/4 | [20260905-120937Z](20260905-120937Z/summary.json) |
-| luna | 3 | merge_ranges | 8255 | 10697 | 4/5 | [20260905-121032Z](20260905-121032Z/summary.json) |
-| luna | 4 | merge_ranges | 8326 | 10251 | 4/5 | [20260905-121131Z](20260905-121131Z/summary.json) |
-| luna | 1 | repair_catalog | 8626 | 9812 | 5/5 | [20260905-121231Z-repair_catalog](20260905-121231Z-repair_catalog/summary.json) |
-| luna | 2 | repair_catalog | 9372 | 12065 | 5/7 | [20260905-121327Z-repair_catalog](20260905-121327Z-repair_catalog/summary.json) |
-| luna | 3 | repair_catalog | 9098 | 11397 | 5/7 | [20260905-121424Z-repair_catalog](20260905-121424Z-repair_catalog/summary.json) |
-| luna | 4 | repair_catalog | 11698 | 11292 | 6/7 | [20260905-121521Z-repair_catalog](20260905-121521Z-repair_catalog/summary.json) |
+| luna | 1 | config_migration | 33318 | 13042 | 12/6 | 20260905-121619Z-config_migration (`20260905-121619Z-config_migration/summary.json`, artefato local n?o versionado) |
+| luna | 2 | config_migration | 23205 | 13884 | 9/6 | 20260905-121737Z-config_migration (`20260905-121737Z-config_migration/summary.json`, artefato local n?o versionado) |
+| luna | 3 | config_migration | 13410 | 12838 | 7/6 | 20260905-121854Z-config_migration (`20260905-121854Z-config_migration/summary.json`, artefato local n?o versionado) |
+| luna | 4 | config_migration | 32880 | 13744 | 11/6 | 20260905-121956Z-config_migration (`20260905-121956Z-config_migration/summary.json`, artefato local n?o versionado) |
+| luna | 1 | js_pagination | 9724 | 11054 | 5/5 | 20260905-121237Z-js_pagination (`20260905-121237Z-js_pagination/summary.json`, artefato local n?o versionado) |
+| luna | 2 | js_pagination | 9762 | 10332 | 5/5 | 20260905-121339Z-js_pagination (`20260905-121339Z-js_pagination/summary.json`, artefato local n?o versionado) |
+| luna | 3 | js_pagination | 9447 | 10794 | 5/5 | 20260905-121428Z-js_pagination (`20260905-121428Z-js_pagination/summary.json`, artefato local n?o versionado) |
+| luna | 4 | js_pagination | 10002 | 12302 | 5/6 | 20260905-121524Z-js_pagination (`20260905-121524Z-js_pagination/summary.json`, artefato local n?o versionado) |
+| luna | 1 | json_cli | 33395 | 29654 | 9/8 | 20260905-120408Z-json_cli (`20260905-120408Z-json_cli/summary.json`, artefato local n?o versionado) |
+| luna | 2 | json_cli | 14417 | 15021 | 5/5 | 20260905-120632Z-json_cli (`20260905-120632Z-json_cli/summary.json`, artefato local n?o versionado) |
+| luna | 3 | json_cli | 22733 | 16586 | 8/6 | 20260905-120833Z-json_cli (`20260905-120833Z-json_cli/summary.json`, artefato local n?o versionado) |
+| luna | 4 | json_cli | 16156 | 13793 | 6/5 | 20260905-121045Z-json_cli (`20260905-121045Z-json_cli/summary.json`, artefato local n?o versionado) |
+| luna | 1 | ledger_audit | 22466 | 30620 | 7/7 | 20260905-120408Z-ledger_audit (`20260905-120408Z-ledger_audit/summary.json`, artefato local n?o versionado) |
+| luna | 2 | ledger_audit | 16272 | 18021 | 6/6 | 20260905-120526Z-ledger_audit (`20260905-120526Z-ledger_audit/summary.json`, artefato local n?o versionado) |
+| luna | 3 | ledger_audit | 16283 | 26713 | 6/8 | 20260905-120629Z-ledger_audit (`20260905-120629Z-ledger_audit/summary.json`, artefato local n?o versionado) |
+| luna | 4 | ledger_audit | 17021 | 10929 | 6/5 | 20260905-120739Z-ledger_audit (`20260905-120739Z-ledger_audit/summary.json`, artefato local n?o versionado) |
+| luna | 1 | merge_ranges | 8571 | 11694 | 4/5 | 20260905-120836Z (`20260905-120836Z/summary.json`, artefato local n?o versionado) |
+| luna | 2 | merge_ranges | 8264 | 9186 | 4/4 | 20260905-120937Z (`20260905-120937Z/summary.json`, artefato local n?o versionado) |
+| luna | 3 | merge_ranges | 8255 | 10697 | 4/5 | 20260905-121032Z (`20260905-121032Z/summary.json`, artefato local n?o versionado) |
+| luna | 4 | merge_ranges | 8326 | 10251 | 4/5 | 20260905-121131Z (`20260905-121131Z/summary.json`, artefato local n?o versionado) |
+| luna | 1 | repair_catalog | 8626 | 9812 | 5/5 | 20260905-121231Z-repair_catalog (`20260905-121231Z-repair_catalog/summary.json`, artefato local n?o versionado) |
+| luna | 2 | repair_catalog | 9372 | 12065 | 5/7 | 20260905-121327Z-repair_catalog (`20260905-121327Z-repair_catalog/summary.json`, artefato local n?o versionado) |
+| luna | 3 | repair_catalog | 9098 | 11397 | 5/7 | 20260905-121424Z-repair_catalog (`20260905-121424Z-repair_catalog/summary.json`, artefato local n?o versionado) |
+| luna | 4 | repair_catalog | 11698 | 11292 | 6/7 | 20260905-121521Z-repair_catalog (`20260905-121521Z-repair_catalog/summary.json`, artefato local n?o versionado) |
 
 luna: 24/24 pares completos; 372701 / 345721 tokens (+7.80% Slim); mediana das razões por par -9.87%; 15/24 vitórias. Todos os pares tabulados passaram nos oráculos, com fixtures preservados e uso completo.
 
@@ -1432,29 +1435,29 @@ luna: 24/24 pares completos; 372701 / 345721 tokens (+7.80% Slim); mediana das r
 | repair_catalog | 4 | 38794 | 44566 | -12.95% |
 | Modelo | Rodada | Cenário | Slim | Pi | Chamadas Slim/Pi | Campanha |
 |---|---:|---|---:|---:|---|---|
-| deepseek | 1 | config_migration | 22521 | 15839 | 7/5 | [20260905-121245Z-opencode-go-config_migration](20260905-121245Z-opencode-go-config_migration/summary.json) |
-| deepseek | 2 | config_migration | 18590 | 17769 | 6/6 | [20260905-121405Z-opencode-go-config_migration](20260905-121405Z-opencode-go-config_migration/summary.json) |
-| deepseek | 3 | config_migration | 18159 | 17284 | 6/6 | [20260905-121436Z-opencode-go-config_migration](20260905-121436Z-opencode-go-config_migration/summary.json) |
-| deepseek | 4 | config_migration | 18129 | 25741 | 6/7 | [20260905-121508Z-opencode-go-config_migration](20260905-121508Z-opencode-go-config_migration/summary.json) |
-| deepseek | 1 | js_pagination | 15506 | 16609 | 5/5 | [20260905-121158Z-opencode-go-js_pagination](20260905-121158Z-opencode-go-js_pagination/summary.json) |
-| deepseek | 2 | js_pagination | 15814 | 14146 | 5/5 | [20260905-121242Z-opencode-go-js_pagination](20260905-121242Z-opencode-go-js_pagination/summary.json) |
-| deepseek | 3 | js_pagination | 14773 | 14833 | 5/5 | [20260905-121412Z-opencode-go-js_pagination](20260905-121412Z-opencode-go-js_pagination/summary.json) |
-| deepseek | 1 | json_cli | 20435 | 15416 | 5/5 | [20260905-120418Z-opencode-go-json_cli](20260905-120418Z-opencode-go-json_cli/summary.json) |
-| deepseek | 2 | json_cli | 21913 | 25998 | 5/6 | [20260905-120511Z-opencode-go-json_cli](20260905-120511Z-opencode-go-json_cli/summary.json) |
-| deepseek | 3 | json_cli | 21180 | 55088 | 6/9 | [20260905-120633Z-opencode-go-json_cli](20260905-120633Z-opencode-go-json_cli/summary.json) |
-| deepseek | 4 | json_cli | 24507 | 34648 | 6/7 | [20260905-120755Z-opencode-go-json_cli](20260905-120755Z-opencode-go-json_cli/summary.json) |
-| deepseek | 1 | ledger_audit | 25810 | 22350 | 6/6 | [20260905-120418Z-opencode-go-ledger_audit](20260905-120418Z-opencode-go-ledger_audit/summary.json) |
-| deepseek | 2 | ledger_audit | 26508 | 37146 | 6/7 | [20260905-120503Z-opencode-go-ledger_audit](20260905-120503Z-opencode-go-ledger_audit/summary.json) |
-| deepseek | 3 | ledger_audit | 37114 | 35434 | 7/6 | [20260905-120603Z-opencode-go-ledger_audit](20260905-120603Z-opencode-go-ledger_audit/summary.json) |
-| deepseek | 4 | ledger_audit | 76628 | 35947 | 8/7 | [20260905-120719Z-opencode-go-ledger_audit](20260905-120719Z-opencode-go-ledger_audit/summary.json) |
-| deepseek | 1 | merge_ranges | 15344 | 15522 | 4/5 | [20260905-120920Z-opencode-go](20260905-120920Z-opencode-go/summary.json) |
-| deepseek | 2 | merge_ranges | 16886 | 17482 | 5/5 | [20260905-121006Z-opencode-go](20260905-121006Z-opencode-go/summary.json) |
-| deepseek | 3 | merge_ranges | 18548 | 18769 | 5/5 | [20260905-121051Z-opencode-go](20260905-121051Z-opencode-go/summary.json) |
-| deepseek | 4 | merge_ranges | 18016 | 17693 | 5/6 | [20260905-121145Z-opencode-go](20260905-121145Z-opencode-go/summary.json) |
-| deepseek | 1 | repair_catalog | 14708 | 14687 | 5/5 | [20260905-120930Z-opencode-go-repair_catalog](20260905-120930Z-opencode-go-repair_catalog/summary.json) |
-| deepseek | 2 | repair_catalog | 14508 | 13982 | 5/5 | [20260905-121003Z-opencode-go-repair_catalog](20260905-121003Z-opencode-go-repair_catalog/summary.json) |
-| deepseek | 3 | repair_catalog | 19788 | 15538 | 6/5 | [20260905-121034Z-opencode-go-repair_catalog](20260905-121034Z-opencode-go-repair_catalog/summary.json) |
-| deepseek | 4 | repair_catalog | 14333 | 15741 | 5/5 | [20260905-121118Z-opencode-go-repair_catalog](20260905-121118Z-opencode-go-repair_catalog/summary.json) |
+| deepseek | 1 | config_migration | 22521 | 15839 | 7/5 | 20260905-121245Z-opencode-go-config_migration (`20260905-121245Z-opencode-go-config_migration/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | config_migration | 18590 | 17769 | 6/6 | 20260905-121405Z-opencode-go-config_migration (`20260905-121405Z-opencode-go-config_migration/summary.json`, artefato local n?o versionado) |
+| deepseek | 3 | config_migration | 18159 | 17284 | 6/6 | 20260905-121436Z-opencode-go-config_migration (`20260905-121436Z-opencode-go-config_migration/summary.json`, artefato local n?o versionado) |
+| deepseek | 4 | config_migration | 18129 | 25741 | 6/7 | 20260905-121508Z-opencode-go-config_migration (`20260905-121508Z-opencode-go-config_migration/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | js_pagination | 15506 | 16609 | 5/5 | 20260905-121158Z-opencode-go-js_pagination (`20260905-121158Z-opencode-go-js_pagination/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | js_pagination | 15814 | 14146 | 5/5 | 20260905-121242Z-opencode-go-js_pagination (`20260905-121242Z-opencode-go-js_pagination/summary.json`, artefato local n?o versionado) |
+| deepseek | 3 | js_pagination | 14773 | 14833 | 5/5 | 20260905-121412Z-opencode-go-js_pagination (`20260905-121412Z-opencode-go-js_pagination/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | json_cli | 20435 | 15416 | 5/5 | 20260905-120418Z-opencode-go-json_cli (`20260905-120418Z-opencode-go-json_cli/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | json_cli | 21913 | 25998 | 5/6 | 20260905-120511Z-opencode-go-json_cli (`20260905-120511Z-opencode-go-json_cli/summary.json`, artefato local n?o versionado) |
+| deepseek | 3 | json_cli | 21180 | 55088 | 6/9 | 20260905-120633Z-opencode-go-json_cli (`20260905-120633Z-opencode-go-json_cli/summary.json`, artefato local n?o versionado) |
+| deepseek | 4 | json_cli | 24507 | 34648 | 6/7 | 20260905-120755Z-opencode-go-json_cli (`20260905-120755Z-opencode-go-json_cli/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | ledger_audit | 25810 | 22350 | 6/6 | 20260905-120418Z-opencode-go-ledger_audit (`20260905-120418Z-opencode-go-ledger_audit/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | ledger_audit | 26508 | 37146 | 6/7 | 20260905-120503Z-opencode-go-ledger_audit (`20260905-120503Z-opencode-go-ledger_audit/summary.json`, artefato local n?o versionado) |
+| deepseek | 3 | ledger_audit | 37114 | 35434 | 7/6 | 20260905-120603Z-opencode-go-ledger_audit (`20260905-120603Z-opencode-go-ledger_audit/summary.json`, artefato local n?o versionado) |
+| deepseek | 4 | ledger_audit | 76628 | 35947 | 8/7 | 20260905-120719Z-opencode-go-ledger_audit (`20260905-120719Z-opencode-go-ledger_audit/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | merge_ranges | 15344 | 15522 | 4/5 | 20260905-120920Z-opencode-go (`20260905-120920Z-opencode-go/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | merge_ranges | 16886 | 17482 | 5/5 | 20260905-121006Z-opencode-go (`20260905-121006Z-opencode-go/summary.json`, artefato local n?o versionado) |
+| deepseek | 3 | merge_ranges | 18548 | 18769 | 5/5 | 20260905-121051Z-opencode-go (`20260905-121051Z-opencode-go/summary.json`, artefato local n?o versionado) |
+| deepseek | 4 | merge_ranges | 18016 | 17693 | 5/6 | 20260905-121145Z-opencode-go (`20260905-121145Z-opencode-go/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | repair_catalog | 14708 | 14687 | 5/5 | 20260905-120930Z-opencode-go-repair_catalog (`20260905-120930Z-opencode-go-repair_catalog/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | repair_catalog | 14508 | 13982 | 5/5 | 20260905-121003Z-opencode-go-repair_catalog (`20260905-121003Z-opencode-go-repair_catalog/summary.json`, artefato local n?o versionado) |
+| deepseek | 3 | repair_catalog | 19788 | 15538 | 6/5 | 20260905-121034Z-opencode-go-repair_catalog (`20260905-121034Z-opencode-go-repair_catalog/summary.json`, artefato local n?o versionado) |
+| deepseek | 4 | repair_catalog | 14333 | 15741 | 5/5 | 20260905-121118Z-opencode-go-repair_catalog (`20260905-121118Z-opencode-go-repair_catalog/summary.json`, artefato local n?o versionado) |
 
 deepseek: 23/24 pares completos; 509718 / 513662 tokens (-0.77% Slim); mediana das razões por par +0.14%; 11/23 vitórias. Todos os pares tabulados passaram nos oráculos, com fixtures preservados e uso completo.
 
@@ -1467,11 +1470,11 @@ deepseek: 23/24 pares completos; 509718 / 513662 tokens (-0.77% Slim); mediana d
 | merge_ranges | 4 | 68794 | 69466 | -0.97% |
 | repair_catalog | 4 | 63337 | 59948 | +5.65% |
 
-**Falha preservada (DeepSeek JavaScript, rodada 4):** [20260905-121441Z-opencode-go-js_pagination](20260905-121441Z-opencode-go-js_pagination/slim.stdout.jsonl). Slim exit 12, repeated_failed_tool, oráculo 1; Pi passou. Uso Slim completo conhecido: 14031 input + 1461 output = 15492 tokens, registrados como tentativa malsucedida, fora da tabela de pares aprovados. O modelo repetiu write com expected sem a quebra final; o arquivo estava intacto e a proteção rejeitou corretamente. Reler e repetir o mesmo expected não resolveu. O resultado não foi substituído. Daily DeepSeek exit 1; Luna exit 0. Não houve recorrência da falha Responses nos 24 pares Luna desta bateria.
+**Falha preservada (DeepSeek JavaScript, rodada 4):** 20260905-121441Z-opencode-go-js_pagination (`20260905-121441Z-opencode-go-js_pagination/slim.stdout.jsonl`, artefato local n?o versionado). Slim exit 12, repeated_failed_tool, oráculo 1; Pi passou. Uso Slim completo conhecido: 14031 input + 1461 output = 15492 tokens, registrados como tentativa malsucedida, fora da tabela de pares aprovados. O modelo repetiu write com expected sem a quebra final; o arquivo estava intacto e a proteção rejeitou corretamente. Reler e repetir o mesmo expected não resolveu. O resultado não foi substituído. Daily DeepSeek exit 1; Luna exit 0. Não houve recorrência da falha Responses nos 24 pares Luna desta bateria.
 
 As reduções fixas aparecem no payload real: Luna system/schema bytes 1922/4785 → 1605/4424; tokens de entrada da primeira chamada caíram aproximadamente 118, com pequenas diferenças entre prompts. Isso não basta para demonstrar a meta ampla: os agregados por cenário continuam mistos e houve uma falha de conclusão de tarefa.
 
-**Outro custo observado:** [DeepSeek ledger, rodada 4](20260905-120719Z-opencode-go-ledger_audit/summary.json) consumiu 76628 tokens no Slim. O arquivo contém ação, mas o stdout Python recebido pelo modelo contém U+FFFD; houve chamadas adicionais para examinar codepoints e validar os nomes. Reprodução local por pipe: Python herdado anunciou cp1252 e escreveu hex 61e7e36f0d0a; a leitura UTF-8 produz caracteres de substituição. Com PYTHONIOENCODING=utf-8 só no filho, anunciou utf-8 e escreveu 61c3a7c3a36f0d0a. O código do ProcessRunner não fixa a codificação do filho, e bounded_output usa from_utf8_lossy. Isso comprova a perda no texto mostrado; não atribui todos os tokens do outlier apenas a essa causa.
+**Outro custo observado:** DeepSeek ledger, rodada 4 (`20260905-120719Z-opencode-go-ledger_audit/summary.json`, artefato local n?o versionado) consumiu 76628 tokens no Slim. O arquivo contém ação, mas o stdout Python recebido pelo modelo contém U+FFFD; houve chamadas adicionais para examinar codepoints e validar os nomes. Reprodução local por pipe: Python herdado anunciou cp1252 e escreveu hex 61e7e36f0d0a; a leitura UTF-8 produz caracteres de substituição. Com PYTHONIOENCODING=utf-8 só no filho, anunciou utf-8 e escreveu 61c3a7c3a36f0d0a. O código do ProcessRunner não fixa a codificação do filho, e bounded_output usa from_utf8_lossy. Isso comprova a perda no texto mostrado; não atribui todos os tokens do outlier apenas a essa causa.
 
 
 ### Escrita protegida sem recópia e stdio UTF-8
@@ -1526,30 +1529,30 @@ OK: Slim slim 0.1.0 implantado em C:\Users\User\bin\Slim.exe (build de 09/05/202
 
 | Modelo | Rodada | Cenário | Slim | Pi | Chamadas Slim/Pi | Campanha |
 |---|---:|---|---:|---:|---|---|
-| luna | 1 | config_migration | 20377 | 28983 | 8/11 | [20260905-123416Z-config_migration](20260905-123416Z-config_migration/summary.json) |
-| luna | 2 | config_migration | 11278 | 23566 | 6/9 | [20260905-123544Z-config_migration](20260905-123544Z-config_migration/summary.json) |
-| luna | 3 | config_migration | 12338 | 10771 | 6/6 | [20260905-123700Z-config_migration](20260905-123700Z-config_migration/summary.json) |
-| luna | 4 | config_migration | 31025 | 10800 | 12/5 | [20260905-123803Z-config_migration](20260905-123803Z-config_migration/summary.json) |
-| luna | 1 | js_pagination | 9674 | 10689 | 5/5 | [20260905-124609Z-js_pagination](20260905-124609Z-js_pagination/summary.json) |
-| luna | 2 | js_pagination | 9607 | 10664 | 5/5 | [20260905-124706Z-js_pagination](20260905-124706Z-js_pagination/summary.json) |
-| luna | 3 | js_pagination | 9452 | 10680 | 5/5 | [20260905-124759Z-js_pagination](20260905-124759Z-js_pagination/summary.json) |
-| luna | 4 | js_pagination | 9478 | 10746 | 5/5 | [20260905-124852Z-js_pagination](20260905-124852Z-js_pagination/summary.json) |
-| luna | 1 | json_cli | 14420 | 21399 | 6/7 | [20260905-123844Z-json_cli](20260905-123844Z-json_cli/summary.json) |
-| luna | 2 | json_cli | 12679 | 21923 | 5/7 | [20260905-124044Z-json_cli](20260905-124044Z-json_cli/summary.json) |
-| luna | 3 | json_cli | 21875 | 12804 | 7/5 | [20260905-124229Z-json_cli](20260905-124229Z-json_cli/summary.json) |
-| luna | 4 | json_cli | 16858 | 11896 | 6/5 | [20260905-124420Z-json_cli](20260905-124420Z-json_cli/summary.json) |
-| luna | 1 | ledger_audit | 16217 | 14051 | 6/5 | [20260905-123416Z-ledger_audit](20260905-123416Z-ledger_audit/summary.json) |
-| luna | 2 | ledger_audit | 16021 | 14415 | 6/5 | [20260905-123511Z-ledger_audit](20260905-123511Z-ledger_audit/summary.json) |
-| luna | 3 | ledger_audit | 17387 | 21516 | 6/8 | [20260905-123607Z-ledger_audit](20260905-123607Z-ledger_audit/summary.json) |
-| luna | 4 | ledger_audit | 16996 | 26914 | 6/8 | [20260905-123720Z-ledger_audit](20260905-123720Z-ledger_audit/summary.json) |
-| luna | 1 | merge_ranges | 8987 | 8460 | 4/4 | [20260905-123926Z](20260905-123926Z/summary.json) |
-| luna | 2 | merge_ranges | 8468 | 8799 | 4/4 | [20260905-124024Z](20260905-124024Z/summary.json) |
-| luna | 3 | merge_ranges | 14826 | 8330 | 6/4 | [20260905-124119Z](20260905-124119Z/summary.json) |
-| luna | 4 | merge_ranges | 9126 | 8653 | 4/4 | [20260905-124225Z](20260905-124225Z/summary.json) |
-| luna | 1 | repair_catalog | 9249 | 11046 | 5/6 | [20260905-124321Z-repair_catalog](20260905-124321Z-repair_catalog/summary.json) |
-| luna | 2 | repair_catalog | 11732 | 9552 | 6/5 | [20260905-124417Z-repair_catalog](20260905-124417Z-repair_catalog/summary.json) |
-| luna | 3 | repair_catalog | 9003 | 11579 | 5/7 | [20260905-124512Z-repair_catalog](20260905-124512Z-repair_catalog/summary.json) |
-| luna | 4 | repair_catalog | 8936 | 9691 | 5/5 | [20260905-124605Z-repair_catalog](20260905-124605Z-repair_catalog/summary.json) |
+| luna | 1 | config_migration | 20377 | 28983 | 8/11 | 20260905-123416Z-config_migration (`20260905-123416Z-config_migration/summary.json`, artefato local n?o versionado) |
+| luna | 2 | config_migration | 11278 | 23566 | 6/9 | 20260905-123544Z-config_migration (`20260905-123544Z-config_migration/summary.json`, artefato local n?o versionado) |
+| luna | 3 | config_migration | 12338 | 10771 | 6/6 | 20260905-123700Z-config_migration (`20260905-123700Z-config_migration/summary.json`, artefato local n?o versionado) |
+| luna | 4 | config_migration | 31025 | 10800 | 12/5 | 20260905-123803Z-config_migration (`20260905-123803Z-config_migration/summary.json`, artefato local n?o versionado) |
+| luna | 1 | js_pagination | 9674 | 10689 | 5/5 | 20260905-124609Z-js_pagination (`20260905-124609Z-js_pagination/summary.json`, artefato local n?o versionado) |
+| luna | 2 | js_pagination | 9607 | 10664 | 5/5 | 20260905-124706Z-js_pagination (`20260905-124706Z-js_pagination/summary.json`, artefato local n?o versionado) |
+| luna | 3 | js_pagination | 9452 | 10680 | 5/5 | 20260905-124759Z-js_pagination (`20260905-124759Z-js_pagination/summary.json`, artefato local n?o versionado) |
+| luna | 4 | js_pagination | 9478 | 10746 | 5/5 | 20260905-124852Z-js_pagination (`20260905-124852Z-js_pagination/summary.json`, artefato local n?o versionado) |
+| luna | 1 | json_cli | 14420 | 21399 | 6/7 | 20260905-123844Z-json_cli (`20260905-123844Z-json_cli/summary.json`, artefato local n?o versionado) |
+| luna | 2 | json_cli | 12679 | 21923 | 5/7 | 20260905-124044Z-json_cli (`20260905-124044Z-json_cli/summary.json`, artefato local n?o versionado) |
+| luna | 3 | json_cli | 21875 | 12804 | 7/5 | 20260905-124229Z-json_cli (`20260905-124229Z-json_cli/summary.json`, artefato local n?o versionado) |
+| luna | 4 | json_cli | 16858 | 11896 | 6/5 | 20260905-124420Z-json_cli (`20260905-124420Z-json_cli/summary.json`, artefato local n?o versionado) |
+| luna | 1 | ledger_audit | 16217 | 14051 | 6/5 | 20260905-123416Z-ledger_audit (`20260905-123416Z-ledger_audit/summary.json`, artefato local n?o versionado) |
+| luna | 2 | ledger_audit | 16021 | 14415 | 6/5 | 20260905-123511Z-ledger_audit (`20260905-123511Z-ledger_audit/summary.json`, artefato local n?o versionado) |
+| luna | 3 | ledger_audit | 17387 | 21516 | 6/8 | 20260905-123607Z-ledger_audit (`20260905-123607Z-ledger_audit/summary.json`, artefato local n?o versionado) |
+| luna | 4 | ledger_audit | 16996 | 26914 | 6/8 | 20260905-123720Z-ledger_audit (`20260905-123720Z-ledger_audit/summary.json`, artefato local n?o versionado) |
+| luna | 1 | merge_ranges | 8987 | 8460 | 4/4 | 20260905-123926Z (`20260905-123926Z/summary.json`, artefato local n?o versionado) |
+| luna | 2 | merge_ranges | 8468 | 8799 | 4/4 | 20260905-124024Z (`20260905-124024Z/summary.json`, artefato local n?o versionado) |
+| luna | 3 | merge_ranges | 14826 | 8330 | 6/4 | 20260905-124119Z (`20260905-124119Z/summary.json`, artefato local n?o versionado) |
+| luna | 4 | merge_ranges | 9126 | 8653 | 4/4 | 20260905-124225Z (`20260905-124225Z/summary.json`, artefato local n?o versionado) |
+| luna | 1 | repair_catalog | 9249 | 11046 | 5/6 | 20260905-124321Z-repair_catalog (`20260905-124321Z-repair_catalog/summary.json`, artefato local n?o versionado) |
+| luna | 2 | repair_catalog | 11732 | 9552 | 6/5 | 20260905-124417Z-repair_catalog (`20260905-124417Z-repair_catalog/summary.json`, artefato local n?o versionado) |
+| luna | 3 | repair_catalog | 9003 | 11579 | 5/7 | 20260905-124512Z-repair_catalog (`20260905-124512Z-repair_catalog/summary.json`, artefato local n?o versionado) |
+| luna | 4 | repair_catalog | 8936 | 9691 | 5/5 | 20260905-124605Z-repair_catalog (`20260905-124605Z-repair_catalog/summary.json`, artefato local n?o versionado) |
 
 luna: 24/24 pares completos; 326009 / 337927 tokens (-3.53% Slim); mediana das razões por par -8.64%; 14/24 vitórias. Todos os oráculos passaram, fixtures intactos, uso completo, auditor e daily exit 0.
 
@@ -1564,30 +1567,30 @@ luna: 24/24 pares completos; 326009 / 337927 tokens (-3.53% Slim); mediana das r
 
 | Modelo | Rodada | Cenário | Slim | Pi | Chamadas Slim/Pi | Campanha |
 |---|---:|---|---:|---:|---|---|
-| deepseek | 1 | config_migration | 18458 | 18551 | 6/6 | [20260905-123426Z-opencode-go-config_migration](20260905-123426Z-opencode-go-config_migration/summary.json) |
-| deepseek | 2 | config_migration | 23326 | 16507 | 7/5 | [20260905-123502Z-opencode-go-config_migration](20260905-123502Z-opencode-go-config_migration/summary.json) |
-| deepseek | 3 | config_migration | 17632 | 15440 | 6/5 | [20260905-123540Z-opencode-go-config_migration](20260905-123540Z-opencode-go-config_migration/summary.json) |
-| deepseek | 4 | config_migration | 18771 | 21037 | 6/6 | [20260905-123637Z-opencode-go-config_migration](20260905-123637Z-opencode-go-config_migration/summary.json) |
-| deepseek | 1 | js_pagination | 15776 | 16091 | 5/5 | [20260905-124315Z-opencode-go-js_pagination](20260905-124315Z-opencode-go-js_pagination/summary.json) |
-| deepseek | 2 | js_pagination | 15735 | 15502 | 5/5 | [20260905-124355Z-opencode-go-js_pagination](20260905-124355Z-opencode-go-js_pagination/summary.json) |
-| deepseek | 3 | js_pagination | 14888 | 17582 | 5/5 | [20260905-124425Z-opencode-go-js_pagination](20260905-124425Z-opencode-go-js_pagination/summary.json) |
-| deepseek | 4 | js_pagination | 15887 | 13724 | 5/5 | [20260905-124524Z-opencode-go-js_pagination](20260905-124524Z-opencode-go-js_pagination/summary.json) |
-| deepseek | 1 | json_cli | 23103 | 32061 | 6/7 | [20260905-123727Z-opencode-go-json_cli](20260905-123727Z-opencode-go-json_cli/summary.json) |
-| deepseek | 2 | json_cli | 19008 | 30660 | 6/7 | [20260905-123840Z-opencode-go-json_cli](20260905-123840Z-opencode-go-json_cli/summary.json) |
-| deepseek | 3 | json_cli | 18314 | 37349 | 6/8 | [20260905-124003Z-opencode-go-json_cli](20260905-124003Z-opencode-go-json_cli/summary.json) |
-| deepseek | 4 | json_cli | 21833 | 48140 | 6/7 | [20260905-124132Z-opencode-go-json_cli](20260905-124132Z-opencode-go-json_cli/summary.json) |
-| deepseek | 1 | ledger_audit | 25709 | 20273 | 6/5 | [20260905-123426Z-opencode-go-ledger_audit](20260905-123426Z-opencode-go-ledger_audit/summary.json) |
-| deepseek | 2 | ledger_audit | 38453 | 25740 | 6/6 | [20260905-123510Z-opencode-go-ledger_audit](20260905-123510Z-opencode-go-ledger_audit/summary.json) |
-| deepseek | 3 | ledger_audit | 37896 | 29840 | 6/7 | [20260905-123744Z-opencode-go-ledger_audit](20260905-123744Z-opencode-go-ledger_audit/summary.json) |
-| deepseek | 4 | ledger_audit | 18904 | 23834 | 5/6 | [20260905-123900Z-opencode-go-ledger_audit](20260905-123900Z-opencode-go-ledger_audit/summary.json) |
-| deepseek | 1 | merge_ranges | 16691 | 24281 | 5/6 | [20260905-123937Z-opencode-go](20260905-123937Z-opencode-go/summary.json) |
-| deepseek | 2 | merge_ranges | 16178 | 16222 | 5/5 | [20260905-124031Z-opencode-go](20260905-124031Z-opencode-go/summary.json) |
-| deepseek | 3 | merge_ranges | 22842 | 26810 | 6/6 | [20260905-124115Z-opencode-go](20260905-124115Z-opencode-go/summary.json) |
-| deepseek | 4 | merge_ranges | 22536 | 18228 | 6/5 | [20260905-124222Z-opencode-go](20260905-124222Z-opencode-go/summary.json) |
-| deepseek | 1 | repair_catalog | 18730 | 15399 | 6/5 | [20260905-124256Z-opencode-go-repair_catalog](20260905-124256Z-opencode-go-repair_catalog/summary.json) |
-| deepseek | 2 | repair_catalog | 16038 | 13606 | 6/5 | [20260905-124326Z-opencode-go-repair_catalog](20260905-124326Z-opencode-go-repair_catalog/summary.json) |
-| deepseek | 3 | repair_catalog | 14435 | 14455 | 5/5 | [20260905-124402Z-opencode-go-repair_catalog](20260905-124402Z-opencode-go-repair_catalog/summary.json) |
-| deepseek | 4 | repair_catalog | 13498 | 13646 | 5/5 | [20260905-124427Z-opencode-go-repair_catalog](20260905-124427Z-opencode-go-repair_catalog/summary.json) |
+| deepseek | 1 | config_migration | 18458 | 18551 | 6/6 | 20260905-123426Z-opencode-go-config_migration (`20260905-123426Z-opencode-go-config_migration/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | config_migration | 23326 | 16507 | 7/5 | 20260905-123502Z-opencode-go-config_migration (`20260905-123502Z-opencode-go-config_migration/summary.json`, artefato local n?o versionado) |
+| deepseek | 3 | config_migration | 17632 | 15440 | 6/5 | 20260905-123540Z-opencode-go-config_migration (`20260905-123540Z-opencode-go-config_migration/summary.json`, artefato local n?o versionado) |
+| deepseek | 4 | config_migration | 18771 | 21037 | 6/6 | 20260905-123637Z-opencode-go-config_migration (`20260905-123637Z-opencode-go-config_migration/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | js_pagination | 15776 | 16091 | 5/5 | 20260905-124315Z-opencode-go-js_pagination (`20260905-124315Z-opencode-go-js_pagination/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | js_pagination | 15735 | 15502 | 5/5 | 20260905-124355Z-opencode-go-js_pagination (`20260905-124355Z-opencode-go-js_pagination/summary.json`, artefato local n?o versionado) |
+| deepseek | 3 | js_pagination | 14888 | 17582 | 5/5 | 20260905-124425Z-opencode-go-js_pagination (`20260905-124425Z-opencode-go-js_pagination/summary.json`, artefato local n?o versionado) |
+| deepseek | 4 | js_pagination | 15887 | 13724 | 5/5 | 20260905-124524Z-opencode-go-js_pagination (`20260905-124524Z-opencode-go-js_pagination/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | json_cli | 23103 | 32061 | 6/7 | 20260905-123727Z-opencode-go-json_cli (`20260905-123727Z-opencode-go-json_cli/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | json_cli | 19008 | 30660 | 6/7 | 20260905-123840Z-opencode-go-json_cli (`20260905-123840Z-opencode-go-json_cli/summary.json`, artefato local n?o versionado) |
+| deepseek | 3 | json_cli | 18314 | 37349 | 6/8 | 20260905-124003Z-opencode-go-json_cli (`20260905-124003Z-opencode-go-json_cli/summary.json`, artefato local n?o versionado) |
+| deepseek | 4 | json_cli | 21833 | 48140 | 6/7 | 20260905-124132Z-opencode-go-json_cli (`20260905-124132Z-opencode-go-json_cli/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | ledger_audit | 25709 | 20273 | 6/5 | 20260905-123426Z-opencode-go-ledger_audit (`20260905-123426Z-opencode-go-ledger_audit/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | ledger_audit | 38453 | 25740 | 6/6 | 20260905-123510Z-opencode-go-ledger_audit (`20260905-123510Z-opencode-go-ledger_audit/summary.json`, artefato local n?o versionado) |
+| deepseek | 3 | ledger_audit | 37896 | 29840 | 6/7 | 20260905-123744Z-opencode-go-ledger_audit (`20260905-123744Z-opencode-go-ledger_audit/summary.json`, artefato local n?o versionado) |
+| deepseek | 4 | ledger_audit | 18904 | 23834 | 5/6 | 20260905-123900Z-opencode-go-ledger_audit (`20260905-123900Z-opencode-go-ledger_audit/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | merge_ranges | 16691 | 24281 | 5/6 | 20260905-123937Z-opencode-go (`20260905-123937Z-opencode-go/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | merge_ranges | 16178 | 16222 | 5/5 | 20260905-124031Z-opencode-go (`20260905-124031Z-opencode-go/summary.json`, artefato local n?o versionado) |
+| deepseek | 3 | merge_ranges | 22842 | 26810 | 6/6 | 20260905-124115Z-opencode-go (`20260905-124115Z-opencode-go/summary.json`, artefato local n?o versionado) |
+| deepseek | 4 | merge_ranges | 22536 | 18228 | 6/5 | 20260905-124222Z-opencode-go (`20260905-124222Z-opencode-go/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | repair_catalog | 18730 | 15399 | 6/5 | 20260905-124256Z-opencode-go-repair_catalog (`20260905-124256Z-opencode-go-repair_catalog/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | repair_catalog | 16038 | 13606 | 6/5 | 20260905-124326Z-opencode-go-repair_catalog (`20260905-124326Z-opencode-go-repair_catalog/summary.json`, artefato local n?o versionado) |
+| deepseek | 3 | repair_catalog | 14435 | 14455 | 5/5 | 20260905-124402Z-opencode-go-repair_catalog (`20260905-124402Z-opencode-go-repair_catalog/summary.json`, artefato local n?o versionado) |
+| deepseek | 4 | repair_catalog | 13498 | 13646 | 5/5 | 20260905-124427Z-opencode-go-repair_catalog (`20260905-124427Z-opencode-go-repair_catalog/summary.json`, artefato local n?o versionado) |
 
 deepseek: 24/24 pares completos; 484641 / 524978 tokens (-7.68% Slim); mediana das razões por par -0.39%; 14/24 vitórias. Todos os oráculos passaram, fixtures intactos, uso completo, auditor e daily exit 0.
 
@@ -1602,7 +1605,7 @@ deepseek: 24/24 pares completos; 484641 / 524978 tokens (-7.68% Slim); mediana d
 
 **Conclusão desta bateria:** 48/48 pares aprovados (96 execuções nativas), mas a economia ampla/considerável continua não demonstrada. Luna economizou no agregado de quatro dos seis cenários; DeepSeek, em três. No DeepSeek, JSON CLI concentra a vantagem, enquanto ledger, migração e reparo custaram mais. A mediana DeepSeek de -0,39% é praticamente empate. Não foi usado teste de significância, e quatro rodadas por cenário não estabelecem superioridade para qualquer tarefa/modelo/provider. Resultados de hashes anteriores não foram somados a estes.
 
-A correção de stdio foi confirmada em execuções reais: [Luna ledger](20260905-123416Z-ledger_audit/summary.json), [Luna ledger seguinte](20260905-123511Z-ledger_audit/summary.json) e [DeepSeek ledger](20260905-123426Z-opencode-go-ledger_audit/summary.json) mostram ação intacto no stdout Python. A inspeção dos 48 pares não encontrou U+FFFD nos outputs Slim nem falhas do tool write. Há falhas intermediárias corrigidas de shell/patch/read/list, portanto aprovação dos oráculos não significa ausência de qualquer erro intermediário. Não houve falha Responses de identidade nesta bateria.
+A correção de stdio foi confirmada em execuções reais: Luna ledger (`20260905-123416Z-ledger_audit/summary.json`, artefato local n?o versionado), Luna ledger seguinte (`20260905-123511Z-ledger_audit/summary.json`, artefato local n?o versionado) e DeepSeek ledger (`20260905-123426Z-opencode-go-ledger_audit/summary.json`, artefato local n?o versionado) mostram ação intacto no stdout Python. A inspeção dos 48 pares não encontrou U+FFFD nos outputs Slim nem falhas do tool write. Há falhas intermediárias corrigidas de shell/patch/read/list, portanto aprovação dos oráculos não significa ausência de qualquer erro intermediário. Não houve falha Responses de identidade nesta bateria.
 
 Validação da entrega: cargo test --workspace (via refresh -Test) 1135 passed / 0 failed / 1 ignored / 73 suítes / 0 compiler warnings; Clippy -D warnings exit 0; deploy/versão e hash alvo/PATH conferidos. Diff-check passou. ConPTY físico e ZIP não se aplicam a esta alteração de core. A qualidade comprovada é a dos testes/oráculos executados, sem alegação de equivalência universal. **A meta de economia ampla permanece aberta.**
 
@@ -1647,34 +1650,34 @@ A intervenção adicionou 204–291 bytes de texto conforme o workspace. A prime
 
 | Modelo | Rodada | Cenário | Atual | Protótipo | Variação | Evidências |
 |---|---:|---|---:|---:|---:|---|
-| gpt-5.6-luna | 1 | merge_ranges | 8746 | 7946 | -9.15% | [atual](20260905-131258Z/probe-summary.json), [protótipo](20260905-131325Z/probe-summary.json) |
-| gpt-5.6-luna | 1 | repair_catalog | 9052 | 7408 | -18.16% | [atual](20260905-131404Z-repair_catalog/probe-summary.json), [protótipo](20260905-131346Z-repair_catalog/probe-summary.json) |
-| gpt-5.6-luna | 1 | json_cli | 14134 | 13091 | -7.38% | [atual](20260905-131423Z-json_cli/probe-summary.json), [protótipo](20260905-131510Z-json_cli/probe-summary.json) |
-| gpt-5.6-luna | 1 | js_pagination | 9307 | 9817 | +5.48% | [atual](20260905-131614Z-js_pagination/probe-summary.json), [protótipo](20260905-131554Z-js_pagination/probe-summary.json) |
-| gpt-5.6-luna | 1 | ledger_audit | 16401 | 15476 | -5.64% | [atual](20260905-131637Z-ledger_audit/probe-summary.json), [protótipo](20260905-131702Z-ledger_audit/probe-summary.json) |
-| gpt-5.6-luna | 1 | config_migration | 12712 | 21535 | +69.41% | [atual](20260905-131757Z-config_migration/probe-summary.json), [protótipo](20260905-131725Z-config_migration/probe-summary.json) |
-| gpt-5.6-luna | 2 | merge_ranges | 10176 | 8394 | -17.51% | [atual](20260905-131844Z/probe-summary.json), [protótipo](20260905-131822Z/probe-summary.json) |
-| gpt-5.6-luna | 2 | repair_catalog | 8902 | 7388 | -17.01% | [atual](20260905-131918Z-repair_catalog/probe-summary.json), [protótipo](20260905-131936Z-repair_catalog/probe-summary.json) |
-| gpt-5.6-luna | 2 | json_cli | 13572 | 13653 | +0.60% | [atual](20260905-132044Z-json_cli/probe-summary.json), [protótipo](20260905-131956Z-json_cli/probe-summary.json) |
-| gpt-5.6-luna | 2 | js_pagination | 9176 | 8157 | -11.11% | [atual](20260905-132142Z-js_pagination/probe-summary.json), [protótipo](20260905-132210Z-js_pagination/probe-summary.json) |
-| gpt-5.6-luna | 2 | ledger_audit | 16613 | 15281 | -8.02% | [atual](20260905-132258Z-ledger_audit/probe-summary.json), [protótipo](20260905-132228Z-ledger_audit/probe-summary.json) |
-| gpt-5.6-luna | 2 | config_migration | 35021 | 19205 | -45.16% | [atual](20260905-132342Z-config_migration/probe-summary.json), [protótipo](20260905-132427Z-config_migration/probe-summary.json) |
-| deepseek-v4-flash | 1 | merge_ranges | 17662 | 15295 | -13.40% | [atual](20260905-131258Z-opencode-go/probe-summary.json), [protótipo](20260905-131325Z-opencode-go/probe-summary.json) |
-| deepseek-v4-flash | 1 | repair_catalog | 14862 | 10967 | -26.21% | [atual](20260905-131451Z-opencode-go-repair_catalog/probe-summary.json), [protótipo](20260905-131434Z-opencode-go-repair_catalog/probe-summary.json) |
-| deepseek-v4-flash | 1 | json_cli | 17099 | 19652 | +14.93% | [atual](20260905-131512Z-opencode-go-json_cli/probe-summary.json), [protótipo](20260905-131536Z-opencode-go-json_cli/probe-summary.json) |
-| deepseek-v4-flash | 1 | js_pagination | 14256 | 14221 | -0.25% | [atual](20260905-131623Z-opencode-go-js_pagination/probe-summary.json), [protótipo](20260905-131605Z-opencode-go-js_pagination/probe-summary.json) |
-| deepseek-v4-flash | 1 | ledger_audit | 18899 | 21388 | +13.17% | [atual](20260905-131643Z-opencode-go-ledger_audit/probe-summary.json), [protótipo](20260905-131703Z-opencode-go-ledger_audit/probe-summary.json) |
-| deepseek-v4-flash | 1 | config_migration | 18514 | 13890 | -24.98% | [atual](20260905-131804Z-opencode-go-config_migration/probe-summary.json), [protótipo](20260905-131751Z-opencode-go-config_migration/probe-summary.json) |
-| deepseek-v4-flash | 2 | merge_ranges | 20714 | 13294 | -35.82% | [atual](20260905-131849Z-opencode-go/probe-summary.json), [protótipo](20260905-131829Z-opencode-go/probe-summary.json) |
-| deepseek-v4-flash | 2 | repair_catalog | 14058 | 13015 | -7.42% | [atual](20260905-131913Z-opencode-go-repair_catalog/probe-summary.json), [protótipo](20260905-131926Z-opencode-go-repair_catalog/probe-summary.json) |
-| deepseek-v4-flash | 2 | json_cli | 22876 | 22887 | +0.05% | [atual](20260905-132008Z-opencode-go-json_cli/probe-summary.json), [protótipo](20260905-131942Z-opencode-go-json_cli/probe-summary.json) |
-| deepseek-v4-flash | 2 | js_pagination | 15302 | 15001 | -1.97% | [atual](20260905-132101Z-opencode-go-js_pagination/probe-summary.json), [protótipo](20260905-132121Z-opencode-go-js_pagination/probe-summary.json) |
-| deepseek-v4-flash | 2 | ledger_audit | 23833 | 23049 | -3.29% | [atual](20260905-132218Z-opencode-go-ledger_audit/probe-summary.json), [protótipo](20260905-132153Z-opencode-go-ledger_audit/probe-summary.json) |
-| deepseek-v4-flash | 2 | config_migration | 17362 | 19989 | +15.13% | [atual](20260905-132305Z-opencode-go-config_migration/probe-summary.json), [protótipo](20260905-132319Z-opencode-go-config_migration/probe-summary.json) |
+| gpt-5.6-luna | 1 | merge_ranges | 8746 | 7946 | -9.15% | atual (`20260905-131258Z/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-131325Z/probe-summary.json`, artefato local n?o versionado) |
+| gpt-5.6-luna | 1 | repair_catalog | 9052 | 7408 | -18.16% | atual (`20260905-131404Z-repair_catalog/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-131346Z-repair_catalog/probe-summary.json`, artefato local n?o versionado) |
+| gpt-5.6-luna | 1 | json_cli | 14134 | 13091 | -7.38% | atual (`20260905-131423Z-json_cli/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-131510Z-json_cli/probe-summary.json`, artefato local n?o versionado) |
+| gpt-5.6-luna | 1 | js_pagination | 9307 | 9817 | +5.48% | atual (`20260905-131614Z-js_pagination/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-131554Z-js_pagination/probe-summary.json`, artefato local n?o versionado) |
+| gpt-5.6-luna | 1 | ledger_audit | 16401 | 15476 | -5.64% | atual (`20260905-131637Z-ledger_audit/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-131702Z-ledger_audit/probe-summary.json`, artefato local n?o versionado) |
+| gpt-5.6-luna | 1 | config_migration | 12712 | 21535 | +69.41% | atual (`20260905-131757Z-config_migration/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-131725Z-config_migration/probe-summary.json`, artefato local n?o versionado) |
+| gpt-5.6-luna | 2 | merge_ranges | 10176 | 8394 | -17.51% | atual (`20260905-131844Z/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-131822Z/probe-summary.json`, artefato local n?o versionado) |
+| gpt-5.6-luna | 2 | repair_catalog | 8902 | 7388 | -17.01% | atual (`20260905-131918Z-repair_catalog/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-131936Z-repair_catalog/probe-summary.json`, artefato local n?o versionado) |
+| gpt-5.6-luna | 2 | json_cli | 13572 | 13653 | +0.60% | atual (`20260905-132044Z-json_cli/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-131956Z-json_cli/probe-summary.json`, artefato local n?o versionado) |
+| gpt-5.6-luna | 2 | js_pagination | 9176 | 8157 | -11.11% | atual (`20260905-132142Z-js_pagination/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-132210Z-js_pagination/probe-summary.json`, artefato local n?o versionado) |
+| gpt-5.6-luna | 2 | ledger_audit | 16613 | 15281 | -8.02% | atual (`20260905-132258Z-ledger_audit/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-132228Z-ledger_audit/probe-summary.json`, artefato local n?o versionado) |
+| gpt-5.6-luna | 2 | config_migration | 35021 | 19205 | -45.16% | atual (`20260905-132342Z-config_migration/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-132427Z-config_migration/probe-summary.json`, artefato local n?o versionado) |
+| deepseek-v4-flash | 1 | merge_ranges | 17662 | 15295 | -13.40% | atual (`20260905-131258Z-opencode-go/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-131325Z-opencode-go/probe-summary.json`, artefato local n?o versionado) |
+| deepseek-v4-flash | 1 | repair_catalog | 14862 | 10967 | -26.21% | atual (`20260905-131451Z-opencode-go-repair_catalog/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-131434Z-opencode-go-repair_catalog/probe-summary.json`, artefato local n?o versionado) |
+| deepseek-v4-flash | 1 | json_cli | 17099 | 19652 | +14.93% | atual (`20260905-131512Z-opencode-go-json_cli/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-131536Z-opencode-go-json_cli/probe-summary.json`, artefato local n?o versionado) |
+| deepseek-v4-flash | 1 | js_pagination | 14256 | 14221 | -0.25% | atual (`20260905-131623Z-opencode-go-js_pagination/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-131605Z-opencode-go-js_pagination/probe-summary.json`, artefato local n?o versionado) |
+| deepseek-v4-flash | 1 | ledger_audit | 18899 | 21388 | +13.17% | atual (`20260905-131643Z-opencode-go-ledger_audit/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-131703Z-opencode-go-ledger_audit/probe-summary.json`, artefato local n?o versionado) |
+| deepseek-v4-flash | 1 | config_migration | 18514 | 13890 | -24.98% | atual (`20260905-131804Z-opencode-go-config_migration/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-131751Z-opencode-go-config_migration/probe-summary.json`, artefato local n?o versionado) |
+| deepseek-v4-flash | 2 | merge_ranges | 20714 | 13294 | -35.82% | atual (`20260905-131849Z-opencode-go/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-131829Z-opencode-go/probe-summary.json`, artefato local n?o versionado) |
+| deepseek-v4-flash | 2 | repair_catalog | 14058 | 13015 | -7.42% | atual (`20260905-131913Z-opencode-go-repair_catalog/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-131926Z-opencode-go-repair_catalog/probe-summary.json`, artefato local n?o versionado) |
+| deepseek-v4-flash | 2 | json_cli | 22876 | 22887 | +0.05% | atual (`20260905-132008Z-opencode-go-json_cli/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-131942Z-opencode-go-json_cli/probe-summary.json`, artefato local n?o versionado) |
+| deepseek-v4-flash | 2 | js_pagination | 15302 | 15001 | -1.97% | atual (`20260905-132101Z-opencode-go-js_pagination/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-132121Z-opencode-go-js_pagination/probe-summary.json`, artefato local n?o versionado) |
+| deepseek-v4-flash | 2 | ledger_audit | 23833 | 23049 | -3.29% | atual (`20260905-132218Z-opencode-go-ledger_audit/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-132153Z-opencode-go-ledger_audit/probe-summary.json`, artefato local n?o versionado) |
+| deepseek-v4-flash | 2 | config_migration | 17362 | 19989 | +15.13% | atual (`20260905-132305Z-opencode-go-config_migration/probe-summary.json`, artefato local n?o versionado), protótipo (`20260905-132319Z-opencode-go-config_migration/probe-summary.json`, artefato local n?o versionado) |
 
 Limitações e decisão: há um sinal favorável em ambos os modelos, com redução de dez chamadas iniciais em cada um. No Luna, os seis agregados de cenário economizaram; no DeepSeek, quatro, com JSON CLI +6,41% e ledger +3,99%. Duas rodadas por cenário e fixtures pequenos não demonstram ganho universal nem comportamento em repositórios grandes. A orientação de agrupar leituras acompanha a lista, portanto o A/B mede a intervenção conjunta.
 
-A falha intermediária na migração Luna da primeira rodada foi retida: o protótipo produziu um patch com vírgula ausente, omitiu uma transformação e chamou shell com command="python check.py", args=[]; o modelo corrigiu e o oráculo passou. A baseline da mesma rodada também errou a forma command/args e recuperou. [Trace do protótipo](20260905-131725Z-config_migration/slim.session.jsonl), [baseline](20260905-131757Z-config_migration/slim.session.jsonl). Esses custos não foram removidos para favorecer o resultado.
+A falha intermediária na migração Luna da primeira rodada foi retida: o protótipo produziu um patch com vírgula ausente, omitiu uma transformação e chamou shell com command="python check.py", args=[]; o modelo corrigiu e o oráculo passou. A baseline da mesma rodada também errou a forma command/args e recuperou. Trace do protótipo (`20260905-131725Z-config_migration/slim.session.jsonl`, artefato local n?o versionado), baseline (`20260905-131757Z-config_migration/slim.session.jsonl`, artefato local n?o versionado). Esses custos não foram removidos para favorecer o resultado.
 
 **Não somar esses percentuais aos ganhos anteriores contra o Pi. Este A/B compara Slim contra o próprio Slim, com contexto experimental adicional. O runtime e o binário instalado continuam inalterados e a meta de superar amplamente o Pi permanece aberta.** O resultado justifica avaliar uma integração limitada e validar sua economia contra o Pi com contextos de maior escala; ainda faltam controle de orçamento de contexto, respeito a ignore e testes de retomada/cancelamento para uma implementação de produção.
 
@@ -1733,42 +1736,42 @@ Os casos inéditos foram definidos antes de sua medição em [holdouts.py](holdo
 
 | Modelo | Rodada | Cenário | Slim | Pi | Chamadas Slim/Pi | Evidência |
 |---|---:|---|---:|---:|---:|---|
-| luna | 1 | merge_ranges | 7665 | 8410 | 4/4 | [20260905-135459Z](20260905-135459Z/summary.json) |
-| luna | 1 | repair_catalog | 7793 | 10993 | 4/6 | [20260905-135551Z-repair_catalog](20260905-135551Z-repair_catalog/summary.json) |
-| luna | 1 | json_cli | 13301 | 12360 | 5/5 | [20260905-135644Z-json_cli](20260905-135644Z-json_cli/summary.json) |
-| luna | 1 | js_pagination | 8035 | 12132 | 4/6 | [20260905-135822Z-js_pagination](20260905-135822Z-js_pagination/summary.json) |
-| luna | 1 | ledger_audit | 30437 | 17691 | 8/6 | [20260905-135916Z-ledger_audit](20260905-135916Z-ledger_audit/summary.json) |
-| luna | 1 | config_migration | 8322 | 9434 | 4/5 | [20260905-140030Z-config_migration](20260905-140030Z-config_migration/summary.json) |
-| luna | 2 | merge_ranges | 8228 | 8710 | 4/4 | [20260905-140126Z](20260905-140126Z/summary.json) |
-| luna | 2 | repair_catalog | 7257 | 9850 | 4/5 | [20260905-140223Z-repair_catalog](20260905-140223Z-repair_catalog/summary.json) |
-| luna | 2 | json_cli | 46244 | 17003 | 10/6 | [20260905-140307Z-json_cli](20260905-140307Z-json_cli/summary.json) |
-| luna | 2 | js_pagination | 7807 | 10428 | 4/5 | [20260905-140540Z-js_pagination](20260905-140540Z-js_pagination/summary.json) |
-| luna | 2 | ledger_audit | 16260 | 13860 | 5/5 | [20260905-140628Z-ledger_audit](20260905-140628Z-ledger_audit/summary.json) |
-| luna | 2 | config_migration | 8246 | 15133 | 4/6 | [20260905-140736Z-config_migration](20260905-140736Z-config_migration/summary.json) |
-| deepseek | 1 | merge_ranges | 17926 | 19769 | 5/6 | [20260905-135459Z-opencode-go](20260905-135459Z-opencode-go/summary.json) |
-| deepseek | 1 | repair_catalog | 12573 | 14962 | 4/5 | [20260905-135537Z-opencode-go-repair_catalog](20260905-135537Z-opencode-go-repair_catalog/summary.json) |
-| deepseek | 1 | json_cli | 30436 | 19127 | 7/6 | [20260905-135616Z-opencode-go-json_cli](20260905-135616Z-opencode-go-json_cli/summary.json) |
-| deepseek | 1 | js_pagination | 14816 | 16728 | 4/5 | [20260905-135819Z-opencode-go-js_pagination](20260905-135819Z-opencode-go-js_pagination/summary.json) |
-| deepseek | 1 | ledger_audit | falha/uso incompleto | aprovado | não comparável | [20260905-135906Z-opencode-go-ledger_audit](20260905-135906Z-opencode-go-ledger_audit/failure-summary.json) |
-| deepseek | 1 | config_migration | 16738 | 14471 | 5/5 | [20260905-135950Z-opencode-go-config_migration](20260905-135950Z-opencode-go-config_migration/summary.json) |
-| deepseek | 2 | merge_ranges | 15071 | 21626 | 4/5 | [20260905-140034Z-opencode-go](20260905-140034Z-opencode-go/summary.json) |
-| deepseek | 2 | repair_catalog | 13206 | 14636 | 4/5 | [20260905-140143Z-opencode-go-repair_catalog](20260905-140143Z-opencode-go-repair_catalog/summary.json) |
-| deepseek | 2 | json_cli | 19067 | 24063 | 5/6 | [20260905-140215Z-opencode-go-json_cli](20260905-140215Z-opencode-go-json_cli/summary.json) |
-| deepseek | 2 | js_pagination | 12385 | 14981 | 4/5 | [20260905-140325Z-opencode-go-js_pagination](20260905-140325Z-opencode-go-js_pagination/summary.json) |
-| deepseek | 2 | ledger_audit | falha/uso incompleto | aprovado | não comparável | [20260905-140443Z-opencode-go-ledger_audit](20260905-140443Z-opencode-go-ledger_audit/failure-summary.json) |
-| deepseek | 2 | config_migration | 15687 | 17533 | 5/6 | [20260905-140516Z-opencode-go-config_migration](20260905-140516Z-opencode-go-config_migration/summary.json) |
-| luna | 1 | repo_wide_repair | 15359 | 15026 | 5/5 | [20260905-140830Z-repo_wide_repair](20260905-140830Z-repo_wide_repair/summary.json) |
-| luna | 1 | sqlite_balances | 9666 | 12662 | 4/5 | [20260905-140944Z-sqlite_balances](20260905-140944Z-sqlite_balances/summary.json) |
-| luna | 2 | repo_wide_repair | 17569 | 16007 | 5/5 | [20260905-141039Z-repo_wide_repair](20260905-141039Z-repo_wide_repair/summary.json) |
-| luna | 2 | sqlite_balances | 13705 | 12527 | 5/5 | [20260905-141156Z-sqlite_balances](20260905-141156Z-sqlite_balances/summary.json) |
-| deepseek | 1 | repo_wide_repair | 32810 | 28448 | 6/6 | [20260905-140617Z-opencode-go-repo_wide_repair](20260905-140617Z-opencode-go-repo_wide_repair/summary.json) |
-| deepseek | 1 | sqlite_balances | 17175 | 42959 | 4/8 | [20260905-140725Z-opencode-go-sqlite_balances](20260905-140725Z-opencode-go-sqlite_balances/summary.json) |
-| deepseek | 2 | repo_wide_repair | 34416 | 27955 | 6/6 | [20260905-140920Z-opencode-go-repo_wide_repair](20260905-140920Z-opencode-go-repo_wide_repair/summary.json) |
-| deepseek | 2 | sqlite_balances | 20571 | 21045 | 4/5 | [20260905-141029Z-opencode-go-sqlite_balances](20260905-141029Z-opencode-go-sqlite_balances/summary.json) |
+| luna | 1 | merge_ranges | 7665 | 8410 | 4/4 | 20260905-135459Z (`20260905-135459Z/summary.json`, artefato local n?o versionado) |
+| luna | 1 | repair_catalog | 7793 | 10993 | 4/6 | 20260905-135551Z-repair_catalog (`20260905-135551Z-repair_catalog/summary.json`, artefato local n?o versionado) |
+| luna | 1 | json_cli | 13301 | 12360 | 5/5 | 20260905-135644Z-json_cli (`20260905-135644Z-json_cli/summary.json`, artefato local n?o versionado) |
+| luna | 1 | js_pagination | 8035 | 12132 | 4/6 | 20260905-135822Z-js_pagination (`20260905-135822Z-js_pagination/summary.json`, artefato local n?o versionado) |
+| luna | 1 | ledger_audit | 30437 | 17691 | 8/6 | 20260905-135916Z-ledger_audit (`20260905-135916Z-ledger_audit/summary.json`, artefato local n?o versionado) |
+| luna | 1 | config_migration | 8322 | 9434 | 4/5 | 20260905-140030Z-config_migration (`20260905-140030Z-config_migration/summary.json`, artefato local n?o versionado) |
+| luna | 2 | merge_ranges | 8228 | 8710 | 4/4 | 20260905-140126Z (`20260905-140126Z/summary.json`, artefato local n?o versionado) |
+| luna | 2 | repair_catalog | 7257 | 9850 | 4/5 | 20260905-140223Z-repair_catalog (`20260905-140223Z-repair_catalog/summary.json`, artefato local n?o versionado) |
+| luna | 2 | json_cli | 46244 | 17003 | 10/6 | 20260905-140307Z-json_cli (`20260905-140307Z-json_cli/summary.json`, artefato local n?o versionado) |
+| luna | 2 | js_pagination | 7807 | 10428 | 4/5 | 20260905-140540Z-js_pagination (`20260905-140540Z-js_pagination/summary.json`, artefato local n?o versionado) |
+| luna | 2 | ledger_audit | 16260 | 13860 | 5/5 | 20260905-140628Z-ledger_audit (`20260905-140628Z-ledger_audit/summary.json`, artefato local n?o versionado) |
+| luna | 2 | config_migration | 8246 | 15133 | 4/6 | 20260905-140736Z-config_migration (`20260905-140736Z-config_migration/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | merge_ranges | 17926 | 19769 | 5/6 | 20260905-135459Z-opencode-go (`20260905-135459Z-opencode-go/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | repair_catalog | 12573 | 14962 | 4/5 | 20260905-135537Z-opencode-go-repair_catalog (`20260905-135537Z-opencode-go-repair_catalog/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | json_cli | 30436 | 19127 | 7/6 | 20260905-135616Z-opencode-go-json_cli (`20260905-135616Z-opencode-go-json_cli/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | js_pagination | 14816 | 16728 | 4/5 | 20260905-135819Z-opencode-go-js_pagination (`20260905-135819Z-opencode-go-js_pagination/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | ledger_audit | falha/uso incompleto | aprovado | não comparável | 20260905-135906Z-opencode-go-ledger_audit (`20260905-135906Z-opencode-go-ledger_audit/failure-summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | config_migration | 16738 | 14471 | 5/5 | 20260905-135950Z-opencode-go-config_migration (`20260905-135950Z-opencode-go-config_migration/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | merge_ranges | 15071 | 21626 | 4/5 | 20260905-140034Z-opencode-go (`20260905-140034Z-opencode-go/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | repair_catalog | 13206 | 14636 | 4/5 | 20260905-140143Z-opencode-go-repair_catalog (`20260905-140143Z-opencode-go-repair_catalog/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | json_cli | 19067 | 24063 | 5/6 | 20260905-140215Z-opencode-go-json_cli (`20260905-140215Z-opencode-go-json_cli/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | js_pagination | 12385 | 14981 | 4/5 | 20260905-140325Z-opencode-go-js_pagination (`20260905-140325Z-opencode-go-js_pagination/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | ledger_audit | falha/uso incompleto | aprovado | não comparável | 20260905-140443Z-opencode-go-ledger_audit (`20260905-140443Z-opencode-go-ledger_audit/failure-summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | config_migration | 15687 | 17533 | 5/6 | 20260905-140516Z-opencode-go-config_migration (`20260905-140516Z-opencode-go-config_migration/summary.json`, artefato local n?o versionado) |
+| luna | 1 | repo_wide_repair | 15359 | 15026 | 5/5 | 20260905-140830Z-repo_wide_repair (`20260905-140830Z-repo_wide_repair/summary.json`, artefato local n?o versionado) |
+| luna | 1 | sqlite_balances | 9666 | 12662 | 4/5 | 20260905-140944Z-sqlite_balances (`20260905-140944Z-sqlite_balances/summary.json`, artefato local n?o versionado) |
+| luna | 2 | repo_wide_repair | 17569 | 16007 | 5/5 | 20260905-141039Z-repo_wide_repair (`20260905-141039Z-repo_wide_repair/summary.json`, artefato local n?o versionado) |
+| luna | 2 | sqlite_balances | 13705 | 12527 | 5/5 | 20260905-141156Z-sqlite_balances (`20260905-141156Z-sqlite_balances/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | repo_wide_repair | 32810 | 28448 | 6/6 | 20260905-140617Z-opencode-go-repo_wide_repair (`20260905-140617Z-opencode-go-repo_wide_repair/summary.json`, artefato local n?o versionado) |
+| deepseek | 1 | sqlite_balances | 17175 | 42959 | 4/8 | 20260905-140725Z-opencode-go-sqlite_balances (`20260905-140725Z-opencode-go-sqlite_balances/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | repo_wide_repair | 34416 | 27955 | 6/6 | 20260905-140920Z-opencode-go-repo_wide_repair (`20260905-140920Z-opencode-go-repo_wide_repair/summary.json`, artefato local n?o versionado) |
+| deepseek | 2 | sqlite_balances | 20571 | 21045 | 4/5 | 20260905-141029Z-opencode-go-sqlite_balances (`20260905-141029Z-opencode-go-sqlite_balances/summary.json`, artefato local n?o versionado) |
 
 Os dois erros de transporte ocorreram aos 15002 e 15014 ms, sem primeiro byte no request que falhou. No primeiro caso houve uma rodada anterior de leitura bem-sucedida; no segundo o request inicial falhou. O código daquela execução aplicava timeouts.connect à operação send inteira, incluindo upload e espera de cabeçalhos, e a política de produção limitava esse campo a 15 segundos. Isso demonstra que o prazo curto pode cortar a espera do servidor; os logs atuais não distinguem espera de conexão, upload ou cabeçalhos nessas duas falhas. Não houve retry automático nem substituição de amostras.
 
-O Luna teve custos elevados em ledger (uma chamada shell sem command, seguida de correção de JSON gerado) e JSON CLI da segunda rodada (mudança após o primeiro check, novas verificações e limpeza de __pycache__). [Ledger](20260905-135916Z-ledger_audit/summary.json), [JSON CLI](20260905-140307Z-json_cli/summary.json). Esses percursos foram incluídos integralmente. Não é correto transformar a redução de chamadas ou a mediana favorável em economia total: Luna terminou +11,70%.
+O Luna teve custos elevados em ledger (uma chamada shell sem command, seguida de correção de JSON gerado) e JSON CLI da segunda rodada (mudança após o primeiro check, novas verificações e limpeza de __pycache__). Ledger (`20260905-135916Z-ledger_audit/summary.json`, artefato local n?o versionado), JSON CLI (`20260905-140307Z-json_cli/summary.json`, artefato local n?o versionado). Esses percursos foram incluídos integralmente. Não é correto transformar a redução de chamadas ou a mediana favorável em economia total: Luna terminou +11,70%.
 
 **Conclusão:** a integração funcional está validada, mas a meta de superar amplamente o Pi não foi atingida. O repositório maior custou +6,11% no Luna e +19,19% no DeepSeek; a consulta SQL economizou nos dois. No conjunto, os ganhos continuam desiguais e há duas falhas de transporte com uso incompleto. A etapa anterior Slim/Slim continua sendo um experimento separado, não uma parcela a somar a estes percentuais. Não houve teste de significância nem alegação de validade para qualquer provider/modelo.
 
@@ -1821,11 +1824,11 @@ Cada linha abaixo agrega as duas rodadas do cenário; valores positivos signific
 | repo_wide_repair | 23596/33090 | -28.69% | 43189/58994 | -26.79% |
 | sqlite_balances | 19577/25144 | -22.14% | 49018/41032 | +19.46% |
 
-A correção de prazo também foi exercitada pelo provider real: os cabeçalhos do DeepSeek chegaram após **28114 ms** no primeiro request de [20260905-145618Z-opencode-go-config_migration](20260905-145618Z-opencode-go-config_migration/slim.session.jsonl) e após **54374 ms** no quarto request de [20260905-150659Z-opencode-go-sqlite_balances](20260905-150659Z-opencode-go-sqlite_balances/slim.session.jsonl). As respostas concluíram com sucesso e sem retry. O limite anterior de 15 s na operação send inteira interromperia essas esperas. Isso não identifica retroativamente a fase das duas falhas da bateria anterior.
+A correção de prazo também foi exercitada pelo provider real: os cabeçalhos do DeepSeek chegaram após **28114 ms** no primeiro request de 20260905-145618Z-opencode-go-config_migration (`20260905-145618Z-opencode-go-config_migration/slim.session.jsonl`, artefato local n?o versionado) e após **54374 ms** no quarto request de 20260905-150659Z-opencode-go-sqlite_balances (`20260905-150659Z-opencode-go-sqlite_balances/slim.session.jsonl`, artefato local n?o versionado). As respostas concluíram com sucesso e sem retry. O limite anterior de 15 s na operação send inteira interromperia essas esperas. Isso não identifica retroativamente a fase das duas falhas da bateria anterior.
 
-No repositório maior, a entrada da primeira requisição caiu de 1395 para 1159 tokens no Luna e de 2305 para 1983 no DeepSeek, comparando as duas rodadas de cada versão. O histórico inicial serializado caiu de 2078 para 853 bytes no Luna e de 2047 para 822 no DeepSeek. Essa redução específica é consistente com a lista limitada por pasta. [Luna anterior](20260905-140830Z-repo_wide_repair/summary.json), [Luna atual](20260905-150537Z-repo_wide_repair/summary.json), [DeepSeek anterior](20260905-140617Z-opencode-go-repo_wide_repair/summary.json), [DeepSeek atual](20260905-150239Z-opencode-go-repo_wide_repair/summary.json). Os totais Slim/Pi do cenário ficaram -28,69% no Luna e -26,79% no DeepSeek nesta bateria.
+No repositório maior, a entrada da primeira requisição caiu de 1395 para 1159 tokens no Luna e de 2305 para 1983 no DeepSeek, comparando as duas rodadas de cada versão. O histórico inicial serializado caiu de 2078 para 853 bytes no Luna e de 2047 para 822 no DeepSeek. Essa redução específica é consistente com a lista limitada por pasta. Luna anterior (`20260905-140830Z-repo_wide_repair/summary.json`, artefato local n?o versionado), Luna atual (`20260905-150537Z-repo_wide_repair/summary.json`, artefato local n?o versionado), DeepSeek anterior (`20260905-140617Z-opencode-go-repo_wide_repair/summary.json`, artefato local n?o versionado), DeepSeek atual (`20260905-150239Z-opencode-go-repo_wide_repair/summary.json`, artefato local n?o versionado). Os totais Slim/Pi do cenário ficaram -28,69% no Luna e -26,79% no DeepSeek nesta bateria.
 
-As perdas continuam visíveis. Em [configuração Luna](20260905-145754Z-config_migration/summary.json), command="python check.py" com args=[] selecionou execução literal e falhou; após corrigir a chamada, a validação encontrou JSON inválido, exigindo outra edição. O contrato atual de shell distingue comando PowerShell de executável com argumentos. Em [SQLite DeepSeek](20260905-150427Z-opencode-go-sqlite_balances/summary.json), a primeira query usou coluna o.id inexistente naquele escopo, e o agente precisou corrigir a query e testar novamente. Os custos dessas falhas recuperadas estão incluídos: Slim teve 5 erros de ferramentas no conjunto, Pi 7; todos terminaram aprovados. JSON CLI Luna também ficou +14,32% no agregado do cenário.
+As perdas continuam visíveis. Em configuração Luna (`20260905-145754Z-config_migration/summary.json`, artefato local n?o versionado), command="python check.py" com args=[] selecionou execução literal e falhou; após corrigir a chamada, a validação encontrou JSON inválido, exigindo outra edição. O contrato atual de shell distingue comando PowerShell de executável com argumentos. Em SQLite DeepSeek (`20260905-150427Z-opencode-go-sqlite_balances/summary.json`, artefato local n?o versionado), a primeira query usou coluna o.id inexistente naquele escopo, e o agente precisou corrigir a query e testar novamente. Os custos dessas falhas recuperadas estão incluídos: Slim teve 5 erros de ferramentas no conjunto, Pi 7; todos terminaram aprovados. JSON CLI Luna também ficou +14,32% no agregado do cenário.
 
 **Conclusão verificada:** o Slim atual superou o Pi no consumo total desta bateria, nos dois modelos, com aprovação integral dos oráculos. A vantagem aparece em 6/8 cenários Luna e 7/8 DeepSeek, e em 27/32 pares. Isso é evidência mais ampla que um caso isolado, mas não prova vantagem em todo agente/provider, nem ausência de perda de qualidade fora dos contratos testados. São duas rodadas por cenário/modelo; não houve teste de significância. As duas mudanças foram medidas juntas contra o Pi, sem A/B contemporâneo contra o binário anterior: a variação dos percursos dos modelos impede atribuir todo o ganho agregado exclusivamente a elas. A meta universal permanece não demonstrada.
 

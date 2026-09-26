@@ -67,6 +67,113 @@ fn read_complete_http_request(stream: &mut std::net::TcpStream) -> String {
     String::from_utf8_lossy(&bytes[..expected_len]).into_owned()
 }
 
+#[test]
+fn manual_retry_command_resumes_the_paused_request_without_another_user_message() {
+    assert_manual_retry_round_trip(false);
+}
+
+#[test]
+fn manual_retry_preserves_a_durable_session_without_duplicate_input() {
+    assert_manual_retry_round_trip(true);
+}
+
+fn assert_manual_retry_round_trip(durable: bool) {
+    let path = durable.then(|| resume_path("manual-retry"));
+    if let Some(path) = &path {
+        create_v2(path);
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut bodies = Vec::new();
+        for index in 0..4 {
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "retry fixture timed out");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            let request = read_complete_http_request(&mut stream);
+            bodies.push(request.split_once("\r\n\r\n").unwrap().1.to_owned());
+            let (status, body) = if index < 3 {
+                ("503 Service Unavailable", "unavailable")
+            } else {
+                ("200 OK", "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+            };
+            write!(stream, "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+        bodies
+    });
+    let options = ProviderRunOptions::default().with_context_window_tokens(32_000);
+    let (runtime, channels) = if let Some(path) = &path {
+        spawn_tui_runtime_with_resume(
+            request(format!("http://{address}")),
+            path,
+            options.with_workspace_root(path.parent().unwrap()),
+        )
+    } else {
+        spawn_tui_runtime(request(format!("http://{address}")), options)
+    }
+    .unwrap();
+    channels
+        .commands
+        .send(UiCommand::SendPrompt("hello".into()))
+        .unwrap();
+    let mut requested = false;
+    let mut user_messages = 0;
+    loop {
+        let event = channels
+            .events_data
+            .recv_timeout(Duration::from_secs(6))
+            .expect("retry event");
+        match event {
+            UiEvent::UserMessageAdded { .. } => user_messages += 1,
+            UiEvent::ProviderPhaseChanged { label, .. } if label.contains("Conexão pausada") => {
+                assert!(!requested);
+                channels.commands.send(UiCommand::RetryProvider).unwrap();
+                requested = true;
+            }
+            UiEvent::RunCompleted { run_id: 1 } => break,
+            UiEvent::RunFailed { message, .. } => panic!("unexpected failure: {message}"),
+            _ => {}
+        }
+    }
+    assert!(requested);
+    assert_eq!(user_messages, 1);
+    channels.commands.send(UiCommand::Shutdown).unwrap();
+    drop(runtime);
+    let bodies = server.join().unwrap();
+    assert_eq!(bodies.len(), 4);
+    assert!(bodies.windows(2).all(|pair| pair[0] == pair[1]));
+    if let Some(path) = path {
+        let report = preflight_session(&path).expect("valid durable session after retry");
+        let inputs = report
+            .records
+            .iter()
+            .filter(|record| {
+                matches!(record,
+                    DurableRecord::Entry { entry, .. }
+                    if entry.role == DurableEntryRole::User && entry.content == "hello"
+                )
+            })
+            .count();
+        assert_eq!(inputs, 1, "retry must not append a second durable input");
+        assert!(report
+            .summary
+            .terminal_operation_ids
+            .iter()
+            .any(|id| id.starts_with("resume-tui-resume-")));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+}
+
 #[cfg(windows)]
 fn working_set_bytes() -> Option<usize> {
     use windows_sys::Win32::System::ProcessStatus::{
@@ -284,7 +391,9 @@ fn tool_output_pages_from_bridge_through_reducer_into_inline_frame() {
 
     let (runtime, channels) = spawn_tui_runtime(
         request(format!("http://{address}")),
-        ProviderRunOptions::default().with_workspace_root(&root),
+        ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
+            .with_workspace_root(&root),
     )
     .expect("bridge");
     channels
@@ -433,7 +542,9 @@ fn list_cursor_survives_the_next_tui_prompt() {
 
     let (runtime, channels) = spawn_tui_runtime(
         request(format!("http://{address}")),
-        ProviderRunOptions::default().with_workspace_root(&root),
+        ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
+            .with_workspace_root(&root),
     )
     .expect("bridge");
     for (run_id, prompt) in [(1, "first page"), (2, "next page")] {
@@ -467,7 +578,9 @@ fn new_tui_emits_workspace_before_other_startup_state() {
     initial.mode = OperatingMode::ReadOnly;
     let (runtime, channels) = spawn_tui_runtime(
         initial,
-        ProviderRunOptions::default().with_workspace_root(workspace),
+        ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
+            .with_workspace_root(workspace),
     )
     .expect("bridge");
 
@@ -499,7 +612,7 @@ fn new_tui_emits_workspace_before_other_startup_state() {
 fn unbound_interaction_response_is_visibly_rejected() {
     let (runtime, channels) = spawn_tui_runtime(
         request("http://127.0.0.1:9".into()),
-        ProviderRunOptions::default(),
+        ProviderRunOptions::default().with_context_window_tokens(32_000),
     )
     .expect("bridge");
     let request_id = InteractionRequestId("approval-unbound".into());
@@ -618,7 +731,9 @@ fn tui_resume_streams_fixture_once_after_durable_prefix() {
     let (runtime, channels) = spawn_tui_runtime_with_resume(
         request(format!("http://{address}")),
         &path,
-        ProviderRunOptions::default().with_workspace_root(&workspace),
+        ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
+            .with_workspace_root(&workspace),
     )
     .expect("resume bridge");
     channels
@@ -694,7 +809,7 @@ fn tui_resume_rejects_v1_before_starting_the_bridge() {
     let error = match spawn_tui_runtime_with_resume(
         request("http://127.0.0.1:1".into()),
         &path,
-        ProviderRunOptions::default(),
+        ProviderRunOptions::default().with_context_window_tokens(32_000),
     ) {
         Ok(_) => panic!("legacy v1 must reject"),
         Err(error) => error,
@@ -718,7 +833,7 @@ fn tui_resume_rejects_torn_tail_before_starting_the_bridge() {
     let error = match spawn_tui_runtime_with_resume(
         request("http://127.0.0.1:1".into()),
         &path,
-        ProviderRunOptions::default(),
+        ProviderRunOptions::default().with_context_window_tokens(32_000),
     ) {
         Ok(_) => panic!("torn tail must reject"),
         Err(error) => error,
@@ -758,7 +873,9 @@ fn bridge_streams_first_delta_before_provider_completion() {
 
     let (runtime, channels) = spawn_tui_runtime(
         request(format!("http://{address}")),
-        ProviderRunOptions::default().with_context_window_tokens(64_000),
+        ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
+            .with_context_window_tokens(64_000),
     )
     .expect("bridge");
     channels
@@ -849,7 +966,7 @@ fn fast_stream_over_data_capacity_drains_before_completion_without_hanging() {
 
     let (runtime, channels) = spawn_tui_runtime(
         request(format!("http://{address}")),
-        ProviderRunOptions::default(),
+        ProviderRunOptions::default().with_context_window_tokens(32_000),
     )
     .expect("bridge");
     channels
@@ -929,7 +1046,7 @@ fn cancel_bypasses_a_full_stream_lane_without_consumer_drain() {
 
     let (runtime, channels) = spawn_tui_runtime(
         request(format!("http://{address}")),
-        ProviderRunOptions::default(),
+        ProviderRunOptions::default().with_context_window_tokens(32_000),
     )
     .expect("bridge");
     channels
@@ -1002,8 +1119,13 @@ fn model_alias_updates_next_codex_request_without_restarting_tui() {
     model_request.kind = ProviderKind::OpenAiCodex;
     model_request.model = "gpt-5.6-sol".into();
     model_request.account_id = Some("account-1".into());
-    let (runtime, channels) =
-        spawn_tui_runtime(model_request, ProviderRunOptions::default()).expect("bridge");
+    let (runtime, channels) = spawn_tui_runtime(
+        model_request,
+        ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
+            .with_max_output_tokens(1_024),
+    )
+    .expect("bridge");
     for (index, fast) in [true, false].into_iter().enumerate() {
         channels
             .commands
@@ -1025,6 +1147,30 @@ fn model_alias_updates_next_codex_request_without_restarting_tui() {
                 break;
             }
         }
+        if index == 0 {
+            assert!(
+                !config_path.exists(),
+                "session model must not create defaults"
+            );
+        } else {
+            let previous: toml::Value = fs::read_to_string(&config_path).unwrap().parse().unwrap();
+            assert_eq!(
+                previous["codex_fast"].as_bool(),
+                Some(true),
+                "session switch must not overwrite defaults"
+            );
+        }
+        channels
+            .commands
+            .send(UiCommand::SaveModelDefault)
+            .expect("save default");
+        loop {
+            if matches!(channels.events_data.recv_timeout(Duration::from_secs(2)).expect("saved event"),
+                UiEvent::Notification { message } if message.contains("salvos como padrão"))
+            {
+                break;
+            }
+        }
         let saved: toml::Value = fs::read_to_string(&config_path)
             .expect("persisted config")
             .parse()
@@ -1037,15 +1183,14 @@ fn model_alias_updates_next_codex_request_without_restarting_tui() {
             .send(UiCommand::SendPrompt("hello".into()))
             .expect("prompt");
         loop {
-            if channels
+            match channels
                 .events_data
                 .recv_timeout(Duration::from_secs(3))
                 .expect("completion")
-                == (UiEvent::RunCompleted {
-                    run_id: index as u64 + 1,
-                })
             {
-                break;
+                UiEvent::RunCompleted { run_id } if run_id == index as u64 + 1 => break,
+                UiEvent::RunFailed { message, .. } => panic!("model run failed: {message}"),
+                _ => {}
             }
         }
     }
@@ -1112,6 +1257,7 @@ fn codex_run_uses_bundled_catalog_context_window_instead_of_loop_default() {
                 saw_catalog_window = true;
             }
             UiEvent::RunCompleted { run_id: 1 } => break,
+            UiEvent::RunFailed { message, .. } => panic!("Codex run failed: {message}"),
             _ => {}
         }
     }
@@ -1199,7 +1345,9 @@ fn known_provider_models_use_their_catalog_context_windows() {
 fn bounded_agent_stop_is_not_reported_as_completed() {
     let (runtime, channels) = spawn_tui_runtime(
         request("http://127.0.0.1:1".into()),
-        ProviderRunOptions::default().with_max_turns(0),
+        ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
+            .with_max_turns(0),
     )
     .expect("bridge");
     channels
@@ -1225,12 +1373,26 @@ fn bounded_agent_stop_is_not_reported_as_completed() {
 
 #[test]
 fn cancel_run_kills_active_shell_before_late_workspace_mutation() {
-    let root = std::env::temp_dir().join(format!("slim-tui-shell-cancel-{}", std::process::id()));
+    cancel_active_shell_before_late_workspace_mutation(false);
+}
+
+#[test]
+fn cancel_run_double_escape_kills_active_shell_before_late_workspace_mutation() {
+    cancel_active_shell_before_late_workspace_mutation(true);
+}
+
+fn cancel_active_shell_before_late_workspace_mutation(force: bool) {
+    let root = std::env::temp_dir().join(format!(
+        "slim-tui-shell-cancel-{}-{force}",
+        std::process::id()
+    ));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("root");
     let marker = root.join("late.txt");
+    let started = root.join("started.txt");
     let command = format!(
-        "Start-Sleep -Seconds 30; Set-Content -LiteralPath '{}' -Value late",
+        "Set-Content -LiteralPath '{}' -Value started; Start-Sleep -Seconds 30; Set-Content -LiteralPath '{}' -Value late",
+        started.display(),
         marker.display()
     );
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1262,7 +1424,9 @@ fn cancel_run_kills_active_shell_before_late_workspace_mutation() {
     });
     let (runtime, channels) = spawn_tui_runtime(
         request(format!("http://{address}")),
-        ProviderRunOptions::default().with_workspace_root(&root),
+        ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
+            .with_workspace_root(&root),
     )
     .expect("bridge");
     channels
@@ -1278,10 +1442,23 @@ fn cancel_run_kills_active_shell_before_late_workspace_mutation() {
             break;
         }
     }
+    // ToolStarted precedes spawn_blocking. Confirm the process itself is live
+    // so this exercises native cancellation rather than pre-execution abort.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !started.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(started.exists(), "shell did not start");
     channels
         .commands
         .send(UiCommand::CancelRun)
         .expect("cancel");
+    if force {
+        channels
+            .commands
+            .send(UiCommand::CancelRun)
+            .expect("force cancel");
+    }
     loop {
         if channels
             .events
@@ -1334,7 +1511,9 @@ fn cancel_locked_write_and_patch_preserves_file_and_durable_result() {
         let (runtime, channels) = spawn_tui_runtime_with_resume(
             request(format!("http://{address}")),
             &session,
-            ProviderRunOptions::default().with_workspace_root(root),
+            ProviderRunOptions::default()
+                .with_context_window_tokens(32_000)
+                .with_workspace_root(root),
         )
         .unwrap();
         channels
@@ -1426,7 +1605,7 @@ fn cancel_run_closes_provider_connection_and_returns_idle() {
 
     let (runtime, channels) = spawn_tui_runtime(
         request(format!("http://{address}")),
-        ProviderRunOptions::default(),
+        ProviderRunOptions::default().with_context_window_tokens(32_000),
     )
     .expect("bridge");
     channels
@@ -1504,7 +1683,9 @@ fn ordinary_tui_second_turn_sends_prior_user_and_assistant() {
 
     let (runtime, channels) = spawn_tui_runtime(
         request(format!("http://{address}")),
-        ProviderRunOptions::default().with_workspace_root(&root),
+        ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
+            .with_workspace_root(&root),
     )
     .expect("bridge");
     channels
@@ -1595,7 +1776,9 @@ fn failed_nonpersistent_turn_keeps_completed_tool_evidence() {
     });
     let (runtime, channels) = spawn_tui_runtime(
         request(format!("http://{address}")),
-        ProviderRunOptions::default().with_workspace_root(&root),
+        ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
+            .with_workspace_root(&root),
     )
     .unwrap();
     channels
@@ -1666,7 +1849,7 @@ fn fifty_turn_tui_soak_completes_without_stall_or_history_loss() {
 
     let (runtime, channels) = spawn_tui_runtime(
         request(format!("http://{address}")),
-        ProviderRunOptions::default(),
+        ProviderRunOptions::default().with_context_window_tokens(32_000),
     )
     .expect("bridge");
     let rss_before = median_working_set_bytes();
@@ -1763,6 +1946,7 @@ fn ordinary_tui_reuses_compacted_history_on_the_next_prompt() {
 
     let oversized_marker = format!("ORIGINAL-OVERSIZED-HISTORY-{}", "x".repeat(2_000_000));
     let options = ProviderRunOptions::default()
+        .with_context_window_tokens(32_000)
         .with_history(vec![
             ProviderMessage::user("small-root-instruction"),
             ProviderMessage::assistant(oversized_marker.clone(), Vec::new()),

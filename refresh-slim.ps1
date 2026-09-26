@@ -12,37 +12,61 @@
 
         .\refresh-slim.ps1          build release + copia + smoke test
         .\refresh-slim.ps1 -Test    idem, rodando cargo test --workspace antes
+        .\refresh-slim.ps1 -FastBuild  build local mais rapido, com menos otimizacao
 
-    Tambem contorna as variaveis de usuario RUSTC/CARGO quebradas apontando
-    RUSTC explicitamente para o toolchain ativo (rustc 1.97.1, scoop persist).
+    Usa cargo/rustc do PATH. Variaveis RUSTC/CARGO herdadas que apontem para
+    arquivos inexistentes sao removidas somente deste processo.
 #>
 param(
-    [switch]$Test
+    [switch]$Test,
+    [switch]$FastBuild
 )
 $ErrorActionPreference = 'Stop'
 
 $root   = $PSScriptRoot
-$rustc  = 'C:\Users\User\scoop\persist\rustup-msvc\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustc.exe'
-$cargo  = 'C:\Users\User\scoop\apps\rustup-msvc\current\.cargo\bin\cargo.exe'
+. "$root/cargo-local.ps1"
+$cargo  = 'cargo'
+$git    = 'git'
 $deploy = Join-Path $env:USERPROFILE 'bin\Slim.exe'
 $built  = Join-Path $root 'target\release\slim.exe'
 
-if (-not (Test-Path $cargo)) { $cargo = 'cargo' }
-if (Test-Path $rustc) { $env:RUSTC = $rustc }
+if (-not (Get-Command $cargo -ErrorAction SilentlyContinue)) {
+    throw 'cargo nao encontrado no PATH.'
+}
+if (-not (Get-Command $git -ErrorAction SilentlyContinue)) {
+    throw 'git nao encontrado no PATH.'
+}
+if ($env:RUSTC -and -not (Test-Path -LiteralPath $env:RUSTC -PathType Leaf)) {
+    Remove-Item Env:RUSTC
+}
+if ($env:CARGO -and -not (Test-Path -LiteralPath $env:CARGO -PathType Leaf)) {
+    Remove-Item Env:CARGO
+}
+
+$commit = (& $git -C $root rev-parse --verify HEAD 2>$null).Trim()
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($commit)) {
+    throw 'nao foi possivel identificar o commit HEAD para o build.'
+}
+$status = & $git -C $root status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) {
+    throw 'nao foi possivel identificar se o worktree esta dirty.'
+}
+$dirtySuffix = if ([string]::IsNullOrWhiteSpace(($status -join "`n"))) { '' } else { '-dirty' }
+$env:SLIM_BUILD_REVISION = "$commit$dirtySuffix"
+Write-Host "Build revision: $env:SLIM_BUILD_REVISION"
 
 if ($Test) {
-    & $cargo test --workspace
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error 'cargo test falhou — deploy abortado.'
-        exit 1
-    }
+    & "$root/test-slim.ps1" -Workspace
 }
 
-& $cargo build --release -p slim-cli
-if ($LASTEXITCODE -ne 0) {
-    Write-Error 'cargo build --release falhou — deploy abortado.'
-    exit 1
+$buildArguments = @('build', '--release', '-p', 'slim-cli', '--jobs', '1', '--timings')
+if ($FastBuild) {
+    # Preserve opt-level=3 while skipping cross-crate LTO and parallelizing codegen.
+    # Opt in because runtime performance of this local profile is not benchmarked.
+    $buildArguments += @('--config', 'profile.release.lto="off"',
+        '--config', 'profile.release.codegen-units=8')
 }
+Invoke-SlimCargo -CargoArguments $buildArguments
 
 New-Item -ItemType Directory -Force -Path (Split-Path $deploy) | Out-Null
 Copy-Item $built $deploy -Force

@@ -45,7 +45,7 @@ fn inspectors_toggle_and_capabilities_degrade_safely() {
 }
 
 #[test]
-fn focused_composer_uses_the_normative_green_border() {
+fn focused_composer_uses_the_subdued_green_border() {
     let capabilities = Capabilities {
         color_depth: ColorDepth::TrueColor,
         mouse: false,
@@ -53,7 +53,10 @@ fn focused_composer_uses_the_normative_green_border() {
         images: false,
         reduced_motion: false,
     };
-    assert_eq!(resolve_theme(capabilities).border_focus, (0x72, 0xCC, 0x91));
+    let theme = resolve_theme(capabilities);
+    assert_eq!(theme.border_focus, (0x4F, 0x7D, 0x5A));
+    // Bright green stays reserved for success and identity.
+    assert_ne!(theme.border_focus, theme.accent);
 }
 
 #[test]

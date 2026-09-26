@@ -17,8 +17,7 @@ use unicode_width::UnicodeWidthStr;
 use slim_core::runtime::mode_name;
 
 use crate::api::{
-    BlockId, LoginProvider, McpServerView, McpStatusView, ReasoningEffort, TodoItemStatus,
-    UiChannels, UiCommand,
+    BlockId, LoginProvider, McpServerView, McpStatusView, TodoItemStatus, UiChannels, UiCommand,
 };
 use crate::app::{
     ActivityPhase, AppState, EffortOverlay, LoginOverlay, LoginStage, McpOverlay, ModelOverlay,
@@ -32,7 +31,7 @@ use crate::fullscreen::FullscreenBackend;
 use crate::input::{DecodedEvent, PasteStreamDecoder};
 use crate::inspector::{is_mutating_tool, InspectorKind};
 use crate::layout::{plan_with_session_rail_and_composer, todo_height, Rect};
-use crate::markdown::{render_plain, sanitize_terminal_text, MarkdownStyles};
+use crate::markdown::{render_plain, render_prose, sanitize_terminal_text, MarkdownStyles};
 use crate::picker::{truncate_cells, visible_window, PICKER_NOMINAL_CAPACITY};
 use crate::reducer::{reduce, Action, Effect, ScrollIntent};
 use crate::render::{
@@ -49,7 +48,7 @@ use crate::theme::{
 use crate::view_model::{
     activity_elapsed, activity_label, activity_phase_label, assistant_label, budget_near_limit,
     completed_tool_phrase, display_cwd, format_context, is_trivial_cwd, run_status_label,
-    session_rail_projection, truncate_display_width,
+    session_rail_projection, tool_target, tool_title, truncate_display_width,
 };
 
 /// Composer prompt is ASCII on purpose (G264): `›` (U+203A) is East-Asian
@@ -58,9 +57,11 @@ use crate::view_model::{
 const COMPOSER_PROMPT: &str = "> ";
 const COMPOSER_OVERFLOW_HINT: &str = "<";
 const CONTROL_BATCH_LIMIT: usize = 32;
-const STREAM_BATCH_LIMIT: usize = 1_024;
+// One event may already be removed from the bounded lane into the prefetch
+// slot when a control event establishes a causal barrier.
+const STREAM_BATCH_LIMIT: usize = crate::api::STREAM_EVENT_CAPACITY + 1;
 const DOCKED_INSPECTOR_MIN_WIDTH: u16 = 100;
-const INFO_TOAST_HIGHLIGHT_MS: u64 = 249;
+const INFO_TOAST_HIGHLIGHT_MS: u64 = crate::block::TOOL_GROUP_HOLD_MS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LaneDrain {
@@ -110,9 +111,16 @@ enum ClipboardOutcome {
 }
 
 pub fn run_app(channels: UiChannels) -> io::Result<()> {
+    run_app_with_initial_prompt(channels, None)
+}
+
+pub fn run_app_with_initial_prompt(
+    channels: UiChannels,
+    initial_prompt: Option<String>,
+) -> io::Result<()> {
     let capabilities = detect_capabilities();
     let mut backend = FullscreenBackend::start(capabilities)?;
-    let result = run_loop(&mut backend, &channels, capabilities);
+    let result = run_loop(&mut backend, &channels, capabilities, initial_prompt);
     let _ = channels.commands.send(UiCommand::Shutdown);
     let shutdown = backend.shutdown();
     result.and(shutdown)
@@ -122,8 +130,10 @@ fn run_loop(
     backend: &mut FullscreenBackend,
     channels: &UiChannels,
     capabilities: Capabilities,
+    initial_prompt: Option<String>,
 ) -> io::Result<()> {
     let mut state = AppState::new();
+    let mut queue = crate::prompt_queue::PersistentQueue::with_initial_prompt(initial_prompt);
     let mut dirty = true;
     let started = Instant::now();
     let mut last_motion_frame = 0;
@@ -142,7 +152,7 @@ fn run_loop(
     let mut size = backend.terminal().size()?;
     loop {
         let clock = runtime_clock(started.elapsed());
-        let effects = reduce(&mut state, Action::SyncClock(clock));
+        let effects = queue.reduce(&mut state, Action::SyncClock(clock))?;
         run_effects(channels, &clipboard_tx, effects)?;
 
         // Clipboard jobs report back through the wake signal like lane events.
@@ -157,7 +167,7 @@ fn run_loop(
                 },
                 ClipboardOutcome::Copied(success) => Action::ClipboardCompleted { success },
             };
-            let effects = reduce(&mut state, action);
+            let effects = queue.reduce(&mut state, action)?;
             run_effects(channels, &clipboard_tx, effects)?;
             dirty = true;
         }
@@ -185,6 +195,7 @@ fn run_loop(
         let mut stream_events = Some(stream_events);
         if data_barrier {
             reduce_stream_events(
+                &mut queue,
                 channels,
                 &mut state,
                 &mut coalescer,
@@ -197,7 +208,7 @@ fn run_loop(
         }
         if !control_events.is_empty() && !coalescer.is_empty() {
             for event in coalescer.flush() {
-                let effects = reduce(&mut state, Action::UiEventReceived(event));
+                let effects = queue.reduce(&mut state, Action::UiEventReceived(event))?;
                 run_effects(channels, &clipboard_tx, effects)?;
                 dirty = true;
             }
@@ -205,7 +216,7 @@ fn run_loop(
         channels.lane_space.notify();
         for event in control_events {
             update_visible_stream_state(&event, &mut visible_stream_started);
-            let effects = reduce(&mut state, Action::UiEventReceived(event));
+            let effects = queue.reduce(&mut state, Action::UiEventReceived(event))?;
             run_effects(channels, &clipboard_tx, effects)?;
             dirty = true;
         }
@@ -213,6 +224,7 @@ fn run_loop(
 
         if let Some(stream_events) = stream_events {
             reduce_stream_events(
+                &mut queue,
                 channels,
                 &mut state,
                 &mut coalescer,
@@ -226,7 +238,7 @@ fn run_loop(
         stream_closed = stream_drain == LaneDrain::Closed;
         if stream_closed || coalescer.window_elapsed() {
             for event in coalescer.flush() {
-                let effects = reduce(&mut state, Action::UiEventReceived(event));
+                let effects = queue.reduce(&mut state, Action::UiEventReceived(event))?;
                 run_effects(channels, &clipboard_tx, effects)?;
                 dirty = true;
             }
@@ -242,8 +254,8 @@ fn run_loop(
                 approval_content_accessible(&state, (size.width, size.height), &mut render_cache)
             {
                 if state.approval_content_accessible != accessible {
-                    let effects =
-                        reduce(&mut state, Action::SetApprovalContentAccessible(accessible));
+                    let effects = queue
+                        .reduce(&mut state, Action::SetApprovalContentAccessible(accessible))?;
                     run_effects(channels, &clipboard_tx, effects)?;
                 }
             }
@@ -347,7 +359,7 @@ fn run_loop(
                             ),
                         };
                         if let Some(action) = action {
-                            let effects = reduce(&mut state, action);
+                            let effects = queue.reduce(&mut state, action)?;
                             run_effects(channels, &clipboard_tx, effects)?;
                             dirty = true;
                         }
@@ -370,7 +382,7 @@ fn run_loop(
                             (size.width, size.height),
                             &mut render_cache,
                         ) {
-                            let effects = reduce(&mut state, action);
+                            let effects = queue.reduce(&mut state, action)?;
                             run_effects(channels, &clipboard_tx, effects)?;
                             dirty = true;
                         }
@@ -394,12 +406,12 @@ fn run_loop(
                     } else {
                         Action::StatusTick(clock)
                     };
-                    let effects = reduce(&mut state, action);
+                    let effects = queue.reduce(&mut state, action)?;
                     run_effects(channels, &clipboard_tx, effects)?;
                     dirty = true;
                 } else if next_expiry_ms.is_some_and(|deadline_ms| clock.elapsed_ms >= deadline_ms)
                 {
-                    let effects = reduce(&mut state, Action::SyncClock(clock));
+                    let effects = queue.reduce(&mut state, Action::SyncClock(clock))?;
                     run_effects(channels, &clipboard_tx, effects)?;
                     dirty = true;
                 }
@@ -430,6 +442,7 @@ fn update_visible_stream_state(event: &crate::api::UiEvent, visible_stream_start
 
 #[allow(clippy::too_many_arguments)]
 fn reduce_stream_events(
+    queue: &mut crate::prompt_queue::PersistentQueue,
     channels: &UiChannels,
     state: &mut AppState,
     coalescer: &mut EventCoalescer,
@@ -448,14 +461,14 @@ fn reduce_stream_events(
                     | crate::api::UiEvent::ThinkingDelta { .. }
             );
         for ready in coalescer.push_data(event) {
-            let effects = reduce(state, Action::UiEventReceived(ready));
+            let effects = queue.reduce(state, Action::UiEventReceived(ready))?;
             run_effects(channels, clipboard_tx, effects)?;
             *dirty = true;
         }
         if first_visible {
             *visible_stream_started = true;
             for ready in coalescer.flush() {
-                let effects = reduce(state, Action::UiEventReceived(ready));
+                let effects = queue.reduce(state, Action::UiEventReceived(ready))?;
                 run_effects(channels, clipboard_tx, effects)?;
                 *dirty = true;
             }
@@ -463,7 +476,7 @@ fn reduce_stream_events(
     }
     if force_flush {
         for event in coalescer.flush() {
-            let effects = reduce(state, Action::UiEventReceived(event));
+            let effects = queue.reduce(state, Action::UiEventReceived(event))?;
             run_effects(channels, clipboard_tx, effects)?;
             *dirty = true;
         }
@@ -522,10 +535,13 @@ fn navigation_captured(state: &AppState) -> bool {
         || state.slash_suggestions.is_some()
         || state.inspector.active.is_some()
         || state.pending_interaction().is_some()
+        || state.todo_focused
 }
 
 fn status_clock_visible(state: &AppState, activity_rows: u16) -> bool {
-    (!navigation_captured(state) && (activity_rows > 0 || state.working || state.retry.is_some()))
+    (state.working && state.todo_dock_open && !state.todo_items.is_empty())
+        || (!navigation_captured(state)
+            && (activity_rows > 0 || state.working || state.retry.is_some()))
         || (state.working
             && state.inspector.active == Some(InspectorKind::Activity)
             && inspector_has_keyboard_focus(state))
@@ -997,13 +1013,22 @@ fn scrollbar_is_guaranteed(blocks: &[Block], viewport: u64) -> bool {
         return true;
     }
     let mut min_rows = 0usize;
-    for block in blocks {
+    for (index, block) in blocks.iter().enumerate() {
         let base = match block.kind() {
             BlockKind::User(_) => 2,
-            BlockKind::Assistant(_) => 3,
+            BlockKind::Assistant(_)
+                if crate::block::assistant_chrome(blocks, index)
+                    .is_some_and(|chrome| chrome.shows_header()) =>
+            {
+                3
+            }
+            BlockKind::Assistant(_) => 1,
             _ => 1,
         };
-        min_rows = min_rows.saturating_add(base + usize::from(block.turn_boundary_before()));
+        min_rows = min_rows.saturating_add(
+            base + usize::from(block.turn_boundary_before())
+                + usize::from(crate::block::transition_gap(blocks, index)),
+        );
         if min_rows > vp {
             return true;
         }
@@ -1017,6 +1042,7 @@ pub fn measure_scrollback(
     height: u16,
     cache: &mut WrapCache,
 ) -> ScrollMetrics {
+    cache.set_tool_presentation(state.clock.elapsed_ms, cache.reduced_motion_presentation());
     let regions = plan_regions(state, width, height, cache);
     let workspace = workspace_regions(state, to_ratatui(regions.scrollback));
     let notices = toast_row_count(state, workspace.transcript.height);
@@ -1056,6 +1082,7 @@ pub(crate) struct Palette {
     link: Style,
     quote: Style,
     tool: Style,
+    inline_code: Style,
     code_block: Style,
     code_rail: Style,
     diff_add: Style,
@@ -1071,6 +1098,8 @@ pub(crate) struct Palette {
     scrollbar_thumb: Style,
     selection: Color,
     menu_selected: Style,
+    /// Applied over everything behind a centered modal; keeps backgrounds.
+    backdrop: Style,
 }
 
 impl Palette {
@@ -1106,12 +1135,23 @@ impl Palette {
             heading: base
                 .fg(color(theme.heading_accent))
                 .add_modifier(Modifier::BOLD),
+            // H1 is set apart from H2 by underline rather than hue.
             h1: base
-                .fg(color(theme.assistant_accent))
-                .add_modifier(Modifier::BOLD),
+                .fg(color(theme.heading_accent))
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             link: base.fg(color(theme.link_accent)),
             quote: base.fg(color(theme.secondary_text)),
             tool: base.fg(color(theme.tool_accent)),
+            // The raised background collapses to Black in ANSI16/no-color, so
+            // those depths keep marking inline code by foreground instead.
+            inline_code: if matches!(
+                capabilities.color_depth,
+                ColorDepth::Ansi16 | ColorDepth::None
+            ) {
+                base.fg(color(theme.tool_accent))
+            } else {
+                base.fg(color(theme.foreground)).bg(color(theme.code_bg))
+            },
             code_block: base.fg(color(theme.foreground)).bg(color(theme.code_bg)),
             code_rail: base.fg(color(theme.code_rail)),
             diff_add: base.fg(color(theme.diff_add)),
@@ -1127,6 +1167,11 @@ impl Palette {
             scrollbar_thumb: base.fg(color(theme.scrollbar_thumb)),
             selection: color(theme.selection),
             menu_selected: base.bg(menu_selected_bg),
+            backdrop: if capabilities.color_depth == ColorDepth::None {
+                base.add_modifier(Modifier::DIM)
+            } else {
+                base.fg(color(theme.backdrop))
+            },
         }
     }
 }
@@ -1158,7 +1203,7 @@ fn draw_state(
     cache: &mut WrapCache,
 ) -> io::Result<String> {
     let mut selected = String::new();
-    backend.terminal().draw(|frame| {
+    backend.draw_synchronized(|frame| {
         render_frame(frame, state, capabilities, cache);
         selected = extract_visible_selection(frame, state, cache);
     })?;
@@ -1179,6 +1224,7 @@ pub fn render_frame(
     capabilities: Capabilities,
     cache: &mut WrapCache,
 ) {
+    cache.set_tool_presentation(state.clock.elapsed_ms, capabilities.reduced_motion);
     cache.selection_regions = [None, None];
     cache.selection_scroll_anchor = None;
     let palette = Palette::of(capabilities);
@@ -1314,6 +1360,14 @@ pub fn render_frame(
             &search_matches,
             cursor_target == Some(InputCursorTarget::Search),
         );
+    }
+    if state.model_overlay.is_some()
+        || state.mcp_overlay.is_some()
+        || state.effort_overlay.is_some()
+        || state.login_overlay.is_some()
+        || state.palette_query.is_some()
+    {
+        dim_backdrop(frame, &palette);
     }
     if let Some(overlay) = &state.model_overlay {
         let rows = cache.model_rows(
@@ -1645,7 +1699,13 @@ fn render_scrollback(
             .map(|block| &block.id)
     });
     let live_collapsed_group = if state.working {
-        cache.tool_group_leader(state.blocks(), content_rev, fold_rev)
+        cache.tool_group_leader(
+            state.blocks(),
+            content_rev,
+            fold_rev,
+            state.clock.elapsed_ms,
+            capabilities.reduced_motion,
+        )
     } else {
         None
     };
@@ -1676,17 +1736,20 @@ fn render_scrollback(
     buf.set_style(text_area, palette.text);
     let mut y = text_area.y;
     while idx < index.len() && rows < capacity && y < text_area.bottom() {
+        let block_index = index.entry_start(idx);
         let (_, block, members) = index.entry(idx);
         idx += 1;
+        let assistant_chrome = crate::block::assistant_chrome(state.blocks(), block_index);
         let is_selected = selected.as_ref() == Some(&block.id);
         let show_enter_hint = is_selected
             || live_collapsed_group
                 .as_ref()
                 .is_some_and(|leader| leader == &block.id);
+        let transition_gap = crate::block::transition_gap(state.blocks(), block_index);
         let thinking_header_index = usize::from(
             members.len() == 1
                 && matches!(block.kind(), BlockKind::Thinking(_))
-                && block.turn_boundary_before(),
+                && (block.turn_boundary_before() || transition_gap),
         );
         let skipped = usize::try_from(skip_rows).unwrap_or(usize::MAX);
         let thinking_header_candidate = matches!(block.kind(), BlockKind::Thinking(_))
@@ -1704,6 +1767,7 @@ fn render_scrollback(
                 && !capabilities.reduced_motion
                 && capabilities.color_depth != ColorDepth::None
                 && thinking_header_candidate,
+            assistant_chrome,
         };
         // Key on everything the produced lines depend on: each member's
         // generation/lifecycle/fold/timing folded together, selection and the
@@ -1744,10 +1808,15 @@ fn render_scrollback(
                 .wrapping_mul(31)
                 .wrapping_add(u64::from(recent));
         }
+        if let Some(chrome) = assistant_chrome {
+            member_state = member_state
+                .wrapping_mul(31)
+                .wrapping_add(chrome.cache_tag());
+        }
         let key = (
             block.cache_identity(),
             member_state,
-            u8::from(is_selected) | u8::from(show_enter_hint) << 1,
+            u8::from(is_selected) | u8::from(show_enter_hint) << 1 | u8::from(transition_gap) << 2,
             content_width,
         );
         let block_lines = cache.get_block_lines(&key).unwrap_or_else(|| {
@@ -1761,8 +1830,9 @@ fn render_scrollback(
                 frame: ctx.frame,
                 now_ms: ctx.now_ms,
                 animate_thinking: false,
+                assistant_chrome: ctx.assistant_chrome,
             };
-            let built = if members.len() > 1 {
+            let mut built = if members.len() > 1 {
                 if crate::block::is_failed_tool(block) {
                     grouped_failed_tool_lines(block, members, show_enter_hint, &static_ctx, cache)
                 } else if crate::block::is_complete_thinking(block) {
@@ -1773,6 +1843,9 @@ fn render_scrollback(
             } else {
                 safe_block_lines(block, &static_ctx, cache)
             };
+            if transition_gap {
+                built.insert(0, Line::default());
+            }
             cache.store_block_lines(key, built)
         });
         let search_match = !matched_ids.is_empty()
@@ -1951,81 +2024,92 @@ fn render_todo_dock(
         ratatui::widgets::Block::default().style(palette.surface_alt),
         area,
     );
-    let total = state.todo_items.len();
-    let done = state
-        .todo_items
-        .iter()
-        .filter(|item| item.status == TodoItemStatus::Completed)
-        .count();
-    let active = state
-        .todo_items
-        .iter()
-        .find(|item| item.status == TodoItemStatus::InProgress);
-    let mut rows = Vec::new();
-    let mut header = vec![
-        Span::styled("TODO", palette.secondary),
-        Span::styled(format!(" {done}/{total}"), palette.muted),
-    ];
-    if let Some(active) = active {
-        // The activity rail or visible thinking header owns the one animated
-        // indicator for a frame; the TODO dock stays a stable status marker.
-        let active_glyph = glyph(capabilities, '\u{25cc}', '~');
-        header.push(Span::styled(format!(" {active_glyph} "), palette.warning));
-        header.push(Span::styled(
-            sanitize_terminal_text(&active.title),
-            palette.text,
-        ));
+    if area.height == 0 || area.width == 0 {
+        return;
     }
-    rows.push(Line::from(header));
-    if area.height > 1 {
-        // Keep actionable work visible before completed history.  `sort_by_key`
-        // is stable, so updates with the same status retain their source
-        // order and the dock never flickers while content changes.
-        let mut items: Vec<_> = state
-            .todo_items
-            .iter()
-            .filter(|item| item.status != TodoItemStatus::InProgress)
-            .collect();
-        items.sort_by_key(|item| match item.status {
-            TodoItemStatus::Blocked => 0u8,
-            TodoItemStatus::Pending => 1,
-            TodoItemStatus::Cancelled => 2,
-            TodoItemStatus::Completed => 3,
-            TodoItemStatus::InProgress => 4,
-        });
-        let rest: Vec<Line> = items
-            .into_iter()
-            .take(area.height as usize - 1)
-            .map(|item| {
-                let style = match item.status {
-                    TodoItemStatus::Completed => palette.success,
-                    TodoItemStatus::InProgress => palette.warning,
-                    TodoItemStatus::Pending => palette.muted,
-                    TodoItemStatus::Blocked => palette.error,
-                    TodoItemStatus::Cancelled => palette.muted,
-                };
-                let fallback = match item.status {
-                    TodoItemStatus::Completed => '+',
-                    TodoItemStatus::InProgress => '~',
-                    TodoItemStatus::Pending => 'o',
-                    TodoItemStatus::Blocked => 'x',
-                    TodoItemStatus::Cancelled => '-',
-                };
-                let preferred = if item.status == TodoItemStatus::Cancelled {
-                    '·'
+    let width = area.width as usize;
+    let summary = crate::todo::summary(state);
+    if area.height == 1 {
+        frame.render_widget(
+            Paragraph::new(truncate_cells(&crate::todo::compact_summary(state), width))
+                .style(palette.text),
+            area,
+        );
+        return;
+    }
+    let indices = crate::todo::ordered_indices(state);
+    let capacity = area.height.saturating_sub(2).max(1) as usize;
+    let selected = indices
+        .iter()
+        .position(|index| *index == state.todo_selected)
+        .unwrap_or(0);
+    let window = visible_window(
+        indices.len(),
+        if state.todo_focused { selected } else { 0 },
+        capacity,
+        0,
+    );
+    let start = window.start;
+    let end = window.end;
+    let mut rows = vec![Line::from(Span::styled(
+        truncate_cells(&summary, width),
+        palette.text,
+    ))];
+    for index in &indices[start..end] {
+        let item = &state.todo_items[*index];
+        let selected = state.todo_focused && *index == state.todo_selected;
+        let (marker, fallback, style) = match item.status {
+            TodoItemStatus::InProgress => ('◌', '~', palette.warning),
+            TodoItemStatus::Blocked => ('✕', 'x', palette.error),
+            TodoItemStatus::Pending => ('○', 'o', palette.text),
+            TodoItemStatus::Completed => ('✓', '+', palette.muted),
+            TodoItemStatus::Cancelled => ('·', '-', palette.muted),
+        };
+        let offset = if selected { state.todo_title_offset } else { 0 };
+        let label = truncate_cells(
+            &crate::todo::visible_title(&crate::todo::item_text(item), offset),
+            width.saturating_sub(3),
+        );
+        rows.push(Line::from(vec![
+            Span::styled(if selected { "> " } else { "  " }, palette.text),
+            Span::styled(glyph(capabilities, marker, fallback).to_string(), style),
+            Span::styled(
+                label,
+                if selected {
+                    style.add_modifier(Modifier::BOLD)
                 } else {
-                    item.status.glyph()
-                };
-                Line::from(vec![
-                    Span::styled(
-                        format!("{} ", glyph(capabilities, preferred, fallback)),
-                        style,
-                    ),
-                    Span::styled(sanitize_terminal_text(&item.title), palette.muted),
-                ])
-            })
-            .collect();
-        rows.extend(rest);
+                    style
+                },
+            ),
+        ]));
+    }
+    if rows.len() < area.height as usize {
+        let hidden = indices.len().saturating_sub(end - start);
+        let mut hint = if state.todo_focused {
+            format!(
+                "{}/{} · ↑↓ tarefas · ←→ título · Tab voltar · Esc recolher",
+                selected + 1,
+                indices.len()
+            )
+        } else {
+            "Alt+T navegar · Ctrl+T recolher".into()
+        };
+        if hidden > 0 {
+            hint = format!("+{hidden} fora da vista · {hint}");
+        }
+        if let Some(updated) = state.todo_updated_ms {
+            // Relative age is visible only while running, when the status clock ticks.
+            if state.working {
+                hint.push_str(&format!(
+                    " · atualizado há {}s",
+                    state.clock.elapsed_ms.saturating_sub(updated) / 1000
+                ));
+            }
+        }
+        rows.push(Line::from(Span::styled(
+            truncate_cells(&hint, width),
+            palette.secondary,
+        )));
     }
     frame.render_widget(Paragraph::new(rows).style(palette.surface_alt), area);
 }
@@ -2086,12 +2170,18 @@ fn render_activity_rail(
             Span::styled(activity_label(state), semantic_style),
         ]
     };
-    if elapsed > 0 {
-        let separator = if header_owns_thinking { " " } else { " · " };
-        spans.push(Span::styled(
-            format!("{separator}{elapsed}s"),
-            palette.muted,
-        ));
+    if header_owns_thinking && spans.is_empty() {
+        // The visible Thinking header already shows this phase's time; the
+        // rail adds the run total only when it says something new.
+        let total = state
+            .run_started_ms
+            .map(|started| state.clock.elapsed_ms.saturating_sub(started) / 1_000)
+            .filter(|total| *total > elapsed);
+        if let Some(total) = total {
+            spans.push(Span::styled(format!("execução {total}s"), palette.muted));
+        }
+    } else if elapsed > 0 {
+        spans.push(Span::styled(format!(" · {elapsed}s"), palette.muted));
     }
     if let Some(age) = last_useful_update_age_ms(state) {
         if age >= 5_000 && cancellation.is_none() && retry.is_none() {
@@ -2125,6 +2215,13 @@ fn render_activity_rail(
             if occupied + UnicodeWidthStr::width(counter.as_str()) <= area.width as usize {
                 spans.push(Span::styled(counter, palette.warning));
             }
+        }
+    }
+    // Segments open with ` · `; with the leading label omitted the rail must
+    // not start on a bare separator.
+    if let Some(first) = spans.first_mut() {
+        if let Some(rest) = first.content.strip_prefix(" · ") {
+            first.content = rest.to_owned().into();
         }
     }
     frame.render_widget(
@@ -2253,7 +2350,11 @@ fn render_welcome(
     );
 }
 
-pub(crate) fn last_collapsed_tool_group_leader(blocks: &[Block]) -> Option<BlockId> {
+pub(crate) fn last_collapsed_tool_group_leader(
+    blocks: &[Block],
+    now_ms: u64,
+    reduced_motion: bool,
+) -> Option<BlockId> {
     let mut index = blocks.len();
     while index > 0 {
         index -= 1;
@@ -2261,8 +2362,8 @@ pub(crate) fn last_collapsed_tool_group_leader(blocks: &[Block]) -> Option<Block
         if !matches!(block.kind(), BlockKind::Tool(_)) {
             continue;
         }
-        let span = if crate::block::is_complete_tool(block) {
-            crate::block::consecutive_complete_tool_span(blocks, index)
+        let span = if crate::block::is_presented_complete_tool(block, now_ms, reduced_motion) {
+            crate::block::consecutive_presented_tool_span(blocks, index, now_ms, reduced_motion)
                 .map(|(start, end)| (start, crate::block::complete_tool_count(blocks, start, end)))
         } else if crate::block::is_failed_tool(block) {
             crate::block::consecutive_identical_failed_tool_span(blocks, index)
@@ -2431,7 +2532,7 @@ fn grouped_thinking_lines(
     let mut lines = vec![thinking_header(leader, count, ctx)];
     if leader.fold == FoldState::Expanded {
         let body_width = thinking_body_width(ctx.width);
-        let thinking_style = ctx.palette.thinking;
+        let thinking_style = ctx.palette.thinking.add_modifier(Modifier::ITALIC);
         for member in members {
             let BlockKind::Thinking(text) = member.kind() else {
                 continue;
@@ -2442,7 +2543,7 @@ fn grouped_thinking_lines(
                 ctx.width,
                 member.lifecycle != BlockLifecycle::Streaming,
                 || {
-                    render_plain(text, body_width)
+                    render_prose(text, body_width)
                         .into_iter()
                         .map(|row| Line::from(Span::styled(format!("    {row}"), thinking_style)))
                         .collect()
@@ -2465,20 +2566,28 @@ fn grouped_failed_tool_lines(
         .iter()
         .filter(|block| crate::block::is_failed_tool(block))
         .count();
-    let (name, preview) = match leader.kind() {
+    let (name, preview, target) = match leader.kind() {
         BlockKind::Tool(tool) => (
             sanitize_terminal_text(&tool.name),
             sanitize_terminal_text(&tool.preview),
+            first_tool_segment(&sanitize_terminal_text(&tool.arguments_summary))
+                .map(|segment| (tool_target(&segment), segment))
+                .filter(|(target, segment)| target != segment)
+                .map(|(target, _)| target),
         ),
-        _ => (String::new(), String::new()),
+        _ => (String::new(), String::new(), None),
     };
     let reason_text = short_failure_reason(&preview);
-    let label = if count > 1 {
-        format!("{name} ×{count}")
-    } else {
-        name
-    };
-    let mut parts = vec![ToolDetailPart::fixed(label)];
+    let mut parts = vec![ToolDetailPart::fixed(tool_title(
+        &name,
+        BlockLifecycle::Failed,
+    ))];
+    if let Some(target) = target {
+        parts.push(ToolDetailPart::flexible(target, 0, 1).attached());
+    }
+    if count > 1 {
+        parts.push(ToolDetailPart::fixed(format!("×{count}")).attached());
+    }
     if reason_text.is_empty() {
         parts.push(ToolDetailPart::fixed("falhou".into()));
     } else {
@@ -2642,19 +2751,41 @@ fn tool_member_lines(
             block.lifecycle,
             BlockLifecycle::Complete | BlockLifecycle::Cancelled
         );
-    let compact_target = show_compact_context
+    // Collapsed rows (settled or failed) keep the call's target and its
+    // edit size; the full argument list stays behind Enter details.
+    // A failure keeps only a recognized target: unknown `key=value`
+    // arguments read as telemetry next to the failure reason.
+    let compact_target = (show_compact_context || collapsed_failure)
         .then(|| first_tool_segment(&args))
+        .flatten()
+        .map(|segment| (tool_target(&segment), segment))
+        .filter(|(target, segment)| !collapsed_failure || target != segment)
+        .map(|(target, _)| target);
+    let compact_stats = (show_compact_context || collapsed_failure)
+        .then(|| {
+            args.split(" · ")
+                .find(|segment| edit_stats_segment(segment).is_some())
+                .map(str::to_owned)
+        })
         .flatten();
     let compact_result = show_compact_context
         .then(|| first_tool_segment(&preview))
-        .flatten();
+        .flatten()
+        .and_then(|segment| compact_tool_result(&name, segment));
     let failure_reason = collapsed_failure
         .then(|| short_failure_reason(&preview))
         .filter(|reason| !reason.is_empty());
     let preview_shown = (show_preview && !preview.is_empty())
         || failure_reason.is_some()
         || compact_result.is_some();
-    let mut parts = vec![ToolDetailPart::fixed(name)];
+    // Restored calls keep their raw name: a past-tense verb would imply an
+    // outcome that history does not record.
+    let title = if state.historical {
+        name
+    } else {
+        tool_title(&name, block.lifecycle)
+    };
+    let mut parts = vec![ToolDetailPart::fixed(title.clone())];
     if show_args {
         for (index, value) in args
             .split(" · ")
@@ -2662,7 +2793,7 @@ fn tool_member_lines(
             .enumerate()
         {
             parts.push(if index == 0 {
-                ToolDetailPart::flexible(value.to_owned(), 0, 1)
+                ToolDetailPart::flexible(tool_target(value), 0, 1).attached()
             } else {
                 ToolDetailPart::fixed(value.to_owned())
             });
@@ -2670,8 +2801,13 @@ fn tool_member_lines(
         if include_call_id && !call.is_empty() {
             parts.push(ToolDetailPart::flexible(call, 0, 1));
         }
-    } else if let Some(target) = compact_target {
-        parts.push(ToolDetailPart::flexible(target, 0, 1));
+    } else {
+        if let Some(target) = compact_target {
+            parts.push(ToolDetailPart::flexible(target, 0, 1).attached());
+        }
+        if let Some(stats) = compact_stats {
+            parts.push(ToolDetailPart::fixed(stats));
+        }
     }
     if let Some(reason) = failure_reason {
         parts.push(ToolDetailPart::flexible(reason, 1, 1));
@@ -2702,7 +2838,7 @@ fn tool_member_lines(
         Span::styled(marker.to_owned(), palette.muted),
         Span::styled(glyph_text, glyph_style),
     ];
-    header_spans.extend(tool_detail_spans(&detail, name_style, palette));
+    header_spans.extend(tool_detail_spans(&detail, &title, name_style, palette));
     let mut lines = vec![Line::from(header_spans)];
     if block.fold == FoldState::Expanded && !state.materialized_output.is_empty() {
         let body_width = width.saturating_sub(4).max(1);
@@ -2733,11 +2869,47 @@ fn first_tool_segment(value: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn tool_detail_spans(detail: &str, action_style: Style, palette: &Palette) -> Vec<Span<'static>> {
+/// `+N -M` line stats that the event projection appends to a patch summary.
+fn edit_stats_segment(segment: &str) -> Option<(&str, &str)> {
+    let digits = |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+    let (added, removed) = segment.trim().strip_prefix('+')?.split_once(" -")?;
+    (digits(added) && digits(removed)).then_some((added, removed))
+}
+
+/// Collapsed result segment worth a row: a clean exit and the textual
+/// patch/write receipts add nothing that the title and stats do not say.
+fn compact_tool_result(name: &str, segment: String) -> Option<String> {
+    (!matches!(name, "patch" | "write") && segment != "exit 0").then_some(segment)
+}
+
+fn tool_detail_spans(
+    detail: &str,
+    title: &str,
+    action_style: Style,
+    palette: &Palette,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (index, segment) in detail.split(" · ").enumerate() {
         if index > 0 {
             spans.push(Span::styled(" · ", palette.muted));
+        }
+        // The title and its attached target share the first segment.
+        if let Some(target) = (index == 0)
+            .then(|| segment.strip_prefix(title))
+            .flatten()
+            .and_then(|rest| rest.strip_prefix(' '))
+        {
+            spans.push(Span::styled(title.to_owned(), action_style));
+            spans.push(Span::styled(format!(" {target}"), palette.secondary));
+            continue;
+        }
+        if index > 0 {
+            if let Some((added, removed)) = edit_stats_segment(segment) {
+                spans.push(Span::styled(format!("+{added}"), palette.diff_add));
+                spans.push(Span::styled(" ", palette.muted));
+                spans.push(Span::styled(format!("-{removed}"), palette.diff_remove));
+                continue;
+            }
         }
         let style = if index == 0 {
             action_style
@@ -2769,6 +2941,9 @@ struct ToolDetailPart {
     text: String,
     shrink_priority: Option<u8>,
     min_width: usize,
+    /// Joined to the previous part by a space instead of ` · `, so a verb
+    /// and its target read as one phrase.
+    attached: bool,
 }
 
 impl ToolDetailPart {
@@ -2777,6 +2952,7 @@ impl ToolDetailPart {
             text,
             shrink_priority: None,
             min_width: 0,
+            attached: false,
         }
     }
 
@@ -2785,7 +2961,13 @@ impl ToolDetailPart {
             text,
             shrink_priority: Some(priority),
             min_width,
+            attached: false,
         }
+    }
+
+    fn attached(mut self) -> Self {
+        self.attached = true;
+        self
     }
 }
 
@@ -2808,18 +2990,28 @@ fn fit_tool_detail(mut parts: Vec<ToolDetailPart>, width: usize) -> String {
             parts.remove(index);
         }
     }
-    truncate_cells(
-        &parts
-            .into_iter()
-            .map(|part| part.text)
-            .collect::<Vec<_>>()
-            .join(" · "),
-        width,
-    )
+    let mut joined = String::new();
+    for (index, part) in parts.into_iter().enumerate() {
+        if index > 0 {
+            joined.push_str(if part.attached { " " } else { " · " });
+        }
+        joined.push_str(&part.text);
+    }
+    truncate_cells(&joined, width)
 }
 
 fn tool_detail_width(parts: &[ToolDetailPart]) -> usize {
-    let separators = parts.len().saturating_sub(1) * UnicodeWidthStr::width(" · ");
+    let separators = parts
+        .iter()
+        .skip(1)
+        .map(|part| {
+            if part.attached {
+                1
+            } else {
+                UnicodeWidthStr::width(" · ")
+            }
+        })
+        .sum::<usize>();
     parts
         .iter()
         .map(|part| UnicodeWidthStr::width(part.text.as_str()))
@@ -2852,57 +3044,42 @@ fn block_transition_recent(block: &Block, ctx: &BlockRender<'_>) -> bool {
     )
 }
 
-fn fill_to_width(mut spans: Vec<Span<'static>>, width: usize, fill: Style) -> Line<'static> {
-    let used: usize = spans
-        .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .sum();
-    if used < width {
-        spans.push(Span::styled(" ".repeat(width - used), fill));
-    }
-    Line::from(spans)
-}
-
-fn user_band_lines(text: &str, ctx: &BlockRender<'_>, recent: bool) -> Vec<Line<'static>> {
-    let width = ctx.width.max(1) as usize;
-    let band = ctx.palette.user_prompt_bg;
-    let user_label_style = if recent {
-        ctx.palette
-            .secondary
-            .add_modifier(Modifier::BOLD)
-            .patch(band)
+fn user_message_lines(text: &str, ctx: &BlockRender<'_>, recent: bool) -> Vec<Line<'static>> {
+    let surface = ctx.palette.user_prompt_bg;
+    let marker_style = if recent {
+        ctx.palette.accent_bold
     } else {
-        ctx.palette.secondary.patch(band)
+        ctx.palette.accent.add_modifier(Modifier::DIM)
     };
-    let hang = " ".repeat(crate::render::USER_PROMPT_PREFIX_COLS as usize);
-    let rows = render_plain(text, user_prompt_text_width(ctx.width));
-    let mut lines: Vec<Line<'static>> = rows
-        .into_iter()
-        .enumerate()
-        .map(|(index, row)| {
-            let mut spans = if index == 0 {
-                vec![
-                    Span::styled("  ", band),
-                    Span::styled("Você", user_label_style),
-                    Span::styled("  ", band),
-                ]
-            } else {
-                vec![Span::styled(hang.clone(), band)]
-            };
-            spans.push(Span::styled(row, ctx.palette.text.patch(band)));
-            fill_to_width(spans, width, band)
-        })
-        .collect();
-    if lines.is_empty() {
-        lines.push(fill_to_width(
-            vec![
-                Span::styled("  ", band),
-                Span::styled("Você", user_label_style),
-            ],
-            width,
-            band,
-        ));
-    }
+    // Pad every band row to the content width: `set_line` paints only the
+    // spans it is given, and the band reads as one surface only when filled.
+    let band = |mut spans: Vec<Span<'static>>| {
+        let used: usize = spans.iter().map(Span::width).sum();
+        let fill = usize::from(ctx.width).saturating_sub(used);
+        if fill > 0 {
+            spans.push(Span::styled(" ".repeat(fill), surface));
+        }
+        Line::from(spans)
+    };
+    let mut lines = vec![band(vec![
+        Span::styled("  ", surface),
+        Span::styled(
+            glyph(ctx.capabilities, '●', '*').to_string(),
+            marker_style.patch(surface),
+        ),
+        Span::styled(" Você", ctx.palette.secondary.patch(surface)),
+    ])];
+    let indent = " ".repeat(crate::render::USER_PROMPT_PREFIX_COLS as usize);
+    lines.extend(
+        render_prose(text, user_prompt_text_width(ctx.width))
+            .into_iter()
+            .map(|row| {
+                band(vec![Span::styled(
+                    format!("{indent}{row}"),
+                    ctx.palette.text.patch(surface),
+                )])
+            }),
+    );
     lines.push(Line::default());
     lines
 }
@@ -2967,6 +3144,7 @@ struct BlockRender<'a> {
     frame: u64,
     now_ms: u64,
     animate_thinking: bool,
+    assistant_chrome: Option<crate::block::AssistantChrome>,
 }
 
 fn thinking_header(block: &Block, count: usize, ctx: &BlockRender<'_>) -> Line<'static> {
@@ -3044,23 +3222,45 @@ fn thinking_duration_ms(block: &Block, now_ms: u64) -> Option<u64> {
 
 fn block_lines(block: &Block, ctx: &BlockRender<'_>, cache: &mut WrapCache) -> Vec<Line<'static>> {
     let mut lines = match block.kind() {
-        BlockKind::User(text) => user_band_lines(text, ctx, block_transition_recent(block, ctx)),
+        BlockKind::User(text) => user_message_lines(text, ctx, block_transition_recent(block, ctx)),
         BlockKind::Assistant(text) => {
-            let label_style = if matches!(
-                block.lifecycle,
-                BlockLifecycle::Cancelled | BlockLifecycle::Failed
-            ) {
-                ctx.palette.secondary
-            } else {
-                ctx.palette.accent_bold
-            };
-            let mut lines = vec![
-                Line::default(),
-                Line::from(Span::styled(
-                    format!("  {}", assistant_label(block.lifecycle)),
+            let mut lines = Vec::new();
+            if ctx
+                .assistant_chrome
+                .is_none_or(|chrome| chrome.shows_header())
+            {
+                let cancelled = matches!(
+                    ctx.assistant_chrome,
+                    Some(crate::block::AssistantChrome::Header {
+                        cancelled: true,
+                        ..
+                    })
+                );
+                let failed = matches!(
+                    ctx.assistant_chrome,
+                    Some(crate::block::AssistantChrome::Header { failed: true, .. })
+                );
+                let lifecycle = if cancelled {
+                    BlockLifecycle::Cancelled
+                } else {
+                    block.lifecycle
+                };
+                let label_style = if cancelled
+                    || failed
+                    || matches!(
+                        block.lifecycle,
+                        BlockLifecycle::Cancelled | BlockLifecycle::Failed
+                    ) {
+                    ctx.palette.secondary
+                } else {
+                    ctx.palette.accent_bold
+                };
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", assistant_label(lifecycle)),
                     label_style,
-                )),
-            ];
+                )));
+            }
             lines.extend(assistant_body(
                 text,
                 ctx,
@@ -3075,7 +3275,8 @@ fn block_lines(block: &Block, ctx: &BlockRender<'_>, cache: &mut WrapCache) -> V
             let mut lines = vec![thinking_header(block, 1, ctx)];
             if block.fold == FoldState::Expanded {
                 let body_width = thinking_body_width(ctx.width);
-                let thinking_style = ctx.palette.thinking;
+                // Reasoning reads apart from the answer by italic.
+                let thinking_style = ctx.palette.thinking.add_modifier(Modifier::ITALIC);
                 // Expanded bodies are wrapped once per generation and shared
                 // with the height probe instead of re-wrapping every frame.
                 lines.extend(cache.wrapped_body(
@@ -3084,7 +3285,7 @@ fn block_lines(block: &Block, ctx: &BlockRender<'_>, cache: &mut WrapCache) -> V
                     ctx.width,
                     !streaming,
                     || {
-                        render_plain(text, body_width)
+                        render_prose(text, body_width)
                             .into_iter()
                             .map(|row| {
                                 Line::from(Span::styled(format!("    {row}"), thinking_style))
@@ -3106,7 +3307,7 @@ fn block_lines(block: &Block, ctx: &BlockRender<'_>, cache: &mut WrapCache) -> V
                     };
                     lines.push(Line::from(Span::styled(
                         format!("{prefix}{row}"),
-                        ctx.palette.thinking,
+                        ctx.palette.thinking.add_modifier(Modifier::ITALIC),
                     )));
                 }
             }
@@ -3186,7 +3387,7 @@ fn assistant_body(
         h2: ctx.palette.heading,
         h3: ctx.palette.thinking,
         link: ctx.palette.link,
-        code: ctx.palette.tool,
+        code: ctx.palette.inline_code,
         code_block: ctx.palette.code_block,
         code_rail: ctx.palette.code_rail,
         diff_add: ctx.palette.diff_add,
@@ -3952,6 +4153,7 @@ fn render_composer(
         .min(max_start);
     let end = start.saturating_add(visible_rows).min(total_rows);
     let mut cursor_x = prompt_width;
+    let placeholder = composer_placeholder(state, focused);
     let mut rendered = Vec::with_capacity(end.saturating_sub(start));
     for row_index in start..end {
         if row_index < attachment_rows {
@@ -3985,6 +4187,13 @@ fn render_composer(
         if is_cursor_line {
             cursor_x = prompt_width + UnicodeWidthStr::width(hint) + local_cursor;
         }
+        if let Some(placeholder) = placeholder.filter(|_| is_cursor_line && line.is_empty()) {
+            rendered.push(Line::from(vec![
+                Span::styled(prompt, glyph_style),
+                Span::styled(truncate_cells(placeholder, text_budget), palette.muted),
+            ]));
+            continue;
+        }
         rendered.push(Line::from(vec![
             Span::styled(
                 if is_cursor_line { prompt } else { "  " },
@@ -4009,6 +4218,25 @@ fn render_composer(
             content_area.y + cursor_y.min(content_area.height.saturating_sub(1)),
         ));
     }
+}
+
+/// Muted hint on an empty, focused composer once the conversation started.
+/// The welcome keeps its own contextual hint, and pending questions or
+/// attachments already describe what Enter does.
+fn composer_placeholder(state: &AppState, focused: bool) -> Option<&'static str> {
+    if !focused
+        || !state.composer.is_empty()
+        || !state.attachment_labels.is_empty()
+        || state.blocks().is_empty()
+        || question_composer_hint(state).is_some()
+    {
+        return None;
+    }
+    Some(if state.working {
+        "Escreva para enfileirar a próxima mensagem"
+    } else {
+        "Responda ou descreva a próxima tarefa · / comandos"
+    })
 }
 
 fn attachment_rows(labels: &[String]) -> usize {
@@ -5341,8 +5569,15 @@ fn mcp_entry_lines<'a>(
 }
 
 fn render_effort_overlay(frame: &mut ratatui::Frame, overlay: &EffortOverlay, palette: &Palette) {
-    let levels = ReasoningEffort::supported(overlay.model);
-    let area = centered(frame.area(), 72, (levels.len() * 2 + 6) as u16);
+    let levels = overlay.levels();
+    // The speed row only exists for Codex aliases; catalog steps are one row
+    // shorter instead of advertising a toggle that does nothing.
+    let speed = overlay.speed_toggle();
+    let area = centered(
+        frame.area(),
+        72,
+        (levels.len() * 2 + if speed { 6 } else { 5 }) as u16,
+    );
     let mut lines = vec![Line::default()];
     for (index, effort) in levels.iter().enumerate() {
         let selected = index == overlay.selected;
@@ -5365,9 +5600,9 @@ fn render_effort_overlay(frame: &mut ratatui::Frame, overlay: &EffortOverlay, pa
             lines.push(Line::default());
         }
     }
-    lines.extend([
-        Line::default(),
-        Line::from(Span::styled(
+    lines.push(Line::default());
+    if speed {
+        lines.push(Line::from(Span::styled(
             format!(
                 " Velocidade: {} · Tab alternar",
                 if overlay.fast {
@@ -5377,12 +5612,12 @@ fn render_effort_overlay(frame: &mut ratatui::Frame, overlay: &EffortOverlay, pa
                 }
             ),
             palette.muted,
-        )),
-        Line::from(Span::styled(
-            " Enter selecionar · Esc voltar",
-            palette.muted,
-        )),
-    ]);
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        " Enter selecionar · Esc voltar",
+        palette.muted,
+    )));
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(modal_block(" Selecionar esforço ", palette)),
@@ -5578,13 +5813,20 @@ fn render_slash_popup(
     matches: &[String],
     palette: &Palette,
 ) {
-    if matches.is_empty() || composer_area.y < 3 {
+    if matches.is_empty() || composer_area.y < 3 || composer_area.width < 4 {
         return;
     }
-    // One row is reserved for the key hint below the commands.
+    // The list rests on the composer's top border at the composer's width,
+    // so it reads as a dropdown of the input. One row holds the key hint.
     let capacity =
-        usize::from(composer_area.y.saturating_sub(3).max(1)).min(PICKER_NOMINAL_CAPACITY);
+        usize::from(composer_area.y.saturating_sub(2).max(1)).min(PICKER_NOMINAL_CAPACITY);
     let visible = visible_window(matches.len(), suggestions.selected, capacity, 0);
+    let inner_width = usize::from(composer_area.width.saturating_sub(2));
+    let name_width = matches[visible.clone()]
+        .iter()
+        .map(|command| UnicodeWidthStr::width(command.as_str()))
+        .max()
+        .unwrap_or(0);
     let mut rows: Vec<Line> = matches[visible.clone()]
         .iter()
         .enumerate()
@@ -5596,28 +5838,39 @@ fn render_slash_popup(
             } else {
                 palette.text
             };
-            Line::from(Span::styled(format!("{marker}{command}"), style))
+            let head = format!("{marker}{command:<name_width$}");
+            let mut spans = vec![Span::styled(head.clone(), style)];
+            let detail = crate::reducer::palette_description(command);
+            let budget = inner_width.saturating_sub(UnicodeWidthStr::width(head.as_str()) + 2);
+            if !detail.is_empty() && budget > 3 {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(truncate_cells(detail, budget), palette.muted));
+            }
+            menu_line(spans, selected, inner_width, palette)
         })
         .collect();
-    let width = 32.min(composer_area.width);
+    // The hint aligns with the command names, past the selection marker.
     rows.push(Line::from(Span::styled(
-        truncate_cells(SLASH_POPUP_HINT, width.saturating_sub(2) as usize),
+        format!(
+            "  {}",
+            truncate_cells(SLASH_POPUP_HINT, inner_width.saturating_sub(2))
+        ),
         palette.muted,
     )));
-    let height = (rows.len() as u16 + 2).min(composer_area.y);
+    let height = (rows.len() as u16 + 1).min(composer_area.y);
     let area = ratatui::layout::Rect {
         x: composer_area.x,
         y: composer_area.y - height,
-        width,
+        width: composer_area.width,
         height,
     };
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(rows).block(
             RatatuiBlock::default()
-                .borders(Borders::ALL)
+                .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
                 .border_type(BorderType::Rounded)
-                .border_style(palette.border)
+                .border_style(palette.border_focus)
                 .style(palette.surface_alt),
         ),
         area,
@@ -5709,8 +5962,11 @@ fn spinner_glyph(frame: u64, capabilities: Capabilities) -> char {
     }
 }
 
+/// Command palette modal width 42 minus its borders.
+const PALETTE_INNER_WIDTH: usize = 40;
+
 fn palette_command_line(command: &str, selected_here: bool, palette: &Palette) -> Line<'static> {
-    const MODAL_INNER_WIDTH: usize = 40; // modal width 42 minus borders
+    const MODAL_INNER_WIDTH: usize = PALETTE_INNER_WIDTH;
     let marker = if selected_here { "> " } else { "  " };
     let style = if selected_here {
         palette.accent_bold
@@ -5760,21 +6016,15 @@ fn grouped_command_lines(
         if visible.is_empty() {
             continue;
         }
-        lines.push(PaletteRow {
-            command_index: None,
-            line: Line::from(Span::styled(
-                match *group {
-                    "help" => "ajuda",
-                    "session" => "sessão",
-                    "runtime" => "execução",
-                    "integrations" => "integrações",
-                    "inspect" => "inspeção",
-                    other => other,
-                }
-                .to_owned(),
-                palette.muted,
-            )),
-        });
+        let name = match *group {
+            "help" => "ajuda",
+            "session" => "sessão",
+            "runtime" => "execução",
+            "integrations" => "integrações",
+            "inspect" => "inspeção",
+            other => other,
+        };
+        lines.push(palette_heading(name, palette));
         for (index, command) in visible {
             lines.push(PaletteRow {
                 command_index: Some(index),
@@ -5793,10 +6043,7 @@ fn grouped_command_lines(
         })
         .collect::<Vec<_>>();
     if !ungrouped.is_empty() {
-        lines.push(PaletteRow {
-            command_index: None,
-            line: Line::from(Span::styled("habilidades", palette.muted)),
-        });
+        lines.push(palette_heading("habilidades", palette));
         for (index, command) in ungrouped {
             lines.push(PaletteRow {
                 command_index: Some(index),
@@ -5805,6 +6052,18 @@ fn grouped_command_lines(
         }
     }
     lines
+}
+
+/// Group heading: a rule to the modal edge sets it apart from its commands.
+fn palette_heading(name: &str, palette: &Palette) -> PaletteRow {
+    let rule = PALETTE_INNER_WIDTH.saturating_sub(UnicodeWidthStr::width(name) + 1);
+    PaletteRow {
+        command_index: None,
+        line: Line::from(vec![
+            Span::styled(name.to_owned(), palette.secondary),
+            Span::styled(format!(" {}", "─".repeat(rule)), palette.border),
+        ]),
+    }
 }
 
 fn ensure_palette_row_visible(
@@ -5825,6 +6084,24 @@ fn ensure_palette_row_visible(
         start = selected.saturating_add(1).saturating_sub(capacity);
     }
     start.min(max_start)
+}
+
+/// Recedes everything already painted so a centered modal reads as the only
+/// active surface. Foregrounds fade and lose weight; backgrounds (user band,
+/// code, diff) keep their shape.
+fn dim_backdrop(frame: &mut ratatui::Frame, palette: &Palette) {
+    let area = frame.area();
+    let buffer = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buffer[(x, y)];
+            if let Some(fg) = palette.backdrop.fg {
+                cell.set_fg(fg);
+            }
+            cell.modifier.remove(Modifier::BOLD);
+            cell.modifier.insert(palette.backdrop.add_modifier);
+        }
+    }
 }
 
 fn modal_block<'a>(title: &'a str, palette: &'a Palette) -> RatatuiBlock<'a> {
@@ -5902,1601 +6179,4 @@ fn horizontal_inset(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        control_requires_data_barrier, footer_line, measure_scrollback, menu_line, receive_batch,
-        terminal_action, toast_row_count, update_visible_stream_state, LaneDrain, Palette,
-        CONTROL_BATCH_LIMIT, STREAM_BATCH_LIMIT,
-    };
-    use crate::api::{
-        McpServerView, McpStatusView, TodoItemStatus, TodoItemView, ToolBatchId, ToolCallId,
-        UiEvent,
-    };
-    use crate::app::{
-        ActivityPhase, ActivityState, AppState, ConfirmedSetting, FrameClock, McpOverlay,
-        SlashSuggestions,
-    };
-    use crate::reducer::{reduce, Action, ScrollIntent};
-    use crate::render::WrapCache;
-    use crate::runtime::render_frame;
-    use crate::selection::{ScreenPos, ScreenSelection};
-    use crate::theme::{Capabilities, ColorDepth};
-    use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-    use ratatui::backend::TestBackend;
-    use ratatui::style::{Color, Modifier};
-    use ratatui::text::Span;
-    use ratatui::widgets::Paragraph;
-    use ratatui::Terminal;
-    use std::sync::mpsc;
-
-    fn caps() -> Capabilities {
-        Capabilities {
-            color_depth: ColorDepth::TrueColor,
-            mouse: false,
-            clipboard: false,
-            images: false,
-            reduced_motion: false,
-        }
-    }
-
-    fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Event {
-        Event::Mouse(MouseEvent {
-            kind,
-            column,
-            row,
-            modifiers: KeyModifiers::NONE,
-        })
-    }
-
-    fn state_with_transcript() -> AppState {
-        let mut state = AppState::new();
-        state.apply_event(UiEvent::UserMessageAdded {
-            text: "hello from the transcript".into(),
-        });
-        state
-    }
-
-    #[test]
-    fn selected_menu_line_fills_the_row_and_keeps_no_color_fallbacks() {
-        let palette = Palette::of(caps());
-        assert_ne!(palette.menu_selected.bg, palette.surface_alt.bg);
-        assert_eq!(palette.menu_selected.bg, Some(Color::Rgb(0x2A, 0x2A, 0x2A)));
-        let ansi = Palette::of(Capabilities {
-            color_depth: ColorDepth::Ansi16,
-            ..caps()
-        });
-        assert_ne!(ansi.menu_selected.bg, ansi.surface_alt.bg);
-        assert_eq!(ansi.menu_selected.bg, Some(Color::DarkGray));
-        let ansi256 = Palette::of(Capabilities {
-            color_depth: ColorDepth::Ansi256,
-            ..caps()
-        });
-        assert_ne!(ansi256.menu_selected.bg, ansi256.surface_alt.bg);
-
-        let mut terminal = Terminal::new(TestBackend::new(20, 1)).expect("terminal");
-        terminal
-            .draw(|frame| {
-                frame.render_widget(
-                    Paragraph::new(vec![menu_line(
-                        vec![Span::styled("> Option", palette.accent_bold)],
-                        true,
-                        20,
-                        &palette,
-                    )]),
-                    frame.area(),
-                );
-            })
-            .expect("draw");
-        let buffer = terminal.backend().buffer();
-        for x in 0..20 {
-            assert_eq!(buffer[(x, 0)].bg, Color::Rgb(0x2A, 0x2A, 0x2A));
-        }
-
-        let no_color = Palette::of(Capabilities {
-            color_depth: ColorDepth::None,
-            ..caps()
-        });
-        assert_eq!(no_color.menu_selected.bg, Some(Color::Reset));
-        let fallback = menu_line(
-            vec![Span::styled("> Option", no_color.accent_bold)],
-            true,
-            20,
-            &no_color,
-        );
-        assert_eq!(fallback.spans[0].content.chars().next(), Some('>'));
-        assert!(fallback.spans[0]
-            .style
-            .add_modifier
-            .contains(Modifier::BOLD));
-    }
-
-    #[test]
-    fn wide_terminal_does_not_open_the_run_inspector_by_default() {
-        let state = state_with_transcript();
-        let frame = render_to_string(&state, 160, 24);
-        assert!(
-            !frame.contains("Ctrl+J  activity"),
-            "wide transcript must not dock the Run inspector:\n{frame}"
-        );
-        assert!(
-            !frame.contains("Ctrl+D  changes"),
-            "wide transcript must not dock inspector shortcuts:\n{frame}"
-        );
-    }
-
-    #[test]
-    fn explicit_inspector_still_docks_on_a_wide_terminal() {
-        let mut state = state_with_transcript();
-        state.inspector.active = Some(crate::inspector::InspectorKind::Activity);
-        let frame = render_to_string(&state, 160, 24);
-        assert!(
-            frame.contains("Atividade"),
-            "Ctrl+J must still dock the activity inspector:\n{frame}"
-        );
-    }
-
-    fn complete_tool(state: &mut AppState, batch: &str, call: &str, name: &str, duration_ms: u64) {
-        state.apply_event(UiEvent::ToolStarted {
-            batch_id: ToolBatchId(batch.into()),
-            call_id: ToolCallId(call.into()),
-            name: name.into(),
-            arguments_summary: String::new(),
-        });
-        state.apply_event(UiEvent::ToolEnded {
-            batch_id: ToolBatchId(batch.into()),
-            call_id: ToolCallId(call.into()),
-            name: name.into(),
-            success: true,
-            duration_ms,
-        });
-    }
-
-    #[test]
-    fn tools_sit_flush_against_assistant_and_thinking() {
-        let mut state = AppState::new();
-        state.apply_event(UiEvent::UserMessageAdded {
-            text: "question".into(),
-        });
-        state.apply_event(UiEvent::run_started(1));
-        state.apply_event(UiEvent::ThinkingStarted);
-        state.apply_event(UiEvent::ThinkingDelta {
-            text: "plan".into(),
-        });
-        state.apply_event(UiEvent::ThinkingEnded);
-        complete_tool(&mut state, "b1", "c1", "list", 3);
-        complete_tool(&mut state, "b1", "c2", "read", 4);
-        state.apply_event(UiEvent::AssistantDelta {
-            text: "Vou explorar o projeto.\n\n".into(),
-        });
-        state.apply_event(UiEvent::AssistantEnded);
-        complete_tool(&mut state, "b2", "c3", "list", 5);
-        complete_tool(&mut state, "b2", "c4", "read", 7);
-        state.apply_event(UiEvent::ThinkingStarted);
-        state.apply_event(UiEvent::ThinkingDelta {
-            text: "still thinking".into(),
-        });
-
-        let frame = render_to_string(&state, 80, 24);
-        let rows: Vec<&str> = frame.lines().collect();
-        let explore = rows
-            .iter()
-            .position(|row| row.contains("Vou explorar"))
-            .unwrap_or_else(|| panic!("assistant body missing\n{frame}"));
-        let second_tools = rows
-            .iter()
-            .rposition(|row| row.contains("Leu, list"))
-            .unwrap_or_else(|| panic!("second tools missing\n{frame}"));
-        let thinking = rows
-            .iter()
-            .position(|row| row.contains("Pensando"))
-            .unwrap_or_else(|| panic!("thinking missing\n{frame}"));
-        assert_eq!(
-            second_tools,
-            explore + 1,
-            "assistant body must sit flush against the next tool row\n{frame}"
-        );
-        assert_eq!(
-            thinking,
-            second_tools + 1,
-            "thinking must sit flush against the tool row\n{frame}"
-        );
-    }
-
-    #[test]
-    fn left_drag_selects_and_right_click_copies_or_pastes() {
-        let mut state = AppState::new();
-        state.apply_event(UiEvent::AssistantDelta {
-            text: "hello world".into(),
-        });
-        let mut cache = WrapCache::default();
-        let size = (80, 24);
-        let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
-        terminal
-            .draw(|frame| render_frame(frame, &state, caps(), &mut cache))
-            .unwrap();
-        let area = cache.selection_regions[0].unwrap();
-        let row = area.bottom() - 1;
-        let start = terminal_action(
-            mouse_event(MouseEventKind::Down(MouseButton::Left), 2, row),
-            &state,
-            size,
-            &mut cache,
-        );
-        reduce(&mut state, start.expect("start"));
-        let drag = terminal_action(
-            mouse_event(MouseEventKind::Drag(MouseButton::Left), 6, row),
-            &state,
-            size,
-            &mut cache,
-        );
-        reduce(&mut state, drag.expect("drag"));
-        assert_eq!(
-            state.selection,
-            Some(ScreenSelection {
-                anchor: ScreenPos::new(2, row),
-                head: ScreenPos::new(6, row),
-            })
-        );
-        let mut copied = String::new();
-        terminal
-            .draw(|frame| {
-                render_frame(frame, &state, caps(), &mut cache);
-                copied = super::extract_visible_selection(frame, &state, &cache);
-            })
-            .unwrap();
-        assert_eq!(copied, "hello");
-        state.selection_text = copied;
-        let right = terminal_action(
-            mouse_event(MouseEventKind::Down(MouseButton::Right), 6, 1),
-            &state,
-            size,
-            &mut cache,
-        );
-        assert_eq!(right, Some(Action::MouseSecondary));
-        assert!(reduce(&mut state, right.unwrap())
-            .contains(&crate::reducer::Effect::CopyToClipboard("hello".into())));
-        let middle = terminal_action(
-            mouse_event(MouseEventKind::Down(MouseButton::Middle), 6, 1),
-            &state,
-            size,
-            &mut cache,
-        );
-        assert_eq!(middle, Some(Action::RequestClipboardPaste));
-    }
-
-    #[test]
-    fn selection_stays_in_transcript_when_dragged_over_composer() {
-        let mut state = AppState::new();
-        state.apply_event(UiEvent::AssistantDelta {
-            text: "alpha\nbeta".into(),
-        });
-        state.apply_event(UiEvent::AssistantEnded);
-        state.composer.insert_text("PRIVATE DRAFT");
-        let mut cache = WrapCache::default();
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal
-            .draw(|frame| render_frame(frame, &state, caps(), &mut cache))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let row = (0..24)
-            .find(|y| {
-                (0..80)
-                    .map(|x| buffer[(x, *y)].symbol())
-                    .collect::<String>()
-                    .contains("alpha")
-            })
-            .unwrap();
-        for event in [
-            mouse_event(MouseEventKind::Down(MouseButton::Left), 2, row),
-            mouse_event(MouseEventKind::Drag(MouseButton::Left), 70, 23),
-            mouse_event(MouseEventKind::Up(MouseButton::Left), 70, 23),
-        ] {
-            let action = terminal_action(event, &state, (80, 24), &mut cache).unwrap();
-            reduce(&mut state, action);
-        }
-        assert!(
-            state.selection_text.is_empty(),
-            "drag has not been painted yet"
-        );
-        let copy_event = mouse_event(MouseEventKind::Down(MouseButton::Right), 70, 23);
-        assert!(super::is_selection_copy_event(&copy_event));
-        let mut copied = String::new();
-        terminal
-            .draw(|frame| {
-                render_frame(frame, &state, caps(), &mut cache);
-                copied = super::extract_visible_selection(frame, &state, &cache);
-            })
-            .unwrap();
-        assert!(
-            copied.contains("alpha") && copied.contains("beta"),
-            "{copied:?}"
-        );
-        assert!(
-            !copied.contains("PRIVATE DRAFT") && !copied.contains("Ctrl+C"),
-            "{copied:?}"
-        );
-        let selected_bg = Palette::of(caps()).selection;
-        let area = state.selection_area.unwrap();
-        let buffer = terminal.backend().buffer();
-        for y in 0..24 {
-            for x in 0..80 {
-                if buffer[(x, y)].bg == selected_bg {
-                    assert!(super::area_contains(area, x, y));
-                    assert!(x < 10, "padding at {x},{y} was highlighted");
-                }
-            }
-        }
-        state.selection_text = copied.clone();
-        let action = terminal_action(copy_event, &state, (80, 24), &mut cache).unwrap();
-        assert!(
-            reduce(&mut state, action).contains(&crate::reducer::Effect::CopyToClipboard(copied))
-        );
-        let action = terminal_action(
-            mouse_event(MouseEventKind::Down(MouseButton::Left), 3, 21),
-            &state,
-            (80, 24),
-            &mut cache,
-        )
-        .unwrap();
-        reduce(&mut state, action);
-        assert!(
-            state.selection.is_none(),
-            "composer does not start transcript selection"
-        );
-    }
-
-    #[test]
-    fn transcript_selection_survives_unrelated_growth_without_following_tail() {
-        let mut state = AppState::new();
-        state.apply_event(UiEvent::AssistantDelta {
-            text: "alpha".into(),
-        });
-        state.apply_event(UiEvent::AssistantEnded);
-        let mut cache = WrapCache::default();
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal
-            .draw(|frame| render_frame(frame, &state, caps(), &mut cache))
-            .unwrap();
-        let area = cache.selection_regions[0].unwrap();
-        let row = area.bottom() - 1;
-        for event in [
-            mouse_event(MouseEventKind::Down(MouseButton::Left), area.x, row),
-            mouse_event(MouseEventKind::Drag(MouseButton::Left), area.x + 4, row),
-        ] {
-            let action = terminal_action(event, &state, (80, 24), &mut cache).unwrap();
-            reduce(&mut state, action);
-        }
-        assert!(state.scroll.is_pinned());
-        let mut selected = String::new();
-        terminal
-            .draw(|frame| {
-                render_frame(frame, &state, caps(), &mut cache);
-                selected = super::extract_visible_selection(frame, &state, &cache);
-            })
-            .unwrap();
-        assert_eq!(selected, "alpha");
-        state.selection_text = selected.clone();
-        state.apply_event(UiEvent::UserMessageAdded {
-            text: "unrelated message".into(),
-        });
-        state.apply_event(UiEvent::AssistantDelta {
-            text: "unrelated\n".repeat(30),
-        });
-        terminal
-            .draw(|frame| {
-                render_frame(frame, &state, caps(), &mut cache);
-                selected = super::extract_visible_selection(frame, &state, &cache);
-            })
-            .unwrap();
-        assert_eq!(selected, "alpha");
-    }
-
-    #[test]
-    fn changed_selected_cells_cannot_silently_retarget_copy() {
-        let mut state = AppState::new();
-        let area = ratatui::layout::Rect::new(0, 0, 5, 1);
-        state.selection = Some(ScreenSelection {
-            anchor: ScreenPos::new(0, 0),
-            head: ScreenPos::new(4, 0),
-        });
-        state.selection_area = Some(area);
-        let mut cache = WrapCache::default();
-        cache.selection_regions[0] = Some(area);
-        let mut terminal = Terminal::new(TestBackend::new(5, 1)).unwrap();
-        terminal
-            .draw(|frame| {
-                frame.render_widget(Paragraph::new("alpha"), area);
-                assert!(super::validate_painted_selection(frame, &state, &mut cache));
-            })
-            .unwrap();
-        state.selection_text = "alpha".into();
-        for text in ["omega", "alpha"] {
-            terminal
-                .draw(|frame| {
-                    frame.render_widget(Paragraph::new(text), area);
-                    assert!(!super::validate_painted_selection(
-                        frame, &state, &mut cache
-                    ));
-                    assert!(super::extract_visible_selection(frame, &state, &cache).is_empty());
-                })
-                .unwrap();
-        }
-        reduce(&mut state, Action::ClearScreenSelection);
-        for event in [
-            mouse_event(MouseEventKind::Down(MouseButton::Right), 1, 0),
-            Event::Key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('c'),
-                KeyModifiers::CONTROL,
-            )),
-        ] {
-            assert!(terminal_action(event, &state, (5, 1), &mut cache).is_none());
-        }
-        assert!(!state.shutdown);
-    }
-
-    #[test]
-    fn resize_then_copy_in_one_batch_does_not_cancel_or_paste() {
-        let mut state = AppState::new();
-        let area = ratatui::layout::Rect::new(0, 0, 5, 1);
-        let selection = ScreenSelection {
-            anchor: ScreenPos::new(0, 0),
-            head: ScreenPos::new(4, 0),
-        };
-        state.selection = Some(selection);
-        state.selection_area = Some(area);
-        state.selection_text = "alpha".into();
-        let mut cache = WrapCache::default();
-        let mut buffer = ratatui::buffer::Buffer::empty(area);
-        buffer.set_string(0, 0, "alpha", ratatui::style::Style::default());
-        cache.painted_selection = Some(crate::selection::capture_selection(
-            &buffer, selection, area,
-        ));
-        let resize = terminal_action(Event::Resize(4, 1), &state, (4, 1), &mut cache).unwrap();
-        reduce(&mut state, resize);
-        assert!(state.selection.is_none());
-        for event in [
-            mouse_event(MouseEventKind::Down(MouseButton::Right), 1, 0),
-            Event::Key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('c'),
-                KeyModifiers::CONTROL,
-            )),
-        ] {
-            assert!(terminal_action(event, &state, (4, 1), &mut cache).is_none());
-        }
-    }
-
-    #[test]
-    fn selection_inside_inspector_excludes_border_and_transcript() {
-        let mut state = AppState::new();
-        state.apply_event(UiEvent::AssistantDelta {
-            text: "TRANSCRIPT ONLY".into(),
-        });
-        state.activity = None;
-        state.inspector.active = Some(crate::inspector::InspectorKind::Activity);
-        let mut cache = WrapCache::default();
-        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
-        terminal
-            .draw(|frame| render_frame(frame, &state, caps(), &mut cache))
-            .unwrap();
-        let area = cache.selection_regions[1].unwrap();
-        for event in [
-            mouse_event(MouseEventKind::Down(MouseButton::Left), area.x, area.y),
-            mouse_event(MouseEventKind::Drag(MouseButton::Left), 0, 23),
-        ] {
-            let action = terminal_action(event, &state, (120, 24), &mut cache).unwrap();
-            reduce(&mut state, action);
-        }
-        let mut copied = String::new();
-        terminal
-            .draw(|frame| {
-                render_frame(frame, &state, caps(), &mut cache);
-                copied = super::extract_visible_selection(frame, &state, &cache);
-            })
-            .unwrap();
-        assert!(copied.contains("Cronologia"), "{copied:?}");
-        assert!(
-            !copied.contains("TRANSCRIPT ONLY")
-                && !copied.contains("scroll")
-                && !copied.contains('│'),
-            "{copied:?}"
-        );
-    }
-
-    #[test]
-    fn wheel_still_scrolls_when_mouse_is_captured() {
-        let state = AppState::new();
-        let mut cache = WrapCache::default();
-        let action = terminal_action(
-            mouse_event(MouseEventKind::ScrollUp, 0, 0),
-            &state,
-            (80, 24),
-            &mut cache,
-        );
-        assert!(matches!(
-            action,
-            Some(Action::Scroll {
-                intent: ScrollIntent::Up,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn slash_popup_keeps_a_late_selection_visible_in_a_small_viewport() {
-        let mut state = AppState::new();
-        state.set_skill_names_for_test((0..20).map(|index| format!("skill-{index:02}")).collect());
-        state.slash_suggestions = Some(SlashSuggestions {
-            query: "skill".into(),
-            selected: 15,
-        });
-
-        let frame = render_to_string(&state, 32, 10);
-
-        assert!(frame.contains("/skill-15"), "{frame}");
-        assert!(!frame.contains("/skill-00"), "{frame}");
-    }
-
-    fn render_to_string(state: &AppState, width: u16, height: u16) -> String {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|frame| render_frame(frame, state, caps(), &mut WrapCache::default()))
-            .expect("draw");
-        let buffer = terminal.backend().buffer();
-        let mut out = String::new();
-        for y in 0..buffer.area.height {
-            for x in 0..buffer.area.width {
-                out.push(buffer[(x, y)].symbol().chars().next().unwrap_or(' '));
-            }
-            out.push('\n');
-        }
-        out
-    }
-
-    #[test]
-    fn migrated_causal_suffix_and_cancel_wait_for_queued_stream_data() {
-        let tool_ended = UiEvent::ToolEnded {
-            batch_id: ToolBatchId("batch-1".into()),
-            call_id: ToolCallId("call-1".into()),
-            name: "read".into(),
-            success: false,
-            duration_ms: 1,
-        };
-        assert!(control_requires_data_barrier(&[tool_ended]));
-        assert!(control_requires_data_barrier(&[UiEvent::RunCancelled {
-            run_id: 1,
-        }]));
-        assert!(!control_requires_data_barrier(&[
-            UiEvent::AuthStateChanged {
-                provider: None,
-                authenticated: false,
-            },
-        ]));
-        let mut visible_stream_started = true;
-        update_visible_stream_state(
-            &UiEvent::RunStarted {
-                run_id: 2,
-                max_mutating_tool_calls: 1,
-                max_read_tool_calls: 1,
-                max_turns: 1,
-            },
-            &mut visible_stream_started,
-        );
-        assert!(!visible_stream_started);
-    }
-
-    #[test]
-    fn question_arrows_are_routed_to_reducer_instead_of_scrollback() {
-        let mut state = AppState::new();
-        state.apply_event(UiEvent::QuestionRequired {
-            request_id: crate::api::InteractionRequestId("question-1".into()),
-            question: "Which crate?".into(),
-            options: vec![
-                slim_core::QuestionOption {
-                    label: "core".into(),
-                    description: String::new(),
-                },
-                slim_core::QuestionOption {
-                    label: "tui".into(),
-                    description: String::new(),
-                },
-            ],
-            persisted: false,
-        });
-        let key = crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Down,
-            crossterm::event::KeyModifiers::NONE,
-        );
-        let mut cache = WrapCache::default();
-        let action = terminal_action(
-            crossterm::event::Event::Key(key),
-            &state,
-            (80, 24),
-            &mut cache,
-        )
-        .expect("action");
-        assert!(
-            matches!(
-                action,
-                Action::Key(event) if event.code == crossterm::event::KeyCode::Down
-            ),
-            "pending question must capture arrows: {action:?}"
-        );
-        reduce(&mut state, action);
-        assert_eq!(
-            state
-                .pending_interaction()
-                .map(|interaction| interaction.selected_question_option),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn approval_decision_is_blocked_when_resize_hides_the_card() {
-        let mut state = AppState::new();
-        state.apply_event(UiEvent::ApprovalRequired {
-            request_id: crate::api::InteractionRequestId("approval-1".into()),
-            summary: "uma solicitação que precisa ser lida".into(),
-            persisted: false,
-        });
-        // Simulate a previously readable frame followed by a resize and Y in
-        // the same input batch.  terminal_action must revalidate geometry
-        // before allowing the reducer to see a decision key.
-        state.approval_content_accessible = true;
-        let mut cache = WrapCache::default();
-        let action = terminal_action(
-            Event::Key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('y'),
-                crossterm::event::KeyModifiers::NONE,
-            )),
-            &state,
-            (20, 3),
-            &mut cache,
-        )
-        .expect("inaccessible approval still yields a reducer action");
-        assert!(matches!(
-            action,
-            Action::SetApprovalContentAccessible(false)
-        ));
-        reduce(&mut state, action);
-        assert!(!state.approval_content_accessible);
-        assert_eq!(
-            super::question_composer_hint(&state),
-            Some("aprovação · amplie o terminal para ler")
-        );
-    }
-
-    #[test]
-    fn toasts_keep_one_principal_row_and_expose_history() {
-        let mut state = AppState::new();
-        state.apply_event(UiEvent::UserMessageAdded {
-            text: "prompt".into(),
-        });
-        state.push_notification("first notice".into());
-        state.push_notification("second notice".into());
-        let frame = render_to_string(&state, 80, 24);
-        assert!(
-            frame.contains("second notice") && frame.contains("+1 histórico"),
-            "latest toast should expose bounded history:\n{frame}"
-        );
-        assert!(
-            !frame.contains("first notice"),
-            "history is inspector-only:\n{frame}"
-        );
-        assert_eq!(toast_row_count(&state, 24), 1);
-    }
-
-    #[test]
-    fn toast_deadline_tracks_highlight_then_expiry_and_skips_hidden_rows() {
-        let mut state = AppState::new();
-        state.push_notification("notice".into());
-        let count = toast_row_count(&state, 24);
-        assert_eq!(count, 1);
-        assert_eq!(
-            super::next_toast_visual_deadline_ms(&state, 0, count, true),
-            Some(super::INFO_TOAST_HIGHLIGHT_MS)
-        );
-        assert_eq!(
-            super::next_toast_visual_deadline_ms(
-                &state,
-                super::INFO_TOAST_HIGHLIGHT_MS,
-                count,
-                true,
-            ),
-            Some(crate::app::INFO_TOAST_TTL_MS)
-        );
-        assert_eq!(
-            super::next_toast_visual_deadline_ms(&state, 0, count, false),
-            Some(crate::app::INFO_TOAST_TTL_MS)
-        );
-
-        state.mcp_overlay = Some(McpOverlay::default());
-        let hidden_count = toast_row_count(&state, 24);
-        assert_eq!(hidden_count, 0);
-        assert_eq!(
-            super::next_toast_visual_deadline_ms(&state, 0, hidden_count, true),
-            None
-        );
-    }
-
-    #[test]
-    fn toast_is_bold_only_during_initial_highlight_and_reduced_motion_is_stable() {
-        let mut state = AppState::new();
-        state.push_notification("notice".into());
-        let render = |state: &AppState, capabilities| {
-            let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
-            terminal
-                .draw(|frame| {
-                    super::render_frame(frame, state, capabilities, &mut WrapCache::default())
-                })
-                .expect("draw");
-            terminal.backend().buffer().clone()
-        };
-        let notice_modifier = |buffer: &ratatui::buffer::Buffer| {
-            for y in 0..buffer.area.height {
-                let row = (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>();
-                if let Some(x) = row.find("notice") {
-                    return buffer[(x as u16, y)].modifier;
-                }
-            }
-            panic!("notice cell")
-        };
-
-        let highlighted = render(&state, caps());
-        assert!(notice_modifier(&highlighted).contains(Modifier::BOLD));
-
-        state.clock.elapsed_ms = super::INFO_TOAST_HIGHLIGHT_MS;
-        let stable = render(&state, caps());
-        assert!(!notice_modifier(&stable).contains(Modifier::BOLD));
-        state.clock.elapsed_ms += 1_000;
-        assert_eq!(stable, render(&state, caps()));
-
-        let reduced = Capabilities {
-            reduced_motion: true,
-            ..caps()
-        };
-        state.clock.elapsed_ms = 0;
-        let reduced_initial = render(&state, reduced);
-        assert!(!notice_modifier(&reduced_initial).contains(Modifier::BOLD));
-        state.clock.elapsed_ms = super::INFO_TOAST_HIGHLIGHT_MS - 1;
-        assert_eq!(reduced_initial, render(&state, reduced));
-    }
-
-    fn mcp_server_view(
-        name: &str,
-        target: &str,
-        status: McpStatusView,
-        error: Option<&str>,
-    ) -> McpServerView {
-        McpServerView {
-            name: name.into(),
-            transport: "stdio",
-            target: target.into(),
-            status,
-            tools: None,
-            error: error.map(str::to_owned),
-        }
-    }
-
-    #[test]
-    fn mcp_overlay_keeps_error_and_hints_on_their_own_rows() {
-        let mut state = AppState::new();
-        state.authenticated = true;
-        state.mcp_overlay = Some(McpOverlay {
-            selected: 1,
-            ..McpOverlay::default()
-        });
-        state.mcp_servers = vec![
-            mcp_server_view(
-                "burp-hunt",
-                r"C:\Users\User\AppData\Local\Programs\Python\Python312\python.exe -B proxy.py",
-                McpStatusView::Disconnected,
-                None,
-            ),
-            mcp_server_view(
-                "chrome-devtools",
-                "npx -y chrome-devtools-mcp@latest",
-                McpStatusView::Failed,
-                Some("%1 não é um aplicativo Win32 válido. (os error 193)"),
-            ),
-        ];
-        let frame = render_to_string(&state, 80, 24);
-        assert!(
-            frame.contains("chrome-devtools") && frame.contains("Enter test"),
-            "{frame}"
-        );
-        assert!(
-            frame.contains("os error 193") && frame.contains("python.exe"),
-            "target and error must remain readable:\n{frame}"
-        );
-        assert!(
-            !frame.contains("npx -y chrome-devtools-mcp@latest %1") && !frame.contains("Entertest"),
-            "error and hints must not be jammed onto one truncated row:\n{frame}"
-        );
-    }
-
-    #[test]
-    fn mcp_overlay_hides_status_toast() {
-        let mut state = AppState::new();
-        state.authenticated = true;
-        state.notifications.push(
-            "mcp chrome-devtools: %1 não é um aplicativo Win32 válido. (os error 193)".into(),
-        );
-        state.mcp_overlay = Some(McpOverlay::default());
-        state.mcp_servers = vec![mcp_server_view(
-            "chrome-devtools",
-            "npx -y chrome-devtools-mcp@latest",
-            McpStatusView::Failed,
-            Some("%1 não é um aplicativo Win32 válido. (os error 193)"),
-        )];
-        let frame = render_to_string(&state, 80, 24);
-        assert!(
-            !frame.contains("mcp chrome-devtools:"),
-            "toast must not sit on the overlay:\n{frame}"
-        );
-        assert_eq!(toast_row_count(&state, 24), 0);
-    }
-
-    #[test]
-    fn wide_activity_rail_includes_turn_and_this_turn_tool_budgets() {
-        let mut state = AppState::new();
-        state.apply_event(UiEvent::run_started_with_budget(1, 32, 96, 128));
-        state.apply_event(UiEvent::UsageEstimateForRun {
-            run_id: 1,
-            request_id: 1,
-            context_tokens: 100,
-            context_window_tokens: 128_000,
-        });
-        let wide = render_to_string(&state, 80, 24);
-        assert!(!wide.contains("turnos 1/128"), "{wide}");
-        assert!(!wide.contains("leituras 0/96"), "{wide}");
-        assert!(!wide.contains("edições 0/32"), "{wide}");
-        assert!(
-            !wide.contains("Ctrl+C stop"),
-            "cancel is already in the footer: {wide}"
-        );
-        assert!(wide.contains("Ctrl+C cancel"), "{wide}");
-        state.turns_used = 103;
-        state.tools_used_read = 77;
-        state.tools_used_mutating = 2;
-        let counters = render_to_string(&state, 80, 24);
-        assert!(counters.contains("turnos 103/128"), "{counters}");
-        assert!(counters.contains("leituras 77/96"), "{counters}");
-        assert!(!counters.contains("edições 2/32"), "{counters}");
-        let narrow = render_to_string(&state, 71, 24);
-        assert!(!narrow.contains("turn 103/128"), "{narrow}");
-    }
-
-    #[test]
-    fn footer_model_keeps_identity_and_effort_with_cell_safe_elision() {
-        let mut state = AppState::new();
-        state.authenticated = true;
-        state.model = "model-宇宙-with-a-very-long-provider-qualified-name".into();
-        for width in [38, 58, 78, 118] {
-            let label = crate::view_model::model_metadata(&state, width as usize - 2);
-            assert!(label.contains("model-"), "{width}: {label}");
-            assert!(
-                label.contains("(high)"),
-                "effort stays beside the model: {width}: {label}"
-            );
-            assert!(
-                !label.contains("Auto") || width < 78,
-                "metadata leaves mode to its own footer row: {width}: {label}"
-            );
-            assert!(unicode_width::UnicodeWidthStr::width(label.as_str()) <= width as usize - 2);
-            assert_eq!(label.contains('…'), width < 78, "{width}: {label}");
-        }
-        state.authenticated = false;
-        assert!(super::composer_label(&state, 38, 1).is_empty());
-        assert!(crate::view_model::model_metadata(&state, 38).is_empty());
-    }
-
-    #[test]
-    fn footer_values_are_accented_while_shortcut_descriptions_stay_muted() {
-        let mut state = AppState::new();
-        state.authenticated = true;
-        let palette = super::Palette::of(caps());
-        let line = footer_line(
-            0,
-            2,
-            "Auto · GPT-5.6 Sol (high) · ctx ~7%",
-            &state,
-            true,
-            caps(),
-            &palette,
-        );
-        assert_eq!(
-            line.spans[0].style,
-            palette.secondary.add_modifier(Modifier::BOLD)
-        );
-        assert_eq!(line.spans[1].style, palette.muted);
-        assert_eq!(
-            line.spans[2].style,
-            palette.secondary.add_modifier(Modifier::BOLD)
-        );
-        assert_eq!(line.spans[3].style, palette.muted);
-        assert_eq!(line.spans[4].style, palette.muted);
-    }
-
-    #[test]
-    fn footer_highlights_hidden_phase_and_unread_value_without_highlighting_controls() {
-        let mut state = AppState::new();
-        state.working = true;
-        state.scroll.mode = crate::app::FollowMode::Top;
-        state.scroll.unseen = 4;
-        let palette = super::Palette::of(caps());
-        let line = footer_line(
-            1,
-            2,
-            "Thinking · Esc stop · 4 new · End latest",
-            &state,
-            false,
-            caps(),
-            &palette,
-        );
-        assert_eq!(
-            line.spans[0].style,
-            palette.secondary.add_modifier(Modifier::BOLD)
-        );
-        assert_eq!(line.spans[2].style, palette.muted);
-        assert_eq!(line.spans[4].style, palette.warning);
-        assert_eq!(line.spans[6].style, palette.muted);
-
-        let visible_controls = footer_line(
-            0,
-            1,
-            "Esc stop · Ctrl+C cancel",
-            &state,
-            true,
-            caps(),
-            &palette,
-        );
-        assert!(visible_controls
-            .spans
-            .iter()
-            .all(|span| span.style == palette.muted));
-    }
-
-    #[test]
-    fn activity_inspector_ages_keep_status_ticks_without_enabling_spinner() {
-        let mut state = AppState::new();
-        state.apply_event(UiEvent::run_started(1));
-        state.apply_event(UiEvent::AssistantDelta {
-            text: "observed".into(),
-        });
-        state.inspector.active = Some(crate::inspector::InspectorKind::Activity);
-        assert!(super::status_clock_visible(&state, 0));
-        assert!(!super::motion_needed(
-            &state,
-            caps(),
-            &mut WrapCache::default()
-        ));
-        let mut cache = WrapCache::default();
-        let mut terminal = Terminal::new(TestBackend::new(144, 32)).unwrap();
-        terminal
-            .draw(|frame| render_frame(frame, &state, caps(), &mut cache))
-            .unwrap();
-        reduce(
-            &mut state,
-            Action::StatusTick(FrameClock {
-                frame: 24,
-                elapsed_ms: 2_000,
-            }),
-        );
-        terminal
-            .draw(|frame| render_frame(frame, &state, caps(), &mut cache))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let text = (0..32)
-            .map(|y| {
-                (0..144)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("há 2.0s"), "{text}");
-        state.palette_query = Some(String::new());
-        assert!(!super::status_clock_visible(&state, 0));
-        state.palette_query = None;
-        state.working = false;
-        assert!(!super::status_clock_visible(&state, 0));
-    }
-
-    #[test]
-    fn microtransition_expires_at_249ms_and_reduced_motion_is_immediate() {
-        let mut state = AppState::new();
-        state.authenticated = true;
-        state.confirmed_setting = Some((ConfirmedSetting::Mode, 0));
-        let palette = super::Palette::of(caps());
-        let highlighted =
-            super::footer_segment_style("Auto", false, false, &state, caps(), &palette);
-        assert!(highlighted.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(
-            super::next_transition_visual_deadline_ms(&state, 0, caps()),
-            Some(super::INFO_TOAST_HIGHLIGHT_MS)
-        );
-
-        state.clock.elapsed_ms = super::INFO_TOAST_HIGHLIGHT_MS;
-        let expired = super::footer_segment_style("Auto", false, false, &state, caps(), &palette);
-        assert!(!expired.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(
-            super::next_transition_visual_deadline_ms(&state, state.clock.elapsed_ms, caps()),
-            None
-        );
-
-        state.clock.elapsed_ms = 0;
-        let reduced = super::footer_segment_style(
-            "Auto",
-            false,
-            false,
-            &state,
-            Capabilities {
-                reduced_motion: true,
-                ..caps()
-            },
-            &palette,
-        );
-        assert!(!reduced.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(
-            super::next_transition_visual_deadline_ms(
-                &state,
-                state.clock.elapsed_ms,
-                Capabilities {
-                    reduced_motion: true,
-                    ..caps()
-                }
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn idle_completed_block_keeps_frame_emphasis_when_spinner_is_suppressed() {
-        let mut state = AppState::new();
-        state.authenticated = true;
-        state.apply_event(UiEvent::UserMessageAdded {
-            text: "mensagem aceita".into(),
-        });
-        let user_label_modifier = |state: &AppState| {
-            let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
-            terminal
-                .draw(|frame| super::render_frame(frame, state, caps(), &mut WrapCache::default()))
-                .expect("draw");
-            let buffer = terminal.backend().buffer();
-            for row in 0..buffer.area.height {
-                for column in 0..buffer.area.width {
-                    if buffer[(column, row)].symbol() == "V" {
-                        return buffer[(column, row)].modifier;
-                    }
-                }
-            }
-            panic!("user label");
-        };
-
-        let recent = user_label_modifier(&state);
-        assert!(recent.contains(Modifier::BOLD));
-        state.clock.elapsed_ms = super::INFO_TOAST_HIGHLIGHT_MS;
-        let settled = user_label_modifier(&state);
-        assert!(!settled.contains(Modifier::BOLD));
-    }
-
-    #[test]
-    fn todo_active_marker_is_stable_when_the_primary_indicator_animates() {
-        let mut state = AppState::new();
-        state.authenticated = true;
-        state.working = true;
-        state.todo_dock_open = true;
-        state.todo_items = vec![TodoItemView {
-            title: "inspect state".into(),
-            status: TodoItemStatus::InProgress,
-        }];
-
-        let render = |state: &AppState| {
-            let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
-            terminal
-                .draw(|frame| super::render_frame(frame, state, caps(), &mut WrapCache::default()))
-                .expect("draw");
-            terminal.backend().buffer().clone()
-        };
-        let first = render(&state);
-        state.clock.frame = 1;
-        let second = render(&state);
-
-        let todo_marker = |buffer: &ratatui::buffer::Buffer| {
-            let row = (0..buffer.area.height)
-                .find(|y| {
-                    (0..buffer.area.width)
-                        .map(|x| buffer[(x, *y)].symbol())
-                        .collect::<String>()
-                        .contains("TODO")
-                })
-                .expect("TODO row");
-            let marker_x = (0..buffer.area.width)
-                .find(|x| matches!(buffer[(*x, row)].symbol(), "◌" | "~"))
-                .expect("TODO active marker");
-            buffer[(marker_x, row)].symbol().to_owned()
-        };
-        assert_eq!(todo_marker(&first), todo_marker(&second));
-        assert_ne!(
-            first, second,
-            "the activity rail/thinking indicator should remain the animated owner"
-        );
-    }
-
-    #[test]
-    fn todo_dock_prioritizes_actionable_items_and_neutralizes_cancelled() {
-        let mut state = AppState::new();
-        state.authenticated = true;
-        state.todo_dock_open = true;
-        state.todo_items = vec![
-            TodoItemView {
-                title: "old completed".into(),
-                status: TodoItemStatus::Completed,
-            },
-            TodoItemView {
-                title: "still pending".into(),
-                status: TodoItemStatus::Pending,
-            },
-            TodoItemView {
-                title: "blocked dependency".into(),
-                status: TodoItemStatus::Blocked,
-            },
-            TodoItemView {
-                title: "cancelled branch".into(),
-                status: TodoItemStatus::Cancelled,
-            },
-        ];
-        let frame = render_to_string(&state, 100, 24);
-        let blocked = frame.find("blocked dependency").expect("blocked row");
-        let pending = frame.find("still pending").expect("pending row");
-        let cancelled = frame.find("cancelled branch").expect("cancelled row");
-        let completed = frame.find("old completed").expect("completed row");
-        assert!(blocked < pending && pending < cancelled && cancelled < completed);
-        let cancelled_row = frame
-            .lines()
-            .find(|line| line.contains("cancelled branch"))
-            .expect("cancelled line");
-        assert!(!cancelled_row.contains('x') && !cancelled_row.contains('✕'));
-    }
-
-    #[test]
-    fn thinking_pulse_moves_to_visible_header_and_freezes_with_motion_disabled() {
-        use ratatui::backend::TestBackend;
-        let mut state = AppState::new();
-        state.authenticated = true;
-        state.apply_event(UiEvent::run_started(1));
-        state.apply_event(UiEvent::UserMessageAdded {
-            text: "history\n".repeat(80),
-        });
-        state.apply_event(UiEvent::ThinkingStarted);
-        state.apply_event(UiEvent::ThinkingDelta {
-            text: "Inspect the current state".into(),
-        });
-        let render = |state: &AppState, capabilities| {
-            let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
-            terminal
-                .draw(|frame| {
-                    super::render_frame(frame, state, capabilities, &mut WrapCache::default())
-                })
-                .unwrap();
-            terminal.backend().buffer().clone()
-        };
-        for at_top in [false, true] {
-            if at_top {
-                state.scroll.mode = crate::app::FollowMode::Top;
-            }
-            state.clock.frame = 0;
-            let first = render(&state, caps());
-            state.clock.frame = 6;
-            let next = render(&state, caps());
-            let changed = first
-                .content
-                .iter()
-                .zip(&next.content)
-                .enumerate()
-                .filter_map(|(i, (a, b))| (a != b).then_some(i))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                changed.len(),
-                1,
-                "only one pulse across transcript and rail"
-            );
-            let thinking_rows = (0..24)
-                .filter(|y| {
-                    (0..80)
-                        .map(|x| first[(x, *y)].symbol())
-                        .collect::<String>()
-                        .contains("Pensando")
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                thinking_rows.len(),
-                1,
-                "Thinking belongs to the visible header or the ActivityRail, never both"
-            );
-            assert_eq!(
-                changed[0] / 80,
-                thinking_rows[0] as usize,
-                "pulse belongs to the visible reasoning header, or rail if offscreen"
-            );
-            for capabilities in [
-                Capabilities {
-                    reduced_motion: true,
-                    ..caps()
-                },
-                Capabilities {
-                    color_depth: ColorDepth::None,
-                    ..caps()
-                },
-            ] {
-                let still = render(&state, capabilities);
-                state.clock.frame = 12;
-                assert_eq!(still, render(&state, capabilities));
-                state.clock.frame = 6;
-            }
-        }
-        state.apply_event(UiEvent::RunCompleted { run_id: 1 });
-        let finished = render(&state, caps());
-        state.clock.frame = 18;
-        assert_eq!(finished, render(&state, caps()));
-    }
-
-    #[test]
-    fn thinking_header_patch_handles_boundary_anchor_offsets_without_body_work() {
-        use crate::app::{FollowMode, ScrollAnchor};
-        use crate::block::{Block, BlockKind, BlockLifecycle, FoldState};
-
-        let mut state = AppState::new();
-        state.authenticated = true;
-        // Keep the pinned thinking block below the viewport so the anchor
-        // produces a non-zero `skip_rows` value inside its boundary-prefixed
-        // line block.
-        for index in 0..24 {
-            assert!(state.append_block(Block::new(
-                format!("history-{index}"),
-                BlockKind::Assistant("history row".into()),
-                BlockLifecycle::Complete,
-            )));
-        }
-        let mut thinking = Block::new(
-            "streaming-thinking",
-            BlockKind::Thinking("first body\nsecond body".into()),
-            BlockLifecycle::Streaming,
-        );
-        thinking.fold = FoldState::Expanded;
-        thinking.set_turn_boundary_before(true);
-        assert!(thinking.turn_boundary_before());
-        let thinking_id = thinking.id.clone();
-        assert!(state.append_block(thinking));
-        for index in 0..24 {
-            assert!(state.append_block(Block::new(
-                format!("tail-{index}"),
-                BlockKind::Assistant("tail row".into()),
-                BlockLifecycle::Complete,
-            )));
-        }
-        state.working = true;
-
-        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
-        let mut cache = WrapCache::default();
-        for (row_offset, header_expected) in [(0, true), (1, false)] {
-            state.scroll.mode = FollowMode::Pinned(ScrollAnchor {
-                block_id: thinking_id.clone(),
-                row_offset,
-            });
-            state.clock.frame = 0;
-            terminal
-                .draw(|frame| render_frame(frame, &state, caps(), &mut cache))
-                .expect("initial draw");
-            let first = terminal.backend().buffer().clone();
-            let body_counters = (
-                cache.body_hits(),
-                cache.body_misses(),
-                cache.body_bypasses(),
-                cache.body_oversized_skips(),
-            );
-
-            state.clock.frame = 6;
-            terminal
-                .draw(|frame| render_frame(frame, &state, caps(), &mut cache))
-                .expect("animated draw");
-            let second = terminal.backend().buffer().clone();
-            let changed = first
-                .content
-                .iter()
-                .zip(&second.content)
-                .enumerate()
-                .filter_map(|(index, (before, after))| (before != after).then_some(index))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                body_counters,
-                (
-                    cache.body_hits(),
-                    cache.body_misses(),
-                    cache.body_bypasses(),
-                    cache.body_oversized_skips(),
-                ),
-                "clock-only redraw must not re-render the Thinking body"
-            );
-            let header_row = (0..12).find(|row| {
-                (0..80)
-                    .map(|column| first[(column, *row)].symbol())
-                    .collect::<String>()
-                    .contains("Pensando")
-            });
-            if header_expected {
-                let header_row = header_row.expect("visible Thinking header");
-                assert_eq!(changed, vec![header_row as usize * 80 + 2]);
-            } else {
-                assert!(
-                    header_row.is_none(),
-                    "row_offset=1 should leave the boundary-prefixed header offscreen"
-                );
-                assert_eq!(changed.len(), 1, "offscreen Thinking pulses the rail only");
-            }
-        }
-    }
-
-    #[test]
-    fn residual_thinking_header_keeps_real_activity_label_without_second_spinner() {
-        use crate::block::{Block, BlockKind, BlockLifecycle};
-
-        let mut state = AppState::new();
-        state.authenticated = true;
-        state.working = true;
-        let mut thinking = Block::new(
-            "streaming-thinking",
-            BlockKind::Thinking("plan".into()),
-            BlockLifecycle::Streaming,
-        );
-        thinking.set_turn_boundary_before(true);
-        assert!(state.append_block(thinking));
-        state.activity = Some(ActivityState {
-            phase: ActivityPhase::RunningTool("read".into()),
-            started_ms: 0,
-        });
-        state.clock.elapsed_ms = 2_000;
-
-        let render = |state: &AppState| {
-            let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
-            terminal
-                .draw(|frame| render_frame(frame, state, caps(), &mut WrapCache::default()))
-                .expect("draw");
-            terminal.backend().buffer().clone()
-        };
-        let first = render(&state);
-        let rail_row = (0..24)
-            .find(|row| {
-                (0..80)
-                    .map(|column| first[(column, *row)].symbol())
-                    .collect::<String>()
-                    .contains("Lendo")
-            })
-            .expect("real activity rail label");
-        let rail_before = (0..80)
-            .map(|column| first[(column, rail_row)].clone())
-            .collect::<Vec<_>>();
-        let header_rows = (0..24)
-            .filter(|row| {
-                (0..80)
-                    .map(|column| first[(column, *row)].symbol())
-                    .collect::<String>()
-                    .contains("Pensando")
-            })
-            .count();
-        assert_eq!(
-            header_rows, 1,
-            "the residual header must not duplicate in rail"
-        );
-
-        state.clock.frame = 6;
-        let second = render(&state);
-        let rail_after = (0..80)
-            .map(|column| second[(column, rail_row)].clone())
-            .collect::<Vec<_>>();
-        assert_eq!(rail_before, rail_after, "rail glyph must stay static");
-    }
-
-    #[test]
-    fn activity_pulse_changes_one_cell_and_stops_with_reduced_motion() {
-        use ratatui::backend::TestBackend;
-        let mut state = AppState::new();
-        state.authenticated = true;
-        state.apply_event(UiEvent::run_started(1));
-        state.apply_event(UiEvent::ToolStarted {
-            batch_id: ToolBatchId("pulse".into()),
-            call_id: ToolCallId("pulse".into()),
-            name: "read".into(),
-            arguments_summary: "path=src/main.rs".into(),
-        });
-        let render = |state: &AppState, capabilities| {
-            let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 30)).unwrap();
-            terminal
-                .draw(|frame| {
-                    super::render_frame(frame, state, capabilities, &mut WrapCache::default())
-                })
-                .unwrap();
-            terminal.backend().buffer().clone()
-        };
-        let first = render(&state, caps());
-        state.clock.frame = 6;
-        let next = render(&state, caps());
-        let changed = first
-            .content
-            .iter()
-            .zip(&next.content)
-            .filter(|(a, b)| a != b)
-            .count();
-        assert_eq!(changed, 1, "only the activity glyph may animate");
-        let reduced = crate::theme::Capabilities {
-            reduced_motion: true,
-            ..caps()
-        };
-        let still = render(&state, reduced);
-        state.clock.frame = 12;
-        assert_eq!(still, render(&state, reduced));
-        let mut motion_cache = WrapCache::default();
-        assert!(!super::motion_needed(&state, reduced, &mut motion_cache));
-        state.apply_event(UiEvent::RunCompleted { run_id: 1 });
-        assert!(!super::motion_needed(&state, caps(), &mut motion_cache));
-    }
-
-    #[test]
-    fn idle_down_becomes_scroll_without_an_overlay() {
-        let state = AppState::new();
-        let mut cache = WrapCache::default();
-        let action = terminal_action(
-            crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Down,
-                crossterm::event::KeyModifiers::NONE,
-            )),
-            &state,
-            (80, 24),
-            &mut cache,
-        )
-        .expect("action");
-        assert!(matches!(
-            action,
-            Action::Scroll {
-                intent: ScrollIntent::Down,
-                ..
-            }
-        ));
-        let _ = measure_scrollback(&state, 80, 24, &mut cache);
-        let _ = FrameClock::default();
-    }
-
-    fn pinned_state_with_draft() -> AppState {
-        let mut state = AppState::new();
-        state.apply_event(UiEvent::UserMessageAdded {
-            text: "something to read back".into(),
-        });
-        let anchor = crate::app::ScrollAnchor {
-            block_id: state.blocks().last().expect("block").id.clone(),
-            row_offset: 0,
-        };
-        state.scroll.mode = crate::app::FollowMode::Pinned(anchor);
-        state.composer.insert_text("half-typed draft");
-        state
-    }
-
-    fn key_action(state: &AppState, code: crossterm::event::KeyCode) -> Action {
-        let mut cache = WrapCache::default();
-        terminal_action(
-            crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
-                code,
-                crossterm::event::KeyModifiers::NONE,
-            )),
-            state,
-            (80, 24),
-            &mut cache,
-        )
-        .expect("action")
-    }
-
-    #[test]
-    fn end_returns_to_live_edge_while_pinned_with_nonempty_draft() {
-        let state = pinned_state_with_draft();
-        assert!(state.scroll.is_pinned());
-        let action = key_action(&state, crossterm::event::KeyCode::End);
-        assert!(
-            matches!(
-                action,
-                Action::Scroll {
-                    intent: ScrollIntent::LiveEdge,
-                    ..
-                }
-            ),
-            "pinned End must honor the footer promise: {action:?}"
-        );
-    }
-
-    #[test]
-    fn home_returns_to_top_while_pinned_with_nonempty_draft() {
-        let state = pinned_state_with_draft();
-        let action = key_action(&state, crossterm::event::KeyCode::Home);
-        assert!(
-            matches!(
-                action,
-                Action::Scroll {
-                    intent: ScrollIntent::Top,
-                    ..
-                }
-            ),
-            "pinned Home must navigate: {action:?}"
-        );
-    }
-
-    #[test]
-    fn end_moves_cursor_while_typing_at_live_edge() {
-        let mut state = AppState::new();
-        state.composer.insert_text("half-typed draft");
-        assert!(state.scroll.is_live_edge());
-        let action = key_action(&state, crossterm::event::KeyCode::End);
-        assert!(
-            matches!(action, Action::Key(_)),
-            "live-edge End must keep editing the cursor: {action:?}"
-        );
-    }
-
-    #[test]
-    fn control_lane_yields_after_its_batch_budget() {
-        let (sender, receiver) = mpsc::channel();
-        for index in 0..=CONTROL_BATCH_LIMIT {
-            sender
-                .send(UiEvent::Notification {
-                    message: index.to_string(),
-                })
-                .expect("enqueue control event");
-        }
-
-        let (batch, state) = receive_batch(&receiver, CONTROL_BATCH_LIMIT, &mut Vec::new());
-
-        assert_eq!(batch.len(), CONTROL_BATCH_LIMIT);
-        assert_eq!(state, LaneDrain::Exhausted);
-        assert!(receiver.try_recv().is_ok(), "next event must remain queued");
-    }
-
-    #[test]
-    fn stream_lane_yields_after_its_batch_budget() {
-        let (sender, receiver) = mpsc::channel();
-        for index in 0..=STREAM_BATCH_LIMIT {
-            sender
-                .send(UiEvent::AssistantDelta {
-                    text: index.to_string(),
-                })
-                .expect("enqueue stream event");
-        }
-
-        let (batch, state) = receive_batch(&receiver, STREAM_BATCH_LIMIT, &mut Vec::new());
-
-        assert_eq!(batch.len(), STREAM_BATCH_LIMIT);
-        assert_eq!(state, LaneDrain::Exhausted);
-        assert!(receiver.try_recv().is_ok(), "next event must remain queued");
-    }
-
-    #[test]
-    fn spinner_glyph_cycles_braille_and_honors_fallbacks() {
-        let full = caps();
-        assert_eq!(super::spinner_glyph(0, full), '⠋');
-        assert_eq!(super::spinner_glyph(1, full), '⠙');
-        assert_eq!(super::spinner_glyph(9, full), '⠏');
-        assert_eq!(super::spinner_glyph(10, full), '⠋');
-
-        let reduced = Capabilities {
-            reduced_motion: true,
-            ..full
-        };
-        assert_eq!(super::spinner_glyph(0, reduced), '\u{25cb}');
-        assert_eq!(super::spinner_glyph(1, reduced), '\u{25cb}');
-
-        let no_color = Capabilities {
-            color_depth: ColorDepth::None,
-            ..full
-        };
-        assert_eq!(super::spinner_glyph(0, no_color), '~');
-    }
-}
+mod tests;

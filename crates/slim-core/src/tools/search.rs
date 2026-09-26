@@ -29,6 +29,8 @@ const MAX_SEARCH_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SEARCH_SCAN_FILES: usize = 4096;
 const MAX_SEARCH_SNAPSHOTS: usize = 8;
 const SEARCH_SNAPSHOT_TTL: Duration = Duration::from_secs(120);
+const MAX_SEARCH_IO_EXAMPLES: usize = 3;
+const MAX_SEARCH_IO_EXAMPLE_BYTES: usize = 96;
 
 pub(crate) const SKIP_DIR_NAMES: &[&str] = &[
     "node_modules",
@@ -80,6 +82,7 @@ pub(crate) struct SearchScan {
     pub scan_complete: bool,
     pub work_limited: bool,
     pub coverage: Vec<SearchPatternCoverage>,
+    pub io_failures: SearchIoSummary,
     pub dependency: DependencyObservation,
     pub bytes_read: u64,
 }
@@ -95,6 +98,80 @@ pub(crate) struct SearchPatternCoverage {
     pub omitted: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchIoFailureKind {
+    Walk,
+    Open,
+    Metadata,
+    Read,
+}
+
+impl SearchIoFailureKind {
+    const fn index(self) -> usize {
+        match self {
+            Self::Walk => 0,
+            Self::Open => 1,
+            Self::Metadata => 2,
+            Self::Read => 3,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Walk => "walk",
+            Self::Open => "open",
+            Self::Metadata => "metadata",
+            Self::Read => "read",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SearchIoSummary {
+    counts: [u16; 4],
+    examples: Vec<String>,
+}
+
+impl SearchIoSummary {
+    fn record(&mut self, kind: SearchIoFailureKind, root: &Path, path: &Path) {
+        let count = &mut self.counts[kind.index()];
+        *count = (*count).saturating_add(1);
+        if self.examples.len() == MAX_SEARCH_IO_EXAMPLES {
+            return;
+        }
+        let example = bounded_search_error_path(root, path);
+        if !self.examples.contains(&example) {
+            self.examples.push(example);
+        }
+    }
+
+    fn has_failures(&self) -> bool {
+        self.counts.iter().any(|count| *count > 0)
+    }
+
+    fn total(&self) -> u32 {
+        self.counts
+            .iter()
+            .fold(0u32, |total, count| total.saturating_add(u32::from(*count)))
+    }
+
+    fn category_counts(&self) -> String {
+        [
+            SearchIoFailureKind::Walk,
+            SearchIoFailureKind::Open,
+            SearchIoFailureKind::Metadata,
+            SearchIoFailureKind::Read,
+        ]
+        .into_iter()
+        .filter_map(|kind| {
+            let count = self.counts[kind.index()];
+            (count > 0).then(|| format!("{} {count}", kind.label()))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SearchBatchPage {
     pub hits: Vec<MatchedSearchHit>,
@@ -106,6 +183,7 @@ pub(crate) struct SearchBatchPage {
     pub scan_complete: bool,
     pub work_limited: bool,
     pub coverage: Arc<Vec<SearchPatternCoverage>>,
+    pub io_failures: Arc<SearchIoSummary>,
     pub next_cursor: Option<String>,
     snapshot_id: String,
     pub dependency: DependencyObservation,
@@ -145,7 +223,18 @@ impl SearchBatchPage {
         }
         let mut text = render(low);
         if low == 0 {
-            text.insert_str(0, "[hit with context and continuation exceeds presentation budget; no hit delivered; narrow the query or use the continuation; not safe for patch.expected]\n");
+            let omitted_hit = "[hit with context and continuation exceeds presentation budget; no hit delivered; narrow the query or use the continuation; not safe for patch.expected]\n";
+            if self.io_failures.has_failures() || self.work_limited || !self.scan_complete {
+                let minimal = format_minimal_search_presentation(self);
+                if minimal.len() < text.len() {
+                    text = minimal;
+                }
+            }
+            if text.len().saturating_add(omitted_hit.len()) <= max_bytes {
+                text.insert_str(0, omitted_hit);
+            } else if !self.io_failures.has_failures() && !self.work_limited && self.scan_complete {
+                text.insert_str(0, omitted_hit);
+            }
         }
         super::ToolPresentation {
             text,
@@ -183,6 +272,7 @@ struct SearchSnapshot {
     scan_complete: bool,
     work_limited: bool,
     coverage: Arc<Vec<SearchPatternCoverage>>,
+    io_failures: Arc<SearchIoSummary>,
     dependency: DependencyObservation,
     expires_at: Instant,
     last_used: Instant,
@@ -320,20 +410,37 @@ impl SearchService {
             context_lines,
             cancellation,
         )?;
+        Ok(self.cache_scan(canonical, patterns, options, scan))
+    }
+
+    fn cache_scan(
+        &self,
+        root: PathBuf,
+        patterns: Vec<String>,
+        options: SearchPageOptions,
+        scan: SearchScan,
+    ) -> SearchBatchPage {
+        let SearchPageOptions {
+            offset,
+            max_hits,
+            context_lines,
+        } = options;
         let id = new_snapshot_id();
         let patterns = Arc::new(patterns);
         let hits = Arc::new(scan.hits);
         let coverage = Arc::new(scan.coverage);
+        let io_failures = Arc::new(scan.io_failures);
         let now = Instant::now();
         let snapshot = SearchSnapshot {
             context_lines,
-            root: canonical,
+            root,
             patterns: Arc::clone(&patterns),
             hits: Arc::clone(&hits),
             capped: scan.capped,
             scan_complete: scan.scan_complete,
             work_limited: scan.work_limited,
             coverage: Arc::clone(&coverage),
+            io_failures,
             dependency: scan.dependency,
             expires_at: now + SEARCH_SNAPSHOT_TTL,
             last_used: now,
@@ -347,7 +454,7 @@ impl SearchService {
             cache.snapshots.insert(id.clone(), snapshot.clone());
             evict_old_snapshots(&mut cache);
         }
-        Ok(snapshot.page(&id, offset, max_hits, scan.bytes_read))
+        snapshot.page(&id, offset, max_hits, scan.bytes_read)
     }
 
     fn page_from_cursor(
@@ -444,6 +551,7 @@ impl SearchSnapshot {
             scan_complete: self.scan_complete,
             work_limited: self.work_limited,
             coverage: Arc::clone(&self.coverage),
+            io_failures: Arc::clone(&self.io_failures),
             next_cursor,
             snapshot_id: id.to_owned(),
             dependency: self.dependency.clone(),
@@ -642,6 +750,12 @@ pub(crate) fn format_search_batch_page(page: &SearchBatchPage, display_root: &Pa
             "\n[search scan work budget exhausted at {MAX_SEARCH_SCAN_BYTES} bytes or {MAX_SEARCH_SCAN_FILES} files; uncovered patterns are not confirmed absent]"
         ));
     }
+    if page.io_failures.has_failures() {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&format_search_io_notice(&page.io_failures));
+    }
     if let Some(coverage) = format_search_coverage(page) {
         if !output.is_empty() {
             output.push('\n');
@@ -666,11 +780,12 @@ pub(crate) fn format_search_batch_page(page: &SearchBatchPage, display_root: &Pa
 }
 
 fn format_search_coverage(page: &SearchBatchPage) -> Option<String> {
-    if page.patterns.len() <= 1 {
+    if page.patterns.len() <= 1 && !page.io_failures.has_failures() {
         return None;
     }
     let needs_summary = page.capped
         || page.work_limited
+        || page.io_failures.has_failures()
         || page.coverage.iter().any(|coverage| coverage.observed == 0);
     if !needs_summary {
         return None;
@@ -679,9 +794,14 @@ fn format_search_coverage(page: &SearchBatchPage) -> Option<String> {
     for (index, pattern) in page.patterns.iter().enumerate() {
         let coverage = page.coverage.get(index).cloned().unwrap_or_default();
         let notice = if coverage.observed == 0 {
-            if page.scan_complete {
+            if page.scan_complete && !page.io_failures.has_failures() {
                 format!(
                     "pattern {} `{pattern}`: not found after full scan",
+                    index + 1
+                )
+            } else if page.io_failures.has_failures() {
+                format!(
+                    "pattern {}: not confirmed absent; I/O errors left part of the scan unread",
                     index + 1
                 )
             } else if page.work_limited {
@@ -708,7 +828,7 @@ fn format_search_coverage(page: &SearchBatchPage) -> Option<String> {
                 coverage.retained,
                 coverage.omitted
             )
-        } else if page.scan_complete {
+        } else if page.scan_complete && !page.io_failures.has_failures() {
             format!(
                 "pattern {} `{pattern}`: {} retained; full coverage",
                 index + 1,
@@ -724,6 +844,80 @@ fn format_search_coverage(page: &SearchBatchPage) -> Option<String> {
         notices.push(notice);
     }
     (!notices.is_empty()).then(|| format!("[search coverage: {}]", notices.join("; ")))
+}
+
+fn format_search_io_notice(failures: &SearchIoSummary) -> String {
+    let mut notice = format!(
+        "[search incomplete: {} I/O failure(s) ({}); coverage is partial and unmatched patterns are not confirmed absent",
+        failures.total(),
+        failures.category_counts()
+    );
+    if !failures.examples.is_empty() {
+        notice.push_str("; example paths: ");
+        notice.push_str(&failures.examples.join(", "));
+    }
+    notice.push(']');
+    notice
+}
+
+fn format_minimal_search_presentation(page: &SearchBatchPage) -> String {
+    let mut causes = Vec::new();
+    if page.io_failures.has_failures() {
+        causes.push("I/O errors");
+    }
+    if page.work_limited {
+        causes.push("search work budget exhausted");
+    }
+    if page.capped {
+        causes.push("result cap reached");
+    }
+    if causes.is_empty() {
+        causes.push("scan stopped early");
+    }
+    let mut output = format!(
+        "[search incomplete: {}; unmatched patterns are not confirmed absent]\n[no hit record delivered within presentation budget]",
+        causes.join("; ")
+    );
+    let next = page.first;
+    if next <= page.total {
+        let cursor = format!("{}:{next:x}", page.snapshot_id);
+        output.push_str(&format!(
+            "\n[pass \"cursor\": \"{cursor}\" for the next page]"
+        ));
+    }
+    output
+}
+
+fn bounded_search_error_path(root: &Path, path: &Path) -> String {
+    let relative = path
+        .strip_prefix(root)
+        .unwrap_or_else(|_| Path::new("<outside-root>"));
+    let display = relative.to_string_lossy();
+    let display = if display.is_empty() {
+        "."
+    } else {
+        display.as_ref()
+    };
+    let mut output = String::with_capacity(MAX_SEARCH_IO_EXAMPLE_BYTES);
+    let mut characters = display.chars().peekable();
+    let mut truncated = false;
+    let prefix_limit = MAX_SEARCH_IO_EXAMPLE_BYTES.saturating_sub(3);
+    while let Some(character) = characters.next() {
+        let character = if character.is_control() {
+            '?'
+        } else {
+            character
+        };
+        if output.len().saturating_add(character.len_utf8()) > prefix_limit {
+            truncated = true;
+            break;
+        }
+        output.push(character);
+    }
+    if truncated {
+        output.push_str("...");
+    }
+    output
 }
 
 impl SearchPage {
@@ -763,6 +957,57 @@ fn validate_patterns(patterns: &[String]) -> Result<(), ToolError> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct SearchWalkEntry {
+    path: PathBuf,
+    is_dir: bool,
+}
+
+#[derive(Debug)]
+struct SearchOpenedFile<R> {
+    reader: R,
+    len: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchOpenFailure {
+    Open,
+    Metadata,
+}
+
+impl SearchOpenFailure {
+    const fn io_kind(self) -> SearchIoFailureKind {
+        match self {
+            Self::Open => SearchIoFailureKind::Open,
+            Self::Metadata => SearchIoFailureKind::Metadata,
+        }
+    }
+}
+
+fn map_search_walk_entry(
+    entry: Result<ignore::DirEntry, ignore::Error>,
+    root: &Path,
+) -> Result<SearchWalkEntry, PathBuf> {
+    let entry =
+        entry.map_err(|error| search_walk_error_path(&error).unwrap_or(root).to_path_buf())?;
+    Ok(SearchWalkEntry {
+        path: entry.path().to_path_buf(),
+        is_dir: entry.file_type().is_some_and(|kind| kind.is_dir()),
+    })
+}
+
+fn search_walk_error_path(error: &ignore::Error) -> Option<&Path> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            search_walk_error_path(err)
+        }
+        ignore::Error::Partial(errors) => errors.iter().find_map(search_walk_error_path),
+        ignore::Error::Loop { child, .. } => Some(child),
+        _ => None,
+    }
+}
+
 fn search_with_walker(
     root: &Path,
     patterns: &[String],
@@ -779,10 +1024,52 @@ fn search_with_walker(
         .follow_links(false);
     walker.filter_entry(|entry| !should_skip_entry(entry.path()));
 
+    let entries = walker
+        .build()
+        .map(|entry| map_search_walk_entry(entry, root));
+    search_with_entries(
+        root,
+        patterns,
+        hit_limit,
+        context_lines,
+        cancellation,
+        entries,
+        |path, evidence| open_search_file(path, evidence),
+    )
+}
+
+fn open_search_file(
+    path: &Path,
+    evidence: &mut SearchEvidence,
+) -> Result<SearchOpenedFile<BufReader<File>>, SearchOpenFailure> {
+    let file = File::open(path).map_err(|_| SearchOpenFailure::Open)?;
+    let metadata = file.metadata().map_err(|_| SearchOpenFailure::Metadata)?;
+    evidence.record_file(path, &file, &metadata);
+    Ok(SearchOpenedFile {
+        reader: BufReader::new(file),
+        len: metadata.len(),
+    })
+}
+
+fn search_with_entries<I, F, R>(
+    root: &Path,
+    patterns: &[String],
+    hit_limit: usize,
+    context_lines: usize,
+    cancellation: Option<&CancellationToken>,
+    entries: I,
+    mut open_file: F,
+) -> Result<SearchScan, ToolExecutionError>
+where
+    I: IntoIterator<Item = Result<SearchWalkEntry, PathBuf>>,
+    F: FnMut(&Path, &mut SearchEvidence) -> Result<SearchOpenedFile<R>, SearchOpenFailure>,
+    R: BufRead,
+{
     let mut hits: Vec<MatchedSearchHit> = Vec::new();
     let mut capped = false;
     let mut scan_complete = true;
     let mut work_limited = false;
+    let mut io_failures = SearchIoSummary::default();
     let mut coverage = vec![SearchPatternCoverage::default(); patterns.len()];
     let mut scanned_files = 0usize;
     let mut evidence = SearchEvidence::new(root, patterns);
@@ -801,18 +1088,23 @@ fn search_with_walker(
         .iter()
         .map(|pattern| pattern.as_bytes())
         .collect::<Vec<_>>();
-    'walk: for entry in walker.build() {
+    'walk: for entry in entries {
         if let Err(error) = check_cancelled(cancellation) {
             return Err(evidence.error(error));
         }
         // Per-entry walk errors (permission, transient lock) skip the entry
         // instead of failing the whole search; the root itself is guarded
         // above.
-        let Ok(entry) = entry else {
-            continue;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(path) => {
+                scan_complete = false;
+                io_failures.record(SearchIoFailureKind::Walk, root, &path);
+                continue;
+            }
         };
-        let path = entry.path();
-        if entry.file_type().is_some_and(|kind| kind.is_dir()) || should_skip_file(path) {
+        let path = entry.path;
+        if entry.is_dir || should_skip_file(&path) {
             continue;
         }
         if scanned_files >= MAX_SEARCH_SCAN_FILES {
@@ -821,21 +1113,27 @@ fn search_with_walker(
             break 'walk;
         }
         scanned_files = scanned_files.saturating_add(1);
-        // Unreadable files are skipped like binary files: one bad file must
-        // not invalidate hits already collected.
-        let Ok(file) = File::open(path) else {
-            continue;
+        // Unreadable files are recorded and skipped: one bad file must not
+        // invalidate hits already collected.
+        let opened = match open_file(&path, &mut evidence) {
+            Ok(opened) => opened,
+            Err(failure) => {
+                scan_complete = false;
+                io_failures.record(failure.io_kind(), root, &path);
+                continue;
+            }
         };
-        let Ok(metadata) = file.metadata() else {
-            continue;
-        };
-        evidence.record_file(path, &file, &metadata);
-        if metadata.len() > MAX_FILE_BYTES {
+        if opened.len > MAX_FILE_BYTES {
             continue;
         }
-        let mut reader = BufReader::new(file);
-        let Ok(sample) = reader.fill_buf() else {
-            continue;
+        let mut reader = opened.reader;
+        let sample = match reader.fill_buf() {
+            Ok(sample) => sample,
+            Err(_) => {
+                scan_complete = false;
+                io_failures.record(SearchIoFailureKind::Read, root, &path);
+                continue;
+            }
         };
         if sample.contains(&0) {
             if !record_search_bytes(&mut evidence, sample) {
@@ -865,9 +1163,11 @@ fn search_with_walker(
                     }
                 }
                 Err(_) => {
-                    // Unreadable chunk ends this file, not the search.
+                    // An unreadable chunk ends this file, not the search. The
+                    // partially accumulated line is not a complete hit.
+                    scan_complete = false;
+                    io_failures.record(SearchIoFailureKind::Read, root, &path);
                     if !record_search_bytes(&mut evidence, &line_bytes) {
-                        scan_complete = false;
                         work_limited = true;
                         break 'walk;
                     }
@@ -1008,6 +1308,7 @@ fn search_with_walker(
         scan_complete,
         work_limited,
         coverage,
+        io_failures,
         dependency,
         bytes_read,
     })
@@ -1151,6 +1452,7 @@ pub(crate) fn display_path(display_root: &Path, path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::{self, BufRead, Cursor, Read};
 
     #[test]
     fn presentation_pages_preserve_multipattern_records_context_and_final_cursor() {
@@ -2014,6 +2316,605 @@ mod tests {
         assert_eq!(second.bytes_read, 0);
         assert_eq!(second.hits.len(), 1);
         assert_eq!(second.total, first.total);
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    fn synthetic_entry(root: &Path, name: &str) -> Result<SearchWalkEntry, PathBuf> {
+        Ok(SearchWalkEntry {
+            path: root.join(name),
+            is_dir: false,
+        })
+    }
+
+    #[test]
+    fn synthetic_walker_open_and_metadata_failures_keep_hits_and_mark_absence_unknown() {
+        let root = temp_root("synthetic-walk-open-metadata");
+        fs::create_dir_all(&root).unwrap();
+        let patterns = vec!["needle".to_owned(), "missing".to_owned()];
+        let scan = search_with_entries(
+            &root,
+            &patterns,
+            10,
+            0,
+            None,
+            vec![
+                synthetic_entry(&root, "hit.txt"),
+                Err(root.join("walk-denied.txt")),
+                synthetic_entry(&root, "denied.txt"),
+                synthetic_entry(&root, "metadata.txt"),
+            ],
+            |path, _| match path.file_name().and_then(|name| name.to_str()) {
+                Some("denied.txt") => Err(SearchOpenFailure::Open),
+                Some("metadata.txt") => Err(SearchOpenFailure::Metadata),
+                _ => Ok(SearchOpenedFile {
+                    reader: Cursor::new(b"needle retained\n".as_slice()),
+                    len: 16,
+                }),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(scan.hits.len(), 1);
+        assert_eq!(scan.hits[0].hit.text, "needle retained");
+        assert!(!scan.scan_complete);
+        assert_eq!(
+            scan.io_failures.counts[SearchIoFailureKind::Walk.index()],
+            1
+        );
+        assert_eq!(
+            scan.io_failures.counts[SearchIoFailureKind::Open.index()],
+            1
+        );
+        assert_eq!(
+            scan.io_failures.counts[SearchIoFailureKind::Metadata.index()],
+            1
+        );
+        assert_eq!(
+            scan.io_failures.counts[SearchIoFailureKind::Read.index()],
+            0
+        );
+        assert!(scan
+            .io_failures
+            .examples
+            .iter()
+            .any(|example| example == "walk-denied.txt"));
+
+        let page = SearchService::default().cache_scan(
+            root.clone(),
+            patterns,
+            SearchPageOptions {
+                offset: 1,
+                max_hits: 10,
+                context_lines: 0,
+            },
+            scan,
+        );
+        let output = format_search_batch_page(&page, &root);
+        assert!(output.contains("search incomplete"), "{output}");
+        assert!(output.contains("not confirmed absent"), "{output}");
+        assert!(!output.contains("not found after full scan"), "{output}");
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    #[test]
+    fn single_pattern_with_io_failure_does_not_confirm_zero_hit_absence() {
+        let root = temp_root("single-pattern-partial-absence");
+        fs::create_dir_all(&root).unwrap();
+        let patterns = vec!["needle".to_owned()];
+        let scan = search_with_entries(
+            &root,
+            &patterns,
+            10,
+            0,
+            None,
+            vec![synthetic_entry(&root, "unreadable.txt")],
+            |_path, _| -> Result<SearchOpenedFile<Cursor<&'static [u8]>>, SearchOpenFailure> {
+                Err(SearchOpenFailure::Open)
+            },
+        )
+        .unwrap();
+        assert!(scan.hits.is_empty());
+        assert!(!scan.scan_complete);
+
+        let page = SearchService::default().cache_scan(
+            root.clone(),
+            patterns,
+            SearchPageOptions {
+                offset: 1,
+                max_hits: 10,
+                context_lines: 0,
+            },
+            scan,
+        );
+        let output = format_search_batch_page(&page, &root);
+        assert!(output.contains("search incomplete"), "{output}");
+        assert!(output.contains("not confirmed absent"), "{output}");
+        assert!(!output.contains("not found after full scan"), "{output}");
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    struct FillBufFailure;
+
+    impl Read for FillBufFailure {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "synthetic read failure",
+            ))
+        }
+    }
+
+    impl BufRead for FillBufFailure {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "synthetic fill_buf failure",
+            ))
+        }
+
+        fn consume(&mut self, _amount: usize) {}
+    }
+
+    struct FailAfterBytes {
+        bytes: &'static [u8],
+        position: usize,
+    }
+
+    impl Read for FailAfterBytes {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.position == self.bytes.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "synthetic mid-read failure",
+                ));
+            }
+            let count = buffer.len().min(self.bytes.len() - self.position);
+            buffer[..count].copy_from_slice(&self.bytes[self.position..self.position + count]);
+            self.position += count;
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn fill_buf_and_mid_read_errors_are_partial_and_discard_incomplete_line() {
+        let root = temp_root("synthetic-read-errors");
+        fs::create_dir_all(&root).unwrap();
+        let fill_scan = search_with_entries(
+            &root,
+            &["needle".to_owned()],
+            10,
+            0,
+            None,
+            vec![synthetic_entry(&root, "fill.txt")],
+            |_path, _| {
+                Ok(SearchOpenedFile {
+                    reader: FillBufFailure,
+                    len: 8,
+                })
+            },
+        )
+        .unwrap();
+        assert!(!fill_scan.scan_complete);
+        assert_eq!(
+            fill_scan.io_failures.counts[SearchIoFailureKind::Read.index()],
+            1
+        );
+        assert!(fill_scan.hits.is_empty());
+
+        let partial = b"needle complete\npartial needle";
+        let mid_read_scan = search_with_entries(
+            &root,
+            &["needle".to_owned()],
+            10,
+            0,
+            None,
+            vec![
+                synthetic_entry(&root, "partial.txt"),
+                synthetic_entry(&root, "later.txt"),
+            ],
+            |path, _| -> Result<SearchOpenedFile<Box<dyn BufRead>>, SearchOpenFailure> {
+                match path.file_name().and_then(|name| name.to_str()) {
+                    Some("partial.txt") => Ok(SearchOpenedFile {
+                        reader: Box::new(BufReader::new(FailAfterBytes {
+                            bytes: partial,
+                            position: 0,
+                        })),
+                        len: partial.len() as u64,
+                    }),
+                    _ => Ok(SearchOpenedFile {
+                        reader: Box::new(Cursor::new(b"needle after error\n".as_slice())),
+                        len: 19,
+                    }),
+                }
+            },
+        )
+        .unwrap();
+        assert!(!mid_read_scan.scan_complete);
+        assert_eq!(
+            mid_read_scan.io_failures.counts[SearchIoFailureKind::Read.index()],
+            1
+        );
+        assert_eq!(mid_read_scan.hits.len(), 2);
+        assert_eq!(mid_read_scan.hits[0].hit.text, "needle complete");
+        assert_eq!(mid_read_scan.hits[1].hit.text, "needle after error");
+        assert!(!mid_read_scan
+            .hits
+            .iter()
+            .any(|hit| hit.hit.text == "partial needle"));
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    #[test]
+    fn partial_snapshot_cursor_and_tiny_presentation_keep_incomplete_notice() {
+        let root = temp_root("partial-snapshot-presentation");
+        fs::create_dir_all(&root).unwrap();
+        let patterns = vec!["needle".to_owned(), "missing".to_owned()];
+        let scan = search_with_entries(
+            &root,
+            &patterns,
+            10,
+            0,
+            None,
+            vec![
+                synthetic_entry(&root, "one.txt"),
+                synthetic_entry(&root, "two.txt"),
+                synthetic_entry(&root, "unreadable.txt"),
+            ],
+            |path, _| match path.file_name().and_then(|name| name.to_str()) {
+                Some("unreadable.txt") => Err(SearchOpenFailure::Open),
+                Some("one.txt") => Ok(SearchOpenedFile {
+                    reader: Cursor::new(b"needle first\n".as_slice()),
+                    len: 13,
+                }),
+                _ => Ok(SearchOpenedFile {
+                    reader: Cursor::new(b"needle second\n".as_slice()),
+                    len: 14,
+                }),
+            },
+        )
+        .unwrap();
+        let service = SearchService::default();
+        let options = SearchPageOptions {
+            offset: 1,
+            max_hits: 1,
+            context_lines: 0,
+        };
+        let first = service.cache_scan(root.clone(), patterns.clone(), options, scan);
+        assert_eq!(first.total, 2);
+        assert!(first.next_cursor.is_some());
+        assert!(!first.scan_complete);
+
+        let formatted = format_search_batch_page(&first, &root);
+        assert!(formatted.contains("search incomplete"), "{formatted}");
+        assert!(formatted.contains("not confirmed absent"), "{formatted}");
+        assert!(
+            !formatted.contains("not found after full scan"),
+            "{formatted}"
+        );
+
+        let intermediate_budget = format_minimal_search_presentation(&first).len();
+        let intermediate = first.present(intermediate_budget, &root);
+        assert_eq!(intermediate.delivered_records, 0);
+        assert!(intermediate.text.len() <= intermediate_budget);
+        assert!(!intermediate.complete);
+        assert!(intermediate.oversized_record);
+        assert!(intermediate.text.contains("search incomplete"));
+        assert!(intermediate.text.contains("pass \"cursor\""));
+        assert!(std::str::from_utf8(intermediate.text.as_bytes()).is_ok());
+
+        let tiny = first.present(1, &root);
+        assert_eq!(tiny.delivered_records, 0);
+        assert!(!tiny.complete);
+        assert!(tiny.oversized_record);
+        assert!(
+            tiny.text.len() > 1,
+            "mandatory warning/cursor markers may overrun the budget"
+        );
+        assert!(std::str::from_utf8(tiny.text.as_bytes()).is_ok());
+        assert!(tiny.text.contains("search incomplete"), "{}", tiny.text);
+        assert!(tiny.text.contains("pass \"cursor\""), "{}", tiny.text);
+        assert!(
+            !tiny.text.contains("not found after full scan"),
+            "{}",
+            tiny.text
+        );
+
+        let cursor = first.next_cursor.as_deref().unwrap();
+        let second = service
+            .page(&root, patterns, options, Some(cursor), None)
+            .unwrap();
+        assert_eq!(second.first, 2);
+        assert_eq!(second.hits[0].hit.text, "needle second");
+        assert!(second.next_cursor.is_none());
+        let second_text = format_search_batch_page(&second, &root);
+        assert!(second_text.contains("search incomplete"), "{second_text}");
+        assert!(
+            !second_text.contains("not found after full scan"),
+            "{second_text}"
+        );
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    #[test]
+    fn partial_zero_hit_snapshot_present_keeps_incomplete_notice() {
+        let root = temp_root("partial-zero-hit-presentation");
+        fs::create_dir_all(&root).unwrap();
+        let patterns = vec!["needle".to_owned()];
+        let scan = search_with_entries(
+            &root,
+            &patterns,
+            10,
+            0,
+            None,
+            vec![synthetic_entry(&root, "unreadable.txt")],
+            |_path, _| -> Result<SearchOpenedFile<Cursor<&'static [u8]>>, SearchOpenFailure> {
+                Err(SearchOpenFailure::Open)
+            },
+        )
+        .unwrap();
+        let page = SearchService::default().cache_scan(
+            root.clone(),
+            patterns,
+            SearchPageOptions {
+                offset: 1,
+                max_hits: 10,
+                context_lines: 0,
+            },
+            scan,
+        );
+        assert_eq!(page.total, 0);
+        let presented = page.present(1, &root);
+        assert!(!presented.complete);
+        assert!(presented.oversized_record);
+        assert!(presented.text.contains("search incomplete"));
+        assert!(presented.text.contains("not confirmed absent"));
+        assert!(!presented.text.contains("not found after full scan"));
+        assert!(std::str::from_utf8(presented.text.as_bytes()).is_ok());
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    #[test]
+    fn tool_registry_presents_an_injected_partial_search_snapshot() {
+        use crate::tools::{PresentationBudget, ToolRegistry};
+        use crate::OperatingMode;
+
+        let root = temp_root("tool-registry-partial-search");
+        fs::create_dir_all(&root).unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let patterns = vec!["needle".to_owned(), "missing".to_owned()];
+        let scan = search_with_entries(
+            &canonical_root,
+            &patterns,
+            10,
+            0,
+            None,
+            vec![
+                synthetic_entry(&canonical_root, "one.txt"),
+                synthetic_entry(&canonical_root, "two.txt"),
+                synthetic_entry(&canonical_root, "three.txt"),
+                synthetic_entry(&canonical_root, "unreadable.txt"),
+            ],
+            |path, _| match path.file_name().and_then(|name| name.to_str()) {
+                Some("unreadable.txt") => Err(SearchOpenFailure::Open),
+                Some("one.txt") => Ok(SearchOpenedFile {
+                    reader: Cursor::new(b"needle one\n".as_slice()),
+                    len: 11,
+                }),
+                Some("two.txt") => Ok(SearchOpenedFile {
+                    reader: Cursor::new(b"needle two\n".as_slice()),
+                    len: 11,
+                }),
+                _ => Ok(SearchOpenedFile {
+                    reader: Cursor::new(b"needle three\n".as_slice()),
+                    len: 13,
+                }),
+            },
+        )
+        .unwrap();
+
+        let mut registry = ToolRegistry::default();
+        let first = Arc::get_mut(&mut registry.services)
+            .expect("registry has a unique service bundle")
+            .search
+            .cache_scan(
+                canonical_root,
+                patterns.clone(),
+                SearchPageOptions {
+                    offset: 1,
+                    max_hits: 1,
+                    context_lines: 0,
+                },
+                scan,
+            );
+        let cursor = first.next_cursor.expect("first page has continuation");
+        let arguments = serde_json::json!({
+            "path": ".",
+            "patterns": patterns,
+            "max_hits": 1,
+            "cursor": cursor,
+        })
+        .to_string();
+        let prepared =
+            registry.prepare_invocation(OperatingMode::ReadOnly, &root, "search", &arguments);
+        let outcome =
+            registry.execute_prepared_with_cancellation_and_progress(&prepared, None, |_| {});
+        assert!(outcome.result.success, "{}", outcome.result.output);
+        assert!(
+            outcome.result.output.contains("search incomplete"),
+            "{}",
+            outcome.result.output
+        );
+        assert!(
+            outcome.result.output.contains("not confirmed absent"),
+            "{}",
+            outcome.result.output
+        );
+
+        let presentation = outcome
+            .receipt
+            .presentation
+            .as_ref()
+            .expect("search provides its structured presentation")
+            .present(PresentationBudget { max_bytes: 1 });
+        assert_eq!(presentation.delivered_records, 0);
+        assert!(presentation.oversized_record);
+        assert!(presentation.text.contains("search incomplete"));
+        assert!(presentation.text.contains("pass \"cursor\""));
+        assert!(!presentation.text.contains("not found after full scan"));
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    #[test]
+    fn work_limit_hit_cap_and_io_failure_are_reported_together() {
+        let root = temp_root("combined-search-limits");
+        fs::create_dir_all(&root).unwrap();
+        let entries = (0..=MAX_SEARCH_SCAN_FILES)
+            .map(|index| synthetic_entry(&root, &format!("file-{index:04}.txt")))
+            .collect::<Vec<_>>();
+        let scan = search_with_entries(
+            &root,
+            &["common".to_owned(), "rare".to_owned()],
+            1,
+            0,
+            None,
+            entries,
+            |path, _| match path.file_name().and_then(|name| name.to_str()) {
+                Some("file-0000.txt" | "file-0001.txt") => Ok(SearchOpenedFile {
+                    reader: Cursor::new(b"common\n".to_vec()),
+                    len: 7,
+                }),
+                Some("file-0002.txt") => Err(SearchOpenFailure::Open),
+                _ => Ok(SearchOpenedFile {
+                    reader: Cursor::new(Vec::<u8>::new()),
+                    len: 0,
+                }),
+            },
+        )
+        .unwrap();
+
+        assert!(scan.capped);
+        assert!(scan.work_limited);
+        assert!(!scan.scan_complete);
+        assert_eq!(scan.hits.len(), 1);
+        assert_eq!(scan.coverage[0].omitted, 1);
+        assert_eq!(
+            scan.io_failures.counts[SearchIoFailureKind::Open.index()],
+            1
+        );
+
+        let page = SearchService::default().cache_scan(
+            root.clone(),
+            vec!["common".to_owned(), "rare".to_owned()],
+            SearchPageOptions {
+                offset: 1,
+                max_hits: 1,
+                context_lines: 0,
+            },
+            scan,
+        );
+        let output = format_search_batch_page(&page, &root);
+        assert!(output.contains("work budget exhausted"), "{output}");
+        assert!(output.contains("I/O failure"), "{output}");
+        assert!(output.contains("1 additional matches omitted"), "{output}");
+        assert_eq!(
+            page.total, 1,
+            "I/O failures must not rewrite the retained hit count"
+        );
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    #[test]
+    fn io_failure_counts_saturate_and_example_paths_stay_bounded() {
+        let root = temp_root("bounded-io-summary");
+        let mut summary = SearchIoSummary::default();
+        let long_path = root.join(format!("{}\nfile.txt", "界".repeat(100)));
+        for index in 0..(usize::from(u16::MAX) + 10) {
+            let path = if index == 0 {
+                long_path.clone()
+            } else {
+                root.join(format!("failure-{index}.txt"))
+            };
+            summary.record(SearchIoFailureKind::Open, &root, &path);
+        }
+
+        assert_eq!(summary.counts[SearchIoFailureKind::Open.index()], u16::MAX);
+        assert_eq!(summary.total(), u32::from(u16::MAX));
+        assert_eq!(summary.examples.len(), MAX_SEARCH_IO_EXAMPLES);
+        assert!(summary
+            .examples
+            .iter()
+            .all(|example| example.len() <= MAX_SEARCH_IO_EXAMPLE_BYTES));
+        assert!(!summary.examples[0].contains('\n'));
+        assert!(summary.category_counts().contains("open 65535"));
+    }
+
+    #[test]
+    fn cancelled_fresh_scan_still_returns_cancelled() {
+        let root = temp_root("cancelled-fresh-search");
+        fs::create_dir_all(&root).unwrap();
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let error = SearchService::default()
+            .page(
+                &root,
+                vec!["needle".to_owned()],
+                SearchPageOptions {
+                    offset: 1,
+                    max_hits: 10,
+                    context_lines: 0,
+                },
+                None,
+                Some(&cancellation),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error.error, ToolError::Cancelled));
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    #[test]
+    fn ignore_walk_adapter_preserves_nested_error_path_in_relative_sample() {
+        let root = temp_root("nested-walker-error-path");
+        fs::create_dir_all(&root).unwrap();
+        let denied_path = root.join("nested").join("blocked.txt");
+        let error = ignore::Error::WithDepth {
+            depth: 2,
+            err: Box::new(ignore::Error::WithPath {
+                path: denied_path,
+                err: Box::new(ignore::Error::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "synthetic walker failure",
+                ))),
+            }),
+        };
+        let walker_event = map_search_walk_entry(Err(error), &root);
+        let scan = search_with_entries(
+            &root,
+            &["needle".to_owned()],
+            10,
+            0,
+            None,
+            vec![walker_event],
+            |_path, _| -> Result<SearchOpenedFile<Cursor<&'static [u8]>>, SearchOpenFailure> {
+                unreachable!("walker failure does not open a file")
+            },
+        )
+        .unwrap();
+
+        assert!(!scan.scan_complete);
+        assert_eq!(
+            scan.io_failures.counts[SearchIoFailureKind::Walk.index()],
+            1
+        );
+        let expected_example = Path::new("nested")
+            .join("blocked.txt")
+            .to_string_lossy()
+            .into_owned();
+        assert!(scan
+            .io_failures
+            .examples
+            .iter()
+            .any(|example| example == &expected_example));
         let _ = fs::remove_dir_all(root.parent().expect("parent"));
     }
 }

@@ -1,0 +1,104 @@
+# Testes de integração do workspace
+
+Estes testes exercitam contratos entre `slim-core`, `slim-tui` e `slim-cli`.
+Embora estejam na raiz, são registrados explicitamente em
+`crates/slim-cli/Cargo.toml` por entradas `[[test]]` com caminhos relativos.
+
+Execute-os pelo workspace ou pelo pacote CLI:
+
+```powershell
+cargo test --workspace
+cargo test -p slim-cli --test smoke_workspace --test e2e_v1 --test e2e_offline
+```
+
+Fixtures e suporte compartilhado permanecem em `tests/fixtures/` e
+`tests/support/`.
+
+## Ciclo local com carga controlada
+
+Use [`test-slim.ps1`](../test-slim.ps1) para selecionar explicitamente os alvos:
+
+```powershell
+# Unidade do fluxo alterado; o filtro nao substitui a selecao de alvo.
+.\test-slim.ps1 -Package slim-core -Lib -Filter runtime::shell_jobs
+# Integracoes afetadas, em uma unica invocacao.
+.\test-slim.ps1 -Package slim-core -TestTarget agent_loop,native_tool_recovery
+# Providers e catalogos de ambos os pacotes, com dependencias resolvidas juntas.
+.\test-slim.ps1 -Package slim-core,slim-cli -TestTarget providers,catalogs
+# Um modulo do alvo agrupado, sem executar os demais casos.
+.\test-slim.ps1 -Package slim-core -TestTarget providers -Filter opencode_go_provider::
+# Contratos entre crates.
+.\test-slim.ps1 -Package slim-cli -TestTarget smoke_workspace,e2e_v1,e2e_offline
+# Mudancas abrangentes: inclui todos os testes padrao do workspace e doc-tests.
+.\test-slim.ps1 -Workspace
+```
+
+Escolha os alvos pelo comportamento e pelas dependencias afetadas; os exemplos
+nao constituem cobertura suficiente para toda alteracao. O script exige `-Lib`
+ou `-TestTarget` no modo direcionado e interrompe em qualquer falha do Cargo.
+`-Package` aceita varios pacotes para validar uma mudanca entre crates em uma
+unica chamada, evitando alternar conjuntos de features das dependencias.
+
+O wrapper aponta `SLIM_CONFIG_FILE` e `SLIM_AUTH_FILE` para caminhos temporarios
+vazios e remove do processo as variaveis de autenticacao reconhecidas pelo CLI.
+Ao terminar, inclusive em falha, restaura o ambiente e remove o diretorio
+temporario. Fixtures podem definir suas proprias credenciais/configuracoes.
+Isso nao isola rede, configuracao do workspace, skills globais ou outros
+overrides `SLIM_*`; Cargo direto tambem nao aplica esse isolamento.
+
+Os 11 antigos alvos de parsing, adapters, catalogos e protocolo de `slim-core`
+agora sao modulos de [`providers`](../crates/slim-core/tests/providers/main.rs).
+Os quatro catalogos do CLI compartilham
+[`catalogs`](../crates/slim-cli/tests/catalogs/main.rs). Os casos e suas assertivas
+foram preservados; use `-TestTarget providers`/`catalogs` e `-Filter modulo::`
+para selecionar um arquivo antigo. Testes de transporte/tempo, subprocessos e
+aqueles que alteram variaveis de ambiente conservam seu isolamento existente.
+
+Oito alvos de contratos em memoria do `slim-core` compartilham
+[`contracts`](../crates/slim-core/tests/contracts/main.rs). Use
+`-TestTarget contracts` e `-Filter modulo::` para selecionar um conjunto antigo;
+as assertivas continuam nos mesmos arquivos, agora dentro desse modulo.
+
+O perfil de testes usa `debug=1` nos pacotes locais: mantem nomes, arquivos e
+linhas para backtraces, mas omite informacao detalhada de tipos/variaveis.
+Dependencias externas e de build conservam os perfis originais para reutilizar o cache de dev.
+Para depurar variaveis, acrescente `-FullDebug`; a troca recompila os alvos
+afetados. Builds de desenvolvimento e release mantem seus perfis anteriores.
+
+Os testes unitarios de runtime e Jev, assim como os de `headless`, `tui`,
+`main`, `reducer` e runtime da TUI, ficam em arquivos de modulos carregados
+somente com `cfg(test)`. Esses arquivos nao sao dependencias Rust do release;
+mantenha novos casos nesses modulos para evitar recompilar producao por uma
+mudanca de assertiva. Mudancas na revisao embutida (incluindo clean/dirty),
+toolchain, perfil ou dependencias ainda podem exigir recompilacao.
+
+O servidor de `sec_secret_flow` recebe um sinal quando a chamada sincrona
+testada termina e confere as conexoes ja enfileiradas antes de encerrar.
+O deadline continua protegendo falhas, e a espera por conexoes nao ocupa CPU
+em um loop de `yield_now`.
+
+Os scripts usam um job de compilacao, duas threads de testes por padrao e
+prioridade BelowNormal, restaurada ao sair. `-TestThreads` permite ajustar o
+limite do harness; threads e subprocessos criados pelos testes nao sao limitados
+por esse parametro. A configuracao local tambem define `RUST_TEST_THREADS=2`
+para Cargo direto, respeitando uma variavel explicitamente definida pelo usuario.
+Prioridade reduzida favorece outros aplicativos, mas nao limita CPU/memoria nem
+garante execucao mais rapida. Execute uma operacao Cargo por vez neste checkout.
+
+Apos aprovar os checks necessarios, execute `refresh-slim.ps1` uma vez. Use
+`refresh-slim.ps1 -Test` quando ainda precisar da suite completa; nao repita
+essa suite imediatamente antes. Nao acrescente `--no-run` antes de executar
+os mesmos testes sem uma necessidade intermediaria. Preserve o cache `target`.
+
+Para iteracoes locais em release, `refresh-slim.ps1 -FastBuild` usa `opt-level=3`,
+sem LTO e com oito unidades de geracao de codigo. O smoke e a copia para o PATH
+continuam iguais, mas o binario fica maior e seu desempenho em uso nao foi
+comparado. O comando sem a opcao conserva o perfil padrao; alternar perfis pode
+recompilar o executavel. Use o padrao para publicar o build plenamente otimizado.
+
+Os scripts mostram tempo total de cada comando e habilitam `--timings`, cujo
+HTML fica em `target/cargo-timings/`. O relatorio Cargo mede compilacao; a saida
+do harness informa execucao dos testes. Compare o mesmo alvo, toolchain e estado
+de cache; nao interprete compilacao fria versus quente como ganho da alteracao.
+Use esses dados antes de agrupar executaveis de teste ou alterar perfis. O perfil
+release continua com as otimizacoes existentes e e gerado somente na publicacao.

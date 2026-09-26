@@ -319,6 +319,115 @@ fn deepseek_thinking_replays_exact_scoped_state_after_native_tools() {
 }
 
 #[test]
+fn reasoning_details_replay_in_order_after_tools_without_persisting() {
+    let root = std::env::temp_dir().join(format!("slim-reasoning-details-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("source.txt"), "source").unwrap();
+    let details = json!([
+        {"type":"reasoning.text","text":"inspect","signature":"opaque-secret","index":0},
+        {"type":"reasoning.encrypted","data":"opaque-secret","id":"r1"},
+        {"type":"reasoning.summary","summary":"read file","index":1}
+    ]);
+    let expected = details.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        for turn in 0..2 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            let wire: Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            let deltas = if turn == 0 {
+                vec![
+                    json!({"reasoning_details":[details[0]]}),
+                    json!({"reasoning_details":[details[1],details[2]]}),
+                    json!({"tool_calls":[{"index":0,"id":"read-1","function":{"name":"read","arguments":"{\"path\":\"source.txt\"}"}}]}),
+                ]
+            } else {
+                let assistant = wire["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m["role"] == "assistant")
+                    .unwrap();
+                assert_eq!(assistant["reasoning_details"], details);
+                assert!(assistant.get("reasoning_content").is_none());
+                vec![json!({"content":"done"})]
+            };
+            let mut response = String::new();
+            for delta in deltas {
+                response.push_str(&format!(
+                    "data: {}\n\n",
+                    json!({"choices":[{"delta":delta}]})
+                ));
+            }
+            response.push_str(&format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices":[{"delta":{},"finish_reason":if turn == 0 {"tool_calls"} else {"stop"}}]})));
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).as_bytes()).unwrap();
+        }
+    });
+    let adapter =
+        OpenAiCompatibleAdapter::new(ProviderConfig::openai(&endpoint, "fixture", "fixture-key"))
+            .unwrap();
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(3)).unwrap();
+    let mut runtime = Runtime::new();
+    runtime.capture_turn_transcript();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "Read source.txt",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig::default(),
+        ))
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert!(result.tool_results[0].success);
+    let history = runtime.conversation();
+    assert!(history.iter().any(|m| m.chat_reasoning.is_some()));
+    assert!(!format!("{history:?}").contains("opaque-secret"));
+    assert!(!format!("{:?}", runtime.app.events()).contains("opaque-secret"));
+    let replay = client
+        .adapter()
+        .prepare_messages_request_with_tools_checked(history, &[])
+        .unwrap();
+    let wire: Value = serde_json::from_slice(replay.body()).unwrap();
+    assert_eq!(
+        wire["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .unwrap()["reasoning_details"],
+        expected
+    );
+    for (url, model, key) in [
+        (endpoint.as_str(), "fixture", "different-key"),
+        (endpoint.as_str(), "different-model", "fixture-key"),
+        ("https://elsewhere.invalid", "fixture", "fixture-key"),
+    ] {
+        let foreign =
+            OpenAiCompatibleAdapter::new(ProviderConfig::openai(url, model, key)).unwrap();
+        let request = foreign
+            .prepare_messages_request_with_tools_checked(history, &[])
+            .unwrap();
+        let wire: Value = serde_json::from_slice(request.body()).unwrap();
+        assert!(wire["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m.get("reasoning_details").is_none()));
+    }
+    let persisted = runtime.take_turn_transcript();
+    assert!(!persisted.is_empty());
+    assert!(persisted.iter().all(|m| m.chat_reasoning.is_none()));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn compact_tool_results_preserve_a_complete_task_across_provider_wires() {
     use slim_core::provider::{
         ClinePassAdapter, CommandCodeAdapter, OpenCodeGoAdapter, ProviderKind, XaiAdapter,
@@ -2328,12 +2437,14 @@ fn large_tool_output_is_materialized_and_referenced_in_the_next_turn() {
     let address = listener.local_addr().expect("address");
     let source_arg = "large.txt".to_owned();
     let server = thread::spawn(move || {
+        let mut artifact_wire = String::new();
         for turn in 0..2 {
             let mut stream = accept_with_deadline(&listener);
             let mut request = [0_u8; 16 * 1024];
             let size = stream.read(&mut request).expect("request");
             if turn == 1 {
-                assert!(String::from_utf8_lossy(&request[..size]).contains("artifact id="));
+                artifact_wire = String::from_utf8_lossy(&request[..size]).into_owned();
+                assert!(artifact_wire.contains("artifact id="));
             }
             stream
                 .write_all(
@@ -2375,6 +2486,7 @@ fn large_tool_output_is_materialized_and_referenced_in_the_next_turn() {
                     .expect("finish");
             }
         }
+        artifact_wire
     });
     let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
         format!("http://{address}"),
@@ -2400,7 +2512,7 @@ fn large_tool_output_is_materialized_and_referenced_in_the_next_turn() {
             },
         ))
         .expect("loop");
-    server.join().expect("server");
+    let artifact_wire = server.join().expect("server");
 
     assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
     let handle = result.tool_results[0].artifact.as_ref().expect("handle");
@@ -2408,6 +2520,20 @@ fn large_tool_output_is_materialized_and_referenced_in_the_next_turn() {
         std::fs::read_to_string(&handle.path).expect("artifact"),
         content
     );
+    let read_path = artifact_wire
+        .split(" path=")
+        .nth(1)
+        .and_then(|tail| tail.split(']').next())
+        .expect("artifact read path");
+    assert_eq!(read_path, format!("artifacts/{}", handle.id));
+    let recalled = slim_core::tools::ToolRegistry::default().execute(
+        OperatingMode::ReadOnly,
+        &root,
+        "read",
+        &json!({"path": read_path, "max_lines": 1}).to_string(),
+    );
+    assert!(recalled.success, "{}", recalled.output);
+    assert_eq!(recalled.output, content);
     assert!(runtime
         .app
         .events()
@@ -3330,6 +3456,121 @@ fn write_sse(stream: &mut TcpStream, body: &str) {
         .expect("fixture response");
 }
 
+#[test]
+fn economy_projection_keeps_written_bytes_and_reconciles_todo_in_normal_turn() {
+    let root = std::env::temp_dir().join(format!("slim-economy-wire-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("source.txt"), "source line\n".repeat(5000)).unwrap();
+    let content = "generated content 日本語\n".repeat(1400);
+    let expected = content.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let mut tools = Value::Null;
+        for turn in 0..3 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            let wire: Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            if turn == 0 {
+                tools = wire["tools"].clone();
+            }
+            assert_eq!(wire["tools"], tools);
+            assert!(!request.contains("[Todo final review]"));
+            if turn == 1 {
+                assert!(request.contains("[Todo progress review]"));
+            }
+            if turn == 2 {
+                let messages = wire["messages"].as_array().unwrap();
+                let write = messages
+                    .iter()
+                    .flat_map(|message| message["tool_calls"].as_array().into_iter().flatten())
+                    .find(|call| call["function"]["name"] == "write")
+                    .unwrap();
+                let arguments = write["function"]["arguments"].as_str().unwrap();
+                assert!(arguments.contains("successful write content elided"));
+                assert!(arguments.len() < 400);
+                let read = messages
+                    .iter()
+                    .find(|message| message["tool_call_id"] == "read-page")
+                    .unwrap();
+                let page = read["content"].as_str().unwrap();
+                assert!(page.len() <= 24 * 1024);
+                assert!(page.contains("more content available"));
+                eprintln!("write original_argument_bytes={} projected_argument_bytes={} read_page_bytes={}",
+                    json!({"path":"output.txt","content":content}).to_string().len(), arguments.len(), page.len());
+                write_sse(&mut stream, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+                continue;
+            }
+            let calls = if turn == 0 {
+                vec![(
+                    "todo-start",
+                    "todo",
+                    json!({"todos":[{"title":"write output","status":"in_progress"}]}),
+                )]
+            } else {
+                vec![
+                    (
+                        "write-file",
+                        "write",
+                        json!({"path":"output.txt", "content":content}),
+                    ),
+                    ("read-page", "read", json!({"path":"source.txt"})),
+                    (
+                        "todo-done",
+                        "todo",
+                        json!({"todos":[{"id":0,"status":"completed"}]}),
+                    ),
+                ]
+            };
+            let calls = calls.into_iter().enumerate().map(|(index, (id, name, arguments))|
+                json!({"index":index, "id":id, "function":{"name":name,"arguments":arguments.to_string()}})).collect::<Vec<_>>();
+            let event =
+                json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]});
+            write_sse(&mut stream, &format!("data: {event}\n\ndata: [DONE]\n\n"));
+        }
+    });
+    let client = jev_openai_client(address);
+    let mut runtime = Runtime::with_artifact_store(root.join("artifacts")).unwrap();
+    runtime.set_read_presentation_bytes(24 * 1024).unwrap();
+    assert!(runtime.set_read_presentation_bytes(0).is_err());
+    assert!(runtime.set_read_presentation_bytes(65537).is_err());
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "Write output, inspect source and track the work.",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig {
+                context_window_tokens: 1_000_000,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(result.turns, 3);
+    assert!(result.tool_results.iter().all(|result| result.success));
+    assert_eq!(
+        std::fs::read_to_string(root.join("output.txt")).unwrap(),
+        expected
+    );
+    let write = runtime
+        .conversation()
+        .iter()
+        .flat_map(|message| &message.tool_calls)
+        .find(|call| call.name == "write")
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&write.arguments).unwrap()["content"],
+        expected
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn sse_read_call_body(call_id: &str) -> String {
     let tool_call = json!({
         "choices": [{
@@ -3421,6 +3662,13 @@ struct CountingJevJudge {
 
 #[async_trait]
 impl slim_core::context::JevJudge for CountingJevJudge {
+    fn metadata(&self) -> slim_core::context::JevJudgeMetadata {
+        slim_core::context::JevJudgeMetadata {
+            backend: Some("typesafe".into()),
+            requested_model: Some(slim_core::context::DEFAULT_JEV_MODEL.into()),
+        }
+    }
+
     async fn judge(
         &self,
         _state: &Value,
@@ -3432,6 +3680,49 @@ impl slim_core::context::JevJudge for CountingJevJudge {
             questions.len()
         ]))
     }
+}
+
+#[test]
+fn uneconomic_jev_prepass_still_runs_the_background_summary() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let mut summary_seen = false;
+        for index in 0..3 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            let body = if request.contains("You are a context compactor") {
+                summary_seen = true;
+                SSE_COMPACTION_SUMMARY.to_owned()
+            } else if index == 0 {
+                sse_read_call_body("economic-read")
+            } else {
+                thread::sleep(Duration::from_millis(250));
+                SSE_FINAL_ANSWER.to_owned()
+            };
+            write_sse(&mut stream, &body);
+        }
+        summary_seen
+    });
+
+    let client = jev_openai_client(address);
+    let history = jev_tool_pair_history();
+    let window = soft_only_context_window_tokens(&client, &history);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut runtime = jev_runtime(Arc::new(CountingJevJudge {
+        calls: calls.clone(),
+    }));
+    runtime.set_compaction_input_cost_micros_per_million(Some(1));
+    let result = run_loop_to_completion(&mut runtime, &client, &history, window, 3);
+    assert!(server.join().expect("server"), "summary request was sent");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(runtime
+        .app
+        .events()
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::CompactionAttemptCompleted { .. })));
 }
 
 fn jev_runtime(judge: Arc<dyn slim_core::context::JevJudge>) -> Runtime {
@@ -6366,6 +6657,7 @@ fn legacy_context_snapshot_defaults_live_usage_fields() {
 
 #[test]
 fn agent_loop_announces_todo_and_applies_add_with_ledger_event() {
+    let (sender, receiver) = SessionEventSender::bounded(256, CancellationToken::new());
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("address");
@@ -6428,6 +6720,19 @@ fn agent_loop_announces_todo_and_applies_add_with_ledger_event() {
             second_request.contains("verify gate"),
             "second todo in the array must be applied: {second_request}"
         );
+        // The status event is delivered before the provider finishes the run.
+        let mut delivered = false;
+        while let Ok(event) = receiver.try_recv() {
+            if let EventKind::TodoChanged { items } = event.kind {
+                assert_eq!(items[0].id, Some(0));
+                assert_eq!(items[1].id, Some(1));
+                delivered = true;
+            }
+        }
+        assert!(
+            delivered,
+            "TodoChanged must arrive before the final response"
+        );
         let final_body = "data: {\"choices\":[{\"delta\":{\"content\":\"todo noted\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         let final_response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -6437,6 +6742,14 @@ fn agent_loop_announces_todo_and_applies_add_with_ledger_event() {
         second_stream
             .write_all(final_response.as_bytes())
             .expect("final response");
+        let mut review_stream = accept_with_deadline(&listener);
+        let review_request = read_http_request(&mut review_stream);
+        assert!(review_request.contains("[Todo final review]"));
+        review_stream
+            .write_all(final_response.as_bytes())
+            .expect("review response");
+        // Dropping this listener also catches an accidental endless final-review loop.
+        receiver // Keep the event consumer alive until the run has ended.
     });
 
     let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
@@ -6448,6 +6761,7 @@ fn agent_loop_announces_todo_and_applies_add_with_ledger_event() {
     let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
     let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
     let mut runtime = Runtime::new();
+    runtime.app.set_event_sender(sender);
     let result = tokio_runtime
         .block_on(runtime.run_agent_loop(
             &client,
@@ -6456,7 +6770,7 @@ fn agent_loop_announces_todo_and_applies_add_with_ledger_event() {
             std::env::temp_dir(),
             1,
             AgentLoopConfig {
-                max_turns: 2,
+                max_turns: 4,
                 max_mutating_tool_calls: 1,
                 ..AgentLoopConfig::default()
             },
@@ -6465,6 +6779,7 @@ fn agent_loop_announces_todo_and_applies_add_with_ledger_event() {
     server.join().expect("server");
 
     assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(result.turns, 3);
     assert_eq!(result.tool_results.len(), 1);
     assert!(result.tool_results[0].success);
     assert!(result.tool_results[0].output.contains("ship n2"));
@@ -6478,7 +6793,7 @@ fn agent_loop_announces_todo_and_applies_add_with_ledger_event() {
 }
 
 #[test]
-fn agent_loop_lazy_skill_is_not_injected_until_called() {
+fn agent_loop_skill_script_requires_trust() {
     let root = std::env::temp_dir().join(format!(
         "slim-agent-skill-{}-{}",
         std::process::id(),
@@ -6530,7 +6845,7 @@ fn agent_loop_lazy_skill_is_not_injected_until_called() {
                         "id": "skill-call-1",
                         "function": {
                             "name": "skill",
-                            "arguments": "{\"name\":\"hello\"}"
+                            "arguments": "{\"name\":\"hello\",\"script\":\"run.ps1\"}"
                         }
                     }]
                 }
@@ -6556,8 +6871,8 @@ fn agent_loop_lazy_skill_is_not_injected_until_called() {
         let second_request = String::from_utf8_lossy(&second_request[..second_size]);
         assert!(second_request.contains("skill-call-1"));
         assert!(
-            second_request.contains("skill-hello-ok"),
-            "second request should include skill stdout: {second_request}"
+            second_request.contains("skill requires user trust"),
+            "second request should include the trust denial: {second_request}"
         );
         let final_body = "data: {\"choices\":[{\"delta\":{\"content\":\"skill ran\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         let final_response = format!(
@@ -6597,9 +6912,11 @@ fn agent_loop_lazy_skill_is_not_injected_until_called() {
 
     assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
     assert_eq!(result.tool_results.len(), 1);
-    assert!(result.tool_results[0].success);
+    assert!(!result.tool_results[0].success);
     assert!(
-        result.tool_results[0].output.contains("skill-hello-ok"),
+        result.tool_results[0]
+            .output
+            .contains("skill requires user trust"),
         "tool output: {}",
         result.tool_results[0].output
     );
@@ -7965,7 +8282,9 @@ fn recovery_fixture_with_headers(
 #[test]
 fn reasoning_only_completion_is_not_success() {
     let body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-    let (client, done, server) = recovery_fixture(vec![(200, body.into())]);
+    let final_body = "data: {\"choices\":[{\"delta\":{\"content\":\"effective answer\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let (client, done, server) =
+        recovery_fixture(vec![(200, body.into()), (200, final_body.into())]);
     let mut runtime = Runtime::new();
     let result = tokio::runtime::Runtime::new()
         .unwrap()
@@ -7975,14 +8294,173 @@ fn reasoning_only_completion_is_not_success() {
             OperatingMode::ReadOnly,
             std::env::temp_dir(),
             1,
-            AgentLoopConfig::default(),
+            AgentLoopConfig {
+                max_turns: 3,
+                ..AgentLoopConfig::default()
+            },
         ));
     let _ = done.send(());
     let requests = server.join().unwrap();
+    assert!(result.expect("empty completion recovers").stop == AgentLoopStop::ProviderCompleted);
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("Produce an effective answer"));
+}
+
+#[test]
+fn repeated_empty_completion_stops_after_one_recovery() {
+    let empty =
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let (client, done, server) = recovery_fixture(vec![(200, empty.into()), (200, empty.into())]);
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Runtime::new().run_agent_loop(
+            &client,
+            "Answer",
+            OperatingMode::ReadOnly,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig {
+                max_turns: 3,
+                ..AgentLoopConfig::default()
+            },
+        ));
+    let _ = done.send(());
+    assert_eq!(server.join().unwrap().len(), 2);
     assert!(
-        matches!(result, Err(ProviderError::InvalidResponse { message }) if message.contains("without assistant text"))
+        matches!(result, Err(ProviderError::InvalidResponse { message })
+        if message.contains("without assistant text") && message.contains("repeated empty provider response"))
     );
-    assert_eq!(requests.len(), 1);
+}
+
+#[test]
+fn provider_recovery_counter_resets_after_successful_tool_turn() {
+    let root = std::env::temp_dir().join(format!("slim-retry-reset-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("source.txt"), "evidence").unwrap();
+    let tool = |id: &str| {
+        format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":id,"function":{"name":"read","arguments":json!({"path":"source.txt"}).to_string()}}]},"finish_reason":"tool_calls"}]})
+        )
+    };
+    let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let (client, done, server) = recovery_fixture(vec![
+        (503, "failed".into()),
+        (200, tool("tool-1")),
+        (503, "failed".into()),
+        (503, "failed".into()),
+        (200, answer.into()),
+    ]);
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Runtime::new().run_agent_loop(
+            &client,
+            "Read then answer",
+            OperatingMode::ReadOnly,
+            &root,
+            1,
+            AgentLoopConfig {
+                max_turns: 8,
+                ..AgentLoopConfig::default()
+            },
+        ));
+    let _ = done.send(());
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 5);
+    let result = result.expect("recovery counter reset");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(result.tool_results.len(), 1);
+    assert!(result.tool_results[0].success);
+    std::fs::remove_file(root.join("source.txt")).unwrap();
+    std::fs::remove_dir(root).unwrap();
+}
+
+#[test]
+fn global_recovery_tally_stops_after_six_recoveries() {
+    let root = std::env::temp_dir().join(format!("slim-retry-global-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    for index in 0..6 {
+        std::fs::write(
+            root.join(format!("source-{index}.txt")),
+            format!("evidence {index}"),
+        )
+        .unwrap();
+    }
+    let tool = |index: usize| {
+        format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("tool-{index}"),"function":{"name":"read","arguments":json!({"path":format!("source-{index}.txt")}).to_string()}}]},"finish_reason":"tool_calls"}]})
+        )
+    };
+    let mut responses = Vec::new();
+    for index in 0..7 {
+        responses.push((503, "failed".into()));
+        if index < 6 {
+            responses.push((200, tool(index)));
+        }
+    }
+    let (client, done, server) = recovery_fixture(responses);
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Runtime::new().run_agent_loop(
+            &client,
+            "Keep working",
+            OperatingMode::ReadOnly,
+            &root,
+            1,
+            AgentLoopConfig {
+                max_turns: 20,
+                ..AgentLoopConfig::default()
+            },
+        ));
+    let _ = done.send(());
+    assert_eq!(server.join().unwrap().len(), 13);
+    assert!(matches!(result, Err(ProviderError::Http { message, .. })
+        if message.contains("global automatic recovery limit reached") && message.contains("automatic recoveries=6/6")));
+    for index in 0..6 {
+        std::fs::remove_file(root.join(format!("source-{index}.txt"))).unwrap();
+    }
+    std::fs::remove_dir(root).unwrap();
+}
+
+#[test]
+fn empty_recovery_counts_toward_consecutive_provider_limit() {
+    let empty =
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    for responses in [
+        vec![
+            (200, empty.into()),
+            (503, "failed".into()),
+            (503, "failed".into()),
+        ],
+        vec![
+            (503, "failed".into()),
+            (503, "failed".into()),
+            (200, empty.into()),
+        ],
+    ] {
+        let (client, done, server) = recovery_fixture(responses);
+        let result =
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(Runtime::new().run_agent_loop(
+                    &client,
+                    "Answer",
+                    OperatingMode::ReadOnly,
+                    std::env::temp_dir(),
+                    1,
+                    AgentLoopConfig {
+                        max_turns: 6,
+                        ..AgentLoopConfig::default()
+                    },
+                ));
+        let _ = done.send(());
+        assert_eq!(server.join().unwrap().len(), 3);
+        assert!(matches!(result,
+            Err(ProviderError::Http { message, .. } | ProviderError::InvalidResponse { message })
+            if message.contains("consecutive provider recovery limit reached")
+                && message.contains("provider attempts=3")));
+    }
 }
 
 #[test]
@@ -8038,6 +8516,77 @@ fn transient_recovery_preserves_completed_tools_and_retries_only_the_failed_requ
         1
     );
     assert_eq!(result.usage.retry_count, 2);
+    std::fs::remove_dir_all(&root).expect("remove own fixture");
+}
+
+#[test]
+fn manual_retry_preserves_completed_tools_and_exact_failed_request() {
+    let root = std::env::temp_dir().join(format!("slim-manual-retry-tools-{}", std::process::id()));
+    std::fs::create_dir(&root).expect("exclusive fixture");
+    let call = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"write-once","function":{"name":"write","arguments":json!({"path":"result.txt","content":"saved once"}).to_string()}}]},"finish_reason":"tool_calls"}]});
+    let final_answer = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let (client, done, server) = recovery_fixture(vec![
+        (200, format!("data: {call}\n\ndata: [DONE]\n\n")),
+        (503, "unavailable".into()),
+        (503, "unavailable".into()),
+        (503, "unavailable".into()),
+        (200, final_answer.into()),
+    ]);
+    let retry = slim_core::runtime::ManualRetryHandle::default();
+    assert!(
+        !retry.request(),
+        "cannot arm a future retry before a failure"
+    );
+    let mut runtime = Runtime::new();
+    runtime.set_manual_retry_handle(retry.clone());
+    let result = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let run = runtime.run_agent_loop(
+                &client,
+                "Write once, then answer",
+                OperatingMode::Auto,
+                &root,
+                1,
+                AgentLoopConfig::default(),
+            );
+            let request = async {
+                while !retry.is_waiting() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(retry.request());
+                assert!(!retry.request(), "duplicate retry must not be queued");
+            };
+            tokio::join!(run, request).0
+        })
+        .await
+        .expect("manual retry must settle")
+    });
+    let _ = done.send(());
+    let requests = server.join().unwrap();
+    let result = result.expect("explicit retry recovered");
+    assert_eq!(
+        result.usage.retry_count, 3,
+        "two automatic retries plus one manual retry"
+    );
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(result.tool_results.len(), 1);
+    assert!(result.tool_results[0].success);
+    assert_eq!(
+        std::fs::read_to_string(root.join("result.txt")).unwrap(),
+        "saved once"
+    );
+    assert_eq!(requests.len(), 5);
+    let bodies: Vec<_> = requests
+        .iter()
+        .map(|r| r.split_once("\r\n\r\n").unwrap().1)
+        .collect();
+    assert!(
+        bodies[1..].windows(2).all(|pair| pair[0] == pair[1]),
+        "manual retry must not append a prompt or duplicate tool results"
+    );
+    assert!(!retry.is_waiting());
+    assert!(!retry.request());
     std::fs::remove_dir_all(&root).expect("remove own fixture");
 }
 
@@ -8272,6 +8821,37 @@ fn provider_recovery_respects_retry_after() {
         "retry ignored server delay: {:?}",
         started.elapsed()
     );
+}
+
+#[test]
+fn provider_recovery_does_not_send_when_retry_after_exceeds_wait_budget() {
+    let final_body = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"delta":{"content":"should not be requested"},"finish_reason":"stop"}]})
+    );
+    let (client, done, server) = recovery_fixture_with_headers(
+        vec![(429, "slow down".into()), (200, final_body)],
+        "Retry-After: 3600\r\n",
+    );
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Runtime::new().run_agent_loop(
+            &client,
+            "answer",
+            OperatingMode::ReadOnly,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig::default(),
+        ));
+    let _ = done.send(());
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(matches!(
+        result,
+        Err(ProviderError::Http { message, .. })
+            if message.contains("3600000 ms")
+                && message.contains("work remains pending")
+    ));
 }
 
 #[test]
@@ -8789,6 +9369,19 @@ fn foreground_compaction_stops_after_two_retries_without_replacing_history() {
 
 #[test]
 fn responses_server_error_continues_partial_without_replaying_completed_tools() {
+    responses_error_continues_partial_without_replaying_completed_tools(
+        json!({"type":"response.failed","response":{"error":{"code":"server_error","message":"upstream failed"}}}),
+    );
+}
+
+#[test]
+fn responses_request_timeout_continues_partial_without_replaying_completed_tools() {
+    responses_error_continues_partial_without_replaying_completed_tools(
+        json!({"type":"error","error":{"code":"request_timeout","type":"invalid_request_error","message":"stream error: stream disconnected before completion: stream closed before response.completed"}}),
+    );
+}
+
+fn responses_error_continues_partial_without_replaying_completed_tools(error: Value) {
     use slim_core::provider::OpenCodeGoAdapter;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -8802,7 +9395,7 @@ fn responses_server_error_continues_partial_without_replaying_completed_tools() 
             ],
             vec![
                 json!({"type":"response.output_text.delta","delta":"Preserved partial answer."}),
-                json!({"type":"response.failed","response":{"error":{"code":"server_error","message":"upstream failed"}}}),
+                error,
             ],
             vec![
                 json!({"type":"response.output_text.delta","delta":"Recovered final answer."}),
@@ -8937,4 +9530,211 @@ fn mcp_call_in_readonly_mode_is_rejected_by_the_gate() {
     assert_eq!(result.tool_results.len(), 1);
     assert!(!result.tool_results[0].success);
     assert!(result.tool_results[0].output.contains("Auto mode"));
+}
+
+#[test]
+fn managed_shell_job_allows_work_then_resumes_once_on_completion() {
+    let root = std::env::temp_dir().join(format!("slim-managed-shell-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("independent.txt"), "independent-work").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let release = root.join("release-job");
+    let server = thread::spawn(move || {
+        for index in 0..4 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            let (delta, reason) = match index {
+                0 => (
+                    json!({"tool_calls":[{"index":0,"id":"launch","function":{"name":"shell",
+                    "arguments":json!({"command":"Write-Output 'job-started'; while (!(Test-Path -LiteralPath 'release-job')) { Start-Sleep -Milliseconds 50 }; Write-Output 'job-done'","yield_ms":0,"timeout_ms":30000}).to_string()}}]}),
+                    "tool_calls",
+                ),
+                1 => {
+                    assert!(request.contains("job_id=shell-1"));
+                    assert!(!request.contains("[Shell job completion:"));
+                    (
+                        json!({"tool_calls":[{"index":0,"id":"independent","function":{"name":"read",
+                        "arguments":json!({"path":"independent.txt"}).to_string()}}]}),
+                        "tool_calls",
+                    )
+                }
+                2 => {
+                    assert!(request.contains("independent-work"));
+                    std::fs::write(&release, "go").unwrap();
+                    (json!({"content":"Waiting for the job result."}), "stop")
+                }
+                _ => {
+                    assert_eq!(request.matches("[Shell job completion:").count(), 1);
+                    assert!(request.contains("job-done"));
+                    assert!(request.contains("success=true"));
+                    (
+                        json!({"content":"Job and independent work completed."}),
+                        "stop",
+                    )
+                }
+            };
+            let event = json!({"choices":[{"delta":delta}]});
+            let stop = json!({"choices":[{"delta":{},"finish_reason":reason}]});
+            let body = format!("data: {event}\n\ndata: {stop}\n\ndata: [DONE]\n\n");
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+        }
+    });
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .unwrap();
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(10)).unwrap();
+    let mut runtime = Runtime::new();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "Run a command and do independent work",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig {
+                max_turns: 6,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(result.turns, 4, "waiting must not poll the provider");
+    assert!(runtime.app.events().iter().any(
+        |e| matches!(&e.kind, EventKind::ToolProcessFinished { call_id, .. } if call_id == "launch")
+    ));
+    let launch_events = runtime
+        .app
+        .events()
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ToolOutput {
+                call_id, output, ..
+            } if call_id == "launch" => Some((event.seq, "ack", output.as_str())),
+            EventKind::ToolJobOutput {
+                call_id, output, ..
+            } if call_id == "launch" => Some((event.seq, "final", output.as_str())),
+            EventKind::ToolFinished {
+                call_id, success, ..
+            } if call_id == "launch" => {
+                Some((event.seq, if *success { "success" } else { "failure" }, ""))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        launch_events.len(),
+        3,
+        "one acknowledgment, final output and terminal event"
+    );
+    assert_eq!(
+        launch_events
+            .iter()
+            .map(|(_, kind, _)| *kind)
+            .collect::<Vec<_>>(),
+        ["ack", "final", "success"]
+    );
+    assert!(launch_events[1].2.contains("job-done"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn managed_shell_job_can_be_inspected_and_cancelled_by_the_agent() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for index in 0..5 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            let completed = request.contains("[Shell job completion:");
+            let (delta, reason) = match index {
+                0 => (
+                    json!({"tool_calls":[{"index":0,"id":"launch","function":{"name":"shell",
+                    "arguments":json!({"command":"Start-Sleep -Seconds 8","yield_ms":0,"timeout_ms":10000}).to_string()}}]}),
+                    "tool_calls",
+                ),
+                1 | 2 => {
+                    assert!(request.contains("job_id=shell-1"));
+                    (
+                        json!({"tool_calls":[{"index":0,"id":format!("control-{index}"),"function":{"name":"shell_job",
+                        "arguments":json!({"job_id":"shell-1","action":if index == 1 {"status"} else {"cancel"}}).to_string()}}]}),
+                        "tool_calls",
+                    )
+                }
+                _ if completed => {
+                    assert!(request.contains("success=false"));
+                    (json!({"content":"Job cancellation confirmed."}), "stop")
+                }
+                _ => (
+                    json!({"content":"Waiting for cancellation confirmation."}),
+                    "stop",
+                ),
+            };
+            let event = json!({"choices":[{"delta":delta}]});
+            let stop = json!({"choices":[{"delta":{},"finish_reason":reason}]});
+            let body = format!("data: {event}\n\ndata: {stop}\n\ndata: [DONE]\n\n");
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            if index >= 3 && completed {
+                return;
+            }
+        }
+        panic!("cancellation result was not delivered");
+    });
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .unwrap();
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(10)).unwrap();
+    let mut runtime = Runtime::new();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "Inspect and cancel a job",
+            OperatingMode::Auto,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig {
+                max_turns: 6,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(
+        result
+            .tool_results
+            .iter()
+            .filter(|r| r.name == "shell_job")
+            .count(),
+        2
+    );
+    let launch_terminal = runtime
+        .app
+        .events()
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ToolFinished {
+                call_id, success, ..
+            } if call_id == "launch" => Some(*success),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(launch_terminal, [false]);
+    assert!(runtime
+        .app
+        .events()
+        .iter()
+        .any(|event| matches!(&event.kind,
+        EventKind::ToolJobOutput { call_id, .. } if call_id == "launch")));
 }

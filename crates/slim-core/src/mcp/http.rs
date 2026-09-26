@@ -1,12 +1,15 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::mcp::spec::{McpConnection, McpError, MCP_PROTOCOL_VERSION};
+use crate::mcp::spec::{
+    MCP_PROTOCOL_VERSION, McpCancellation, McpCleanupStatus, McpConnection, McpError,
+    McpInterruption, McpRequestOutcome,
+};
 
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
@@ -129,7 +132,11 @@ impl HttpConnection {
 
     async fn send_request(&self, body: Value, expected_id: u64) -> Result<Value, McpError> {
         let response = self.post(body).send().await.map_err(|error| {
-            McpError::Protocol(format!("http request failed: {}", error.without_url()))
+            if error.is_timeout() {
+                McpError::Timeout(self.timeout)
+            } else {
+                McpError::Protocol(format!("http request failed: {}", error.without_url()))
+            }
         })?;
         self.remember_session(&response);
         let status = response.status();
@@ -165,7 +172,11 @@ impl HttpConnection {
             let mut bytes = Vec::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|error| {
-                    McpError::Protocol(format!("http body: {}", error.without_url()))
+                    if error.is_timeout() {
+                        McpError::Timeout(self.timeout)
+                    } else {
+                        McpError::Protocol(format!("http body: {}", error.without_url()))
+                    }
                 })?;
                 if bytes.len() + chunk.len() > MAX_MESSAGE_BYTES {
                     return Err(McpError::Protocol("response exceeds 16 MiB".into()));
@@ -196,7 +207,11 @@ impl HttpConnection {
         let mut payload = String::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|error| {
-                McpError::Protocol(format!("sse stream: {}", error.without_url()))
+                if error.is_timeout() {
+                    McpError::Timeout(self.timeout)
+                } else {
+                    McpError::Protocol(format!("sse stream: {}", error.without_url()))
+                }
             })?;
             buffer.extend_from_slice(&chunk);
             if buffer.len() > MAX_MESSAGE_BYTES {
@@ -261,6 +276,49 @@ impl McpConnection for HttpConnection {
         }
         let body = json!({"jsonrpc": "2.0", "method": method, "params": params});
         let _ = self.post(body).send().await;
+    }
+
+    async fn close_for_cleanup(&self) -> McpCleanupStatus {
+        self.closed.store(true, Ordering::Release);
+        // HTTP requests have no child process to reap, but this transport does
+        // not own cancellation handles for concurrent reqwest futures.
+        McpCleanupStatus::Unconfirmed
+    }
+
+    async fn notify_cancellable(
+        &self,
+        method: &str,
+        params: Value,
+        cancellation: McpCancellation,
+    ) -> McpRequestOutcome<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return McpRequestOutcome::Completed(Err(McpError::Closed));
+        }
+        if cancellation.is_cancelled() {
+            return McpRequestOutcome::InterruptedBeforeSend {
+                interruption: McpInterruption::Cancelled,
+                cleanup: McpCleanupStatus::NotRequired,
+            };
+        }
+        let body = json!({"jsonrpc": "2.0", "method": method, "params": params});
+        tokio::select! {
+            biased;
+            result = self.post(body).send() => match result {
+                Ok(_) => McpRequestOutcome::Completed(Ok(())),
+                Err(error) => McpRequestOutcome::OutcomeUncertain {
+                    interruption: if error.is_timeout() {
+                        McpInterruption::TimedOut(self.timeout)
+                    } else {
+                        McpInterruption::ConnectionClosed
+                    },
+                    cleanup: McpCleanupStatus::Unconfirmed,
+                },
+            },
+            _ = cancellation.cancelled() => McpRequestOutcome::OutcomeUncertain {
+                interruption: McpInterruption::Cancelled,
+                cleanup: McpCleanupStatus::Unconfirmed,
+            },
+        }
     }
 
     fn is_closed(&self) -> bool {

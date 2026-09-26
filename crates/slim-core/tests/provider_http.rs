@@ -310,6 +310,15 @@ fn accepted_connection_waits_for_headers_within_first_semantic_budget() {
 
 #[test]
 fn heartbeat_stream_cannot_extend_first_semantic_deadline() {
+    heartbeat_deadline(false);
+}
+
+#[test]
+fn heartbeat_stream_cannot_extend_semantic_idle_deadline() {
+    heartbeat_deadline(true);
+}
+
+fn heartbeat_deadline(after_content: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let address = listener.local_addr().expect("address");
     let server = thread::spawn(move || {
@@ -320,6 +329,12 @@ fn heartbeat_stream_cannot_extend_first_semantic_deadline() {
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
             )
             .expect("headers");
+        if after_content {
+            let content = b"data: {\"choices\":[{\"delta\":{\"content\":\"started\"}}]}\n\n";
+            write!(stream, "{:X}\r\n", content.len()).expect("chunk size");
+            stream.write_all(content).expect("content");
+            stream.write_all(b"\r\n").expect("chunk end");
+        }
         let heartbeat = b": keepalive\n\n";
         for _ in 0..30 {
             let chunk = format!("{:X}\r\n", heartbeat.len());
@@ -343,7 +358,7 @@ fn heartbeat_stream_cannot_extend_first_semantic_deadline() {
         adapter,
         ProviderTimeouts {
             connect: Duration::from_millis(500),
-            idle: Duration::from_millis(500),
+            idle: Duration::from_millis(if after_content { 100 } else { 500 }),
             first_semantic: Duration::from_millis(100),
             wall: Duration::from_secs(1),
         },
@@ -358,7 +373,8 @@ fn heartbeat_stream_cannot_extend_first_semantic_deadline() {
     server.join().expect("server");
 
     assert!(
-        matches!(&error, ProviderError::Transport { message, .. } if message.contains("first semantic")),
+        matches!(&error, ProviderError::Transport { message, .. }
+            if message.contains(if after_content { "no semantic progress" } else { "first semantic" })),
         "{error:?}"
     );
     assert!(!error.is_retryable(), "a response already started");

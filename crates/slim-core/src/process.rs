@@ -17,6 +17,7 @@ pub(crate) mod windows_job;
 
 const EXECUTABLE_CACHE_CAPACITY: usize = 128;
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const INTERRUPTED_PIPE_DRAIN_LIMIT: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Debug)]
 pub struct ExecutableResolver {
@@ -275,6 +276,8 @@ pub struct ProcessRunOutput {
     pub output: Output,
     pub timed_out: bool,
     pub cancelled: bool,
+    /// A cancellation/timeout stopped readers before pipe EOF was confirmed.
+    pub capture_may_be_incomplete: bool,
     pub stdout_discarded_bytes: usize,
     pub stderr_discarded_bytes: usize,
 }
@@ -287,6 +290,8 @@ pub struct ProcessExecutionFacts {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub cancelled: bool,
+    #[serde(default)]
+    pub capture_may_be_incomplete: bool,
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
     pub stdout_discarded_bytes: u64,
@@ -298,6 +303,7 @@ impl ProcessExecutionFacts {
         output: &Output,
         timed_out: bool,
         cancelled: bool,
+        capture_may_be_incomplete: bool,
         stdout_discarded_bytes: usize,
         stderr_discarded_bytes: usize,
     ) -> Self {
@@ -307,6 +313,7 @@ impl ProcessExecutionFacts {
             exit_code: output.status.code(),
             timed_out,
             cancelled,
+            capture_may_be_incomplete,
             stdout_bytes: u64::try_from(output.stdout.len())
                 .unwrap_or(u64::MAX)
                 .saturating_add(stdout_discarded_bytes),
@@ -420,6 +427,7 @@ impl ProcessRunner {
         let mut next_progress = Duration::from_secs(1);
         let mut timed_out = false;
         let mut cancelled = false;
+        let mut capture_may_be_incomplete = false;
         let status = (|| -> io::Result<ExitStatus> {
             let mut status = None;
             loop {
@@ -450,7 +458,8 @@ impl ProcessRunner {
                     .is_some_and(CancellationToken::is_cancelled);
                 timed_out = !cancelled && started.elapsed() >= request.timeout;
                 if cancelled || timed_out {
-                    stop_reading.cancel();
+                    capture_may_be_incomplete =
+                        !stdout_reader.is_finished() || !stderr_reader.is_finished();
                     #[cfg(windows)]
                     let tree_result = job.terminate();
                     #[cfg(unix)]
@@ -461,6 +470,7 @@ impl ProcessRunner {
                         let _ = child.kill();
                         status = wait_for_exit(&mut child, Duration::from_millis(500))?;
                     }
+                    stop_reading.cancel();
                     tree_result.map_err(|error| io::Error::other(format!(
                         "process interrupted; descendant termination unconfirmed; side effects may still occur: {error}"
                     )))?;
@@ -495,6 +505,7 @@ impl ProcessRunner {
         performance::mark("wait_complete");
         // Pipe readers use readiness polling, so stopping and joining them does
         // not depend on a descendant closing an inherited output handle.
+        capture_may_be_incomplete |= !stdout_reader.is_finished() || !stderr_reader.is_finished();
         stop_reading.cancel();
         #[cfg(windows)]
         {
@@ -505,7 +516,17 @@ impl ProcessRunner {
         let stderr = join_pipe(stderr_reader, "stderr");
         #[cfg(all(test, windows))]
         performance::mark("readers_joined");
-        let status = status.map_err(|error| process_error_with_output(error, &stdout, &stderr))?;
+        let status = status.map_err(|error| {
+            let error = process_error_with_output(error, &stdout, &stderr);
+            if capture_may_be_incomplete {
+                io::Error::new(
+                    error.kind(),
+                    format!("{error}\n[pipe capture may be incomplete after interruption]"),
+                )
+            } else {
+                error
+            }
+        })?;
         let stdout = stdout?;
         let stderr = stderr?;
         let result = ProcessRunOutput {
@@ -516,6 +537,7 @@ impl ProcessRunner {
             },
             timed_out,
             cancelled,
+            capture_may_be_incomplete,
             stdout_discarded_bytes: stdout.discarded_bytes,
             stderr_discarded_bytes: stderr.discarded_bytes,
         };
@@ -735,13 +757,24 @@ fn read_pipe(
     let mut tail = VecDeque::<u8>::with_capacity(tail_budget.min(16 * 1024));
     let mut total_bytes = 0usize;
     let mut chunk = [0_u8; 16 * 1024];
-    while !stop_reading.is_cancelled() {
+    let mut drain_deadline = None;
+    loop {
+        if stop_reading.is_cancelled() {
+            let deadline = *drain_deadline
+                .get_or_insert_with(|| Instant::now() + INTERRUPTED_PIPE_DRAIN_LIMIT);
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
         let available = match ready_bytes(&pipe) {
             Ok(available) => available,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         };
         if available == 0 {
+            if drain_deadline.is_some() {
+                break;
+            }
             #[cfg(windows)]
             std::thread::park_timeout(CANCELLATION_POLL_INTERVAL);
             #[cfg(not(windows))]
@@ -880,6 +913,7 @@ pub(crate) fn terminate_process_tree(resolver: &ExecutableResolver, pid: u32) ->
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
 
     #[test]
     fn interruption_error_preserves_captured_output_and_limits() {
@@ -923,6 +957,61 @@ mod tests {
     #[ignore = "subprocess fixture"]
     fn inherited_pipe_holder() {
         std::thread::sleep(Duration::from_secs(3));
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn pipe_marker_writer() {
+        let signal = std::env::var_os("SLIM_TEST_PIPE_SIGNAL").unwrap();
+        std::io::stdout()
+            .write_all(b"pipe-marker-before-cancel\n")
+            .unwrap();
+        std::io::stdout().flush().unwrap();
+        fs::write(signal, b"ready").unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+    }
+
+    #[test]
+    fn cancelled_reader_drains_bytes_already_in_pipe() {
+        let signal = std::env::temp_dir().join(format!(
+            "slim-pipe-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "process::tests::pipe_marker_writer", "--ignored"])
+            .env("SLIM_TEST_PIPE_SIGNAL", &signal)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        while !signal.exists() && started.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(signal.exists(), "fixture did not write its marker");
+        let stop = CancellationToken::new();
+        stop.cancel();
+        let capture = read_pipe(
+            child.stdout.take().unwrap(),
+            PipeKind::Stdout,
+            1024,
+            Arc::new(Mutex::new(PipeProgress::default())),
+            stop,
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_file(signal);
+        assert!(
+            capture
+                .unwrap()
+                .bytes
+                .windows(b"pipe-marker-before-cancel".len())
+                .any(|window| window == b"pipe-marker-before-cancel"),
+            "already-written marker was lost"
+        );
     }
 
     #[test]

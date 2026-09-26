@@ -143,6 +143,9 @@ pub struct PasteStreamDecoder {
     /// Text already seen in the current input burst; an `Enter` that follows
     /// it (or precedes more queued input) is a paste newline, not a submit.
     burst_text: bool,
+    /// ConPTY maps CRLF to Enter + Ctrl+Enter, sometimes in separate drains.
+    /// Only coalesce the adjacent LF immediately following a burst CR.
+    burst_cr_at: Option<std::time::Instant>,
 }
 
 impl PasteStreamDecoder {
@@ -152,6 +155,14 @@ impl PasteStreamDecoder {
         };
         if key.kind != KeyEventKind::Press {
             return vec![DecodedEvent::Event(event)];
+        }
+        if let Some(cr_at) = self.burst_cr_at.take() {
+            if key.code == KeyCode::Enter
+                && key.modifiers == KeyModifiers::CONTROL
+                && cr_at.elapsed() < std::time::Duration::from_millis(10)
+            {
+                return Vec::new();
+            }
         }
         if self.marker_progress > 0 {
             return self.feed_marker(key, more_input);
@@ -188,6 +199,7 @@ impl PasteStreamDecoder {
             && (more_input || self.burst_text)
         {
             self.burst_text = true;
+            self.burst_cr_at = Some(std::time::Instant::now());
             return vec![DecodedEvent::Event(Event::Key(KeyEvent::new(
                 KeyCode::Char('\n'),
                 KeyModifiers::NONE,
@@ -300,6 +312,26 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn crlf_coalescing_preserves_deliberate_newlines() {
+        let mut decoder = PasteStreamDecoder::default();
+        decoder.feed(Event::Key(key(KeyCode::Enter)), true);
+        decoder.end_of_input();
+        decoder.burst_cr_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert_eq!(
+            decoder.feed(enter.clone(), false),
+            vec![DecodedEvent::Event(enter)]
+        );
+        // Two CR presses are two intentional blank lines, not a CRLF pair.
+        for _ in 0..2 {
+            assert_eq!(
+                decoder.feed(Event::Key(key(KeyCode::Enter)), true),
+                vec![DecodedEvent::Event(Event::Key(key(KeyCode::Char('\n'))))]
+            );
+        }
     }
 
     #[test]

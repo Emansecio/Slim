@@ -672,7 +672,7 @@ fn apply_typed_mutation(
                     .map_err(CapabilityLedgerError::InvalidTaskTransition)?;
             }
         }
-        TaskMutation::TodoSetStatus { id, status } => {
+        TaskMutation::TodoSetStatus { id, status, reason } => {
             let tracker = todos.entry(entity_id.into()).or_default();
             let id = id
                 .or_else(|| {
@@ -685,7 +685,7 @@ fn apply_typed_mutation(
                 })
                 .ok_or_else(error)?;
             tracker
-                .set_status(id, todo_status(status.clone()))
+                .set_status_with_reason(id, todo_status(status.clone()), reason.clone())
                 .map_err(CapabilityLedgerError::InvalidTaskTransition)?;
         }
         TaskMutation::PlanAddNode {

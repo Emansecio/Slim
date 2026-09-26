@@ -2,7 +2,7 @@ use slim_core::provider::ProviderKind;
 use slim_core::OperatingMode;
 use slim_tui::api::ModelAlias;
 
-use crate::oauth::{OAuthProvider, OAuthService};
+use crate::oauth::{OAuthCredential, OAuthProvider, OAuthService};
 use crate::{
     load_local_images, redact, render_jsonl, render_provider_jsonl, render_provider_text,
     render_provider_verbose_text, render_text, run_fake_headless,
@@ -397,9 +397,14 @@ where
                 return failure(ExitCode::Auth, &format!("provider auth configuration invalid: {error}\n"))
             }
         };
+        let mut oauth_context = None;
         let (api_key, account_id) = if credential.oauth {
             match refresh_headless_oauth(kind) {
-                Ok(refreshed) => refreshed,
+                Ok(context) => {
+                    let refreshed = (context.access.clone(), context.account_id.clone());
+                    oauth_context = Some(context);
+                    refreshed
+                }
                 Err(error) => {
                     return failure(
                         ExitCode::Auth,
@@ -432,7 +437,12 @@ where
         };
         let content_blocks = match load_local_images(&image_paths) {
             Ok(blocks) => blocks,
-            Err(error) => return failure(ExitCode::InputRequired, &format!("image: {error}\n")),
+            Err(error) => {
+                return finish_oauth_output(
+                    failure(ExitCode::InputRequired, &format!("image: {error}\n")),
+                    oauth_context,
+                )
+            }
         };
         // G248: a configured model only applies when it validates against the
         // active provider kind; otherwise the provider default is used.
@@ -441,9 +451,12 @@ where
             .as_deref()
             .is_some_and(|model| !crate::provider_compatible_model(kind, model))
         {
-            return failure(
-                ExitCode::InputRequired,
-                "explicit model is unsupported by the selected provider\n",
+            return finish_oauth_output(
+                failure(
+                    ExitCode::InputRequired,
+                    "explicit model is unsupported by the selected provider\n",
+                ),
+                oauth_context,
             );
         }
         let model = explicit_model
@@ -453,7 +466,7 @@ where
         let model = crate::canonical_provider_model(kind, &model);
         let timeout = match resolve_timeout_secs(layered_config.timeout_secs) {
             Ok(timeout) => timeout,
-            Err(error) => return provider_failure(error),
+            Err(error) => return finish_oauth_output(provider_failure(error), oauth_context),
         };
         let request = ProviderRequest {
             prompt,
@@ -525,30 +538,33 @@ where
                 },
             },
         };
-        let result = match provider_result {
-            Ok(result) => result,
-            Err(error) => return provider_failure(error),
-        };
-        let rendered = match format {
-            OutputFormat::Text if verbose => render_provider_verbose_text(&result),
-            OutputFormat::Text => render_provider_text(&result),
-            OutputFormat::Jsonl => match render_provider_jsonl(&result) {
-                Ok(output) => output,
-                Err(error) => {
-                    return failure(ExitCode::Internal, &format!("render error: {error}\n"))
+        let output = match provider_result {
+            Err(error) => provider_failure(error),
+            Ok(result) => {
+                let rendered = match format {
+                    OutputFormat::Text if verbose => Ok(render_provider_verbose_text(&result)),
+                    OutputFormat::Text => Ok(render_provider_text(&result)),
+                    OutputFormat::Jsonl => render_provider_jsonl(&result),
+                };
+                match rendered {
+                    Err(error) => failure(ExitCode::Internal, &format!("render error: {error}\n")),
+                    Ok(rendered) => {
+                        let (stdout, stderr) =
+                            if format == OutputFormat::Text && result.stop == "provider_error" {
+                                (String::new(), rendered)
+                            } else {
+                                (rendered, String::new())
+                            };
+                        CliOutput {
+                            code: result.code,
+                            stdout,
+                            stderr,
+                        }
+                    }
                 }
-            },
+            }
         };
-        let (stdout, stderr) = if format == OutputFormat::Text && result.stop == "provider_error" {
-            (String::new(), rendered)
-        } else {
-            (rendered, String::new())
-        };
-        return CliOutput {
-            code: result.code,
-            stdout,
-            stderr,
-        };
+        return finish_oauth_output(output, oauth_context);
     }
 
     if !fake {
@@ -573,7 +589,25 @@ where
     }
 }
 
-fn refresh_headless_oauth(kind: ProviderKind) -> Result<(String, Option<String>), String> {
+pub(crate) struct HeadlessOAuthContext {
+    pub(crate) access: String,
+    pub(crate) account_id: Option<String>,
+    oauth: OAuthService,
+}
+
+impl HeadlessOAuthContext {
+    pub(crate) fn shutdown(self) -> Vec<String> {
+        let mut warnings = match crate::headless::provider_runtime_block_on(self.oauth.shutdown()) {
+            Ok(warnings) => warnings,
+            Err(_) => vec!["OAuth supervisor shutdown could not be completed".into()],
+        };
+        warnings.sort();
+        warnings.dedup();
+        warnings
+    }
+}
+
+fn refresh_headless_oauth(kind: ProviderKind) -> Result<HeadlessOAuthContext, String> {
     let provider = match kind {
         ProviderKind::Anthropic => OAuthProvider::Anthropic,
         ProviderKind::OpenAiCodex => OAuthProvider::OpenAiCodex,
@@ -585,28 +619,85 @@ fn refresh_headless_oauth(kind: ProviderKind) -> Result<(String, Option<String>)
         .credential(provider)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "OAuth credential is missing from the auth store".to_string())?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| error.to_string())?;
-    let fresh = runtime
-        .block_on(oauth.fresh_credential(provider, stored))
-        .map_err(|error| error.to_string())?;
+    refresh_headless_oauth_with_service(oauth, provider, stored)
+}
+
+pub(crate) fn refresh_headless_oauth_with_service(
+    oauth: OAuthService,
+    provider: OAuthProvider,
+    stored: OAuthCredential,
+) -> Result<HeadlessOAuthContext, String> {
+    let fresh =
+        crate::headless::provider_runtime_block_on(oauth.fresh_credential(provider, stored))
+            .map_err(|error| format!("OAuth provider runtime could not start: {error:?}"))?;
+    let fresh = match fresh {
+        Ok(fresh) => fresh,
+        Err(error) => {
+            let warnings = crate::headless::provider_runtime_block_on(oauth.shutdown())
+                .unwrap_or_else(
+                    |_| vec!["OAuth supervisor shutdown could not be completed".into()],
+                );
+            return Err(oauth_error_with_warnings(error.to_string(), warnings));
+        }
+    };
     let account_id = match provider {
-        OAuthProvider::OpenAiCodex => Some(
-            fresh
-                .credential
-                .account_id
-                .filter(|id| !id.is_empty())
-                .ok_or_else(|| {
+        OAuthProvider::OpenAiCodex => match fresh
+            .credential
+            .account_id
+            .clone()
+            .filter(|id| !id.is_empty())
+        {
+            Some(account_id) => Some(account_id),
+            None => {
+                let warnings = crate::headless::provider_runtime_block_on(oauth.shutdown())
+                    .unwrap_or_else(|_| {
+                        vec!["OAuth supervisor shutdown could not be completed".into()]
+                    });
+                return Err(oauth_error_with_warnings(
                     "Codex OAuth account id is required; use a ChatGPT access token JWT or TUI /login"
-                        .to_string()
-                })?,
-        ),
-        OAuthProvider::Anthropic => Some(fresh.credential.account_id.unwrap_or_default()),
+                        .into(),
+                    warnings,
+                ));
+            }
+        },
+        OAuthProvider::Anthropic => Some(fresh.credential.account_id.clone().unwrap_or_default()),
         OAuthProvider::Xai => None,
     };
-    Ok((fresh.credential.access, account_id))
+    Ok(HeadlessOAuthContext {
+        access: fresh.credential.access,
+        account_id,
+        oauth,
+    })
+}
+
+fn oauth_error_with_warnings(mut error: String, warnings: Vec<String>) -> String {
+    for warning in warnings {
+        if !error.ends_with('\n') {
+            error.push('\n');
+        }
+        error.push_str("OAuth warning: ");
+        error.push_str(&warning);
+    }
+    error
+}
+
+pub(crate) fn append_oauth_warnings(mut output: CliOutput, warnings: &[String]) -> CliOutput {
+    for warning in warnings {
+        if !output.stderr.is_empty() && !output.stderr.ends_with('\n') {
+            output.stderr.push('\n');
+        }
+        output.stderr.push_str("OAuth warning: ");
+        output.stderr.push_str(warning);
+        output.stderr.push('\n');
+    }
+    output
+}
+
+fn finish_oauth_output(output: CliOutput, context: Option<HeadlessOAuthContext>) -> CliOutput {
+    match context {
+        Some(context) => append_oauth_warnings(output, &context.shutdown()),
+        None => output,
+    }
 }
 
 pub(crate) fn default_provider_endpoint(kind: ProviderKind) -> &'static str {

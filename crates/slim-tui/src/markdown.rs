@@ -418,6 +418,85 @@ pub(crate) fn render_plain(source: &str, width: u16) -> Vec<String> {
     rows
 }
 
+/// Greedy word wrap of one sanitized line into byte ranges. A row breaks at
+/// the last space that fits and drops that space; a word wider than the row
+/// breaks between graphemes. Rows depend only on where the previous row
+/// ended, so wrapping from any row start reproduces the rest of the line.
+/// The flag reports whether a grapheme wider than the row was measured as
+/// its one-cell replacement, so display text needs `prose_row_text`.
+pub(crate) fn prose_line_ranges(line: &str, width: usize) -> (Vec<std::ops::Range<usize>>, bool) {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut replaced = false;
+    let mut start = 0usize;
+    let mut used = 0usize;
+    // Last space in the current row: (byte offset, cells before it).
+    let mut space: Option<(usize, usize)> = None;
+    for (offset, grapheme) in line.grapheme_indices(true) {
+        let (display, cells) = normalized_grapheme(grapheme, width);
+        replaced |= display.len() != grapheme.len();
+        let is_space = grapheme == " ";
+        if starts_new_row(used, cells, width) {
+            if is_space {
+                rows.push(start..offset);
+                start = offset + 1;
+                used = 0;
+                space = None;
+                continue;
+            }
+            if let Some((at, before)) = space.take().filter(|&(_, before)| before > 0) {
+                rows.push(start..at);
+                start = at + 1;
+                used -= before + 1;
+            } else {
+                rows.push(start..offset);
+                start = offset;
+                used = 0;
+            }
+        }
+        if is_space {
+            space = Some((offset, used));
+        }
+        used += cells;
+    }
+    rows.push(start..line.len());
+    (rows, replaced)
+}
+
+/// Prose (thinking, user prompts) wrapped at word boundaries.
+pub(crate) fn render_prose(source: &str, width: u16) -> Vec<String> {
+    let width = width.max(1) as usize;
+    let safe = sanitize_terminal_text_cow(source);
+    let mut rows = Vec::new();
+    for line in safe.split('\n') {
+        let (ranges, replaced) = prose_line_ranges(line, width);
+        for range in ranges {
+            rows.push(prose_row_text(&line[range], width, replaced));
+        }
+    }
+    rows
+}
+
+/// Row text as displayed: a plain copy unless the line had graphemes wider
+/// than the row, which take the replacement of `normalized_grapheme`.
+pub(crate) fn prose_row_text(row: &str, width: usize, replaced: bool) -> String {
+    if !replaced {
+        return row.to_owned();
+    }
+    row.graphemes(true)
+        .map(|grapheme| normalized_grapheme(grapheme, width).0)
+        .collect()
+}
+
+pub(crate) fn prose_row_count(source: &str, width: u16) -> usize {
+    let width = width.max(1) as usize;
+    sanitize_terminal_text_cow(source)
+        .split('\n')
+        .map(|line| prose_line_ranges(line, width).0.len())
+        .sum::<usize>()
+        .max(1)
+}
+
 pub(crate) fn plain_row_count(source: &str, width: u16) -> usize {
     let width = width.max(1) as usize;
     if is_safe_ascii(source) {
@@ -539,7 +618,8 @@ fn project(source: &str, width: usize) -> Vec<LogicalLine> {
                     projection.code_depth = projection.code_depth.saturating_sub(1);
                 }
             }
-            Event::SoftBreak | Event::HardBreak => {
+            Event::SoftBreak => projection.push_in_scope(" "),
+            Event::HardBreak => {
                 if projection.table.is_some() {
                     projection.push_in_scope(" ");
                 } else {
@@ -1124,9 +1204,10 @@ mod tests {
     use ratatui::text::Line;
 
     use super::{
-        markdown_row_count, plain_row_count, render_markdown, render_plain, sanitize_terminal_text,
-        sanitize_terminal_text_with_offsets, MarkdownStyles,
+        markdown_row_count, plain_row_count, prose_row_count, render_markdown, render_plain,
+        render_prose, sanitize_terminal_text, sanitize_terminal_text_with_offsets, MarkdownStyles,
     };
+    use unicode_width::UnicodeWidthStr;
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans
@@ -1178,6 +1259,48 @@ mod tests {
         let lines = rendered.iter().map(line_text).collect::<Vec<_>>();
         assert_eq!(lines, ["alpha beta", "gamma"]);
         assert_eq!(markdown_row_count("alpha beta gamma", 10), lines.len());
+    }
+
+    #[test]
+    fn soft_breaks_join_prose_and_wrap_at_the_viewport_width() {
+        let source = "alpha\nbeta gamma";
+        for (width, expected) in [
+            (40, vec!["alpha beta gamma"]),
+            (10, vec!["alpha beta", "gamma"]),
+        ] {
+            let rendered = render_markdown(source, width, styles());
+            assert_eq!(rendered.iter().map(line_text).collect::<Vec<_>>(), expected);
+            assert_eq!(markdown_row_count(source, width), rendered.len());
+        }
+    }
+
+    #[test]
+    fn explicit_breaks_and_paragraph_boundaries_remain_distinct() {
+        for (source, expected) in [
+            ("alpha  \nbeta", vec!["alpha", "beta"]),
+            ("alpha\\\nbeta", vec!["alpha", "beta"]),
+            ("alpha\n\nbeta", vec!["alpha", "", "beta"]),
+        ] {
+            let rendered = render_markdown(source, 40, styles());
+            assert_eq!(rendered.iter().map(line_text).collect::<Vec<_>>(), expected);
+            assert_eq!(markdown_row_count(source, 40), rendered.len());
+        }
+    }
+
+    #[test]
+    fn code_line_breaks_and_indentation_survive_prose_soft_breaks() {
+        let source = "before\ncode\n\n```rust\nfn main() {\n    run();\n}\n```";
+        let rendered = render_markdown(source, 40, styles());
+        let lines = rendered.iter().map(line_text).collect::<Vec<_>>();
+        assert_eq!(lines[0], "before code");
+        let first = lines
+            .iter()
+            .position(|line| line.contains("fn main() {"))
+            .unwrap();
+        assert_eq!(lines[first].trim_end(), "│ fn main() {");
+        assert_eq!(lines[first + 1].trim_end(), "│     run();");
+        assert_eq!(lines[first + 2].trim_end(), "│ }");
+        assert_eq!(markdown_row_count(source, 40), rendered.len());
     }
 
     #[test]
@@ -1262,6 +1385,39 @@ mod tests {
     fn tabs_expand_before_materialization() {
         let rendered = render_markdown("`a\tb`", 20, styles());
         assert!(rendered.iter().all(|line| !line_text(line).contains('\t')));
+    }
+
+    #[test]
+    fn prose_wraps_at_word_boundaries_and_shares_its_measure() {
+        let source = "O cache atual conta entradas, não bytes. Preciso ver quem chama insert";
+        let rows = render_prose(source, 30);
+        assert_eq!(
+            rows,
+            [
+                "O cache atual conta entradas,",
+                "não bytes. Preciso ver quem",
+                "chama insert",
+            ]
+        );
+        let mixed = "palavra-muito-longa-sem-espaco curto 界界 👨‍👩‍👧‍👦 fim\n\nsegunda  linha";
+        for width in 1..=24u16 {
+            for text in [source, mixed] {
+                let rows = render_prose(text, width);
+                assert_eq!(rows.len(), prose_row_count(text, width), "width {width}");
+                assert!(
+                    rows.iter().all(|row| row.width() <= usize::from(width)),
+                    "width {width}: {rows:?}"
+                );
+                // Only the dropped break spaces are lost; content order stays.
+                // Width 1 replaces wide graphemes by design.
+                if width >= 2 {
+                    let kept: String = rows.concat().split_whitespace().collect();
+                    let expected: String =
+                        sanitize_terminal_text(text).split_whitespace().collect();
+                    assert_eq!(kept, expected, "width {width}");
+                }
+            }
+        }
     }
 
     #[test]

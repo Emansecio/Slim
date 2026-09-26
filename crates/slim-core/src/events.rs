@@ -180,6 +180,17 @@ pub enum EventKind {
         name: String,
         output: String,
     },
+    /// Final output of a shell job whose initial ToolOutput acknowledged its
+    /// launch. It shares the original call identity without creating a second
+    /// provider tool result.
+    ToolJobOutput {
+        #[serde(default)]
+        batch_id: String,
+        #[serde(default)]
+        call_id: String,
+        name: String,
+        output: String,
+    },
     ToolProgress {
         #[serde(default)]
         batch_id: String,
@@ -501,6 +512,11 @@ pub enum EventKind {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TodoChangedItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Older event logs did not include task identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
     pub title: String,
     pub status: String,
 }

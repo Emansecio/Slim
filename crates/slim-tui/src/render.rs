@@ -44,30 +44,33 @@ impl ThinkingPreview {
         let safe = safe[prefix.len()..].trim_end();
         let width = usize::from(width.max(1));
         let mut rows = Vec::new();
-        let mut boundaries = vec![(0usize, self.logical_column)];
-        let mut row = String::new();
-        let mut used = 0usize;
-        let mut column = self.logical_column;
-        for (offset, grapheme) in safe.grapheme_indices(true) {
-            if grapheme == "\n" {
-                rows.push(std::mem::take(&mut row));
-                used = 0;
-                column = 0;
-                boundaries.push((offset + 1, column));
-                continue;
-            }
-            let (display, cells) = crate::markdown::normalized_grapheme(grapheme, width);
-            if used > 0 && used.saturating_add(cells) > width {
-                rows.push(std::mem::take(&mut row));
-                used = 0;
-                boundaries.push((offset, column));
-            }
-            row.push_str(display);
-            used = used.saturating_add(cells);
-            column = column.saturating_add(unicode_width::UnicodeWidthStr::width(grapheme));
-        }
+        // Start (offset, logical column) of each row, for restarting later.
+        let mut boundaries = Vec::new();
         if !safe.is_empty() {
-            rows.push(row);
+            let mut line_start = 0usize;
+            let mut line_column = self.logical_column;
+            for line in safe.split('\n') {
+                // Row starts only move forward: accumulate the column from
+                // the previous start to keep the pass linear.
+                let mut previous_start = 0usize;
+                let mut column = line_column;
+                let (ranges, replaced) = crate::markdown::prose_line_ranges(line, width);
+                for range in ranges {
+                    column += line[previous_start..range.start]
+                        .graphemes(true)
+                        .map(unicode_width::UnicodeWidthStr::width)
+                        .sum::<usize>();
+                    previous_start = range.start;
+                    boundaries.push((line_start + range.start, column));
+                    rows.push(crate::markdown::prose_row_text(
+                        &line[range],
+                        width,
+                        replaced,
+                    ));
+                }
+                line_start += line.len() + 1;
+                line_column = 0;
+            }
         }
         // Only restart on a real raw boundary. A tab expansion can cross a row
         // boundary; in that case retain the preceding row as well.
@@ -342,6 +345,7 @@ mod coalescer_tests {
                     exit_code: Some(7),
                     timed_out: true,
                     cancelled: false,
+                    capture_may_be_incomplete: false,
                     stdout_bytes: 12,
                     stderr_bytes: 8,
                     stdout_discarded_bytes: 3,
@@ -415,8 +419,14 @@ pub fn wrapped_row_count(text: &str, width: usize) -> usize {
     crate::markdown::plain_row_count(text, width.min(u16::MAX as usize) as u16)
 }
 
-/// Cells before the user prompt text on each band row (`"  You  "`).
-pub(crate) const USER_PROMPT_PREFIX_COLS: u16 = 7;
+/// Height of prose (thinking, user prompts) under the word wrap of
+/// `markdown::render_prose`.
+pub(crate) fn prose_row_count(text: &str, width: usize) -> usize {
+    crate::markdown::prose_row_count(text, width.min(u16::MAX as usize) as u16)
+}
+
+/// Align the body with the label in the separate `"  ● Você"` header.
+pub(crate) const USER_PROMPT_PREFIX_COLS: u16 = 4;
 
 pub(crate) fn user_prompt_text_width(width: u16) -> u16 {
     width.saturating_sub(USER_PROMPT_PREFIX_COLS).max(1)
@@ -427,12 +437,15 @@ pub(crate) fn thinking_body_width(width: u16) -> u16 {
     width.saturating_sub(4).max(1)
 }
 
-fn block_height(block: &Block, width: u16, cache: &mut WrapCache) -> usize {
+fn block_height(
+    block: &Block,
+    width: u16,
+    cache: &mut WrapCache,
+    show_assistant_header: bool,
+) -> usize {
     let body_width = width.saturating_sub(2).max(1) as usize; // rail/padding column
     let content_rows = match block.kind() {
-        BlockKind::User(text) => {
-            wrapped_row_count(text, user_prompt_text_width(width) as usize) + 1
-        }
+        BlockKind::User(text) => prose_row_count(text, user_prompt_text_width(width) as usize) + 2,
         BlockKind::Assistant(text) => {
             let text_width = if body_width > 1 {
                 body_width - 1 // reserved streaming-caret cell, stable after completion
@@ -441,7 +454,15 @@ fn block_height(block: &Block, width: u16, cache: &mut WrapCache) -> usize {
             };
             // The measured projection is shared with the render pass, so the
             // streaming body is parsed once per generation instead of twice.
-            2 + cache.markdown_rows(block, text, text_width as u16)
+            // Continuations omit the breathing row and the role header.
+            let chrome = if show_assistant_header { 2 } else { 0 };
+            let body = cache.markdown_rows(block, text, text_width as u16);
+            chrome
+                + if show_assistant_header {
+                    body
+                } else {
+                    body.max(1)
+                }
         }
         BlockKind::Thinking(text) => match block.fold {
             crate::block::FoldState::Expanded => {
@@ -450,7 +471,7 @@ fn block_height(block: &Block, width: u16, cache: &mut WrapCache) -> usize {
                     BodyKind::Thinking,
                     width,
                     block.lifecycle != crate::block::BlockLifecycle::Streaming,
-                    || wrapped_row_count(text, thinking_body_width(width) as usize),
+                    || prose_row_count(text, thinking_body_width(width) as usize),
                 )
             }
             _ if block.shows_thinking_preview() => {
@@ -591,6 +612,10 @@ impl<'a> HeightIndex<'a> {
         (prefix, &self.blocks[leader], &self.blocks[start..end])
     }
 
+    pub fn entry_start(&self, index: usize) -> usize {
+        self.memo.spans[index].2
+    }
+
     pub fn len(&self) -> usize {
         self.memo.spans.len()
     }
@@ -607,26 +632,37 @@ impl<'a> HeightIndex<'a> {
         let mut index = 0usize;
         while index < blocks.len() {
             let block = &blocks[index];
-            if crate::block::is_complete_tool(block) {
-                if let Some((start, end)) =
-                    crate::block::consecutive_complete_tool_span(blocks, index)
-                {
-                    let tool_count = crate::block::complete_tool_count(blocks, start, end);
-                    if tool_count > 1 && start == index {
-                        let rows = grouped_member_rows(block, tool_count);
-                        let entry_prefix = prefix;
-                        prefix = record_grouped_member_rows(
-                            &mut block_rows,
-                            prefix,
-                            block,
-                            &blocks[start..end],
-                            rows,
-                            crate::block::is_complete_tool,
-                        );
-                        spans.push((entry_prefix, start, start, end));
-                        index = end;
-                        continue;
-                    }
+            // Grouped spans always start at `index`, so the leader's gap is
+            // the span's gap and precedes every member row.
+            let gap = u64::from(crate::block::transition_gap(blocks, index));
+            let tool_span = if cache.present_tool_hold {
+                crate::block::consecutive_presented_tool_span(
+                    blocks,
+                    index,
+                    cache.present_now_ms,
+                    cache.present_reduced_motion,
+                )
+            } else if crate::block::is_complete_tool(block) {
+                crate::block::consecutive_complete_tool_span(blocks, index)
+            } else {
+                None
+            };
+            if let Some((start, end)) = tool_span {
+                let tool_count = crate::block::complete_tool_count(blocks, start, end);
+                if tool_count > 1 && start == index {
+                    let rows = grouped_member_rows(block, tool_count);
+                    let entry_prefix = prefix;
+                    prefix = record_grouped_member_rows(
+                        &mut block_rows,
+                        prefix.saturating_add(gap),
+                        block,
+                        &blocks[start..end],
+                        rows,
+                        crate::block::is_complete_tool,
+                    );
+                    spans.push((entry_prefix, start, start, end));
+                    index = end;
+                    continue;
                 }
             }
             if crate::block::is_failed_tool(block) {
@@ -639,7 +675,7 @@ impl<'a> HeightIndex<'a> {
                         let entry_prefix = prefix;
                         prefix = record_grouped_member_rows(
                             &mut block_rows,
-                            prefix,
+                            prefix.saturating_add(gap),
                             block,
                             &blocks[start..end],
                             rows,
@@ -677,7 +713,7 @@ impl<'a> HeightIndex<'a> {
                         let entry_prefix = prefix;
                         prefix = record_grouped_member_rows(
                             &mut block_rows,
-                            prefix,
+                            prefix.saturating_add(gap),
                             block,
                             members,
                             rows,
@@ -700,12 +736,14 @@ impl<'a> HeightIndex<'a> {
                 height
             } else {
                 cache.height_misses = cache.height_misses.saturating_add(1);
-                let height = block_height(block, width, cache);
+                let show_assistant_header = crate::block::assistant_chrome(blocks, index)
+                    .is_none_or(|chrome| chrome.shows_header());
+                let height = block_height(block, width, cache, show_assistant_header);
                 pending_heights.push((key, height));
                 height
             };
-            let rows = height as u64;
-            let boundary_rows = u64::from(block.turn_boundary_before());
+            let rows = height as u64 + gap;
+            let boundary_rows = u64::from(block.turn_boundary_before()) + gap;
             block_rows.entry(block.id.clone()).or_insert((
                 prefix.saturating_add(boundary_rows),
                 rows.saturating_sub(boundary_rows).max(1),
@@ -745,11 +783,37 @@ impl<'a> HeightIndex<'a> {
         if self.memo.spans.is_empty() || row >= self.total_rows {
             return None;
         }
-        let (index, row_offset) = self.locate(row);
+        let (index, skipped) = self.locate(row);
+        let leader = self.entry(index).1;
+        // Offsets are relative to the block's content start, as in
+        // `row_for_anchor`; a leading blank row resolves to that start.
+        let leading = self
+            .prefix_for_block(&leader.id)
+            .map_or(0, |prefix| prefix.saturating_sub(self.memo.spans[index].0));
         Some(ScrollAnchor {
-            block_id: self.entry(index).1.id.clone(),
-            row_offset,
+            block_id: leader.id.clone(),
+            row_offset: skipped.saturating_sub(leading),
         })
+    }
+
+    /// Anchor whose resolved row is at or before `row`. Leading blank rows
+    /// resolve forward to their block, so upward moves step past them rather
+    /// than resolving back to the row they started from.
+    fn anchor_at_or_before(&self, row: u64) -> Option<ScrollAnchor> {
+        let mut candidate = row;
+        loop {
+            let anchor = self.anchor_for_row(candidate)?;
+            if self
+                .row_for_anchor(&anchor)
+                .is_some_and(|resolved| resolved <= row)
+            {
+                return Some(anchor);
+            }
+            if candidate == 0 {
+                return None;
+            }
+            candidate -= 1;
+        }
     }
 
     pub fn metrics(&self, mode: &FollowMode, viewport_rows: u64) -> ScrollMetrics {
@@ -786,9 +850,9 @@ impl<'a> HeightIndex<'a> {
             total_rows: self.total_rows,
             bottom_start,
             top_anchor: self.anchor_for_row(viewport_start),
-            up_anchor: self.anchor_for_row(up),
+            up_anchor: self.anchor_at_or_before(up),
             down_anchor: self.anchor_for_row(down),
-            page_up_anchor: self.anchor_for_row(page_up),
+            page_up_anchor: self.anchor_at_or_before(page_up),
             page_down_anchor: self.anchor_for_row(page_down),
             last_visible_foldable_anchor,
         }
@@ -820,13 +884,15 @@ impl<'a> HeightIndex<'a> {
             .partition_point(|(prefix, _, _, _)| *prefix < viewport_end);
         while index > 0 {
             index -= 1;
-            let (prefix, leader, start, end) = self.memo.spans[index];
+            let (_, leader, start, end) = self.memo.spans[index];
             let block = &self.blocks[leader];
             let members = &self.blocks[start..end];
-            let Some(&(_, rows)) = self.memo.block_rows.get(&block.id) else {
+            // `block_rows` excludes leading blank rows from both its start and
+            // its count, so the content end must use that same start.
+            let Some(&(block_prefix, rows)) = self.memo.block_rows.get(&block.id) else {
                 continue;
             };
-            if prefix.saturating_add(rows) <= viewport_start {
+            if block_prefix.saturating_add(rows) <= viewport_start {
                 break;
             }
             let foldable_tool = matches!(block.kind(), BlockKind::Tool(state)
@@ -923,16 +989,23 @@ pub struct WrapCache {
     /// one pulldown-cmark parse feeds both row counting and body rendering.
     #[allow(clippy::type_complexity)]
     projections: Vec<((u64, u64, u16), Arc<Vec<LogicalLine>>)>,
-    /// Built height indexes keyed by (content rev, fold rev, width): scroll
-    /// gestures and churn-free frames re-render without an O(n) rebuild.
-    height_indexes: HashMap<(u64, u64, u16), Arc<HeightIndexMemo>>,
+    /// Built height indexes keyed by (content rev, fold rev, width, tool-hold
+    /// epoch). The epoch stays put across motion frames and changes only when
+    /// a just-finished tool joins or leaves its group.
+    height_indexes: HashMap<(u64, u64, u16, u64), Arc<HeightIndexMemo>>,
     /// Transcript search results keyed by (query, filter, content rev).
     #[allow(clippy::type_complexity)]
     search_memo: Option<((String, SearchFilter, u64), Arc<[usize]>)>,
     /// Foldable selected-block probe keyed by (content, fold, scroll mode).
     selected_memo: Option<((u64, u64, FollowMode), Option<BlockId>)>,
-    /// Last collapsed tool-group leader keyed by (content, fold).
-    tool_leader_memo: Option<((u64, u64), Option<BlockId>)>,
+    /// Last collapsed tool-group leader keyed by (content, fold, hold epoch).
+    tool_leader_memo: Option<((u64, u64, u64), Option<BlockId>)>,
+    /// Live clock for tool-group hold. Direct `HeightIndex::build` leaves
+    /// this off and keeps the settled span, so probes that do not paint a
+    /// frame stay independent of the emphasis window.
+    present_tool_hold: bool,
+    present_now_ms: u64,
+    present_reduced_motion: bool,
     /// Composer display snapshot keyed by (composer revision, width).
     composer_memo: Option<((u64, u16), DisplaySnapshot)>,
     /// Slash completion matches keyed by (query, skill list revision).
@@ -980,6 +1053,7 @@ type BlockLinesKey = (u64, u64, u8, u16);
 #[derive(Clone, Eq, PartialEq)]
 struct FooterKey {
     working: bool,
+    prompt_preparing: bool,
     mode: slim_core::OperatingMode,
     pinned: bool,
     unseen: u32,
@@ -1064,8 +1138,21 @@ impl WrapCache {
         result
     }
 
+    /// Arms the tool-group hold for the next height build. Motion frames that
+    /// share the same hold set reuse the index; only a settlement or a new
+    /// completion changes the epoch.
+    pub(crate) fn set_tool_presentation(&mut self, now_ms: u64, reduced_motion: bool) {
+        self.present_now_ms = now_ms;
+        self.present_reduced_motion = reduced_motion;
+        self.present_tool_hold = true;
+    }
+
+    pub(crate) fn reduced_motion_presentation(&self) -> bool {
+        self.present_reduced_motion
+    }
+
     /// Height index for the current frame: shares the memoized index content
-    /// when (content, fold, width) are unchanged, built and memoized otherwise.
+    /// when (content, fold, width, hold epoch) are unchanged, built otherwise.
     pub(crate) fn height_index<'a>(
         &mut self,
         blocks: &'a [Block],
@@ -1073,7 +1160,12 @@ impl WrapCache {
         fold_rev: u64,
         width: u16,
     ) -> HeightIndex<'a> {
-        let key = (content_rev, fold_rev, width);
+        let epoch = if self.present_tool_hold {
+            crate::block::tool_hold_epoch(blocks, self.present_now_ms, self.present_reduced_motion)
+        } else {
+            0
+        };
+        let key = (content_rev, fold_rev, width, epoch);
         if let Some(memo) = self.height_indexes.get(&key) {
             return HeightIndex {
                 blocks,
@@ -1083,7 +1175,7 @@ impl WrapCache {
         }
         let index = HeightIndex::build(blocks, width, self);
         self.height_indexes
-            .retain(|(c, f, _), _| *c == content_rev && *f == fold_rev);
+            .retain(|(c, f, _, e), _| *c == content_rev && *f == fold_rev && *e == epoch);
         if self.height_indexes.len() >= MAX_HEIGHT_INDEX_MEMOS {
             self.height_indexes.clear();
         }
@@ -1191,17 +1283,23 @@ impl WrapCache {
         .clone()
     }
 
-    /// The most recent collapsed tool-group leader while a run is active;
-    /// memoized over (content, fold) so working frames stop rescanning.
+    /// The most recent collapsed tool-group leader while a run is active.
+    /// Keyed by the hold epoch so a spinner frame does not rescan, and a
+    /// tool joining the group does.
     pub(crate) fn tool_group_leader(
         &mut self,
         blocks: &[Block],
         content_rev: u64,
         fold_rev: u64,
+        now_ms: u64,
+        reduced_motion: bool,
     ) -> Option<BlockId> {
-        memoized(&mut self.tool_leader_memo, (content_rev, fold_rev), || {
-            crate::runtime::last_collapsed_tool_group_leader(blocks)
-        })
+        let epoch = crate::block::tool_hold_epoch(blocks, now_ms, reduced_motion);
+        memoized(
+            &mut self.tool_leader_memo,
+            (content_rev, fold_rev, epoch),
+            || crate::runtime::last_collapsed_tool_group_leader(blocks, now_ms, reduced_motion),
+        )
         .clone()
     }
 
@@ -1347,6 +1445,7 @@ impl WrapCache {
     ) -> Arc<Vec<String>> {
         let key = FooterKey {
             working: state.working,
+            prompt_preparing: state.prompt_is_busy(),
             mode: state.mode,
             pinned: state.scroll.is_pinned(),
             unseen: state.scroll.unseen,
@@ -1408,9 +1507,7 @@ impl WrapCache {
         }
         self.height_misses = self.height_misses.saturating_add(1);
         let height = match block.kind() {
-            BlockKind::Thinking(text) => {
-                wrapped_row_count(text, thinking_body_width(width) as usize)
-            }
+            BlockKind::Thinking(text) => prose_row_count(text, thinking_body_width(width) as usize),
             _ => 1,
         };
         pending.push((key, height));
@@ -1542,6 +1639,9 @@ impl Default for WrapCache {
             search_memo: None,
             selected_memo: None,
             tool_leader_memo: None,
+            present_tool_hold: false,
+            present_now_ms: 0,
+            present_reduced_motion: false,
             composer_memo: None,
             slash_memo: None,
             model_rows_memo: None,
@@ -1593,7 +1693,7 @@ mod height_cache_tests {
                 };
                 let (actual, _) = cache.thinking_preview(&block, text, width);
                 let safe = crate::markdown::sanitize_terminal_text(text);
-                let expected = crate::markdown::render_plain(safe.trim_end(), width);
+                let expected = crate::markdown::render_prose(safe.trim_end(), width);
                 let start = expected.len().saturating_sub(2);
                 assert_eq!(actual, expected[start..], "width={width} part={part:?}");
             }
@@ -1603,7 +1703,7 @@ mod height_cache_tests {
                 unreachable!()
             };
             let resized = cache.thinking_preview(&block, text, 13).0;
-            let expected = crate::markdown::render_plain(text.trim_end(), 13);
+            let expected = crate::markdown::render_prose(text.trim_end(), 13);
             assert_eq!(resized, expected[expected.len().saturating_sub(2)..]);
         }
     }
@@ -1635,7 +1735,7 @@ mod height_cache_tests {
             let BlockKind::Thinking(text) = block.kind() else {
                 unreachable!()
             };
-            let expected = crate::markdown::render_plain(text.trim_end(), 76);
+            let expected = crate::markdown::render_prose(text.trim_end(), 76);
             assert_eq!(
                 cache.thinking_preview(block, text, 76).0,
                 expected[expected.len() - 2..]
@@ -1668,7 +1768,7 @@ mod height_cache_tests {
                     unreachable!()
                 };
                 let safe = crate::markdown::sanitize_terminal_text(text);
-                let expected = crate::markdown::render_plain(safe.trim_end(), width);
+                let expected = crate::markdown::render_prose(safe.trim_end(), width);
                 let actual = cache.thinking_preview(&block, text, width).0;
                 assert_eq!(
                     actual,
@@ -1698,7 +1798,8 @@ mod height_cache_tests {
                 .iter()
                 .map(|block| match block.kind() {
                     BlockKind::Thinking(text) => {
-                        wrapped_row_count(text, super::thinking_body_width(width) as usize) as u64
+                        super::prose_row_count(text, super::thinking_body_width(width) as usize)
+                            as u64
                     }
                     _ => unreachable!(),
                 })
@@ -1728,7 +1829,7 @@ mod height_cache_tests {
         // A standalone heading must not reuse the grouped body-only height.
         assert_eq!(
             HeightIndex::build(&blocks[..1], 12, &mut cache).total_rows,
-            block_height(&blocks[0], 12, &mut cache) as u64
+            block_height(&blocks[0], 12, &mut cache, true) as u64
         );
         let replacement = blocks[1].clone();
         blocks[1] = replacement;

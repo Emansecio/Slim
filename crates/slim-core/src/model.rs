@@ -335,7 +335,6 @@ fn is_cancel_droppable(event: &SessionEvent) -> bool {
         &event.kind,
         crate::EventKind::AssistantTextDelta { .. }
             | crate::EventKind::ReasoningDelta { .. }
-            | crate::EventKind::ToolOutput { .. }
             | crate::EventKind::ToolProgress { .. }
     )
 }
@@ -385,9 +384,8 @@ impl AppHandle {
         if !try_coalesce_event_vec(&mut self.events, &event) {
             self.events.push(event.clone());
         }
-        // ToolOutput is the only carrier of a tool's full result: it must wait
-        // for queue space like every other event instead of being dropped on a
-        // full queue. It stays cancel-droppable inside `send_interruptible`.
+        // Final tool output goes through the bounded queue with its terminal;
+        // only transient progress and text deltas are cancel-droppable.
         if self
             .event_sender
             .as_ref()
@@ -436,7 +434,9 @@ impl AppHandle {
                 EventKind::ToolStarted { arguments, .. }
                 | EventKind::ToolCall { arguments, .. }
                 | EventKind::ProviderToolCall { arguments, .. } => *arguments = String::new(),
-                EventKind::ToolOutput { output, .. } => *output = String::new(),
+                EventKind::ToolOutput { output, .. } | EventKind::ToolJobOutput { output, .. } => {
+                    *output = String::new()
+                }
                 EventKind::ToolProgress { preview, .. } => *preview = String::new(),
                 EventKind::QuestionRequired { question, .. } => *question = String::new(),
                 _ => {}
@@ -561,14 +561,14 @@ mod tests {
         .expect("cancelled visual event remains in ledger");
         app.push_event(SessionEvent::new(
             3,
-            EventKind::ToolOutput {
+            EventKind::ToolProgress {
                 batch_id: "batch".into(),
                 call_id: "call".into(),
                 name: "read".into(),
-                output: "dropped preview".into(),
+                preview: "dropped preview".into(),
             },
         ))
-        .expect("cancelled tool progress remains in ledger");
+        .expect("cancelled visual tool progress remains in ledger");
         assert_eq!(receiver.try_iter().count(), 1);
 
         app.push_event(SessionEvent::new(
@@ -587,6 +587,82 @@ mod tests {
             EventKind::ToolFinished { .. }
         ));
         assert_eq!(app.events().len(), 4);
+    }
+
+    #[test]
+    fn cancellation_keeps_uncertain_tool_output_and_terminal_with_bounded_queue() {
+        let cancellation = CancellationToken::new();
+        let (sender, receiver) = SessionEventSender::bounded(1, cancellation.clone());
+        let stats_probe = sender.clone();
+        let (output_enqueued_tx, output_enqueued_rx) = std::sync::mpsc::channel();
+        let mut app = AppHandle::fake();
+        app.set_event_sender(sender);
+        app.push_event(SessionEvent::new(
+            1,
+            EventKind::ToolProgress {
+                batch_id: "batch".into(),
+                call_id: "call".into(),
+                name: "mcp".into(),
+                preview: "connecting".into(),
+            },
+        ))
+        .expect("fill the single slot with disposable progress");
+        cancellation.cancel();
+
+        let producer = std::thread::spawn(move || {
+            app.push_event(SessionEvent::new(
+                2,
+                EventKind::ToolOutput {
+                    batch_id: "batch".into(),
+                    call_id: "call".into(),
+                    name: "mcp".into(),
+                    output: "mcp operation outcome is uncertain; do not replay the call".into(),
+                },
+            ))
+            .expect("uncertain final tool output is delivered");
+            output_enqueued_tx
+                .send(())
+                .expect("test waits until final output send returns");
+            app.push_event(SessionEvent::new(
+                3,
+                EventKind::ToolFinished {
+                    batch_id: "batch".into(),
+                    call_id: "call".into(),
+                    name: "mcp".into(),
+                    success: false,
+                    duration_ms: 1,
+                },
+            ))
+            .expect("tool terminal follows final output");
+        });
+
+        output_enqueued_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("producer attempts final output before receiver drains the queue");
+        assert!(matches!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("uncertain tool output reaches receiver"),
+            SessionEvent {
+                kind: EventKind::ToolOutput { output, .. },
+                ..
+            } if output.contains("outcome is uncertain")
+        ));
+        assert!(matches!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("terminal reaches receiver after output"),
+            SessionEvent {
+                kind: EventKind::ToolFinished { success: false, .. },
+                ..
+            }
+        ));
+        producer.join().expect("event producer completes");
+
+        let stats = stats_probe.stats();
+        assert_eq!(stats.capacity, 1);
+        assert_eq!(stats.high_watermark, 1, "bounded queue never grew");
+        assert_eq!(stats.queued, 0, "receiver drained the causal suffix");
     }
 
     #[test]
@@ -651,6 +727,7 @@ mod tests {
                     exit_code: Some(1),
                     timed_out: false,
                     cancelled: true,
+                    capture_may_be_incomplete: false,
                     stdout_bytes: 0,
                     stderr_bytes: 0,
                     stdout_discarded_bytes: 0,

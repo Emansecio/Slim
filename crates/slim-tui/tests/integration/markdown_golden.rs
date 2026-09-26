@@ -110,20 +110,21 @@ fn render_state_with_caps(state: &AppState, width: u16, capabilities: Capabiliti
 }
 
 #[test]
-fn headings_hide_markers_and_use_three_semantic_colors() {
+fn headings_hide_markers_and_keep_three_distinct_levels() {
     let rendered = render("# Primary\n## Structure\n### Detail", 80);
     let text = rendered.text();
     assert!(!text.contains("# Primary"));
     assert!(!text.contains("## Structure"));
     assert!(!text.contains("### Detail"));
-    assert_eq!(
-        rendered.word_style("Primary").0,
-        Color::Rgb(0x72, 0xCC, 0x91)
-    );
-    assert_eq!(
-        rendered.word_style("Structure").0,
-        Color::Rgb(0x91, 0xC2, 0x8F)
-    );
+    // Hierarchy comes from weight and underline on ivory, not from green.
+    let ivory = Color::Rgb(0xE8, 0xE5, 0xDB);
+    let (h1, h1_modifiers) = rendered.word_style("Primary");
+    let (h2, h2_modifiers) = rendered.word_style("Structure");
+    assert_eq!(h1, ivory);
+    assert!(h1_modifiers.contains(Modifier::BOLD | Modifier::UNDERLINED));
+    assert_eq!(h2, ivory);
+    assert!(h2_modifiers.contains(Modifier::BOLD));
+    assert!(!h2_modifiers.contains(Modifier::UNDERLINED));
     assert_eq!(
         rendered.word_style("Detail").0,
         Color::Rgb(0xAF, 0xA9, 0x9D)
@@ -151,17 +152,15 @@ fn inline_markdown_renders_without_control_markers() {
 }
 
 #[test]
-fn inline_code_uses_tool_accent_not_code_rail() {
+fn inline_code_uses_raised_surface_not_green() {
     let rendered = render("see `target\\debug` and more", 80);
     assert_eq!(
         rendered.word_style("target").0,
-        Color::Rgb(0x72, 0xCC, 0x91),
+        Color::Rgb(0xE8, 0xE5, 0xDB),
         "inline paths must stay readable on near-black"
     );
-    assert_ne!(
-        rendered.word_style("target").0,
-        Color::Rgb(0x68, 0x66, 0x5A)
-    );
+    assert_eq!(rendered.word_bg("target"), Color::Rgb(0x14, 0x14, 0x14));
+    assert_ne!(rendered.word_bg("more"), rendered.word_bg("target"));
 }
 
 #[test]
@@ -174,7 +173,7 @@ fn fenced_code_uses_rail_and_code_background() {
     );
     assert_eq!(
         rendered.word_bg("value"),
-        Color::Rgb(0x0A, 0x0A, 0x0A),
+        Color::Rgb(0x14, 0x14, 0x14),
         "fenced code must use code_bg"
     );
 }
@@ -193,7 +192,7 @@ fn diff_rows_keep_prefixes_and_semantic_backgrounds() {
     );
     assert_eq!(rendered.word_bg("old"), Color::Rgb(0x2A, 0x18, 0x16));
     assert_eq!(rendered.word_bg("new"), Color::Rgb(0x17, 0x2A, 0x1E));
-    assert_eq!(rendered.word_bg("context"), Color::Rgb(0x0A, 0x0A, 0x0A));
+    assert_eq!(rendered.word_bg("context"), Color::Rgb(0x14, 0x14, 0x14));
 }
 
 #[test]
@@ -329,7 +328,7 @@ fn assistant_body_uses_role_label_and_foreground() {
 }
 
 #[test]
-fn user_band_is_followed_by_one_blank_row() {
+fn user_header_and_body_are_followed_by_one_blank_row() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::UserMessageAdded {
         text: "question".into(),
@@ -354,17 +353,16 @@ fn user_band_is_followed_by_one_blank_row() {
         .iter()
         .position(|row| row.contains("answer"))
         .expect("answer");
-    assert_eq!(
-        question, you,
-        "Você prefixes the prompt on the same band row"
-    );
-    assert!(rendered.rows[you + 1].trim().is_empty());
+    assert_eq!(question, you + 1, "user header precedes the body");
+    assert!(rendered.rows[you].starts_with("  ● Você"));
+    assert!(rendered.rows[question].starts_with("    question"));
+    assert!(rendered.rows[question + 1].trim().is_empty());
     assert!(
-        rendered.rows[you + 2].trim().is_empty(),
+        rendered.rows[question + 2].trim().is_empty(),
         "agent breathing row"
     );
-    assert_eq!(rendered.rows[you + 3].trim(), "Slim");
-    assert_eq!(answer, you + 4);
+    assert_eq!(rendered.rows[question + 3].trim(), "Slim");
+    assert_eq!(answer, question + 4);
 }
 
 #[test]
@@ -389,6 +387,106 @@ fn agent_response_is_separated_from_thinking_and_explicitly_attributed() {
     assert!(rendered.rows[thought + 1].trim().is_empty());
     assert_eq!(rendered.rows[thought + 2].trim(), "Slim");
     assert_eq!(rendered.rows[thought + 3].trim(), "Oi! Tudo certo?");
+}
+
+fn role_header(row: &str) -> bool {
+    let trimmed = row.trim();
+    trimmed == "Slim" || trimmed.starts_with("Slim ·")
+}
+
+#[test]
+fn later_assistant_segments_keep_one_header_for_the_turn() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::UserMessageAdded { text: "oi".into() });
+    state.apply_event(UiEvent::AssistantDelta {
+        text: "primeiro".into(),
+    });
+    state.apply_event(UiEvent::AssistantEnded);
+    state.apply_event(UiEvent::ToolStarted {
+        batch_id: slim_tui::api::ToolBatchId("batch".into()),
+        call_id: slim_tui::api::ToolCallId("call".into()),
+        name: "read".into(),
+        arguments_summary: "arquivo".into(),
+    });
+    state.apply_event(UiEvent::ToolEnded {
+        batch_id: slim_tui::api::ToolBatchId("batch".into()),
+        call_id: slim_tui::api::ToolCallId("call".into()),
+        name: "read".into(),
+        success: true,
+        duration_ms: 1,
+    });
+    state.apply_event(UiEvent::AssistantDelta {
+        text: "depois".into(),
+    });
+    state.apply_event(UiEvent::AssistantEnded);
+
+    let rendered = render_state(&state, 80);
+    assert_eq!(
+        rendered.rows.iter().filter(|row| role_header(row)).count(),
+        1,
+        "one role header for the whole answer\n{}",
+        rendered.text()
+    );
+    let first = rendered
+        .rows
+        .iter()
+        .position(|row| row.contains("primeiro"))
+        .expect("first segment");
+    let second = rendered
+        .rows
+        .iter()
+        .position(|row| row.contains("depois"))
+        .expect("continuation");
+    assert!(second > first);
+    assert_ne!(rendered.rows[second - 1].trim(), "Slim");
+
+    state.apply_event(UiEvent::UserMessageAdded {
+        text: "de novo".into(),
+    });
+    state.apply_event(UiEvent::AssistantDelta {
+        text: "outro turno".into(),
+    });
+    state.apply_event(UiEvent::AssistantEnded);
+    state.scroll.mode = slim_tui::app::FollowMode::Top;
+    let next_turn = render_state(&state, 80);
+    assert_eq!(
+        next_turn
+            .rows
+            .iter()
+            .filter(|row| row.trim() == "Slim")
+            .count(),
+        2,
+        "a new user message opens another header\n{}",
+        next_turn.text()
+    );
+}
+
+#[test]
+fn a_failed_later_segment_marks_the_group_header() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::UserMessageAdded { text: "oi".into() });
+    state.apply_event(UiEvent::AssistantDelta {
+        text: "parcial".into(),
+    });
+    state.apply_event(UiEvent::AssistantEnded);
+    assert!(state.append_block(Block::new(
+        "tail",
+        BlockKind::Assistant("cortado".into()),
+        BlockLifecycle::Cancelled,
+    )));
+    let rendered = render_state(&state, 80);
+    assert_eq!(
+        rendered.rows.iter().filter(|row| role_header(row)).count(),
+        1,
+        "{}",
+        rendered.text()
+    );
+    assert!(
+        rendered.text().contains("Slim · interrompido · parcial"),
+        "{}",
+        rendered.text()
+    );
+    assert!(rendered.text().contains("cortado"), "{}", rendered.text());
 }
 
 #[test]
@@ -437,7 +535,79 @@ fn streaming_thinking_shows_only_the_latest_two_physical_rows() {
 }
 
 #[test]
-fn user_prompt_label_stays_distinct_from_the_transcript_surface() {
+fn user_marker_settles_without_changing_the_label_or_layout() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::UserMessageAdded {
+        text: "mensagem".into(),
+    });
+    let recent = render_state(&state, 80);
+    assert_eq!(recent.word_style("●").0, Color::Rgb(0x72, 0xCC, 0x91));
+    assert!(recent.word_style("●").1.contains(Modifier::BOLD));
+    assert!(!recent.word_style("Você").1.contains(Modifier::BOLD));
+    let reduced = render_state_with_caps(
+        &state,
+        80,
+        Capabilities {
+            reduced_motion: true,
+            ..caps()
+        },
+    );
+    assert!(reduced.word_style("●").1.contains(Modifier::DIM));
+    assert!(!reduced.word_style("●").1.contains(Modifier::BOLD));
+    state.clock.elapsed_ms = 1000;
+    let settled = render_state(&state, 80);
+    assert_eq!(recent.rows, settled.rows);
+    assert_eq!(recent.word_style("Você"), settled.word_style("Você"));
+    assert!(settled.word_style("●").1.contains(Modifier::DIM));
+    assert!(!settled.word_style("●").1.contains(Modifier::BOLD));
+    let plain = render_state_with_caps(
+        &state,
+        80,
+        Capabilities {
+            color_depth: ColorDepth::None,
+            ..caps()
+        },
+    );
+    assert!(plain.text().contains("  * Você"));
+    assert_eq!(plain.word_style("*").0, Color::Reset);
+}
+
+#[test]
+fn user_wrapping_keeps_body_alignment_and_measured_height() {
+    for width in [30, 48, 80] {
+        let text = "á界🙂 mensagem longa ".repeat(4);
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::UserMessageAdded { text: text.clone() });
+        let rendered = render_state(&state, width);
+        let header = rendered
+            .rows
+            .iter()
+            .position(|row| row.contains("Você"))
+            .unwrap();
+        let body: Vec<_> = rendered.rows[header + 1..]
+            .iter()
+            .take_while(|row| !row.trim().is_empty())
+            .collect();
+        assert!(body.len() > 1);
+        for row in &body {
+            assert!(row.starts_with("    "));
+        }
+        assert_eq!(
+            body.iter()
+                .map(|row| row[4..].trim_end())
+                .collect::<String>()
+                .replace(' ', ""),
+            text.replace(' ', "")
+        );
+        assert_eq!(
+            HeightIndex::build(state.blocks(), width, &mut WrapCache::default()).total_rows,
+            body.len() as u64 + 2
+        );
+    }
+}
+
+#[test]
+fn user_prompt_sits_on_a_raised_full_width_band() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::UserMessageAdded {
         text: "question".into(),
@@ -447,9 +617,18 @@ fn user_prompt_label_stays_distinct_from_the_transcript_surface() {
     });
     state.apply_event(UiEvent::AssistantEnded);
     let rendered = render_state(&state, 80);
-    assert_eq!(rendered.word_bg("Você"), Color::Rgb(0x10, 0x10, 0x10));
-    assert_eq!(rendered.word_bg("question"), Color::Rgb(0x10, 0x10, 0x10));
-    assert_ne!(rendered.word_bg("answer"), Color::Rgb(0x10, 0x10, 0x10));
+    let band = Color::Rgb(0x14, 0x14, 0x14);
+    assert_eq!(rendered.word_bg("Você"), band);
+    assert_eq!(rendered.word_bg("question"), band);
+    assert_eq!(rendered.word_bg("answer"), Color::Rgb(0, 0, 0));
+    // The band fills the row, not only the painted text.
+    let row = rendered
+        .rows
+        .iter()
+        .position(|row| row.contains("question"))
+        .expect("prompt row");
+    let last_cell = rendered.background[row].len() - 2; // scrollbar column excluded
+    assert_eq!(rendered.background[row][last_cell], band);
 }
 
 #[test]
@@ -559,6 +738,8 @@ fn public_plain_frame_strips_terminal_controls() {
     state.notifications.push(payload.into());
     state.todo_dock_open = true;
     state.todo_items.push(TodoItemView {
+        reason: None,
+        id: None,
         title: payload.into(),
         status: TodoItemStatus::InProgress,
     });
@@ -737,8 +918,8 @@ fn completed_singleton_tool_is_success_on_both_surfaces() {
 
     let fullscreen = render_state(&state, 80).text();
     let plain = render_plain_frame(&state, 80, 24).lines.join("\n");
-    assert!(fullscreen.contains("✓ read"), "{fullscreen}");
-    assert!(plain.contains("✓ read"), "{plain}");
+    assert!(fullscreen.contains("✓ Leu"), "{fullscreen}");
+    assert!(plain.contains("✓ Leu"), "{plain}");
     assert!(!plain.contains("failed"), "{plain}");
 }
 

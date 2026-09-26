@@ -78,6 +78,7 @@ pub enum OAuthError {
     Callback(String),
     Transport(String),
     InvalidResponse(String),
+    CredentialsChanged,
     Store(String),
 }
 
@@ -91,6 +92,9 @@ impl fmt::Display for OAuthError {
             | Self::Transport(message)
             | Self::InvalidResponse(message)
             | Self::Store(message) => formatter.write_str(message),
+            Self::CredentialsChanged => formatter.write_str(
+                "OAuth credentials changed while refresh was in progress; retry with the current account",
+            ),
         }
     }
 }

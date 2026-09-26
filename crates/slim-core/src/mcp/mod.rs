@@ -7,8 +7,9 @@ mod stdio;
 pub use catalog::McpCatalog;
 pub use manager::McpManager;
 pub use spec::{
-    McpConnection, McpError, McpServerInfo, McpServerSpec, McpServerStatus, McpToolSummary,
-    McpTransport, MCP_PROTOCOL_VERSION,
+    MCP_PROTOCOL_VERSION, McpCancellation, McpCleanupStatus, McpConnection, McpError,
+    McpInterruption, McpRequestOutcome, McpServerInfo, McpServerSpec, McpServerStatus,
+    McpToolSummary, McpTransport,
 };
 pub use stdio::{FramedLine, JsonLineFramer};
 

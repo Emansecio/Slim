@@ -139,7 +139,8 @@ async fn server_state(
         .acquire_warm(&root, "rust-analyzer", config)
         .await
         .expect("warm mock server");
-    let uri = slim_lsp::instance::file_uri(path)
+    let path = std::fs::canonicalize(path).expect("canonical test path");
+    let uri = slim_lsp::instance::file_uri(&path)
         .expect("file URI")
         .to_string();
     lease

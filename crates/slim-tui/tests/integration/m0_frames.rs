@@ -50,7 +50,6 @@ fn fake_session_materializes_deterministic_frame_without_io() {
             "Slim",
             "world",
             "activity: Respondendo",
-            "todo: 0/0 sem tarefa ativa",
             "composer: ",
             "Read-only",
             "desconectado · /login",

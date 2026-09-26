@@ -4,7 +4,8 @@ use crossterm::cursor::{SetCursorStyle, Show};
 use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, EndSynchronizedUpdate, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 
 pub struct TerminalGuard {
@@ -196,6 +197,9 @@ fn enable_with_rollback(
 fn restore_surface<W: Write>(stdout: &mut W, mouse_capture: bool) -> io::Result<()> {
     execute!(
         stdout,
+        // A frame interrupted by a panic must not leave the terminal holding
+        // its presentation; ending an inactive update is a no-op.
+        EndSynchronizedUpdate,
         SetCursorStyle::DefaultUserShape,
         Show,
         LeaveAlternateScreen,
@@ -257,6 +261,16 @@ mod tests {
                 .windows(b"\x1b[0 q".len())
                 .any(|window| window == b"\x1b[0 q"),
             "terminal cleanup must restore the user's cursor shape"
+        );
+    }
+
+    #[test]
+    fn restore_surface_closes_a_synchronized_update_first() {
+        let mut output = Vec::new();
+        super::restore_surface(&mut output, false).expect("terminal cleanup");
+        assert!(
+            output.starts_with(b"\x1b[?2026l"),
+            "an interrupted frame must not keep the terminal's presentation held"
         );
     }
 

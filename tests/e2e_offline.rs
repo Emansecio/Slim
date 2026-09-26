@@ -309,6 +309,7 @@ fn anthropic_offline_e2e_runs_tool_turn_usage_and_session_without_secret_persist
         },
         &session,
         ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
             .with_workspace_root(temp.path())
             .with_artifact_root(temp.path().join("artifacts")),
     );
@@ -383,6 +384,7 @@ fn openai_compatible_offline_e2e_runs_structured_tool_turn_usage_and_session() {
         },
         &session,
         ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
             .with_workspace_root(temp.path())
             .with_artifact_root(temp.path().join("artifacts")),
     );
@@ -471,6 +473,7 @@ fn real_binary_offline_e2e_uses_temp_cwd_and_never_prints_secret() {
             "hello binary",
         ])
         .env("SLIM_API_KEY", "binary-fixture-secret")
+        .env("SLIM_CONTEXT_WINDOW_TOKENS", "32000")
         .env_remove("SLIM_AUTH_FILE")
         .env_remove("OPENAI_API_KEY")
         .output()
@@ -537,6 +540,7 @@ fn cli_offline_auth_json_uses_local_provider_without_secret_output_or_session_pe
             "inspect auth fixture",
         ])
         .env("SLIM_AUTH_FILE", &auth)
+        .env("SLIM_CONTEXT_WINDOW_TOKENS", "32000")
         .env_remove("SLIM_API_KEY")
         .env_remove("OPENAI_API_KEY")
         .env_remove("ANTHROPIC_API_KEY")

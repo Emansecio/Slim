@@ -19,8 +19,9 @@ pub use compact::{
     CompactionStrategy, ContextItem, PreparedCompaction, COMPACTION_SYSTEM_PROMPT,
 };
 pub use jev_prune::{
-    estimate_prune_input_tokens, prune_summarized, prune_summarized_with_instructions,
-    prune_summarized_with_instructions_cancellable, HttpJevJudge, JevBackend, JevInputEstimate,
-    JevJudge, JevJudgeMetadata, JevJudgment, JevPruneConfig, JevPruneError, JevPruneFailure,
-    JevPruneStats, DEFAULT_JEV_MODEL, DEFAULT_VERCEL_JEV_MODEL,
+    estimate_prune_input_tokens, estimate_prune_max_savings_tokens, prune_summarized,
+    prune_summarized_with_instructions, prune_summarized_with_instructions_cancellable,
+    HttpJevJudge, JevBackend, JevInputEstimate, JevJudge, JevJudgeMetadata, JevJudgment,
+    JevPruneConfig, JevPruneError, JevPruneFailure, JevPruneStats, DEFAULT_JEV_MODEL,
+    DEFAULT_VERCEL_JEV_MODEL, TYPESAFE_JEV_INPUT_MICROS_PER_MILLION,
 };

@@ -8,7 +8,7 @@
 performance/virtualização e capabilities.
 
 Os gates normativos estão em
-`Documentações - Projeto/VALIDACAO-VIABILIDADE-RATATUI-GROK-BUILD.md`.
+[`../../docs/VALIDACAO-VIABILIDADE-RATATUI-GROK-BUILD.md`](../../docs/VALIDACAO-VIABILIDADE-RATATUI-GROK-BUILD.md).
 
 Harness executável: `cargo run --manifest-path poc/tui/Cargo.toml -- --cycles 100`.
 O comando precisa de um terminal real/ConPTY; execução sem TTY registra falha de

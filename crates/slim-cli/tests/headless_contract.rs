@@ -68,11 +68,18 @@ fn provider_jsonl_preserves_usage_completeness_and_overflow() {
                 exit_code: Some(0),
                 timed_out: false,
                 cancelled: false,
+                capture_may_be_incomplete: false,
                 stdout_bytes: 5,
                 stderr_bytes: 0,
                 stdout_discarded_bytes: 2,
                 stderr_discarded_bytes: 0,
             },
+        }],
+        tool_job_outputs: vec![slim_cli::ToolJobOutputFact {
+            batch_id: "batch".into(),
+            call_id: "call".into(),
+            name: "shell".into(),
+            output: "exit 0\nstdout:\njob-final".into(),
         }],
     };
     let value: serde_json::Value = serde_json::from_str(
@@ -88,6 +95,11 @@ fn provider_jsonl_preserves_usage_completeness_and_overflow() {
     assert!(value.get("cache_hit_ratio").is_none());
     assert_eq!(value["tool_process_facts"][0]["name"], "shell");
     assert_eq!(value["tool_process_facts"][0]["process"]["exit_code"], 0);
+    assert_eq!(value["tool_job_outputs"][0]["call_id"], "call");
+    assert_eq!(
+        value["tool_job_outputs"][0]["output"],
+        "exit 0\nstdout:\njob-final"
+    );
     assert!(render_provider_verbose_text(&result).contains("estimation_error=?"));
     assert_eq!(render_provider_text(&result), "partial\n");
 }
@@ -118,6 +130,7 @@ fn verbose_provider_text_prepends_only_redacted_tool_summaries() {
         validation_source: Some("derived_runtime".into()),
         tool_summary_lines: vec!["✓ 2 tools · read, shell · 12ms".into()],
         tool_process_facts: Vec::new(),
+        tool_job_outputs: Vec::new(),
     };
 
     assert_eq!(
@@ -229,6 +242,7 @@ fn cancelled_provider_headless_run_reports_cancelled_stop_and_exit() {
         },
         slim_cli::ProviderRunOptions {
             cancellation: Some(cancellation),
+            context_window_tokens: Some(32_000),
             ..Default::default()
         },
     )

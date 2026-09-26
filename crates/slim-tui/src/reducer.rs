@@ -1,9 +1,12 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use unicode_segmentation::UnicodeSegmentation;
 
-use crate::api::{BlockId, LoginProvider, ModelAlias, ReasoningEffort, UiCommand, UiEvent};
+use crate::api::{
+    BlockId, LoginProvider, ModelAlias, PromptOrigin, ReasoningEffort, UiCommand, UiEvent,
+};
 use crate::app::{
-    AppState, EffortOverlay, FollowMode, FrameClock, LoginOverlay, LoginStage, ModelOverlay,
-    ModelRow, NotificationPriority, ScrollAnchor,
+    AppState, EffortOverlay, EffortTarget, FollowMode, FrameClock, LoginOverlay, LoginStage,
+    ModelOverlay, ModelRow, NotificationPriority, ScrollAnchor,
 };
 use crate::block::{BlockKind, InteractionRequestKind};
 use crate::composer::ComposerError;
@@ -17,6 +20,9 @@ const MAX_QUEUED_PROMPTS: usize = 8;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
     UiEventReceived(UiEvent),
+    /// CLI startup prompt routed through the same admission reducer as an
+    /// interactive submission.
+    SubmitInitialPrompt(String),
     Key(KeyEvent),
     Paste(String),
     /// Composer paste from the system clipboard: the image attachment and the
@@ -113,14 +119,19 @@ fn clear_screen_selection(state: &mut AppState) {
     state.selection_text.clear();
 }
 
+fn prepare_prompt(state: &mut AppState, prompt: String, origin: PromptOrigin) -> Option<Effect> {
+    let admission = state.begin_prompt_preparation(prompt.clone(), origin)?;
+    Some(Effect::Send(UiCommand::PreparePrompt { prompt, admission }))
+}
+
 /// Single mutation route (DESIGN-SLIM-TUI §4.1/§9.2): every state change flows
 /// through here; the runtime only executes the returned effects.
 pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
     match action {
         Action::UiEventReceived(event) => {
             // G244 (§7.4): a provider terminal or locally handled prompt is a
-            // queue boundary. After applying it, drain exactly one queued
-            // prompt, FIFO, into SendPrompt.
+            // queue boundary. After applying it, admit exactly one queued
+            // prompt, FIFO, into preparation.
             let local_skill_selection = matches!(
                 &event,
                 UiEvent::RestoreDraft { text } if selected_skill_draft(state, text)
@@ -128,7 +139,15 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
             let prompt_boundary = local_skill_selection
                 || matches!(
                     &event,
-                    UiEvent::RunCompleted { .. }
+                    UiEvent::PromptPreparationHandled { .. }
+                        | UiEvent::PromptRunCompleted { .. }
+                        | UiEvent::PromptRunStopped { .. }
+                        | UiEvent::PromptRunCancelled { .. }
+                        | UiEvent::PromptRunFailed {
+                            run_id: Some(_),
+                            ..
+                        }
+                        | UiEvent::RunCompleted { .. }
                         | UiEvent::RunStopped { .. }
                         | UiEvent::RunCancelled { .. }
                         | UiEvent::RunFailed { .. }
@@ -140,16 +159,37 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
                     | UiEvent::SessionRestored { .. }
             );
             state.apply_event(event);
+            let cancel_started_run = state.take_cancelled_prompt_run_start();
+            if cancel_started_run.is_some() {
+                state.request_cancel_active_run();
+                return vec![Effect::Send(UiCommand::CancelRun), Effect::RequestRender];
+            }
             if skills_changed {
                 sync_slash_suggestions(state);
             }
             let mut effects = vec![Effect::RequestRender];
-            if prompt_boundary && !state.working && !state.queue_paused {
+            if prompt_boundary && !state.working && !state.prompt_is_busy() && !state.queue_paused {
                 if let Some(prompt) = state.pop_queued_prompt() {
-                    effects.push(Effect::Send(UiCommand::SendPrompt(prompt)));
+                    if let Some(effect) = prepare_prompt(state, prompt, PromptOrigin::Queued) {
+                        effects.push(effect);
+                    }
                 }
             }
             effects
+        }
+        Action::SubmitInitialPrompt(prompt) => {
+            if prompt.trim().is_empty() {
+                return vec![Effect::RequestRender];
+            }
+            if !state.composer.is_empty() {
+                let draft = state.composer.payload();
+                state.enqueue_queued_prompt_front(draft);
+                state.queue_paused = true;
+                state.composer.clear();
+            }
+            state.composer.insert_text(prompt);
+            state.revisions.content += 1;
+            submit_composer(state)
         }
         Action::Key(key) => {
             if key.code == KeyCode::Esc && state.selection.is_some() {
@@ -239,6 +279,7 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
         }
         Action::ToggleTodoDock => {
             state.todo_dock_open = !state.todo_dock_open;
+            state.todo_focused = false;
             state.todo_dock_user_preference = Some(state.todo_dock_open);
             state.revisions.status += 1;
             vec![Effect::RequestRender]
@@ -365,15 +406,17 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
     }
 }
 
-const PALETTE_COMMANDS: [&str; 14] = [
+const PALETTE_COMMANDS: [&str; 16] = [
     "/help",
     "/login",
     "/logout",
     "/resume",
     "/queue",
     "/model",
+    "/model --default",
     "/mode",
     "/compact",
+    "/retry",
     "/image",
     "/mcp",
     "/diff",
@@ -402,9 +445,14 @@ pub const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     ("help", &["/help"]),
     (
         "session",
-        &["/login", "/logout", "/resume", "/queue", "/compact"],
+        &[
+            "/login", "/logout", "/resume", "/queue", "/compact", "/retry",
+        ],
     ),
-    ("runtime", &["/model", "/mode", "/image"]),
+    (
+        "runtime",
+        &["/model", "/model --default", "/mode", "/image"],
+    ),
     ("integrations", &["/mcp"]),
     (
         "inspect",
@@ -436,7 +484,8 @@ pub fn palette_description(command: &str) -> &'static str {
         "/logout" => "sair",
         "/resume" => "retomar sessão",
         "/queue" => "gerenciar prompts pendentes",
-        "/model" => "selecionar modelo",
+        "/model" => "modelo desta sessão",
+        "/model --default" => "salvar modelo atual como padrão",
         "/mode" => "alternar modo",
         "/compact" => "resumir contexto",
         "/image" => "anexar imagem",
@@ -445,6 +494,7 @@ pub fn palette_description(command: &str) -> &'static str {
         "/activity" => "ver atividade",
         "/session" => "árvore da sessão",
         "/diagnostics" => "tempos do provedor",
+        "/retry" => "retomar conexão pausada",
         _ => "",
     }
 }
@@ -697,12 +747,34 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     if is_ctrl_c(&key) && state.selection.is_some() {
         return vec![Effect::RequestRender];
     }
+    if key.code == KeyCode::Esc && state.prompt_is_busy() {
+        return state.cancel_prompt_preparation().map_or_else(
+            || vec![Effect::RequestRender],
+            |admission| {
+                vec![
+                    Effect::Send(UiCommand::CancelPromptPreparation { admission }),
+                    Effect::RequestRender,
+                ]
+            },
+        );
+    }
     if is_ctrl_v(&key) || is_shift_insert(&key) {
         return vec![Effect::PasteFromClipboard];
     }
     if is_ctrl_c(&key) {
         if state.login_overlay.is_some() {
             return reduce_login_key(state, key);
+        }
+        if state.prompt_is_busy() {
+            return state.cancel_prompt_preparation().map_or_else(
+                || vec![Effect::RequestRender],
+                |admission| {
+                    vec![
+                        Effect::Send(UiCommand::CancelPromptPreparation { admission }),
+                        Effect::RequestRender,
+                    ]
+                },
+            );
         }
         if state.working {
             state.request_cancel_active_run();
@@ -835,6 +907,21 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return reduce(state, Action::ToggleTodoDock);
     }
+    if !interaction_pending && state.inspector.active.is_none() {
+        if key.code == KeyCode::Char('t')
+            && key.modifiers == KeyModifiers::ALT
+            && !state.todo_items.is_empty()
+        {
+            state.todo_focused = !state.todo_focused;
+            state.todo_dock_open = true;
+            state.todo_dock_user_preference = Some(true);
+            state.revisions.focus += 1;
+            return vec![Effect::RequestRender];
+        }
+        if state.todo_focused {
+            return reduce_todo_key(state, key);
+        }
+    }
     if key.code == KeyCode::Esc && state.working {
         state.request_cancel_active_run();
         return vec![Effect::Send(UiCommand::CancelRun), Effect::RequestRender];
@@ -843,7 +930,7 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         || (key.code == KeyCode::Tab && key.modifiers == KeyModifiers::ALT))
         && !interaction_pending
     {
-        if state.working {
+        if state.working || state.prompt_is_busy() {
             state.push_notification("Aguarde ou cancele a execução antes de trocar o modo".into());
             state.revisions.status += 1;
             return vec![Effect::RequestRender];
@@ -867,7 +954,7 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     }
     if key.code == KeyCode::Enter
         && key.kind == KeyEventKind::Press
-        && state.working
+        && (state.working || state.prompt_is_busy())
         && state.composer.payload().trim() == "/resume"
     {
         state
@@ -877,7 +964,7 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     }
     if key.code == KeyCode::Enter
         && key.kind == KeyEventKind::Press
-        && state.working
+        && (state.working || state.prompt_is_busy())
         && state.composer.payload().trim().starts_with("/queue")
     {
         return submit_composer(state);
@@ -886,15 +973,25 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     // arms must not queue as prompt text mid-run: /compact defers to a safe
     // boundary; /mcp opens the overlay (its mutating UiCommands are rejected
     // by the active-run catch-all with a notification).
-    if key.code == KeyCode::Enter && key.kind == KeyEventKind::Press && state.working {
+    if key.code == KeyCode::Enter
+        && key.kind == KeyEventKind::Press
+        && (state.working || state.prompt_is_busy())
+    {
         let payload = state.composer.payload();
         let payload = payload.trim();
-        if payload.starts_with("/compact") || payload == "/mcp" || payload.starts_with("/mcp ") {
+        if payload == "/retry"
+            || payload == "/model --default"
+            || payload.starts_with("/compact")
+            || payload == "/mcp"
+            || payload.starts_with("/mcp ")
+        {
             return submit_composer(state);
         }
     }
-    match classify_enter(normalize(key), state.working) {
-        EnterIntent::Submit if state.working => return enqueue_queued(state),
+    match classify_enter(normalize(key), state.working || state.prompt_is_busy()) {
+        EnterIntent::Submit if state.working || state.prompt_is_busy() => {
+            return enqueue_queued(state)
+        }
         EnterIntent::Submit => return submit_composer(state),
         EnterIntent::Steer => return enqueue_queued(state),
         EnterIntent::Newline => {
@@ -906,6 +1003,38 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         EnterIntent::Ignore => {}
     }
     match key.code {
+        KeyCode::Char('z' | 'Z')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            let changed = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                state.composer.redo()
+            } else {
+                state.composer.undo()
+            };
+            if changed {
+                state.revisions.content += 1;
+                sync_slash_suggestions(state);
+            }
+        }
+        KeyCode::Left | KeyCode::Right
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            if state.composer.move_word(key.code == KeyCode::Right) {
+                state.revisions.focus += 1;
+                sync_slash_suggestions(state);
+            }
+        }
+        KeyCode::Backspace | KeyCode::Delete
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            if state.composer.delete_word(key.code == KeyCode::Delete) {
+                state.revisions.content += 1;
+                sync_slash_suggestions(state);
+            }
+        }
         KeyCode::Char(character)
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 || key.modifiers.contains(KeyModifiers::ALT) =>
@@ -952,6 +1081,58 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         _ => {}
     }
+    vec![Effect::RequestRender]
+}
+
+fn reduce_todo_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
+    let indices = crate::todo::ordered_indices(state);
+    let current = indices
+        .iter()
+        .position(|index| *index == state.todo_selected)
+        .unwrap_or(0);
+    let last = indices.len().saturating_sub(1);
+    let next = match key.code {
+        KeyCode::Up => current.saturating_sub(1),
+        KeyCode::Down => current.saturating_add(1).min(last),
+        KeyCode::PageUp => current.saturating_sub(4),
+        KeyCode::PageDown => current.saturating_add(4).min(last),
+        KeyCode::Home => 0,
+        KeyCode::End => last,
+        KeyCode::Left => {
+            state.todo_title_offset = state.todo_title_offset.saturating_sub(8);
+            current
+        }
+        KeyCode::Right => {
+            let length = state.todo_items.get(state.todo_selected).map_or(0, |item| {
+                crate::todo::title(&crate::todo::item_text(item))
+                    .graphemes(true)
+                    .count()
+            });
+            state.todo_title_offset = state
+                .todo_title_offset
+                .saturating_add(8)
+                .min(length.saturating_sub(1));
+            current
+        }
+        KeyCode::Esc => {
+            state.todo_focused = false;
+            state.todo_dock_open = false;
+            state.todo_dock_user_preference = Some(false);
+            current
+        }
+        KeyCode::Tab | KeyCode::Enter => {
+            state.todo_focused = false;
+            current
+        }
+        _ => return vec![],
+    };
+    if next != current {
+        state.todo_title_offset = 0;
+    }
+    if let Some(index) = indices.get(next) {
+        state.todo_selected = *index;
+    }
+    state.revisions.focus += 1;
     vec![Effect::RequestRender]
 }
 
@@ -1407,6 +1588,12 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
     }
     let prompt = state.composer.payload();
     let command = prompt.trim().to_owned();
+    if state.prompt_is_busy() && command.starts_with('/') && !command.starts_with("/queue") {
+        state
+            .push_notification("Aguarde ou cancele a preparação antes de executar comandos".into());
+        state.revisions.status += 1;
+        return vec![Effect::RequestRender];
+    }
     let mut effects = Vec::new();
     // Locally rejected slash input (unknown model, missing path, signed-out
     // compaction) keeps the draft so the user can fix and resubmit it instead
@@ -1414,9 +1601,20 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
     let mut keep_draft = false;
     match command.as_str() {
         "" => {}
+        "/retry" => effects.push(Effect::Send(UiCommand::RetryProvider)),
+        "/model --default" => {
+            if state.working {
+                state.push_notification(
+                    "Aguarde ou cancele a execução antes de salvar o padrão".into(),
+                );
+                keep_draft = true;
+            } else {
+                effects.push(Effect::Send(UiCommand::SaveModelDefault));
+            }
+        }
         "/help" => {
             state.push_notification(
-                "F1 / Ctrl+P comandos · Shift+Tab modo · Ctrl+F buscar · Ctrl+T tarefas · Esc cancelar"
+                "F1 / Ctrl+P comandos · Ctrl+Z desfazer · Ctrl+Shift+Z refazer · Ctrl+←/→ palavra · Ctrl+Backspace/Delete apagar palavra · /model --default salvar padrão · /retry retomar conexão · Esc cancelar"
                     .into(),
             );
             state.revisions.status += 1;
@@ -1624,15 +1822,7 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                         .iter()
                         .find(|model| model.id == value)
                     {
-                        let effort = if model.reasoning_levels.contains(&state.effort) {
-                            state.effort
-                        } else {
-                            model
-                                .reasoning_levels
-                                .first()
-                                .copied()
-                                .unwrap_or(ReasoningEffort::High)
-                        };
+                        let effort = catalog_effort(&model.reasoning_levels, state.effort);
                         effects.push(Effect::Send(UiCommand::SetOpenCodeModel {
                             model: model.id.clone(),
                             effort,
@@ -1646,15 +1836,7 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                 }
                 Some(LoginProvider::OpenCodeZen) => {
                     if let Some(model) = state.zen_models.iter().find(|model| model.id == value) {
-                        let effort = if model.reasoning_levels.contains(&state.effort) {
-                            state.effort
-                        } else {
-                            model
-                                .reasoning_levels
-                                .first()
-                                .copied()
-                                .unwrap_or(ReasoningEffort::High)
-                        };
+                        let effort = catalog_effort(&model.reasoning_levels, state.effort);
                         effects.push(Effect::Send(UiCommand::SetZenModel {
                             model: model.id.clone(),
                             effort,
@@ -1668,16 +1850,24 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                 }
                 Some(LoginProvider::ClinePass) => {
                     // G249: textual `/model <id>` also works while ClinePass is
-                    // connected; effort defaults to High on the static catalog.
+                    // connected; use the same effort step as the model picker.
                     if let Some(model) = state
                         .cline_pass_models
                         .iter()
                         .find(|model| model.id == value)
                     {
-                        effects.push(Effect::Send(UiCommand::SetClinePassModel {
-                            model: model.id.clone(),
-                            effort: ReasoningEffort::High,
-                        }));
+                        if model.reasoning_levels.is_empty() {
+                            effects.push(Effect::Send(UiCommand::SetClinePassModel {
+                                model: model.id.clone(),
+                                effort: state.effort,
+                            }));
+                        } else {
+                            state.effort_overlay = Some(EffortOverlay::for_catalog(
+                                EffortTarget::ClinePass(model.id.clone()),
+                                model.reasoning_levels.clone(),
+                                state.effort,
+                            ));
+                        }
                     } else {
                         state.push_notification(
                             "Modelo ClinePass desconhecido. Use /models.".into(),
@@ -1691,10 +1881,18 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                         .iter()
                         .find(|model| model.id == value)
                     {
-                        effects.push(Effect::Send(UiCommand::SetCommandCodeModel {
-                            model: model.id.clone(),
-                            effort: ReasoningEffort::High,
-                        }));
+                        if model.reasoning_levels.is_empty() {
+                            effects.push(Effect::Send(UiCommand::SetCommandCodeModel {
+                                model: model.id.clone(),
+                                effort: state.effort,
+                            }));
+                        } else {
+                            state.effort_overlay = Some(EffortOverlay::for_catalog(
+                                EffortTarget::CommandCode(model.id.clone()),
+                                model.reasoning_levels.clone(),
+                                state.effort,
+                            ));
+                        }
                     } else {
                         state.push_notification(
                             "Modelo Command Code desconhecido. Use /models.".into(),
@@ -1704,10 +1902,18 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                 }
                 Some(LoginProvider::Xai) => {
                     if slim_core::provider::is_xai_model_id(value) {
-                        effects.push(Effect::Send(UiCommand::SetXaiModel {
-                            model: value.to_owned(),
-                            effort: ReasoningEffort::High,
-                        }));
+                        let levels = slim_core::provider::gateway_reasoning_levels(
+                            slim_core::provider::ProviderKind::Xai,
+                            value,
+                        )
+                        .iter()
+                        .filter_map(|level| ReasoningEffort::parse(level))
+                        .collect();
+                        state.effort_overlay = Some(EffortOverlay::for_catalog(
+                            EffortTarget::Xai(value.to_owned()),
+                            levels,
+                            state.effort,
+                        ));
                     } else {
                         state.push_notification(
                             "Modelo xAI desconhecido. Use grok-4.3, grok-4.5, grok-4.6 ou grok-build-0.1."
@@ -1729,7 +1935,15 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
         // Let the worker resolve dynamic skill commands. This also keeps
         // unknown slash commands fail-closed without losing the draft.
         _ if command.starts_with('/') => {
-            effects.push(Effect::Send(UiCommand::SendPrompt(prompt)));
+            if let Some(effect) = prepare_prompt(state, prompt.clone(), PromptOrigin::Direct) {
+                effects.push(effect);
+            } else {
+                state.push_notification_with_priority(
+                    "Não foi possível admitir o prompt agora; tente novamente".into(),
+                    NotificationPriority::Warning,
+                );
+                keep_draft = true;
+            }
         }
         _ if !state.authenticated => {
             state.push_notification("Nenhum provedor conectado. Use /login.".into());
@@ -1737,7 +1951,15 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
             return effects;
         }
         _ => {
-            effects.push(Effect::Send(UiCommand::SendPrompt(prompt)));
+            if let Some(effect) = prepare_prompt(state, prompt.clone(), PromptOrigin::Direct) {
+                effects.push(effect);
+            } else {
+                state.push_notification_with_priority(
+                    "Não foi possível admitir o prompt agora; tente novamente".into(),
+                    NotificationPriority::Warning,
+                );
+                keep_draft = true;
+            }
         }
     }
     // Draft is cleared on every accepted submission (slash command or send);
@@ -1784,15 +2006,23 @@ fn reduce_queue_command(state: &mut AppState, command: &str, effects: &mut Vec<E
             true
         }
         "resume" if position.is_none() => {
-            if state.working {
-                state.push_notification("A fila pode ser retomada após a execução atual".into());
+            if state.working || state.prompt_is_busy() {
+                state.push_notification(
+                    "A fila pode ser retomada após a preparação ou execução atual".into(),
+                );
                 state.revisions.status += 1;
                 return true;
             }
             state.queue_paused = false;
             if let Some(prompt) = state.pop_queued_prompt() {
-                effects.push(Effect::Send(UiCommand::SendPrompt(prompt)));
-                state.push_notification("Fila retomada".into());
+                if let Some(effect) = prepare_prompt(state, prompt.clone(), PromptOrigin::Queued) {
+                    effects.push(effect);
+                    state.push_notification("Fila retomada".into());
+                } else {
+                    state.enqueue_queued_prompt_front(prompt);
+                    state.queue_paused = true;
+                    state.push_notification("Não foi possível admitir o item da fila".into());
+                }
             } else {
                 state.push_notification("Fila vazia".into());
             }
@@ -1843,6 +2073,17 @@ fn reduce_queue_command(state: &mut AppState, command: &str, effects: &mut Vec<E
 fn parse_queue_position(value: &str) -> Option<usize> {
     let position = value.parse::<usize>().ok()?;
     position.checked_sub(1)
+}
+
+/// Effort sent when a model is selected without the interactive step (textual
+/// `/model <id>`) or when the model declares no levels: the session choice when
+/// the model supports it, otherwise its first level.
+fn catalog_effort(levels: &[ReasoningEffort], current: ReasoningEffort) -> ReasoningEffort {
+    if levels.contains(&current) {
+        current
+    } else {
+        levels.first().copied().unwrap_or(ReasoningEffort::High)
+    }
 }
 
 fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
@@ -1920,15 +2161,11 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                     } else {
                         ReasoningEffort::default_for(*alias)
                     };
-                    let selected = levels
-                        .iter()
-                        .position(|level| *level == preferred)
-                        .unwrap_or(0);
-                    state.effort_overlay = Some(EffortOverlay {
-                        model: *alias,
-                        selected,
-                        fast: state.codex_fast,
-                    });
+                    state.effort_overlay = Some(EffortOverlay::for_alias(
+                        *alias,
+                        preferred,
+                        state.codex_fast,
+                    ));
                 }
                 ModelRow::Catalog(model_index) => {
                     let Some(model) = state.open_code_models.get(*model_index).cloned() else {
@@ -1938,37 +2175,46 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                             Effect::RequestRender,
                         ];
                     };
-                    state.model_overlay = None;
-                    let effort = if model.reasoning_levels.contains(&state.effort) {
-                        state.effort
+                    if !model.reasoning_levels.is_empty() {
+                        // The step sits on top of the model overlay (G239), so
+                        // Esc returns to the same row, filter and folds.
+                        state.effort_overlay = Some(EffortOverlay::for_catalog(
+                            EffortTarget::OpenCodeGo(model.id),
+                            model.reasoning_levels,
+                            state.effort,
+                        ));
                     } else {
-                        model
-                            .reasoning_levels
-                            .first()
-                            .copied()
-                            .unwrap_or(ReasoningEffort::High)
-                    };
-                    return vec![
-                        Effect::Send(UiCommand::SetOpenCodeModel {
-                            model: model.id,
-                            effort,
-                        }),
-                        Effect::RequestRender,
-                    ];
+                        state.model_overlay = None;
+                        return vec![
+                            Effect::Send(UiCommand::SetOpenCodeModel {
+                                model: model.id,
+                                effort: catalog_effort(&model.reasoning_levels, state.effort),
+                            }),
+                            Effect::RequestRender,
+                        ];
+                    }
                 }
                 ModelRow::ClinePass(model_index) => {
                     let Some(model) = state.cline_pass_models.get(*model_index).cloned() else {
                         state.model_overlay = Some(overlay);
                         return vec![Effect::RequestRender];
                     };
-                    state.model_overlay = None;
-                    return vec![
-                        Effect::Send(UiCommand::SetClinePassModel {
-                            model: model.id,
-                            effort: ReasoningEffort::High,
-                        }),
-                        Effect::RequestRender,
-                    ];
+                    if !model.reasoning_levels.is_empty() {
+                        state.effort_overlay = Some(EffortOverlay::for_catalog(
+                            EffortTarget::ClinePass(model.id),
+                            model.reasoning_levels,
+                            state.effort,
+                        ));
+                    } else {
+                        state.model_overlay = None;
+                        return vec![
+                            Effect::Send(UiCommand::SetClinePassModel {
+                                model: model.id,
+                                effort: state.effort,
+                            }),
+                            Effect::RequestRender,
+                        ];
+                    }
                 }
                 ModelRow::CommandCode(model_index) => {
                     let Some(model) = state.command_code_models.get(*model_index).cloned() else {
@@ -1978,14 +2224,22 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                             Effect::RequestRender,
                         ];
                     };
-                    state.model_overlay = None;
-                    return vec![
-                        Effect::Send(UiCommand::SetCommandCodeModel {
-                            model: model.id,
-                            effort: ReasoningEffort::High,
-                        }),
-                        Effect::RequestRender,
-                    ];
+                    if !model.reasoning_levels.is_empty() {
+                        state.effort_overlay = Some(EffortOverlay::for_catalog(
+                            EffortTarget::CommandCode(model.id),
+                            model.reasoning_levels,
+                            state.effort,
+                        ));
+                    } else {
+                        state.model_overlay = None;
+                        return vec![
+                            Effect::Send(UiCommand::SetCommandCodeModel {
+                                model: model.id,
+                                effort: state.effort,
+                            }),
+                            Effect::RequestRender,
+                        ];
+                    }
                 }
                 ModelRow::Zen(model_index) => {
                     let Some(model) = state.zen_models.get(*model_index).cloned() else {
@@ -1995,23 +2249,22 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                             Effect::RequestRender,
                         ];
                     };
-                    state.model_overlay = None;
-                    let effort = if model.reasoning_levels.contains(&state.effort) {
-                        state.effort
+                    if !model.reasoning_levels.is_empty() {
+                        state.effort_overlay = Some(EffortOverlay::for_catalog(
+                            EffortTarget::Zen(model.id),
+                            model.reasoning_levels,
+                            state.effort,
+                        ));
                     } else {
-                        model
-                            .reasoning_levels
-                            .first()
-                            .copied()
-                            .unwrap_or(ReasoningEffort::High)
-                    };
-                    return vec![
-                        Effect::Send(UiCommand::SetZenModel {
-                            model: model.id,
-                            effort,
-                        }),
-                        Effect::RequestRender,
-                    ];
+                        state.model_overlay = None;
+                        return vec![
+                            Effect::Send(UiCommand::SetZenModel {
+                                model: model.id,
+                                effort: catalog_effort(&model.reasoning_levels, state.effort),
+                            }),
+                            Effect::RequestRender,
+                        ];
+                    }
                 }
             }
             return vec![Effect::RequestRender];
@@ -2134,7 +2387,7 @@ fn reduce_effort_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     let Some(overlay) = state.effort_overlay.clone() else {
         return vec![];
     };
-    let levels = ReasoningEffort::supported(overlay.model);
+    let levels = overlay.levels();
     match key.code {
         KeyCode::Esc => {
             // Back to the model list underneath (G239): selection, filter and
@@ -2148,25 +2401,35 @@ fn reduce_effort_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         KeyCode::Down => {
             if let Some(current) = state.effort_overlay.as_mut() {
-                current.selected = (current.selected + 1).min(levels.len() - 1);
+                current.selected = (current.selected + 1).min(levels.len().saturating_sub(1));
             }
         }
-        KeyCode::Tab => {
+        // Tab only toggles the Codex service tier; catalog models have no
+        // speed knob, so the key stays inert instead of flipping a hidden flag.
+        KeyCode::Tab if overlay.speed_toggle() => {
             if let Some(current) = state.effort_overlay.as_mut() {
                 current.fast = !current.fast;
             }
         }
+        KeyCode::Tab => return vec![],
         KeyCode::Enter => {
             let effort = overlay.effort();
             state.effort_overlay = None;
-            return vec![
-                Effect::Send(UiCommand::SetModel {
-                    model: overlay.model,
+            let command = match overlay.target {
+                EffortTarget::Alias(model) => UiCommand::SetModel {
+                    model,
                     effort,
                     fast: overlay.fast,
-                }),
-                Effect::RequestRender,
-            ];
+                },
+                EffortTarget::OpenCodeGo(model) => UiCommand::SetOpenCodeModel { model, effort },
+                EffortTarget::Zen(model) => UiCommand::SetZenModel { model, effort },
+                EffortTarget::ClinePass(model) => UiCommand::SetClinePassModel { model, effort },
+                EffortTarget::CommandCode(model) => {
+                    UiCommand::SetCommandCodeModel { model, effort }
+                }
+                EffortTarget::Xai(model) => UiCommand::SetXaiModel { model, effort },
+            };
+            return vec![Effect::Send(command), Effect::RequestRender];
         }
         _ => return vec![],
     }
@@ -2463,2229 +2726,13 @@ fn fitted_fold_navigation(state: &AppState, intent: ScrollIntent) -> Option<Foll
 }
 
 #[cfg(test)]
-mod tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    use super::{open_model_overlay, reduce, Action, Effect};
-    use crate::api::{
-        LoginProvider, ModelAlias, OpenCodeCatalogSource, OpenCodeModelView, ReasoningEffort,
-        UiCommand, UiEvent,
-    };
-    use crate::app::{
-        ActivityPhase, AppState, CancellationPhase, ConfirmedSetting, FrameClock, LoginStage,
-        NotificationPriority, RunOutcomeKind,
-    };
-
-    fn enter() -> KeyEvent {
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
-    }
-
-    #[test]
-    fn login_command_opens_selector_and_selected_provider_is_sent() {
-        let mut state = AppState::new();
-        state.composer.insert_text("/login");
-        reduce(&mut state, Action::Key(enter()));
-        assert!(state.login_overlay.is_some());
-
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-        );
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(effects.contains(&Effect::Send(UiCommand::StartLogin(
-            LoginProvider::OpenAiCodex
-        ))));
-    }
-
-    #[test]
-    fn login_failure_releases_overlay_instead_of_sticking_in_progress() {
-        // G251: a terminal failure must reset `in_progress` — while set, the
-        // reducer swallows every key, freezing the dialog on the error.
-        let mut state = AppState::new();
-        state.composer.insert_text("/login codex");
-        reduce(&mut state, Action::Key(enter()));
-        assert!(state.login_overlay.as_ref().unwrap().in_progress);
-
-        reduce(
-            &mut state,
-            Action::UiEventReceived(UiEvent::LoginFailed {
-                message: "key save task failed boom".into(),
-            }),
-        );
-
-        let overlay = state.login_overlay.as_ref().unwrap();
-        assert!(
-            !overlay.in_progress,
-            "failure must release the overlay for retry"
-        );
-        assert_eq!(
-            overlay.progress.as_deref(),
-            Some("key save task failed boom"),
-            "the error stays visible in the dialog"
-        );
-        // Esc now closes the dialog without issuing a bogus CancelLogin.
-        let effects = reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-        );
-        assert!(state.login_overlay.is_none());
-        assert!(!effects.contains(&Effect::Send(UiCommand::CancelLogin)));
-    }
-
-    #[test]
-    fn opencode_login_collects_secret_and_emits_typed_command() {
-        let mut state = AppState::new();
-        state.composer.insert_text("/login");
-        reduce(&mut state, Action::Key(enter()));
-        for _ in 0..2 {
-            reduce(
-                &mut state,
-                Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-            );
-        }
-        reduce(&mut state, Action::Key(enter()));
-        for character in "needle-secret".chars() {
-            reduce(
-                &mut state,
-                Action::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
-            );
-        }
-
-        let effects = reduce(&mut state, Action::Key(enter()));
-
-        assert!(matches!(
-            effects.as_slice(),
-            [
-                Effect::Send(UiCommand::SaveApiKey {
-                    provider: LoginProvider::OpenCodeGo,
-                    api_key,
-                }),
-                Effect::RequestRender,
-            ] if api_key.expose() == "needle-secret"
-        ));
-        assert!(!format!("{state:?}").contains("needle-secret"));
-    }
-
-    #[test]
-    fn opencode_login_paste_never_enters_composer() {
-        let mut state = AppState::new();
-        state.composer.insert_text("/login");
-        reduce(&mut state, Action::Key(enter()));
-        for _ in 0..2 {
-            reduce(
-                &mut state,
-                Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-            );
-        }
-        reduce(&mut state, Action::Key(enter()));
-
-        reduce(&mut state, Action::Paste("pasted-secret".into()));
-
-        assert!(state.composer.payload().is_empty());
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(matches!(
-            effects.first(),
-            Some(Effect::Send(UiCommand::SaveApiKey { api_key, .. }))
-                if api_key.expose() == "pasted-secret"
-        ));
-    }
-
-    #[test]
-    fn clipboard_pull_prefers_the_image_attachment() {
-        // §20: one clipboard pull carries image and text; the composer keeps
-        // the attachment and never echoes the raw clipboard text.
-        let mut state = AppState::new();
-        let effects = reduce(
-            &mut state,
-            Action::ClipboardPull {
-                image: Some(r"C:\Temp\slim-paste-42\clipboard-0.png".into()),
-                text: Some("also on the clipboard".into()),
-            },
-        );
-        assert_eq!(
-            effects,
-            vec![
-                Effect::Send(UiCommand::AttachImage(
-                    r"C:\Temp\slim-paste-42\clipboard-0.png".into()
-                )),
-                Effect::RequestRender,
-            ]
-        );
-        assert!(state.composer.payload().is_empty());
-    }
-
-    #[test]
-    fn clipboard_pull_without_an_image_pastes_the_text() {
-        let mut state = AppState::new();
-        let effects = reduce(
-            &mut state,
-            Action::ClipboardPull {
-                image: None,
-                text: Some("pasted text".into()),
-            },
-        );
-        assert_eq!(effects, vec![Effect::RequestRender]);
-        assert_eq!(state.composer.payload(), "pasted text");
-
-        // An empty clipboard stays a no-op: no empty paste segment.
-        let mut empty = AppState::new();
-        let effects = reduce(
-            &mut empty,
-            Action::ClipboardPull {
-                image: None,
-                text: None,
-            },
-        );
-        assert_eq!(effects, vec![Effect::RequestRender]);
-        assert!(empty.composer.payload().is_empty());
-    }
-
-    #[test]
-    fn clipboard_image_never_lands_on_the_login_api_key_field() {
-        // The login field is a text target: an image on the clipboard must not
-        // hijack the secret input.
-        let mut state = AppState::new();
-        state.composer.insert_text("/login");
-        reduce(&mut state, Action::Key(enter()));
-        for _ in 0..2 {
-            reduce(
-                &mut state,
-                Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-            );
-        }
-        reduce(&mut state, Action::Key(enter()));
-
-        let effects = reduce(
-            &mut state,
-            Action::ClipboardPull {
-                image: Some("clipboard-0.png".into()),
-                text: Some("needle-secret".into()),
-            },
-        );
-        assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::Send(UiCommand::AttachImage(_)))),
-            "an image must not replace the API key paste"
-        );
-        let saved = reduce(&mut state, Action::Key(enter()));
-        assert!(matches!(
-            saved.first(),
-            Some(Effect::Send(UiCommand::SaveApiKey { api_key, .. }))
-                if api_key.expose() == "needle-secret"
-        ));
-    }
-
-    #[test]
-    fn clipboard_image_is_ignored_under_a_stacked_modal() {
-        let mut state = AppState::new();
-        state.auth_provider = Some(LoginProvider::OpenCodeGo);
-        state.authenticated = true;
-        state.composer.insert_text("/models");
-        reduce(&mut state, Action::Key(enter()));
-        assert!(state.model_overlay.is_some());
-
-        let effects = reduce(
-            &mut state,
-            Action::ClipboardPull {
-                image: Some("clipboard-0.png".into()),
-                text: None,
-            },
-        );
-        assert_eq!(effects, vec![Effect::RequestRender]);
-    }
-
-    #[test]
-    fn clipboard_image_failures_are_visible_notifications() {
-        let mut state = AppState::new();
-        reduce(
-            &mut state,
-            Action::ClipboardImageFailed {
-                message: "Clipboard image: bitmap is not supported".into(),
-            },
-        );
-        assert_eq!(
-            state.notifications.last().map(|notice| notice.as_str()),
-            Some("Clipboard image: bitmap is not supported")
-        );
-    }
-
-    #[test]
-    fn opencode_models_refresh_and_select_dynamic_catalog() {
-        let mut state = AppState::new();
-        state.auth_provider = Some(LoginProvider::OpenCodeGo);
-        state.authenticated = true;
-        state.composer.insert_text("/models");
-
-        let effects = reduce(&mut state, Action::Key(enter()));
-
-        assert!(effects.contains(&Effect::Send(UiCommand::RefreshOpenCodeModels)));
-        assert!(effects.contains(&Effect::Send(UiCommand::RefreshClinePassModels)));
-        assert!(effects.contains(&Effect::Send(UiCommand::RefreshCommandCodeModels)));
-        assert!(state.model_overlay.is_some());
-        reduce(
-            &mut state,
-            Action::UiEventReceived(UiEvent::OpenCodeCatalogLoaded {
-                models: vec![
-                    OpenCodeModelView {
-                        id: "deepseek-v4-flash".into(),
-                        name: "DeepSeek V4 Flash".into(),
-                        context_window_tokens: 1_000_000,
-                        max_output_tokens: 384_000,
-                        reasoning_levels: vec![ReasoningEffort::Low, ReasoningEffort::High],
-                        accepts_images: false,
-                    },
-                    OpenCodeModelView {
-                        id: "glm-5.3".into(),
-                        name: "GLM 5.3".into(),
-                        context_window_tokens: 202_752,
-                        max_output_tokens: 131_072,
-                        reasoning_levels: vec![ReasoningEffort::Low, ReasoningEffort::High],
-                        accepts_images: false,
-                    },
-                ],
-                source: OpenCodeCatalogSource::Live,
-            }),
-        );
-        // Filter down to the OpenCode group and select GLM.
-        for character in "glm".chars() {
-            reduce(
-                &mut state,
-                Action::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
-            );
-        }
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-        );
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-        );
-
-        let effects = reduce(&mut state, Action::Key(enter()));
-
-        assert!(effects.contains(&Effect::Send(UiCommand::SetOpenCodeModel {
-            model: "glm-5.3".into(),
-            effort: ReasoningEffort::High,
-        })));
-    }
-
-    #[test]
-    fn textual_model_command_selects_clinepass_model() {
-        // G249: `/model <id>` works while ClinePass is connected, validating
-        // against the static catalog and sending SetClinePassModel (High).
-        let mut state = AppState::new();
-        state.auth_provider = Some(LoginProvider::ClinePass);
-        state.authenticated = true;
-        state.composer.insert_text("/model cline-pass/kimi-k3");
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(
-            effects.contains(&Effect::Send(UiCommand::SetClinePassModel {
-                model: "cline-pass/kimi-k3".into(),
-                effort: ReasoningEffort::High,
-            }))
-        );
-    }
-
-    #[test]
-    fn textual_model_command_rejects_unknown_clinepass_model() {
-        let mut state = AppState::new();
-        state.auth_provider = Some(LoginProvider::ClinePass);
-        state.authenticated = true;
-        state.composer.insert_text("/model not-a-model");
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(
-            !effects.contains(&Effect::Send(UiCommand::SetClinePassModel {
-                model: "not-a-model".into(),
-                effort: ReasoningEffort::High,
-            }))
-        );
-        // Unknown selection still surfaces a notification and does not hang.
-        assert!(effects.contains(&Effect::RequestRender));
-    }
-
-    #[test]
-    fn unknown_model_command_preserves_draft_for_correction() {
-        let mut state = AppState::new();
-        state.auth_provider = Some(LoginProvider::ClinePass);
-        state.authenticated = true;
-        state.composer.insert_text("/model not-a-model");
-        let _ = reduce(&mut state, Action::Key(enter()));
-        assert_eq!(state.composer.payload(), "/model not-a-model");
-        assert!(
-            state.notifications.iter().any(|notification| notification
-                .as_str()
-                .contains("Modelo ClinePass desconhecido")),
-            "rejection must stay visible: {:?}",
-            state.notifications
-        );
-    }
-
-    #[test]
-    fn command_code_login_collects_secret_and_emits_typed_command() {
-        let mut state = AppState::new();
-        state.composer.insert_text("/login");
-        reduce(&mut state, Action::Key(enter()));
-        for _ in 0..4 {
-            reduce(
-                &mut state,
-                Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-            );
-        }
-        reduce(&mut state, Action::Key(enter()));
-        for character in "cmd-secret".chars() {
-            reduce(
-                &mut state,
-                Action::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
-            );
-        }
-
-        let effects = reduce(&mut state, Action::Key(enter()));
-
-        assert!(matches!(
-            effects.as_slice(),
-            [
-                Effect::Send(UiCommand::SaveApiKey {
-                    provider: LoginProvider::CommandCode,
-                    api_key,
-                }),
-                Effect::RequestRender,
-            ] if api_key.expose() == "cmd-secret"
-        ));
-        assert!(!format!("{state:?}").contains("cmd-secret"));
-    }
-
-    #[test]
-    fn login_command_code_slash_opens_api_key_stage() {
-        let mut state = AppState::new();
-        state.composer.insert_text("/login command-code");
-        reduce(&mut state, Action::Key(enter()));
-        let overlay = state.login_overlay.expect("overlay");
-        assert_eq!(overlay.provider(), LoginProvider::CommandCode);
-        assert!(matches!(overlay.stage, LoginStage::ApiKey(_)));
-    }
-
-    #[test]
-    fn textual_model_command_selects_command_code_model() {
-        let mut state = AppState::new();
-        state.auth_provider = Some(LoginProvider::CommandCode);
-        state.authenticated = true;
-        state
-            .composer
-            .insert_text("/model deepseek/deepseek-v4.1-flash");
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(
-            effects.contains(&Effect::Send(UiCommand::SetCommandCodeModel {
-                model: "deepseek/deepseek-v4.1-flash".into(),
-                effort: ReasoningEffort::High,
-            }))
-        );
-    }
-
-    #[test]
-    fn ctrl_p_does_not_open_palette_over_login() {
-        // G250: palette is gated behind the stacked overlays.
-        let mut state = AppState::new();
-        state.composer.insert_text("/login");
-        reduce(&mut state, Action::Key(enter()));
-        assert!(state.login_overlay.is_some());
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
-        );
-        assert!(
-            state.palette_query.is_none(),
-            "Ctrl+P must not open the palette over a modal"
-        );
-    }
-
-    #[test]
-    fn paste_does_not_edit_composer_under_model_overlay() {
-        // G250: paste never reaches the composer beneath a stacked modal.
-        let mut state = AppState::new();
-        state.auth_provider = Some(LoginProvider::OpenCodeGo);
-        state.authenticated = true;
-        state.composer.insert_text("/models");
-        reduce(&mut state, Action::Key(enter()));
-        assert!(state.model_overlay.is_some());
-        reduce(&mut state, Action::Paste("snuck in".into()));
-        assert!(
-            state.composer.payload().is_empty(),
-            "paste must be ignored under a modal overlay"
-        );
-    }
-
-    #[test]
-    fn ctrl_l_opens_model_overlay() {
-        // G250: Ctrl+L is the missing spec §17.2 binding for the model overlay.
-        let mut state = AppState::new();
-        state.auth_provider = Some(LoginProvider::OpenAiCodex);
-        state.authenticated = true;
-        let effects = reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
-        );
-        assert!(
-            state.model_overlay.is_some(),
-            "Ctrl+L must open the model overlay"
-        );
-        assert!(effects.contains(&Effect::Send(UiCommand::RefreshOpenCodeModels)));
-    }
-
-    #[test]
-    fn ctrl_t_toggles_todo_dock() {
-        // G250: Ctrl+T is the missing spec §17.2 binding for the Todo dock.
-        let mut state = AppState::new();
-        assert!(!state.todo_dock_open);
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
-        );
-        assert!(state.todo_dock_open);
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
-        );
-        assert!(!state.todo_dock_open);
-    }
-
-    #[test]
-    fn model_command_requires_effort_before_updating_runtime() {
-        let mut state = AppState::new();
-        state.auth_provider = Some(LoginProvider::OpenAiCodex);
-        state.authenticated = true;
-        state.composer.insert_text("/model");
-        reduce(&mut state, Action::Key(enter()));
-        assert!(state.model_overlay.is_some());
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-        );
-        reduce(&mut state, Action::Key(enter()));
-        assert!(
-            state.model_overlay.is_some(),
-            "parent model overlay survives the effort step (G239)"
-        );
-        assert!(state.effort_overlay.is_some());
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(effects.contains(&Effect::Send(UiCommand::SetModel {
-            model: ModelAlias::Terra,
-            effort: ReasoningEffort::High,
-            fast: false,
-        })));
-    }
-
-    #[test]
-    fn effort_esc_returns_to_model_overlay_on_the_same_model() {
-        let mut state = AppState::new();
-        state.auth_provider = Some(LoginProvider::OpenAiCodex);
-        state.authenticated = true;
-        state.composer.insert_text("/model");
-        reduce(&mut state, Action::Key(enter()));
-        // Rows: Header, Sol, Terra — one Down lands on Terra.
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-        );
-        reduce(&mut state, Action::Key(enter()));
-        assert!(state.effort_overlay.is_some());
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-        );
-        let overlay = state.model_overlay.expect("parent overlay survives Esc");
-        assert_eq!(
-            overlay.selected, 2,
-            "highlight stays on the chosen model row"
-        );
-    }
-
-    #[test]
-    fn altgr_printable_slash_reaches_composer() {
-        let mut state = AppState::new();
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(
-                KeyCode::Char('/'),
-                KeyModifiers::CONTROL | KeyModifiers::ALT,
-            )),
-        );
-        assert_eq!(state.composer.payload(), "/");
-    }
-
-    #[test]
-    fn signed_out_prompt_preserves_draft_without_sending() {
-        let mut state = AppState::new();
-        state.composer.insert_text("keep this prompt");
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert_eq!(state.composer.payload(), "keep this prompt");
-        assert!(effects
-            .iter()
-            .all(|effect| !matches!(effect, Effect::Send(UiCommand::SendPrompt(_)))));
-        assert_eq!(
-            state.notifications.last().map(|notice| notice.as_str()),
-            Some("Nenhum provedor conectado. Use /login.")
-        );
-    }
-
-    #[test]
-    fn enter_during_active_run_enqueues_draft_instead_of_sending() {
-        // G244 (§7.4): submit while a run is active queues the draft as a
-        // visible QueuedUser block instead of silently dropping it.
-        let mut state = AppState::new();
-        state.working = true;
-        state.composer.insert_text("keep this draft");
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert_eq!(state.composer.payload(), "");
-        assert_eq!(state.queued_prompts.len(), 1);
-        assert_eq!(
-            state.queued_prompts.front().map(String::as_str),
-            Some("keep this draft")
-        );
-        assert!(effects
-            .iter()
-            .all(|effect| !matches!(effect, Effect::Send(UiCommand::SendPrompt(_)))));
-    }
-
-    #[test]
-    fn ctrl_c_with_screen_selection_copies_instead_of_shutdown() {
-        let mut state = AppState::new();
-        state.selection_text = "copied from the frame".into();
-        let effects = reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-        );
-        assert!(!state.shutdown);
-        assert!(effects.contains(&Effect::CopyToClipboard("copied from the frame".into())));
-    }
-
-    #[test]
-    fn right_click_copies_selection_or_requests_paste() {
-        let mut state = AppState::new();
-        let paste = reduce(&mut state, Action::MouseSecondary);
-        assert_eq!(paste, vec![Effect::PasteFromClipboard]);
-        state.selection_text = "block".into();
-        let copy = reduce(&mut state, Action::MouseSecondary);
-        assert!(copy.contains(&Effect::CopyToClipboard("block".into())));
-    }
-
-    #[test]
-    fn clipboard_confirmation_is_success_only_coalesced_and_transient() {
-        let mut state = AppState::new();
-        state.selection_text = "selected".into();
-        reduce(&mut state, Action::MouseSecondary);
-        assert!(
-            state.notifications.is_empty(),
-            "scheduling a copy is not success"
-        );
-        state.clock.elapsed_ms = 100;
-        reduce(&mut state, Action::ClipboardCompleted { success: true });
-        assert_eq!(state.notifications.len(), 1);
-        assert_eq!(state.notifications[0].message, "Copiado");
-        state.clock.elapsed_ms = 200;
-        reduce(&mut state, Action::ClipboardCompleted { success: true });
-        assert_eq!(state.notifications.len(), 1);
-        assert_eq!(state.notifications[0].created_ms, 200);
-        state.clock.elapsed_ms = 200 + crate::app::INFO_TOAST_TTL_MS;
-        state.prune_notifications();
-        assert!(state.notifications.is_empty());
-        reduce(&mut state, Action::ClipboardCompleted { success: false });
-        assert_eq!(state.notifications.len(), 1);
-        assert_eq!(
-            state.notifications[0].message,
-            "Área de transferência indisponível"
-        );
-    }
-
-    #[test]
-    fn click_without_drag_clears_the_screen_selection() {
-        let mut state = AppState::new();
-        reduce(
-            &mut state,
-            Action::StartScreenSelection {
-                x: 4,
-                y: 1,
-                area: Some(ratatui::layout::Rect::new(0, 0, 10, 3)),
-            },
-        );
-        assert!(state.selection.is_some());
-        reduce(&mut state, Action::FinishScreenSelection);
-        assert_eq!(state.selection, None);
-    }
-
-    #[test]
-    fn empty_selection_neither_pastes_nor_cancels_and_resize_clears_it() {
-        let mut state = AppState::new();
-        state.working = true;
-        reduce(
-            &mut state,
-            Action::StartScreenSelection {
-                x: 4,
-                y: 1,
-                area: Some(ratatui::layout::Rect::new(0, 0, 10, 3)),
-            },
-        );
-        reduce(&mut state, Action::UpdateScreenSelection { x: 8, y: 1 });
-        assert_eq!(
-            reduce(&mut state, Action::MouseSecondary),
-            vec![Effect::RequestRender]
-        );
-        assert_eq!(
-            reduce(
-                &mut state,
-                Action::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
-            ),
-            vec![Effect::RequestRender]
-        );
-        assert_eq!(
-            reduce(
-                &mut state,
-                Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-            ),
-            vec![Effect::RequestRender]
-        );
-        assert!(state.selection.is_none());
-        reduce(
-            &mut state,
-            Action::StartScreenSelection {
-                x: 4,
-                y: 1,
-                area: Some(ratatui::layout::Rect::new(0, 0, 10, 3)),
-            },
-        );
-        reduce(&mut state, Action::Resize);
-        assert!(state.selection.is_none() && state.selection_area.is_none());
-    }
-
-    #[test]
-    fn new_content_preserves_coordinate_selection_snapshot() {
-        let mut state = AppState::new();
-        reduce(
-            &mut state,
-            Action::StartScreenSelection {
-                x: 4,
-                y: 1,
-                area: Some(ratatui::layout::Rect::new(0, 0, 10, 3)),
-            },
-        );
-        state.selection_text = "old content".into();
-        reduce(
-            &mut state,
-            Action::UiEventReceived(UiEvent::AssistantDelta {
-                text: "new content".into(),
-            }),
-        );
-        assert!(state.selection.is_some() && state.selection_area.is_some());
-        assert_eq!(state.selection_text, "old content");
-    }
-
-    #[test]
-    fn ctrl_c_idle_with_empty_draft_requests_shutdown_once() {
-        let mut state = AppState::new();
-        let effects = reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-        );
-        assert!(state.shutdown);
-        assert!(effects.contains(&Effect::Send(UiCommand::Shutdown)));
-    }
-
-    #[test]
-    fn ctrl_c_while_working_cancels_run_and_stays_alive() {
-        let mut state = AppState::new();
-        state.working = true;
-        let effects = reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-        );
-        assert!(!state.shutdown);
-        assert!(effects.contains(&Effect::Send(UiCommand::CancelRun)));
-    }
-
-    fn ctrl_c() -> KeyEvent {
-        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
-    }
-
-    #[test]
-    fn login_api_key_esc_returns_to_provider_list() {
-        let mut state = AppState::new();
-        state.composer.insert_text("/login opencode");
-        reduce(&mut state, Action::Key(enter()));
-        assert!(matches!(
-            state.login_overlay.as_ref().map(|overlay| &overlay.stage),
-            Some(LoginStage::ApiKey(_))
-        ));
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-        );
-        let overlay = state
-            .login_overlay
-            .as_ref()
-            .expect("Esc back keeps the login overlay open");
-        assert!(
-            matches!(overlay.stage, LoginStage::Providers),
-            "API-key Esc returns to the provider list"
-        );
-        assert!(!state.shutdown);
-    }
-
-    #[test]
-    fn login_providers_esc_closes_overlay() {
-        let mut state = AppState::new();
-        state.composer.insert_text("/login");
-        reduce(&mut state, Action::Key(enter()));
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-        );
-        assert!(state.login_overlay.is_none());
-        assert!(!state.shutdown);
-    }
-
-    #[test]
-    fn ctrl_c_on_model_overlay_still_exits_when_idle() {
-        let mut state = AppState::new();
-        state.authenticated = true;
-        state.auth_provider = Some(LoginProvider::OpenAiCodex);
-        state.composer.insert_text("/model");
-        reduce(&mut state, Action::Key(enter()));
-        assert!(state.model_overlay.is_some());
-        let effects = reduce(&mut state, Action::Key(ctrl_c()));
-        assert!(state.shutdown);
-        assert!(effects.contains(&Effect::Send(UiCommand::Shutdown)));
-    }
-
-    #[test]
-    fn ctrl_c_on_palette_still_exits_when_idle() {
-        let mut state = AppState::new();
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
-        );
-        assert!(state.palette_query.is_some());
-        let effects = reduce(&mut state, Action::Key(ctrl_c()));
-        assert!(state.shutdown);
-        assert!(effects.contains(&Effect::Send(UiCommand::Shutdown)));
-    }
-
-    #[test]
-    fn ctrl_c_etx_idle_with_empty_draft_requests_shutdown() {
-        let mut state = AppState::new();
-        let effects = reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Char('\u{3}'), KeyModifiers::NONE)),
-        );
-        assert!(state.shutdown);
-        assert!(effects.contains(&Effect::Send(UiCommand::Shutdown)));
-    }
-
-    #[test]
-    fn ctrl_c_idle_with_draft_clears_before_exit() {
-        let mut state = AppState::new();
-        state.composer.insert_text("do not lose this silently");
-        let first = reduce(&mut state, Action::Key(ctrl_c()));
-        assert!(!state.shutdown);
-        assert!(state.composer.payload().is_empty());
-        assert!(
-            first
-                .iter()
-                .all(|effect| !matches!(effect, Effect::Send(UiCommand::Shutdown))),
-            "first Ctrl+C with a draft must not quit"
-        );
-        let second = reduce(&mut state, Action::Key(ctrl_c()));
-        assert!(state.shutdown);
-        assert!(second.contains(&Effect::Send(UiCommand::Shutdown)));
-    }
-
-    #[test]
-    fn backtab_cycles_mode_through_boundary() {
-        let mut state = AppState::new();
-        let effects = reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)),
-        );
-        assert!(effects.contains(&Effect::Send(UiCommand::SetMode(
-            slim_core::OperatingMode::ReadOnly
-        ))));
-    }
-
-    #[test]
-    fn alt_tab_cycles_mode_like_shift_tab() {
-        for (from, expected) in [
-            (
-                slim_core::OperatingMode::Auto,
-                slim_core::OperatingMode::ReadOnly,
-            ),
-            (
-                slim_core::OperatingMode::ReadOnly,
-                slim_core::OperatingMode::Plan,
-            ),
-            (
-                slim_core::OperatingMode::Plan,
-                slim_core::OperatingMode::Auto,
-            ),
-        ] {
-            let mut state = AppState::new();
-            state.mode = from;
-            let effects = reduce(
-                &mut state,
-                Action::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::ALT)),
-            );
-            assert!(
-                effects.contains(&Effect::Send(UiCommand::SetMode(expected))),
-                "{from:?} via Alt+Tab"
-            );
-        }
-    }
-
-    #[test]
-    fn mode_switch_is_refused_while_a_run_is_active() {
-        let mut state = AppState::new();
-        state.working = true;
-        for key in [
-            KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::ALT),
-        ] {
-            let effects = reduce(&mut state, Action::Key(key));
-            assert!(!effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::Send(UiCommand::SetMode(_)))));
-        }
-    }
-
-    #[test]
-    fn mode_slash_command_accepts_explicit_modes() {
-        let mut state = AppState::new();
-        state.composer.insert_text("/mode plan");
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(effects.contains(&Effect::Send(UiCommand::SetMode(
-            slim_core::OperatingMode::Plan
-        ))));
-
-        let mut state = AppState::new();
-        state.composer.insert_text("/mode bogus");
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(!effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::Send(UiCommand::SetMode(_)))));
-    }
-
-    #[test]
-    fn mode_slash_command_cycles_like_shift_tab() {
-        let mut state = AppState::new();
-        state.composer.insert_text("/mode");
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(effects.contains(&Effect::Send(UiCommand::SetMode(
-            slim_core::OperatingMode::ReadOnly
-        ))));
-        assert!(state.composer.payload().is_empty());
-    }
-
-    #[test]
-    fn model_picker_survives_an_empty_result() {
-        let mut state = AppState::new();
-        let _ = open_model_overlay(&mut state);
-        let mut overlay = state.model_overlay.clone().expect("overlay");
-        // Nothing matches the filter: the list is empty rather than showing
-        // dead headers, and no model can be selected.
-        overlay.filter = "zzz-no-such-model".into();
-        state.model_overlay = Some(overlay);
-
-        let effects = reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        );
-        assert!(!effects.iter().any(|effect| matches!(
-            effect,
-            Effect::Send(UiCommand::SetModel { .. })
-                | Effect::Send(UiCommand::SetOpenCodeModel { .. })
-                | Effect::Send(UiCommand::SetZenModel { .. })
-                | Effect::Send(UiCommand::SetClinePassModel { .. })
-                | Effect::Send(UiCommand::SetCommandCodeModel { .. })
-        )));
-
-        // Esc still leaves: the interface never sticks.
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-        );
-        assert!(state.model_overlay.is_none());
-    }
-
-    #[test]
-    fn api_key_login_collects_the_secret_masked() {
-        let mut state = AppState::new();
-        state.composer.insert_text("/login opencode-zen");
-        reduce(&mut state, Action::Key(enter()));
-        assert_eq!(
-            state.login_overlay.as_ref().expect("overlay").provider(),
-            LoginProvider::OpenCodeZen
-        );
-        for character in "ts-fixture-secret".chars() {
-            reduce(
-                &mut state,
-                Action::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
-            );
-        }
-
-        let effects = reduce(&mut state, Action::Key(enter()));
-
-        assert!(matches!(
-            effects.as_slice(),
-            [
-                Effect::Send(UiCommand::SaveApiKey {
-                    provider: LoginProvider::OpenCodeZen,
-                    ..
-                }),
-                Effect::RequestRender
-            ]
-        ));
-        assert!(!format!("{state:?}").contains("ts-fixture-secret"));
-    }
-
-    #[test]
-    fn resume_command_dispatches_only_while_idle() {
-        let mut state = AppState::new();
-        state.composer.insert_text("/resume");
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(effects.contains(&Effect::Send(UiCommand::ResumePrevious)));
-
-        state.working = true;
-        for character in "/re".chars() {
-            reduce(
-                &mut state,
-                Action::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
-            );
-        }
-        assert!(state.slash_suggestions.is_some());
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert_eq!(state.composer.payload().trim(), "/resume");
-        assert!(!effects.contains(&Effect::Send(UiCommand::ResumePrevious)));
-    }
-
-    #[test]
-    fn compact_command_keeps_optional_instructions_out_of_user_prompt() {
-        let mut state = AppState::new();
-        state.authenticated = true;
-        state
-            .composer
-            .insert_text("/compact preserve build evidence");
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(effects.contains(&Effect::Send(UiCommand::Compact {
-            instructions: "preserve build evidence".into(),
-        })));
-        assert!(effects
-            .iter()
-            .all(|effect| !matches!(effect, Effect::Send(UiCommand::SendPrompt(_)))));
-    }
-
-    #[test]
-    fn compact_command_during_run_goes_to_safe_boundary_not_prompt_queue() {
-        let mut state = AppState::new();
-        state.authenticated = true;
-        state.working = true;
-        state.composer.insert_text("/compact");
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(effects.contains(&Effect::Send(UiCommand::Compact {
-            instructions: String::new(),
-        })));
-        assert!(state.queued_prompts.is_empty());
-    }
-
-    #[test]
-    fn paste_too_large_is_visible_error_not_silent_drop() {
-        let mut state = AppState::new();
-        reduce(
-            &mut state,
-            Action::Paste("x".repeat(crate::composer::MAX_DRAFT_CHARS + 1)),
-        );
-        assert!(!state.notifications.is_empty());
-    }
-
-    #[test]
-    fn info_toasts_expire_after_five_seconds_on_tick() {
-        let mut state = AppState::new();
-        state.clock.elapsed_ms = 1_000;
-        state.apply_event(UiEvent::Notification {
-            message: "Connected: OpenAI Codex — ChatGPT Plus/Pro".into(),
-        });
-        assert_eq!(state.notifications.len(), 1);
-
-        reduce(
-            &mut state,
-            Action::Tick(FrameClock {
-                frame: 60,
-                elapsed_ms: 6_000,
-            }),
-        );
-        assert!(
-            state.notifications.is_empty(),
-            "info toast must expire at 5s: {:?}",
-            state.notifications
-        );
-    }
-
-    #[test]
-    fn mode_command_via_alias_sends_set_model() {
-        let mut state = AppState::new();
-        state.auth_provider = Some(LoginProvider::OpenAiCodex);
-        state.authenticated = true;
-        state.composer.insert_text("/model luna");
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(effects.contains(&Effect::Send(UiCommand::SetModel {
-            model: ModelAlias::Luna,
-            effort: ReasoningEffort::High,
-            fast: false,
-        })));
-        assert!(state.composer.payload().is_empty());
-    }
-    #[test]
-    fn mcp_command_opens_overlay_and_starts_watch() {
-        let mut state = AppState::new();
-        state.composer.insert_text("/mcp");
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(state.mcp_overlay.is_some());
-        assert!(effects.contains(&Effect::Send(UiCommand::McpRefresh)));
-        assert!(effects.contains(&Effect::Send(UiCommand::McpWatch { on: true })));
-        // Esc closes the overlay and stops the worker-side watch.
-        let effects = reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-        );
-        assert!(state.mcp_overlay.is_none());
-        assert!(effects.contains(&Effect::Send(UiCommand::McpWatch { on: false })));
-    }
-
-    #[test]
-    fn mcp_overlay_remove_requires_confirmation() {
-        let mut state = AppState::new();
-        state.mcp_servers = vec![crate::api::McpServerView {
-            name: "fs".into(),
-            transport: "stdio",
-            target: "npx fs".into(),
-            status: crate::api::McpStatusView::Ready,
-            tools: Some(3),
-            error: None,
-        }];
-        state.composer.insert_text("/mcp");
-        reduce(&mut state, Action::Key(enter()));
-        // d arms confirmation; nothing is sent yet.
-        let effects = reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
-        );
-        assert!(effects
-            .iter()
-            .all(|effect| !matches!(effect, Effect::Send(UiCommand::McpRemove { .. }))));
-        // A non-confirming key cancels the armed removal.
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
-        );
-        let effects = reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
-        );
-        let _ = effects;
-        let effects = reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
-        );
-        assert!(effects.contains(&Effect::Send(UiCommand::McpRemove { name: "fs".into() })));
-    }
-
-    #[test]
-    fn mcp_overlay_enter_tests_selected_server() {
-        let mut state = AppState::new();
-        state.mcp_servers = vec![
-            crate::api::McpServerView {
-                name: "fs".into(),
-                transport: "stdio",
-                target: "npx fs".into(),
-                status: crate::api::McpStatusView::Disconnected,
-                tools: None,
-                error: None,
-            },
-            crate::api::McpServerView {
-                name: "web".into(),
-                transport: "http",
-                target: "https://mcp.example.com".into(),
-                status: crate::api::McpStatusView::Disconnected,
-                tools: None,
-                error: None,
-            },
-        ];
-        state.composer.insert_text("/mcp");
-        reduce(&mut state, Action::Key(enter()));
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-        );
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(effects.contains(&Effect::Send(UiCommand::McpTest { name: "web".into() })));
-    }
-
-    #[test]
-    fn mcp_add_parses_stdio_and_http_forms() {
-        let mut state = AppState::new();
-        state.composer.insert_text("/mcp add fs npx -y fs-server");
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(effects.contains(&Effect::Send(UiCommand::McpAdd {
-            name: "fs".into(),
-            command: Some("npx".into()),
-            args: vec!["-y".into(), "fs-server".into()],
-            url: None,
-            global: false,
-        })));
-
-        let mut state = AppState::new();
-        state
-            .composer
-            .insert_text("/mcp add web --url https://mcp.example.com --global");
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(effects.contains(&Effect::Send(UiCommand::McpAdd {
-            name: "web".into(),
-            command: None,
-            args: Vec::new(),
-            url: Some("https://mcp.example.com".into()),
-            global: true,
-        })));
-    }
-
-    fn mcp_server(name: &str) -> crate::api::McpServerView {
-        crate::api::McpServerView {
-            name: name.into(),
-            transport: "stdio",
-            target: "cmd".into(),
-            status: crate::api::McpStatusView::Disconnected,
-            tools: None,
-            error: None,
-        }
-    }
-
-    fn open_mcp(state: &mut AppState) {
-        state.composer.insert_text("/mcp");
-        reduce(state, Action::Key(enter()));
-    }
-
-    #[test]
-    fn mcp_overlay_ignores_modified_destructive_keys() {
-        let mut state = AppState::new();
-        state.mcp_servers = vec![mcp_server("fs")];
-        open_mcp(&mut state);
-        for code in [
-            KeyCode::Char('r'),
-            KeyCode::Char('x'),
-            KeyCode::Char('d'),
-            KeyCode::Char('y'),
-        ] {
-            let effects = reduce(
-                &mut state,
-                Action::Key(KeyEvent::new(code, KeyModifiers::CONTROL)),
-            );
-            assert!(
-                effects.iter().all(|effect| !matches!(
-                    effect,
-                    Effect::Send(UiCommand::McpReconnect { .. })
-                        | Effect::Send(UiCommand::McpDisconnect { .. })
-                        | Effect::Send(UiCommand::McpRemove { .. })
-                )),
-                "Ctrl+{code:?} must not fire an MCP action"
-            );
-        }
-        assert!(state.mcp_overlay.is_some());
-    }
-
-    #[test]
-    fn mcp_command_during_run_opens_overlay_instead_of_queuing() {
-        let mut state = AppState::new();
-        state.working = true;
-        state.composer.insert_text("/mcp");
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(state.mcp_overlay.is_some());
-        assert!(state.queued_prompts.is_empty());
-        assert!(effects.contains(&Effect::Send(UiCommand::McpRefresh)));
-        assert!(effects.contains(&Effect::Send(UiCommand::McpWatch { on: true })));
-    }
-
-    #[test]
-    fn mcp_mutating_subcommand_during_run_is_dispatched_not_queued() {
-        // The worker's active-run catch-all rejects it with a notification;
-        // what must never happen is the text reaching the prompt queue.
-        let mut state = AppState::new();
-        state.working = true;
-        state.composer.insert_text("/mcp reconnect fs");
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(state.queued_prompts.is_empty());
-        assert!(effects.contains(&Effect::Send(UiCommand::McpReconnect { name: "fs".into() })));
-        assert!(effects
-            .iter()
-            .all(|effect| !matches!(effect, Effect::Send(UiCommand::SendPrompt(_)))));
-    }
-
-    #[test]
-    fn mcp_overlay_open_clears_search() {
-        // Search captures keys before overlays do; the palette (Ctrl+P) is
-        // the only route that can stack /mcp over it — the overlay must win.
-        let mut state = AppState::new();
-        state.search = Some(crate::inspector::SearchState::default());
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
-        );
-        for character in "mcp".chars() {
-            reduce(
-                &mut state,
-                Action::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
-            );
-        }
-        reduce(&mut state, Action::Key(enter()));
-        assert!(state.search.is_none());
-        assert!(state.mcp_overlay.is_some());
-    }
-
-    #[test]
-    fn mcp_selection_follows_server_name_across_snapshots() {
-        let mut state = AppState::new();
-        state.mcp_servers = vec![mcp_server("a"), mcp_server("b"), mcp_server("c")];
-        open_mcp(&mut state);
-        // Select "c" (index 2).
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-        );
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-        );
-        assert_eq!(state.mcp_overlay.as_ref().unwrap().selected, 2);
-        // Snapshot with "a" removed: "c" now sits at index 1 and the cursor
-        // must follow the name, not the numeric position.
-        reduce(
-            &mut state,
-            Action::UiEventReceived(UiEvent::McpServersChanged {
-                servers: vec![mcp_server("b"), mcp_server("c")],
-            }),
-        );
-        let overlay = state.mcp_overlay.as_ref().unwrap();
-        assert_eq!(overlay.selected, 1);
-        assert_eq!(state.mcp_servers[overlay.selected].name, "c");
-        // Selected server removed entirely: clamp into range.
-        reduce(
-            &mut state,
-            Action::UiEventReceived(UiEvent::McpServersChanged {
-                servers: vec![mcp_server("b")],
-            }),
-        );
-        assert_eq!(state.mcp_overlay.as_ref().unwrap().selected, 0);
-    }
-
-    #[test]
-    fn mcp_malformed_subcommand_shows_usage_and_keeps_draft() {
-        let mut state = AppState::new();
-        state.composer.insert_text("/mcp frobnicate");
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(state.composer.payload().contains("/mcp frobnicate"));
-        assert!(effects
-            .iter()
-            .all(|effect| !matches!(effect, Effect::Send(UiCommand::SendPrompt(_)))));
-        assert!(state
-            .notifications
-            .iter()
-            .any(|notification| notification.message.starts_with("Uso: /mcp")));
-    }
-
-    #[test]
-    fn parallel_tool_activity_keeps_running_call_until_each_identity_ends() {
-        let mut state = AppState::new();
-        state.apply_event(UiEvent::RunStarted {
-            run_id: 1,
-            max_mutating_tool_calls: 8,
-            max_read_tool_calls: 8,
-            max_turns: 4,
-        });
-        let batch_a = crate::api::ToolBatchId("batch-a".into());
-        let call_a = crate::api::ToolCallId("call-a".into());
-        let batch_b = crate::api::ToolBatchId("batch-b".into());
-        let call_b = crate::api::ToolCallId("call-b".into());
-
-        state.apply_event(UiEvent::ToolAdmitted {
-            batch_id: batch_a.clone(),
-            call_id: call_a.clone(),
-            name: "search".into(),
-        });
-        assert_eq!(
-            state.activity.as_ref().map(|activity| &activity.phase),
-            Some(&ActivityPhase::QueuedTool("search".into()))
-        );
-        state.apply_event(UiEvent::ToolStarted {
-            batch_id: batch_a.clone(),
-            call_id: call_a.clone(),
-            name: "search".into(),
-            arguments_summary: "{}".into(),
-        });
-        state.apply_event(UiEvent::ToolAdmitted {
-            batch_id: batch_b.clone(),
-            call_id: call_b.clone(),
-            name: "write".into(),
-        });
-        assert_eq!(
-            state.activity.as_ref().map(|activity| &activity.phase),
-            Some(&ActivityPhase::RunningTool("search".into()))
-        );
-        state.apply_event(UiEvent::ToolStarted {
-            batch_id: batch_b,
-            call_id: call_b,
-            name: "write".into(),
-            arguments_summary: "{}".into(),
-        });
-        state.apply_event(UiEvent::ToolEnded {
-            batch_id: batch_a,
-            call_id: call_a,
-            name: "search".into(),
-            success: true,
-            duration_ms: 10,
-        });
-        assert_eq!(
-            state.activity.as_ref().map(|activity| &activity.phase),
-            Some(&ActivityPhase::RunningTool("write".into()))
-        );
-    }
-
-    #[test]
-    fn retry_state_is_cleared_by_provider_phase_and_late_retry_is_ignored() {
-        let mut state = AppState::new();
-        state.apply_event(UiEvent::RunStarted {
-            run_id: 7,
-            max_mutating_tool_calls: 1,
-            max_read_tool_calls: 1,
-            max_turns: 1,
-        });
-        state.apply_event(UiEvent::RetryScheduled {
-            attempt: 1,
-            limit: 3,
-            wait_ms: 250,
-            reason: Some("timeout".into()),
-        });
-        assert!(state.retry.is_some());
-        state.apply_event(UiEvent::ProviderPhaseChanged {
-            phase: slim_core::ProviderPhase::HeadersReceived,
-            label: "headers".into(),
-            elapsed_ms: 11,
-        });
-        assert!(state.retry.is_none());
-        state.apply_event(UiEvent::RunCompleted { run_id: 7 });
-        state.apply_event(UiEvent::RetryScheduled {
-            attempt: 2,
-            limit: 3,
-            wait_ms: 500,
-            reason: None,
-        });
-        assert!(state.retry.is_none());
-    }
-
-    #[test]
-    fn explicit_cancel_pauses_queue_until_deliberate_resume() {
-        let mut state = AppState::new();
-        state.apply_event(UiEvent::RunStarted {
-            run_id: 3,
-            max_mutating_tool_calls: 1,
-            max_read_tool_calls: 1,
-            max_turns: 1,
-        });
-        state.enqueue_queued_prompt("first".into());
-        state.enqueue_queued_prompt("second".into());
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-        );
-        assert_eq!(
-            state.cancellation.map(|cancellation| cancellation.phase),
-            Some(CancellationPhase::Requested)
-        );
-        let effects = reduce(
-            &mut state,
-            Action::UiEventReceived(UiEvent::RunStopped {
-                run_id: 3,
-                message: "cancelled".into(),
-            }),
-        );
-        assert!(state.queue_paused);
-        assert_eq!(state.queue_len(), 2);
-        assert!(!effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::Send(UiCommand::SendPrompt(_)))));
-
-        state.composer.insert_text("/queue resume");
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(!state.queue_paused);
-        assert!(effects.contains(&Effect::Send(UiCommand::SendPrompt("first".into()))));
-        assert_eq!(state.queue_len(), 1);
-
-        state.composer.insert_text("/queue edit 1");
-        reduce(&mut state, Action::Key(enter()));
-        assert_eq!(state.composer.payload(), "second");
-        assert_eq!(state.queue_len(), 0);
-    }
-
-    #[test]
-    fn explicit_cancel_keeps_queue_paused_even_if_completion_wins_race() {
-        let mut state = AppState::new();
-        state.apply_event(UiEvent::RunStarted {
-            run_id: 4,
-            max_mutating_tool_calls: 1,
-            max_read_tool_calls: 1,
-            max_turns: 1,
-        });
-        state.enqueue_queued_prompt("after cancel".into());
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-        );
-        let effects = reduce(
-            &mut state,
-            Action::UiEventReceived(UiEvent::RunCompleted { run_id: 4 }),
-        );
-        assert!(state.queue_paused);
-        assert_eq!(state.queue_len(), 1);
-        assert!(!effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::Send(UiCommand::SendPrompt(_)))));
-        assert_eq!(
-            state.last_execution.as_ref().map(|summary| summary.outcome),
-            Some(RunOutcomeKind::Completed)
-        );
-    }
-
-    #[test]
-    fn execution_summary_survives_next_run_and_tracks_outcome() {
-        let mut state = AppState::new();
-        state.clock.elapsed_ms = 100;
-        state.apply_event(UiEvent::RunStarted {
-            run_id: 1,
-            max_mutating_tool_calls: 1,
-            max_read_tool_calls: 1,
-            max_turns: 1,
-        });
-        state.clock.elapsed_ms = 275;
-        state.apply_event(UiEvent::RunCompleted { run_id: 1 });
-        let summary = state.last_execution.as_ref().expect("completed summary");
-        assert_eq!(summary.run_id, 1);
-        assert_eq!(summary.duration_ms, 175);
-        assert_eq!(summary.outcome, RunOutcomeKind::Completed);
-        state.apply_event(UiEvent::RunStarted {
-            run_id: 2,
-            max_mutating_tool_calls: 1,
-            max_read_tool_calls: 1,
-            max_turns: 1,
-        });
-        assert_eq!(
-            state.last_execution.as_ref().map(|summary| summary.run_id),
-            Some(1)
-        );
-        state.clock.elapsed_ms = 300;
-        state.apply_event(UiEvent::RunStopped {
-            run_id: 2,
-            message: "stopped".into(),
-        });
-        assert_eq!(state.execution_history.len(), 2);
-        assert_eq!(
-            state.last_execution.as_ref().map(|summary| summary.outcome),
-            Some(RunOutcomeKind::Interrupted)
-        );
-    }
-
-    #[test]
-    fn todo_dock_preference_survives_todo_updates() {
-        let mut state = AppState::new();
-        state.apply_event(UiEvent::TodoChanged {
-            items: vec![crate::api::TodoItemView {
-                title: "pending".into(),
-                status: crate::api::TodoItemStatus::Pending,
-            }],
-        });
-        assert!(state.todo_dock_open);
-        reduce(&mut state, Action::ToggleTodoDock);
-        assert!(!state.todo_dock_open);
-        state.apply_event(UiEvent::TodoChanged {
-            items: vec![crate::api::TodoItemView {
-                title: "still pending".into(),
-                status: crate::api::TodoItemStatus::Pending,
-            }],
-        });
-        assert!(!state.todo_dock_open);
-    }
-
-    #[test]
-    fn confirmed_setting_records_effective_changes_only() {
-        let mut state = AppState::new();
-        state.clock.elapsed_ms = 10;
-        state.apply_event(UiEvent::ModeChanged {
-            mode: slim_core::OperatingMode::Auto,
-        });
-        assert!(state.confirmed_setting.is_none());
-        state.apply_event(UiEvent::ModeChanged {
-            mode: slim_core::OperatingMode::ReadOnly,
-        });
-        assert_eq!(state.confirmed_setting, Some((ConfirmedSetting::Mode, 10)));
-        state.clock.elapsed_ms = 20;
-        state.apply_event(UiEvent::EffortChanged {
-            effort: ReasoningEffort::Low,
-        });
-        assert_eq!(
-            state.confirmed_setting,
-            Some((ConfirmedSetting::Effort, 20))
-        );
-        state.clock.elapsed_ms = 30;
-        state.apply_event(UiEvent::ModelChanged {
-            model: "gpt-5.6-terra".into(),
-        });
-        assert_eq!(state.confirmed_setting, Some((ConfirmedSetting::Model, 30)));
-    }
-
-    #[test]
-    fn notification_coalescing_preserves_priority_and_history() {
-        let mut state = AppState::new();
-        state.clock.elapsed_ms = 1;
-        state.push_notification("same".into());
-        state.clock.elapsed_ms = 2;
-        state.push_notification("same".into());
-        assert_eq!(state.notifications.len(), 1);
-        assert_eq!(state.notifications[0].repeat_count, 2);
-        assert_eq!(state.notification_history()[0].repeat_count, 2);
-        state.push_notification_with_priority("same".into(), NotificationPriority::Warning);
-        state.push_notification_with_priority("failure".into(), NotificationPriority::Error);
-        let toast = state.visible_toast_tail(3);
-        assert_eq!(toast.len(), 1);
-        assert_eq!(toast[0].message, "failure");
-        assert_eq!(toast[0].priority, NotificationPriority::Error);
-    }
-
-    #[test]
-    fn thinking_preview_retention_uses_thinking_start_and_releases_at_boundary() {
-        let mut state = AppState::new();
-        state.clock.elapsed_ms = 10;
-        state.apply_event(UiEvent::RunStarted {
-            run_id: 9,
-            max_mutating_tool_calls: 1,
-            max_read_tool_calls: 1,
-            max_turns: 1,
-        });
-        state.clock.elapsed_ms = 20;
-        state.apply_event(UiEvent::ThinkingStarted);
-        state.clock.elapsed_ms = 50;
-        state.apply_event(UiEvent::ThinkingDelta {
-            text: "reason".into(),
-        });
-        let thinking_id = state
-            .blocks()
-            .iter()
-            .find(|block| matches!(block.kind(), crate::block::BlockKind::Thinking(_)))
-            .map(|block| block.id.clone())
-            .expect("thinking block");
-        let thinking = state
-            .blocks()
-            .iter()
-            .find(|block| block.id == thinking_id)
-            .unwrap();
-        assert_eq!(thinking.started_ms, Some(20));
-        state.clock.elapsed_ms = 60;
-        state.apply_event(UiEvent::ThinkingEnded);
-        assert!(state
-            .blocks()
-            .iter()
-            .find(|block| block.id == thinking_id)
-            .is_some_and(|block| block.preview_retained));
-        state.clock.elapsed_ms = 70;
-        state.apply_event(UiEvent::AssistantDelta {
-            text: "answer".into(),
-        });
-        assert!(state
-            .blocks()
-            .iter()
-            .find(|block| block.id == thinking_id)
-            .is_some_and(|block| !block.preview_retained));
-    }
-
-    #[test]
-    fn approval_decision_waits_until_runtime_marks_content_accessible() {
-        let mut state = AppState::new();
-        let request_id = crate::api::InteractionRequestId("approval-1".into());
-        state.apply_event(UiEvent::ApprovalRequired {
-            request_id: request_id.clone(),
-            summary: "run command".into(),
-            persisted: false,
-        });
-        let blocked = reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
-        );
-        assert!(!blocked
-            .iter()
-            .any(|effect| matches!(effect, Effect::Send(UiCommand::Approve { .. }))));
-        reduce(&mut state, Action::SetApprovalContentAccessible(true));
-        let approved = reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
-        );
-        assert!(approved
-            .iter()
-            .any(|effect| matches!(effect, Effect::Send(UiCommand::Approve { request_id: id }) if id == &request_id)));
-    }
-}
+mod tests;
 
 #[cfg(test)]
-mod palette_tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    use super::{reduce, Action};
-    use crate::app::AppState;
-
-    fn ctrl_p() -> KeyEvent {
-        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)
-    }
-
-    #[test]
-    fn palette_filters_and_submits_top_match() {
-        let mut state = AppState::new();
-        state.auth_provider = Some(crate::api::LoginProvider::OpenAiCodex);
-        state.authenticated = true;
-        reduce(&mut state, Action::Key(ctrl_p()));
-        assert!(state.palette_query.is_some());
-
-        for character in "mod".chars() {
-            reduce(
-                &mut state,
-                Action::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
-            );
-        }
-        assert_eq!(state.palette_query.as_deref(), Some("mod"));
-
-        // Top match is "/model": submitted as a slash command and executed.
-        let _ = reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        );
-        assert!(state.palette_query.is_none());
-        assert!(
-            state.model_overlay.is_some(),
-            "palette submit must execute /model (G243)"
-        );
-    }
-
-    #[test]
-    fn palette_query_without_slash_matches_and_executes_login() {
-        let mut state = AppState::new();
-        reduce(&mut state, Action::Key(ctrl_p()));
-        for character in "log".chars() {
-            reduce(
-                &mut state,
-                Action::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
-            );
-        }
-        let _ = reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        );
-        assert!(
-            state.login_overlay.is_some(),
-            "bare 'log' must run /login without the leading slash"
-        );
-    }
-
-    #[test]
-    fn esc_dismisses_palette_without_submitting() {
-        let mut state = AppState::new();
-        reduce(&mut state, Action::Key(ctrl_p()));
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-        );
-        assert!(state.palette_query.is_none());
-    }
-
-    #[test]
-    fn palette_matches_by_substring_not_only_prefix() {
-        let mut state = AppState::new();
-        reduce(&mut state, Action::Key(ctrl_p()));
-        for character in "agn".chars() {
-            reduce(
-                &mut state,
-                Action::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
-            );
-        }
-        let _ = reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        );
-        assert!(
-            state.palette_query.is_none(),
-            "enter must submit the substring match"
-        );
-        assert_eq!(
-            state.inspector.active,
-            Some(crate::inspector::InspectorKind::Diagnostics),
-            "bare 'agn' must run /diagnostics"
-        );
-    }
-
-    #[test]
-    fn f1_toggles_palette_open_and_closed() {
-        let mut state = AppState::new();
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),
-        );
-        assert!(state.palette_query.is_some(), "F1 must open palette");
-
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),
-        );
-        assert!(state.palette_query.is_none(), "F1 must toggle palette off");
-    }
-
-    #[test]
-    fn help_slash_command_shows_shortcuts_toast() {
-        let mut state = AppState::new();
-        state.composer.insert_text("/help");
-        let _ = reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        );
-        assert!(
-            state
-                .notifications
-                .iter()
-                .any(|n| n.message.contains("F1 / Ctrl+P")),
-            "help command must display shortcuts notification"
-        );
-    }
-
-    #[test]
-    fn palette_selection_clamps_when_narrowed() {
-        let mut state = AppState::new();
-        state.palette_query = Some(String::new());
-        state.palette_selected = 100;
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-        );
-        let total = super::palette_matches("").len();
-        assert!(state.palette_selected < total, "must clamp selection");
-    }
-
-    #[test]
-    fn search_selection_clamps_when_matches_are_fewer() {
-        let mut state = AppState::new();
-        state.search = Some(crate::inspector::SearchState {
-            query: "test".into(),
-            selected: 99,
-            filter: crate::inspector::SearchFilter::All,
-        });
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-        );
-        assert_eq!(state.search.as_ref().unwrap().selected, 0);
-    }
-}
+mod palette_tests;
 
 #[cfg(test)]
-mod slash_tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    use super::{reduce, slash_matches, slash_matches_with_skills, Action, Effect};
-    use crate::api::UiCommand;
-    use crate::app::AppState;
-
-    fn type_text(state: &mut AppState, text: &str) {
-        for character in text.chars() {
-            reduce(
-                state,
-                Action::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
-            );
-        }
-    }
-
-    fn press_key(state: &mut AppState, code: KeyCode) {
-        reduce(state, Action::Key(KeyEvent::new(code, KeyModifiers::NONE)));
-    }
-
-    #[test]
-    fn slash_opens_at_start_and_mid_prompt() {
-        let mut state = AppState::new();
-        type_text(&mut state, "/");
-        assert!(
-            state.slash_suggestions.is_some(),
-            "bare slash lists every command"
-        );
-
-        let mut state = AppState::new();
-        type_text(&mut state, "explain this /mo");
-        let suggestions = state
-            .slash_suggestions
-            .as_ref()
-            .expect("mid-prompt slash opens");
-        assert_eq!(suggestions.query, "mo");
-    }
-
-    #[test]
-    fn slash_opens_on_token_under_cursor_mid_draft() {
-        let mut state = AppState::new();
-        type_text(&mut state, "run /logi now");
-        for _ in 0..5 {
-            press_key(&mut state, KeyCode::Left);
-        }
-        let suggestions = state
-            .slash_suggestions
-            .as_ref()
-            .expect("slash under cursor opens mid-draft");
-        assert_eq!(suggestions.query, "logi");
-    }
-
-    #[test]
-    fn tab_completes_mid_draft_token_preserving_tail() {
-        let mut state = AppState::new();
-        type_text(&mut state, "run /logi now");
-        for _ in 0..5 {
-            press_key(&mut state, KeyCode::Left);
-        }
-        press_key(&mut state, KeyCode::Tab);
-        assert_eq!(state.composer.payload(), "run /login now");
-        assert!(state.slash_suggestions.is_none());
-    }
-
-    #[test]
-    fn moving_cursor_off_slash_token_closes_popup() {
-        let mut state = AppState::new();
-        type_text(&mut state, "run /lo");
-        assert!(state.slash_suggestions.is_some());
-        // Caret back onto "run": the token under the cursor no longer starts
-        // with `/`, so the popup must close.
-        for _ in 0..4 {
-            press_key(&mut state, KeyCode::Left);
-        }
-        assert!(state.slash_suggestions.is_none());
-    }
-
-    #[test]
-    fn plain_text_never_opens() {
-        let mut state = AppState::new();
-        type_text(&mut state, "explain this mode");
-        assert!(state.slash_suggestions.is_none());
-    }
-
-    #[test]
-    fn filter_narrows_to_prefix() {
-        assert_eq!(slash_matches("lo"), vec!["/login", "/logout"]);
-        assert_eq!(slash_matches("logi"), vec!["/login"]);
-        assert_eq!(slash_matches("he"), vec!["/help"]);
-        assert_eq!(slash_matches("").len(), 14);
-        assert!(slash_matches("zzz").is_empty());
-    }
-
-    #[test]
-    fn discovered_skill_autocompletes_and_dispatches_as_a_prompt() {
-        let mut state = AppState::new();
-        state.authenticated = true;
-        state.set_skill_names_for_test(vec!["review-code".into()]);
-        type_text(&mut state, "/rev");
-        assert_eq!(
-            slash_matches_with_skills(&state, "rev"),
-            vec!["/review-code"]
-        );
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-        );
-        type_text(&mut state, "check this change");
-        let effects = reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        );
-        assert!(effects.contains(&Effect::Send(UiCommand::SendPrompt(
-            "/review-code check this change".into()
-        ))));
-    }
-
-    #[test]
-    fn tab_completes_selected_command_into_draft() {
-        let mut state = AppState::new();
-        type_text(&mut state, "run /lo");
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-        );
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-        );
-        assert_eq!(state.composer.payload(), "run /logout ");
-        assert!(state.slash_suggestions.is_none());
-    }
-
-    #[test]
-    fn backspace_after_tab_complete_removes_one_grapheme_not_the_draft() {
-        let mut state = AppState::new();
-        type_text(&mut state, "run /lo");
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-        );
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-        );
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
-        );
-        assert_eq!(state.composer.payload(), "run /logout");
-    }
-
-    #[test]
-    fn enter_executes_highlighted_command() {
-        let mut state = AppState::new();
-        state.auth_provider = Some(crate::api::LoginProvider::OpenAiCodex);
-        state.authenticated = true;
-        type_text(&mut state, "/mo");
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        );
-        assert!(state.model_overlay.is_some());
-        assert!(state.composer.payload().is_empty());
-        assert!(state.slash_suggestions.is_none());
-    }
-
-    #[test]
-    fn esc_dismisses_without_touching_draft() {
-        let mut state = AppState::new();
-        type_text(&mut state, "/mo");
-        reduce(
-            &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-        );
-        assert!(state.slash_suggestions.is_none());
-        assert_eq!(state.composer.payload(), "/mo");
-    }
-
-    #[test]
-    fn editing_reopens_and_closes_the_popup() {
-        let mut state = AppState::new();
-        type_text(&mut state, "/mode");
-        assert!(state.slash_suggestions.is_some());
-        for _ in 0..5 {
-            reduce(
-                &mut state,
-                Action::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
-            );
-        }
-        assert!(
-            state.slash_suggestions.is_none(),
-            "empty draft closes the popup"
-        );
-    }
-
-    #[test]
-    fn paste_with_slash_token_opens() {
-        let mut state = AppState::new();
-        reduce(&mut state, Action::Paste("run /log".into()));
-        let suggestions = state
-            .slash_suggestions
-            .as_ref()
-            .expect("paste triggers the popup too");
-        assert_eq!(suggestions.query, "log");
-    }
-}
+mod slash_tests;
 
 #[cfg(test)]
-mod queued_prompt_tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    use super::{reduce, Action, Effect};
-    use crate::api::{UiCommand, UiEvent};
-    use crate::app::AppState;
-    use crate::block::BlockKind;
-
-    fn enter() -> KeyEvent {
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
-    }
-
-    fn alt_enter() -> KeyEvent {
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)
-    }
-
-    fn run_started(run_id: u64) -> Action {
-        Action::UiEventReceived(UiEvent::run_started(run_id))
-    }
-
-    fn run_completed(run_id: u64) -> Action {
-        Action::UiEventReceived(UiEvent::RunCompleted { run_id })
-    }
-
-    fn queued_texts(state: &AppState) -> Vec<String> {
-        state
-            .blocks()
-            .iter()
-            .filter_map(|block| match block.kind() {
-                BlockKind::QueuedUser(text) => Some(text.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn type_text(state: &mut AppState, text: &str) {
-        for character in text.chars() {
-            reduce(
-                state,
-                Action::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
-            );
-        }
-    }
-
-    #[test]
-    fn submit_during_run_enqueues_visible_block_and_clears_composer() {
-        let mut state = AppState::new();
-        reduce(&mut state, run_started(1));
-        assert!(state.working, "RunStarted must flip the run active flag");
-
-        type_text(&mut state, "second question");
-        let effects = reduce(&mut state, Action::Key(enter()));
-
-        assert_eq!(effects, vec![Effect::RequestRender]);
-        assert!(state.composer.payload().is_empty());
-        assert_eq!(queued_texts(&state), vec!["second question"]);
-        assert_eq!(state.queued_prompts.len(), 1);
-    }
-
-    #[test]
-    fn second_enqueue_increments_fifo_position() {
-        let mut state = AppState::new();
-        reduce(&mut state, run_started(1));
-        type_text(&mut state, "first");
-        reduce(&mut state, Action::Key(enter()));
-        type_text(&mut state, "second");
-        reduce(&mut state, Action::Key(enter()));
-
-        assert_eq!(queued_texts(&state), vec!["first", "second"]);
-    }
-
-    #[test]
-    fn ninth_queued_prompt_is_rejected_without_losing_the_draft() {
-        let mut state = AppState::new();
-        reduce(&mut state, run_started(1));
-        for index in 0..8 {
-            type_text(&mut state, &format!("queued-{index}"));
-            reduce(&mut state, Action::Key(enter()));
-        }
-        type_text(&mut state, "keep ninth");
-
-        let effects = reduce(&mut state, Action::Key(enter()));
-
-        assert_eq!(state.queued_prompts.len(), 8);
-        assert_eq!(state.composer.payload(), "keep ninth");
-        assert_eq!(effects, vec![Effect::RequestRender]);
-        assert!(state
-            .notifications
-            .iter()
-            .any(|notification| notification.message == "Fila de prompts cheia (8)."));
-    }
-
-    #[test]
-    fn alt_enter_during_run_enqueues_too() {
-        let mut state = AppState::new();
-        reduce(&mut state, run_started(1));
-        type_text(&mut state, "steered");
-        let effects = reduce(&mut state, Action::Key(alt_enter()));
-
-        assert_eq!(effects, vec![Effect::RequestRender]);
-        assert_eq!(queued_texts(&state), vec!["steered"]);
-    }
-
-    #[test]
-    fn empty_draft_never_enqueues() {
-        let mut state = AppState::new();
-        reduce(&mut state, run_started(1));
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(effects.is_empty());
-        assert_eq!(state.queued_prompts.len(), 0);
-    }
-
-    #[test]
-    fn run_terminal_drains_exactly_one_prompt() {
-        let mut state = AppState::new();
-        reduce(&mut state, run_started(1));
-        type_text(&mut state, "queued prompt");
-        reduce(&mut state, Action::Key(enter()));
-
-        let effects = reduce(&mut state, run_completed(1));
-
-        assert!(effects.contains(&Effect::Send(UiCommand::SendPrompt("queued prompt".into()))));
-        assert_eq!(state.queued_prompts.len(), 0);
-        assert!(queued_texts(&state).is_empty(), "drain removes the block");
-    }
-
-    #[test]
-    fn two_queued_two_terminals_fifo_order() {
-        let mut state = AppState::new();
-        reduce(&mut state, run_started(1));
-        type_text(&mut state, "alpha");
-        reduce(&mut state, Action::Key(enter()));
-        type_text(&mut state, "beta");
-        reduce(&mut state, Action::Key(enter()));
-
-        let first = reduce(&mut state, run_completed(1));
-        assert!(first.contains(&Effect::Send(UiCommand::SendPrompt("alpha".into()))));
-        assert_eq!(state.queued_prompts.len(), 1);
-        assert_eq!(queued_texts(&state), vec!["beta"]);
-
-        let second = reduce(&mut state, run_completed(2));
-        assert!(second.contains(&Effect::Send(UiCommand::SendPrompt("beta".into()))));
-        assert_eq!(state.queued_prompts.len(), 0);
-        assert!(queued_texts(&state).is_empty());
-    }
-
-    #[test]
-    fn locally_handled_skill_selection_drains_the_next_queued_prompt() {
-        let mut state = AppState::new();
-        state.set_skill_names_for_test(vec!["review-code".into()]);
-        reduce(&mut state, run_started(1));
-        type_text(&mut state, "/review-code");
-        reduce(&mut state, Action::Key(enter()));
-        type_text(&mut state, "after selection");
-        reduce(&mut state, Action::Key(enter()));
-
-        let first = reduce(&mut state, run_completed(1));
-        assert!(first.contains(&Effect::Send(UiCommand::SendPrompt("/review-code ".into()))));
-        assert_eq!(state.queued_prompts.len(), 1);
-
-        let second = reduce(
-            &mut state,
-            Action::UiEventReceived(UiEvent::RestoreDraft {
-                text: "/review-code ".into(),
-            }),
-        );
-        assert!(second.contains(&Effect::Send(UiCommand::SendPrompt(
-            "after selection".into()
-        ))));
-        assert!(state.queued_prompts.is_empty());
-    }
-
-    #[test]
-    fn non_terminal_event_does_not_drain() {
-        let mut state = AppState::new();
-        reduce(&mut state, run_started(1));
-        type_text(&mut state, "kept while running");
-        reduce(&mut state, Action::Key(enter()));
-        assert_eq!(state.queued_prompts.len(), 1);
-
-        // A non-terminal event (tick) must not drain the queue.
-        reduce(&mut state, Action::Tick(Default::default()));
-        assert_eq!(state.queued_prompts.len(), 1);
-        assert_eq!(queued_texts(&state).len(), 1);
-    }
-}
+mod queued_prompt_tests;

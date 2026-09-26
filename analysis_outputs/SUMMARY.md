@@ -5,7 +5,7 @@
 > deste relatório. As afirmações abaixo descrevem aquela base e não o checkout
 > atual; não use a lista de lacunas como backlog sem revalidar o fluxo no código.
 > Consulte o [checkpoint do checkout](../README.md#checkpoint-do-checkout) e a
-> [matriz de integração](../Documentações%20-%20Projeto/README.md).
+> [matriz de integração](../docs/README.md).
 
 ## Conclusão
 

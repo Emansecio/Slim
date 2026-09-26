@@ -86,12 +86,13 @@ pub async fn login(
     parse_token(response, None).await
 }
 
-pub async fn refresh(
+pub async fn refresh_with_dispatch(
     client: &reqwest::Client,
     endpoints: &OAuthEndpoints,
     credential: &OAuthCredential,
+    on_dispatch: impl FnOnce() -> Result<(), OAuthError> + Send,
 ) -> Result<OAuthCredential, OAuthError> {
-    let response = client
+    let request = client
         .post(&endpoints.anthropic_token)
         .header("anthropic-beta", "oauth-2025-04-20")
         .header("User-Agent", "anthropic-sdk-rust/0.1 userOAuthProvider")
@@ -99,11 +100,15 @@ pub async fn refresh(
             "grant_type": "refresh_token",
             "client_id": CLIENT_ID,
             "refresh_token": credential.refresh,
-        }))
+        }));
+    on_dispatch()?;
+    let response = request
         .send()
         .await
         .map_err(|_| OAuthError::Transport("Anthropic token refresh failed".into()))?;
-    parse_token(response, Some(&credential.refresh)).await
+    let mut refreshed = parse_token(response, Some(&credential.refresh)).await?;
+    refreshed.account_id = credential.account_id.clone();
+    Ok(refreshed)
 }
 
 async fn parse_token(
@@ -132,9 +137,7 @@ async fn parse_token(
             .ok_or_else(|| {
                 OAuthError::InvalidResponse("Anthropic refresh token is missing".into())
             })?,
-        expires: now_ms()
-            .saturating_add(token.expires_in.saturating_mul(1000))
-            .saturating_sub(5 * 60 * 1000),
+        expires: now_ms().saturating_add(token.expires_in.saturating_mul(1000)),
         account_id: None,
     })
 }

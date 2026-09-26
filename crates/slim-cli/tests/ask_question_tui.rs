@@ -78,7 +78,7 @@ fn ordinary_tui_answers_question_and_provider_continues_in_the_same_run() {
 
     let (runtime, channels) = spawn_tui_runtime(
         request(format!("http://{address}")),
-        ProviderRunOptions::default(),
+        ProviderRunOptions::default().with_context_window_tokens(32_000),
     )
     .expect("bridge");
     channels
@@ -171,7 +171,7 @@ fn ordinary_tui_answers_question_and_provider_continues_in_the_same_run() {
 fn wrong_run_question_id_is_rejected_without_reaching_the_runtime() {
     let (runtime, channels) = spawn_tui_runtime(
         request("http://127.0.0.1:9".into()),
-        ProviderRunOptions::default(),
+        ProviderRunOptions::default().with_context_window_tokens(32_000),
     )
     .expect("bridge");
     let request_id = InteractionRequestId("run-99:question-call-1".into());
@@ -243,7 +243,7 @@ fn malformed_question_fails_the_tool_without_opening_a_tui_request() {
     });
     let (runtime, channels) = spawn_tui_runtime(
         request(format!("http://{address}")),
-        ProviderRunOptions::default(),
+        ProviderRunOptions::default().with_context_window_tokens(32_000),
     )
     .expect("bridge");
     channels
@@ -305,7 +305,7 @@ fn cancel_run_while_question_waits_closes_without_a_follow_up_request() {
     });
     let (runtime, channels) = spawn_tui_runtime(
         request(format!("http://{address}")),
-        ProviderRunOptions::default(),
+        ProviderRunOptions::default().with_context_window_tokens(32_000),
     )
     .expect("bridge");
     channels

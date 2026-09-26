@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::mcp::http::HttpConnection;
 use crate::mcp::spec::{
-    McpConnection, McpError, McpServerInfo, McpServerSpec, McpServerStatus, McpToolSummary,
-    McpTransport, MCP_PROTOCOL_VERSION,
+    MCP_PROTOCOL_VERSION, McpCancellation, McpCleanupStatus, McpConnection, McpError,
+    McpInterruption, McpRequestOutcome, McpServerInfo, McpServerSpec, McpServerStatus,
+    McpToolSummary, McpTransport,
 };
 use crate::mcp::stdio::StdioConnection;
 use crate::process::ExecutableResolver;
@@ -270,41 +271,232 @@ impl McpManager {
         Ok(tools)
     }
 
+    pub async fn list_tools_cancellable(
+        &self,
+        server: &str,
+        cancellation: McpCancellation,
+    ) -> McpRequestOutcome<Arc<Vec<McpToolSummary>>> {
+        if cancellation.is_cancelled() {
+            return McpRequestOutcome::InterruptedBeforeSend {
+                interruption: McpInterruption::Cancelled,
+                cleanup: McpCleanupStatus::NotRequired,
+            };
+        }
+        let entry = match self.entry(server) {
+            Ok(entry) => entry,
+            Err(error) => return McpRequestOutcome::Completed(Err(error)),
+        };
+        let (connection, generation) = match self
+            .ensure_connected_cancellable(&entry, cancellation.clone())
+            .await
+        {
+            McpRequestOutcome::Completed(Ok(connection)) => connection,
+            McpRequestOutcome::Completed(Err(error)) => {
+                return McpRequestOutcome::Completed(Err(error));
+            }
+            McpRequestOutcome::InterruptedBeforeSend {
+                interruption,
+                cleanup,
+            } => {
+                return McpRequestOutcome::InterruptedBeforeSend {
+                    interruption,
+                    cleanup,
+                };
+            }
+            McpRequestOutcome::OutcomeUncertain {
+                interruption,
+                cleanup,
+            } => {
+                return McpRequestOutcome::OutcomeUncertain {
+                    interruption,
+                    cleanup,
+                };
+            }
+        };
+        let stale = connection.take_tools_stale();
+        let cached = entry
+            .status
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let McpServerStatus::Ready { tools } = &cached {
+            if !stale {
+                return McpRequestOutcome::Completed(Ok(Arc::clone(tools)));
+            }
+        }
+        let outcome =
+            fetch_tools_pages_cancellable(connection.as_ref(), cancellation.clone()).await;
+        match outcome {
+            McpRequestOutcome::Completed(Ok(tools)) => {
+                let slot = entry.connection.lock().await;
+                if entry.generation.load(Ordering::Acquire) == generation
+                    && slot
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &connection))
+                {
+                    Self::set_status(
+                        &entry,
+                        McpServerStatus::Ready {
+                            tools: Arc::clone(&tools),
+                        },
+                    );
+                    self.bump();
+                }
+                McpRequestOutcome::Completed(Ok(tools))
+            }
+            McpRequestOutcome::OutcomeUncertain {
+                interruption,
+                cleanup,
+            } => {
+                let cleanup = merge_cleanup(cleanup, connection.close_for_cleanup().await);
+                self.disconnect_if_generation(&entry, generation, &connection)
+                    .await;
+                McpRequestOutcome::OutcomeUncertain {
+                    interruption,
+                    cleanup,
+                }
+            }
+            McpRequestOutcome::Completed(Err(
+                error @ (McpError::Closed | McpError::Protocol(_)),
+            )) if connection.is_closed() => {
+                let _ = connection.close_for_cleanup().await;
+                self.disconnect_if_generation(&entry, generation, &connection)
+                    .await;
+                if cancellation.is_cancelled() {
+                    return McpRequestOutcome::Completed(Err(error));
+                }
+                match self
+                    .ensure_connected_cancellable(&entry, cancellation)
+                    .await
+                {
+                    McpRequestOutcome::Completed(Ok((reconnected, reconnected_generation))) => {
+                        let slot = entry.connection.lock().await;
+                        if entry.generation.load(Ordering::Acquire) == reconnected_generation
+                            && slot
+                                .as_ref()
+                                .is_some_and(|current| Arc::ptr_eq(current, &reconnected))
+                        {
+                            match &*entry
+                                .status
+                                .read()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            {
+                                McpServerStatus::Ready { tools } => {
+                                    McpRequestOutcome::Completed(Ok(Arc::clone(tools)))
+                                }
+                                _ => McpRequestOutcome::Completed(Err(McpError::Closed)),
+                            }
+                        } else {
+                            McpRequestOutcome::Completed(Err(McpError::Closed))
+                        }
+                    }
+                    McpRequestOutcome::Completed(Err(reconnect_error)) => {
+                        McpRequestOutcome::Completed(Err(reconnect_error))
+                    }
+                    McpRequestOutcome::InterruptedBeforeSend {
+                        interruption,
+                        cleanup,
+                    } => McpRequestOutcome::InterruptedBeforeSend {
+                        interruption,
+                        cleanup,
+                    },
+                    McpRequestOutcome::OutcomeUncertain {
+                        interruption,
+                        cleanup,
+                    } => McpRequestOutcome::OutcomeUncertain {
+                        interruption,
+                        cleanup,
+                    },
+                }
+            }
+            McpRequestOutcome::InterruptedBeforeSend {
+                interruption,
+                cleanup,
+            } if connection.is_closed() => {
+                let cleanup = merge_cleanup(cleanup, connection.close_for_cleanup().await);
+                self.disconnect_if_generation(&entry, generation, &connection)
+                    .await;
+                McpRequestOutcome::InterruptedBeforeSend {
+                    interruption,
+                    cleanup,
+                }
+            }
+            McpRequestOutcome::InterruptedBeforeSend {
+                interruption,
+                cleanup,
+            } => {
+                if stale {
+                    connection.mark_tools_stale();
+                }
+                McpRequestOutcome::InterruptedBeforeSend {
+                    interruption,
+                    cleanup,
+                }
+            }
+            McpRequestOutcome::Completed(Err(error)) => {
+                if stale {
+                    connection.mark_tools_stale();
+                }
+                McpRequestOutcome::Completed(Err(error))
+            }
+        }
+    }
+
     /// Tool names (+short descriptions) for the model, bounded. Pages of
     /// `MAX_LIST_TOOLS_PER_SERVER` entries are selected with `offset`; the
     /// trailing "… N more tools" line never counts toward the page size.
     pub async fn list_tools_text(&self, server: &str, offset: usize) -> Result<String, McpError> {
         let tools = self.list_tools(server).await?;
-        let mut lines = Vec::new();
-        for tool in tools.iter().skip(offset).take(MAX_LIST_TOOLS_PER_SERVER) {
-            match &tool.description {
-                Some(description) => {
-                    let short = description.lines().next().unwrap_or("");
-                    let short = if short.chars().count() > 80 {
-                        format!("{}…", short.chars().take(80).collect::<String>())
-                    } else {
-                        short.to_owned()
-                    };
-                    lines.push(format!("{} — {}", tool.name, short));
-                }
-                None => lines.push(tool.name.clone()),
+        Ok(render_tools_page(&tools, offset))
+    }
+
+    pub async fn list_tools_text_cancellable(
+        &self,
+        server: &str,
+        offset: usize,
+        cancellation: McpCancellation,
+    ) -> McpRequestOutcome<String> {
+        self.list_tools_cancellable(server, cancellation)
+            .await
+            .map(|tools| render_tools_page(&tools, offset))
+    }
+
+    pub async fn describe_cancellable(
+        &self,
+        server: &str,
+        tool: &str,
+        cancellation: McpCancellation,
+    ) -> McpRequestOutcome<String> {
+        let tools = match self.list_tools_cancellable(server, cancellation).await {
+            McpRequestOutcome::Completed(Ok(tools)) => tools,
+            McpRequestOutcome::Completed(Err(error)) => {
+                return McpRequestOutcome::Completed(Err(error));
             }
-        }
-        let next_offset = offset.saturating_add(lines.len());
-        let remaining = tools.len().saturating_sub(next_offset);
-        if remaining > 0 {
-            lines.push(format!(
-                "… {remaining} more tools (call again with \"offset\": {next_offset})"
-            ));
-        }
-        if lines.is_empty() {
-            lines.push(if offset == 0 {
-                "(no tools)".to_owned()
-            } else {
-                format!("(no tools at offset {offset}; {} total)", tools.len())
-            });
-        }
-        Ok(lines.join("\n"))
+            McpRequestOutcome::InterruptedBeforeSend {
+                interruption,
+                cleanup,
+            } => {
+                return McpRequestOutcome::InterruptedBeforeSend {
+                    interruption,
+                    cleanup,
+                };
+            }
+            McpRequestOutcome::OutcomeUncertain {
+                interruption,
+                cleanup,
+            } => {
+                return McpRequestOutcome::OutcomeUncertain {
+                    interruption,
+                    cleanup,
+                };
+            }
+        };
+        let Some(tool) = tools.iter().find(|candidate| candidate.name == tool) else {
+            return McpRequestOutcome::Completed(Err(McpError::Protocol(format!(
+                "unknown tool {tool} on server {server}"
+            ))));
+        };
+        McpRequestOutcome::Completed(render_tool_schema(&tool.schema))
     }
 
     pub async fn describe(&self, server: &str, tool: &str) -> Result<String, McpError> {
@@ -313,16 +505,7 @@ impl McpManager {
             .iter()
             .find(|candidate| candidate.name == tool)
             .ok_or_else(|| McpError::Protocol(format!("unknown tool {tool} on server {server}")))?;
-        let rendered = serde_json::to_string_pretty(&tool.schema)?;
-        Ok(if rendered.len() > MAX_DESCRIBE_BYTES {
-            let mut end = MAX_DESCRIBE_BYTES;
-            while !rendered.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!("{}…(truncated)", &rendered[..end])
-        } else {
-            rendered
-        })
+        render_tool_schema(&tool.schema)
     }
 
     pub async fn call(
@@ -331,26 +514,103 @@ impl McpManager {
         tool: &str,
         arguments: Value,
     ) -> Result<Value, McpError> {
-        let entry = self.entry(server)?;
-        let connection = self.ensure_connected(&entry).await?;
-        let params = json!({"name": tool, "arguments": arguments});
-        match connection.request("tools/call", params).await {
-            Err(error) if connection.is_closed() => {
-                // The tool may already have run server-side: never silently
-                // retry a non-idempotent call. Drop the dead transport so the
-                // next call reconnects, then surface the failure.
-                {
-                    let mut slot = entry.connection.lock().await;
-                    if slot
-                        .as_ref()
-                        .is_some_and(|current| Arc::ptr_eq(current, &connection))
-                    {
-                        drop_detached(slot.take());
-                    }
+        self.call_cancellable(server, tool, arguments, McpCancellation::new())
+            .await
+            .into_result()
+    }
+
+    /// Runs one non-replayable tools/call with cancellation classified at the
+    /// transport's Queued -> Sending boundary.
+    pub async fn call_cancellable(
+        &self,
+        server: &str,
+        tool: &str,
+        arguments: Value,
+        cancellation: McpCancellation,
+    ) -> McpRequestOutcome<Value> {
+        if cancellation.is_cancelled() {
+            return McpRequestOutcome::InterruptedBeforeSend {
+                interruption: McpInterruption::Cancelled,
+                cleanup: McpCleanupStatus::NotRequired,
+            };
+        }
+        let entry = match self.entry(server) {
+            Ok(entry) => entry,
+            Err(error) => return McpRequestOutcome::Completed(Err(error)),
+        };
+        let (connection, generation) = match self
+            .ensure_connected_cancellable(&entry, cancellation.clone())
+            .await
+        {
+            McpRequestOutcome::Completed(Ok(connection)) => connection,
+            McpRequestOutcome::Completed(Err(error)) => {
+                return McpRequestOutcome::Completed(Err(error));
+            }
+            McpRequestOutcome::InterruptedBeforeSend {
+                interruption,
+                cleanup,
+            } => {
+                return McpRequestOutcome::InterruptedBeforeSend {
+                    interruption,
+                    cleanup,
+                };
+            }
+            McpRequestOutcome::OutcomeUncertain {
+                interruption,
+                cleanup,
+            } => {
+                // Lazy initialize/notifications/tools/list may have reached
+                // the server, but the requested tool itself was not admitted.
+                return McpRequestOutcome::InterruptedBeforeSend {
+                    interruption,
+                    cleanup,
+                };
+            }
+        };
+
+        if cancellation.is_cancelled() {
+            return McpRequestOutcome::InterruptedBeforeSend {
+                interruption: McpInterruption::Cancelled,
+                cleanup: McpCleanupStatus::NotRequired,
+            };
+        }
+        let outcome = connection
+            .request_cancellable(
+                "tools/call",
+                json!({"name": tool, "arguments": arguments}),
+                cancellation,
+            )
+            .await;
+        match outcome {
+            McpRequestOutcome::OutcomeUncertain {
+                interruption,
+                cleanup,
+            } => {
+                let cleanup = merge_cleanup(cleanup, connection.close_for_cleanup().await);
+                self.disconnect_if_generation(&entry, generation, &connection)
+                    .await;
+                McpRequestOutcome::OutcomeUncertain {
+                    interruption,
+                    cleanup,
                 }
-                Self::set_status(&entry, McpServerStatus::Disconnected);
-                self.bump();
-                Err(error)
+            }
+            McpRequestOutcome::Completed(Err(error)) if connection.is_closed() => {
+                let _ = connection.close_for_cleanup().await;
+                self.disconnect_if_generation(&entry, generation, &connection)
+                    .await;
+                McpRequestOutcome::Completed(Err(error))
+            }
+            McpRequestOutcome::InterruptedBeforeSend {
+                interruption,
+                cleanup,
+            } if connection.is_closed() => {
+                let cleanup = merge_cleanup(cleanup, connection.close_for_cleanup().await);
+                self.disconnect_if_generation(&entry, generation, &connection)
+                    .await;
+                McpRequestOutcome::InterruptedBeforeSend {
+                    interruption,
+                    cleanup,
+                }
             }
             result => result,
         }
@@ -473,13 +733,14 @@ impl McpManager {
             return Err(McpError::Disabled(entry.spec.name.clone()));
         }
         let mut slot = entry.connection.lock().await;
-        let generation = entry.generation.load(Ordering::Acquire);
         if let Some(connection) = slot.as_ref() {
             if !connection.is_closed() {
                 return Ok(Arc::clone(connection));
             }
             drop_detached(slot.take());
+            entry.generation.fetch_add(1, Ordering::AcqRel);
         }
+        let generation = entry.generation.load(Ordering::Acquire);
         Self::set_status(entry, McpServerStatus::Connecting);
         self.bump();
         match connect(&entry.spec, &self.cwd, &self.resolver).await {
@@ -510,6 +771,148 @@ impl McpManager {
         }
     }
 
+    async fn ensure_connected_cancellable(
+        &self,
+        entry: &Arc<ServerEntry>,
+        cancellation: McpCancellation,
+    ) -> McpRequestOutcome<(Arc<dyn McpConnection>, u64)> {
+        if cancellation.is_cancelled() {
+            return McpRequestOutcome::InterruptedBeforeSend {
+                interruption: McpInterruption::Cancelled,
+                cleanup: McpCleanupStatus::NotRequired,
+            };
+        }
+        if !entry.spec.enabled {
+            Self::set_status(entry, McpServerStatus::Disabled);
+            self.bump();
+            return McpRequestOutcome::Completed(Err(McpError::Disabled(entry.spec.name.clone())));
+        }
+        let mut slot = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return McpRequestOutcome::InterruptedBeforeSend {
+                    interruption: McpInterruption::Cancelled,
+                    cleanup: McpCleanupStatus::NotRequired,
+                };
+            }
+            slot = entry.connection.lock() => slot,
+        };
+        if cancellation.is_cancelled() {
+            return McpRequestOutcome::InterruptedBeforeSend {
+                interruption: McpInterruption::Cancelled,
+                cleanup: McpCleanupStatus::NotRequired,
+            };
+        }
+        let mut generation = entry.generation.load(Ordering::Acquire);
+        if let Some(connection) = slot.as_ref() {
+            if !connection.is_closed() {
+                return McpRequestOutcome::Completed(Ok((Arc::clone(connection), generation)));
+            }
+            drop_detached(slot.take());
+            entry.generation.fetch_add(1, Ordering::AcqRel);
+            generation = entry.generation.load(Ordering::Acquire);
+        }
+        Self::set_status(entry, McpServerStatus::Connecting);
+        self.bump();
+        match connect_cancellable(&entry.spec, &self.cwd, &self.resolver, cancellation.clone())
+            .await
+        {
+            McpRequestOutcome::Completed(Ok((connection, tools))) => {
+                if entry.generation.load(Ordering::Acquire) != generation {
+                    let cleanup = connection.close_for_cleanup().await;
+                    return McpRequestOutcome::InterruptedBeforeSend {
+                        interruption: McpInterruption::ConnectionClosed,
+                        cleanup,
+                    };
+                }
+                if cancellation.is_cancelled() {
+                    let cleanup = connection.close_for_cleanup().await;
+                    if entry.generation.load(Ordering::Acquire) == generation {
+                        Self::set_status(entry, McpServerStatus::Disconnected);
+                        self.bump();
+                    }
+                    return McpRequestOutcome::InterruptedBeforeSend {
+                        interruption: McpInterruption::Cancelled,
+                        cleanup,
+                    };
+                }
+                Self::set_status(entry, McpServerStatus::Ready { tools });
+                *slot = Some(Arc::clone(&connection));
+                self.bump();
+                McpRequestOutcome::Completed(Ok((connection, generation)))
+            }
+            McpRequestOutcome::Completed(Err(error)) => {
+                if entry.generation.load(Ordering::Acquire) == generation {
+                    Self::set_status(
+                        entry,
+                        McpServerStatus::Failed {
+                            error: error.to_string(),
+                        },
+                    );
+                    self.bump();
+                }
+                McpRequestOutcome::Completed(Err(error))
+            }
+            McpRequestOutcome::InterruptedBeforeSend {
+                interruption,
+                cleanup,
+            } => {
+                if entry.generation.load(Ordering::Acquire) == generation {
+                    Self::set_status(entry, McpServerStatus::Disconnected);
+                    self.bump();
+                }
+                McpRequestOutcome::InterruptedBeforeSend {
+                    interruption,
+                    cleanup,
+                }
+            }
+            McpRequestOutcome::OutcomeUncertain {
+                interruption,
+                cleanup,
+            } => {
+                if entry.generation.load(Ordering::Acquire) == generation {
+                    Self::set_status(entry, McpServerStatus::Disconnected);
+                    self.bump();
+                }
+                // This uncertainty belongs to initialize/tools/list; the
+                // side-effecting tools/call has not been admitted yet.
+                McpRequestOutcome::InterruptedBeforeSend {
+                    interruption,
+                    cleanup,
+                }
+            }
+        }
+    }
+
+    async fn disconnect_if_generation(
+        &self,
+        entry: &Arc<ServerEntry>,
+        generation: u64,
+        connection: &Arc<dyn McpConnection>,
+    ) {
+        let mut slot = entry.connection.lock().await;
+        if entry.generation.load(Ordering::Acquire) != generation
+            || !slot
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, connection))
+        {
+            return;
+        }
+        let taken = slot.take();
+        entry.generation.fetch_add(1, Ordering::AcqRel);
+        Self::set_status(
+            entry,
+            if entry.spec.enabled {
+                McpServerStatus::Disconnected
+            } else {
+                McpServerStatus::Disabled
+            },
+        );
+        self.bump();
+        drop(slot);
+        drop_detached(taken);
+    }
+
     async fn reconnect_entry(
         &self,
         entry: &Arc<ServerEntry>,
@@ -517,6 +920,7 @@ impl McpManager {
         {
             let mut slot = entry.connection.lock().await;
             drop_detached(slot.take());
+            entry.generation.fetch_add(1, Ordering::AcqRel);
         }
         Self::set_status(entry, McpServerStatus::Disconnected);
         self.ensure_connected(entry).await
@@ -573,6 +977,52 @@ impl ServerEntry {
     }
 }
 
+fn render_tools_page(tools: &[McpToolSummary], offset: usize) -> String {
+    let mut lines = Vec::new();
+    for tool in tools.iter().skip(offset).take(MAX_LIST_TOOLS_PER_SERVER) {
+        match &tool.description {
+            Some(description) => {
+                let short = description.lines().next().unwrap_or("");
+                let short = if short.chars().count() > 80 {
+                    format!("{}…", short.chars().take(80).collect::<String>())
+                } else {
+                    short.to_owned()
+                };
+                lines.push(format!("{} — {}", tool.name, short));
+            }
+            None => lines.push(tool.name.clone()),
+        }
+    }
+    let next_offset = offset.saturating_add(lines.len());
+    let remaining = tools.len().saturating_sub(next_offset);
+    if remaining > 0 {
+        lines.push(format!(
+            "… {remaining} more tools (call again with \"offset\": {next_offset})"
+        ));
+    }
+    if lines.is_empty() {
+        lines.push(if offset == 0 {
+            "(no tools)".to_owned()
+        } else {
+            format!("(no tools at offset {offset}; {} total)", tools.len())
+        });
+    }
+    lines.join("\n")
+}
+
+fn render_tool_schema(schema: &Value) -> Result<String, McpError> {
+    let rendered = serde_json::to_string_pretty(schema)?;
+    Ok(if rendered.len() > MAX_DESCRIBE_BYTES {
+        let mut end = MAX_DESCRIBE_BYTES;
+        while !rendered.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…(truncated)", &rendered[..end])
+    } else {
+        rendered
+    })
+}
+
 async fn connect(
     spec: &McpServerSpec,
     cwd: &Path,
@@ -603,6 +1053,140 @@ async fn connect(
         .await;
     let tools = fetch_tools_pages(connection.as_ref()).await?;
     Ok((connection, tools))
+}
+
+async fn connect_cancellable(
+    spec: &McpServerSpec,
+    cwd: &Path,
+    resolver: &ExecutableResolver,
+    cancellation: McpCancellation,
+) -> McpRequestOutcome<(Arc<dyn McpConnection>, Arc<Vec<McpToolSummary>>)> {
+    let connection: Arc<dyn McpConnection> = match &spec.transport {
+        McpTransport::Stdio { command, args, env } => {
+            match StdioConnection::spawn(command, args, env, cwd, spec.timeout, resolver) {
+                Ok(connection) => connection,
+                Err(error) => return McpRequestOutcome::Completed(Err(error)),
+            }
+        }
+        McpTransport::Http { url, headers } => {
+            match HttpConnection::new(url.clone(), headers.clone(), spec.timeout) {
+                Ok(connection) => Arc::new(connection),
+                Err(error) => return McpRequestOutcome::Completed(Err(error)),
+            }
+        }
+    };
+    let initialized = connection
+        .request_cancellable(
+            "initialize",
+            json!({
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "slim", "version": env!("CARGO_PKG_VERSION")},
+            }),
+            cancellation.clone(),
+        )
+        .await;
+    match initialized {
+        McpRequestOutcome::Completed(Ok(_)) => {}
+        McpRequestOutcome::Completed(Err(error)) => {
+            let _ = connection.close_for_cleanup().await;
+            return McpRequestOutcome::Completed(Err(error));
+        }
+        McpRequestOutcome::InterruptedBeforeSend {
+            interruption,
+            cleanup,
+        } => {
+            let cleanup = merge_cleanup(cleanup, connection.close_for_cleanup().await);
+            return McpRequestOutcome::InterruptedBeforeSend {
+                interruption,
+                cleanup,
+            };
+        }
+        McpRequestOutcome::OutcomeUncertain {
+            interruption,
+            cleanup,
+        } => {
+            let cleanup = merge_cleanup(cleanup, connection.close_for_cleanup().await);
+            return McpRequestOutcome::OutcomeUncertain {
+                interruption,
+                cleanup,
+            };
+        }
+    }
+    if cancellation.is_cancelled() {
+        let cleanup = connection.close_for_cleanup().await;
+        return McpRequestOutcome::InterruptedBeforeSend {
+            interruption: McpInterruption::Cancelled,
+            cleanup,
+        };
+    }
+    match connection
+        .notify_cancellable("notifications/initialized", json!({}), cancellation.clone())
+        .await
+    {
+        McpRequestOutcome::Completed(Ok(())) => {}
+        McpRequestOutcome::Completed(Err(error)) => {
+            let _ = connection.close_for_cleanup().await;
+            return McpRequestOutcome::Completed(Err(error));
+        }
+        McpRequestOutcome::InterruptedBeforeSend {
+            interruption,
+            cleanup,
+        } => {
+            let cleanup = merge_cleanup(cleanup, connection.close_for_cleanup().await);
+            return McpRequestOutcome::InterruptedBeforeSend {
+                interruption,
+                cleanup,
+            };
+        }
+        McpRequestOutcome::OutcomeUncertain {
+            interruption,
+            cleanup,
+        } => {
+            let cleanup = merge_cleanup(cleanup, connection.close_for_cleanup().await);
+            return McpRequestOutcome::InterruptedBeforeSend {
+                interruption,
+                cleanup,
+            };
+        }
+    }
+    let tools = fetch_tools_pages_cancellable(connection.as_ref(), cancellation.clone()).await;
+    match tools {
+        McpRequestOutcome::Completed(Ok(_tools)) if cancellation.is_cancelled() => {
+            let cleanup = connection.close_for_cleanup().await;
+            McpRequestOutcome::InterruptedBeforeSend {
+                interruption: McpInterruption::Cancelled,
+                cleanup,
+            }
+        }
+        McpRequestOutcome::Completed(Ok(tools)) => {
+            McpRequestOutcome::Completed(Ok((connection, tools)))
+        }
+        McpRequestOutcome::Completed(Err(error)) => {
+            let _ = connection.close_for_cleanup().await;
+            McpRequestOutcome::Completed(Err(error))
+        }
+        McpRequestOutcome::InterruptedBeforeSend {
+            interruption,
+            cleanup,
+        } => {
+            let cleanup = merge_cleanup(cleanup, connection.close_for_cleanup().await);
+            McpRequestOutcome::InterruptedBeforeSend {
+                interruption,
+                cleanup,
+            }
+        }
+        McpRequestOutcome::OutcomeUncertain {
+            interruption,
+            cleanup,
+        } => {
+            let cleanup = merge_cleanup(cleanup, connection.close_for_cleanup().await);
+            McpRequestOutcome::OutcomeUncertain {
+                interruption,
+                cleanup,
+            }
+        }
+    }
 }
 
 /// Paginated `tools/list`: pages stop at `nextCursor` exhaustion,
@@ -650,4 +1234,95 @@ async fn fetch_tools_pages(
         }
     }
     Ok(Arc::new(summaries))
+}
+
+async fn fetch_tools_pages_cancellable(
+    connection: &dyn McpConnection,
+    cancellation: McpCancellation,
+) -> McpRequestOutcome<Arc<Vec<McpToolSummary>>> {
+    let mut summaries = Vec::new();
+    let mut cursor = Value::Null;
+    for _ in 0..MAX_TOOLS_PAGES {
+        if cancellation.is_cancelled() {
+            return McpRequestOutcome::InterruptedBeforeSend {
+                interruption: McpInterruption::Cancelled,
+                cleanup: McpCleanupStatus::NotRequired,
+            };
+        }
+        let params = if cursor.is_null() {
+            json!({})
+        } else {
+            json!({"cursor": cursor})
+        };
+        let response = match connection
+            .request_cancellable("tools/list", params, cancellation.clone())
+            .await
+        {
+            McpRequestOutcome::Completed(Ok(response)) => response,
+            McpRequestOutcome::Completed(Err(error)) => {
+                return McpRequestOutcome::Completed(Err(error));
+            }
+            McpRequestOutcome::InterruptedBeforeSend {
+                interruption,
+                cleanup,
+            } => {
+                return McpRequestOutcome::InterruptedBeforeSend {
+                    interruption,
+                    cleanup,
+                };
+            }
+            McpRequestOutcome::OutcomeUncertain {
+                interruption,
+                cleanup,
+            } => {
+                return McpRequestOutcome::OutcomeUncertain {
+                    interruption,
+                    cleanup,
+                };
+            }
+        };
+        let Some(tools) = response.get("tools").and_then(Value::as_array) else {
+            return McpRequestOutcome::Completed(Err(McpError::Protocol(
+                "tools/list missing tools array".into(),
+            )));
+        };
+        for tool in tools {
+            if summaries.len() >= MAX_TOOLS_PER_SERVER {
+                break;
+            }
+            let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            summaries.push(McpToolSummary {
+                name: name.to_owned(),
+                description: tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                schema: tool
+                    .get("inputSchema")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type": "object"})),
+            });
+        }
+        match response.get("nextCursor").and_then(Value::as_str) {
+            Some(next) if summaries.len() < MAX_TOOLS_PER_SERVER => {
+                cursor = Value::String(next.to_owned());
+            }
+            _ => break,
+        }
+    }
+    McpRequestOutcome::Completed(Ok(Arc::new(summaries)))
+}
+
+fn merge_cleanup(first: McpCleanupStatus, second: McpCleanupStatus) -> McpCleanupStatus {
+    match (first, second) {
+        (_, McpCleanupStatus::Confirmed) | (McpCleanupStatus::Confirmed, _) => {
+            McpCleanupStatus::Confirmed
+        }
+        (McpCleanupStatus::Unconfirmed, _) | (_, McpCleanupStatus::Unconfirmed) => {
+            McpCleanupStatus::Unconfirmed
+        }
+        _ => McpCleanupStatus::NotRequired,
+    }
 }

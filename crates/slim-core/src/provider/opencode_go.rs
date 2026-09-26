@@ -629,6 +629,9 @@ impl ProviderAdapter for OpenCodeGoAdapter {
         tools: &[Value],
     ) -> Result<HttpRequest, ProviderError> {
         self.validate_messages(messages)?;
+        if self.wire_kind() == ProviderKind::Anthropic {
+            super::image_limits::validate_anthropic_images(messages)?;
+        }
         Ok(self.build_messages_request_with_tools(messages, tools))
     }
 

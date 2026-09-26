@@ -107,15 +107,29 @@ fn oauth_store_round_trips_active_credential_without_debug_leak() {
     );
     let saved = std::fs::read_to_string(&auth_path).expect("auth text");
     assert!(saved.contains("access-secret") || saved.contains("oauth"));
-    assert!(
-        !saved.contains("existing-key"),
-        "OAuth save must drop the leftover api_key: {saved}"
+    let saved_document: serde_json::Value =
+        serde_json::from_str(&saved).expect("saved auth document");
+    assert_eq!(
+        saved_document["providers"]["openai-codex"]["api_key"], "existing-key",
+        "OAuth save must preserve the sibling api_key"
+    );
+    assert_eq!(
+        saved_document["providers"]["openai-codex"]["preferred_method"], "oauth",
+        "OAuth save must select OAuth"
     );
     store.remove(OAuthProvider::OpenAiCodex).expect("remove");
     assert_eq!(store.active().expect("active"), None);
-    assert!(!std::fs::read_to_string(auth_path)
-        .expect("auth text")
-        .contains("existing-key"));
+    let removed_document: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(auth_path).expect("auth text after remove"))
+            .expect("auth document after remove");
+    assert_eq!(
+        removed_document["providers"]["openai-codex"]["api_key"], "existing-key",
+        "OAuth removal must preserve the sibling api_key"
+    );
+    assert_eq!(
+        removed_document["providers"]["openai-codex"]["preferred_method"], "oauth",
+        "OAuth removal must retain the explicit selection and avoid fallback"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -598,6 +612,15 @@ async fn unexpired_credential_returns_without_waiting_for_refresh() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn background_refresh_within_ten_minutes_persists_rotated_token() {
+    background_refresh_is_reused(3600).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn short_lived_background_refresh_is_reused() {
+    background_refresh_is_reused(240).await;
+}
+
+async fn background_refresh_is_reused(expires_in: u32) {
     let root = std::env::temp_dir().join(format!(
         "slim-refresh-background-{}-{}",
         std::process::id(),
@@ -632,7 +655,9 @@ async fn background_refresh_within_ten_minutes_persists_rotated_token() {
         server_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut request = [0_u8; 16 * 1024];
         let _ = stream.read(&mut request).expect("refresh request");
-        let body = r#"{"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600}"#;
+        let body = format!(
+            r#"{{"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":{expires_in}}}"#
+        );
         stream
             .write_all(
                 format!(
@@ -689,6 +714,1112 @@ async fn background_refresh_within_ten_minutes_persists_rotated_token() {
 
 #[derive(Clone, Copy)]
 struct NoopBrowser;
+
+#[tokio::test]
+async fn short_lived_refresh_is_reused_but_expiry_still_forces_refresh() {
+    let root = std::env::temp_dir().join(format!(
+        "slim-short-refresh-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let store = OAuthStore::at(root.join("auth.json"));
+    let expired = OAuthCredential {
+        access: "old".into(),
+        refresh: "refresh".into(),
+        expires: 1,
+        account_id: None,
+    };
+    store.save(OAuthProvider::Anthropic, &expired).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let server_hits = hits.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8192];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            server_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = r#"{"access_token":"short-access","refresh_token":"short-refresh","expires_in":240}"#;
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let service = OAuthService::new(
+        OAuthEndpoints {
+            anthropic_token: format!("http://{address}"),
+            ..OAuthEndpoints::default()
+        },
+        Arc::new(NoopBrowser),
+        store.clone(),
+    )
+    .unwrap();
+    let (first, second) = tokio::join!(
+        service.fresh_credential(OAuthProvider::Anthropic, expired.clone()),
+        service.fresh_credential(OAuthProvider::Anthropic, expired.clone())
+    );
+    let first = first.unwrap().credential;
+    assert_eq!(first, second.unwrap().credential);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert!(
+        (230_000..=240_000).contains(&first.expires.saturating_sub(now)),
+        "server validity must not lose five minutes"
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            service
+                .fresh_credential(OAuthProvider::Anthropic, expired.clone())
+                .await
+                .unwrap()
+                .credential,
+            first
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // A newly loaded expired credential must override the recent-refresh window.
+    store.save(OAuthProvider::Anthropic, &expired).unwrap();
+    assert_eq!(
+        service
+            .fresh_credential(OAuthProvider::Anthropic, expired)
+            .await
+            .unwrap()
+            .credential
+            .access,
+        "short-access"
+    );
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    server.abort();
+    let _ = server.await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn distinct_services_sharing_a_store_refresh_one_base_once() {
+    let root = temp_oauth_root("distinct-services");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = OAuthStore::at(root.join("auth.json"));
+    let expired = expired_fixture_credential("shared-expired");
+    store.save(OAuthProvider::Anthropic, &expired).unwrap();
+
+    let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = accept_fixture(&listener);
+        let request = read_http_request(&mut stream);
+        assert!(request.contains("shared-expired"));
+        thread::sleep(Duration::from_millis(100));
+        write_refresh_response(&mut stream, "shared-access", "shared-refresh", 3600);
+        listener.set_nonblocking(true).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        usize::from(listener.accept().is_ok())
+    });
+
+    let endpoint = format!("http://{address}");
+    let first = oauth_service(endpoint.clone(), store.clone());
+    let second = oauth_service(endpoint, store.clone());
+    let (one, two) = tokio::join!(
+        first.fresh_credential(OAuthProvider::Anthropic, expired.clone()),
+        second.fresh_credential(OAuthProvider::Anthropic, expired),
+    );
+    let extra_requests = server.join().unwrap();
+    assert_eq!(one.unwrap().credential.access, "shared-access");
+    assert_eq!(two.unwrap().credential.access, "shared-access");
+    assert_eq!(
+        extra_requests, 0,
+        "independent services must share refresh ownership"
+    );
+    assert_eq!(
+        store
+            .credential(OAuthProvider::Anthropic)
+            .unwrap()
+            .unwrap()
+            .refresh,
+        "shared-refresh"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_ownership_isolated_by_store_and_provider() {
+    let root = temp_oauth_root("isolation");
+    std::fs::create_dir_all(&root).unwrap();
+    let store_one = OAuthStore::at(root.join("one.json"));
+    let store_two = OAuthStore::at(root.join("two.json"));
+    let anthropic = expired_fixture_credential("anthropic-base");
+    let codex = expired_fixture_credential("codex-base");
+    store_one
+        .save(OAuthProvider::Anthropic, &anthropic)
+        .unwrap();
+    store_one.save(OAuthProvider::OpenAiCodex, &codex).unwrap();
+    store_two
+        .save(
+            OAuthProvider::Anthropic,
+            &expired_fixture_credential("other-store-base"),
+        )
+        .unwrap();
+
+    let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let codex_access = codex_fixture_access();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..3 {
+            let (mut stream, _) = accept_fixture(&listener);
+            let request = read_http_request(&mut stream);
+            let path = request.lines().next().unwrap().to_owned();
+            requests.push((stream, request, path));
+        }
+        let mut outcomes = Vec::new();
+        for (mut stream, request, path) in requests {
+            let (access, refresh) = if path.contains("/codex") {
+                (codex_access.as_str(), "codex-next")
+            } else if request.contains("other-store-base") {
+                ("other-store-access", "other-store-next")
+            } else {
+                ("anthropic-access", "anthropic-next")
+            };
+            outcomes.push((path, access.to_owned()));
+            write_refresh_response(&mut stream, access, refresh, 3600);
+        }
+        outcomes
+    });
+
+    let origin = format!("http://{address}");
+    let mut endpoints = OAuthEndpoints::default();
+    endpoints.anthropic_token = format!("{origin}/anthropic");
+    endpoints.codex_token = format!("{origin}/codex");
+    let first =
+        OAuthService::new(endpoints.clone(), Arc::new(NoopBrowser), store_one.clone()).unwrap();
+    let second = oauth_service(format!("{origin}/anthropic"), store_two.clone());
+    let (anthropic_result, codex_result, other_store_result) = tokio::join!(
+        first.fresh_credential(OAuthProvider::Anthropic, anthropic),
+        first.fresh_credential(OAuthProvider::OpenAiCodex, codex),
+        second.fresh_credential(
+            OAuthProvider::Anthropic,
+            expired_fixture_credential("other-store-base")
+        ),
+    );
+    let requests = server.join().unwrap();
+    assert_eq!(
+        anthropic_result.unwrap().credential.access,
+        "anthropic-access"
+    );
+    assert_eq!(
+        codex_result.unwrap().credential.access,
+        codex_fixture_access()
+    );
+    assert_eq!(
+        other_store_result.unwrap().credential.access,
+        "other-store-access"
+    );
+    assert!(requests.iter().any(|(path, _)| path.contains("/codex")));
+    assert_eq!(
+        store_two
+            .credential(OAuthProvider::Anthropic)
+            .unwrap()
+            .unwrap()
+            .access,
+        "other-store-access"
+    );
+    assert_eq!(
+        store_one
+            .credential(OAuthProvider::Anthropic)
+            .unwrap()
+            .unwrap()
+            .access,
+        "anthropic-access"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_key_change_supersedes_an_in_flight_oauth_refresh() {
+    let root = temp_oauth_root("api-key-cas");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = OAuthStore::at(root.join("auth.json"));
+    let expired = expired_fixture_credential("api-key-base");
+    store.save(OAuthProvider::Xai, &expired).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("loopback OAuth refresh request")
+            .unwrap();
+        let request = read_http_request_async(&mut stream).await;
+        assert!(request.contains("api-key-base"));
+        received_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        let body = r#"{"access_token":"late-xai-access","refresh_token":"late-xai-refresh","expires_in":3600}"#;
+        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+    });
+    let endpoints = OAuthEndpoints {
+        xai_token: format!("http://{address}"),
+        ..OAuthEndpoints::default()
+    };
+    let service = OAuthService::new(endpoints, Arc::new(NoopBrowser), store.clone()).unwrap();
+    let request = service
+        .request_fresh_credential(OAuthProvider::Xai, expired)
+        .unwrap();
+    let waiter = tokio::spawn(request.wait());
+    received_rx.await.unwrap();
+    OAuthStore::at(store.path().to_path_buf())
+        .save_api_key("xai", "chosen-api-key-fixture")
+        .unwrap();
+    release_tx.send(()).unwrap();
+    let _ = waiter.await;
+    server.await.unwrap();
+
+    let document = std::fs::read_to_string(store.path()).unwrap();
+    assert!(document.contains("chosen-api-key-fixture"));
+    assert!(!document.contains("late-xai-access"));
+    assert_eq!(store.active_provider_key().unwrap().as_deref(), Some("xai"));
+    assert!(service.shutdown().await.is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_oauth_login_supersedes_a_late_refresh_response() {
+    let root = temp_oauth_root("external-login-cas");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = OAuthStore::at(root.join("auth.json"));
+    let expired = expired_fixture_credential("external-login-base");
+    store.save(OAuthProvider::Anthropic, &expired).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("loopback OAuth refresh request")
+            .unwrap();
+        let request = read_http_request_async(&mut stream).await;
+        assert!(request.contains("external-login-base"));
+        received_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        write_refresh_response_async(&mut stream, "stale-access", "stale-refresh", 3600).await;
+    });
+    let service = oauth_service(format!("http://{address}"), store.clone());
+    let request = service
+        .request_fresh_credential(OAuthProvider::Anthropic, expired)
+        .unwrap();
+    let waiter = tokio::spawn(request.wait());
+    received_rx.await.unwrap();
+    let external = OAuthCredential {
+        access: "external-access-fixture".into(),
+        refresh: "external-refresh-fixture".into(),
+        expires: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600,
+        account_id: Some("external-account-fixture".into()),
+    };
+    OAuthStore::at(store.path().to_path_buf())
+        .save(OAuthProvider::Anthropic, &external)
+        .unwrap();
+    release_tx.send(()).unwrap();
+    match waiter.await.unwrap() {
+        Ok(result) => assert_eq!(
+            result.credential, external,
+            "late refresh must not supersede external login"
+        ),
+        Err(error) => assert!(matches!(
+            error,
+            OAuthError::CredentialsChanged | OAuthError::Store(_)
+        )),
+    }
+    server.await.unwrap();
+    assert_eq!(
+        store.credential(OAuthProvider::Anthropic).unwrap(),
+        Some(external)
+    );
+    assert_eq!(service.shutdown().await.len(), 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn refresh_http_error_releases_ownership_for_a_later_attempt() {
+    let root = temp_oauth_root("http-error-release");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = OAuthStore::at(root.join("auth.json"));
+    let expired = expired_fixture_credential("retry-after-error");
+    store.save(OAuthProvider::Anthropic, &expired).unwrap();
+    let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for attempt in 0..2 {
+            let (mut stream, _) = accept_fixture(&listener);
+            assert!(read_http_request(&mut stream).contains("retry-after-error"));
+            if attempt == 0 {
+                let body = r#"{"error":"invalid_grant"}"#;
+                stream.write_all(format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+            } else {
+                write_refresh_response(&mut stream, "retry-access", "retry-next", 3600);
+            }
+        }
+    });
+    let service = oauth_service(format!("http://{address}"), store.clone());
+    assert!(service
+        .fresh_credential(OAuthProvider::Anthropic, expired.clone())
+        .await
+        .is_err());
+    let recovered = service
+        .fresh_credential(OAuthProvider::Anthropic, expired)
+        .await
+        .expect("a failed request must release ownership");
+    server.join().unwrap();
+    assert_eq!(recovered.credential.access, "retry-access");
+    assert_eq!(
+        store
+            .credential(OAuthProvider::Anthropic)
+            .unwrap()
+            .unwrap()
+            .refresh,
+        "retry-next"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn refresh_preserves_account_identity_and_keeps_secrets_out_of_diagnostics() {
+    let root = temp_oauth_root("account-preservation");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = OAuthStore::at(root.join("auth.json"));
+    let expired = OAuthCredential {
+        access: "old-access-secret-fixture".into(),
+        refresh: "old-refresh-secret-fixture".into(),
+        expires: 1,
+        account_id: Some("account-preserved-fixture".into()),
+    };
+    store.save(OAuthProvider::Anthropic, &expired).unwrap();
+    let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = accept_fixture(&listener);
+        assert!(read_http_request(&mut stream).contains("old-refresh-secret-fixture"));
+        write_refresh_response(
+            &mut stream,
+            "new-access-secret-fixture",
+            "new-refresh-secret-fixture",
+            240,
+        );
+    });
+    let service = oauth_service(format!("http://{address}"), store.clone());
+    let fresh = service
+        .request_fresh_credential(OAuthProvider::Anthropic, expired)
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(
+        fresh.credential.account_id.as_deref(),
+        Some("account-preserved-fixture")
+    );
+    assert_eq!(fresh.credential.access, "new-access-secret-fixture");
+    let warnings = service.shutdown().await;
+    let diagnostics = format!("{warnings:?} {fresh:?}");
+    assert!(!diagnostics.contains("new-access-secret-fixture"));
+    assert!(!diagnostics.contains("new-refresh-secret-fixture"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn unreadable_store_and_expired_fallback_fail_closed_without_refreshing() {
+    let root = temp_oauth_root("unreadable-expired");
+    std::fs::create_dir_all(&root).unwrap();
+    let auth_path = root.join("auth.json");
+    std::fs::write(&auth_path, b"not-json").unwrap();
+    let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = read_http_request(&mut stream);
+                    let body = r#"{"error":"fixture-reject"}"#;
+                    let _ = stream.write_all(format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes());
+                    return true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("loopback listener failed: {error}"),
+            }
+        }
+    });
+    let service = oauth_service(format!("http://{address}"), OAuthStore::at(&auth_path));
+    let error = service
+        .fresh_credential(
+            OAuthProvider::Anthropic,
+            expired_fixture_credential("synthetic-expired-fallback"),
+        )
+        .await
+        .expect_err("unreadable store must not downgrade to the supplied expired token");
+    assert!(matches!(
+        error,
+        OAuthError::Store(_) | OAuthError::CredentialsChanged
+    ));
+    assert!(
+        !server.join().unwrap(),
+        "malformed auth must fail before any refresh POST"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_windows_processes_share_refresh_ownership_for_one_store() {
+    const CHILD: &str = "SLIM_OAUTH_R2_PROCESS_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let root = std::path::PathBuf::from(std::env::var_os("SLIM_OAUTH_R2_STORE").unwrap());
+        let endpoint = std::env::var("SLIM_OAUTH_R2_ENDPOINT").unwrap();
+        let service = oauth_service(endpoint, OAuthStore::at(root.join("auth.json")));
+        let result = service
+            .fresh_credential(
+                OAuthProvider::Anthropic,
+                expired_fixture_credential("process-shared-base"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.credential.access, "process-shared-access");
+        return;
+    }
+
+    let root = temp_oauth_root("two-processes");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = OAuthStore::at(root.join("auth.json"));
+    store
+        .save(
+            OAuthProvider::Anthropic,
+            &expired_fixture_credential("process-shared-base"),
+        )
+        .unwrap();
+    let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = accept_fixture(&listener);
+        assert!(read_http_request(&mut stream).contains("process-shared-base"));
+        thread::sleep(Duration::from_millis(150));
+        write_refresh_response(
+            &mut stream,
+            "process-shared-access",
+            "process-shared-next",
+            3600,
+        );
+        listener.set_nonblocking(true).unwrap();
+        thread::sleep(Duration::from_millis(400));
+        usize::from(listener.accept().is_ok())
+    });
+
+    let current_exe = std::env::current_exe().unwrap();
+    let endpoint = format!("http://{address}");
+    let start_child = || {
+        std::process::Command::new(&current_exe)
+            .arg("--exact")
+            .arg("two_windows_processes_share_refresh_ownership_for_one_store")
+            .arg("--nocapture")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .env(CHILD, "1")
+            .env("SLIM_OAUTH_R2_STORE", &root)
+            .env("SLIM_OAUTH_R2_ENDPOINT", &endpoint)
+            .spawn()
+            .unwrap()
+    };
+    let first = start_child();
+    let second = start_child();
+    let first_output = first.wait_with_output().unwrap();
+    let second_output = second.wait_with_output().unwrap();
+    assert!(
+        first_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    assert!(
+        second_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    assert_eq!(
+        server.join().unwrap(),
+        0,
+        "only one process may POST this refresh base"
+    );
+    assert_eq!(
+        store
+            .credential(OAuthProvider::Anthropic)
+            .unwrap()
+            .unwrap()
+            .refresh,
+        "process-shared-next"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn windows_process_restart_after_refresh_post_reuses_consumed_base() {
+    const MODE: &str = "SLIM_OAUTH_R2_CRASH_CHILD";
+    if let Ok(mode) = std::env::var(MODE) {
+        let root = std::path::PathBuf::from(std::env::var_os("SLIM_OAUTH_R2_CRASH_STORE").unwrap());
+        let endpoint = std::env::var("SLIM_OAUTH_R2_CRASH_ENDPOINT").unwrap();
+        let service = oauth_service(endpoint, OAuthStore::at(root.join("auth.json")));
+        let result = service
+            .fresh_credential(
+                OAuthProvider::Anthropic,
+                expired_fixture_credential("crash-consumed-base"),
+            )
+            .await;
+        if mode == "successor" {
+            match result {
+                Err(OAuthError::InvalidResponse(message)) => {
+                    assert_eq!(message, "Anthropic OAuth failed (400)");
+                }
+                other => panic!("successor must report an explicit OAuth rejection: {other:?}"),
+            }
+        } else {
+            panic!("crash-owner must remain blocked until the harness terminates it: {result:?}");
+        }
+        return;
+    }
+
+    let root = temp_oauth_root("post-crash");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = OAuthStore::at(root.join("auth.json"));
+    store
+        .save(
+            OAuthProvider::Anthropic,
+            &expired_fixture_credential("crash-consumed-base"),
+        )
+        .unwrap();
+
+    let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (first_post_tx, first_post_rx) = std::sync::mpsc::channel::<()>();
+    let (owner_killed_tx, owner_killed_rx) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut first_stream, _) = accept_fixture(&listener);
+        let first_request = read_http_request(&mut first_stream);
+        // Accepting this request consumes and rotates the synthetic base; the
+        // fixture intentionally withholds the response until the harness kills A.
+        first_post_tx.send(()).unwrap();
+        owner_killed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("harness terminates the owner after its POST is observed");
+        drop(first_stream);
+
+        let (mut second_stream, _) = accept_fixture(&listener);
+        let second_request = read_http_request(&mut second_stream);
+        let body = r#"{"error":"invalid_grant"}"#;
+        second_stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        (first_request, second_request)
+    });
+
+    let current_exe = std::env::current_exe().unwrap();
+    let endpoint = format!("http://{address}");
+    let start_child = |mode: &str| {
+        std::process::Command::new(&current_exe)
+            .arg("--exact")
+            .arg("windows_process_restart_after_refresh_post_reuses_consumed_base")
+            .arg("--nocapture")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .env(MODE, mode)
+            .env("SLIM_OAUTH_R2_CRASH_STORE", &root)
+            .env("SLIM_OAUTH_R2_CRASH_ENDPOINT", &endpoint)
+            .spawn()
+    };
+
+    let mut owner = start_child("owner").expect("spawn crash-owner child");
+    match first_post_rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(()) => {}
+        Err(error) => {
+            let _ = owner.kill();
+            let _ = owner.wait();
+            let _ = owner_killed_tx.send(());
+            let _ = server.join();
+            let _ = std::fs::remove_dir_all(&root);
+            panic!("crash-owner did not POST before the deadline: {error}");
+        }
+    }
+    let owner_kill_result = owner.kill();
+    let owner_status = owner.wait();
+    let _ = owner_killed_tx.send(());
+
+    let mut successor = match start_child("successor") {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = server.join();
+            let _ = std::fs::remove_dir_all(&root);
+            panic!("spawn successor child: {error}");
+        }
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut successor_status = None;
+    let mut successor_poll_error = None;
+    while std::time::Instant::now() < deadline {
+        match successor.try_wait() {
+            Ok(Some(status)) => {
+                successor_status = Some(status);
+                break;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                successor_poll_error = Some(error.to_string());
+                break;
+            }
+        }
+    }
+    let mut successor_cleanup_errors = Vec::new();
+    if successor_status.is_none() {
+        if let Err(error) = successor.kill() {
+            successor_cleanup_errors.push(format!("kill successor: {error}"));
+        }
+        match successor.wait() {
+            Ok(status) => successor_status = Some(status),
+            Err(error) => successor_cleanup_errors.push(format!("wait for successor: {error}")),
+        }
+    }
+    let successor_output = successor.wait_with_output();
+    let requests = server.join();
+    let _ = std::fs::remove_dir_all(&root);
+
+    let (first_request, second_request) = requests.expect("loopback fixture must finish");
+    assert!(
+        successor_poll_error.is_none(),
+        "polling successor must succeed: {successor_poll_error:?}"
+    );
+    assert!(
+        successor_cleanup_errors.is_empty(),
+        "successor cleanup must succeed: {successor_cleanup_errors:?}"
+    );
+    let first_body = first_request.split_once("\r\n\r\n").unwrap().1;
+    let second_body = second_request.split_once("\r\n\r\n").unwrap().1;
+    assert!(
+        owner_kill_result.is_ok(),
+        "owner process must be terminated"
+    );
+    assert!(
+        !owner_status.unwrap().success(),
+        "owner must be killed after POST"
+    );
+    assert!(
+        first_body.contains("crash-consumed-base"),
+        "the blocked owner POST must use the fixture base"
+    );
+    assert!(
+        second_body.contains("crash-consumed-base"),
+        "the successor must explicitly retry the consumed base"
+    );
+    let successor_output = successor_output.expect("collect successor output");
+    assert!(
+        successor_status.is_some_and(|status| status.success()),
+        "successor must exit after recognizing invalid_grant: {}",
+        String::from_utf8_lossy(&successor_output.stderr)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logout_wins_against_a_refresh_response_already_in_flight() {
+    let root = temp_oauth_root("logout-cas");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = OAuthStore::at(root.join("auth.json"));
+    let expired = expired_fixture_credential("logout-base");
+    store.save(OAuthProvider::Anthropic, &expired).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("loopback OAuth refresh request")
+            .unwrap();
+        let request = read_http_request_async(&mut stream).await;
+        assert!(request.contains("logout-base"));
+        received_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        let body =
+            r#"{"access_token":"late-access","refresh_token":"late-refresh","expires_in":3600}"#;
+        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+    });
+    let service = oauth_service(format!("http://{address}"), store.clone());
+    let request = service
+        .request_fresh_credential(OAuthProvider::Anthropic, expired)
+        .unwrap();
+    let waiter = tokio::spawn(request.wait());
+    received_rx.await.unwrap();
+    service.logout(OAuthProvider::Anthropic).unwrap();
+    release_tx.send(()).unwrap();
+    let _ = waiter.await;
+    server.await.unwrap();
+    assert_eq!(store.credential(OAuthProvider::Anthropic).unwrap(), None);
+    assert_eq!(store.active().unwrap(), None);
+    assert!(service.shutdown().await.is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_a_waiter_after_send_does_not_cancel_the_shared_owner() {
+    let root = temp_oauth_root("owner-after-waiter");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = OAuthStore::at(root.join("auth.json"));
+    let expired = expired_fixture_credential("owner-base");
+    store.save(OAuthProvider::Anthropic, &expired).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("loopback OAuth refresh request")
+            .unwrap();
+        let mut request = vec![0; 16 * 1024];
+        let size = stream.read(&mut request).await.unwrap();
+        assert!(String::from_utf8_lossy(&request[..size]).contains("owner-base"));
+        received_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        let body =
+            r#"{"access_token":"owner-access","refresh_token":"owner-refresh","expires_in":3600}"#;
+        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+    });
+    let service = oauth_service(format!("http://{address}"), store.clone());
+    let request = service
+        .request_fresh_credential(OAuthProvider::Anthropic, expired)
+        .unwrap();
+    let waiter = tokio::spawn(request.wait());
+    received_rx.await.unwrap();
+    waiter.abort();
+    release_tx.send(()).unwrap();
+    server.await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if store
+            .credential(OAuthProvider::Anthropic)
+            .unwrap()
+            .is_some_and(|credential| credential.access == "owner-access")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "owner must persist after waiter drop"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(service.shutdown().await.is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn dropping_an_unpolled_request_prevents_refresh_send() {
+    let root = temp_oauth_root("cancel-before-send");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = OAuthStore::at(root.join("auth.json"));
+    let expired = expired_fixture_credential("cancel-base");
+    store.save(OAuthProvider::Anthropic, &expired).unwrap();
+    let before = std::fs::read(store.path()).unwrap();
+
+    let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let service = oauth_service(format!("http://{address}"), store.clone());
+    let request = service
+        .request_fresh_credential(OAuthProvider::Anthropic, expired)
+        .unwrap();
+    drop(request);
+    assert!(service.shutdown().await.is_empty());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        matches!(listener.accept(), Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    assert_eq!(std::fs::read(store.path()).unwrap(), before);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn auth_file_legacy_preference_defaults_to_oauth_and_rejects_unknown_method() {
+    let root = temp_oauth_root("preferred-method-legacy");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("auth.json");
+    std::fs::write(
+        &path,
+        r#"{"version":1,"providers":{"anthropic":{"oauth":{"access":"legacy-oauth-fixture","refresh":"legacy-refresh-fixture","expires":4102444800,"account_id":"legacy-account-fixture"},"api_key":"legacy-api-key-fixture"}}}"#,
+    )
+    .unwrap();
+
+    let legacy =
+        slim_cli::load_auth_credential(&path, slim_core::provider::ProviderKind::Anthropic)
+            .unwrap()
+            .expect("legacy provider credential");
+    assert!(
+        legacy.oauth,
+        "legacy files prefer OAuth when the method is absent"
+    );
+    assert_eq!(legacy.access, "legacy-oauth-fixture");
+    assert_eq!(legacy.account_id.as_deref(), Some("legacy-account-fixture"));
+
+    std::fs::write(
+        &path,
+        r#"{"version":1,"providers":{"anthropic":{"preferred_method":"future_method","oauth":{"access":"legacy-oauth-fixture","refresh":"legacy-refresh-fixture","expires":4102444800},"api_key":"legacy-api-key-fixture"}}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        slim_cli::load_auth_credential(&path, slim_core::provider::ProviderKind::Anthropic),
+        Err(slim_cli::AuthError::InvalidSchema)
+    ));
+
+    std::fs::write(
+        &path,
+        r#"{"version":1,"providers":{"anthropic":{"preferred_method":null,"oauth":{"access":"legacy-oauth-fixture","refresh":"legacy-refresh-fixture","expires":4102444800},"api_key":"legacy-api-key-fixture"}}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        slim_cli::load_auth_credential(&path, slim_core::provider::ProviderKind::Anthropic),
+        Err(slim_cli::AuthError::InvalidSchema)
+    ));
+    assert!(
+        OAuthStore::at(&path).active().is_err(),
+        "OAuthStore must reject null preferred_method too"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn auth_api_key_save_and_delete_preserve_oauth_credentials() {
+    let root = temp_oauth_root("auth-key-preserves-oauth");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("auth.json");
+    let provider = slim_core::provider::ProviderKind::Anthropic;
+    let store = OAuthStore::at(&path);
+    let oauth = OAuthCredential {
+        access: "auth-preserved-oauth-access-fixture".into(),
+        refresh: "auth-preserved-oauth-refresh-fixture".into(),
+        expires: 4102444800,
+        account_id: Some("auth-preserved-account-fixture".into()),
+    };
+    store.save(OAuthProvider::Anthropic, &oauth).unwrap();
+
+    slim_cli::save_api_key_file(&path, provider, "saved-api-key-fixture").unwrap();
+    let after_save: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        after_save["providers"]["anthropic"]["oauth"]["access"],
+        "auth-preserved-oauth-access-fixture"
+    );
+    assert_eq!(
+        after_save["providers"]["anthropic"]["api_key"],
+        "saved-api-key-fixture"
+    );
+
+    store.save(OAuthProvider::Anthropic, &oauth).unwrap();
+    slim_cli::delete_api_key_file(&path, provider).unwrap();
+    let after_delete: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        after_delete["providers"]["anthropic"]["oauth"]["access"],
+        "auth-preserved-oauth-access-fixture"
+    );
+    assert!(after_delete["providers"]["anthropic"]["api_key"].is_null());
+    let selected = slim_cli::load_auth_credential(&path, provider)
+        .unwrap()
+        .expect("OAuth remains selected after deleting the API key");
+    assert!(selected.oauth);
+    assert_eq!(selected.access, "auth-preserved-oauth-access-fixture");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn temp_oauth_root(label: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "slim-oauth-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+}
+
+fn expired_fixture_credential(refresh: &str) -> OAuthCredential {
+    OAuthCredential {
+        access: "expired-access-fixture".into(),
+        refresh: refresh.into(),
+        expires: 1,
+        account_id: Some("account-fixture".into()),
+    }
+}
+
+fn codex_fixture_access() -> String {
+    format!(
+        "header.{}.signature",
+        URL_SAFE_NO_PAD.encode(
+            br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"codex-account-fixture"}}"#
+        )
+    )
+}
+
+fn oauth_service(endpoint: String, store: OAuthStore) -> OAuthService {
+    OAuthService::new(
+        OAuthEndpoints {
+            anthropic_token: endpoint,
+            ..OAuthEndpoints::default()
+        },
+        Arc::new(NoopBrowser),
+        store,
+    )
+    .unwrap()
+}
+
+fn accept_fixture(listener: &StdTcpListener) -> (StdTcpStream, SocketAddr) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match listener.accept() {
+            Ok((stream, address)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("fixture stream blocking mode");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("fixture stream read timeout");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .expect("fixture stream write timeout");
+                return (stream, address);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "loopback OAuth request timed out"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("loopback listener accept failed: {error}"),
+        }
+    }
+}
+
+fn read_http_request(stream: &mut StdTcpStream) -> String {
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 4096];
+    loop {
+        let count = stream.read(&mut chunk).unwrap();
+        assert!(count > 0, "fixture request ended before headers");
+        bytes.extend_from_slice(&chunk[..count]);
+        if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header = String::from_utf8_lossy(&bytes[..end]);
+            let body_len = header
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            if bytes.len() >= end + 4 + body_len {
+                break;
+            }
+        }
+    }
+    String::from_utf8(bytes).unwrap()
+}
+
+async fn read_http_request_async(stream: &mut TcpStream) -> String {
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 4096];
+    loop {
+        let count = stream.read(&mut chunk).await.unwrap();
+        assert!(count > 0, "fixture request ended before headers");
+        bytes.extend_from_slice(&chunk[..count]);
+        if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header = String::from_utf8_lossy(&bytes[..end]);
+            let body_len = header
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            if bytes.len() >= end + 4 + body_len {
+                break;
+            }
+        }
+    }
+    String::from_utf8(bytes).unwrap()
+}
+
+fn write_refresh_response(stream: &mut StdTcpStream, access: &str, refresh: &str, expires: u32) {
+    let body = format!(
+        r#"{{"access_token":"{access}","refresh_token":"{refresh}","expires_in":{expires}}}"#
+    );
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+}
+
+async fn write_refresh_response_async(
+    stream: &mut TcpStream,
+    access: &str,
+    refresh: &str,
+    expires: u32,
+) {
+    let body = format!(
+        r#"{{"access_token":"{access}","refresh_token":"{refresh}","expires_in":{expires}}}"#
+    );
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+}
 
 impl BrowserLauncher for NoopBrowser {
     fn open(&self, _url: &str) -> Result<(), OAuthError> {

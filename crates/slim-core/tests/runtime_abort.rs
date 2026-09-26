@@ -1,5 +1,8 @@
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -7,6 +10,11 @@ use std::time::Instant;
 use serde_json::json;
 
 use slim_core::context::CompactionHandle;
+use slim_core::mcp::{
+    McpCancellation, McpCleanupStatus, McpConnection, McpError, McpInterruption, McpManager,
+    McpRequestOutcome, McpServerSpec, McpToolSummary, McpTransport,
+};
+use slim_core::process::ExecutableResolver;
 use slim_core::runtime::{AgentLoopConfig, AgentLoopStop, CancellationToken};
 use slim_core::{
     EventKind, HttpProviderClient, OpenAiCompatibleAdapter, OperatingMode, ProviderAdapter,
@@ -562,4 +570,498 @@ fn cancellation_during_tool_closes_the_tool_lifecycle_and_preserves_next_seq() {
         1
     );
     std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+struct CancelledMcpConnection {
+    started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    calls: AtomicUsize,
+    closed: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl McpConnection for CancelledMcpConnection {
+    async fn request(
+        &self,
+        method: &str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, McpError> {
+        Err(McpError::Protocol(format!(
+            "unexpected non-cancellable MCP request: {method}"
+        )))
+    }
+
+    async fn request_cancellable(
+        &self,
+        method: &str,
+        _params: serde_json::Value,
+        cancellation: McpCancellation,
+    ) -> McpRequestOutcome<serde_json::Value> {
+        if method != "tools/call" {
+            return McpRequestOutcome::Completed(Err(McpError::Protocol(format!(
+                "unexpected MCP method: {method}"
+            ))));
+        }
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        if let Some(started) = self
+            .started
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = started.send(());
+        }
+        cancellation.cancelled().await;
+        McpRequestOutcome::OutcomeUncertain {
+            interruption: McpInterruption::Cancelled,
+            cleanup: McpCleanupStatus::NotRequired,
+        }
+    }
+
+    async fn close_for_cleanup(&self) -> McpCleanupStatus {
+        self.closed.store(true, Ordering::Release);
+        McpCleanupStatus::Confirmed
+    }
+
+    async fn notify(&self, _method: &str, _params: serde_json::Value) {}
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+}
+
+#[test]
+fn cancellation_during_mcp_call_finishes_lifecycle_with_uncertain_output_and_consistent_sequence() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let mut stream = accept_with_deadline(&listener);
+        let mut request = [0_u8; 16 * 1024];
+        let size = stream.read(&mut request).expect("provider request");
+        assert!(size > 0, "provider request reached fixture");
+
+        let arguments = json!({
+            "server": "fixture",
+            "tool": "ping",
+            "arguments": {"operation": "non-replayable"},
+        });
+        let call = json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "mcp-call-uncertain",
+                        "function": {
+                            "name": "mcp",
+                            "arguments": arguments.to_string(),
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        });
+        let body = format!("data: {call}\n\ndata: [DONE]\n\n");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body,
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("provider response");
+    });
+
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let connection = Arc::new(CancelledMcpConnection {
+        started: Mutex::new(Some(started_tx)),
+        calls: AtomicUsize::new(0),
+        closed: AtomicBool::new(false),
+    });
+    let spec = McpServerSpec {
+        name: "fixture".into(),
+        transport: McpTransport::Stdio {
+            command: "controlled-test-connection".into(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+        },
+        enabled: true,
+        timeout: Duration::from_secs(5),
+    };
+    let manager = Arc::new(McpManager::new(
+        std::collections::BTreeMap::from([(spec.name.clone(), spec.clone())]),
+        PathBuf::from("."),
+        ExecutableResolver::default(),
+    ));
+    manager.insert_connection(
+        spec,
+        connection.clone() as Arc<dyn McpConnection>,
+        vec![McpToolSummary {
+            name: "ping".into(),
+            description: Some("controlled cancellation fixture".into()),
+            schema: json!({"type":"object"}),
+        }],
+    );
+
+    let cancellation = CancellationToken::new();
+    let mut runtime = Runtime::new();
+    runtime.set_cancellation_token(cancellation.clone());
+    runtime.set_mcp_manager(Some(manager));
+    let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let result = tokio_runtime.block_on(async {
+        let run = runtime.run_agent_loop(
+            &client,
+            "make one non-replayable MCP call",
+            OperatingMode::Auto,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig {
+                max_turns: 1,
+                ..AgentLoopConfig::default()
+            },
+        );
+        let cancel_when_called = async {
+            tokio::time::timeout(Duration::from_secs(3), started_rx)
+                .await
+                .expect("MCP call starts before timeout")
+                .expect("MCP call start signal");
+            cancellation.cancel();
+        };
+        let (result, ()) = tokio::join!(run, cancel_when_called);
+        result
+    });
+
+    server.join().expect("provider fixture");
+    let result = result.expect("cooperative cancellation is a loop result");
+    assert_eq!(result.stop, AgentLoopStop::Cancelled);
+    assert_eq!(connection.calls.load(Ordering::Relaxed), 1);
+    assert!(connection.is_closed());
+    assert_eq!(result.tool_results.len(), 1);
+    assert!(!result.tool_results[0].success);
+    assert!(result.tool_results[0]
+        .output
+        .contains("outcome is uncertain"));
+    assert!(result.tool_results[0].output.contains("do not replay"));
+
+    let events = runtime.app.events();
+    let lifecycle = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ToolStarted { call_id, name, .. } if call_id == "mcp-call-uncertain" => {
+                Some(("started", event.seq, name.as_str()))
+            }
+            EventKind::ToolOutput {
+                call_id,
+                name,
+                output,
+                ..
+            } if call_id == "mcp-call-uncertain" => {
+                assert!(output.contains("outcome is uncertain"));
+                assert!(output.contains("do not replay"));
+                Some(("output", event.seq, name.as_str()))
+            }
+            EventKind::ToolFinished {
+                call_id,
+                name,
+                success,
+                ..
+            } if call_id == "mcp-call-uncertain" => {
+                assert!(!success);
+                Some(("finished", event.seq, name.as_str()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lifecycle
+            .iter()
+            .map(|(kind, _, _)| *kind)
+            .collect::<Vec<_>>(),
+        ["started", "output", "finished"]
+    );
+    assert!(lifecycle.iter().all(|(_, _, name)| *name == "mcp"));
+    assert_eq!(lifecycle[1].1, lifecycle[0].1 + 1);
+    assert_eq!(lifecycle[2].1, lifecycle[1].1 + 1);
+    assert!(events.windows(2).all(|pair| pair[1].seq > pair[0].seq));
+    assert_eq!(
+        result.next_seq,
+        events.last().expect("event journal").seq + 1
+    );
+}
+
+fn read_mcp_http_request(mut stream: TcpStream) -> (TcpStream, serde_json::Value) {
+    let body = {
+        let mut reader = BufReader::new(&mut stream);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).expect("request line");
+        assert!(request_line.starts_with("POST "), "{request_line:?}");
+
+        let mut content_length = None;
+        loop {
+            let mut header = String::new();
+            reader.read_line(&mut header).expect("request header");
+            if header == "\r\n" || header == "\n" {
+                break;
+            }
+            if let Some((name, value)) = header.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = Some(value.trim().parse::<usize>().expect("content length"));
+                }
+            }
+        }
+        let mut body = vec![0; content_length.expect("content-length header")];
+        reader.read_exact(&mut body).expect("request body");
+        body
+    };
+    (
+        stream,
+        serde_json::from_slice(&body).expect("JSON-RPC request body"),
+    )
+}
+
+fn write_mcp_http_json(stream: &mut TcpStream, body: &serde_json::Value) {
+    let body = serde_json::to_vec(body).expect("serialize MCP response");
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).expect("MCP headers");
+    stream.write_all(&body).expect("MCP JSON body");
+    let _ = stream.flush();
+}
+
+#[test]
+fn cancellation_during_initialized_notification_reports_unconfirmed_cleanup_without_call() {
+    let provider_listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
+    let provider_address = provider_listener.local_addr().expect("provider address");
+    let provider = thread::spawn(move || {
+        let mut stream = accept_with_deadline(&provider_listener);
+        let mut request = [0_u8; 16 * 1024];
+        let size = stream.read(&mut request).expect("provider request");
+        assert!(size > 0, "provider request reaches local fixture");
+
+        let arguments = json!({
+            "server": "fixture",
+            "tool": "ping",
+            "arguments": {"operation": "no-call-before-init"},
+        });
+        let call = json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "mcp-init-cancel",
+                        "function": {
+                            "name": "mcp",
+                            "arguments": arguments.to_string(),
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        });
+        let body = format!("data: {call}\n\ndata: [DONE]\n\n");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body,
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("provider tool-call response");
+    });
+
+    let mcp_listener = TcpListener::bind("127.0.0.1:0").expect("bind MCP fixture");
+    let mcp_address = mcp_listener.local_addr().expect("MCP address");
+    let (notification_seen_tx, notification_seen_rx) = tokio::sync::oneshot::channel();
+    let (release_mcp_tx, release_mcp_rx) = mpsc::sync_channel(1);
+    let mcp_server = thread::spawn(move || {
+        let mut methods = Vec::new();
+        let init_stream = accept_with_deadline(&mcp_listener);
+        let (mut init_stream, initialize) = read_mcp_http_request(init_stream);
+        methods.push(
+            initialize["method"]
+                .as_str()
+                .expect("initialize method")
+                .to_owned(),
+        );
+        assert_eq!(methods[0], "initialize");
+        write_mcp_http_json(
+            &mut init_stream,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": initialize["id"],
+                "result": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "runtime-abort-fixture", "version": "1"},
+                },
+            }),
+        );
+
+        let notify_stream = accept_with_deadline(&mcp_listener);
+        let (mut notify_stream, notification) = read_mcp_http_request(notify_stream);
+        methods.push(
+            notification["method"]
+                .as_str()
+                .expect("notification method")
+                .to_owned(),
+        );
+        assert_eq!(methods[1], "notifications/initialized");
+        notification_seen_tx
+            .send(())
+            .expect("runtime cancellation task waits for notification");
+        release_mcp_rx
+            .recv()
+            .expect("test releases local MCP HTTP fixture");
+        let response = b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let _ = notify_stream.write_all(response);
+
+        // The cancellation outcome is returned only after the lazy connect
+        // path has stopped. Drain any already-issued request to make a
+        // regression to tools/list or tools/call visible in this fixture.
+        mcp_listener
+            .set_nonblocking(true)
+            .expect("nonblocking MCP fixture listener");
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < deadline {
+            match mcp_listener.accept() {
+                Ok((stream, _)) => {
+                    let (_, unexpected) = read_mcp_http_request(stream);
+                    methods.push(
+                        unexpected["method"]
+                            .as_str()
+                            .expect("unexpected MCP method")
+                            .to_owned(),
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::yield_now();
+                }
+                Err(error) => panic!("MCP fixture accept: {error}"),
+            }
+        }
+        methods
+    });
+
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{provider_address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .expect("provider adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+    let spec = McpServerSpec {
+        name: "fixture".into(),
+        transport: McpTransport::Http {
+            url: format!("http://{mcp_address}"),
+            headers: std::collections::BTreeMap::new(),
+        },
+        enabled: true,
+        timeout: Duration::from_secs(5),
+    };
+    let manager = Arc::new(McpManager::new(
+        std::collections::BTreeMap::from([(spec.name.clone(), spec)]),
+        PathBuf::from("."),
+        ExecutableResolver::default(),
+    ));
+    let cancellation = CancellationToken::new();
+    let mut runtime = Runtime::new();
+    runtime.set_cancellation_token(cancellation.clone());
+    runtime.set_mcp_manager(Some(manager));
+    let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let result = tokio_runtime.block_on(async {
+        let run = runtime.run_agent_loop(
+            &client,
+            "make one MCP call",
+            OperatingMode::Auto,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig {
+                max_turns: 1,
+                ..AgentLoopConfig::default()
+            },
+        );
+        let cancel_during_initialization = async {
+            tokio::time::timeout(Duration::from_secs(3), notification_seen_rx)
+                .await
+                .expect("initialized notification reaches MCP fixture")
+                .expect("notification readiness signal");
+            cancellation.cancel();
+        };
+        let (result, ()) = tokio::join!(run, cancel_during_initialization);
+        result
+    });
+
+    provider.join().expect("provider fixture exits");
+    release_mcp_tx
+        .send(())
+        .expect("release MCP fixture after cancellation completes");
+    let mcp_methods = mcp_server.join().expect("MCP HTTP fixture exits");
+    let result = result.expect("cooperative cancellation is a loop result");
+    assert_eq!(result.stop, AgentLoopStop::Cancelled);
+    assert_eq!(result.tool_results.len(), 1);
+    assert!(!result.tool_results[0].success);
+    let tool_output = result.tool_results[0].output.to_lowercase();
+    assert!(tool_output.contains("cleanup"));
+    assert!(tool_output.contains("unconfirmed") || tool_output.contains("not confirmed"));
+
+    let events = runtime.app.events();
+    let lifecycle = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ToolStarted { call_id, name, .. } if call_id == "mcp-init-cancel" => {
+                Some(("started", event.seq, name.as_str()))
+            }
+            EventKind::ToolOutput {
+                call_id,
+                name,
+                output,
+                ..
+            } if call_id == "mcp-init-cancel" => {
+                let output = output.to_lowercase();
+                assert!(output.contains("cleanup"));
+                assert!(output.contains("unconfirmed") || output.contains("not confirmed"));
+                Some(("output", event.seq, name.as_str()))
+            }
+            EventKind::ToolFinished {
+                call_id,
+                name,
+                success,
+                ..
+            } if call_id == "mcp-init-cancel" => {
+                assert!(!success);
+                Some(("finished", event.seq, name.as_str()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lifecycle
+            .iter()
+            .map(|(kind, _, _)| *kind)
+            .collect::<Vec<_>>(),
+        ["started", "output", "finished"]
+    );
+    assert!(lifecycle.iter().all(|(_, _, name)| *name == "mcp"));
+    assert_eq!(lifecycle[1].1, lifecycle[0].1 + 1);
+    assert_eq!(lifecycle[2].1, lifecycle[1].1 + 1);
+    assert!(events.windows(2).all(|pair| pair[1].seq > pair[0].seq));
+    assert_eq!(
+        result.next_seq,
+        events.last().expect("event journal").seq + 1
+    );
+
+    assert_eq!(
+        mcp_methods,
+        vec![
+            "initialize".to_owned(),
+            "notifications/initialized".to_owned()
+        ]
+    );
 }

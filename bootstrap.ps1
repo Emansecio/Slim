@@ -27,12 +27,10 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 'rustc: ' + (rustc --version)
 
 if ($Test) {
-    '== cargo test --workspace =='
-    Push-Location $root
-    cargo test --workspace
+    '== test-slim.ps1 -Workspace =='
+    & "$root/test-slim.ps1" -Workspace
     $code = $LASTEXITCODE
-    Pop-Location
-    if ($code -ne 0) { throw 'cargo test falhou' }
+    if ($code -ne 0) { throw 'test-slim.ps1 falhou' }
 }
 
 '== cargo build --release -p slim-cli =='
@@ -60,4 +58,4 @@ if ($Deploy) {
 ''
 'Falta fazer a mao:'
 '  - /login na TUI (OAuth Anthropic/OpenAI) ou SLIM_API_KEY/OPENAI_API_KEY/ANTHROPIC_API_KEY'
-'  - opcional: ./slim.toml ou %APPDATA%\slim\slim.toml'
+'  - opcional: ./slim.toml ou %APPDATA%\slim\config\slim.toml'

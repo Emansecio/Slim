@@ -45,12 +45,17 @@ fn enter() -> KeyEvent {
     KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
 }
 
+fn settle(state: &mut AppState) {
+    state.clock.elapsed_ms = state.clock.elapsed_ms.saturating_add(249);
+}
+
 #[test]
 fn same_batch_groups_different_names_and_expands_in_provider_order() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::run_started(1));
     complete(&mut state, "batch-a", "call-1", "read", "path=one", 7);
     complete(&mut state, "batch-a", "call-2", "shell", "cmd=two", 5);
+    settle(&mut state);
 
     let collapsed = render_terminal_text(&state, 120, 30);
     assert!(
@@ -86,7 +91,7 @@ fn same_batch_groups_different_names_and_expands_in_provider_order() {
     let first = expanded.find("call-1").expect("first member");
     let second = expanded.find("call-2").expect("second member");
     assert!(first < second, "provider order changed\n{expanded}");
-    for expected in ["read", "path=one", "shell", "cmd=two"] {
+    for expected in ["Leu one", "Executou cmd=two"] {
         assert!(
             expanded.contains(expected),
             "missing {expected}\n{expanded}"
@@ -94,7 +99,7 @@ fn same_batch_groups_different_names_and_expands_in_provider_order() {
     }
     let first_row = expanded
         .lines()
-        .find(|line| line.contains("path=one"))
+        .find(|line| line.contains("Leu one"))
         .expect("first member row");
     assert!(
         !first_row.contains("cmd=two"),
@@ -117,6 +122,7 @@ fn same_batch_groups_equal_names_by_batch_identity() {
     let mut state = AppState::new();
     complete(&mut state, "batch-a", "call-1", "read", "one", 3);
     complete(&mut state, "batch-a", "call-2", "read", "two", 4);
+    settle(&mut state);
 
     let frame = render_terminal_text(&state, 80, 24);
     assert!(frame.contains("✓ 2 chamadas de leitura · 7ms"), "{frame}");
@@ -130,6 +136,7 @@ fn grouped_header_summarizes_names_counts_and_total_duration() {
     complete(&mut state, "batch-a", "call-2", "read", "two", 8);
     complete(&mut state, "batch-a", "call-3", "read", "three", 9);
     complete(&mut state, "batch-a", "call-4", "shell", "four", 18);
+    settle(&mut state);
 
     let wide = render_terminal_text(&state, 120, 30);
     let expected = format!(
@@ -177,6 +184,7 @@ fn plain_enter_at_live_edge_activates_last_visible_tool_group() {
     let mut state = AppState::new();
     complete(&mut state, "batch-a", "call-1", "read", "one", 3);
     complete(&mut state, "batch-a", "call-2", "shell", "two", 4);
+    settle(&mut state);
     let leader = state.blocks()[0].id.clone();
     let mut cache = WrapCache::default();
 
@@ -204,6 +212,7 @@ fn collapsed_thinking_does_not_split_complete_tool_groups() {
     assert!(state.append_block(thinking));
     complete(&mut state, "batch-b", "call-3", "read", "three", 1);
     complete(&mut state, "batch-b", "call-4", "read", "four", 1);
+    settle(&mut state);
 
     let frame = render_terminal_text(&state, 80, 24);
     assert!(
@@ -229,6 +238,7 @@ fn consecutive_complete_tools_group_across_batches() {
     complete(&mut state, "batch-b", "call-2", "shell", "two", 1561);
     complete(&mut state, "batch-c", "call-3", "shell", "three", 1548);
     complete(&mut state, "batch-d", "call-4", "shell", "four", 1559);
+    settle(&mut state);
 
     let frame = render_terminal_text(&state, 80, 24);
     assert!(frame.contains("✓ Executou 4 comandos · 6.2s"), "{frame}");
@@ -252,6 +262,7 @@ fn enter_details_only_on_selected_or_last_live_collapsed_group() {
     )));
     complete(&mut state, "batch-b", "call-3", "shell", "three", 5);
     complete(&mut state, "batch-b", "call-4", "write", "four", 6);
+    settle(&mut state);
 
     let live = render_terminal_text(&state, 120, 30);
     let hint_lines: Vec<_> = live
@@ -326,11 +337,11 @@ fn identical_consecutive_failures_collapse_to_one_row() {
 
     let frame = render_terminal_text(&state, 100, 24);
     assert!(
-        frame.contains("✕ search ×4 · search requires exactly one of query or patterns"),
+        frame.contains("✕ Buscou ×4 · search requires exactly one of query or patterns"),
         "{frame}"
     );
     assert_eq!(
-        frame.matches("✕ search").count(),
+        frame.matches("✕ Buscou").count(),
         1,
         "identical failures must occupy one row\n{frame}"
     );
@@ -377,14 +388,82 @@ fn failed_and_cancelled_members_remain_individual_and_ordered() {
     assert_eq!(names, ["read", "shell", "write"]);
     let frame = render_terminal_text(&state, 80, 24);
     assert!(!frame.contains("tools ·"), "{frame}");
-    assert!(frame.contains("✕ shell · 4ms · falhou"), "{frame}");
+    assert!(frame.contains("✕ Executou · 4ms · falhou"), "{frame}");
     assert!(
-        frame.contains("■ write") && frame.contains("cancelada"),
+        frame.contains("■ Escrevendo") && frame.contains("cancelada"),
         "{frame}"
     );
     assert!(!frame.contains("bad"), "{frame}");
     assert!(
         frame.contains("later"),
         "cancelled tools keep their target\n{frame}"
+    );
+}
+
+#[test]
+fn fresh_tool_keeps_its_row_until_the_emphasis_expires() {
+    let mut state = AppState::new();
+    complete(&mut state, "batch-a", "call-1", "read", "one", 3);
+    complete(&mut state, "batch-a", "call-2", "read", "two", 4);
+
+    let fresh = render_terminal_text(&state, 80, 24);
+    assert_eq!(
+        fresh.matches("Leu ").count(),
+        2,
+        "each just-finished call keeps a row\n{fresh}"
+    );
+    assert!(
+        !fresh.contains("2 chamadas de leitura"),
+        "the group waits out the emphasis\n{fresh}"
+    );
+
+    settle(&mut state);
+    let grouped = render_terminal_text(&state, 80, 24);
+    assert!(grouped.contains("2 chamadas de leitura"), "{grouped}");
+    assert!(
+        !grouped.contains("✓ read"),
+        "settled calls fold into the group\n{grouped}"
+    );
+}
+
+#[test]
+fn reduced_motion_folds_a_finished_tool_immediately() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use slim_tui::runtime::render_frame;
+    use slim_tui::theme::{Capabilities, ColorDepth};
+
+    let mut state = AppState::new();
+    complete(&mut state, "batch-a", "call-1", "read", "one", 3);
+    complete(&mut state, "batch-a", "call-2", "read", "two", 4);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+    let mut cache = WrapCache::default();
+    terminal
+        .draw(|frame| {
+            render_frame(
+                frame,
+                &state,
+                Capabilities {
+                    color_depth: ColorDepth::TrueColor,
+                    mouse: false,
+                    clipboard: false,
+                    images: false,
+                    reduced_motion: true,
+                },
+                &mut cache,
+            )
+        })
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let mut text = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            text.push(buffer[(x, y)].symbol().chars().next().unwrap_or(' '));
+        }
+        text.push('\n');
+    }
+    assert!(
+        text.contains("2 chamadas de leitura"),
+        "reduced motion shows the settled group\n{text}"
     );
 }

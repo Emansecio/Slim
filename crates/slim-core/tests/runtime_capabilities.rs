@@ -155,16 +155,19 @@ fn targeted_todos_reopen_with_initial_status_and_legacy_records() {
             status: None,
         },
         TaskMutation::TodoSetStatus {
+            reason: None,
             id: Some(0),
             status: TaskTodoStatus::Completed,
         },
         TaskMutation::TodoSetStatus {
+            reason: None,
             id: Some(2),
             status: TaskTodoStatus::InProgress,
         },
         TaskMutation::TodoSetStatus {
+            reason: Some("dependency unavailable".into()),
             id: Some(1),
-            status: TaskTodoStatus::Completed,
+            status: TaskTodoStatus::Blocked,
         },
         TaskMutation::TodoAdd {
             title: "already done".into(),
@@ -191,11 +194,12 @@ fn targeted_todos_reopen_with_initial_status_and_legacy_records() {
         before.iter().map(|item| item.status).collect::<Vec<_>>(),
         vec![
             slim_core::task::TodoStatus::Completed,
-            slim_core::task::TodoStatus::Completed,
+            slim_core::task::TodoStatus::Blocked,
             slim_core::task::TodoStatus::InProgress,
             slim_core::task::TodoStatus::Completed,
         ]
     );
+    assert_eq!(before[1].reason.as_deref(), Some("dependency unavailable"));
     let repo = bridge.into_service().into_repo();
     let restored = runtime
         .open_capability_bridge(repo, &discovery, &[])
@@ -351,6 +355,7 @@ fn runtime_bridge_runs_skill_selected_mcp_child_tasks_and_reopens_without_replay
             "todo",
             2,
             TaskMutation::TodoSetStatus {
+                reason: None,
                 id: None,
                 status: TaskTodoStatus::InProgress,
             },

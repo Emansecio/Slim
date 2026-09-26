@@ -48,6 +48,28 @@ impl DiscoveryResult {
     pub fn active_entries(&self) -> &[SkillEntry] {
         &self.active_entries
     }
+
+    /// Bounded diagnostics for user-visible discovery/listing output.
+    pub fn diagnostic_lines(&self) -> Vec<String> {
+        let mut lines = self
+            .warnings
+            .iter()
+            .take(5)
+            .map(|warning| {
+                format!(
+                    "skill warning: {}",
+                    warning.chars().take(512).collect::<String>()
+                )
+            })
+            .collect::<Vec<_>>();
+        if self.warnings.len() > 5 {
+            lines.push(format!(
+                "{} more skill warnings omitted",
+                self.warnings.len() - 5
+            ));
+        }
+        lines
+    }
 }
 
 pub fn discover(roots: &[SkillRoot]) -> io::Result<DiscoveryResult> {
@@ -114,12 +136,14 @@ fn discover_workspace_with_profile(
     let mut roots = vec![
         SkillRoot::new(cwd.join(".slim").join("skills"), 0),
         SkillRoot::new(cwd.join(".claude").join("skills"), 1),
+        SkillRoot::new(cwd.join(".agents").join("skills"), 2),
     ];
     if let Some(profile) = profile {
         let global = profile.join(".slim").join("skills");
         if !roots.iter().any(|root| root.path == global) {
             roots.push(SkillRoot::new(global, 10));
         }
+        roots.push(SkillRoot::new(profile.join(".agents").join("skills"), 11));
     }
     roots.retain(|root| root.path.is_dir());
     discover(&roots)
@@ -153,6 +177,16 @@ mod tests {
         write_skill(&workspace.join(".slim/skills"), "same", "workspace");
         write_skill(&profile.join(".slim/skills"), "same", "global");
         write_skill(&profile.join(".slim/skills"), "global-only", "global");
+        write_skill(
+            &workspace.join(".agents/skills"),
+            "agents-only",
+            "workspace compat",
+        );
+        write_skill(
+            &profile.join(".agents/skills"),
+            "agents-global",
+            "global compat",
+        );
 
         let discovery = discover_workspace_with_profile(&workspace, Some(&profile))
             .expect("workspace discovery");
@@ -166,6 +200,8 @@ mod tests {
             "workspace"
         );
         assert!(discovery.active("global-only").is_some());
+        assert!(discovery.active("agents-only").is_some());
+        assert!(discovery.active("agents-global").is_some());
         let _ = std::fs::remove_dir_all(root);
     }
 }

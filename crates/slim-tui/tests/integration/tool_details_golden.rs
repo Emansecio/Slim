@@ -6,7 +6,7 @@ use slim_tui::api::{
     ContentHandle, ContentRequestId, PageCursor, ToolBatchId, ToolCallId, UiCommand, UiEvent,
 };
 use slim_tui::app::{AppState, FollowMode, ScrollAnchor};
-use slim_tui::block::{BlockKind, FoldState};
+use slim_tui::block::{BlockKind, BlockLifecycle, FoldState};
 use slim_tui::reducer::{reduce, Action, Effect};
 use slim_tui::render::WrapCache;
 use slim_tui::runtime::render_frame;
@@ -231,6 +231,64 @@ fn enter_pages_inline_and_rejects_stale_duplicate_or_out_of_order_pages() {
 }
 
 #[test]
+fn shell_job_final_output_replaces_loaded_running_page_before_terminal() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::ToolStarted {
+        batch_id: batch("batch"),
+        call_id: call("launch"),
+        name: "shell".into(),
+        arguments_summary: String::new(),
+    });
+    let progress = |preview: &str| UiEvent::ToolProgress {
+        batch_id: batch("batch"),
+        call_id: call("launch"),
+        name: "shell".into(),
+        preview: preview.into(),
+        content_handle: Some(handle("shell-output")),
+    };
+    state.apply_event(progress("state=running"));
+    state.scroll.mode = FollowMode::Pinned(ScrollAnchor {
+        block_id: state.blocks()[0].id.clone(),
+        row_offset: 0,
+    });
+    assert!(reduce(&mut state, Action::Key(enter()))
+        .iter()
+        .any(|effect| matches!(
+            effect,
+            Effect::Send(UiCommand::RequestContentPage { cursor: None, .. })
+        )));
+    state.apply_event(UiEvent::ContentPageLoaded {
+        handle: handle("shell-output"),
+        request_id: ContentRequestId(1),
+        cursor: None,
+        text: "state=running".into(),
+        next_cursor: None,
+    });
+    assert!(render_at(&state).contains("state=running"));
+    state.apply_event(progress("exit 1 · final marker"));
+    assert_eq!(state.blocks()[0].lifecycle, BlockLifecycle::Streaming);
+    let BlockKind::Tool(tool) = state.blocks()[0].kind() else {
+        panic!("tool block")
+    };
+    assert!(tool.materialized_output.is_empty());
+    assert_eq!(tool.next_cursor, None);
+    assert!(reduce(&mut state, Action::Key(enter()))
+        .iter()
+        .any(|effect| matches!(
+            effect,
+            Effect::Send(UiCommand::RequestContentPage { cursor: None, .. })
+        )));
+    state.apply_event(UiEvent::ToolEnded {
+        batch_id: batch("batch"),
+        call_id: call("launch"),
+        name: "shell".into(),
+        success: false,
+        duration_ms: 42,
+    });
+    assert_eq!(state.blocks()[0].lifecycle, BlockLifecycle::Failed);
+}
+
+#[test]
 fn arguments_and_output_are_sanitized_in_the_frame() {
     let secret = "super-secret-token";
     let projected = UiEvent::from_core(slim_core::SessionEvent::new(
@@ -378,15 +436,15 @@ fn collapsed_single_tool_keeps_compact_target_and_result() {
     });
 
     let collapsed = render_at(&state);
-    assert!(collapsed.contains("✓ shell"), "{collapsed}");
+    assert!(collapsed.contains("✓ Executou"), "{collapsed}");
     assert!(collapsed.contains("854ms"), "{collapsed}");
     assert!(
-        collapsed.contains("command=Get-ChildItem"),
+        collapsed.contains("$ Get-ChildItem"),
         "collapsed row keeps the target summary\n{collapsed}"
     );
     assert!(
-        collapsed.contains("exit 0"),
-        "collapsed row keeps the short result\n{collapsed}"
+        !collapsed.contains("exit 0"),
+        "a clean exit is already stated by the success glyph\n{collapsed}"
     );
 
     let tool_id = state.blocks()[0].id.clone();
@@ -394,7 +452,11 @@ fn collapsed_single_tool_keeps_compact_target_and_result() {
     assert!(changed);
     assert_eq!(state.blocks()[0].fold, FoldState::Expanded);
     let expanded = render_at(&state);
-    assert!(expanded.contains("command=Get-ChildItem"), "{expanded}");
+    assert!(expanded.contains("$ Get-ChildItem"), "{expanded}");
+    assert!(
+        expanded.contains("exit 0"),
+        "details keep the full result\n{expanded}"
+    );
 }
 
 #[test]
@@ -415,7 +477,7 @@ fn running_shell_shows_command_limit_and_live_progress() {
     });
 
     let frame = render_at(&state);
-    assert!(frame.contains("command="), "{frame}");
+    assert!(frame.contains("Executando $ cargo"), "{frame}");
     assert!(frame.contains("limit 120s"), "{frame}");
     assert!(frame.contains("Compiling slim-core"), "{frame}");
 }
@@ -444,14 +506,14 @@ fn running_tool_summary_stays_on_one_row_and_preserves_progress_metadata() {
         .lines()
         .take(transcript_rows as usize)
         .filter(|line| {
-            ["shell", "limit 120s", "out 128 B", "err 0 B"]
+            ["Executando", "limit 120s", "out 128 B", "err 0 B"]
                 .iter()
                 .any(|needle| line.contains(needle))
         })
         .collect::<Vec<_>>();
     assert_eq!(matching.len(), 1, "tool summary wrapped:\n{frame}");
     let summary = matching[0];
-    assert!(summary.contains("shell"), "{summary}");
+    assert!(summary.contains("Executando"), "{summary}");
     assert!(summary.contains("limit 120s"), "{summary}");
     assert!(summary.contains("out 128 B"), "{summary}");
     assert!(summary.contains("err 0 B"), "{summary}");
@@ -523,7 +585,7 @@ fn collapsed_failed_tool_drops_telemetry_and_keeps_the_short_reason() {
     let frame = render_at(&state);
     let summary = frame
         .lines()
-        .find(|line| line.contains("shell"))
+        .find(|line| line.contains("Executou"))
         .expect("failed shell row");
     assert!(summary.contains("exit 1"), "{summary}");
     assert!(summary.contains("733ms"), "{summary}");
@@ -533,4 +595,96 @@ fn collapsed_failed_tool_drops_telemetry_and_keeps_the_short_reason() {
     );
     assert!(!summary.contains("out 128 B"), "{summary}");
     assert!(!summary.contains("command="), "{summary}");
+}
+
+fn project(state: &mut AppState, kind: slim_core::EventKind) {
+    let event = UiEvent::from_core(slim_core::SessionEvent::new(1, kind)).expect("projected");
+    state.apply_event(event);
+}
+
+#[test]
+fn projected_patch_and_shell_rows_read_as_verb_target_and_outcome() {
+    use slim_core::EventKind as Kind;
+    let mut state = AppState::new();
+    let arguments = r#"{"path":"src/lib.rs","edits":[{"expected":"a\nold\nz","replacement":"a\nnew\nmore\nz"}]}"#;
+    project(
+        &mut state,
+        Kind::ToolStarted {
+            batch_id: "b1".into(),
+            call_id: "c1".into(),
+            name: "patch".into(),
+            arguments: arguments.into(),
+        },
+    );
+    project(
+        &mut state,
+        Kind::ToolOutput {
+            batch_id: "b1".into(),
+            call_id: "c1".into(),
+            name: "patch".into(),
+            output: "patched src/lib.rs:2; replaced 3 bytes with 8 bytes; bytes=9; sha256=ab; do not re-read".into(),
+        },
+    );
+    project(
+        &mut state,
+        Kind::ToolFinished {
+            batch_id: "b1".into(),
+            call_id: "c1".into(),
+            name: "patch".into(),
+            success: true,
+            duration_ms: 8,
+        },
+    );
+    project(
+        &mut state,
+        Kind::ToolStarted {
+            batch_id: "b2".into(),
+            call_id: "c2".into(),
+            name: "shell".into(),
+            arguments: r#"{"command":"cargo test"}"#.into(),
+        },
+    );
+    project(
+        &mut state,
+        Kind::ToolOutput {
+            batch_id: "b2".into(),
+            call_id: "c2".into(),
+            name: "shell".into(),
+            output: "exit 101\nstderr:\nerror: test failed".into(),
+        },
+    );
+    project(
+        &mut state,
+        Kind::ToolFinished {
+            batch_id: "b2".into(),
+            call_id: "c2".into(),
+            name: "shell".into(),
+            success: false,
+            duration_ms: 4_200,
+        },
+    );
+    state.clock.elapsed_ms = 10_000;
+
+    let frame = render_at_width(&state, 100);
+    let patch = frame
+        .lines()
+        .find(|line| line.contains("Editou"))
+        .unwrap_or_else(|| panic!("patch row\n{frame}"));
+    assert!(
+        patch.contains("✓ Editou src/lib.rs · +2 -1 · 8ms"),
+        "{patch}"
+    );
+    assert!(
+        !patch.contains("patched"),
+        "the receipt stays behind details\n{patch}"
+    );
+    let shell = frame
+        .lines()
+        .find(|line| line.contains("Executou"))
+        .unwrap_or_else(|| panic!("shell row\n{frame}"));
+    assert!(
+        shell.contains("✕ Executou $ cargo test · exit 101"),
+        "{shell}"
+    );
+    assert!(shell.contains("4.2s"), "{shell}");
 }

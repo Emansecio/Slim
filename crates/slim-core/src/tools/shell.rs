@@ -40,6 +40,7 @@ pub struct TimedShellOutput {
     pub cancelled: bool,
     pub stdout_discarded_bytes: usize,
     pub stderr_discarded_bytes: usize,
+    pub capture_may_be_incomplete: bool,
 }
 
 impl TimedShellOutput {
@@ -48,6 +49,7 @@ impl TimedShellOutput {
             &self.output,
             self.timed_out,
             self.cancelled,
+            self.capture_may_be_incomplete,
             self.stdout_discarded_bytes,
             self.stderr_discarded_bytes,
         )
@@ -189,6 +191,7 @@ fn run_with_runner(
         output: result.output,
         timed_out: result.timed_out,
         cancelled: result.cancelled,
+        capture_may_be_incomplete: result.capture_may_be_incomplete,
         stdout_discarded_bytes: result.stdout_discarded_bytes,
         stderr_discarded_bytes: result.stderr_discarded_bytes,
     })
@@ -202,7 +205,12 @@ fn shell_invocation(
     // PowerShell -Command otherwise collapses a native program's nonzero
     // exit code to 1. Preserve it without turning a failed cmdlet into success.
     let script = format!(
-        "{command}\nif (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}"
+        "$utf8 = [System.Text.UTF8Encoding]::new($false)\n\
+         $OutputEncoding = $utf8\n\
+         [Console]::InputEncoding = $utf8\n\
+         [Console]::OutputEncoding = $utf8\n\
+         {command}\n\
+         if (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}"
     );
     Ok((
         program,
@@ -276,7 +284,8 @@ mod tests {
         assert_eq!(args[3], OsString::from("-Command"));
         assert!(args[4]
             .to_string_lossy()
-            .starts_with("fake --flag 'two words'"));
+            .lines()
+            .any(|line| line == "fake --flag 'two words'"));
         let _ = fs::remove_dir_all(root);
     }
 }

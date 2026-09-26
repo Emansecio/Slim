@@ -16,6 +16,7 @@ use crate::events::ReasoningClassification;
 mod clinepass;
 mod codex;
 mod command_code;
+mod image_limits;
 mod opencode_go;
 mod opencode_zen;
 #[cfg(test)]
@@ -47,6 +48,37 @@ pub use opencode_zen::{
 pub use xai::{
     is_xai_model_id, xai_model, xai_models, XaiAdapter, XaiModel, XAI_BASE_URL, XAI_DEFAULT_MODEL,
 };
+
+/// Documented effort controls for catalog gateways without capability metadata.
+/// Empty means no confirmed effort knob, not that the model cannot reason.
+/// Sources: DeepSeek thinking_mode; Claude effort; xAI text/reasoning.
+pub fn gateway_reasoning_levels(kind: ProviderKind, model: &str) -> &'static [&'static str] {
+    let slug = model.rsplit('/').next().unwrap_or(model);
+    match kind {
+        ProviderKind::Xai => xai_model(model).map_or(&[], |m| m.reasoning_levels),
+        ProviderKind::ClinePass | ProviderKind::CommandCode => match slug {
+            "deepseek-v4.1-flash" => &["low", "high", "max"],
+            "deepseek-v4-pro"
+            | "deepseek-v4-flash"
+            | "deepseek-v4-flash-fast"
+            | "deepseek-v4-flash-vision-exp" => &["high", "max"],
+            "claude-opus-5" | "claude-opus-4-8" | "claude-opus-4-7" | "claude-sonnet-5"
+            | "claude-fable-5" | "claude-fable-5-1"
+                if kind == ProviderKind::CommandCode =>
+            {
+                &["low", "medium", "high", "xhigh", "max"]
+            }
+            "claude-sonnet-4-6" | "claude-opus-4-6" if kind == ProviderKind::CommandCode => {
+                &["low", "medium", "high", "max"]
+            }
+            _ if kind == ProviderKind::CommandCode => {
+                xai_model(slug).map_or(&[], |m| m.reasoning_levels)
+            }
+            _ => &[],
+        },
+        _ => &[],
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -175,23 +207,76 @@ impl ProviderErrorMetadata {
     }
 
     pub(crate) fn is_transient(&self) -> bool {
-        self.status
-            .is_none_or(|status| matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 529))
+        // Some Responses proxies wrap a stream timeout in invalid_request_error.
+        // Only that explicit SSE identity may override the generic envelope;
+        // HTTP failures and specific permanent details keep their usual gates.
+        let stream_timeout = self.status.is_none()
+            && self.code.as_deref() == Some("request_timeout")
+            && self.detail_code.is_none()
             && matches!(
-                self.classification_code(),
-                Some(
-                    "server_error"
-                        | "service_unavailable_error"
-                        | "server_is_overloaded"
-                        | "api_error"
-                        | "overloaded_error"
-                        | "overloaded"
-                        | "rate_limit_error"
-                        | "rate_limit_exceeded"
-                        | "too_many_requests"
-                        | "slow_down"
-                )
+                self.error_type.as_deref(),
+                None | Some("invalid_request_error")
+            );
+        if stream_timeout {
+            return true;
+        }
+        // These are the explicit terminal identities Slim currently knows how
+        // to classify. Check every field: detail/code/type precedence must not
+        // hide a permanent identity in a lower-priority field.
+        const PERMANENT_CODES: &[&str] = &[
+            "authentication_error",
+            "unauthorized",
+            "unauthorized_error",
+            "forbidden",
+            "permission_denied",
+            "invalid_api_key",
+            "invalid_token",
+            "expired_token",
+            "invalid_request",
+            "invalid_request_error",
+            "bad_request",
+            "invalid_argument",
+            "invalid_parameter",
+            "invalid_model",
+            "model_not_found",
+            "insufficient_quota",
+            "quota_exceeded",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded",
+            "credit_balance_exhausted",
+            "enforced_spend_limit_reached",
+        ];
+        let has_permanent_code = [
+            self.code.as_deref(),
+            self.error_type.as_deref(),
+            self.detail_code.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|code| PERMANENT_CODES.contains(&code));
+        if has_permanent_code || matches!(self.status, Some(401 | 403)) {
+            return false;
+        }
+
+        let recognized_transient = matches!(
+            self.classification_code(),
+            Some(
+                "server_error"
+                    | "service_unavailable_error"
+                    | "server_is_overloaded"
+                    | "api_error"
+                    | "overloaded_error"
+                    | "overloaded"
+                    | "rate_limit_error"
+                    | "rate_limit_exceeded"
+                    | "too_many_requests"
+                    | "slow_down"
             )
+        );
+        let recognized_status = self
+            .status
+            .is_none_or(|status| matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 529));
+        (recognized_transient && recognized_status) || matches!(self.status, Some(502..=504))
     }
 }
 
@@ -225,6 +310,30 @@ pub enum ProviderError {
     },
 }
 
+/// Bounded, non-sensitive metadata for one actual provider HTTP call.
+///
+/// This is deliberately separate from `ProviderError`: provider messages and
+/// response bodies are never carried across the durable telemetry boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderCallTelemetry {
+    pub provider: String,
+    pub model: String,
+    pub duration_ms: u64,
+    pub headers_ms: Option<u64>,
+    pub first_semantic_ms: Option<u64>,
+    pub outcome: ProviderCallOutcome,
+    pub status: Option<u16>,
+    pub code: Option<String>,
+    pub retry_after_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderCallOutcome {
+    Success,
+    Failed,
+    Cancelled,
+}
+
 impl ProviderError {
     /// Whether the provider explicitly classified this failure as transient.
     /// Callers must still check delivery, tool effects, cancellation and budgets
@@ -245,6 +354,95 @@ impl ProviderError {
                 ..
             }
         )
+    }
+}
+
+pub(crate) fn normalized_provider_code(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() || value.len() > 64 {
+        return None;
+    }
+    const SAFE_CODES: &[&str] = &[
+        "authentication_error",
+        "unauthorized",
+        "unauthorized_error",
+        "forbidden",
+        "permission_denied",
+        "invalid_api_key",
+        "invalid_token",
+        "expired_token",
+        "invalid_request",
+        "invalid_request_error",
+        "bad_request",
+        "invalid_argument",
+        "invalid_parameter",
+        "invalid_model",
+        "model_not_found",
+        "insufficient_quota",
+        "quota_exceeded",
+        "organization_spend_limit_exceeded",
+        "project_spend_limit_exceeded",
+        "credit_balance_exhausted",
+        "enforced_spend_limit_reached",
+        "server_error",
+        "service_unavailable_error",
+        "server_is_overloaded",
+        "api_error",
+        "overloaded_error",
+        "overloaded",
+        "rate_limit_error",
+        "rate_limit_exceeded",
+        "too_many_requests",
+        "slow_down",
+        "request_timeout",
+    ];
+    if SAFE_CODES.contains(&value.as_str()) {
+        return Some(value);
+    }
+    if let Some(status) = value
+        .strip_prefix("http_")
+        .and_then(|status| status.parse::<u16>().ok())
+        .filter(|status| (100..=599).contains(status))
+    {
+        return Some(format!("http_{status}"));
+    }
+    Some("provider_error".into())
+}
+
+fn provider_call_error_fields(error: &ProviderError) -> (Option<u16>, Option<String>, Option<u64>) {
+    match error {
+        ProviderError::Api { metadata, .. } => {
+            let code = [
+                metadata.code.as_deref(),
+                metadata.error_type.as_deref(),
+                metadata.detail_code.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .find_map(normalized_provider_code);
+            (
+                metadata.status,
+                code,
+                metadata
+                    .retry_after
+                    .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX)),
+            )
+        }
+        ProviderError::Http {
+            status,
+            retry_after,
+            ..
+        } => (
+            Some(*status),
+            Some(format!("http_{status}")),
+            retry_after.map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX)),
+        ),
+        ProviderError::Transport { .. } => (None, Some("transport".into()), None),
+        ProviderError::Cancelled => (None, Some("cancelled".into()), None),
+        ProviderError::MalformedToolCall => (None, Some("malformed_tool_call".into()), None),
+        ProviderError::TransientRemote { .. } => (None, Some("transient_remote".into()), None),
+        ProviderError::Remote { .. } => (None, Some("remote".into()), None),
+        ProviderError::InvalidResponse { .. } => (None, Some("invalid_response".into()), None),
     }
 }
 
@@ -284,6 +482,7 @@ pub struct ChatReasoning {
     pub(crate) scope_id: u64,
     pub(crate) model: String,
     pub(crate) content: String,
+    pub(crate) details: Vec<Value>,
 }
 
 impl ChatReasoning {
@@ -1048,6 +1247,9 @@ pub trait ProviderAdapter {
         tools: &[Value],
     ) -> Result<HttpRequest, ProviderError> {
         normalize_messages(messages)?;
+        if self.wire_kind() == ProviderKind::Anthropic {
+            image_limits::validate_anthropic_images(messages)?;
+        }
         Ok(self.build_messages_request_with_tools(messages, tools))
     }
 
@@ -1239,10 +1441,27 @@ pub async fn run_http_provider_messages<A: ProviderAdapter>(
     )
     .with_reasoning_classification(client.adapter().reasoning_classification());
     let request_started = Instant::now();
+    let provider_call_journal = app.run_journal.clone();
     let stream_result = client
-        .stream_prepared_cancellable(request, std::future::pending(), |event| {
-            normalizer.push(app, event)
-        })
+        .stream_prepared_cancellable_observed(
+            request,
+            std::future::pending(),
+            |event| normalizer.push(app, event),
+            |telemetry| {
+                if let Some(journal) = &provider_call_journal {
+                    journal
+                        .lock()
+                        .map_err(|_| ProviderError::InvalidResponse {
+                            message: "durable run lock poisoned".into(),
+                        })?
+                        .record_provider_call(&telemetry)
+                        .map_err(|error| ProviderError::InvalidResponse {
+                            message: error.to_string(),
+                        })?;
+                }
+                Ok(())
+            },
+        )
         .await;
     if let Err(error) = stream_result {
         let completion_seq = app
@@ -2209,11 +2428,27 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         &self,
         request: PreparedProviderRequest,
         cancellation: C,
-        mut on_event: F,
+        on_event: F,
     ) -> Result<(), ProviderError>
     where
         F: FnMut(ProviderEvent),
         C: Future<Output = ()>,
+    {
+        self.stream_prepared_cancellable_observed(request, cancellation, on_event, |_| Ok(()))
+            .await
+    }
+
+    pub(crate) async fn stream_prepared_cancellable_observed<F, C, O>(
+        &self,
+        request: PreparedProviderRequest,
+        cancellation: C,
+        mut on_event: F,
+        mut on_call: O,
+    ) -> Result<(), ProviderError>
+    where
+        F: FnMut(ProviderEvent),
+        C: Future<Output = ()>,
+        O: FnMut(ProviderCallTelemetry) -> Result<(), ProviderError>,
     {
         tokio::pin!(cancellation);
         let mut request = request;
@@ -2243,7 +2478,16 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         let mut captured_events = self.cache.as_ref().map(|_| Vec::new());
         let mut captured_bytes = cache_key.as_ref().map_or(0, String::capacity);
         let mut saw_stopped = false;
+        let mut headers_ms = None;
+        let mut first_semantic_ms = None;
         let mut forward_event = |event| {
+            if let ProviderEvent::Phase { phase, elapsed_ms } = &event {
+                match phase {
+                    ProviderPhase::HeadersReceived => headers_ms = Some(*elapsed_ms),
+                    ProviderPhase::FirstSemantic => first_semantic_ms = Some(*elapsed_ms),
+                    _ => {}
+                }
+            }
             if matches!(event, ProviderEvent::Phase { .. }) {
                 on_event(event);
                 return;
@@ -2289,6 +2533,11 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         let mut terminal_breakdown = None::<UsageBreakdown>;
         // Keep accounting outside the cancellable future so an error, wall
         // deadline or cancellation does not discard usage already received.
+        let mut call_started = false;
+        let mut status = None;
+        let provider = provider_kind_name(self.adapter.kind()).to_owned();
+        let model = self.adapter.model().to_owned();
+        let call_started_at = Instant::now();
         let result = {
             let mut emit = |event| {
                 let event = if coalesce_terminal_usage {
@@ -2322,7 +2571,13 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
                 };
                 forward_event(event);
             };
-            let send = self.send_inner(request, &mut emit);
+            let mut mark_started = || {
+                call_started = true;
+            };
+            let mut observe_status = |response_status| {
+                status = Some(response_status);
+            };
+            let send = self.send_inner(request, &mut emit, &mut mark_started, &mut observe_status);
             tokio::select! {
                 biased;
                 _ = &mut cancellation => Err(ProviderError::Cancelled),
@@ -2341,12 +2596,44 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
                 output_tokens,
             });
         }
-        let _saw_done = result?;
-        if !saw_stopped {
-            return Err(ProviderError::InvalidResponse {
+        let result = match result {
+            Ok(_) if !saw_stopped => Err(ProviderError::InvalidResponse {
                 message: "provider stream ended before completion".into(),
-            });
+            }),
+            result => result,
+        };
+        if call_started {
+            let (outcome, code, retry_after_ms) = match &result {
+                Ok(_) => (ProviderCallOutcome::Success, None, None),
+                Err(error) => {
+                    let (error_status, code, retry_after_ms) = provider_call_error_fields(error);
+                    if status.is_none() {
+                        status = error_status;
+                    }
+                    (
+                        if matches!(error, ProviderError::Cancelled) {
+                            ProviderCallOutcome::Cancelled
+                        } else {
+                            ProviderCallOutcome::Failed
+                        },
+                        code,
+                        retry_after_ms,
+                    )
+                }
+            };
+            on_call(ProviderCallTelemetry {
+                provider,
+                model,
+                duration_ms: elapsed_millis(call_started_at),
+                headers_ms,
+                first_semantic_ms,
+                outcome,
+                status,
+                code,
+                retry_after_ms,
+            })?;
         }
+        let _saw_done = result?;
         if let (Some(cache), Some(key), Some(events)) = (&self.cache, cache_key, captured_events) {
             if !events.iter().any(is_tool_call_event) {
                 cache.insert(key, events);
@@ -2359,12 +2646,15 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         &self,
         request: PreparedProviderRequest,
         on_event: &mut F,
+        on_started: &mut impl FnMut(),
+        on_status: &mut impl FnMut(u16),
     ) -> Result<bool, ProviderError>
     where
         F: FnMut(ProviderEvent),
     {
         let sensitive_values = request.sensitive_values;
         let started = Instant::now();
+        on_started();
         on_event(ProviderEvent::Phase {
             phase: ProviderPhase::Connecting,
             elapsed_ms: 0,
@@ -2395,6 +2685,7 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
             elapsed_ms: elapsed_millis(started),
         });
         let status = response.status();
+        on_status(status.as_u16());
         if !status.is_success() {
             let retry_after = response
                 .headers()
@@ -2441,12 +2732,13 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         let mut received_bytes = 0_usize;
         let mut saw_first_byte = false;
         let mut saw_first_semantic = false;
+        let mut semantic_idle_deadline = started;
         let first_semantic_deadline = started
             .checked_add(self.timeouts.first_semantic)
             .unwrap_or(started);
         let saw_done = loop {
             let wait = if saw_first_semantic {
-                self.timeouts.idle
+                semantic_idle_deadline.saturating_duration_since(Instant::now())
             } else {
                 self.timeouts
                     .idle
@@ -2455,7 +2747,12 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
             if wait.is_zero() {
                 return Err(ProviderError::Transport {
                     safe_to_retry: false,
-                    message: "timeout waiting for the first semantic provider event".into(),
+                    message: if saw_first_semantic {
+                        "provider stream idle timeout (no semantic progress)"
+                    } else {
+                        "timeout waiting for the first semantic provider event"
+                    }
+                    .into(),
                 });
             }
             let next = tokio::time::timeout(wait, bytes.next())
@@ -2463,7 +2760,7 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
                 .map_err(|_| ProviderError::Transport {
                     safe_to_retry: false,
                     message: if saw_first_semantic {
-                        "provider stream idle timeout"
+                        "provider stream idle timeout (no semantic progress)"
                     } else {
                         "timeout waiting for the first semantic provider event"
                     }
@@ -2489,14 +2786,17 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
                 let has_semantic =
                     provider_events_have_semantic_output(std::slice::from_ref(&event));
                 let events = event_redactor.push(event);
-                if (has_semantic || provider_events_have_semantic_output(&events))
-                    && !saw_first_semantic
-                {
-                    on_event(ProviderEvent::Phase {
-                        phase: ProviderPhase::FirstSemantic,
-                        elapsed_ms: elapsed_millis(started),
-                    });
-                    saw_first_semantic = true;
+                if has_semantic || provider_events_have_semantic_output(&events) {
+                    semantic_idle_deadline = Instant::now()
+                        .checked_add(self.timeouts.idle)
+                        .unwrap_or(started);
+                    if !saw_first_semantic {
+                        on_event(ProviderEvent::Phase {
+                            phase: ProviderPhase::FirstSemantic,
+                            elapsed_ms: elapsed_millis(started),
+                        });
+                        saw_first_semantic = true;
+                    }
                 }
                 for event in events {
                     on_event(event);
@@ -2555,7 +2855,9 @@ fn merge_usage_breakdowns(previous: UsageBreakdown, current: UsageBreakdown) -> 
 fn provider_events_have_semantic_output(events: &[ProviderEvent]) -> bool {
     events.iter().any(|event| match event {
         ProviderEvent::ResponsesReasoning(_) => true,
-        ProviderEvent::ChatReasoning(state) => !state.content.is_empty(),
+        ProviderEvent::ChatReasoning(state) => {
+            !state.content.is_empty() || !state.details.is_empty()
+        }
         ProviderEvent::TextDelta(text) | ProviderEvent::ReasoningDelta(text) => !text.is_empty(),
         ProviderEvent::ToolCallDelta {
             id,
@@ -3877,7 +4179,15 @@ fn provider_event_retained_bytes(event: &ProviderEvent) -> usize {
         | ProviderEvent::UsagePartial { .. }
         | ProviderEvent::ResponseCacheHit => 0,
         ProviderEvent::ResponsesReasoning(state) => state.item.to_string().len(),
-        ProviderEvent::ChatReasoning(state) => state.content.capacity() + state.model.capacity(),
+        ProviderEvent::ChatReasoning(state) => {
+            state.content.capacity()
+                + state.model.capacity()
+                + state
+                    .details
+                    .iter()
+                    .map(|detail| detail.to_string().len())
+                    .sum::<usize>()
+        }
         ProviderEvent::Stopped { reason } => reason.capacity(),
         ProviderEvent::TextDelta(text) | ProviderEvent::ReasoningDelta(text) => text.capacity(),
         ProviderEvent::ToolCallDelta {
@@ -4369,6 +4679,15 @@ impl OpenAiCompatibleAdapter {
                         .unwrap_or_default(),
                 );
             }
+            if message.role == "assistant" {
+                if let Some(state) = message
+                    .chat_reasoning
+                    .as_ref()
+                    .filter(|state| state.belongs_to(self) && !state.details.is_empty())
+                {
+                    value["reasoning_details"] = json!(state.details);
+                }
+            }
             if let Some(name) = &message.name {
                 value["name"] = Value::String(name.clone());
             }
@@ -4563,6 +4882,7 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                             .expect("Chat credential scope"),
                         model: self.config.model.clone(),
                         content: reasoning.into(),
+                        details: Vec::new(),
                     }));
                 }
             }
@@ -4574,6 +4894,14 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                 .and_then(Value::as_array)
                 .filter(|details| !details.is_empty())
             {
+                events.push(ProviderEvent::ChatReasoning(ChatReasoning {
+                    scope_id: self
+                        .response_cache_scope_id()
+                        .expect("Chat credential scope"),
+                    model: self.config.model.clone(),
+                    content: String::new(),
+                    details: details.clone(),
+                }));
                 let text = details
                     .iter()
                     .filter_map(|detail| {
@@ -4678,6 +5006,8 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
             let cache_read_tokens = usage
                 .pointer("/prompt_tokens_details/cached_tokens")
                 .and_then(Value::as_u64)
+                .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
+                .or_else(|| usage.get("cached_tokens").and_then(Value::as_u64))
                 .unwrap_or(0);
             let cache_write_tokens = usage
                 .pointer("/prompt_tokens_details/cache_write_tokens")
@@ -4956,6 +5286,7 @@ impl ProviderAdapter for AnthropicAdapter {
         tools: &[Value],
     ) -> Result<PreparedProviderRequest, ProviderError> {
         normalize_messages(messages)?;
+        image_limits::validate_anthropic_images(messages)?;
         PreparedProviderRequest::from_http_body(
             self.config.endpoint.clone(),
             anthropic_headers(&self.config),
@@ -4971,6 +5302,7 @@ impl ProviderAdapter for AnthropicAdapter {
         normalize_messages(messages)?;
         let mut body = self.messages_body(messages, &[]);
         harden_compaction_body(&mut body, true)?;
+        image_limits::validate_anthropic_images(messages)?;
         PreparedProviderRequest::from_http_body(
             self.config.endpoint.clone(),
             anthropic_headers(&self.config),
@@ -5029,6 +5361,27 @@ impl ProviderAdapter for AnthropicAdapter {
                         Some("thinking" | "redacted_thinking")
                     ) {
                         events.push(ProviderEvent::ReasoningStarted);
+                    }
+                    match block.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            if let Some(text) = block
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .filter(|text| !text.is_empty())
+                            {
+                                events.push(ProviderEvent::TextDelta(text.into()));
+                            }
+                        }
+                        Some("thinking") => {
+                            if let Some(text) = block
+                                .get("thinking")
+                                .and_then(Value::as_str)
+                                .filter(|text| !text.is_empty())
+                            {
+                                events.push(ProviderEvent::ReasoningDelta(text.into()));
+                            }
+                        }
+                        _ => {}
                     }
                     if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                         let index = value
@@ -5232,6 +5585,61 @@ mod finalization_tests {
     use super::*;
 
     #[test]
+    fn stream_request_timeout_overrides_only_its_generic_envelope() {
+        let adapter = OpenAiCodexAdapter::new(ProviderConfig::openai_codex(
+            "http://localhost",
+            "fixture-model",
+            "fixture-key",
+            "fixture-account",
+        ))
+        .unwrap();
+        let event = json!({"type":"error","error":{
+            "code":"request_timeout", "type":"invalid_request_error",
+            "message":"stream disconnected before response.completed"
+        }});
+        let ProviderError::Api { metadata, .. } = adapter.parse_event(&event).unwrap_err() else {
+            panic!("expected structured stream error")
+        };
+        assert!(metadata.is_transient());
+        assert_eq!(metadata.code.as_deref(), Some("request_timeout"));
+        assert_eq!(
+            metadata.error_type.as_deref(),
+            Some("invalid_request_error")
+        );
+        assert_eq!(
+            normalized_provider_code("request_timeout").as_deref(),
+            Some("request_timeout")
+        );
+
+        for status in [400, 401, 403, 429, 500, 502, 503, 504] {
+            let mut http = *metadata.clone();
+            http.status = Some(status);
+            assert!(
+                !http.is_transient(),
+                "HTTP {status} must retain the permanent gate"
+            );
+        }
+        for identity in [
+            "invalid_api_key",
+            "insufficient_quota",
+            "invalid_argument",
+            "unknown_detail",
+        ] {
+            let mut specific = *metadata.clone();
+            specific.detail_code = Some(identity.into());
+            assert!(!specific.is_transient(), "detail {identity}");
+            specific.detail_code = None;
+            specific.error_type = Some(identity.into());
+            assert!(!specific.is_transient(), "type {identity}");
+        }
+        for code in [None, Some("invalid_request_error"), Some("unknown_code")] {
+            let mut other = *metadata.clone();
+            other.code = code.map(str::to_owned);
+            assert!(!other.is_transient(), "code {code:?}");
+        }
+    }
+
+    #[test]
     fn anthropic_hidden_thinking_emits_reasoning_signals() {
         let adapter = AnthropicAdapter::new(ProviderConfig::anthropic(
             "https://api.anthropic.com/v1/messages",
@@ -5368,6 +5776,62 @@ mod finalization_tests {
                 !metadata.is_transient(),
                 "explicit code overrides generic type: {code}"
             );
+        }
+    }
+
+    #[test]
+    fn transient_classification_handles_unknown_gateway_statuses_conservatively() {
+        for status in [502, 503, 504] {
+            let metadata = ProviderErrorMetadata {
+                status: Some(status),
+                code: Some("future_provider_code".into()),
+                error_type: None,
+                detail_code: None,
+                retry_after: None,
+            };
+            assert!(metadata.is_transient(), "unknown gateway status: {status}");
+        }
+
+        let unknown_rate_limit = ProviderErrorMetadata {
+            status: Some(429),
+            code: Some("future_provider_code".into()),
+            error_type: None,
+            detail_code: None,
+            retry_after: None,
+        };
+        assert!(!unknown_rate_limit.is_transient());
+
+        for (field, value) in [
+            ("code", "insufficient_quota"),
+            ("error_type", "invalid_api_key"),
+            ("detail_code", "organization_spend_limit_exceeded"),
+        ] {
+            let metadata = ProviderErrorMetadata {
+                status: Some(503),
+                code: (field == "code")
+                    .then(|| value.to_owned())
+                    .or_else(|| Some("server_error".into())),
+                error_type: (field == "error_type")
+                    .then(|| value.to_owned())
+                    .or_else(|| Some("server_error".into())),
+                detail_code: (field == "detail_code").then(|| value.to_owned()),
+                retry_after: None,
+            };
+            assert!(!metadata.is_transient(), "permanent {field} must win");
+        }
+
+        let recognized = ProviderErrorMetadata {
+            status: Some(503),
+            code: Some("server_error".into()),
+            error_type: None,
+            detail_code: None,
+            retry_after: None,
+        };
+        assert!(recognized.is_transient());
+        let mut recognized_on_terminal_status = recognized;
+        for status in [Some(400), Some(401), Some(403), Some(404)] {
+            recognized_on_terminal_status.status = status;
+            assert!(!recognized_on_terminal_status.is_transient());
         }
     }
 
@@ -5601,6 +6065,7 @@ mod continuation_scope_tests {
             scope_id: 42,
             model: "deepseek-v4-flash".into(),
             content: "thought".into(),
+            details: Vec::new(),
         });
         assert_eq!(
             history_response_cache_scope(&[message.clone()], "deepseek-v4-flash"),

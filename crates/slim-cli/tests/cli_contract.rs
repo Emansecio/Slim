@@ -88,6 +88,46 @@ fn headless_binary_rejects_stdin_above_the_prompt_budget() {
 }
 
 #[test]
+fn recovery_does_not_wait_for_open_silent_stdin() {
+    let missing = std::env::temp_dir().join(format!(
+        "slim-recover-missing-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_slim"))
+        .args(["--headless", "--recover"])
+        .arg(&missing)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("recovery process");
+    let stdin = child.stdin.take().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let completed = loop {
+        if child.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    };
+    if !completed {
+        child.kill().expect("stop blocked fixture");
+    }
+    let output = child.wait_with_output().unwrap();
+    drop(stdin);
+    assert!(completed, "recovery waited for stdin EOF");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("explicit recovery rejected"));
+    assert!(!missing.exists());
+}
+
+#[test]
 fn headless_codex_without_jwt_account_id_is_auth() {
     let _lock = ENV_LOCK
         .get_or_init(|| Mutex::new(()))

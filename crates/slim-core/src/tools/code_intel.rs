@@ -36,24 +36,23 @@ pub const CODE_INTEL_ACTIONS: &[&str] = &[
 pub fn code_intel_definition() -> Value {
     json!({
         "name": "code_intel",
-        "description": "Use semantic Rust navigation for definitions (with a bounded preview), references, types/hover, document or workspace symbols and diagnostics. Use search for literal text, strings, configuration or documentation; text matches are not semantic references.",
+        "description": "Semantic Rust navigation and diagnostics; definition includes a bounded preview. Use search for literal text, not semantic references.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": CODE_INTEL_ACTIONS,
-                    "description": "symbol, definition, references, hover, diagnostics, status"
+                    "enum": CODE_INTEL_ACTIONS
                 },
-                "path": {"type": "string", "description": "file path relative to the workspace; for symbol, selects document outline"},
+                "path": {"type": "string", "description": "Workspace-relative; symbol with path selects document outline."},
                 "line": {"type": "integer", "minimum": 1, "description": "1-based line"},
-                "column": {"type": "integer", "minimum": 1, "description": "1-based character within the line"},
-                "symbol": {"type": "string", "description": "optional symbol name for headers"},
-                "query": {"type": "string", "description": "symbol name/query for workspace search; with path, ranks matching document symbols first"},
-                "include_info": {"type": "boolean", "description": "include info/hint diagnostics (default false)"},
+                "column": {"type": "integer", "minimum": 1, "description": "1-based character column."},
+                "symbol": {"type": "string", "description": "Symbol name for headers."},
+                "query": {"type": "string", "description": "Workspace symbol query; with path, ranks document matches first."},
+                "include_info": {"type": "boolean", "description": "Include info/hint diagnostics; default false."},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_CODE_INTEL_RESULTS},
-                "offset": {"type": "integer", "minimum": 0, "description": "references/symbol paging: 0-based index of the first result to return"},
-                "revision": {"type": "integer", "minimum": 0, "description": "continuation token from a previous page's \"revision\" field; rejected when the workspace or server changed since"}
+                "offset": {"type": "integer", "minimum": 0, "description": "0-based references/symbol page offset."},
+                "revision": {"type": "integer", "minimum": 0, "description": "Previous page revision; rejected if workspace/server changed."}
             },
             "required": ["action"],
             "oneOf": [

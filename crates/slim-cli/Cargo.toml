@@ -50,4 +50,5 @@ name = "slim"
 path = "src/main.rs"
 
 [dev-dependencies]
+crossterm = "0.28"
 portable-pty = "0.9"

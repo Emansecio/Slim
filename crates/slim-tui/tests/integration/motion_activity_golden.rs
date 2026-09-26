@@ -151,7 +151,7 @@ fn retry_detail_is_visible_until_the_next_provider_phase() {
         .expect("next phase"),
     );
     let frame = render_state(&state, caps(false)).join("\n");
-    assert!(frame.contains("Conectando ao provedor"), "{frame}");
+    assert!(frame.contains("Aguardando resposta do provedor"), "{frame}");
     assert!(
         !frame.contains("Pensando"),
         "provider plumbing is not reasoning\n{frame}"
@@ -168,6 +168,8 @@ fn hidden_activity_rail_keeps_phase_and_cancel_in_footer() {
         state.apply_event(UiEvent::TodoChanged {
             items: (0..6)
                 .map(|n| TodoItemView {
+                    reason: None,
+                    id: None,
                     title: format!("task {n}"),
                     status: TodoItemStatus::Pending,
                 })
@@ -221,8 +223,40 @@ fn activity_projects_known_phase_and_elapsed() {
     );
 
     let frame = render_state(&state, caps(false)).join("\n");
-    assert!(frame.contains("Pensando"), "{frame}");
-    assert!(frame.contains("2s"), "{frame}");
+    // The visible header owns the thinking time; the rail does not repeat it.
+    assert!(frame.contains("Pensando · 2.5s"), "{frame}");
+    assert!(!frame.contains(" 2s"), "{frame}");
+}
+
+#[test]
+fn rail_labels_the_run_total_when_it_differs_from_the_thinking_time() {
+    let mut state = AppState::new();
+    let tick = |state: &mut AppState, frame: u64, elapsed_ms: u64| {
+        reduce(state, Action::Tick(FrameClock { frame, elapsed_ms }));
+    };
+    tick(&mut state, 1, 1_000);
+    reduce(&mut state, Action::UiEventReceived(UiEvent::run_started(1)));
+    tick(&mut state, 50, 5_000);
+    reduce(
+        &mut state,
+        Action::UiEventReceived(UiEvent::ThinkingStarted),
+    );
+    reduce(
+        &mut state,
+        Action::UiEventReceived(UiEvent::ThinkingDelta {
+            text: "plan".into(),
+        }),
+    );
+    tick(&mut state, 80, 7_500);
+
+    let frame = render_state(&state, caps(false)).join("\n");
+    assert!(frame.contains("Pensando · 2.5s"), "{frame}");
+    assert!(frame.contains("execução 6s"), "{frame}");
+    let rail = frame
+        .lines()
+        .find(|line| line.contains("execução"))
+        .expect("rail row");
+    assert!(!rail.trim_start().starts_with('·'), "{rail}");
 }
 
 #[test]
@@ -274,7 +308,7 @@ fn mid_run_connect_shows_provider_phase_without_fake_reasoning() {
         elapsed_ms: 0,
     });
     let frame = render_state(&state, caps(false)).join("\n");
-    assert!(frame.contains("Conectando ao provedor"), "{frame}");
+    assert!(frame.contains("Aguardando resposta do provedor"), "{frame}");
     assert!(
         !frame.contains("Pensando"),
         "provider plumbing is not reasoning\n{frame}"
@@ -847,6 +881,49 @@ fn terminal_events_close_streaming_lifecycles_and_activity() {
             ) || block.lifecycle != BlockLifecycle::Streaming
         }));
     }
+}
+
+#[test]
+fn exhausted_run_failure_keeps_cause_and_persistent_resume_guidance() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::run_started(1));
+    state.apply_event(UiEvent::RunFailed {
+        run_id: Some(1),
+        message: "provider unavailable".into(),
+    });
+
+    assert!(!state.working);
+    assert!(state.cancellation.is_none());
+    assert!(matches!(
+        state.blocks().last().map(|block| (&block.lifecycle, block.kind())),
+        Some((BlockLifecycle::Failed, BlockKind::Error(message)))
+            if message.contains("provider unavailable")
+                && message.contains("Envie uma nova mensagem nesta conversa para continuar.")
+                && !message.contains("/resume")
+    ));
+    let frame = render_state(&state, caps(false)).join("\n");
+    assert!(
+        frame.contains("provider unavailable"),
+        "a causa precisa permanecer visível:\n{frame}"
+    );
+    assert!(
+        frame.contains("Envie uma nova mensagem nesta conversa para continuar."),
+        "a orientação precisa caber no frame:\n{frame}"
+    );
+    assert!(
+        !frame.contains("/resume"),
+        "falha do provider não usa /resume:\n{frame}"
+    );
+
+    let mut detached = AppState::new();
+    detached.apply_event(UiEvent::RunFailed {
+        run_id: None,
+        message: "session setup failed".into(),
+    });
+    assert!(matches!(
+        detached.blocks().last().map(|block| block.kind()),
+        Some(BlockKind::Error(message)) if message == "session setup failed"
+    ));
 }
 
 #[test]

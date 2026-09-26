@@ -240,12 +240,17 @@ fn search_filter_cycles_all_errors_and_tools() {
 #[test]
 fn copy_shortcut_targets_the_latest_assistant_and_reports_the_real_result() {
     let mut state = AppState::new();
+    let original = "Consulte https://example.com/a/long/path/that/must/not/gain/newlines?query=ação\n\n```rust\nfn main() {\n    println!(\"olá\");\n}\n```";
     state.apply_event(UiEvent::AssistantDelta {
-        text: "copy this answer".into(),
+        text: original.into(),
     });
     state.apply_event(UiEvent::AssistantEnded);
-    let effects = reduce(&mut state, ctrl('y'));
-    assert!(effects.contains(&Effect::CopyToClipboard("copy this answer".into())));
+    for width in [40, 120, 60] {
+        let frame = render(&state, width, 30);
+        assert!(frame.contains("Consulte"), "{frame}");
+        let effects = reduce(&mut state, ctrl('y'));
+        assert!(effects.contains(&Effect::CopyToClipboard(original.into())));
+    }
 
     reduce(&mut state, Action::ClipboardCompleted { success: false });
     assert!(state
@@ -337,10 +342,10 @@ fn wide_transcript_uses_terminal_width_without_automatic_inspector() {
 
     let user_line = wide
         .lines()
-        .find(|line| line.contains("Você  Revise a organização visual"))
+        .find(|line| line.contains("● Você"))
         .expect("user prompt");
     assert_eq!(
-        user_line.find("Você"),
+        user_line.find("●"),
         Some(2),
         "140-column transcript starts at the terminal inset\n{wide}"
     );
@@ -354,10 +359,10 @@ fn below_default_breakpoint_uses_full_width_single_column_without_run_inspector(
         assert!(!narrow.contains(" Run "), "width {width}\n{narrow}");
         let user_line = narrow
             .lines()
-            .find(|line| line.contains("Você  Revise a organização visual"))
+            .find(|line| line.contains("● Você"))
             .expect("user prompt");
         assert_eq!(
-            user_line.find("Você"),
+            user_line.find("●"),
             Some(2),
             "width {width} transcript should use the full terminal width\n{narrow}"
         );

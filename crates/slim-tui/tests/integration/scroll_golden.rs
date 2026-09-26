@@ -113,8 +113,12 @@ fn live_edge_uses_physical_rows_inside_wrapped_user_block() {
     );
 
     let frame = render_at_size(&state, 40, 8);
+    let visible_body: String = transcript_rows(&frame, 40, 8)
+        .iter()
+        .map(|row| row.trim_end_matches(['│', '┃']).trim())
+        .collect();
     assert!(
-        frame.contains("TAIL_VISIBLE"),
+        visible_body.ends_with("TAIL_VISIBLE"),
         "live edge must skip physical wrapped rows, not logical lines\n{frame}"
     );
 }
@@ -191,9 +195,10 @@ fn latest_short_turn_page_fills_from_its_prompt_after_long_history() {
         .unwrap_or_else(|| panic!("latest prompt missing\n{frame}"));
 
     assert_eq!(
-        question_row, 0,
-        "an overflowing history starts the live tail at the top of the transcript\n{frame}"
+        question_row, 1,
+        "an overflowing history starts with the header followed by its body\n{frame}"
     );
+    assert_eq!(transcript[0].trim_end_matches(['│', '┃']).trim(), "● Você");
     assert!(frame.contains("LATEST_ANSWER"));
     assert!(
         !frame.contains("OLD_ANSWER_3"),
@@ -233,23 +238,23 @@ fn turn_boundary_adds_one_row_only_before_later_user() {
         .expect("second question");
 
     assert!(
-        first_question > 0,
+        first_question >= 2,
         "user label precedes first body\n{frame}"
     );
     assert!(
-        rows[first_question - 1].trim().is_empty(),
+        rows[first_question - 2].trim().is_empty(),
         "a short conversation gets one page-fill row above its first turn\n{frame}"
     );
     assert!(
-        second_question >= 2,
+        second_question >= 3,
         "second turn has boundary rows\n{frame}"
     );
     assert!(
-        rows[second_question - 1].trim().is_empty(),
+        rows[second_question - 2].trim().is_empty(),
         "exactly one spacer must precede the next user label\n{frame}"
     );
     assert!(
-        !rows[second_question - 2].trim().is_empty(),
+        !rows[second_question - 3].trim().is_empty(),
         "the turn boundary must not add a second spacer\n{frame}"
     );
 }

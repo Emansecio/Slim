@@ -79,6 +79,36 @@ fn metadata_is_loaded_without_loading_body_and_invalid_skill_is_diagnostic() {
 }
 
 #[test]
+fn empty_skill_metadata_is_rejected_and_diagnostics_are_bounded() {
+    let root = temp_dir();
+    for (name, frontmatter) in [
+        ("empty-name", "name:   \ndescription: valid"),
+        ("empty-description", "name: valid\ndescription:   "),
+    ] {
+        let path = root.join(name);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(
+            path.join("SKILL.md"),
+            format!("---\n{frontmatter}\n---\nbody"),
+        )
+        .unwrap();
+    }
+    let mut discovery = discover(&[SkillRoot::new(&root, 0)]).unwrap();
+    assert!(discovery.active_entries().is_empty());
+    assert_eq!(discovery.warnings.len(), 2);
+    assert!(discovery
+        .diagnostic_lines()
+        .iter()
+        .any(|line| line.contains("empty-name")));
+    discovery.warnings = vec!["é".repeat(1000); 7];
+    let lines = discovery.diagnostic_lines();
+    assert_eq!(lines.len(), 6);
+    assert!(lines[0].chars().count() < 540);
+    assert_eq!(lines[5], "2 more skill warnings omitted");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn metadata_does_not_decode_the_skill_body() {
     let root = temp_dir();
     let skill = root.join("binary-body");

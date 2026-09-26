@@ -274,6 +274,33 @@ fn unmarked_paste_burst_turns_newlines_into_draft_text_not_submits() {
 }
 
 #[test]
+fn conpty_crlf_does_not_duplicate_composer_newlines() {
+    let mut decoder = PasteStreamDecoder::default();
+    let mut state = AppState::default();
+    // ConPTY emits CR as Enter, LF as Ctrl+Enter, with releases between.
+    let mut decoded = collect(
+        &mut decoder,
+        vec![press(KeyCode::Char('a')), press(KeyCode::Enter)],
+    );
+    decoded.extend(collect(
+        &mut decoder,
+        vec![
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+            press(KeyCode::Char('b')),
+        ],
+    ));
+    for event in decoded {
+        if let Some(key) = key_event(&event) {
+            let effects = reduce(&mut state, Action::Key(key));
+            assert!(!effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Send(_))));
+        }
+    }
+    assert_eq!(state.composer.payload(), "a\nb");
+}
+
+#[test]
 fn a_lone_enter_still_submits_and_lone_esc_still_fires() {
     let mut decoder = PasteStreamDecoder::default();
     assert_eq!(

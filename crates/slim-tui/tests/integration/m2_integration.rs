@@ -40,6 +40,8 @@ fn completed_run_retains_pending_tasks_without_marking_the_run_failed() {
         });
         state.apply_event(UiEvent::TodoChanged {
             items: vec![TodoItemView {
+                reason: None,
+                id: None,
                 title: "verify changes".into(),
                 status,
             }],
@@ -497,10 +499,14 @@ fn activity_queue_todo_and_composer_are_projected_into_one_frame() {
     state.apply_event(UiEvent::TodoChanged {
         items: vec![
             slim_tui::api::TodoItemView {
+                reason: None,
+                id: None,
                 title: "first task".into(),
                 status: slim_tui::api::TodoItemStatus::Completed,
             },
             slim_tui::api::TodoItemView {
+                reason: None,
+                id: None,
                 title: "second prompt".into(),
                 status: slim_tui::api::TodoItemStatus::InProgress,
             },
@@ -510,7 +516,9 @@ fn activity_queue_todo_and_composer_are_projected_into_one_frame() {
     let lines = render(&state, 80, 24).lines;
     assert!(lines.iter().any(|line| line == "activity: child running"));
     assert!(lines.iter().any(|line| line == "> second prompt"));
-    assert!(lines.iter().any(|line| line == "todo: 1/2 second prompt"));
+    assert!(lines
+        .iter()
+        .any(|line| line == "TODO 1/2 · parada · second prompt"));
     assert!(lines
         .iter()
         .any(|line| line == "composer: [Pasted Content 0 10 chars]"));

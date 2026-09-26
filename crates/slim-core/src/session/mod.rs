@@ -9,6 +9,7 @@ mod jsonl_repo;
 mod manual_drive;
 mod manual_journal;
 mod memory_repo;
+mod prompt_queue;
 mod queue;
 mod recovery;
 mod reducer;
@@ -18,6 +19,7 @@ mod schema_v2;
 mod tool_phases;
 mod transcript;
 
+pub use prompt_queue::{PromptQueueJournal, PromptQueueSnapshot};
 use serde::{Deserialize, Serialize};
 
 pub use crate::context::CompactionReason;

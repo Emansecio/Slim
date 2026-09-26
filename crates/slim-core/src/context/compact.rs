@@ -1774,7 +1774,7 @@ mod tests {
                 .contains("required heading")
         );
         let wrong_order = "## Goal\nobjetivo\n## Progress\nfeito\n## Constraints\n\n## Blocked\n\n## Decisions\n\n## Next steps\n\n## Critical context\nlocal";
-        assert!(validate_checkpoint_content(&wrong_order, 4096)
+        assert!(validate_checkpoint_content(wrong_order, 4096)
             .unwrap_err()
             .contains("out of order"));
         assert!(validate_checkpoint_content(valid, valid.len() - 1)

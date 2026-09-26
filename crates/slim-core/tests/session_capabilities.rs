@@ -430,6 +430,7 @@ fn typed_task_mutations_are_revisioned_idempotent_and_restorable() {
                 entity_id: "todo".into(),
                 revision: 3,
                 mutation: TaskMutation::TodoSetStatus {
+                    reason: None,
                     id: None,
                     status: TaskTodoStatus::Completed,
                 },
@@ -1053,6 +1054,7 @@ fn task_projection_enforces_todo_plan_and_goal_invariants() {
                 entity_id: "todo-a".into(),
                 revision: 2,
                 mutation: TaskMutation::TodoSetStatus {
+                    reason: None,
                     id: None,
                     status: TaskTodoStatus::InProgress,
                 },
@@ -1075,6 +1077,7 @@ fn task_projection_enforces_todo_plan_and_goal_invariants() {
                 entity_id: "todo-b".into(),
                 revision: 2,
                 mutation: TaskMutation::TodoSetStatus {
+                    reason: None,
                     id: None,
                     status: TaskTodoStatus::InProgress,
                 },

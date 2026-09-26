@@ -3,3 +3,8 @@
 # rather than logical core count, has constrained builds. This does not cap
 # test-runner threads or guarantee that an individual compiler fits in memory.
 jobs = 1
+
+[env]
+# Bound the standard test harness without changing the user's global environment.
+# An explicit RUST_TEST_THREADS or --test-threads still takes precedence.
+RUST_TEST_THREADS = { value = "2", force = false }

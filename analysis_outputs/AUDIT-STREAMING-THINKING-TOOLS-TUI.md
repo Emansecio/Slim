@@ -27,8 +27,8 @@ O fluxo não precisa de redesign amplo. A direção recomendada é preservar a l
 Foram lidos nesta sessão:
 
 - `RULES.md`, `AGENTS.md`;
-- `Documentações - Projeto/DESIGN-SLIM-TUI.md`;
-- `Documentações - Projeto/AUDIT-SLIM-TUI-TRACKER.md`;
+- `docs/DESIGN-SLIM-TUI.md`;
+- `docs/AUDIT-SLIM-TUI-TRACKER.md`;
 - eventos e runtime de `slim-core`;
 - bridge e lifecycle em `crates/slim-cli/src/tui.rs`;
 - `api`, `app`, `block`, `reducer`, `render`, `runtime`, `layout`, `theme`, `view_model`, `markdown` e testes de `slim-tui`;
@@ -190,7 +190,7 @@ Regra transversal da matriz: enquanto `working=true`, o footer mantém a ação 
 | 8 | Ferramenta iniciada | executor emite `ToolStarted { name }` (`crates/slim-core/src/runtime/mod.rs:1074-1095`) | cria um bloco independente por start; se não há terminal tail, activity `RunningTool(name)` (`crates/slim-tui/src/app.rs:815-833`) | `◌ name` em warning/tool; rail `Running name` | `40×10` mostrou `Runni`; sem rail, `Working…` | call ID, argumentos, origem e cancelamento individual |
 | 9 | Ferramenta produz output | `ToolOutput` → `ToolProgress` | no caminho core→TUI normal, limita à primeira linha/512 chars e procura a última Tool **streaming de mesmo nome** (`crates/slim-tui/src/api.rs:461-504`; `crates/slim-tui/src/app.rs:834-841`) | primeira linha; depois pode truncar por largura | sem mudança semântica; apenas menos células | output integral, linhas posteriores, cursor/página e ContentHandle; `UiEvent::ToolProgress` direto não impõe o limite de 512 |
 | 10 | Ferramenta conclui, falha ou é cancelada | `ToolFinished(success)`; cancelamento da run | sucesso→`Complete`, falha→`Failed`; `RunCancelled` só converte blocos ainda streaming em `Cancelled` (`crates/slim-tui/src/app.rs:843-864`, `crates/slim-tui/src/app.rs:609-619`) | `✓` success, `✕ … failed`, `■ … cancelled`, com success/error/warning (`crates/slim-tui/src/runtime.rs:1264-1287`) | detalhe pode truncar; footer volta a exit no terminal | duração, status estruturado e cancelamento individual; se `ToolEnded(false)` chegar antes, o bloco já Failed não vira Cancelled |
-| 11 | Múltiplas ferramentas | provider entrega vetor; core percorre `for call` serialmente (`crates/slim-core/src/runtime/mod.rs:789-830`) | cada `ToolStarted` cria bloco; progress/end correlacionam só por nome (`crates/slim-tui/src/app.rs:815-855`) | completas, consecutivas e homônimas agregam visualmente em `✓ name ×N` (`crates/slim-tui/src/render.rs:175-200`; `crates/slim-tui/src/runtime.rs:860-877`) | grupo economiza rows | IDs, args e outputs dos membros; o paralelismo do mapa de arquitetura-alvo (`Documentações - Projeto/RUST-CLI.md:3-4`, `Documentações - Projeto/RUST-CLI.md:257-260`) não ocorre hoje |
+| 11 | Múltiplas ferramentas | provider entrega vetor; core percorre `for call` serialmente (`crates/slim-core/src/runtime/mod.rs:789-830`) | cada `ToolStarted` cria bloco; progress/end correlacionam só por nome (`crates/slim-tui/src/app.rs:815-855`) | completas, consecutivas e homônimas agregam visualmente em `✓ name ×N` (`crates/slim-tui/src/render.rs:175-200`; `crates/slim-tui/src/runtime.rs:860-877`) | grupo economiza rows | IDs, args e outputs dos membros; o paralelismo do mapa de arquitetura-alvo (`docs/RUST-CLI.md:3-4`, `docs/RUST-CLI.md:257-260`) não ocorre hoje |
 | 12 | Retorno da ferramenta ao provider | não há UiEvent de “awaiting provider” | somente se `ended && was_current && working && terminal_tail.is_none()`, `ToolEnded` entra em `Responding` (`crates/slim-tui/src/app.rs:843-863`) | buffer da sessão mostrou `✓ shell` + `Responding` durante o segundo request silencioso | sem rail, degrada normativamente para `Working…` | transporte, TTFT/retry e diferença entre espera e resposta ativa |
 | 13 | Nova fase de reasoning após tool | novo `ReasoningDelta` | em run ativa e sem terminal tail, como o último bloco é Tool, cria novo Thinking e volta a `Thinking`; após terminal, cria lifecycle terminal sem reativar fase (`crates/slim-tui/src/app.rs:709-731`) | dois thinking blocks separados no buffer `80×24` | cada um recolhido em uma linha | vínculo explícito com round/tool anterior |
 | 14 | Resposta final | `AssistantEnded` | conclui o último Assistant que ainda esteja streaming e projeta usage; sem tal bloco, não muda lifecycle; ainda não encerra `working` (`crates/slim-tui/src/app.rs:695-707`) | resposta fica sem caret quando o bloco foi concluído; rail só some no outcome seguinte | texto continua responsivo/wrapped | motivo final/stop e fronteira entre texto final e outcome |
@@ -202,7 +202,7 @@ Regra transversal da matriz: enquanto `working=true`, o footer mantém a ação 
 ### 5.1 Eventos e lifecycle
 
 - O core tem `ReasoningDelta`, mas não `ThinkingStarted`/`ThinkingEnded`: `crates/slim-core/src/events.rs:18-32`.
-- O contrato normativo mostra explicitamente `ThinkingStarted`, `ThinkingDelta`, `ThinkingEnded`: `Documentações - Projeto/DESIGN-SLIM-TUI.md:512-527`.
+- O contrato normativo mostra explicitamente `ThinkingStarted`, `ThinkingDelta`, `ThinkingEnded`: `docs/DESIGN-SLIM-TUI.md:512-527`.
 - A TUI também possui apenas `ThinkingDelta`: `crates/slim-tui/src/api.rs:273-325`.
 - Sem terminal tail, o primeiro `AssistantDelta` fecha o Thinking streaming encontrado e entra em `Responding`; após terminal, não revive fase/lifecycle: `crates/slim-tui/src/app.rs:663-690`.
 - `ThinkingDelta` cria bloco recolhido e concatena apenas quando o último bloco é um Thinking compatível: `crates/slim-tui/src/app.rs:709-731`.
@@ -216,8 +216,8 @@ Regra transversal da matriz: enquanto `working=true`, o footer mantém a ação 
 - `ToolState` guarda somente `name` e `preview`: `crates/slim-tui/src/block.rs:11-15`.
 - Cada `ToolStarted` cria um bloco; progress/end procuram a última Tool streaming pelo nome, sem call ID: `crates/slim-tui/src/app.rs:815-855`.
 - `ContentPageLoaded` gera apenas uma notificação; não expande conteúdo: `crates/slim-tui/src/app.rs:891-898`.
-- O contrato exige ID, args resumidos, duração, `ContentHandle` e expansão inline: `Documentações - Projeto/DESIGN-SLIM-TUI.md:936-951` e `Documentações - Projeto/DESIGN-SLIM-TUI.md:976-982`.
-- Calls recebidas juntas são executadas serialmente: `crates/slim-core/src/runtime/mod.rs:789-830`; o mapa de contrato/arquitetura-alvo, que não se declara inventário do wiring atual, descreve batches seguros paralelos: `Documentações - Projeto/RUST-CLI.md:3-4` e `Documentações - Projeto/RUST-CLI.md:257-260`.
+- O contrato exige ID, args resumidos, duração, `ContentHandle` e expansão inline: `docs/DESIGN-SLIM-TUI.md:936-951` e `docs/DESIGN-SLIM-TUI.md:976-982`.
+- Calls recebidas juntas são executadas serialmente: `crates/slim-core/src/runtime/mod.rs:789-830`; o mapa de contrato/arquitetura-alvo, que não se declara inventário do wiring atual, descreve batches seguros paralelos: `docs/RUST-CLI.md:3-4` e `docs/RUST-CLI.md:257-260`.
 - Tools completas, consecutivas e de mesmo nome são agregadas apenas na apresentação: `crates/slim-tui/src/render.rs:175-200` e `crates/slim-tui/src/runtime.rs:860-877`.
 
 ### 5.3 Interação e fases
@@ -254,7 +254,7 @@ Rubrica editorial desta auditoria: **P1** compromete confiança/inspeção de um
 
 ### STT-02 — P2 — A fronteira semântica de `Responding` é ambígua após tool
 
-- **Fato:** se `ended && was_current && working && terminal_tail.is_none()`, `ToolEnded` muda a activity para `Responding` antes de qualquer novo delta (`crates/slim-tui/src/app.rs:843-863`). A spec lista `Responding` como fase, mas não define se ela começa no envio do request ou no primeiro byte (`Documentações - Projeto/DESIGN-SLIM-TUI.md:1405-1414`).
+- **Fato:** se `ended && was_current && working && terminal_tail.is_none()`, `ToolEnded` muda a activity para `Responding` antes de qualquer novo delta (`crates/slim-tui/src/app.rs:843-863`). A spec lista `Responding` como fase, mas não define se ela começa no envio do request ou no primeiro byte (`docs/DESIGN-SLIM-TUI.md:1405-1414`).
 - **Reprodução:** fixture concluiu `shell`, aceitou o segundo request e reteve todos os deltas; o binário mostrou `✓ shell` e `◐ Responding · 0s`.
 - **Impacto:** por inferência de UX, o usuário pode ler espera de rede/provider como geração ativa; não há violação inequívoca do contrato atual.
 - **Correção mínima:** primeiro fechar na spec a fronteira. Se `Responding` significar conteúdo recebido, introduzir `AwaitingProvider` após ToolEnded e entrar em `Thinking`/`Responding` no primeiro delta; se significar request ativo, documentar isso e usar copy menos ambígua.
@@ -278,7 +278,7 @@ Rubrica editorial desta auditoria: **P1** compromete confiança/inspeção de um
 
 ### STT-05 — P2 — Multi-tool perde identidade e diverge da arquitetura-alvo documentada
 
-- **Fato:** o core executa calls em loop serial; a apresentação agrega completas consecutivas pelo nome (`crates/slim-core/src/runtime/mod.rs:789-830`; `crates/slim-tui/src/render.rs:175-200`). `RUST-CLI.md` se identifica como arquitetura-alvo, não inventário atual (`Documentações - Projeto/RUST-CLI.md:3-4`).
+- **Fato:** o core executa calls em loop serial; a apresentação agrega completas consecutivas pelo nome (`crates/slim-core/src/runtime/mod.rs:789-830`; `crates/slim-tui/src/render.rs:175-200`). `RUST-CLI.md` se identifica como arquitetura-alvo, não inventário atual (`docs/RUST-CLI.md:3-4`).
 - **Reprodução:** no buffer VT `60×16`, duas calls `shell` distintas viraram `✓ shell ×2`; nenhum membro pôde ser inspecionado.
 - **Impacto:** duração/ordem aparente podem enganar; calls homônimas ficam indistinguíveis; a TUI não está pronta para paralelismo futuro.
 - **Correção mínima:** decidir primeiro o contrato real (serial ou paralelo); em ambos os casos, correlacionar por call ID e permitir expandir o grupo para membros individuais.
@@ -312,17 +312,17 @@ Rubrica editorial desta auditoria: **P1** compromete confiança/inspeção de um
 
 | Tema | Spec | Código atual | Teste atual / lacuna |
 |---|---|---|---|
-| Reasoning lifecycle | start/delta/end (`Documentações - Projeto/DESIGN-SLIM-TUI.md:512-529`) | só delta; fechamento implícito (`crates/slim-tui/src/api.rs:273-325`) | motion testa mudança por AssistantDelta, não boundary real (`crates/slim-tui/tests/motion_activity_golden.rs:73-125`) |
-| Thinking collapsed | recolhido/expansível (`Documentações - Projeto/DESIGN-SLIM-TUI.md:612-613`), preview de 3 linhas (`Documentações - Projeto/DESIGN-SLIM-TUI.md:923-929`) e `ToggleBlock` genérico (`Documentações - Projeto/DESIGN-SLIM-TUI.md:703-716`) | uma linha; sem foco/toggle (`crates/slim-tui/src/runtime.rs:1243-1262`; `crates/slim-tui/src/reducer.rs:12-30`) | não há golden de expansão real |
-| Tool block | ID, args, duração, status, ContentHandle (`Documentações - Projeto/DESIGN-SLIM-TUI.md:936-982`) | name + primeira linha (`crates/slim-tui/src/block.rs:11-15`; `crates/slim-tui/src/api.rs:456-466`) | testes validam lifecycle nominal, não inspeção |
-| Fase pós-tool | lista `Responding`, mas não define sua fronteira inicial (`Documentações - Projeto/DESIGN-SLIM-TUI.md:1405-1414`) | ToolEnded→Responding sob quatro condições (`crates/slim-tui/src/app.rs:843-863`) | teste afirma a transição sem provider gap (`crates/slim-tui/tests/motion_activity_golden.rs:106-125`) |
-| Multi-tool | arquitetura-alvo, não inventário atual, prevê batch seguro paralelo (`Documentações - Projeto/RUST-CLI.md:3-4`, `Documentações - Projeto/RUST-CLI.md:257-260`) | loop serial; aggregate por nome (`crates/slim-core/src/runtime/mod.rs:789-830`; `crates/slim-tui/src/render.rs:175-200`) | fixture preserva calls, mas não valida inspeção individual |
-| Streaming | primeiro delta imediato; seguintes ≤16 ms (`Documentações - Projeto/DESIGN-SLIM-TUI.md:822-829`) | flush por drain; janela não usada (`crates/slim-tui/src/runtime.rs:193-230`) | teste de 1.200 deltas valida completude, não cadência/frame count (`crates/slim-cli/tests/tui_bridge.rs:337-427`) |
-| Filas | stream/control bounded e lossless (`Documentações - Projeto/DESIGN-SLIM-TUI.md:763-804`) | fila core→projector unbounded (`crates/slim-cli/src/tui.rs:1369-1384`) | sem assert de capacidade/RSS |
-| Input/approval | views e comandos tipados (`Documentações - Projeto/DESIGN-SLIM-TUI.md:535-569`) | input sem payload; approval toast (`crates/slim-tui/src/api.rs:474-477`, `crates/slim-tui/src/api.rs:507-532`) | sem E2E bidirecional |
-| ConPTY | matriz golden em `Documentações - Projeto/DESIGN-SLIM-TUI.md:2064-2095`; PTY E2E em `Documentações - Projeto/DESIGN-SLIM-TUI.md:2097-2110` | existe um teste `80×24` básico (`crates/slim-cli/tests/tui_pty.rs:50-66`) | C4 consta fechado e C5 pendente no tracker (`Documentações - Projeto/AUDIT-SLIM-TUI-TRACKER.md:383-386`); teste está `#[ignore]` e usa `CARGO_BIN_EXE_slim` |
+| Reasoning lifecycle | start/delta/end (`docs/DESIGN-SLIM-TUI.md:512-529`) | só delta; fechamento implícito (`crates/slim-tui/src/api.rs:273-325`) | motion testa mudança por AssistantDelta, não boundary real (`crates/slim-tui/tests/motion_activity_golden.rs:73-125`) |
+| Thinking collapsed | recolhido/expansível (`docs/DESIGN-SLIM-TUI.md:612-613`), preview de 3 linhas (`docs/DESIGN-SLIM-TUI.md:923-929`) e `ToggleBlock` genérico (`docs/DESIGN-SLIM-TUI.md:703-716`) | uma linha; sem foco/toggle (`crates/slim-tui/src/runtime.rs:1243-1262`; `crates/slim-tui/src/reducer.rs:12-30`) | não há golden de expansão real |
+| Tool block | ID, args, duração, status, ContentHandle (`docs/DESIGN-SLIM-TUI.md:936-982`) | name + primeira linha (`crates/slim-tui/src/block.rs:11-15`; `crates/slim-tui/src/api.rs:456-466`) | testes validam lifecycle nominal, não inspeção |
+| Fase pós-tool | lista `Responding`, mas não define sua fronteira inicial (`docs/DESIGN-SLIM-TUI.md:1405-1414`) | ToolEnded→Responding sob quatro condições (`crates/slim-tui/src/app.rs:843-863`) | teste afirma a transição sem provider gap (`crates/slim-tui/tests/motion_activity_golden.rs:106-125`) |
+| Multi-tool | arquitetura-alvo, não inventário atual, prevê batch seguro paralelo (`docs/RUST-CLI.md:3-4`, `docs/RUST-CLI.md:257-260`) | loop serial; aggregate por nome (`crates/slim-core/src/runtime/mod.rs:789-830`; `crates/slim-tui/src/render.rs:175-200`) | fixture preserva calls, mas não valida inspeção individual |
+| Streaming | primeiro delta imediato; seguintes ≤16 ms (`docs/DESIGN-SLIM-TUI.md:822-829`) | flush por drain; janela não usada (`crates/slim-tui/src/runtime.rs:193-230`) | teste de 1.200 deltas valida completude, não cadência/frame count (`crates/slim-cli/tests/tui_bridge.rs:337-427`) |
+| Filas | stream/control bounded e lossless (`docs/DESIGN-SLIM-TUI.md:763-804`) | fila core→projector unbounded (`crates/slim-cli/src/tui.rs:1369-1384`) | sem assert de capacidade/RSS |
+| Input/approval | views e comandos tipados (`docs/DESIGN-SLIM-TUI.md:535-569`) | input sem payload; approval toast (`crates/slim-tui/src/api.rs:474-477`, `crates/slim-tui/src/api.rs:507-532`) | sem E2E bidirecional |
+| ConPTY | matriz golden em `docs/DESIGN-SLIM-TUI.md:2064-2095`; PTY E2E em `docs/DESIGN-SLIM-TUI.md:2097-2110` | existe um teste `80×24` básico (`crates/slim-cli/tests/tui_pty.rs:50-66`) | C4 consta fechado e C5 pendente no tracker (`docs/AUDIT-SLIM-TUI-TRACKER.md:383-386`); teste está `#[ignore]` e usa `CARGO_BIN_EXE_slim` |
 
-O `crates/slim-tui/tests/golden_matrix.rs:83-116` percorre tamanhos, mas comprova principalmente ausência de branding/panic, composer, usage e tiling. Não cobre sozinho a matriz normativa de `Documentações - Projeto/DESIGN-SLIM-TUI.md:2064-2095`. O gate PTY continua explicitamente pendente no tracker: `Documentações - Projeto/AUDIT-SLIM-TUI-TRACKER.md:385-386`; `crates/slim-cli/tests/tui_pty.rs:50-66` fixa `80×24`, está ignorado e usa o executável construído pelo Cargo.
+O `crates/slim-tui/tests/golden_matrix.rs:83-116` percorre tamanhos, mas comprova principalmente ausência de branding/panic, composer, usage e tiling. Não cobre sozinho a matriz normativa de `docs/DESIGN-SLIM-TUI.md:2064-2095`. O gate PTY continua explicitamente pendente no tracker: `docs/AUDIT-SLIM-TUI-TRACKER.md:385-386`; `crates/slim-cli/tests/tui_pty.rs:50-66` fixa `80×24`, está ignorado e usa o executável construído pelo Cargo.
 
 ### Hipóteses obrigatórias verificadas
 
@@ -336,7 +336,7 @@ O `crates/slim-tui/tests/golden_matrix.rs:83-116` percorre tamanhos, mas comprov
 8. **Confirmada — argumentos da tool não são exibidos.** O core os possui, porém `ToolState` recebe apenas name/preview: `crates/slim-core/src/events.rs:46-64`; `crates/slim-tui/src/block.rs:11-15`; `crates/slim-tui/src/api.rs:456-466`.
 9. **Confirmada no caminho core→TUI normal — preview usa somente a primeira linha e até 512 caracteres.** `UiEvent::from_core` chama `bounded_first_line`; a variante pública `ToolProgress` em si aceita String sem esse cap: `crates/slim-tui/src/api.rs:318-322`, `crates/slim-tui/src/api.rs:461-504`.
 10. **Confirmada com escopo — tools completas, consecutivas e homônimas são agrupadas em `✓ nome ×N`.** A agregação é somente de apresentação: `crates/slim-tui/src/render.rs:175-200`; `crates/slim-tui/src/runtime.rs:860-877`.
-11. **Confirmada e normativa — terminal baixo pode remover a ActivityRail e usar `Working…`.** É degradação deliberada, não achado: `crates/slim-tui/src/layout.rs:67-97`, `crates/slim-tui/src/layout.rs:164-235`; `crates/slim-tui/src/runtime.rs:1640-1661`; `Documentações - Projeto/DESIGN-SLIM-TUI.md:1195-1198`, `Documentações - Projeto/DESIGN-SLIM-TUI.md:1241-1248`.
+11. **Confirmada e normativa — terminal baixo pode remover a ActivityRail e usar `Working…`.** É degradação deliberada, não achado: `crates/slim-tui/src/layout.rs:67-97`, `crates/slim-tui/src/layout.rs:164-235`; `crates/slim-tui/src/runtime.rs:1640-1661`; `docs/DESIGN-SLIM-TUI.md:1195-1198`, `docs/DESIGN-SLIM-TUI.md:1241-1248`.
 12. **Confirmada — a janela de 16 ms não governa o loop atual.** Ela é armazenada, mas o runtime cria e descarrega o coalescer no mesmo drain sem consultar `window_elapsed()`: `crates/slim-tui/src/render.rs:95-105`; `crates/slim-tui/src/runtime.rs:193-230`.
 13. **Parcial — a equivalência de `ThinkingDelta` é refutada no coalescer, mas existe na projeção do bloco.** O `EventCoalescer` não o une, embora o reducer concatene deltas adjacentes no mesmo Thinking: `crates/slim-tui/src/render.rs:35-93`; `crates/slim-tui/src/app.rs:709-731`.
 14. **Parcial — ticks periódicos de caret, spinner e elapsed respeitam visibilidade; redraws por evento não consultam essa visibilidade.** Motion/elapsed usam predicates visuais, mas qualquer evento reduzido marca `dirty` e desenha: `crates/slim-tui/src/runtime.rs:668-772`, `crates/slim-tui/src/runtime.rs:274-350`, `crates/slim-tui/src/runtime.rs:2748-2951`. CPU não foi medida.
@@ -399,7 +399,7 @@ Quando chegar reasoning:
 Working… ^C
 ```
 
-O fallback genérico abaixo de `40×8` é uma decisão normativa (`Documentações - Projeto/DESIGN-SLIM-TUI.md:1195-1198`, `Documentações - Projeto/DESIGN-SLIM-TUI.md:1241-1260`) e está implementado (`crates/slim-tui/src/layout.rs:164-235`; `crates/slim-tui/src/runtime.rs:1652-1661`). Ele preserva cancelamento ao custo deliberado da fase específica; não foi tratado como defeito nem deve mudar sem revisão explícita da spec.
+O fallback genérico abaixo de `40×8` é uma decisão normativa (`docs/DESIGN-SLIM-TUI.md:1195-1198`, `docs/DESIGN-SLIM-TUI.md:1241-1260`) e está implementado (`crates/slim-tui/src/layout.rs:164-235`; `crates/slim-tui/src/runtime.rs:1652-1661`). Ele preserva cancelamento ao custo deliberado da fase específica; não foi tratado como defeito nem deve mudar sem revisão explícita da spec.
 
 Princípios:
 
@@ -423,7 +423,7 @@ Nenhum slice foi implementado nesta auditoria.
 | 5 | **Input/approval bidirecional** — `events.rs`, `api.rs`, `app.rs`, `reducer.rs`, bridge CLI | request ID + payload + answer/approve/reject + ack/persistência; não mostrar estado antes do round-trip existir | UI entra em espera sem comando capaz de responder | request→render→response→ack funciona; duplicate/stale/reload são determinísticos | alto: segurança de approval e replay |
 | 6 | **Medição de cadência/fila** — testes de `render.rs`, `runtime.rs`, `tui_bridge.rs` | fake clock e consumidor retido; nenhuma mudança de produção | ausência de contagem de frames, latência, profundidade e RSS torna impacto desconhecido | baseline repetível registra first frame, frames/burst, p95, queue high-water e RSS | baixo: harness apenas |
 | 7 | **Cadência/backpressure, condicional ao slice 6** — `render.rs`, `runtime.rs`, `slim-cli/src/tui.rs` | persistir coalescer entre iterações e limitar fila sem perder eventos terminais | threshold previamente definido falha; burst demonstra excesso/crescimento | primeiro delta imediato; demais ≤16 ms; terminal loss `0`; memória/fila dentro do teto medido | alto: ordering, cancelamento e deadlock |
-| 8 | **Harness do binário implantado** — `crates/slim-cli/tests/tui_pty.rs` + fixture offline | aceitar caminho explícito do executável e matriz de dimensões/capabilities | teste atual está `#[ignore]`, fixa `80×24` e usa binário do Cargo | gate reproduz os cenários solicitados nesta auditoria no `Slim.exe` implantado, com buffers persistidos e diff legível; expansão futura cobre PTY M1 (`Documentações - Projeto/DESIGN-SLIM-TUI.md:2097-2110`) | médio: flake de PTY/Windows |
+| 8 | **Harness do binário implantado** — `crates/slim-cli/tests/tui_pty.rs` + fixture offline | aceitar caminho explícito do executável e matriz de dimensões/capabilities | teste atual está `#[ignore]`, fixa `80×24` e usa binário do Cargo | gate reproduz os cenários solicitados nesta auditoria no `Slim.exe` implantado, com buffers persistidos e diff legível; expansão futura cobre PTY M1 (`docs/DESIGN-SLIM-TUI.md:2097-2110`) | médio: flake de PTY/Windows |
 
 Cada slice deve atualizar primeiro a spec quando alterar comportamento normativo e, após código, cumprir o deploy obrigatório do projeto. Isso não se aplica a esta auditoria somente leitura.
 
@@ -448,7 +448,7 @@ Cada slice deve atualizar primeiro a spec quando alterar comportamento normativo
 - impacto perceptível do coalescing ausente;
 - equivalência de performance entre fixture loopback e provider real.
 
-O tracker registra testes e benchmark históricos, mas eles não foram reexecutados e não são tratados como medição atual (`Documentações - Projeto/AUDIT-SLIM-TUI-TRACKER.md:500-506`).
+O tracker registra testes e benchmark históricos, mas eles não foram reexecutados e não são tratados como medição atual (`docs/AUDIT-SLIM-TUI-TRACKER.md:500-506`).
 
 ## 11. Limites, preservações e verificação
 

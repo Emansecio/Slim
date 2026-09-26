@@ -32,10 +32,14 @@ fn state_with_content() -> AppState {
         slim_tui::reducer::Action::UiEventReceived(slim_tui::api::UiEvent::TodoChanged {
             items: vec![
                 TodoItemView {
+                    reason: None,
+                    id: None,
                     title: "um".into(),
                     status: TodoItemStatus::Completed,
                 },
                 TodoItemView {
+                    reason: None,
+                    id: None,
                     title: "dois".into(),
                     status: TodoItemStatus::InProgress,
                 },
@@ -149,9 +153,19 @@ fn surface_levels_stay_distinguishable_across_color_depths() {
                 to_terminal_color(depth, theme.tool_accent),
                 Color::LightGreen
             );
+            // Headings carry hierarchy by weight on ivory, not by green.
+            assert_eq!(to_terminal_color(depth, theme.heading_accent), Color::White);
             assert_eq!(
-                to_terminal_color(depth, theme.heading_accent),
+                to_terminal_color(depth, theme.border_focus),
                 Color::LightGreen
+            );
+        }
+        // The raised user band stays one distinct step above the transcript.
+        if matches!(depth, ColorDepth::TrueColor | ColorDepth::Ansi256) {
+            assert_ne!(
+                to_terminal_color(depth, theme.user_prompt_bg),
+                surface,
+                "user band must stay distinct at {depth:?}"
             );
         }
         // Transcript and composer intentionally use true black; overlays are

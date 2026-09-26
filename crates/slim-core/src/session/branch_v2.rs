@@ -1,11 +1,9 @@
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use super::jsonl_repo::JsonlRepo;
-use super::repository::DurableRepo;
 use super::resume::{preflight_session, PreflightStatus};
-use super::schema_v2::DurableRecord;
+use super::schema_v2::{DurableRecord, DurableSessionHeader};
 use super::SessionFormat;
 use crate::context::{
     build_summary_prompt_with_checkpoint, compaction_prefix_fingerprint,
@@ -44,6 +42,26 @@ pub fn create_durable_branch(
     child_id: &str,
     cutoff_seq: u64,
 ) -> io::Result<DurableBranch> {
+    let prepared = prepare_durable_branch(path, child_id, cutoff_seq)?;
+    drop(JsonlRepo::create_with_records(
+        &prepared.branch.path,
+        prepared.header,
+        prepared.records,
+    )?);
+    Ok(prepared.branch)
+}
+
+struct PreparedBranch {
+    branch: DurableBranch,
+    header: DurableSessionHeader,
+    records: Vec<DurableRecord>,
+}
+
+fn prepare_durable_branch(
+    path: impl AsRef<Path>,
+    child_id: &str,
+    cutoff_seq: u64,
+) -> io::Result<PreparedBranch> {
     validate_child_id(child_id)?;
     let report = preflight_session(path)?;
     if report.format != Some(SessionFormat::DurableV2) {
@@ -110,38 +128,32 @@ pub fn create_durable_branch(
     let header = report
         .header
         .ok_or_else(|| invalid_input("durable parent header is missing"))?;
-    let child_header = super::schema_v2::DurableSessionHeader::new(
+    let child_header = DurableSessionHeader::new(
         child_id,
         header.timestamp,
         header.cwd,
         Some(parent_id.clone()),
         Some(cutoff_seq),
     );
-    let mut child = JsonlRepo::create(&child_path, child_header)?;
-    for record in report
+    let records = report
         .records
         .into_iter()
         .filter(|record| record.seq() <= cutoff_seq)
-    {
-        if let Err(error) = child.append(record) {
-            drop(child);
-            let _ = fs::remove_file(&child_path);
-            return Err(error);
-        }
-    }
-    drop(child);
-    Ok(DurableBranch {
-        path: child_path,
-        parent_id,
-        cutoff_seq,
-        next_seq,
+        .collect();
+    Ok(PreparedBranch {
+        branch: DurableBranch {
+            path: child_path,
+            parent_id,
+            cutoff_seq,
+            next_seq,
+        },
+        header: child_header,
+        records,
     })
 }
 
-/// Create the confirmed child prefix first, then summarize its compactable
-/// history through an injected offline-testable callback and append a v2
-/// checkpoint. The pure branch helper remains unchanged and `/tree` is not
-/// involved.
+/// Prepare and summarize the confirmed prefix, then publish child and checkpoint
+/// together. A failed summary leaves the requested child id free for retry.
 pub async fn create_durable_branch_compacted<F, Fut>(
     path: impl AsRef<Path>,
     child_id: &str,
@@ -152,9 +164,8 @@ where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = io::Result<String>>,
 {
-    let branch = create_durable_branch(path, child_id, cutoff_seq)?;
-    let report = preflight_session(&branch.path)?;
-    let entries: Vec<_> = report
+    let mut prepared = prepare_durable_branch(path, child_id, cutoff_seq)?;
+    let entries: Vec<_> = prepared
         .records
         .iter()
         .filter_map(|record| match record {
@@ -162,17 +173,14 @@ where
             _ => None,
         })
         .collect();
-    let Ok(messages) = super::provider_messages_from_records(report.records.iter()) else {
-        // A cutoff inside a tool batch is not a complete conversation to summarize.
-        return Ok(branch);
-    };
+    let messages = super::provider_messages_from_records(prepared.records.iter())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let entry_ids: Vec<_> = entries.iter().map(|entry| entry.entry_id.clone()).collect();
     let mut policy = CompactionPolicy::default();
     policy.keep_recent_tokens = policy.keep_recent_for_window(32_000);
-    let Ok(selection) = select_compaction_history(&messages, &policy) else {
-        return Ok(branch);
-    };
-    let previous = report.records.iter().rev().find_map(|record| {
+    let selection = select_compaction_history(&messages, &policy)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let previous = prepared.records.iter().rev().find_map(|record| {
         if let DurableRecord::Compaction { checkpoint, .. } = record {
             Some(checkpoint)
         } else {
@@ -189,10 +197,12 @@ where
     if summary.trim().is_empty() || summary.len() > policy.summary_max_bytes {
         return Err(invalid_input("branch compaction summary is invalid"));
     }
-    let mut child = JsonlRepo::open(&branch.path)?;
-    let seq = child.next_seq()?;
+    let seq = prepared.branch.next_seq;
+    let following_seq = seq
+        .checked_add(1)
+        .ok_or_else(|| invalid_input("branch checkpoint successor overflowed"))?;
     let previous_checkpoint_id = previous.map(|checkpoint| checkpoint.checkpoint_id.clone());
-    child.append(DurableRecord::Compaction {
+    prepared.records.push(DurableRecord::Compaction {
         seq,
         checkpoint: super::schema_v2::CompactionCheckpoint {
             checkpoint_id: format!("compact-{child_id}-{seq}"),
@@ -209,8 +219,14 @@ where
             read_files: Vec::new(),
             modified_files: Vec::new(),
         },
-    })?;
-    Ok(branch)
+    });
+    drop(JsonlRepo::create_with_records(
+        &prepared.branch.path,
+        prepared.header,
+        prepared.records,
+    )?);
+    prepared.branch.next_seq = following_seq;
+    Ok(prepared.branch)
 }
 
 pub(crate) fn validate_child_id(child_id: &str) -> io::Result<()> {

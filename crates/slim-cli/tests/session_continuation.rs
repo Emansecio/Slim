@@ -153,6 +153,7 @@ fn consecutive_compactions_restore_the_latest_checkpoint_and_pending_tasks() {
             json!({"choices":[{"delta":{"tool_calls":[call]},"finish_reason":"tool_calls"}]}),
             summary("second-checkpoint"),
             json!({"choices":[{"delta":{"content":"Tasks recorded"},"finish_reason":"stop"}]}),
+            json!({"choices":[{"delta":{"content":"Tasks remain pending"},"finish_reason":"stop"}]}),
         ],
         move |index| {
             if index == 1 {
@@ -188,7 +189,14 @@ fn consecutive_compactions_restore_the_latest_checkpoint_and_pending_tasks() {
     )
     .unwrap();
     let requests = server.join().unwrap();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 5);
+    assert!(requests[4]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("[Todo final review]"))));
     assert_eq!(result.code, slim_cli::ExitCode::Success);
     assert!(result
         .stop_message
@@ -227,7 +235,7 @@ fn consecutive_compactions_restore_the_latest_checkpoint_and_pending_tasks() {
         .unwrap()
         .contains("[Run ended]"));
 
-    let (endpoint, server) = spawn_turn(vec![None]);
+    let (endpoint, server) = spawn_turn(vec![None, None]);
     let resumed = slim_cli::run_provider_headless_with_resume_and_options(
         request(endpoint),
         &session,
@@ -241,6 +249,7 @@ fn consecutive_compactions_restore_the_latest_checkpoint_and_pending_tasks() {
         .unwrap()
         .contains("verify changes"));
     let restored = server.join().unwrap();
+    assert_eq!(restored.len(), 2, "one bounded review after resume");
     let messages = restored[0]["messages"].as_array().unwrap();
     assert!(messages.iter().any(
         |message| message["content"]
@@ -339,6 +348,7 @@ fn cli_command(cwd: &Path, session: &Path, endpoint: &str, resume: bool) -> Comm
         .current_dir(cwd)
         .env("SLIM_CONFIG_FILE", cwd.join("empty.toml"))
         .env("SLIM_API_KEY", "continuation-fixture-secret")
+        .env("SLIM_CONTEXT_WINDOW_TOKENS", "32768")
         .args([
             "--headless",
             "--provider",
@@ -384,7 +394,7 @@ fn new_session_reopens_in_another_process_with_tools_and_fresh_file_guards() {
         Some(tool(
             "first-check",
             "shell",
-            json!({"command":"if ((Get-Content state.txt -Raw).Trim() -ne 'first') { throw 'bad state' }; Add-Content run-count.txt first"}),
+            json!({"command":"if ((Get-Content state.txt -Raw).Trim() -ne 'first') { throw 'bad state' }; Add-Content run-count.txt first","yield_ms":10000}),
         )),
         None,
     ]);
@@ -425,7 +435,7 @@ fn new_session_reopens_in_another_process_with_tools_and_fresh_file_guards() {
         Some(tool(
             "second-check",
             "shell",
-            json!({"command":"if ((Get-Content state.txt -Raw).Trim() -ne 'second') { throw 'bad state' }"}),
+            json!({"command":"if ((Get-Content state.txt -Raw).Trim() -ne 'second') { throw 'bad state' }","yield_ms":10000}),
         )),
         None,
     ]);
@@ -506,7 +516,9 @@ fn new_session_reopens_in_another_process_with_tools_and_fresh_file_guards() {
     let (runtime, channels) = slim_cli::spawn_tui_runtime_with_resume(
         request,
         &session,
-        slim_cli::ProviderRunOptions::default().with_workspace_root(&root.0),
+        slim_cli::ProviderRunOptions::default()
+            .with_context_window_tokens(32_768)
+            .with_workspace_root(&root.0),
     )
     .unwrap();
     let restored = channels
@@ -666,7 +678,7 @@ fn interrupted_process_after_side_effect_cannot_resume_or_replay_it() {
                 let mut call = tool(
                     "side-effect",
                     "shell",
-                    json!({"command":"Add-Content crash-marker.txt completed; Write-Output 'durable-receipt-42'"}),
+                    json!({"command":"Add-Content crash-marker.txt completed; Write-Output 'durable-receipt-42'","yield_ms":10000}),
                 );
                 call["index"] = json!(0);
                 let chunk = json!({"choices":[{"delta":{"tool_calls":[call]},"finish_reason":"tool_calls"}]});
@@ -814,7 +826,7 @@ fn interrupted_batch_recovers_known_results_and_marks_missing_results_unknown() 
             tool(
                 "in-flight",
                 "shell",
-                json!({"command":command,"timeout_ms":15000}),
+                json!({"command":command,"timeout_ms":15000,"yield_ms":10000}),
             ),
             tool(
                 "not-started",

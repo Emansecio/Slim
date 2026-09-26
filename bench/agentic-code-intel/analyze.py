@@ -5,6 +5,30 @@ from pathlib import Path
 from evaluate import RESULTS, dump
 
 
+def cargo_validation(call):
+    return call["tool"] == "shell" and cargo_validation_arguments(call["arguments"])
+
+
+def cargo_validation_arguments(args):
+    command = args.get("command")
+    if not isinstance(command, str):
+        return False
+    argv = args.get("args")
+    if argv is None:
+        if any(char in command for char in ";|&><`$\n\r"):
+            return False
+        argv = command.split()
+    elif isinstance(argv, list) and all(isinstance(arg, str) for arg in argv):
+        argv = [command, *argv]
+    else:
+        return False
+    if len(argv) < 2 or argv[0] not in ("cargo", "cargo.exe"):
+        return False
+    if any(arg.strip("'\"") in ("--fix", "--help", "-h", "--version", "-V") for arg in argv):
+        return False
+    return argv[1] in ("test", "check", "clippy") or (argv[1] == "fmt" and "--check" in argv[2:])
+
+
 def analyze(out):
     run = json.loads((out / "run.json").read_text(encoding="utf-8"))
     result = json.loads((out / "result.jsonl").read_text(encoding="utf-8"))
@@ -48,6 +72,40 @@ def analyze(out):
             if error["run"] == out.name:
                 calls[error["call"]-1]["error_category"] = error["category"]
     counts = collections.Counter(c["tool"] for c in calls)
+    complete_results = all(c["result_bytes"] is not None for c in calls)
+    adjacent_edit_cargo_validation_pairs = (sum(
+        first["tool"] in ("write", "patch") and cargo_validation(second)
+        for first, second in zip(calls, calls[1:])
+    ) if complete_results else None)
+    cross_round_edit_cargo_validation_pairs = (sum(
+        first["tool"] in ("write", "patch") and cargo_validation(second)
+        and first["batch"] != second["batch"]
+        for first, second in zip(calls, calls[1:])
+    ) if complete_results else None)
+    fused_edit_cargo_validation_calls = (sum(
+        call["tool"] in ("write", "patch")
+        and isinstance(call["arguments"].get("then_run"), dict)
+        and cargo_validation_arguments(call["arguments"]["then_run"])
+        for call in calls
+    ) if complete_results else None)
+    large_tool_results_gt_10k = (sum(
+        c["result_bytes"] > 10 * 1024 for c in calls
+    ) if complete_results else None)
+    process_facts = result.get("tool_process_facts")
+    shell_truncated_calls = shell_preview_omitted_bytes = shell_capture_discarded_bytes = None
+    if isinstance(process_facts, list):
+        shell_facts = [fact["process"] for fact in process_facts
+                       if fact.get("name") in ("shell", "write", "patch")]
+        shell_truncated_calls = sum(
+            p["stdout_bytes"] > 8192 or p["stderr_bytes"] > 8192 for p in shell_facts
+        )
+        shell_preview_omitted_bytes = sum(
+            max(0, p["stdout_bytes"] - 8192) + max(0, p["stderr_bytes"] - 8192)
+            for p in shell_facts
+        )
+        shell_capture_discarded_bytes = sum(
+            p["stdout_discarded_bytes"] + p["stderr_discarded_bytes"] for p in shell_facts
+        )
     buckets = {name: counts.get(name, 0) for name in ("code_intel", "search", "read", "shell")}
     buckets["patch/write"] = counts["patch"] + counts["write"]
     buckets["other"] = sum(counts.values()) - sum(buckets.values())
@@ -62,6 +120,13 @@ def analyze(out):
                    tool_sequence=[[calls[i-1]["tool"] for i in b["calls"]] for b in batches],
                    rounds=rounds, batches=len(batches), calls=len(calls), counts=dict(counts), buckets=buckets,
                    missing_results=sum(c["result"] is None for c in calls),
+                   adjacent_edit_cargo_validation_pairs=adjacent_edit_cargo_validation_pairs,
+                   cross_round_edit_cargo_validation_pairs=cross_round_edit_cargo_validation_pairs,
+                   fused_edit_cargo_validation_calls=fused_edit_cargo_validation_calls,
+                   large_tool_results_gt_10k=large_tool_results_gt_10k,
+                   shell_truncated_calls=shell_truncated_calls,
+                   shell_preview_omitted_bytes=shell_preview_omitted_bytes,
+                   shell_capture_discarded_bytes=shell_capture_discarded_bytes,
                    result_bytes=sum(c["result_bytes"] or 0 for c in calls),
                    wall_ms=run["wall_ms"], provider_latency_ms=usage.get("provider_latency_ms"),
                    tool_latency_ms=usage.get("tool_latency_ms"), provider_turns=usage.get("provider_turns"),

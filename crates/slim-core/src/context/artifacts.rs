@@ -1,7 +1,12 @@
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 
 use crate::tools::digest_bytes;
 
@@ -38,8 +43,8 @@ impl ArtifactStore {
     /// Stores `content` under a content-addressed id (`{label}-{sha256}`).
     /// Byte-identical repeats (e.g. the same >16 KiB tool output produced on
     /// consecutive turns) reuse the existing file instead of writing another
-    /// timestamped duplicate: the write is skipped when a file with the same
-    /// id already holds exactly `content.len()` bytes.
+    /// timestamped duplicate: the write is skipped only when the existing
+    /// regular file holds the same bytes.
     pub fn put(&self, label: &str, content: &[u8]) -> io::Result<ArtifactHandle> {
         let staged = self.stage(label, content)?;
         self.commit_staged(staged)
@@ -47,15 +52,21 @@ impl ArtifactStore {
 
     pub(crate) fn stage(&self, label: &str, content: &[u8]) -> io::Result<StagedArtifact> {
         let handle = self.preview(label, content);
-        let path = handle.path.clone();
-        let already_stored = fs::metadata(&path)
-            .map(|metadata| metadata.len() == content.len() as u64)
-            .unwrap_or(false);
-        if already_stored {
-            return Ok(StagedArtifact {
-                handle,
-                temp_path: None,
-            });
+        match self.read(&handle) {
+            Ok(existing) if existing == content => {
+                return Ok(StagedArtifact {
+                    handle,
+                    temp_path: None,
+                });
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "artifact id already contains different content",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
         fs::create_dir_all(&self.root)?;
         let temp_path = loop {
@@ -96,28 +107,35 @@ impl ArtifactStore {
 
     pub(crate) fn commit_staged(&self, staged: StagedArtifact) -> io::Result<ArtifactHandle> {
         let Some(temp_path) = staged.temp_path else {
+            self.read(&staged.handle)?;
             return Ok(staged.handle);
         };
-        if fs::metadata(&staged.handle.path)
-            .map(|metadata| metadata.len() == staged.handle.size)
-            .unwrap_or(false)
-        {
-            fs::remove_file(temp_path)?;
-            return Ok(staged.handle);
+        match self.read(&staged.handle) {
+            Ok(_) => {
+                fs::remove_file(temp_path)?;
+                return Ok(staged.handle);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let _ = fs::remove_file(temp_path);
+                return Err(error);
+            }
         }
-        match fs::rename(&temp_path, &staged.handle.path) {
-            Ok(()) => Ok(staged.handle),
-            Err(_error)
-                if fs::metadata(&staged.handle.path)
-                    .map(|metadata| metadata.len() == staged.handle.size)
-                    .unwrap_or(false) =>
-            {
+        // Create the final name only if absent; rename would replace a file
+        // another process published between the read above and this step.
+        match fs::hard_link(&temp_path, &staged.handle.path) {
+            Ok(()) => {
                 fs::remove_file(temp_path)?;
                 Ok(staged.handle)
             }
             Err(error) => {
+                let result = match self.read(&staged.handle) {
+                    Ok(_) => Ok(staged.handle),
+                    Err(read_error) if read_error.kind() == io::ErrorKind::NotFound => Err(error),
+                    Err(read_error) => Err(read_error),
+                };
                 let _ = fs::remove_file(temp_path);
-                Err(error)
+                result
             }
         }
     }
@@ -149,7 +167,102 @@ impl ArtifactStore {
     }
 
     pub fn read(&self, handle: &ArtifactHandle) -> io::Result<Vec<u8>> {
-        fs::read(&handle.path)
+        let (label, expected_digest) = handle
+            .id
+            .rsplit_once('-')
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid artifact id"))?;
+        if !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || expected_digest.len() != 64
+            || !expected_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || handle.path != self.root.join(&handle.id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid artifact handle",
+            ));
+        }
+
+        let metadata = fs::symlink_metadata(&handle.path)?;
+        if !regular_artifact(&metadata) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "artifact is not a regular file",
+            ));
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW);
+        #[cfg(windows)]
+        options.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
+        let mut file = options.open(&handle.path)?;
+        let metadata = file.metadata()?;
+        if !regular_artifact(&metadata) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "artifact is not a regular file",
+            ));
+        }
+        if metadata.len() != handle.size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "artifact size differs from handle",
+            ));
+        }
+        let mut content = Vec::new();
+        file.read_to_end(&mut content)?;
+        if content.len() as u64 != handle.size
+            || digest_bytes(b"slim-artifact-v1", &content) != expected_digest
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "artifact content differs from id",
+            ));
+        }
+        Ok(content)
+    }
+
+    /// Resolve an opaque id only within this store, then verify its contents.
+    pub(crate) fn read_id(&self, id: &str) -> io::Result<Vec<u8>> {
+        let (label, digest) = id
+            .rsplit_once('-')
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid artifact id"))?;
+        if label.is_empty()
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid artifact id",
+            ));
+        }
+        let path = self.root.join(id);
+        let size = fs::symlink_metadata(&path)?.len();
+        self.read(&ArtifactHandle {
+            id: id.to_owned(),
+            path,
+            size,
+        })
+    }
+}
+
+fn regular_artifact(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        metadata.is_file() && metadata.file_attributes() & 0x400 == 0 // FILE_ATTRIBUTE_REPARSE_POINT
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.is_file() && !metadata.file_type().is_symlink()
     }
 }
 
@@ -185,6 +298,83 @@ mod tests {
             "identical content must not write a second file"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn same_size_corruption_is_not_read_or_reused() {
+        let root = std::env::temp_dir().join(format!(
+            "slim-artifact-corrupt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = ArtifactStore::new(&root).unwrap();
+        let handle = store.put("output", b"original").unwrap();
+        std::fs::write(&handle.path, b"corrupt!").unwrap();
+
+        assert_eq!(
+            store.read(&handle).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            store.put("output", b"original").unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(std::fs::read(&handle.path).unwrap(), b"corrupt!");
+
+        std::fs::remove_file(&handle.path).unwrap();
+        let staged = store.stage("output", b"original").unwrap();
+        std::fs::write(&handle.path, b"corrupt!").unwrap();
+        assert_eq!(
+            store.commit_staged(staged).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(std::fs::read(&handle.path).unwrap(), b"corrupt!");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn symlink_with_valid_content_is_not_an_artifact() {
+        let root = std::env::temp_dir().join(format!(
+            "slim-artifact-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = ArtifactStore::new(&root).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let handle = store.preview("output", b"original");
+        let target = root.join("target");
+        std::fs::write(&target, b"original").unwrap();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, &handle.path);
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&target, &handle.path);
+        if let Err(error) = linked {
+            std::fs::remove_dir_all(root).unwrap();
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                || cfg!(windows) && error.raw_os_error() == Some(1314)
+            {
+                return; // Symlink creation can require elevated privileges on Windows.
+            }
+            panic!("symlink creation failed: {error}");
+        }
+
+        assert_eq!(
+            store.read(&handle).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            store.put("output", b"original").unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use slim_cli::{
-    load_local_images, render_provider_jsonl, render_provider_text, run_cli, run_provider_headless,
-    run_provider_headless_with_options, run_provider_headless_with_session,
-    run_provider_headless_with_session_and_options, ExitCode, ProviderRequest, ProviderRunOptions,
+    load_local_images, render_provider_jsonl, render_provider_text, run_cli,
+    run_provider_headless_with_options, run_provider_headless_with_session_and_options, ExitCode,
+    ProviderRequest, ProviderRunOptions,
 };
 use slim_core::provider::ProviderKind;
 use slim_core::session::{
@@ -181,12 +181,15 @@ fn spawn_image_fixture(kind: ProviderKind, image_count: usize) -> (String, threa
         match kind {
             ProviderKind::OpenAiCompatible => {
                 assert_eq!(content[1]["type"], "image_url");
-                assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AAEC");
+                assert_eq!(
+                    content[1]["image_url"]["url"],
+                    format!("data:image/png;base64,{IMAGE_PNG}")
+                );
             }
             ProviderKind::Anthropic => {
                 assert_eq!(content[1]["type"], "image");
                 assert_eq!(content[1]["source"]["media_type"], "image/png");
-                assert_eq!(content[1]["source"]["data"], "AAEC");
+                assert_eq!(content[1]["source"]["data"], IMAGE_PNG);
             }
             ProviderKind::OpenAiCodex
             | ProviderKind::OpenCodeGo
@@ -289,7 +292,9 @@ data: [DONE]
             timeout: Duration::from_secs(2),
         },
         &session_path,
-        ProviderRunOptions::default().with_max_output_tokens(1234),
+        ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
+            .with_max_output_tokens(1234),
     )
     .expect("provider");
     server.join().expect("server");
@@ -646,6 +651,7 @@ fn configured_headless_executes_a_read_tool_call_in_auto_mode() {
             timeout: Duration::from_secs(2),
         },
         ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
             .with_workspace_root(&root)
             .with_artifact_root(root.join("artifacts")),
     )
@@ -742,6 +748,7 @@ fn configured_headless_runs_a_second_provider_turn_after_tool_result() {
         },
         &session_path,
         ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
             .with_workspace_root(&root)
             .with_artifact_root(root.join("artifacts")),
     )
@@ -764,13 +771,16 @@ fn bounded_stops_expose_stable_status_and_nonzero_codes() {
     std::fs::create_dir_all(&root).expect("root");
     for (options, expected_code, expected_stop, events) in [
         (
-            ProviderRunOptions::default().with_max_turns(1),
+            ProviderRunOptions::default()
+                .with_context_window_tokens(32_000)
+                .with_max_turns(1),
             ExitCode::Blocked,
             "turn_limit",
             vec![tool_event("missing.txt", "turn-1"), finish_tool_event()],
         ),
         (
             ProviderRunOptions::default()
+                .with_context_window_tokens(32_000)
                 .with_max_tool_calls(0)
                 .with_max_read_tool_calls(0),
             ExitCode::Tool,
@@ -858,6 +868,7 @@ fn repeated_failed_tool_stop_is_blocked_and_anti_loop_is_reported() {
             timeout: Duration::from_secs(2),
         },
         ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
             .with_workspace_root(&root)
             .with_artifact_root(root.join("artifacts")),
     )
@@ -869,8 +880,12 @@ fn repeated_failed_tool_stop_is_blocked_and_anti_loop_is_reported() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+const IMAGE_PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
 #[test]
 fn local_images_are_repeatable_and_encoded_for_both_provider_shapes() {
+    use base64::Engine;
     let _lock = ENV_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -878,7 +893,13 @@ fn local_images_are_repeatable_and_encoded_for_both_provider_shapes() {
     let root = std::env::temp_dir().join(format!("slim-images-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("root");
     let image = root.join("fixture.png");
-    std::fs::write(&image, [0_u8, 1, 2]).expect("image");
+    std::fs::write(
+        &image,
+        base64::engine::general_purpose::STANDARD
+            .decode(IMAGE_PNG)
+            .unwrap(),
+    )
+    .expect("image");
     let paths = vec![image.to_string_lossy().to_string()];
     let blocks = load_local_images(&paths).expect("image blocks");
     assert_eq!(blocks.len(), 1);
@@ -897,6 +918,7 @@ fn local_images_are_repeatable_and_encoded_for_both_provider_shapes() {
                 timeout: Duration::from_secs(2),
             },
             ProviderRunOptions::default()
+                .with_context_window_tokens(32_000)
                 .with_content_blocks(blocks.clone())
                 .with_workspace_root(&root)
                 .with_artifact_root(root.join("artifacts")),
@@ -908,6 +930,8 @@ fn local_images_are_repeatable_and_encoded_for_both_provider_shapes() {
     }
 
     let previous_key = std::env::var_os("SLIM_API_KEY");
+    let previous_context = std::env::var_os("SLIM_CONTEXT_WINDOW_TOKENS");
+    std::env::set_var("SLIM_CONTEXT_WINDOW_TOKENS", "131072");
     std::env::set_var("SLIM_API_KEY", "image-cli-secret");
     let (endpoint, server) = spawn_image_fixture(ProviderKind::OpenAiCompatible, 2);
     let output = run_cli(
@@ -933,7 +957,32 @@ fn local_images_are_repeatable_and_encoded_for_both_provider_shapes() {
     } else {
         std::env::remove_var("SLIM_API_KEY");
     }
+    if let Some(value) = previous_context {
+        std::env::set_var("SLIM_CONTEXT_WINDOW_TOKENS", value);
+    } else {
+        std::env::remove_var("SLIM_CONTEXT_WINDOW_TOKENS");
+    }
     assert_eq!(output.code, ExitCode::Success);
     assert_eq!(output.stdout, "image ok\n");
     let _ = std::fs::remove_dir_all(root);
+}
+
+fn run_provider_headless(
+    request: ProviderRequest,
+) -> Result<slim_cli::ProviderHeadlessResult, slim_core::provider::ProviderError> {
+    run_provider_headless_with_options(
+        request,
+        ProviderRunOptions::default().with_context_window_tokens(32_000),
+    )
+}
+
+fn run_provider_headless_with_session(
+    request: ProviderRequest,
+    path: &std::path::Path,
+) -> Result<slim_cli::ProviderHeadlessResult, slim_core::provider::ProviderError> {
+    run_provider_headless_with_session_and_options(
+        request,
+        path,
+        ProviderRunOptions::default().with_context_window_tokens(32_000),
+    )
 }

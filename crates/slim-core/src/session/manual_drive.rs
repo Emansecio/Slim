@@ -60,6 +60,13 @@ pub struct RunTelemetryContext {
     pub provider: String,
     pub model: String,
     pub build_revision: String,
+    /// SHA-256 digest of the exact executable image used by this process.
+    /// `None` is paired with `executable_identity_error` when the image could
+    /// not be identified without exposing a filesystem path or OS error.
+    pub executable_sha256: Option<String>,
+    /// Bounded, non-sensitive category explaining why executable identity is
+    /// unavailable, when applicable.
+    pub executable_identity_error: Option<String>,
     /// Unix timestamp in milliseconds.
     pub started_at: u64,
     /// Configured limits known before execution. The terminal snapshot may
@@ -503,6 +510,8 @@ fn run_telemetry_fact(
             "provider": context.provider,
             "model": context.model,
             "build_revision": context.build_revision,
+            "executable_sha256": context.executable_sha256,
+            "executable_identity_error": context.executable_identity_error,
             "started_at": context.started_at,
             "duration_ms": duration_ms,
             "stop": stop,

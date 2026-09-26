@@ -2,16 +2,19 @@ use std::io::{self, Stdout};
 
 use crossterm::cursor::{Hide, SetCursorStyle};
 use crossterm::event::EnableBracketedPaste;
-use crossterm::execute;
+use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+use crossterm::{execute, queue};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::terminal::TerminalGuard;
-use crate::theme::Capabilities;
+use crate::theme::{env_flag_enabled, Capabilities};
 
 pub struct FullscreenBackend {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     guard: TerminalGuard,
+    /// DEC 2026 synchronized output; `SLIM_SYNC_OUTPUT=0` turns it off.
+    synchronized: bool,
 }
 
 impl FullscreenBackend {
@@ -33,11 +36,33 @@ impl FullscreenBackend {
         }
         let _ = execute!(stdout, SetCursorStyle::BlinkingBar, Hide);
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-        Ok(Self { terminal, guard })
+        Ok(Self {
+            terminal,
+            guard,
+            synchronized: env_flag_enabled("SLIM_SYNC_OUTPUT", true),
+        })
     }
 
     pub fn terminal(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
         &mut self.terminal
+    }
+
+    /// Draws one frame inside a synchronized update, so the terminal
+    /// presents it whole instead of mid-write. Terminals without DEC 2026
+    /// ignore the markers. The update is closed even if drawing fails.
+    pub fn draw_synchronized<F>(&mut self, render: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut ratatui::Frame),
+    {
+        if self.synchronized {
+            queue!(self.terminal.backend_mut(), BeginSynchronizedUpdate)?;
+        }
+        let drawn = self.terminal.draw(render).map(|_| ());
+        if self.synchronized {
+            let ended = execute!(self.terminal.backend_mut(), EndSynchronizedUpdate);
+            return drawn.and(ended);
+        }
+        drawn
     }
 
     pub fn shutdown(mut self) -> io::Result<()> {

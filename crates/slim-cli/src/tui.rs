@@ -24,9 +24,9 @@ use slim_core::{
 use slim_tui::api::{
     ClinePassCatalogSource, CommandCodeCatalogSource, ContentHandle, ContentRequestId,
     InteractionRequestId, LoginProvider, McpServerView, McpStatusView, ModelAlias,
-    OpenCodeCatalogSource, OpenCodeModelView, PageCursor, ReasoningEffort, ToolBatchId, ToolCallId,
-    TranscriptMessage, TranscriptRole, UiChannels, UiCommand, UiEvent, WakeSignal,
-    ZenCatalogSource,
+    OpenCodeCatalogSource, OpenCodeModelView, PageCursor, PromptAdmission, ReasoningEffort,
+    ToolBatchId, ToolCallId, TranscriptMessage, TranscriptRole, UiChannels, UiCommand, UiEvent,
+    WakeSignal, ZenCatalogSource, STREAM_EVENT_CAPACITY,
 };
 
 use crate::cli::parse_cli_args;
@@ -40,14 +40,16 @@ use crate::headless::{
     ProviderExecution, ProviderRequest, ProviderRunOptions, SkillInstructions,
     MAX_SLASH_SKILL_BODY_BYTES,
 };
-use crate::oauth::{OAuthCredential, OAuthError, OAuthProgress, OAuthProvider, OAuthService};
+use crate::oauth::{
+    FreshCredential, OAuthCredential, OAuthError, OAuthProgress, OAuthProvider, OAuthService,
+};
 use crate::opencode_go_catalog::{CatalogSnapshot, CatalogSource, OpenCodeCatalog};
 use crate::opencode_zen_catalog::OpenCodeZenCatalog;
 use crate::{delete_api_key, load_local_images, resolve_provider_credential, save_api_key};
 
 pub struct TuiRuntimeHandle {
     shutdown: Option<mpsc::Sender<UiCommand>>,
-    worker: Option<thread::JoinHandle<()>>,
+    worker: Option<thread::JoinHandle<Vec<String>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -142,12 +144,14 @@ fn valid_slash_skill_name(name: &str) -> bool {
 
 /// Skill names for slash completion, discovered here (never on the TUI
 /// thread) and attached to the workspace events that carry them.
-fn workspace_skill_names(workspace_root: &Path) -> Vec<String> {
+fn workspace_skill_names(workspace_root: &Path, warnings: &mut String) -> Vec<String> {
+    warnings.clear();
     if !workspace_root.is_dir() {
         return Vec::new();
     }
     slim_core::skills::discover_workspace(workspace_root)
         .map(|discovery| {
+            *warnings = discovery.diagnostic_lines().join("\n");
             discovery
                 .active_entries()
                 .iter()
@@ -161,18 +165,23 @@ fn workspace_skill_names(workspace_root: &Path) -> Vec<String> {
 /// Memoized variant of [`workspace_skill_names`] so the startup
 /// WorkspaceChanged + SessionRestored pair scans the same workspace once.
 fn memoized_skill_names(
-    memo: &mut Option<(PathBuf, Vec<String>)>,
+    memo: &mut Option<(PathBuf, Vec<String>, String)>,
     root: Option<PathBuf>,
+    warnings: &mut String,
 ) -> Vec<String> {
     let Some(root) = root else {
+        warnings.clear();
         return Vec::new();
     };
     let root = root.canonicalize().unwrap_or(root);
-    if let Some((_, names)) = memo.as_ref().filter(|(cached, _)| *cached == root) {
+    if let Some((_, names, cached_warnings)) =
+        memo.as_ref().filter(|(cached, _, _)| *cached == root)
+    {
+        warnings.clone_from(cached_warnings);
         return names.clone();
     }
-    let names = workspace_skill_names(&root);
-    *memo = Some((root, names.clone()));
+    let names = workspace_skill_names(&root, warnings);
+    *memo = Some((root, names.clone(), warnings.clone()));
     names
 }
 
@@ -442,16 +451,15 @@ pub fn run_tui(args: Vec<String>) -> Result<(), TuiError> {
     let startup = prepare_tui(args, &oauth)?;
     let initial_prompt = startup.initial_prompt.clone();
     let (runtime, channels) = spawn_tui_session(startup, oauth).map_err(tui_provider_error)?;
-    if let Some(prompt) = initial_prompt {
-        channels
-            .commands
-            .send(UiCommand::SendPrompt(prompt))
-            .map_err(|_| TuiError::new(ExitCode::Internal, "TUI runtime disconnected"))?;
-    }
-    let result = slim_tui::run_app(channels)
+    let result = slim_tui::run_app_with_initial_prompt(channels, initial_prompt)
         .map_err(|error| TuiError::new(ExitCode::Internal, error.to_string()));
     let worker_result = runtime.finish();
-    result.and(worker_result)
+    if let Ok(warnings) = &worker_result {
+        for warning in warnings {
+            eprintln!("warning: {warning}");
+        }
+    }
+    result.and(worker_result.map(|_| ()))
 }
 
 fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, TuiError> {
@@ -560,16 +568,12 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
 
     let (mut request, oauth_session) = if let Some(provider_name) = explicit_provider {
         let kind = provider_kind(&provider_name)?;
-        let api_request = if kind != ProviderKind::OpenAiCodex {
-            api_key_request(
-                kind,
-                parsed.mode,
-                endpoint_override.as_deref(),
-                model_override.as_deref(),
-            )?
-        } else {
-            None
-        };
+        let api_request = api_key_request(
+            kind,
+            parsed.mode,
+            endpoint_override.as_deref(),
+            model_override.as_deref(),
+        )?;
         if api_request.is_some() {
             (api_request, None)
         } else if let Some((provider, credential)) = oauth
@@ -600,16 +604,12 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
         let active_oauth = oauth.active().map_err(tui_auth_error)?;
         if let Some(provider_name) = active_provider {
             let kind = provider_kind(&provider_name)?;
-            let api_request = if kind != ProviderKind::OpenAiCodex {
-                api_key_request(
-                    kind,
-                    parsed.mode,
-                    endpoint_override.as_deref(),
-                    model_override.as_deref(),
-                )?
-            } else {
-                None
-            };
+            let api_request = api_key_request(
+                kind,
+                parsed.mode,
+                endpoint_override.as_deref(),
+                model_override.as_deref(),
+            )?;
             if api_request.is_some() {
                 (api_request, None)
             } else if let Some((provider, credential)) =
@@ -898,6 +898,11 @@ fn api_key_request(
         return Ok(None);
     }
     let api_key = credential.access;
+    let account_id = if kind == ProviderKind::OpenAiCodex {
+        Some(crate::oauth::codex_account_id(&api_key).map_err(tui_auth_error)?)
+    } else {
+        None
+    };
     let (default_endpoint, default_model) = defaults(kind);
     // G248: a configured model only applies when it belongs to this provider;
     // otherwise the provider default is used (no cross-kind leakage).
@@ -913,7 +918,7 @@ fn api_key_request(
         endpoint: endpoint.unwrap_or(default_endpoint).into(),
         model,
         api_key,
-        account_id: None,
+        account_id,
         timeout: Duration::from_secs(120),
     }))
 }
@@ -967,11 +972,11 @@ fn provider_kind_for_oauth(provider: OAuthProvider) -> ProviderKind {
 
 impl TuiRuntimeHandle {
     /// Shut down and observe the worker result without exposing panic payloads.
-    pub fn finish(mut self) -> Result<(), TuiError> {
+    pub fn finish(mut self) -> Result<Vec<String>, TuiError> {
         self.shutdown_and_join()
     }
 
-    fn shutdown_and_join(&mut self) -> Result<(), TuiError> {
+    fn shutdown_and_join(&mut self) -> Result<Vec<String>, TuiError> {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(UiCommand::Shutdown);
         }
@@ -981,9 +986,10 @@ impl TuiRuntimeHandle {
                     ExitCode::Internal,
                     "TUI worker thread failed; run completion and prior effects are unverified",
                 )
-            })?;
+            })
+        } else {
+            Ok(Vec::new())
         }
-        Ok(())
     }
 }
 
@@ -1134,7 +1140,7 @@ fn spawn_tui_session(
     // Bounded lanes per spec §10.1: immediate control 256 and ordered stream
     // 1024. Both are lossless/blocking; adjacent deltas may coalesce downstream.
     let (control_tx, control_rx) = mpsc::sync_channel::<UiEvent>(256);
-    let (data_tx, data_rx) = mpsc::sync_channel::<UiEvent>(1024);
+    let (data_tx, data_rx) = mpsc::sync_channel::<UiEvent>(STREAM_EVENT_CAPACITY);
     let wake = WakeSignal::new().map_err(|error| ProviderError::InvalidResponse {
         message: format!("TUI wake signal: {error}"),
     })?;
@@ -1261,8 +1267,8 @@ impl EventSink {
                 // core receiver so later causal suffixes are still delivered.
                 return true;
             }
-            // Causal accounting, interaction, tool boundaries and the
-            // AssistantEnded fence migrate off a full data lane after cancel.
+            // Causal accounting, interaction, final tool output/boundaries
+            // and the AssistantEnded fence migrate off a full data lane after cancel.
             // Sequential projection preserves their order before the terminal.
             let sender = if event.is_control()
                 || (cancelled && (causal_telemetry || survives_cancellation))
@@ -1306,12 +1312,15 @@ impl Drop for EventSink {
 
 struct ActiveRun {
     run_id: u64,
+    admission: Option<PromptAdmission>,
+    cancellation_from_preparation: bool,
     task: tokio::task::JoinHandle<Result<ProviderExecution, ProviderError>>,
     projector: thread::JoinHandle<()>,
     cancellation: CancellationToken,
     durable: bool,
     content_store: SharedContentStore,
     interaction_responder: Option<InteractionResponder>,
+    manual_retry: slim_core::runtime::ManualRetryHandle,
 }
 
 struct ActiveRunLaunch {
@@ -1322,6 +1331,7 @@ struct ActiveRunLaunch {
 
 struct PendingRun {
     run_id: u64,
+    admission: Option<PromptAdmission>,
     result: Option<Result<Result<ProviderExecution, ProviderError>, tokio::task::JoinError>>,
     projector: Option<thread::JoinHandle<()>>,
     delivery: VecDeque<UiEvent>,
@@ -1329,6 +1339,141 @@ struct PendingRun {
     durable: bool,
     cancel_requested: bool,
     content_store: SharedContentStore,
+}
+
+struct ActivePromptPreparation {
+    admission: PromptAdmission,
+    prompt: String,
+    skill_instructions: Option<SkillInstructions>,
+    task: tokio::task::JoinHandle<Result<Option<FreshCredential>, OAuthError>>,
+}
+
+fn start_prompt_run(
+    prompt: String,
+    admission: Option<PromptAdmission>,
+    skill_instructions: Option<SkillInstructions>,
+    startup: &mut TuiStartup,
+    sink: &EventSink,
+    content_store: SharedContentStore,
+    next_run_id: &mut u64,
+    active: &mut Option<ActiveRun>,
+    skill_memo: &mut Option<(PathBuf, Vec<String>, String)>,
+    skill_warnings: &mut String,
+) -> Result<(), String> {
+    if startup.request.is_none() {
+        return Err("No provider connected. Use /login.".into());
+    }
+    if !startup.image_labels.is_empty() {
+        if let Some(message) = image_model_error(startup.request.as_ref()) {
+            return Err(message);
+        }
+    }
+    match create_tui_session(startup) {
+        Ok(Some((session_id, cwd))) => {
+            let skill_names = memoized_skill_names(
+                skill_memo,
+                startup.options.workspace_root.clone(),
+                skill_warnings,
+            );
+            let _ = sink.send(UiEvent::SessionSnapshot {
+                session_id: slim_tui::api::SessionId(session_id.into()),
+                cwd,
+                skill_names,
+            });
+            if !skill_warnings.is_empty() {
+                let _ = sink.send(UiEvent::Notification {
+                    message: skill_warnings.clone(),
+                });
+            }
+        }
+        Ok(None) => {}
+        Err(message) => return Err(message),
+    }
+    let request = startup
+        .request
+        .as_mut()
+        .expect("provider checked before session creation");
+    request.prompt.clone_from(&prompt);
+    let api_key = request.api_key.clone();
+    let request = request.clone();
+    let Some(run_id) = take_run_id(next_run_id) else {
+        return Err("TUI run identity exhausted".into());
+    };
+    let tool_budget = match (
+        resolve_max_mutating_tool_calls(&startup.options),
+        resolve_max_read_tool_calls(&startup.options),
+        resolve_max_turns(&startup.options),
+    ) {
+        (Ok(max_mutating), Ok(max_read), Ok(max_turns)) => (max_mutating, max_read, max_turns),
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+            return Err(provider_error_message(error));
+        }
+    };
+    if let Some(admission) = admission {
+        let _ = sink.send(UiEvent::PromptRunStarted {
+            admission,
+            run_id,
+            max_mutating_tool_calls: tool_budget.0,
+            max_read_tool_calls: tool_budget.1,
+            max_turns: tool_budget.2,
+        });
+    } else {
+        let _ = sink.send(UiEvent::run_started_with_budget(
+            run_id,
+            tool_budget.0,
+            tool_budget.1,
+            tool_budget.2,
+        ));
+    }
+    let mut display_prompt = redact_for_ui(&prompt, &api_key);
+    if !startup.image_labels.is_empty() {
+        display_prompt.push_str("\n\n");
+        for label in &startup.image_labels {
+            display_prompt.push_str(&format!("[image · {label}]\n"));
+        }
+        display_prompt.pop();
+    }
+    let _ = sink.send(UiEvent::UserMessageAdded {
+        text: display_prompt,
+    });
+    let run_options = startup.options.clone();
+    let resume_preflight = startup.resume_preflight.take();
+    match start_active_run(
+        run_id,
+        admission,
+        ActiveRunLaunch {
+            request,
+            options: run_options,
+            skill_instructions,
+        },
+        startup.resume_path.clone(),
+        resume_preflight,
+        sink.clone(),
+        content_store,
+    ) {
+        Ok(run) => {
+            startup.options.content_blocks.clear();
+            startup.image_labels.clear();
+            let _ = sink.send(UiEvent::AttachmentsChanged { labels: Vec::new() });
+            *active = Some(run);
+        }
+        Err(message) => {
+            if let Some(admission) = admission {
+                let _ = sink.send(UiEvent::PromptRunFailed {
+                    admission,
+                    run_id: Some(run_id),
+                    message,
+                });
+            } else {
+                let _ = sink.send(UiEvent::RestoreDraft { text: prompt });
+                let _ = sink.send(UiEvent::RunFailed {
+                    run_id: Some(run_id),
+                    message,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 const CONTENT_PAGE_BYTES: usize = 16 * 1024;
@@ -1458,6 +1603,11 @@ enum LoginEvent {
     Finished(Result<Result<OAuthCredential, OAuthError>, tokio::task::JoinError>),
 }
 
+enum PromptPreparationEvent {
+    Command(Option<UiCommand>),
+    Finished(Result<Result<Option<FreshCredential>, OAuthError>, tokio::task::JoinError>),
+}
+
 fn unbound_interaction_ack(request_id: InteractionRequestId) -> UiEvent {
     UiEvent::InteractionAcknowledged {
         request_id,
@@ -1519,7 +1669,7 @@ fn run_worker(
     oauth: OAuthService,
     command_rx: mpsc::Receiver<UiCommand>,
     sink: EventSink,
-) {
+) -> Vec<String> {
     let (async_tx, mut async_rx) = tokio::sync::mpsc::unbounded_channel();
     let forwarder = thread::spawn(move || {
         while let Ok(command) = command_rx.recv() {
@@ -1542,11 +1692,32 @@ fn run_worker(
                 run_id: None,
                 message: format!("runtime: {error}"),
             });
-            return;
+            return Vec::new();
         }
     };
-    tokio_runtime.block_on(async move {
+    let warnings = tokio_runtime.block_on(async move {
+        let (oauth_warning_stop, mut oauth_warning_stop_rx) = tokio::sync::watch::channel(false);
+        let warning_oauth = oauth.clone();
+        let warning_sink = sink.clone();
+        let oauth_warning_forwarder = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(200));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        for message in warning_oauth.take_warnings() {
+                            let _ = warning_sink.send(UiEvent::Notification { message });
+                        }
+                    }
+                    changed = oauth_warning_stop_rx.changed() => {
+                        if changed.is_err() || *oauth_warning_stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
         let mut skill_memo = None;
+        let mut skill_warnings = String::new();
         let cwd = startup
             .options
             .workspace_root
@@ -1554,19 +1725,20 @@ fn run_worker(
             .map(display_workspace_path)
             .unwrap_or_default();
         let skill_names =
-            memoized_skill_names(&mut skill_memo, startup.options.workspace_root.clone());
+            memoized_skill_names(&mut skill_memo, startup.options.workspace_root.clone(), &mut skill_warnings);
         sink.send(UiEvent::WorkspaceChanged { cwd, skill_names });
         if let Some(preflight) = startup.resume_preflight.as_ref() {
             match session_transcript(preflight) {
                 Ok(messages) => {
                     let todo_event = match restored_todo_event(preflight) {
                         Ok(event) => event,
-                        Err(message) => { sink.send(UiEvent::RunFailed { run_id: None, message }); return; }
+                        Err(message) => { sink.send(UiEvent::RunFailed { run_id: None, message }); return Vec::new(); }
                     };
                     if let Some(header) = preflight.header.as_ref() {
                         let skill_names = memoized_skill_names(
                             &mut skill_memo,
                             Some(PathBuf::from(&header.cwd)),
+                            &mut skill_warnings,
                         );
                         sink.send(UiEvent::SessionRestored {
                             session_id: slim_tui::api::SessionId(header.id.clone().into()),
@@ -1577,8 +1749,32 @@ fn run_worker(
                         sink.send(todo_event);
                     }
                 }
-                Err(message) => { sink.send(UiEvent::RunFailed { run_id: None, message }); return; }
+                Err(message) => { sink.send(UiEvent::RunFailed { run_id: None, message }); return Vec::new(); }
             }
+        }
+        if startup.initial_prompt.is_some() && startup.resume_path.is_none() {
+            match create_tui_session(&mut startup) {
+                Ok(Some((session_id, cwd))) => {
+                    let skill_names = memoized_skill_names(
+                        &mut skill_memo,
+                        startup.options.workspace_root.clone(),
+                        &mut skill_warnings,
+                    );
+                    sink.send(UiEvent::SessionSnapshot {
+                        session_id: slim_tui::api::SessionId(session_id.into()),
+                        cwd,
+                        skill_names,
+                    });
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    sink.send(UiEvent::RunFailed { run_id: None, message });
+                }
+            }
+        }
+        // Restore clears old notifications; publish discovery diagnostics afterwards.
+        if !skill_warnings.is_empty() {
+            sink.send(UiEvent::Notification { message: skill_warnings.clone() });
         }
         sink.send(UiEvent::ModeChanged { mode: startup.mode });
         let provider = startup
@@ -1595,6 +1791,7 @@ fn run_worker(
                         ProviderKind::ClinePass => Some(LoginProvider::ClinePass),
                         ProviderKind::CommandCode => Some(LoginProvider::CommandCode),
                         ProviderKind::Xai => Some(LoginProvider::Xai),
+                        ProviderKind::OpenAiCodex => Some(LoginProvider::OpenAiCodex),
                         _ => None,
                     }
                 })
@@ -1622,6 +1819,8 @@ fn run_worker(
             });
         }
         let mut active: Option<ActiveRun> = None;
+        let mut preparing: Option<ActivePromptPreparation> = None;
+        let mut ignored_prep_cancel = false;
         let mut pending: Option<PendingRun> = None;
         let mut last_esc_at: Option<Instant> = None;
         let mut login: Option<ActiveLogin> = None;
@@ -1669,17 +1868,147 @@ fn run_worker(
         let mut mcp_watch_tick = tokio::time::interval(Duration::from_secs(1));
         let mcp_inflight = Arc::new(Mutex::new(HashSet::<String>::new()));
         loop {
+            if let Some(mut prompt_prep) = preparing.take() {
+                let wake = tokio::select! {
+                    biased;
+                    command = async_rx.recv() => PromptPreparationEvent::Command(command),
+                    result = &mut prompt_prep.task => PromptPreparationEvent::Finished(result),
+                };
+                match wake {
+                    PromptPreparationEvent::Command(Some(UiCommand::CancelPromptPreparation { admission }))
+                        if admission == prompt_prep.admission =>
+                    {
+                        prompt_prep.task.abort();
+                        let _ = sink.send(UiEvent::PromptPreparationCancelled { admission });
+                    }
+                    PromptPreparationEvent::Command(Some(UiCommand::CancelRun)) => {
+                        let admission = prompt_prep.admission;
+                        prompt_prep.task.abort();
+                        let _ = sink.send(UiEvent::PromptPreparationCancelled { admission });
+                    }
+                    PromptPreparationEvent::Command(Some(UiCommand::Shutdown))
+                    | PromptPreparationEvent::Command(None) => {
+                        let admission = prompt_prep.admission;
+                        prompt_prep.task.abort();
+                        let _ = sink.send(UiEvent::PromptPreparationCancelled { admission });
+                        let _ = sink.send(UiEvent::Shutdown);
+                        break;
+                    }
+                    PromptPreparationEvent::Command(Some(UiCommand::McpWatch { on })) => {
+                        mcp_watch = on;
+                        preparing = Some(prompt_prep);
+                    }
+                    PromptPreparationEvent::Command(Some(UiCommand::McpRefresh)) => {
+                        if let Some(manager) = mcp_manager.as_ref() {
+                            let _ = sink.send(UiEvent::McpServersChanged {
+                                servers: mcp_server_views(manager),
+                            });
+                        }
+                        preparing = Some(prompt_prep);
+                    }
+                    PromptPreparationEvent::Command(Some(UiCommand::CancelPromptPreparation { .. })) => {
+                        let _ = sink.send(UiEvent::Notification {
+                            message: "A preparação ativa pertence a outro prompt".into(),
+                        });
+                        preparing = Some(prompt_prep);
+                    }
+                    PromptPreparationEvent::Command(Some(_)) => {
+                        let _ = sink.send(UiEvent::Notification {
+                            message: "Aguarde ou cancele a preparação ativa".into(),
+                        });
+                        preparing = Some(prompt_prep);
+                    }
+                    PromptPreparationEvent::Finished(result) => {
+                        match result {
+                            Ok(Ok(Some(fresh))) => {
+                                if let Some(message) = fresh.persistence_warning {
+                                    let _ = sink.send(UiEvent::Notification { message });
+                                }
+                                let credential = fresh.credential;
+                                let Some(provider) = startup
+                                    .oauth_session
+                                    .as_ref()
+                                    .map(|(provider, _)| *provider)
+                                else {
+                                    let _ = sink.send(UiEvent::PromptPreparationFailed {
+                                        admission: prompt_prep.admission,
+                                        message: "OAuth session disappeared during prompt preparation".into(),
+                                    });
+                                    continue;
+                                };
+                                match oauth_request(
+                                    provider,
+                                    &credential,
+                                    startup.mode,
+                                    startup.endpoint_override.as_deref(),
+                                    startup.model_override.as_deref(),
+                                ) {
+                                    Ok(request) => {
+                                        startup.request = Some(request);
+                                        startup.oauth_session = Some((provider, credential));
+                                    }
+                                    Err(error) => {
+                                        let _ = sink.send(UiEvent::PromptPreparationFailed {
+                                            admission: prompt_prep.admission,
+                                            message: error.to_string(),
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
+                            Ok(Ok(None)) => {}
+                            Ok(Err(error)) => {
+                                let _ = sink.send(UiEvent::PromptPreparationFailed {
+                                    admission: prompt_prep.admission,
+                                    message: format!("Authentication: {error}"),
+                                });
+                                continue;
+                            }
+                            Err(_) => {
+                                let _ = sink.send(UiEvent::PromptPreparationFailed {
+                                    admission: prompt_prep.admission,
+                                    message: "OAuth credential preparation task failed".into(),
+                                });
+                                continue;
+                            }
+                        }
+                        if let Err(message) = start_prompt_run(
+                            prompt_prep.prompt,
+                            Some(prompt_prep.admission),
+                            prompt_prep.skill_instructions,
+                            &mut startup,
+                            &sink,
+                            content_store.clone(),
+                            &mut next_run_id,
+                            &mut active,
+                            &mut skill_memo,
+                            &mut skill_warnings,
+                        ) {
+                            let _ = sink.send(UiEvent::PromptPreparationFailed {
+                                admission: prompt_prep.admission,
+                                message,
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
             if let Some(mut run) = pending.take() {
                 if let Some(projector) = run.projector.take() {
                     if projector.is_finished() {
                         let _ = projector.join();
                         let result = run.result.take().expect("pending result");
                         if run.cancel_requested {
-                            send_cancel_result(run.run_id, result, &sink);
+                            send_cancel_result(run.run_id, run.admission, result, &sink);
                             continue;
                         }
                         let deferred = std::mem::take(&mut run.delivery);
-                        run.delivery = execution_result_events(run.run_id, result, run.durable);
+                        run.delivery = execution_result_events(
+                            run.run_id,
+                            run.admission,
+                            result,
+                            run.durable,
+                        );
                         run.delivery.extend(deferred);
                     } else {
                         run.projector = Some(projector);
@@ -1854,11 +2183,45 @@ fn run_worker(
                     }
                 };
                 match wake {
+                    ActiveEvent::Command(Some(UiCommand::RetryProvider)) => {
+                        let accepted = active.as_ref().is_some_and(|run| {
+                            !run.cancellation.is_cancelled() && run.manual_retry.request()
+                        });
+                        if !accepted {
+                            let _ = sink.send(UiEvent::Notification {
+                                message: "Nenhuma falha de conexão está aguardando /retry".into(),
+                            });
+                        }
+                    }
                     ActiveEvent::Command(None) => {
                         let _ = abort_active(&mut active).await;
                         break;
                     }
+                    ActiveEvent::Command(Some(UiCommand::CancelPromptPreparation { admission })) => {
+                        if let Some(run) = active.as_mut().filter(|run| {
+                            run.admission == Some(admission)
+                        }) {
+                            if !run.cancellation_from_preparation {
+                                run.cancellation_from_preparation = true;
+                                run.cancellation.cancel();
+                                let now = Instant::now();
+                                last_esc_at = Some(now);
+                                let run_id = run.run_id;
+                                let _ = sink.send_control(UiEvent::CancellationRequested { run_id });
+                                let _ = sink.send_control(UiEvent::CancellationStarted { run_id });
+                            }
+                            ignored_prep_cancel = true;
+                        } else {
+                            let _ = sink.send(UiEvent::Notification {
+                                message: "No matching prompt preparation is active".into(),
+                            });
+                        }
+                    }
                     ActiveEvent::Command(Some(UiCommand::CancelRun)) => {
+                        if ignored_prep_cancel {
+                            ignored_prep_cancel = false;
+                            continue;
+                        }
                         let now = Instant::now();
                         if esc_forces_quit(last_esc_at, now) {
                             pending =
@@ -1957,6 +2320,8 @@ fn run_worker(
                                 startup.options.task_facts.clone_from(&execution.task_facts);
                             }
                             if let Some(preflight) = execution.resume_preflight.clone() {
+                                startup.options.artifact_ids =
+                                    crate::headless::session_artifact_ids(&preflight);
                                 startup.resume_path = Some(preflight.path.clone());
                                 startup.resume_preflight = Some(preflight);
                             }
@@ -1974,8 +2339,10 @@ fn run_worker(
                         }
                         let durable = active.as_ref().is_some_and(|run| run.durable);
                         if let Some(run) = active.take() {
+                            ignored_prep_cancel = false;
                             pending = Some(PendingRun {
                                 run_id: run.run_id,
+                                admission: run.admission,
                                 result: Some(*result),
                                 projector: Some(run.projector),
                                 delivery: VecDeque::new(),
@@ -2015,6 +2382,112 @@ fn run_worker(
                 break;
             };
             match command {
+                UiCommand::PreparePrompt { prompt, admission }
+                    if !prompt.trim().is_empty() =>
+                {
+                    let skill_instructions = match startup.options.workspace_root.as_deref() {
+                        Some(workspace_root) => match resolve_slash_skill_command(workspace_root, &prompt) {
+                            Ok(Some(SlashSkillCommand::Selected { name })) => {
+                                let _ = sink.send(UiEvent::PromptPreparationHandled {
+                                    admission,
+                                    restore_draft: Some(format!("/{name} ")),
+                                });
+                                let _ = sink.send(UiEvent::Notification {
+                                    message: format!("Skill /{name} selected. Add a task and send."),
+                                });
+                                continue;
+                            }
+                            Ok(Some(SlashSkillCommand::Invoke { name, body, source })) => {
+                                Some(SkillInstructions { name, body, source })
+                            }
+                            Ok(None) => None,
+                            Err(message) => {
+                                let _ = sink.send(UiEvent::PromptPreparationFailed {
+                                    admission,
+                                    message,
+                                });
+                                continue;
+                            }
+                        },
+                        None => None,
+                    };
+
+                    if startup.resume_path.is_none() {
+                        match create_tui_session(&mut startup) {
+                            Ok(Some((session_id, cwd))) => {
+                                let skill_names = memoized_skill_names(
+                                    &mut skill_memo,
+                                    startup.options.workspace_root.clone(),
+                                    &mut skill_warnings,
+                                );
+                                let _ = sink.send(UiEvent::SessionSnapshot {
+                                    session_id: slim_tui::api::SessionId(session_id.into()),
+                                    cwd,
+                                    skill_names,
+                                });
+                            }
+                            Ok(None) => {}
+                            Err(message) => {
+                                let _ = sink.send(UiEvent::PromptPreparationFailed {
+                                    admission,
+                                    message,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+
+                    let Some((provider, credential)) = startup.oauth_session.clone() else {
+                        if startup.request.is_none() {
+                            let _ = sink.send(UiEvent::PromptPreparationFailed {
+                                admission,
+                                message: "No provider connected. Use /login.".into(),
+                            });
+                            continue;
+                        }
+                        let task = tokio::spawn(async {
+                            Ok::<Option<FreshCredential>, OAuthError>(None)
+                        });
+                        preparing = Some(ActivePromptPreparation {
+                            admission,
+                            prompt,
+                            skill_instructions,
+                            task,
+                        });
+                        continue;
+                    };
+                    let request = match oauth.request_fresh_credential(provider, credential) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            let _ = sink.send(UiEvent::PromptPreparationFailed {
+                                admission,
+                                message: format!("Authentication: {error}"),
+                            });
+                            continue;
+                        }
+                    };
+                    let task = tokio::spawn(async move { request.wait().await.map(Some) });
+                    let _ = sink.send(UiEvent::ActivityChanged {
+                        label: "Checking authentication".into(),
+                    });
+                    preparing = Some(ActivePromptPreparation {
+                        admission,
+                        prompt,
+                        skill_instructions,
+                        task,
+                    });
+                }
+                UiCommand::PreparePrompt { admission, .. } => {
+                    let _ = sink.send(UiEvent::PromptPreparationFailed {
+                        admission,
+                        message: "prompt cannot be empty".into(),
+                    });
+                }
+                UiCommand::CancelPromptPreparation { .. } => {
+                    let _ = sink.send(UiEvent::Notification {
+                        message: "No prompt preparation is active".into(),
+                    });
+                }
                 UiCommand::ResumePrevious => {
                     let workspace = startup
                         .options
@@ -2051,12 +2524,13 @@ fn run_worker(
                             }
                             startup.options.history = selected.history;
                             startup.options.task_facts = crate::headless::session_task_facts(&selected.preflight);
+                            startup.options.artifact_ids = crate::headless::session_artifact_ids(&selected.preflight);
                             startup.options.tool_registry = None;
                             startup.options.ensure_shared_tool_registry();
                             startup.resume_path = Some(selected.preflight.path.clone());
                             startup.resume_preflight = Some(selected.preflight);
                             let skill_names =
-                                memoized_skill_names(&mut skill_memo, Some(workspace.clone()));
+                                memoized_skill_names(&mut skill_memo, Some(workspace.clone()), &mut skill_warnings);
                             let _ = sink.send(UiEvent::SessionRestored {
                                 session_id: slim_tui::api::SessionId(session_id.into()),
                                 cwd,
@@ -2064,6 +2538,9 @@ fn run_worker(
                                 skill_names,
                             });
                             let _ = sink.send(todo_event);
+                            if !skill_warnings.is_empty() {
+                                sink.send(UiEvent::Notification { message: skill_warnings.clone() });
+                            }
                             let _ = sink.send(UiEvent::Notification {
                                 message: "Previous session restored. Send a prompt to continue."
                                     .into(),
@@ -2443,13 +2920,13 @@ fn run_worker(
                                     .map(|entry| {
                                         let bundled = clinepass_model(&entry.id);
                                         OpenCodeModelView {
+                                            reasoning_levels: slim_core::provider::gateway_reasoning_levels(ProviderKind::ClinePass, &entry.id).iter().filter_map(|level| ReasoningEffort::parse(level)).collect(),
                                             id: entry.id,
                                             name: entry.name,
                                             context_window_tokens: entry.context_window,
                                             max_output_tokens: bundled
                                                 .map(|model| model.max_output_tokens as u64)
                                                 .unwrap_or(131_072),
-                                            reasoning_levels: Vec::new(),
                                             accepts_images: bundled
                                                 .map(|model| model.accepts_images)
                                                 .unwrap_or(false),
@@ -2473,7 +2950,7 @@ fn run_worker(
                                         name: m.name.to_owned(),
                                         context_window_tokens: m.context_window,
                                         max_output_tokens: m.max_output_tokens as u64,
-                                        reasoning_levels: Vec::new(),
+                                        reasoning_levels: slim_core::provider::gateway_reasoning_levels(ProviderKind::ClinePass, m.id).iter().filter_map(|level| ReasoningEffort::parse(level)).collect(),
                                         accepts_images: m.accepts_images,
                                     })
                                     .collect::<Vec<_>>(),
@@ -2566,7 +3043,9 @@ fn run_worker(
                     startup.model_override = Some(model.clone());
                     startup.effort = effort;
                     startup.options.reasoning_effort = Some(effort.id().into());
-                    persist_model(&sink, &model, effort.id(), None);
+                    let _ = sink.send(UiEvent::Notification {
+                        message: "Modelo aplicado nesta sessão · /model --default para salvar o padrão".into(),
+                    });
                     let _ = sink.send(UiEvent::ModelChanged { model });
                     let _ = sink.send(UiEvent::EffortChanged { effort });
                 }
@@ -2606,7 +3085,9 @@ fn run_worker(
                     startup.options.reasoning_effort = zen_model(&model)
                         .filter(|model| model.reasoning_levels.is_empty())
                         .map_or_else(|| Some(effort.id().into()), |_| None);
-                    persist_model(&sink, &model, effort.id(), None);
+                    let _ = sink.send(UiEvent::Notification {
+                        message: "Modelo aplicado nesta sessão · /model --default para salvar o padrão".into(),
+                    });
                     let _ = sink.send(UiEvent::ModelChanged { model });
                     let _ = sink.send(UiEvent::EffortChanged { effort });
                 }
@@ -2619,6 +3100,11 @@ fn run_worker(
                         let _ = sink.send(UiEvent::Notification {
                             message: "Unsupported ClinePass model".into(),
                         });
+                        continue;
+                    }
+                    let levels = slim_core::provider::gateway_reasoning_levels(ProviderKind::ClinePass, &model);
+                    if !levels.is_empty() && !levels.contains(&effort.id()) {
+                        let _ = sink.send(UiEvent::Notification { message: "Unsupported reasoning effort for this model".into() });
                         continue;
                     }
                     let switched = match activate_saved_api_key_provider(
@@ -2652,7 +3138,9 @@ fn run_worker(
                     startup.model_override = Some(model.clone());
                     startup.effort = effort;
                     startup.options.reasoning_effort = Some(effort.id().into());
-                    persist_model(&sink, &model, effort.id(), None);
+                    let _ = sink.send(UiEvent::Notification {
+                        message: "Modelo aplicado nesta sessão · /model --default para salvar o padrão".into(),
+                    });
                     let _ = sink.send(UiEvent::ModelChanged { model });
                     let _ = sink.send(UiEvent::EffortChanged { effort });
                 }
@@ -2661,6 +3149,11 @@ fn run_worker(
                         let _ = sink.send(UiEvent::Notification {
                             message: "Unsupported Command Code model".into(),
                         });
+                        continue;
+                    }
+                    let levels = slim_core::provider::gateway_reasoning_levels(ProviderKind::CommandCode, &model);
+                    if !levels.is_empty() && !levels.contains(&effort.id()) {
+                        let _ = sink.send(UiEvent::Notification { message: "Unsupported reasoning effort for this model".into() });
                         continue;
                     }
                     let switched = match activate_saved_api_key_provider(
@@ -2694,7 +3187,9 @@ fn run_worker(
                     startup.model_override = Some(model.clone());
                     startup.effort = effort;
                     startup.options.reasoning_effort = Some(effort.id().into());
-                    persist_model(&sink, &model, effort.id(), None);
+                    let _ = sink.send(UiEvent::Notification {
+                        message: "Modelo aplicado nesta sessão · /model --default para salvar o padrão".into(),
+                    });
                     let _ = sink.send(UiEvent::ModelChanged { model });
                     let _ = sink.send(UiEvent::EffortChanged { effort });
                 }
@@ -2703,6 +3198,11 @@ fn run_worker(
                         let _ = sink.send(UiEvent::Notification {
                             message: "Unsupported xAI model".into(),
                         });
+                        continue;
+                    }
+                    let levels = slim_core::provider::gateway_reasoning_levels(ProviderKind::Xai, &model);
+                    if !levels.is_empty() && !levels.contains(&effort.id()) {
+                        let _ = sink.send(UiEvent::Notification { message: "Unsupported reasoning effort for this model".into() });
                         continue;
                     }
                     let switched = match activate_saved_api_key_provider(
@@ -2736,7 +3236,9 @@ fn run_worker(
                     startup.model_override = Some(model.clone());
                     startup.effort = effort;
                     startup.options.reasoning_effort = Some(effort.id().into());
-                    persist_model(&sink, &model, effort.id(), None);
+                    let _ = sink.send(UiEvent::Notification {
+                        message: "Modelo aplicado nesta sessão · /model --default para salvar o padrão".into(),
+                    });
                     let _ = sink.send(UiEvent::ModelChanged { model });
                     let _ = sink.send(UiEvent::EffortChanged { effort });
                 }
@@ -2820,6 +3322,21 @@ fn run_worker(
                     } else {
                         let _ = sink.send(UiEvent::Notification {
                             message: "No provider session is active".into(),
+                        });
+                    }
+                }
+                UiCommand::RetryProvider => {
+                    let _ = sink.send(UiEvent::Notification {
+                        message: "Nenhuma falha de conexão está aguardando /retry".into(),
+                    });
+                }
+                UiCommand::SaveModelDefault => {
+                    if let Some(request) = startup.request.as_ref() {
+                        persist_model(&sink, &request.model, startup.effort.id(),
+                            (request.kind == ProviderKind::OpenAiCodex).then_some(startup.options.codex_fast));
+                    } else {
+                        let _ = sink.send(UiEvent::Notification {
+                            message: "Selecione um modelo antes de salvar o padrão".into(),
                         });
                     }
                 }
@@ -2927,6 +3444,7 @@ fn run_worker(
                             let skill_names = memoized_skill_names(
                                 &mut skill_memo,
                                 startup.options.workspace_root.clone(),
+                                &mut skill_warnings,
                             );
                             let _ = sink.send(UiEvent::SessionSnapshot {
                                 session_id: slim_tui::api::SessionId(session_id.into()),
@@ -2993,6 +3511,7 @@ fn run_worker(
                     let resume_preflight = startup.resume_preflight.take();
                     match start_active_run(
                         run_id,
+                        None,
                         ActiveRunLaunch {
                             request: request.clone(),
                             options: run_options,
@@ -3162,7 +3681,9 @@ fn run_worker(
                         request.model.clone_from(&model);
                     }
                     startup.options.codex_fast = fast;
-                    persist_model(&sink, &model, effort.id(), Some(fast));
+                    let _ = sink.send(UiEvent::Notification {
+                        message: "Modelo aplicado nesta sessão · /model --default para salvar o padrão".into(),
+                    });
                     let _ = sink.send(UiEvent::CodexSpeedChanged { fast });
                     let _ = sink.send(UiEvent::ModelChanged { model });
                     let _ = sink.send(UiEvent::EffortChanged { effort });
@@ -3395,8 +3916,12 @@ fn run_worker(
         if let Some(code_intelligence) = startup.options.code_intelligence.take() {
             code_intelligence.shutdown().await;
         }
+        let _ = oauth_warning_stop.send(true);
+        let _ = oauth_warning_forwarder.await;
+        oauth.shutdown().await
     });
     let _ = forwarder.join();
+    warnings
 }
 
 /// Scrubs text headed for UI surfaces: the CLI-side redactor plus every
@@ -3552,6 +4077,13 @@ fn dispatch_pending_command(
     mcp_manager: &Option<Arc<McpManager>>,
 ) -> bool {
     match command {
+        Some(UiCommand::CancelPromptPreparation { admission })
+            if run.admission == Some(admission) =>
+        {
+            run.request_cancel();
+            let _ = sink.send_control(UiEvent::CancellationRequested { run_id: run.run_id });
+            let _ = sink.send_control(UiEvent::CancellationStarted { run_id: run.run_id });
+        }
         Some(UiCommand::CancelRun) => {
             run.request_cancel();
             let _ = sink.send_control(UiEvent::CancellationRequested { run_id: run.run_id });
@@ -3647,7 +4179,11 @@ fn take_run_id(next_run_id: &mut u64) -> Option<u64> {
 /// survives restarts. Failures are surfaced as a non-fatal toast.
 fn persist_model(sink: &EventSink, model: &str, effort: &str, codex_fast: Option<bool>) {
     match crate::config::save_global_model(model, effort, codex_fast) {
-        Ok(_) => {}
+        Ok(_) => {
+            let _ = sink.send(UiEvent::Notification {
+                message: "Modelo e esforço salvos como padrão para novas sessões".into(),
+            });
+        }
         Err(error) => {
             let _ = sink.send(UiEvent::Notification {
                 message: format!("model selection not persisted: {error}"),
@@ -3713,11 +4249,17 @@ fn command_code_catalog_event(snapshot: crate::command_code_catalog::CatalogSnap
         .models
         .into_iter()
         .map(|model| OpenCodeModelView {
+            reasoning_levels: slim_core::provider::gateway_reasoning_levels(
+                ProviderKind::CommandCode,
+                &model.id,
+            )
+            .iter()
+            .filter_map(|level| ReasoningEffort::parse(level))
+            .collect(),
             id: model.id,
             name: model.name,
             context_window_tokens: model.context_window,
             max_output_tokens: 0,
-            reasoning_levels: Vec::new(),
             accepts_images: false,
         })
         .collect();
@@ -3812,6 +4354,22 @@ fn namespace_projected_ids(event: UiEvent, scope: &str) -> UiEvent {
                 call_id,
                 name,
                 preview,
+                content_handle,
+            }
+        }
+        UiEvent::ToolOutput {
+            batch_id,
+            call_id,
+            name,
+            output,
+            content_handle,
+        } => {
+            let (batch_id, call_id) = identity(batch_id, call_id);
+            UiEvent::ToolOutput {
+                batch_id,
+                call_id,
+                name,
+                output,
                 content_handle,
             }
         }
@@ -3933,14 +4491,20 @@ fn project_core_event(
     store: &SharedContentStore,
 ) -> Option<UiEvent> {
     let SessionEvent { seq, kind } = event;
-    let EventKind::ToolOutput {
-        batch_id,
-        call_id,
-        name,
-        output,
-    } = kind
-    else {
-        return UiEvent::from_core(SessionEvent::new(seq, kind));
+    let (batch_id, call_id, name, output, job_output) = match kind {
+        EventKind::ToolOutput {
+            batch_id,
+            call_id,
+            name,
+            output,
+        } => (batch_id, call_id, name, output, false),
+        EventKind::ToolJobOutput {
+            batch_id,
+            call_id,
+            name,
+            output,
+        } => (batch_id, call_id, name, output, true),
+        kind => return UiEvent::from_core(SessionEvent::new(seq, kind)),
     };
     let handle = ContentHandle(format!("tool:{run_id}:{batch_id}:{call_id}").into());
     let preview = slim_tui::api::tool_output_preview(&name, &output);
@@ -3951,14 +4515,23 @@ fn project_core_event(
         .then_some(handle);
     let mut projected = UiEvent::from_core(SessionEvent::new(
         seq,
-        EventKind::ToolOutput {
-            batch_id,
-            call_id,
-            name,
-            output: preview,
+        if job_output {
+            EventKind::ToolJobOutput {
+                batch_id,
+                call_id,
+                name,
+                output: preview,
+            }
+        } else {
+            EventKind::ToolOutput {
+                batch_id,
+                call_id,
+                name,
+                output: preview,
+            }
         },
     ))?;
-    if let UiEvent::ToolProgress {
+    if let UiEvent::ToolOutput {
         content_handle: projected_handle,
         ..
     } = &mut projected
@@ -3990,6 +4563,7 @@ fn request_manual_compaction(options: &ProviderRunOptions, instructions: String,
 
 fn start_active_run(
     run_id: u64,
+    admission: Option<PromptAdmission>,
     launch: ActiveRunLaunch,
     resume_path: Option<PathBuf>,
     resume_preflight: Option<SessionPreflight>,
@@ -4009,7 +4583,7 @@ fn start_active_run(
     let cwd_display = display_workspace_path(&workspace_root);
     // Fresh discovery per run (off the UI thread): skills added mid-session
     // appear on the next prompt.
-    let projector_skill_names = workspace_skill_names(&workspace_root);
+    let projector_skill_names = workspace_skill_names(&workspace_root, &mut String::new());
     let cancellation = CancellationToken::new();
     let (core_tx, core_rx) = SessionEventSender::bounded(1_024, cancellation.clone());
     let projector_cancellation = cancellation.clone();
@@ -4032,6 +4606,8 @@ fn start_active_run(
         })
         .map_err(|error| format!("TUI projector thread: {error}"))?;
     options.cancellation = Some(cancellation.clone());
+    let manual_retry = slim_core::runtime::ManualRetryHandle::default();
+    options.manual_retry = Some(manual_retry.clone());
     options.allow_plan_loop = true;
     let durable = resume_path.is_some();
     let (runtime_interaction_route, interaction_responder) = interaction_route();
@@ -4081,12 +4657,15 @@ fn start_active_run(
     });
     Ok(ActiveRun {
         run_id,
+        admission,
+        cancellation_from_preparation: false,
         task,
         projector,
         cancellation,
         durable,
         content_store,
         interaction_responder: Some(interaction_responder),
+        manual_retry,
     })
 }
 
@@ -4125,6 +4704,7 @@ async fn abort_active_with_grace(
         };
         Some(PendingRun {
             run_id: run.run_id,
+            admission: run.admission,
             result: Some(result),
             projector: Some(run.projector),
             delivery: VecDeque::new(),
@@ -4154,6 +4734,7 @@ fn run_stop_message(execution: &ProviderExecution) -> String {
 
 fn send_cancel_result(
     run_id: u64,
+    admission: Option<PromptAdmission>,
     result: Result<Result<ProviderExecution, ProviderError>, tokio::task::JoinError>,
     sink: &EventSink,
 ) {
@@ -4184,11 +4765,16 @@ fn send_cancel_result(
     // Cancellation authorizes abandoning the buffered presentation tail. Send
     // its truthful terminal on control so a full stream lane cannot hide it;
     // run identity prevents an overtaken start from clearing this tombstone.
-    sink.send_control(event);
+    if let Some(admission) = admission {
+        let _ = sink.send_control(correlate_prompt_event(event, admission));
+    } else {
+        sink.send_control(event);
+    }
 }
 
 fn execution_result_events(
     run_id: u64,
+    admission: Option<PromptAdmission>,
     result: Result<Result<ProviderExecution, ProviderError>, tokio::task::JoinError>,
     durable_streamed: bool,
 ) -> VecDeque<UiEvent> {
@@ -4223,8 +4809,28 @@ fn execution_result_events(
             message: "TUI runtime task failed".into(),
         },
     };
-    events.push_back(terminal);
+    events.push_back(admission.map_or(terminal.clone(), |admission| {
+        correlate_prompt_event(terminal, admission)
+    }));
     events
+}
+
+fn correlate_prompt_event(event: UiEvent, admission: PromptAdmission) -> UiEvent {
+    match event {
+        UiEvent::RunCompleted { run_id } => UiEvent::PromptRunCompleted { admission, run_id },
+        UiEvent::RunStopped { run_id, message } => UiEvent::PromptRunStopped {
+            admission,
+            run_id,
+            message,
+        },
+        UiEvent::RunCancelled { run_id } => UiEvent::PromptRunCancelled { admission, run_id },
+        UiEvent::RunFailed { run_id, message } => UiEvent::PromptRunFailed {
+            admission,
+            run_id,
+            message,
+        },
+        event => event,
+    }
 }
 
 fn redact_for_ui(input: &str, secret: &str) -> String {
@@ -4263,1965 +4869,16 @@ fn provider_error_message(error: ProviderError) -> String {
 }
 
 #[cfg(test)]
-mod local_session_tests {
-    use std::path::Path;
-
-    use slim_core::session::{
-        DurableOperation, DurableOperationKind, DurableOutcome, DurableRecord, DurableRepo,
-        DurableSessionHeader, JsonlRepo, ManualDrive, ManualExecutor, ManualRunSpec,
-        ProviderResponse,
-    };
-
-    use super::select_previous_tui_session;
-
-    #[test]
-    fn restored_tasks_repopulate_the_dock_without_execution() {
-        use slim_core::runtime::{CancellationToken, RuntimeCapabilityBridge};
-        use slim_core::session::{
-            AuthorizationGrant, CapabilityCatalog, TaskMutation, TaskMutationRequest,
-        };
-        let root = std::env::temp_dir().join(format!(
-            "slim-todo-dock-{}-{}",
-            std::process::id(),
-            super::system_time_nanos(std::time::SystemTime::now())
-        ));
-        let mut bridge = RuntimeCapabilityBridge::new(
-            JsonlRepo::create(
-                root.join("session.jsonl"),
-                DurableSessionHeader::new("todo", "now", root.to_string_lossy(), None, None),
-            )
-            .unwrap(),
-            CapabilityCatalog::with_native_tools(),
-            &Default::default(),
-            &[],
-            Default::default(),
-            CancellationToken::new(),
-        )
-        .unwrap();
-        bridge
-            .apply_task_mutation(
-                TaskMutationRequest {
-                    idempotency_key: "saved-todo".into(),
-                    entity_id: "session".into(),
-                    revision: 1,
-                    mutation: TaskMutation::TodoAdd {
-                        title: "retained pending task".into(),
-                        status: None,
-                    },
-                },
-                slim_core::OperatingMode::Auto,
-                AuthorizationGrant::Explicit,
-            )
-            .unwrap();
-        let preflight =
-            slim_core::session::SessionPreflight::from_open_repo(bridge.service().repo());
-        let event = super::restored_todo_event(&preflight).unwrap();
-        let mut app = slim_tui::app::AppState::new();
-        let effects =
-            slim_tui::reducer::reduce(&mut app, slim_tui::reducer::Action::UiEventReceived(event));
-        assert_eq!(app.todo_items.len(), 1);
-        assert_eq!(app.todo_items[0].title, "retained pending task");
-        assert!(app.todo_dock_open);
-        assert!(effects
-            .iter()
-            .all(|effect| matches!(effect, slim_tui::reducer::Effect::RequestRender)));
-        drop(bridge);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    struct FixtureExecutor;
-    struct FailingExecutor;
-
-    impl ManualExecutor for FixtureExecutor {
-        type Error = std::io::Error;
-
-        fn execute(
-            &mut self,
-            _effect: &slim_core::session::Effect,
-        ) -> Result<ProviderResponse, Self::Error> {
-            Ok(ProviderResponse::new("previous answer", None))
-        }
-    }
-
-    impl ManualExecutor for FailingExecutor {
-        type Error = std::io::Error;
-
-        fn execute(
-            &mut self,
-            _effect: &slim_core::session::Effect,
-        ) -> Result<ProviderResponse, Self::Error> {
-            Err(std::io::Error::other("fixture failure"))
-        }
-    }
-
-    fn create_completed(path: &Path, id: &str, cwd: &Path) {
-        let cwd = std::fs::canonicalize(cwd).expect("canonical cwd");
-        let header =
-            DurableSessionHeader::new(id, "1", cwd.to_str().expect("unicode cwd"), None, None);
-        let mut repo = JsonlRepo::create(path, header).expect("create session");
-        ManualDrive::new(&mut repo, &mut FixtureExecutor)
-            .run(ManualRunSpec::new(
-                format!("{id}-operation"),
-                format!("{id}-attempt"),
-                format!("{id}-user"),
-                format!("{id}-assistant"),
-                "previous question",
-                0,
-            ))
-            .expect("complete turn");
-    }
-
-    fn create_failed_terminal(path: &Path, id: &str, cwd: &Path) {
-        let cwd = std::fs::canonicalize(cwd).expect("canonical cwd");
-        let header =
-            DurableSessionHeader::new(id, "3", cwd.to_str().expect("unicode cwd"), None, None);
-        let mut repo = JsonlRepo::create(path, header).expect("create failed session");
-        let operation_id = format!("{id}-operation");
-        let result = ManualDrive::new(&mut repo, &mut FailingExecutor).run(ManualRunSpec::new(
-            operation_id.clone(),
-            format!("{id}-attempt"),
-            format!("{id}-user"),
-            format!("{id}-assistant"),
-            "failed question",
-            0,
-        ));
-        assert!(result.is_err());
-        let seq = repo.next_seq().expect("next failed seq");
-        repo.append(DurableRecord::Operation {
-            seq,
-            operation: DurableOperation {
-                operation_id,
-                kind: DurableOperationKind::Finished {
-                    outcome: DurableOutcome::Failed,
-                },
-            },
-        })
-        .expect("finish failed operation");
-    }
-
-    #[test]
-    fn previous_session_selection_stays_in_the_current_workspace() {
-        let root = std::env::temp_dir().join(format!(
-            "slim-local-resume-{}-{}",
-            std::process::id(),
-            super::system_time_nanos(std::time::SystemTime::now())
-        ));
-        let foreign = root.with_extension("foreign");
-        std::fs::create_dir_all(root.join(".slim/sessions")).expect("session directory");
-        std::fs::create_dir_all(&foreign).expect("foreign directory");
-        let sessions = root.join(".slim/sessions");
-        create_completed(&sessions.join("tui-valid.jsonl"), "tui-valid", &root);
-        create_completed(&sessions.join("tui-foreign.jsonl"), "tui-foreign", &foreign);
-        let current = sessions.join("tui-current.jsonl");
-        let current_header = DurableSessionHeader::new(
-            "tui-current",
-            "2",
-            std::fs::canonicalize(&root)
-                .expect("canonical root")
-                .to_str()
-                .expect("unicode root"),
-            None,
-            None,
-        );
-        drop(JsonlRepo::create(&current, current_header).expect("current session"));
-        create_failed_terminal(&sessions.join("tui-failed.jsonl"), "tui-failed", &root);
-
-        let selected = select_previous_tui_session(&root, Some(&current))
-            .expect("selection")
-            .expect("previous session");
-        assert_eq!(selected.preflight.session_id.as_deref(), Some("tui-valid"));
-        assert_eq!(selected.history[0].content, "previous question");
-        assert_eq!(selected.history[1].content, "previous answer");
-
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&foreign);
-    }
-
-    #[test]
-    fn resume_after_cancel_restores_final_and_partial_answers_without_mutation() {
-        struct CancelledExecutor;
-        impl ManualExecutor for CancelledExecutor {
-            type Error = std::io::Error;
-            fn execute(
-                &mut self,
-                _: &slim_core::session::Effect,
-            ) -> Result<ProviderResponse, Self::Error> {
-                Ok(ProviderResponse::with_outcome(
-                    "partial answer",
-                    None,
-                    DurableOutcome::Cancelled,
-                ))
-            }
-        }
-        let root = std::env::temp_dir().join(format!(
-            "slim-resume-cancel-{}-{}",
-            std::process::id(),
-            super::system_time_nanos(std::time::SystemTime::now())
-        ));
-        let sessions = root.join(".slim/sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let path = sessions.join("tui-cancelled.jsonl");
-        create_completed(&path, "tui-cancelled", &root);
-        let mut repo = JsonlRepo::open_no_repair(&path).unwrap();
-        let seq = repo.next_seq().unwrap();
-        ManualDrive::new(&mut repo, &mut CancelledExecutor)
-            .run(ManualRunSpec::new(
-                "cancelled",
-                "cancelled-attempt",
-                "cancelled-input",
-                "cancelled-answer",
-                "cancelled question",
-                seq,
-            ))
-            .unwrap();
-        drop(repo);
-        let before = std::fs::read(&path).unwrap();
-        let selected = select_previous_tui_session(&root, None)
-            .expect("resume cancelled session")
-            .unwrap();
-        let messages = super::session_transcript(&selected.preflight).unwrap();
-        let mut app = slim_tui::app::AppState::new();
-        let effects = slim_tui::reducer::reduce(
-            &mut app,
-            slim_tui::reducer::Action::UiEventReceived(slim_tui::api::UiEvent::SessionRestored {
-                session_id: slim_tui::api::SessionId("tui-cancelled".into()),
-                cwd: root.to_string_lossy().into_owned(),
-                messages,
-                skill_names: Vec::new(),
-            }),
-        );
-        assert!(
-            effects
-                .iter()
-                .all(|effect| matches!(effect, slim_tui::reducer::Effect::RequestRender)),
-            "restore must only request rendering"
-        );
-        let frame = slim_tui::render::render(&app, 100, 30).lines.join("\n");
-        for text in [
-            "previous question",
-            "previous answer",
-            "cancelled question",
-            "partial answer",
-        ] {
-            assert!(frame.contains(text), "missing {text}: {frame}");
-        }
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-}
+mod local_session_tests;
 
 #[cfg(test)]
-mod slash_skill_tests {
-    use super::{resolve_slash_skill_command, SlashSkillCommand, MAX_SLASH_SKILL_BODY_BYTES};
-
-    #[test]
-    fn slash_skill_metadata_is_lazy_and_body_loads_only_for_a_task() {
-        let root = std::env::temp_dir().join(format!(
-            "slim-slash-skill-{}-{}",
-            std::process::id(),
-            super::system_time_nanos(std::time::SystemTime::now())
-        ));
-        let skill_dir = root.join(".slim/skills/review-code");
-        let skill_file = skill_dir.join("SKILL.md");
-        std::fs::create_dir_all(&skill_dir).expect("skill directory");
-        let native_collision = root.join(".slim/skills/models");
-        std::fs::create_dir_all(&native_collision).expect("collision directory");
-        std::fs::write(
-            native_collision.join("SKILL.md"),
-            "---\nname: models\ndescription: Must not shadow the native command\n---\nIgnored.\n",
-        )
-        .expect("collision fixture");
-
-        let mut metadata_with_invalid_body =
-            b"---\nname: review-code\ndescription: Review code\n---\n".to_vec();
-        metadata_with_invalid_body.push(0xff);
-        std::fs::write(&skill_file, metadata_with_invalid_body).expect("lazy skill fixture");
-
-        assert!(matches!(
-            resolve_slash_skill_command(&root, "/models"),
-            Ok(None)
-        ));
-        assert!(matches!(
-            resolve_slash_skill_command(&root, "/review-code"),
-            Ok(Some(SlashSkillCommand::Selected { name })) if name == "review-code"
-        ));
-
-        std::fs::write(
-            &skill_file,
-            "---\nname: review-code\ndescription: Review code\n---\nInspect the change carefully.\n",
-        )
-        .expect("invokable skill fixture");
-        assert!(matches!(
-            resolve_slash_skill_command(&root, "/review-code check this"),
-            Ok(Some(SlashSkillCommand::Invoke { name, body, source }))
-                if name == "review-code"
-                    && body == "Inspect the change carefully.\n"
-                    && source == skill_file
-        ));
-        assert!(matches!(
-            resolve_slash_skill_command(&root, "please /review-code check this"),
-            Ok(Some(SlashSkillCommand::Invoke { name, .. })) if name == "review-code"
-        ));
-
-        std::fs::write(
-            &skill_file,
-            format!(
-                "---\nname: review-code\ndescription: Review code\n---\n{}",
-                "x".repeat(MAX_SLASH_SKILL_BODY_BYTES)
-            ),
-        )
-        .expect("maximum-size skill fixture");
-        assert!(matches!(
-            resolve_slash_skill_command(&root, "/review-code check this"),
-            Ok(Some(SlashSkillCommand::Invoke { body, .. }))
-                if body.len() == MAX_SLASH_SKILL_BODY_BYTES
-        ));
-
-        std::fs::write(
-            &skill_file,
-            format!(
-                "---\nname: review-code\ndescription: Review code\n---\n{}",
-                "x".repeat(MAX_SLASH_SKILL_BODY_BYTES + 1)
-            ),
-        )
-        .expect("oversized skill fixture");
-        let error = match resolve_slash_skill_command(&root, "/review-code check this") {
-            Err(error) => error,
-            Ok(_) => panic!("oversized skill must be rejected"),
-        };
-        assert!(error.contains("slash limit"), "{error}");
-        assert!(matches!(
-            resolve_slash_skill_command(&root, "/missing check this"),
-            Ok(None)
-        ));
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-}
+mod slash_skill_tests;
 
 #[cfg(test)]
-mod cancel_tests {
-    use super::{
-        advance_pending_delivery, associate_projected_run, attach_workspace_to_snapshot,
-        esc_forces_quit, execution_result_events, project_core_event, project_sync_tui_events,
-        send_cancel_result, take_run_id, ContentStore, EventSink, PendingDeliveryStep, PendingRun,
-        WakeSignal, CONTENT_ENTRY_BYTES, CONTENT_PAGE_BYTES, CONTENT_STORE_BYTES,
-        CONTENT_STORE_ENTRIES, ESC_FORCE_WINDOW,
-    };
-    use crate::exit_codes::ExitCode;
-    use crate::headless::{ProviderExecution, ProviderHeadlessResult, ToolLoopLimits};
-    use slim_core::provider::ProviderKind;
-    use slim_core::runtime::{AgentLoopConfig, CancellationToken};
-    use slim_core::{EventKind, SessionEvent};
-    use slim_tui::api::{
-        ContentHandle, InteractionRequestId, PageCursor, SessionId, ToolBatchId, ToolCallId,
-        UiCommand, UiEvent,
-    };
-    use std::collections::VecDeque;
-    use std::sync::mpsc;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn esc_escalates_only_inside_the_force_window() {
-        let now = Instant::now();
-        assert!(!esc_forces_quit(None, now));
-        assert!(esc_forces_quit(Some(now), now));
-        assert!(esc_forces_quit(
-            Some(now),
-            now + ESC_FORCE_WINDOW - Duration::from_millis(1)
-        ));
-        assert!(!esc_forces_quit(
-            Some(now),
-            now + ESC_FORCE_WINDOW + Duration::from_millis(1)
-        ));
-    }
-
-    #[test]
-    fn content_store_pages_on_utf8_boundaries_at_sixteen_kibibytes() {
-        let handle = ContentHandle("unicode".into());
-        let output = "界".repeat(CONTENT_PAGE_BYTES);
-        let mut store = ContentStore::default();
-        store.insert(handle.clone(), &output);
-
-        let first = store.page(&handle, None).expect("first page");
-        assert!(first.text.len() <= CONTENT_PAGE_BYTES);
-        assert!(first.text.is_char_boundary(first.text.len()));
-        let cursor = first.next_cursor.expect("next cursor");
-        assert_eq!(cursor.0 as usize, first.text.len());
-        let second = store.page(&handle, Some(cursor)).expect("second page");
-        assert!(second.text.len() <= CONTENT_PAGE_BYTES);
-        assert!(output.starts_with(&(first.text + &second.text)));
-    }
-
-    #[test]
-    fn content_store_takes_ownership_without_copying_bounded_output() {
-        let handle = ContentHandle("owned".into());
-        let mut output = String::with_capacity(8 * 1024);
-        output.push_str(&"x".repeat(4 * 1024));
-        let allocation = output.as_ptr();
-        let mut store = ContentStore::default();
-
-        store.insert_owned(handle.clone(), output);
-
-        let retained = store
-            .entries
-            .iter()
-            .find(|entry| entry.handle == handle)
-            .expect("owned output retained");
-        assert_eq!(retained.text.as_ptr(), allocation);
-    }
-
-    #[test]
-    fn content_store_enforces_entry_count_per_output_and_total_byte_caps() {
-        let mut store = ContentStore::default();
-        for index in 0..=CONTENT_STORE_ENTRIES {
-            store.insert(ContentHandle(format!("small-{index}").into()), "x");
-        }
-        assert!(store.entries.len() <= CONTENT_STORE_ENTRIES);
-        assert!(store.page(&ContentHandle("small-0".into()), None).is_err());
-
-        let oversized = "z".repeat(CONTENT_ENTRY_BYTES + 100);
-        store.insert(ContentHandle("oversized".into()), &oversized);
-        let retained = store
-            .entries
-            .iter()
-            .find(|entry| entry.handle == ContentHandle("oversized".into()))
-            .expect("oversized retained");
-        assert!(retained.text.len() <= CONTENT_ENTRY_BYTES);
-        assert!(retained.text.ends_with("[output truncated at 2 MiB]"));
-
-        for index in 0..8 {
-            store.insert(
-                ContentHandle(format!("large-{index}").into()),
-                &"y".repeat(CONTENT_ENTRY_BYTES),
-            );
-        }
-        assert!(store.retained_bytes <= CONTENT_STORE_BYTES);
-    }
-
-    #[test]
-    fn projector_namespaces_and_registers_redacted_tool_output() {
-        let store = Default::default();
-        let projected = project_core_event(
-            SessionEvent::new(
-                3,
-                EventKind::ToolOutput {
-                    batch_id: "batch".into(),
-                    call_id: "call".into(),
-                    name: "shell".into(),
-                    output: "exit 1\nstdout:\nstderr:\nsafe [REDACTED]".into(),
-                },
-            ),
-            7,
-            &store,
-        )
-        .expect("projected");
-        let UiEvent::ToolProgress {
-            content_handle: Some(handle),
-            preview,
-            ..
-        } = projected
-        else {
-            panic!("expected paged tool progress");
-        };
-        assert_eq!(&*handle.0, "tool:7:batch:call");
-        let page = store
-            .lock()
-            .expect("store")
-            .page(&handle, Some(PageCursor(0)))
-            .expect("page");
-        assert_eq!(page.text, "exit 1\nstdout:\nstderr:\nsafe [REDACTED]");
-        assert_eq!(preview, "exit 1 · safe [REDACTED]");
-    }
-
-    #[test]
-    fn session_snapshot_receives_resolved_workspace_display() {
-        let event = attach_workspace_to_snapshot(
-            UiEvent::SessionSnapshot {
-                session_id: SessionId("session".into()),
-                cwd: String::new(),
-                skill_names: Vec::new(),
-            },
-            r"D:\Slim",
-        );
-        assert_eq!(
-            event,
-            UiEvent::SessionSnapshot {
-                session_id: SessionId("session".into()),
-                cwd: r"D:\Slim".into(),
-                skill_names: Vec::new(),
-            }
-        );
-    }
-
-    #[test]
-    fn run_identity_exhaustion_fails_closed_without_reuse() {
-        let mut next = u64::MAX - 1;
-        assert_eq!(take_run_id(&mut next), Some(u64::MAX - 1));
-        assert_eq!(next, u64::MAX);
-        assert_eq!(take_run_id(&mut next), None);
-        assert_eq!(take_run_id(&mut next), None);
-    }
-
-    #[test]
-    fn provider_failure_is_durable_in_the_ui_after_toast_expiry() {
-        let mut execution = execution(ExitCode::Provider);
-        execution.result.stop = "provider_error".into();
-        execution.result.text = "provider error: http 401: denied".into();
-        let events = execution_result_events(7, Ok(Ok(execution)), true);
-        assert!(matches!(events.back(), Some(UiEvent::RunFailed { .. })));
-        let mut state = slim_tui::app::AppState::new();
-        state.apply_event(UiEvent::run_started(7));
-        for event in events {
-            state.apply_event(event);
-        }
-        state.clock.elapsed_ms = 10_000;
-        state.prune_notifications();
-        assert!(!state.working);
-        assert!(state.blocks().iter().any(|block| matches!(block.kind(), slim_tui::block::BlockKind::Error(message) if message.contains("http 401"))));
-    }
-
-    fn execution(code: ExitCode) -> ProviderExecution {
-        ProviderExecution {
-            turn_transcript: Vec::new(),
-            task_facts: Vec::new(),
-            result: ProviderHeadlessResult {
-                code,
-                provider: ProviderKind::OpenAiCompatible,
-                model: "fixture".into(),
-                text: String::new(),
-                input_tokens: None,
-                output_tokens: None,
-                stop_reason: None,
-                stop: "fixture".into(),
-                cost_micros: None,
-                usage_complete: false,
-                usage_overflowed: false,
-                usage: slim_core::UsageTotals::default(),
-                costs: crate::headless::UsageCostSummary::default(),
-                validation_source: None,
-                tool_summary_lines: Vec::new(),
-                tool_process_facts: Vec::new(),
-                stop_message: None,
-            },
-            history: None,
-            events: Vec::new(),
-            tool_results: Vec::new(),
-            limits: ToolLoopLimits {
-                max_mutating_tool_calls: AgentLoopConfig::DEFAULT_MAX_MUTATING_TOOL_CALLS,
-                max_read_tool_calls: AgentLoopConfig::DEFAULT_MAX_READ_TOOL_CALLS,
-                max_total_tool_calls: AgentLoopConfig::DEFAULT_MAX_TOTAL_TOOL_CALLS,
-                max_turns: AgentLoopConfig::DEFAULT_MAX_TURNS,
-                max_output_tokens: slim_core::provider::DEFAULT_MAX_OUTPUT_TOKENS,
-                max_result_bytes: AgentLoopConfig::default().max_result_bytes,
-                context_window_tokens: AgentLoopConfig::default().context_window_tokens,
-            },
-            resume_preflight: None,
-        }
-    }
-
-    fn sink() -> (EventSink, mpsc::Receiver<UiEvent>, mpsc::Receiver<UiEvent>) {
-        let (control, control_rx) = mpsc::sync_channel(4);
-        let (data, data_rx) = mpsc::sync_channel(4);
-        (
-            EventSink {
-                control: Some(control),
-                data: Some(data),
-                wake: WakeSignal::default(),
-                lane_space: WakeSignal::default(),
-                drop_probe: None,
-            },
-            control_rx,
-            data_rx,
-        )
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn final_sender_teardown_precedes_wake_probe() {
-        let (mut sink, control_rx, data_rx) = sink();
-        let wake = sink.wake.clone();
-        let reached_pre_wake = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let release_wake = std::sync::Arc::new(std::sync::Barrier::new(2));
-        sink.drop_probe = Some(super::DropProbe {
-            reached_pre_wake: reached_pre_wake.clone(),
-            release_wake: release_wake.clone(),
-        });
-        let dropper = std::thread::spawn(move || drop(sink));
-
-        reached_pre_wake.wait();
-        assert!(matches!(
-            control_rx.try_recv(),
-            Err(mpsc::TryRecvError::Disconnected)
-        ));
-        assert!(matches!(
-            data_rx.try_recv(),
-            Err(mpsc::TryRecvError::Disconnected)
-        ));
-        assert!(
-            !wake
-                .wait_timeout(std::time::Duration::ZERO)
-                .expect("wake remains unsignaled at pre-wake barrier"),
-            "wake cannot precede sender disconnection"
-        );
-        release_wake.wait();
-        dropper.join().expect("drop completes after wake release");
-        assert!(
-            wake.wait_timeout(std::time::Duration::from_millis(50))
-                .expect("final wake is observable"),
-            "teardown must emit its final wake"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn projected_send_resumes_when_lane_space_is_signaled() {
-        let (sink, _control_rx, data_rx) = sink();
-        let cancellation = CancellationToken::new();
-        for _ in 0..4 {
-            assert!(sink.send(UiEvent::AssistantDelta { text: "x".into() }));
-        }
-        let space = sink.lane_space.clone();
-        let handle = std::thread::spawn(move || {
-            sink.send_projected(UiEvent::AssistantDelta { text: "y".into() }, &cancellation)
-        });
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let _ = data_rx.recv().expect("drain one data event");
-        space.notify();
-        assert!(handle.join().expect("projected send completes"));
-    }
-
-    #[test]
-    fn normal_projector_keeps_request_accounting_and_fence_on_stream_lane() {
-        let (sink, control_rx, data_rx) = sink();
-        let cancellation = CancellationToken::new();
-        for event in [
-            UiEvent::UsageEstimate {
-                request_id: 1,
-                context_tokens: 11,
-                context_window_tokens: 100,
-            },
-            UiEvent::Usage {
-                input_tokens: 7,
-                output_tokens: 3,
-            },
-            UiEvent::AssistantEnded,
-        ] {
-            assert!(sink.send_projected(event, &cancellation));
-        }
-        assert!(matches!(
-            control_rx.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
-        assert!(matches!(
-            data_rx.recv().expect("snapshot"),
-            UiEvent::UsageEstimate { request_id: 1, .. }
-        ));
-        assert!(matches!(
-            data_rx.recv().expect("usage"),
-            UiEvent::Usage { .. }
-        ));
-        assert_eq!(
-            data_rx.recv().expect("assistant fence"),
-            UiEvent::AssistantEnded
-        );
-    }
-
-    #[test]
-    fn cancelled_projector_drops_visual_progress_and_migrates_causal_suffix() {
-        let (sink, control_rx, data_rx) = sink();
-        let tool_started = UiEvent::ToolStarted {
-            batch_id: ToolBatchId("batch-1".into()),
-            call_id: ToolCallId("call-1".into()),
-            name: "shell".into(),
-            arguments_summary: "command=safe".into(),
-        };
-        for index in 0..4 {
-            sink.data()
-                .send(UiEvent::ToolProgress {
-                    batch_id: ToolBatchId("batch-1".into()),
-                    call_id: ToolCallId(format!("queued-{index}").into()),
-                    name: "shell".into(),
-                    preview: format!("fills capacity {index}"),
-                    content_handle: None,
-                })
-                .expect("fill");
-        }
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        assert!(sink.send_projected(
-            UiEvent::Notification {
-                message: "discard me".into(),
-            },
-            &cancellation,
-        ));
-
-        let sender = sink.clone();
-        let token = cancellation.clone();
-        let projector = std::thread::spawn(move || {
-            sender.send_projected(
-                UiEvent::UsageEstimate {
-                    request_id: 9,
-                    context_tokens: 11,
-                    context_window_tokens: 100,
-                },
-                &token,
-            )
-        });
-        assert!(projector.join().expect("projector"));
-        assert!(matches!(
-            control_rx.recv().expect("causal telemetry on control"),
-            UiEvent::UsageEstimate { request_id: 9, .. }
-        ));
-        assert!(sink.send_projected(UiEvent::AssistantEnded, &cancellation));
-        assert_eq!(
-            control_rx.recv().expect("exactness fence on control"),
-            UiEvent::AssistantEnded
-        );
-        assert!(sink.send_projected(tool_started.clone(), &cancellation));
-        assert_eq!(
-            control_rx.recv().expect("tool start migrates to control"),
-            tool_started
-        );
-        let tool_progress = UiEvent::ToolProgress {
-            batch_id: ToolBatchId("batch-1".into()),
-            call_id: ToolCallId("call-1".into()),
-            name: "shell".into(),
-            preview: "partial output".into(),
-            content_handle: Some(ContentHandle("content-1".into())),
-        };
-        assert!(sink.send_projected(tool_progress.clone(), &cancellation));
-        let tool_ended = UiEvent::ToolEnded {
-            batch_id: ToolBatchId("batch-1".into()),
-            call_id: ToolCallId("call-1".into()),
-            name: "shell".into(),
-            success: false,
-            duration_ms: 9,
-        };
-        assert!(sink.send_projected(tool_ended.clone(), &cancellation));
-        assert_eq!(
-            control_rx
-                .recv()
-                .expect("tool terminal migrates to control"),
-            tool_ended
-        );
-        let remaining = data_rx.try_iter().collect::<Vec<_>>();
-        assert_eq!(remaining.len(), 4, "full data lane remains untouched");
-        assert!(!remaining.contains(&tool_progress));
-        assert!(!remaining.contains(&tool_ended));
-    }
-
-    #[test]
-    fn projector_associates_fatal_error_with_active_run() {
-        assert_eq!(
-            associate_projected_run(
-                UiEvent::FatalError {
-                    run_id: None,
-                    message: "fatal".into(),
-                },
-                7,
-            ),
-            UiEvent::FatalError {
-                run_id: Some(7),
-                message: "fatal".into(),
-            }
-        );
-        assert_eq!(
-            associate_projected_run(
-                UiEvent::UsageEstimate {
-                    request_id: 1,
-                    context_tokens: 10,
-                    context_window_tokens: 100,
-                },
-                7,
-            ),
-            UiEvent::UsageEstimateForRun {
-                run_id: 7,
-                request_id: 1,
-                context_tokens: 10,
-                context_window_tokens: 100,
-            }
-        );
-    }
-
-    #[test]
-    fn projector_namespaces_tool_identity_by_run() {
-        let tool = UiEvent::ToolStarted {
-            batch_id: ToolBatchId("batch-1".into()),
-            call_id: ToolCallId("call-1".into()),
-            name: "read".into(),
-            arguments_summary: "{}".into(),
-        };
-        let first = associate_projected_run(tool.clone(), 1);
-        let second = associate_projected_run(tool, 2);
-        let identities = [first, second].map(|event| match event {
-            UiEvent::ToolStarted {
-                batch_id, call_id, ..
-            } => (batch_id, call_id),
-            _ => panic!("tool start"),
-        });
-        assert_ne!(identities[0], identities[1]);
-    }
-
-    #[test]
-    fn projector_namespaces_interaction_identity_and_matching_ack_by_run() {
-        let request = UiEvent::InputRequired {
-            request_id: InteractionRequestId("input-1".into()),
-            prompt: "choose".into(),
-            options: Vec::new(),
-            persisted: true,
-        };
-        let ack = UiEvent::InteractionAcknowledged {
-            request_id: InteractionRequestId("input-1".into()),
-            accepted: true,
-            message: "accepted".into(),
-        };
-        let first = associate_projected_run(request.clone(), 1);
-        let second = associate_projected_run(request, 2);
-        let first_ack = associate_projected_run(ack, 1);
-
-        let UiEvent::InputRequired {
-            request_id: first_id,
-            ..
-        } = first
-        else {
-            panic!("input request")
-        };
-        let UiEvent::InputRequired {
-            request_id: second_id,
-            ..
-        } = second
-        else {
-            panic!("input request")
-        };
-        let UiEvent::InteractionAcknowledged {
-            request_id: ack_id, ..
-        } = first_ack
-        else {
-            panic!("interaction ack")
-        };
-        assert_ne!(first_id, second_id);
-        assert_eq!(first_id, ack_id);
-    }
-
-    #[test]
-    fn cancelled_projector_preserves_interaction_requests() {
-        let (sink, control_rx, _data_rx) = sink();
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let request = UiEvent::InputRequired {
-            request_id: InteractionRequestId("input-cancelled".into()),
-            prompt: "persist me".into(),
-            options: Vec::new(),
-            persisted: true,
-        };
-
-        assert!(sink.send_projected(request.clone(), &cancellation));
-        assert_eq!(control_rx.recv().expect("preserved request"), request);
-    }
-
-    #[test]
-    fn synchronous_projection_namespaces_reused_tool_identity_per_turn() {
-        let core_events = || {
-            vec![SessionEvent::new(
-                1,
-                EventKind::ToolStarted {
-                    batch_id: "batch-1".into(),
-                    call_id: "call-1".into(),
-                    name: "read".into(),
-                    arguments: "{}".into(),
-                },
-            )]
-        };
-        let first = project_sync_tui_events("one".into(), core_events()).expect("first turn");
-        let second = project_sync_tui_events("two".into(), core_events()).expect("second turn");
-        let identities = [first, second].map(|events| match &events[1] {
-            UiEvent::ToolStarted {
-                batch_id, call_id, ..
-            } => (batch_id.clone(), call_id.clone()),
-            _ => panic!("tool start"),
-        });
-        assert_ne!(identities[0], identities[1]);
-    }
-
-    #[test]
-    fn exact_full_pending_delivery_services_cancel_without_losing_truth() {
-        let (sink, control_rx, _data_rx) = sink();
-        for index in 0..4 {
-            sink.data()
-                .send(UiEvent::Notification {
-                    message: format!("fills capacity {index}"),
-                })
-                .expect("fill");
-        }
-        let cancellation = CancellationToken::new();
-        let mut run = PendingRun {
-            run_id: 7,
-            result: None,
-            projector: None,
-            delivery: execution_result_events(7, Ok(Ok(execution(ExitCode::Success))), false),
-            cancellation: cancellation.clone(),
-            durable: false,
-            cancel_requested: false,
-            content_store: Default::default(),
-        };
-        let (commands, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
-        commands.send(UiCommand::CancelRun).expect("cancel");
-
-        assert_eq!(
-            advance_pending_delivery(&mut run, &mut command_rx, &sink, &mut false, &None),
-            PendingDeliveryStep::Complete
-        );
-        assert!(cancellation.is_cancelled());
-        assert_eq!(
-            control_rx.recv().expect("truthful terminal"),
-            UiEvent::CancellationRequested { run_id: 7 }
-        );
-        assert_eq!(
-            control_rx.recv().expect("cancellation started"),
-            UiEvent::CancellationStarted { run_id: 7 }
-        );
-        assert_eq!(
-            control_rx.recv().expect("truthful terminal"),
-            UiEvent::RunCompleted { run_id: 7 }
-        );
-    }
-
-    #[test]
-    fn exact_full_pending_delivery_services_shutdown() {
-        let (sink, control_rx, _data_rx) = sink();
-        for index in 0..4 {
-            sink.data()
-                .send(UiEvent::Notification {
-                    message: format!("fills capacity {index}"),
-                })
-                .expect("fill");
-        }
-        let cancellation = CancellationToken::new();
-        let mut run = PendingRun {
-            run_id: 7,
-            result: None,
-            projector: None,
-            delivery: execution_result_events(7, Ok(Ok(execution(ExitCode::Success))), false),
-            cancellation: cancellation.clone(),
-            durable: false,
-            cancel_requested: false,
-            content_store: Default::default(),
-        };
-        let (commands, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
-        commands.send(UiCommand::Shutdown).expect("shutdown");
-
-        assert_eq!(
-            advance_pending_delivery(&mut run, &mut command_rx, &sink, &mut false, &None),
-            PendingDeliveryStep::Shutdown
-        );
-        assert!(cancellation.is_cancelled());
-        assert_eq!(
-            control_rx.recv().expect("shutdown event"),
-            UiEvent::Shutdown
-        );
-    }
-
-    #[test]
-    fn exact_full_pending_delivery_queues_unbound_interaction_ack_without_blocking() {
-        let (sink, control_rx, _data_rx) = sink();
-        for index in 0..4 {
-            sink.data()
-                .send(UiEvent::Notification {
-                    message: format!("fills capacity {index}"),
-                })
-                .expect("fill");
-        }
-        let request_id = InteractionRequestId("pending-input".into());
-        let mut run = PendingRun {
-            run_id: 7,
-            result: None,
-            projector: None,
-            delivery: execution_result_events(7, Ok(Ok(execution(ExitCode::Success))), false),
-            cancellation: CancellationToken::new(),
-            durable: false,
-            cancel_requested: false,
-            content_store: Default::default(),
-        };
-        let (commands, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
-        commands
-            .send(UiCommand::AnswerInput {
-                request_id: request_id.clone(),
-                answer: "answer".into(),
-            })
-            .expect("answer");
-
-        assert_eq!(
-            advance_pending_delivery(&mut run, &mut command_rx, &sink, &mut false, &None),
-            PendingDeliveryStep::Pending
-        );
-        assert_eq!(
-            run.delivery.back(),
-            Some(&UiEvent::InteractionAcknowledged {
-                request_id: request_id.clone(),
-                accepted: false,
-                message: "interaction route unavailable in this host".into(),
-            })
-        );
-
-        commands.send(UiCommand::CancelRun).expect("cancel");
-        assert_eq!(
-            advance_pending_delivery(&mut run, &mut command_rx, &sink, &mut false, &None),
-            PendingDeliveryStep::Complete
-        );
-        assert_eq!(
-            control_rx.recv().expect("cancellation requested"),
-            UiEvent::CancellationRequested { run_id: 7 }
-        );
-        assert_eq!(
-            control_rx.recv().expect("cancellation started"),
-            UiEvent::CancellationStarted { run_id: 7 }
-        );
-        assert_eq!(
-            control_rx.recv().expect("terminal remains authoritative"),
-            UiEvent::RunCompleted { run_id: 7 }
-        );
-        assert_eq!(
-            control_rx.recv().expect("ack remains visible"),
-            UiEvent::InteractionAcknowledged {
-                request_id,
-                accepted: false,
-                message: "interaction route unavailable in this host".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn pending_run_cancel_is_recorded_and_interrupts_projector() {
-        let cancellation = CancellationToken::new();
-        let mut run = PendingRun {
-            run_id: 1,
-            result: Some(Ok(Ok(execution(ExitCode::Success)))),
-            projector: Some(std::thread::spawn(|| {})),
-            delivery: VecDeque::new(),
-            cancellation: cancellation.clone(),
-            durable: false,
-            cancel_requested: false,
-            content_store: Default::default(),
-        };
-
-        run.request_cancel();
-
-        assert!(run.cancel_requested);
-        assert!(cancellation.is_cancelled());
-        run.projector
-            .take()
-            .expect("projector")
-            .join()
-            .expect("join");
-    }
-
-    #[test]
-    fn cancel_after_durable_success_emits_completed_from_task_result() {
-        let (sink, control_rx, _data_rx) = sink();
-        send_cancel_result(1, Ok(Ok(execution(ExitCode::Success))), &sink);
-        assert_eq!(
-            control_rx.recv().expect("terminal event"),
-            UiEvent::RunCompleted { run_id: 1 }
-        );
-    }
-
-    #[test]
-    fn cancellation_terminal_result_emits_cancelled() {
-        let (sink, control_rx, _data_rx) = sink();
-        send_cancel_result(1, Ok(Ok(execution(ExitCode::Cancelled))), &sink);
-        assert_eq!(
-            control_rx.recv().expect("terminal event"),
-            UiEvent::RunCancelled { run_id: 1 }
-        );
-    }
-}
+mod cancel_tests;
 
 #[cfg(test)]
-mod tests {
-    use std::sync::{Arc, Mutex, OnceLock};
-
-    use crate::oauth::{BrowserLauncher, OAuthEndpoints, OAuthError, OAuthService, OAuthStore};
-
-    use super::{prepare_tui, spawn_tui_session, TuiStartup};
-
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    #[test]
-    fn worker_join_reports_panic_and_normal_shutdown_is_success() {
-        let failed = super::TuiRuntimeHandle {
-            shutdown: None,
-            worker: Some(std::thread::spawn(|| panic!("fixture worker failure"))),
-        }
-        .finish()
-        .unwrap_err();
-        assert_eq!(failed.code(), crate::ExitCode::Internal);
-        assert!(failed.to_string().contains("effects are unverified"));
-        assert!(!failed.to_string().contains("fixture worker failure"));
-        let (tx, rx) = std::sync::mpsc::channel();
-        super::TuiRuntimeHandle {
-            shutdown: Some(tx),
-            worker: Some(std::thread::spawn(move || {
-                assert_eq!(rx.recv().unwrap(), super::UiCommand::Shutdown);
-            })),
-        }
-        .finish()
-        .unwrap();
-    }
-
-    #[test]
-    fn deepseek_flash_catalog_displays_v4_1_with_canonical_selection_id() {
-        let super::UiEvent::OpenCodeCatalogLoaded { models, source } =
-            super::open_code_catalog_event(super::CatalogSnapshot {
-                model_ids: vec!["deepseek-flash".into(), "deepseek-v4-flash".into()],
-                source: super::CatalogSource::Live,
-            })
-        else {
-            panic!("catalog event")
-        };
-        assert_eq!(source, super::OpenCodeCatalogSource::Live);
-        assert_eq!(models.len(), 2);
-        assert_eq!(models[0].id, "deepseek-flash");
-        assert_eq!(models[0].name, "DeepSeek V4.1 Flash");
-        assert_eq!(models[1].id, "deepseek-v4-flash");
-        assert_eq!(models[1].name, "DeepSeek V4 Flash");
-    }
-
-    #[test]
-    fn muse_catalog_offers_efforts_through_xhigh() {
-        let super::UiEvent::OpenCodeCatalogLoaded { models, .. } =
-            super::open_code_catalog_event(super::CatalogSnapshot {
-                model_ids: vec![
-                    "muse-spark-1.2-contributor".into(),
-                    "muse-spark-1.3-contributor".into(),
-                ],
-                source: super::CatalogSource::Live,
-            })
-        else {
-            panic!("catalog event")
-        };
-        assert_eq!(models.len(), 2);
-        for model in models {
-            assert_eq!(
-                model
-                    .reasoning_levels
-                    .iter()
-                    .map(|effort| effort.id())
-                    .collect::<Vec<_>>(),
-                ["low", "medium", "high", "xhigh"]
-            );
-        }
-    }
-
-    fn wait_for_auth_provider(
-        channels: &slim_tui::api::UiChannels,
-        expected: super::LoginProvider,
-    ) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while std::time::Instant::now() < deadline {
-            if matches!(
-                channels.events.try_recv(),
-                Ok(super::UiEvent::AuthStateChanged {
-                    provider: Some(provider),
-                    authenticated: true,
-                }) if provider == expected
-            ) {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        panic!("saved provider was not activated: {expected:?}");
-    }
-
-    struct NoBrowser;
-
-    impl BrowserLauncher for NoBrowser {
-        fn open(&self, _url: &str) -> Result<(), OAuthError> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn known_text_only_model_rejects_tui_image_before_send() {
-        let mut request = crate::ProviderRequest {
-            prompt: String::new(),
-            mode: slim_core::OperatingMode::Auto,
-            kind: slim_core::provider::ProviderKind::OpenCodeGo,
-            endpoint: slim_core::provider::OPENCODE_GO_BASE_URL.into(),
-            model: "deepseek-v4-flash".into(),
-            api_key: "fixture-key".into(),
-            account_id: None,
-            timeout: std::time::Duration::from_secs(120),
-        };
-        assert_eq!(
-            super::image_model_error(Some(&request)),
-            Some("OpenCode Go model deepseek-v4-flash does not accept images".into())
-        );
-
-        request.model = "deepseek-v4-flash-vision-exp".into();
-        assert_eq!(super::image_model_error(Some(&request)), None);
-    }
-
-    #[test]
-    fn text_only_model_restores_prompt_when_attachment_is_pending() {
-        let root = std::env::temp_dir().join(format!(
-            "slim-tui-image-model-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        let oauth = OAuthService::new(
-            OAuthEndpoints::default(),
-            Arc::new(NoBrowser),
-            OAuthStore::at(root.join("auth.json")),
-        )
-        .expect("oauth");
-        let startup = TuiStartup {
-            request: Some(crate::ProviderRequest {
-                prompt: String::new(),
-                mode: slim_core::OperatingMode::Auto,
-                kind: slim_core::provider::ProviderKind::OpenCodeGo,
-                endpoint: slim_core::provider::OPENCODE_GO_BASE_URL.into(),
-                model: "deepseek-v4-flash".into(),
-                api_key: "fixture-key".into(),
-                account_id: None,
-                timeout: std::time::Duration::from_secs(120),
-            }),
-            oauth_session: None,
-            options: crate::ProviderRunOptions::default(),
-            initial_prompt: None,
-            image_labels: vec!["screen.png".into()],
-            resume_path: None,
-            resume_preflight: None,
-            persist_sessions: false,
-            mode: slim_core::OperatingMode::Auto,
-            effort: super::ReasoningEffort::High,
-            endpoint_override: None,
-            model_override: None,
-            timeout: std::time::Duration::from_secs(120),
-        };
-        let (runtime, channels) = spawn_tui_session(startup, oauth).expect("runtime");
-        channels
-            .commands
-            .send(super::UiCommand::SendPrompt("keep this draft".into()))
-            .expect("send prompt");
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let mut restored = false;
-        let mut rejected = false;
-        let mut errors = Vec::new();
-        while std::time::Instant::now() < deadline && !(restored && rejected) {
-            let mut received = false;
-            for event in channels
-                .events
-                .try_iter()
-                .chain(channels.events_data.try_iter())
-            {
-                received = true;
-                match event {
-                    super::UiEvent::RestoreDraft { text } => {
-                        restored = text == "keep this draft";
-                    }
-                    super::UiEvent::RunFailed { message, .. } => {
-                        rejected = message.contains("does not accept images");
-                        errors.push(message);
-                    }
-                    _ => {}
-                }
-            }
-            if !received {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        }
-        drop(runtime);
-        let _ = std::fs::remove_dir_all(root);
-        assert!(restored, "prompt was not restored");
-        assert!(
-            rejected,
-            "model incompatibility was not visible: {errors:?}"
-        );
-    }
-
-    #[test]
-    fn tui_preparation_succeeds_without_any_credential() {
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        let root = std::env::temp_dir().join(format!("slim-signed-out-{}", std::process::id()));
-        let auth = root.join("missing-auth.json");
-        let previous_auth = std::env::var_os("SLIM_AUTH_FILE");
-        let previous_slim_key = std::env::var_os("SLIM_API_KEY");
-        let previous_codex_key = std::env::var_os("CODEX_ACCESS_TOKEN");
-        std::env::set_var("SLIM_AUTH_FILE", &auth);
-        std::env::remove_var("SLIM_API_KEY");
-        std::env::remove_var("CODEX_ACCESS_TOKEN");
-        let oauth = OAuthService::new(
-            OAuthEndpoints::default(),
-            Arc::new(NoBrowser),
-            OAuthStore::at(auth),
-        )
-        .expect("service");
-        let startup = prepare_tui(
-            vec![
-                "--tui".into(),
-                "--provider".into(),
-                "codex".into(),
-                "--experiment-id".into(),
-                "exp-arm-b".into(),
-                "--task-id".into(),
-                "repo-17".into(),
-            ],
-            &oauth,
-        )
-        .expect("signed-out startup");
-        assert!(startup.request.is_none());
-        assert_eq!(startup.options.experiment_id.as_deref(), Some("exp-arm-b"));
-        assert_eq!(startup.options.task_id.as_deref(), Some("repo-17"));
-
-        match previous_auth {
-            Some(value) => std::env::set_var("SLIM_AUTH_FILE", value),
-            None => std::env::remove_var("SLIM_AUTH_FILE"),
-        }
-        match previous_slim_key {
-            Some(value) => std::env::set_var("SLIM_API_KEY", value),
-            None => std::env::remove_var("SLIM_API_KEY"),
-        }
-        match previous_codex_key {
-            Some(value) => std::env::set_var("CODEX_ACCESS_TOKEN", value),
-            None => std::env::remove_var("CODEX_ACCESS_TOKEN"),
-        }
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn environment_api_key_overrides_active_oauth_for_default_provider() {
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        let root = std::env::temp_dir().join(format!("slim-auth-priority-{}", std::process::id()));
-        let auth = root.join("auth.json");
-        let store = OAuthStore::at(&auth);
-        store
-            .save(
-                crate::oauth::OAuthProvider::Anthropic,
-                &crate::oauth::OAuthCredential {
-                    access: "oauth-access".into(),
-                    refresh: "oauth-refresh".into(),
-                    expires: u64::MAX,
-                    account_id: None,
-                },
-            )
-            .expect("oauth store");
-        let previous_auth = std::env::var_os("SLIM_AUTH_FILE");
-        let previous_openai = std::env::var_os("OPENAI_API_KEY");
-        let previous_slim = std::env::var_os("SLIM_API_KEY");
-        std::env::set_var("SLIM_AUTH_FILE", &auth);
-        std::env::set_var("OPENAI_API_KEY", "environment-key");
-        std::env::remove_var("SLIM_API_KEY");
-        let oauth = OAuthService::new(OAuthEndpoints::default(), Arc::new(NoBrowser), store)
-            .expect("service");
-        let startup = prepare_tui(vec!["--tui".into()], &oauth).expect("startup");
-        let request = startup.request.expect("provider request");
-        assert_eq!(
-            request.kind,
-            slim_core::provider::ProviderKind::OpenAiCompatible
-        );
-        assert_eq!(request.api_key, "environment-key");
-        assert!(startup.oauth_session.is_none());
-
-        match previous_auth {
-            Some(value) => std::env::set_var("SLIM_AUTH_FILE", value),
-            None => std::env::remove_var("SLIM_AUTH_FILE"),
-        }
-        match previous_openai {
-            Some(value) => std::env::set_var("OPENAI_API_KEY", value),
-            None => std::env::remove_var("OPENAI_API_KEY"),
-        }
-        match previous_slim {
-            Some(value) => std::env::set_var("SLIM_API_KEY", value),
-            None => std::env::remove_var("SLIM_API_KEY"),
-        }
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn active_api_key_provider_is_restored_after_restart() {
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        let variables = [
-            "SLIM_AUTH_FILE",
-            "SLIM_PROVIDER",
-            "SLIM_API_KEY",
-            "OPENAI_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "OPENCODE_API_KEY",
-            "CLINEPASS_API_KEY",
-            "COMMANDCODE_API_KEY",
-            "CMD_API_KEY",
-        ];
-        let previous = variables.map(std::env::var_os);
-        for name in variables {
-            std::env::remove_var(name);
-        }
-
-        let cases = [
-            slim_core::provider::ProviderKind::OpenAiCompatible,
-            slim_core::provider::ProviderKind::Anthropic,
-            slim_core::provider::ProviderKind::OpenCodeGo,
-            slim_core::provider::ProviderKind::ClinePass,
-            slim_core::provider::ProviderKind::CommandCode,
-        ];
-        let mut observed = Vec::new();
-        let mut expected = Vec::new();
-        for (index, expected_kind) in cases.into_iter().enumerate() {
-            let root = std::env::temp_dir().join(format!(
-                "slim-restore-active-{index}-{}",
-                std::process::id()
-            ));
-            let auth = root.join("auth.json");
-            let key = format!("persisted-key-{index}");
-            crate::save_api_key_file(&auth, expected_kind, &key).expect("save provider key");
-            std::env::set_var("SLIM_AUTH_FILE", &auth);
-
-            let oauth = OAuthService::new(
-                OAuthEndpoints::default(),
-                Arc::new(NoBrowser),
-                OAuthStore::at(&auth),
-            )
-            .expect("restarted service");
-            let startup = prepare_tui(vec!["--tui".into()], &oauth).expect("restart startup");
-            observed.push(
-                startup
-                    .request
-                    .map(|request| (request.kind, request.api_key)),
-            );
-            expected.push(Some((expected_kind, key)));
-            let _ = std::fs::remove_dir_all(root);
-        }
-
-        for (name, value) in variables.into_iter().zip(previous) {
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-        assert_eq!(observed, expected);
-    }
-
-    #[test]
-    fn active_oauth_provider_is_restored_after_restart() {
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        let variables = [
-            "SLIM_AUTH_FILE",
-            "SLIM_PROVIDER",
-            "SLIM_API_KEY",
-            "OPENAI_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "CODEX_ACCESS_TOKEN",
-        ];
-        let previous = variables.map(std::env::var_os);
-        for name in variables {
-            std::env::remove_var(name);
-        }
-
-        let cases = [
-            (
-                crate::oauth::OAuthProvider::Anthropic,
-                slim_core::provider::ProviderKind::Anthropic,
-                None,
-                "anthropic",
-            ),
-            (
-                crate::oauth::OAuthProvider::OpenAiCodex,
-                slim_core::provider::ProviderKind::OpenAiCodex,
-                Some("account-1".to_owned()),
-                "codex",
-            ),
-        ];
-        let mut observed = Vec::new();
-        let mut explicit_observed = Vec::new();
-        let mut expected = Vec::new();
-        for (index, (provider, expected_kind, account_id, provider_name)) in
-            cases.into_iter().enumerate()
-        {
-            let root = std::env::temp_dir()
-                .join(format!("slim-restore-oauth-{index}-{}", std::process::id()));
-            let auth = root.join("auth.json");
-            let access = format!("oauth-access-{index}");
-            OAuthStore::at(&auth)
-                .save(
-                    provider,
-                    &crate::oauth::OAuthCredential {
-                        access: access.clone(),
-                        refresh: format!("oauth-refresh-{index}"),
-                        expires: u64::MAX,
-                        account_id,
-                    },
-                )
-                .expect("save OAuth credential");
-            std::env::set_var("SLIM_AUTH_FILE", &auth);
-
-            let oauth = OAuthService::new(
-                OAuthEndpoints::default(),
-                Arc::new(NoBrowser),
-                OAuthStore::at(&auth),
-            )
-            .expect("restarted service");
-            let startup = prepare_tui(vec!["--tui".into()], &oauth).expect("restart startup");
-            observed.push((
-                startup
-                    .request
-                    .map(|request| (request.kind, request.api_key)),
-                startup.oauth_session.map(|(provider, _)| provider),
-            ));
-            let explicit = prepare_tui(
-                vec!["--tui".into(), "--provider".into(), provider_name.into()],
-                &oauth,
-            )
-            .expect("explicit provider startup");
-            explicit_observed.push((
-                explicit
-                    .request
-                    .map(|request| (request.kind, request.api_key)),
-                explicit.oauth_session.map(|(provider, _)| provider),
-            ));
-            expected.push((Some((expected_kind, access)), Some(provider)));
-            let _ = std::fs::remove_dir_all(root);
-        }
-
-        for (name, value) in variables.into_iter().zip(previous) {
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-        assert_eq!(observed, expected);
-        assert_eq!(explicit_observed, expected);
-    }
-
-    #[test]
-    fn malformed_auth_file_is_reported_instead_of_appearing_signed_out() {
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        let variables = [
-            "SLIM_AUTH_FILE",
-            "SLIM_PROVIDER",
-            "SLIM_API_KEY",
-            "OPENAI_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "CODEX_ACCESS_TOKEN",
-        ];
-        let previous = variables.map(std::env::var_os);
-        for name in variables {
-            std::env::remove_var(name);
-        }
-        let root = std::env::temp_dir().join(format!(
-            "slim-malformed-auth-startup-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("auth directory");
-        let auth = root.join("auth.json");
-        std::fs::write(&auth, b"{\"version\":1,").expect("malformed auth fixture");
-        std::env::set_var("SLIM_AUTH_FILE", &auth);
-        let oauth = OAuthService::new(
-            OAuthEndpoints::default(),
-            Arc::new(NoBrowser),
-            OAuthStore::at(&auth),
-        )
-        .expect("service");
-
-        let observed = prepare_tui(vec!["--tui".into()], &oauth)
-            .err()
-            .map(|error| (error.code(), error.to_string()));
-
-        let _ = std::fs::remove_dir_all(root);
-        for (name, value) in variables.into_iter().zip(previous) {
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-        assert!(matches!(
-            observed,
-            Some((crate::ExitCode::Auth, message))
-                if message.starts_with("authentication: auth file")
-        ));
-    }
-
-    #[test]
-    fn environment_credentials_do_not_read_a_lower_priority_malformed_auth_file() {
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        let variables = [
-            "SLIM_AUTH_FILE",
-            "SLIM_PROVIDER",
-            "SLIM_API_KEY",
-            "OPENAI_API_KEY",
-            "OPENCODE_API_KEY",
-            "SLIM_EFFORT",
-        ];
-        let previous = variables.map(std::env::var_os);
-        for name in variables {
-            std::env::remove_var(name);
-        }
-        let root = std::env::temp_dir().join(format!(
-            "slim-env-over-malformed-auth-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("auth directory");
-        let auth = root.join("auth.json");
-        std::fs::write(&auth, b"{\"version\":1,").expect("malformed auth fixture");
-        std::env::set_var("SLIM_AUTH_FILE", &auth);
-        let oauth = OAuthService::new(
-            OAuthEndpoints::default(),
-            Arc::new(NoBrowser),
-            OAuthStore::at(&auth),
-        )
-        .expect("service");
-
-        std::env::set_var("OPENAI_API_KEY", "openai-environment");
-        std::env::set_var("SLIM_EFFORT", "low");
-        let default_startup =
-            prepare_tui(vec!["--tui".into()], &oauth).expect("default environment credential");
-        let sent_effort = default_startup.options.reasoning_effort;
-        let default = default_startup
-            .request
-            .map(|request| (request.kind, request.api_key));
-        std::env::set_var("SLIM_EFFORT", "invalid-effort");
-        let invalid_effort = prepare_tui(vec!["--tui".into()], &oauth).err();
-        std::env::remove_var("SLIM_EFFORT");
-        std::env::remove_var("OPENAI_API_KEY");
-        std::env::set_var("OPENCODE_API_KEY", "opencode-environment");
-        let explicit = prepare_tui(
-            vec!["--tui".into(), "--provider".into(), "opencode-go".into()],
-            &oauth,
-        )
-        .expect("explicit environment credential")
-        .request
-        .map(|request| (request.kind, request.api_key));
-
-        let invalid_model = prepare_tui(
-            vec![
-                "--provider".into(),
-                "opencode-go".into(),
-                "--model".into(),
-                "unknown-model".into(),
-            ],
-            &oauth,
-        )
-        .err();
-        let _ = std::fs::remove_dir_all(root);
-        for (name, value) in variables.into_iter().zip(previous) {
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-        assert_eq!(sent_effort.as_deref(), Some("low"));
-        assert!(invalid_effort.is_some());
-        assert!(invalid_model.is_some());
-        assert_eq!(
-            default,
-            Some((
-                slim_core::provider::ProviderKind::OpenAiCompatible,
-                "openai-environment".into()
-            ))
-        );
-        assert_eq!(
-            explicit,
-            Some((
-                slim_core::provider::ProviderKind::OpenCodeGo,
-                "opencode-environment".into()
-            ))
-        );
-    }
-
-    #[test]
-    fn selecting_codex_model_activates_saved_login_from_opencode() {
-        let root =
-            std::env::temp_dir().join(format!("slim-model-provider-switch-{}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("auth directory");
-        let auth = root.join("auth.json");
-        let store = OAuthStore::at(&auth);
-        store
-            .save(
-                crate::oauth::OAuthProvider::OpenAiCodex,
-                &crate::oauth::OAuthCredential {
-                    access: "codex-access".into(),
-                    refresh: "codex-refresh".into(),
-                    expires: u64::MAX,
-                    account_id: Some("account-1".into()),
-                },
-            )
-            .expect("save Codex login");
-        store
-            .save_api_key("opencode-go", "opencode-key")
-            .expect("make OpenCode active");
-        let oauth = OAuthService::new(OAuthEndpoints::default(), Arc::new(NoBrowser), store)
-            .expect("service");
-        let startup = TuiStartup {
-            request: Some(crate::ProviderRequest {
-                prompt: String::new(),
-                mode: slim_core::OperatingMode::Auto,
-                kind: slim_core::provider::ProviderKind::OpenCodeGo,
-                endpoint: slim_core::provider::OPENCODE_GO_BASE_URL.into(),
-                model: slim_core::provider::OPENCODE_GO_DEFAULT_MODEL.into(),
-                api_key: "opencode-key".into(),
-                account_id: None,
-                timeout: std::time::Duration::from_secs(120),
-            }),
-            oauth_session: None,
-            options: crate::ProviderRunOptions::default(),
-            initial_prompt: None,
-            image_labels: Vec::new(),
-            resume_path: None,
-            resume_preflight: None,
-            persist_sessions: false,
-            mode: slim_core::OperatingMode::Auto,
-            effort: super::ReasoningEffort::High,
-            endpoint_override: None,
-            model_override: None,
-            timeout: std::time::Duration::from_secs(120),
-        };
-        let (runtime, channels) = spawn_tui_session(startup, oauth).expect("runtime");
-        channels
-            .commands
-            .send(super::UiCommand::SetModel {
-                model: super::ModelAlias::Sol,
-                effort: super::ReasoningEffort::High,
-                fast: false,
-            })
-            .expect("select Codex model");
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let mut switched = false;
-        while std::time::Instant::now() < deadline {
-            if matches!(
-                channels.events.try_recv(),
-                Ok(super::UiEvent::AuthStateChanged {
-                    provider: Some(super::LoginProvider::OpenAiCodex),
-                    authenticated: true,
-                })
-            ) {
-                switched = true;
-                break;
-            }
-            if let Ok(super::UiEvent::Notification { message }) = channels.events_data.try_recv() {
-                if message.contains("require an OpenAI Codex connection") {
-                    panic!("saved Codex login was ignored: {message}");
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(switched, "saved Codex login was not activated");
-        channels
-            .commands
-            .send(super::UiCommand::Shutdown)
-            .expect("shutdown");
-        drop(runtime);
-        assert_eq!(
-            OAuthStore::at(&auth)
-                .active_provider_key()
-                .expect("active provider"),
-            Some("openai-codex".into())
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn model_overlay_switches_across_all_saved_provider_groups() {
-        let root = std::env::temp_dir().join(format!(
-            "slim-all-model-provider-switches-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("auth directory");
-        let auth = root.join("auth.json");
-        crate::auth::save_api_key_file(
-            &auth,
-            slim_core::provider::ProviderKind::OpenCodeGo,
-            "opencode-key",
-        )
-        .expect("save OpenCode key");
-        crate::auth::save_api_key_file(
-            &auth,
-            slim_core::provider::ProviderKind::ClinePass,
-            "clinepass-key",
-        )
-        .expect("save ClinePass key");
-        crate::auth::save_api_key_file(
-            &auth,
-            slim_core::provider::ProviderKind::CommandCode,
-            "command-code-key",
-        )
-        .expect("save Command Code key");
-        let store = OAuthStore::at(&auth);
-        let codex_credential = crate::oauth::OAuthCredential {
-            access: "codex-access".into(),
-            refresh: "codex-refresh".into(),
-            expires: u64::MAX,
-            account_id: Some("account-1".into()),
-        };
-        store
-            .save(crate::oauth::OAuthProvider::OpenAiCodex, &codex_credential)
-            .expect("save Codex login");
-        let oauth = OAuthService::new(OAuthEndpoints::default(), Arc::new(NoBrowser), store)
-            .expect("service");
-        let startup = TuiStartup {
-            request: Some(crate::ProviderRequest {
-                prompt: String::new(),
-                mode: slim_core::OperatingMode::Auto,
-                kind: slim_core::provider::ProviderKind::OpenAiCodex,
-                endpoint: crate::cli::default_provider_endpoint(
-                    slim_core::provider::ProviderKind::OpenAiCodex,
-                )
-                .into(),
-                model: super::ModelAlias::Sol.id().into(),
-                api_key: codex_credential.access.clone(),
-                account_id: codex_credential.account_id.clone(),
-                timeout: std::time::Duration::from_secs(120),
-            }),
-            oauth_session: Some((crate::oauth::OAuthProvider::OpenAiCodex, codex_credential)),
-            options: crate::ProviderRunOptions::default(),
-            initial_prompt: None,
-            image_labels: Vec::new(),
-            resume_path: None,
-            resume_preflight: None,
-            persist_sessions: false,
-            mode: slim_core::OperatingMode::Auto,
-            effort: super::ReasoningEffort::High,
-            endpoint_override: None,
-            model_override: None,
-            timeout: std::time::Duration::from_secs(120),
-        };
-        let (runtime, channels) = spawn_tui_session(startup, oauth).expect("runtime");
-
-        channels
-            .commands
-            .send(super::UiCommand::SetOpenCodeModel {
-                model: slim_core::provider::OPENCODE_GO_DEFAULT_MODEL.into(),
-                effort: super::ReasoningEffort::High,
-            })
-            .expect("select OpenCode model");
-        wait_for_auth_provider(&channels, super::LoginProvider::OpenCodeGo);
-        assert_eq!(
-            OAuthStore::at(&auth)
-                .active_provider_key()
-                .expect("active OpenCode provider"),
-            Some("opencode-go".into())
-        );
-
-        channels
-            .commands
-            .send(super::UiCommand::SetClinePassModel {
-                model: slim_core::provider::CLINEPASS_DEFAULT_MODEL.into(),
-                effort: super::ReasoningEffort::High,
-            })
-            .expect("select ClinePass model");
-        wait_for_auth_provider(&channels, super::LoginProvider::ClinePass);
-        assert_eq!(
-            OAuthStore::at(&auth)
-                .active_provider_key()
-                .expect("active ClinePass provider"),
-            Some("clinepass".into())
-        );
-
-        channels
-            .commands
-            .send(super::UiCommand::SetCommandCodeModel {
-                model: slim_core::provider::COMMANDCODE_DEFAULT_MODEL.into(),
-                effort: super::ReasoningEffort::High,
-            })
-            .expect("select Command Code model");
-        wait_for_auth_provider(&channels, super::LoginProvider::CommandCode);
-        assert_eq!(
-            OAuthStore::at(&auth)
-                .active_provider_key()
-                .expect("active Command Code provider"),
-            Some("command-code".into())
-        );
-
-        channels
-            .commands
-            .send(super::UiCommand::SetModel {
-                model: super::ModelAlias::Sol,
-                effort: super::ReasoningEffort::High,
-                fast: false,
-            })
-            .expect("select Codex model");
-        wait_for_auth_provider(&channels, super::LoginProvider::OpenAiCodex);
-
-        channels
-            .commands
-            .send(super::UiCommand::Shutdown)
-            .expect("shutdown");
-        drop(runtime);
-        assert_eq!(
-            OAuthStore::at(&auth)
-                .active_provider_key()
-                .expect("active provider"),
-            Some("openai-codex".into())
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-}
+mod tests;
 
 #[cfg(test)]
-mod restored_tool_tests {
-    use super::*;
-
-    #[test]
-    fn restored_tools_keep_batch_order_and_namespace_reused_call_ids() {
-        let call = |id: &str| slim_core::provider::ProviderToolCall {
-            id: id.into(),
-            name: "read".into(),
-            arguments: format!("{{\"path\":\"{id}\"}}"),
-        };
-        let history = vec![
-            ProviderMessage::assistant("checking", vec![call("a"), call("b")]),
-            ProviderMessage::tool("read", "b", "second result"),
-            ProviderMessage::tool("read", "a", "first result"),
-            ProviderMessage::assistant("", vec![call("a")]),
-            ProviderMessage::tool("read", "a", "later result"),
-        ];
-        let messages = transcript_messages(&history);
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[1].text, "first result");
-        assert_eq!(messages[2].text, "second result");
-        assert_eq!(messages[3].text, "later result");
-        let ids = messages
-            .iter()
-            .filter_map(|message| match &message.role {
-                TranscriptRole::Tool { call_id, .. } => Some(&call_id.0),
-                _ => None,
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(ids.len(), 3);
-    }
-
-    #[test]
-    fn session_header_decodes_valid_first_line() {
-        let path = std::env::temp_dir().join(format!(
-            "slim-session-header-ok-{}-{}.jsonl",
-            std::process::id(),
-            system_time_nanos(SystemTime::now())
-        ));
-        let header = DurableSessionHeader::new("tui-check", "1", "D:/tmp", None, None);
-        let mut bytes = serde_json::to_vec(&header).expect("encode header");
-        bytes.push(b'\n');
-        bytes.extend_from_slice(b"{\"type\":\"operation\"}");
-        fs::write(&path, &bytes).expect("write fixture");
-        let parsed = read_session_header(&path).expect("header");
-        assert_eq!(parsed.id, "tui-check");
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn session_header_rejects_line_beyond_the_read_cap() {
-        let path = std::env::temp_dir().join(format!(
-            "slim-session-header-huge-{}-{}.jsonl",
-            std::process::id(),
-            system_time_nanos(SystemTime::now())
-        ));
-        let header = DurableSessionHeader::new("tui-huge", "1", "x".repeat(128 * 1024), None, None);
-        let mut bytes = serde_json::to_vec(&header).expect("encode header");
-        bytes.push(b'\n');
-        fs::write(&path, &bytes).expect("write fixture");
-        assert!(read_session_header(&path).is_none());
-        let _ = fs::remove_file(&path);
-    }
-}
+mod restored_tool_tests;

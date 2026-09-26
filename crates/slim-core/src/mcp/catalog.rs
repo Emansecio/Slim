@@ -1,4 +1,4 @@
-use crate::{mcp::canonical_name, OperatingMode};
+use crate::{OperatingMode, mcp::canonical_name};
 
 #[derive(Clone, Debug)]
 pub struct McpCatalog {
