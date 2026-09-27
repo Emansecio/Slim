@@ -24,7 +24,7 @@ pub use codeintel::{
 pub use events::{
     CausalAnomalyKind, CausalBoundaryKind, CausalConfidence, CausalProgressKind,
     CausalShadowAction, EventKind, ReasoningClassification, RequestKind, SessionEvent,
-    TodoChangedItem,
+    TodoChangedItem, ToolEditDiff, ToolEditHunk,
 };
 pub use interaction::{
     ask_question_definition, interaction_route, AskQuestion, InteractionError,
@@ -44,6 +44,5 @@ pub use provider::{
 };
 pub use runtime::{
     tool_call_is_read_only, without_workspace_snapshot, AgentLoopConfig, AgentLoopResult,
-    AgentLoopStop, InProcessCapabilityAdapter, RequestUsage, Runtime, RuntimeCapabilityAdapter,
-    RuntimeCapabilityBridge, RuntimeCapabilityTarget, UsageTotals,
+    AgentLoopStop, RequestUsage, Runtime, RuntimeCapabilityBridge, UsageTotals,
 };

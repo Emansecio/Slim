@@ -486,9 +486,7 @@ fn block_height(
         // prompt preserve their full multiline payload behind a four-cell role
         // prefix, using the same physical-row contract as materialization.
         BlockKind::Tool(state) => {
-            if block.fold == crate::block::FoldState::Expanded
-                && !state.materialized_output.is_empty()
-            {
+            if block.fold == crate::block::FoldState::Expanded && state.has_expanded_body() {
                 1 + cache.cached_body_rows(
                     block,
                     BodyKind::ToolOutput,
@@ -496,7 +494,7 @@ fn block_height(
                     block.lifecycle != crate::block::BlockLifecycle::Streaming,
                     || {
                         wrapped_row_count(
-                            &state.materialized_output,
+                            &state.expanded_body(),
                             width.saturating_sub(4).max(1) as usize,
                         )
                     },

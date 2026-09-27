@@ -113,7 +113,8 @@ fn tui_turn_projects_prompt_tool_stream_final_text_and_usage() {
     )));
     assert!(events.iter().any(|event| matches!(
         event,
-        UiEvent::ToolProgress { preview, .. } if preview.contains("tui tool fixture")
+        UiEvent::ToolOutput { name, output, .. }
+            if name == "read" && output.contains("tui tool fixture")
     )));
     assert_eq!(
         events

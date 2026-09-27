@@ -1935,7 +1935,7 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
         // Let the worker resolve dynamic skill commands. This also keeps
         // unknown slash commands fail-closed without losing the draft.
         _ if command.starts_with('/') => {
-            if let Some(effect) = prepare_prompt(state, prompt.clone(), PromptOrigin::Direct) {
+            if let Some(effect) = prepare_prompt(state, prompt, PromptOrigin::Direct) {
                 effects.push(effect);
             } else {
                 state.push_notification_with_priority(
@@ -1951,7 +1951,7 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
             return effects;
         }
         _ => {
-            if let Some(effect) = prepare_prompt(state, prompt.clone(), PromptOrigin::Direct) {
+            if let Some(effect) = prepare_prompt(state, prompt, PromptOrigin::Direct) {
                 effects.push(effect);
             } else {
                 state.push_notification_with_priority(

@@ -115,6 +115,10 @@ impl ReadService {
             std::fs::File::open(canonical).map_err(|error| read_path_error(canonical, error))?;
         super::execution::verify_opened_path(&file, canonical)?;
         let metadata = file.metadata()?;
+        // Unix opens directories; Windows fails in `read_path_error`.
+        if metadata.is_dir() {
+            return Err(directory_read_error());
+        }
         let stamp = FastStamp::from_file(DependencyKind::File, &file, &metadata, None);
         let version = FileVersion {
             len: metadata.len(),
@@ -257,8 +261,16 @@ impl ReadService {
                 line: current_line,
                 offset: checkpoint.offset.saturating_add(bytes_read),
             };
-            let more =
-                read_utf8_line(&mut reader, &mut line, &dependency, &mut bytes_read)?.is_some();
+            // Only the presence of a next line matters here; its encoding is
+            // checked when that page is read, so it cannot fail this one.
+            line.clear();
+            let next_read = reader.read_until(b'\n', &mut line).map_err(|error| {
+                bytes_read =
+                    bytes_read.saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX));
+                observed_read_error(error.into(), &dependency, bytes_read)
+            })?;
+            bytes_read = bytes_read.saturating_add(u64::try_from(next_read).unwrap_or(u64::MAX));
+            let more = next_read > 0;
             if more {
                 discovered.push(next_page);
                 let following_line = current_line.saturating_add(1);
@@ -431,12 +443,22 @@ impl ReadService {
     }
 }
 
+fn directory_read_error() -> ToolExecutionError {
+    ToolError::InvalidInput {
+        message: "path is a directory; use list to see its entries".into(),
+    }
+    .into()
+}
+
 fn read_path_error(path: &Path, error: io::Error) -> ToolExecutionError {
+    if path.is_dir() {
+        return directory_read_error();
+    }
     let missing = error.kind() == io::ErrorKind::NotFound;
     let mut failure = ToolExecutionError::from(ToolError::from(error));
     if missing {
         failure.context = Some(format!(
-            "{}: file does not exist. If the task requires creating it, use write with expected omitted or null; an existing file is not required for creation.",
+            "{}: file does not exist; use list or search to locate it. If the task requires creating it, use write with expected omitted or null.",
             path.display()
         ));
     }
@@ -660,6 +682,34 @@ mod tests {
         );
         assert_eq!(page.output, expected);
         assert_eq!(service.complete_digest(&canonical), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn invalid_utf8_after_a_full_page_does_not_fail_that_page() {
+        let path = std::env::temp_dir().join(format!(
+            "slim-read-bad-lookahead-{}.txt",
+            std::process::id()
+        ));
+        let lines: Vec<String> = (1..=200).map(|line| format!("line {line}\n")).collect();
+        let mut body = lines.concat().into_bytes();
+        body.extend_from_slice(b"bad \xff byte\nline 202\n");
+        std::fs::write(&path, &body).expect("fixture");
+        let canonical = path.canonicalize().expect("canonical");
+        let service = ReadService::default();
+        let page = service
+            .read_file_range_resolved(&canonical, 1, Some(200), false, None)
+            .expect("the requested lines are valid UTF-8");
+        assert_eq!(
+            page.output,
+            format!(
+                "{}\n[showing lines 1-200; more content available; pass \"offset\": 201 for the next page]",
+                lines.concat()
+            )
+        );
+        assert!(service
+            .read_file_range_resolved(&canonical, 201, Some(1), false, None)
+            .is_err());
         let _ = std::fs::remove_file(path);
     }
 

@@ -94,6 +94,113 @@ fn unicode_recovery_keeps_write_and_patch_errors_recoverable() {
     }
 }
 
+/// Receipts and error headers name workspace paths relative to the workspace:
+/// the canonical absolute form costs tokens on every call and exposes the host.
+#[test]
+fn receipts_and_errors_use_workspace_relative_paths() {
+    let root = Workspace::new();
+    let canonical = fs::canonicalize(&root.0).unwrap();
+    let absolute = canonical.to_str().unwrap().to_owned();
+    fs::create_dir_all(root.0.join("src")).unwrap();
+    fs::write(root.0.join("src/data.txt"), "one\ntwo\n").unwrap();
+    let shown = std::path::Path::new("src").join("data.txt");
+    let shown = shown.to_str().unwrap();
+    let outputs = [
+        (
+            "patch",
+            json!({"path":"src/data.txt", "edits":[{"expected":"two", "replacement":"2"}]}),
+            format!("patched {shown}:2; replaced 3 bytes with 1 bytes"),
+        ),
+        (
+            "patch",
+            json!({"path":"src/data.txt", "edits":[{"expected":"missing", "replacement":"x"}]}),
+            format!("expected one match; got 0\n{shown}: file unchanged."),
+        ),
+        (
+            "write",
+            json!({"path":"src/data.txt", "content":"x", "expected":"stale"}),
+            format!("stale read: {shown}; precondition differs"),
+        ),
+        (
+            "read",
+            json!({"path":"src/missing.txt"}),
+            format!(
+                "{}: file does not exist; use list or search to locate it.",
+                std::path::Path::new("src").join("missing.txt").display()
+            ),
+        ),
+        (
+            "search",
+            json!({"path":"src/nope", "query":"x"}),
+            "search root is not a readable directory".to_owned(),
+        ),
+    ];
+    for (name, args, expected) in outputs {
+        let result = root.call(name, args);
+        assert!(
+            result.output.contains(&expected),
+            "{name}: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains(&absolute),
+            "{name}: {}",
+            result.output
+        );
+    }
+}
+
+/// Recovery text is only useful when the model receives it whole: a failure on
+/// a file between the result cap and the old 64 KiB recovery cap must not
+/// promise the current file ("Do not read again") and then lose its end.
+#[test]
+fn mutation_recovery_fits_the_default_result_budget() {
+    let budget = slim_core::runtime::AgentLoopConfig::default().max_result_bytes;
+    // Room for the artifact reference and an admission prefix added later.
+    let headroom = 1024;
+    let mut content = String::new();
+    for index in 0..1000 {
+        content.push_str(&format!("pub const VALUE_{index:04}: usize = {index};\n"));
+    }
+    assert!(content.len() > budget && content.len() < 64 * 1024);
+    let root = Workspace::new();
+    fs::write(root.0.join("big.rs"), &content).unwrap();
+    for (name, args) in [
+        ("write", json!({"path":"big.rs", "content":"x\n"})),
+        (
+            "patch",
+            json!({"path":"big.rs", "edits":[{"expected":"VALUE_9999", "replacement":"x"}]}),
+        ),
+    ] {
+        let result = root.call(name, args);
+        assert!(!result.success);
+        assert!(
+            result.output.len() + headroom <= budget,
+            "{name}: {} bytes",
+            result.output.len()
+        );
+        assert!(
+            result.output.contains("Current file edges are below"),
+            "{name}: {}",
+            result.output
+        );
+        assert!(result.output.contains("VALUE_0000"), "{name}");
+        assert!(result.output.contains("VALUE_0999"), "{name}");
+    }
+    let small = "fn a() {}\n".repeat(100);
+    fs::write(root.0.join("small.rs"), &small).unwrap();
+    let result = root.call(
+        "patch",
+        json!({"path":"small.rs", "edits":[{"expected":"missing", "replacement":"x"}]}),
+    );
+    assert!(
+        result.output.contains("Current file is below"),
+        "{}",
+        result.output
+    );
+    assert!(result.output.ends_with(&small));
+}
+
 impl Drop for Workspace {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
@@ -1408,9 +1515,12 @@ fn recovery_guidance_bytes(output: &str, path: &std::path::Path) -> usize {
         }
     }
     assert!(found_evidence, "missing evidence boundary: {output}");
-    let path = fs::canonicalize(path).unwrap();
-    assert!(prefix.contains(path.to_str().unwrap()));
-    let mut guidance = prefix.replace(path.to_str().unwrap(), "");
+    // Headers name the workspace-relative path, never the canonical one.
+    let canonical = fs::canonicalize(path).unwrap();
+    assert!(!prefix.contains(canonical.to_str().unwrap()), "{prefix}");
+    let shown = path.file_name().unwrap().to_str().unwrap();
+    assert!(prefix.contains(shown), "{prefix}");
+    let mut guidance = prefix.replace(shown, "");
     // Line locations are diagnostic evidence; retain every surrounding label,
     // header, separator and instruction, including the fixed 'first 8' notice.
     if let Some(start) = guidance.find("Matches at lines ") {

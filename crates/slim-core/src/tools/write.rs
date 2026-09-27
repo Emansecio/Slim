@@ -423,7 +423,11 @@ pub(super) fn read_existing_file_observed(
     })
 }
 
-pub(super) const CURRENT_FILE_RECOVERY_BYTES: usize = 64 * 1024;
+/// Recovery text must reach the model whole. Both bounds leave room under the
+/// default 16 KiB per-result allowance (`AgentLoopConfig::max_result_bytes`)
+/// for the failure header, an admission prefix and an artifact reference.
+pub(super) const CURRENT_FILE_RECOVERY_BYTES: usize = 12 * 1024;
+const RECOVERY_EDGE_BYTES: usize = 8 * 1024;
 
 const WRITE_COMPLETE_RECOVERY_GUIDANCE: &str =
     "Use full text as expected, or patch a unique excerpt. Do not read again.";
@@ -440,7 +444,7 @@ pub(super) fn current_file_recovery_context(content: &str) -> String {
     } else {
         format!(
             "Current file edges are below; middle omitted. {WRITE_PARTIAL_RECOVERY_GUIDANCE}\n{}",
-            recovery_head_tail(content, 16 * 1024)
+            recovery_head_tail(content, RECOVERY_EDGE_BYTES)
         )
     }
 }
@@ -451,7 +455,7 @@ pub(super) fn patch_file_recovery_context(content: &str) -> String {
     } else {
         format!(
             "Current file edges are below; middle omitted. {PATCH_PARTIAL_RECOVERY_GUIDANCE}\n{}",
-            recovery_head_tail(content, 16 * 1024)
+            recovery_head_tail(content, RECOVERY_EDGE_BYTES)
         )
     }
 }

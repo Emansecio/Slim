@@ -283,13 +283,14 @@ impl Runtime {
                     let until = tokio::time::Instant::now() + Duration::from_millis(yield_ms);
                     loop {
                         if let Some(result) = self.shell_jobs.inline_ready(&id) {
-                            push_tool_process_finished(
+                            push_tool_result_facts(
                                 &mut self.app,
                                 &mut seq,
                                 &result.batch_id,
                                 &result.call_id,
                                 "shell",
                                 result.process.as_ref(),
+                                None,
                             )?;
                             if let Some(actual) = result.receipt {
                                 receipt = actual;
@@ -353,13 +354,14 @@ impl Runtime {
         let ready = self.shell_jobs.ready();
         let delivered = !ready.is_empty();
         for completion in ready {
-            push_tool_process_finished(
+            push_tool_result_facts(
                 &mut self.app,
                 seq,
                 &completion.batch_id,
                 &completion.call_id,
                 "shell",
                 completion.process.as_ref(),
+                None,
             )?;
             let elapsed_ms = completion.elapsed_ms;
             let id = completion.id;

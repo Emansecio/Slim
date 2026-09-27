@@ -981,14 +981,20 @@ fn loopback_fixture_exercises_reasoning_homonymous_tools_and_answer_offline() {
     assert!(call_ids[0].ends_with(CALL_ALPHA));
     assert!(call_ids[1].ends_with(CALL_BETA));
     assert_ne!(call_ids[0], call_ids[1]);
-    assert!(events.iter().any(|event| matches!(
-        event,
-        UiEvent::ToolProgress { preview, .. } if preview.contains(CALL_ONE_OUTPUT)
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        UiEvent::ToolProgress { preview, .. } if preview.contains(CALL_TWO_OUTPUT)
-    )));
+    // Homonymous calls must keep each final output attached to its own call.
+    for (expected_call, expected_output) in [
+        (call_ids[0], CALL_ONE_OUTPUT),
+        (call_ids[1], CALL_TWO_OUTPUT),
+    ] {
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                UiEvent::ToolOutput { call_id, output, .. }
+                    if call_id.0.as_ref() == expected_call && output.contains(expected_output)
+            )),
+            "missing {expected_output} output for {expected_call}"
+        );
+    }
     assert_eq!(
         events
             .iter()

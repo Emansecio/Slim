@@ -3,7 +3,8 @@ use std::io::Write;
 use std::path::PathBuf;
 
 #[cfg(windows)]
-use std::os::windows::fs::symlink_file;
+#[path = "../../../tests/support/windows_symlink.rs"]
+mod windows_symlink;
 
 use slim_core::events::{EventKind, SessionEvent};
 use slim_core::session::{recover, SessionWriter, MAX_DURABLE_SESSION_BYTES};
@@ -341,14 +342,14 @@ fn symlinked_session_alias_cannot_bypass_writer_lock() {
     let alias = path.parent().expect("parent").join("alias-session.jsonl");
     let writer = SessionWriter::create(&path, "session-alias", "D:\\Slim").expect("create");
 
-    match symlink_file(&path, &alias) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            drop(writer);
-            let _ = fs::remove_dir_all(path.parent().expect("parent"));
-            return;
-        }
-        Err(error) => panic!("symlink setup failed: {error}"),
+    if !windows_symlink::symlink_file_or_skip(
+        &path,
+        &alias,
+        "symlinked_session_alias_cannot_bypass_writer_lock",
+    ) {
+        drop(writer);
+        let _ = fs::remove_dir_all(path.parent().expect("parent"));
+        return;
     }
 
     assert!(SessionWriter::create(&alias, "session-alias", "D:\\Slim").is_err());
@@ -367,13 +368,13 @@ fn symlinked_lock_sentinel_is_rejected_without_redirecting() {
     let original = b"unrelated sentinel";
     fs::write(&target, original).expect("target");
 
-    match symlink_file(&target, &lock_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            let _ = fs::remove_dir_all(parent);
-            return;
-        }
-        Err(error) => panic!("symlink setup failed: {error}"),
+    if !windows_symlink::symlink_file_or_skip(
+        &target,
+        &lock_path,
+        "session_recovery::symlinked_lock_sentinel_is_rejected_without_redirecting",
+    ) {
+        let _ = fs::remove_dir_all(parent);
+        return;
     }
 
     assert!(SessionWriter::create(&path, "session-redirect", "D:\\Slim").is_err());

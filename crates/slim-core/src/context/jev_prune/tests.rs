@@ -331,6 +331,47 @@ async fn http_judge_uses_official_gateway_shape_and_parses_camel_case_usage() {
 }
 
 #[tokio::test]
+async fn http_judge_rejects_oversized_stream_before_eof() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut first_request_byte = [0_u8; 1];
+        stream.read_exact(&mut first_request_byte).expect("request");
+        let oversized = vec![b'x'; MAX_RESPONSE_BYTES as usize + 1];
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n{:x}\r\n",
+            oversized.len()
+        )
+        .expect("headers");
+        stream.write_all(&oversized).expect("oversized chunk");
+        stream.write_all(b"\r\n").expect("chunk suffix");
+        stream.flush().expect("flush");
+        // Leave the chunked response unfinished. The client must reject the
+        // body limit without waiting for a terminal chunk or connection close.
+        std::thread::sleep(Duration::from_secs(3));
+    });
+
+    let judge = HttpJevJudge::new(JevPruneConfig::new(JevBackend::Typesafe, "fixture-key"))
+        .with_endpoint_for_test(format!("http://{address}/v1/systemone"));
+    let questions = vec![("keep_0".into(), "keep it?".into())];
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        judge.judge(&serde_json::json!({ "task": "test" }), &questions),
+    )
+    .await;
+    server.join().expect("server");
+    let error = result
+        .expect("oversized response must be rejected before EOF")
+        .expect_err("oversized response must fail");
+    assert!(error.contains("response exceeds"), "{error}");
+}
+
+#[tokio::test]
 async fn drops_stale_pair_and_preserves_call_ids() {
     let mut summarized = pair("call-1", 8_000);
     summarized.push(message("user", "thanks, now patch it".into()));

@@ -87,7 +87,7 @@ impl PersistentQueue {
             if let Some(preparation) = active_preparation {
                 self.active = Some(ActivePrompt {
                     admission: Some(preparation.admission),
-                    text: preparation.prompt.clone(),
+                    text: preparation.prompt,
                     run_id: None,
                 });
             }
@@ -253,14 +253,13 @@ impl PersistentQueue {
             Some(UiEvent::RunFailed {
                 run_id: Some(run_id),
                 ..
-            }) => {
-                if self.active.as_ref().is_some_and(|active| {
-                    active.admission.is_none() && active.run_id == Some(*run_id)
-                }) {
-                    self.active = None;
-                    snapshot.in_flight = None;
-                    snapshot.recovery_draft = None;
-                }
+            }) if self.active.as_ref().is_some_and(|active| {
+                active.admission.is_none() && active.run_id == Some(*run_id)
+            }) =>
+            {
+                self.active = None;
+                snapshot.in_flight = None;
+                snapshot.recovery_draft = None;
             }
             _ => {}
         }
@@ -268,7 +267,7 @@ impl PersistentQueue {
         // A legacy RunStarted can arrive on a later event after the command was
         // accepted. Its matching terminal is the only event that clears it.
         if was_working && !state.working && self.active.is_some() && prompt_event.is_none() {
-            snapshot.in_flight = journal.snapshot().in_flight.clone();
+            snapshot.in_flight.clone_from(&journal.snapshot().in_flight);
         }
         snapshot.pending = state.queued_prompts.iter().cloned().collect();
         journal.save(snapshot)?;

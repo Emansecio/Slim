@@ -220,7 +220,7 @@ impl RequestState {
                 InterruptedRequest::Uncertain(interruption)
             }
             RequestPhase::Completed(result) => {
-                let result = result.take().unwrap_or_else(|| Err(McpError::Closed));
+                let result = result.take().unwrap_or(Err(McpError::Closed));
                 *phase = RequestPhase::Taken;
                 InterruptedRequest::Completed(result)
             }
@@ -263,7 +263,7 @@ impl RequestState {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match &mut *phase {
             RequestPhase::Completed(result) => {
-                let result = result.take().unwrap_or_else(|| Err(McpError::Closed));
+                let result = result.take().unwrap_or(Err(McpError::Closed));
                 *phase = RequestPhase::Taken;
                 Some(McpRequestOutcome::Completed(result))
             }

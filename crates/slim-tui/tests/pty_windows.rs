@@ -1,5 +1,5 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use slim_tui::api::UiCommand;
+use slim_tui::api::{PromptOrigin, UiCommand};
 use slim_tui::app::AppState;
 use slim_tui::composer::{Composer, ComposerError, MAX_DRAFT_CHARS};
 use slim_tui::input::{
@@ -232,7 +232,10 @@ fn marker_paste_reaching_the_composer_never_sends_a_prompt() {
         if let Some(action) = action {
             for effect in reduce(&mut state, action) {
                 assert!(
-                    !matches!(effect, Effect::Send(UiCommand::SendPrompt(_))),
+                    !matches!(
+                        effect,
+                        Effect::Send(UiCommand::PreparePrompt { .. } | UiCommand::SendPrompt(_))
+                    ),
                     "paste must never submit"
                 );
             }
@@ -362,7 +365,15 @@ fn paste_landing_while_idle_leaves_the_draft_ready_for_a_manual_submit() {
         &mut state,
         Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
     );
-    assert!(effects
+    let admitted = effects
         .iter()
-        .any(|effect| matches!(effect, Effect::Send(UiCommand::SendPrompt(_)))));
+        .filter_map(|effect| match effect {
+            Effect::Send(UiCommand::PreparePrompt { prompt, admission }) => {
+                Some((prompt.as_str(), admission.origin))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(admitted, vec![("todo\nlist", PromptOrigin::Direct)]);
+    assert!(state.prompt_is_busy());
 }

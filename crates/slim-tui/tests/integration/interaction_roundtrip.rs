@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use slim_tui::api::{InteractionRequestId, UiCommand, UiEvent};
+use slim_tui::api::{InteractionRequestId, PromptOrigin, UiCommand, UiEvent};
 use slim_tui::app::AppState;
 use slim_tui::block::{BlockKind, BlockLifecycle, InteractionRequestKind};
 use slim_tui::reducer::{reduce, Action, Effect};
@@ -8,6 +8,15 @@ use slim_tui::testkit::render_terminal_text;
 
 fn request_id(value: &str) -> InteractionRequestId {
     InteractionRequestId(value.into())
+}
+
+/// Any command that would start a prompt run, through either the reducer's
+/// admission-aware path or the legacy programmatic one.
+fn starts_prompt(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::Send(UiCommand::PreparePrompt { .. } | UiCommand::SendPrompt(_))
+    )
 }
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -54,9 +63,7 @@ fn question_options_support_selection_and_custom_answer_without_sending_a_prompt
         request_id: request_id("question-1"),
         answer: slim_core::QuestionAnswer::option(1, "tui").expect("option"),
     })));
-    assert!(effects
-        .iter()
-        .all(|effect| !matches!(effect, Effect::Send(UiCommand::SendPrompt(_)))));
+    assert!(!effects.iter().any(starts_prompt));
     state.apply_event(UiEvent::InteractionAcknowledged {
         request_id: request_id("question-1"),
         accepted: true,
@@ -104,9 +111,7 @@ fn explicit_cancellation_pauses_queue_until_resume_command() {
     for prompt in ["first queued prompt", "second queued prompt"] {
         state.composer.insert_text(prompt);
         let effects = reduce(&mut state, Action::Key(key(KeyCode::Enter)));
-        assert!(effects
-            .iter()
-            .all(|effect| !matches!(effect, Effect::Send(UiCommand::SendPrompt(_)))));
+        assert!(!effects.iter().any(starts_prompt));
     }
     assert_eq!(state.queue_len(), 2);
     assert_eq!(state.queued_prompt(0), Some("first queued prompt"));
@@ -121,19 +126,30 @@ fn explicit_cancellation_pauses_queue_until_resume_command() {
     assert!(state.queue_paused);
     assert_eq!(state.queue_len(), 2);
     assert!(
-        terminal_effects
-            .iter()
-            .all(|effect| !matches!(effect, Effect::Send(UiCommand::SendPrompt(_)))),
+        !terminal_effects.iter().any(starts_prompt),
         "cancellation must not auto-start the next queued prompt"
     );
+    assert!(!state.prompt_is_busy());
     let frame = render_terminal_text(&state, 80, 24);
     assert!(frame.contains("fila pausada"), "{frame}");
 
     state.composer.insert_text("/queue resume");
     let effects = reduce(&mut state, Action::Key(key(KeyCode::Enter)));
-    assert!(effects.contains(&Effect::Send(UiCommand::SendPrompt(
-        "first queued prompt".into(),
-    ))));
+    let admitted = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Send(UiCommand::PreparePrompt { prompt, admission }) => {
+                Some((prompt.as_str(), admission.origin))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        admitted,
+        vec![("first queued prompt", PromptOrigin::Queued)],
+        "resume admits exactly the queue head: {effects:?}"
+    );
+    assert!(state.prompt_is_busy());
     assert!(!state.queue_paused);
     assert_eq!(state.queue_len(), 1);
     assert_eq!(state.queued_prompt(0), Some("second queued prompt"));
@@ -184,9 +200,7 @@ fn input_request_renders_answers_and_completes_only_after_matching_ack() {
         request_id: request_id("input-1"),
         answer: "tui".into(),
     })));
-    assert!(effects
-        .iter()
-        .all(|effect| !matches!(effect, Effect::Send(UiCommand::SendPrompt(_)))));
+    assert!(!effects.iter().any(starts_prompt));
     assert_eq!(state.blocks()[0].lifecycle, BlockLifecycle::Pending);
     let BlockKind::InteractionRequest(pending) = state.blocks()[0].kind() else {
         panic!("interaction request")
@@ -249,9 +263,7 @@ fn approval_uses_y_n_and_rejected_ack_is_visible() {
     assert!(reduce(&mut state, Action::Key(release)).is_empty());
     assert!(state.composer.payload().is_empty());
     let enter = reduce(&mut state, Action::Key(key(KeyCode::Enter)));
-    assert!(enter
-        .iter()
-        .all(|effect| !matches!(effect, Effect::Send(UiCommand::SendPrompt(_)))));
+    assert!(!enter.iter().any(starts_prompt));
     assert!(reduce(&mut state, Action::Key(key(KeyCode::Char('x')))).is_empty());
     assert!(state.composer.payload().is_empty());
 

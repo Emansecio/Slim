@@ -4,7 +4,6 @@ use std::sync::Arc;
 use slim_cli::{run_fake_headless, ExitCode, HeadlessRequest};
 use slim_core::context::{compact, ArtifactStore, ContextItem};
 use slim_core::mcp::McpCatalog;
-use slim_core::runtime::PromptQueue;
 use slim_core::session::{branch, recover, SessionWriter};
 use slim_core::skills::{discover, read_body, SkillRoot};
 use slim_core::task::{Assurance, Goal, Plan, TodoStatus, TodoTracker};
@@ -102,12 +101,6 @@ fn fake_v1_flow_covers_headless_core_and_tui_contracts() {
             .expect("mcp tool"),
         "mcp.demo.read({})"
     );
-
-    let mut queue = PromptQueue::new(8);
-    queue.push("first").expect("queue");
-    queue.push("second").expect("queue");
-    assert_eq!(queue.pop().as_deref(), Some("first"));
-    assert_eq!(queue.pop().as_deref(), Some("second"));
 
     let input_required = run_fake_headless(HeadlessRequest {
         prompt: String::new(),

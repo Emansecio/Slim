@@ -281,7 +281,7 @@ fn sink() -> (EventSink, mpsc::Receiver<UiEvent>, mpsc::Receiver<UiEvent>) {
 
 #[test]
 fn skill_discovery_warning_survives_memoized_workspace_restore() {
-    use super::memoized_skill_names;
+    use super::SkillNameMemo;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -296,16 +296,15 @@ fn skill_discovery_warning_survives_memoized_workspace_restore() {
     let skill = root.join(".slim/skills/broken");
     fs::create_dir_all(&skill).unwrap();
     fs::write(skill.join("SKILL.md"), "invalid frontmatter").unwrap();
-    let mut memo = None;
-    let mut warnings = String::new();
-    let first = memoized_skill_names(&mut memo, Some(root.clone()), &mut warnings);
-    let original_warning = warnings.clone();
-    warnings.clear();
-    let second = memoized_skill_names(&mut memo, Some(root.clone()), &mut warnings);
+    let mut memo = SkillNameMemo::default();
+    let first = memo.names(Some(root.clone()));
+    let original_warning = memo.warnings.clone();
+    memo.warnings.clear();
+    let second = memo.names(Some(root.clone()));
     assert_eq!(first, second);
-    assert_eq!(warnings, original_warning);
-    assert!(warnings.contains("broken"));
-    assert!(warnings.contains("missing frontmatter"));
+    assert_eq!(memo.warnings, original_warning);
+    assert!(memo.warnings.contains("broken"));
+    assert!(memo.warnings.contains("missing frontmatter"));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -548,6 +547,44 @@ fn projector_namespaces_tool_identity_by_run() {
         _ => panic!("tool start"),
     });
     assert_ne!(identities[0], identities[1]);
+}
+
+#[test]
+fn projector_namespaces_patch_diff_like_its_tool_start() {
+    let (batch_id, call_id) = (ToolBatchId("batch-1".into()), ToolCallId("call-1".into()));
+    let started = associate_projected_run(
+        UiEvent::ToolStarted {
+            batch_id: batch_id.clone(),
+            call_id: call_id.clone(),
+            name: "patch".into(),
+            arguments_summary: "path=a.rs".into(),
+        },
+        7,
+    );
+    let diff = associate_projected_run(
+        UiEvent::ToolDiff {
+            batch_id,
+            call_id,
+            diff: slim_core::ToolEditDiff::default(),
+        },
+        7,
+    );
+    let (
+        UiEvent::ToolStarted {
+            batch_id: started_batch,
+            call_id: started_call,
+            ..
+        },
+        UiEvent::ToolDiff {
+            batch_id: diff_batch,
+            call_id: diff_call,
+            ..
+        },
+    ) = (started, diff)
+    else {
+        panic!("tool events");
+    };
+    assert_eq!((started_batch, started_call), (diff_batch, diff_call));
 }
 
 #[test]

@@ -9,7 +9,7 @@ use super::select_previous_tui_session;
 
 #[test]
 fn restored_tasks_repopulate_the_dock_without_execution() {
-    use slim_core::runtime::{CancellationToken, RuntimeCapabilityBridge};
+    use slim_core::runtime::RuntimeCapabilityBridge;
     use slim_core::session::{
         AuthorizationGrant, CapabilityCatalog, TaskMutation, TaskMutationRequest,
     };
@@ -25,10 +25,6 @@ fn restored_tasks_repopulate_the_dock_without_execution() {
         )
         .unwrap(),
         CapabilityCatalog::with_native_tools(),
-        &Default::default(),
-        &[],
-        Default::default(),
-        CancellationToken::new(),
     )
     .unwrap();
     bridge

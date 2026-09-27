@@ -46,8 +46,3 @@ impl MemorySurface {
         self.frames.push(frame);
     }
 }
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct FakeClock {
-    pub ticks: u64,
-}

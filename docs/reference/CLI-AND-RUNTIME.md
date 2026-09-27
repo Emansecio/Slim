@@ -78,10 +78,13 @@ concluídos. Chamadas de ferramentas cortadas não são executadas. Nessas tenta
 por recuperação, respeitando o teto conhecido do modelo e metade da janela de
 contexto (sem metadados, o teto de crescimento é 32.768 tokens). Providers que
 omitem o limite continuam omitindo-o. O esforço de raciocínio não muda. As
-recuperações contam no limite de turnos; se não bastarem, o Slim informa a
-interrupção e orienta ajustar o orçamento ou reduzir o próximo passo.
+recuperações de truncamento contam no limite de turnos; se não bastarem, o Slim
+informa a interrupção e orienta ajustar o orçamento ou reduzir o próximo passo.
 Se o provider rejeitar o aumento por erro no parâmetro de saída, a recuperação
-restante volta ao orçamento original, com aviso explícito.
+restante volta ao orçamento original, com aviso explícito; esse reenvio não conta
+como turno. Retries de transporte (falha recuperável, resposta vazia, `/retry`)
+reenviam o turno atual e também não consomem `max_turns`: são limitados pelos
+próprios contadores de recuperação.
 
 - Arquivo ausente é normal; **arquivo presente e inválido aborta** com erro
   nomeando o caminho — sem silenciar configuração quebrada.
@@ -252,7 +255,7 @@ Revisão de 12/09/2026:
   reutilizadas pelo cache do harness enquanto há jobs ativos ou no lote que
   inicia shell. Captura e cancelamento continuam usando o executor existente.
 
-- A ferramenta shell mantém uma prévia de até 8 KiB por stream, com início, fim
+- A ferramenta shell mantém uma prévia de até 7 KiB por stream, com início, fim
   e contagem de descarte. Cortes respeitam as fronteiras UTF-8 das partes
   preservadas; bytes parciais entram na contagem de descarte. Quando há
   armazenamento de artefatos, captura até
@@ -330,6 +333,47 @@ Robustez de admissão para chamadas malformadas (14/09/2026):
 - OpenAI-compatible: deltas identificados não geram uma cópia legada sem
   identidade; chamadas paralelas com IDs distintos conservam sua identidade
   mesmo quando têm nome e argumentos iguais.
+
+Revisão das tools nativas (27/09/2026):
+
+- A recuperação de falhas de `write`/`patch` inclui o arquivo inteiro só até
+  12 KiB; acima disso, as bordas somam 8 KiB. O texto cabe inteiro no
+  resultado padrão de 16 KiB, em vez de o runtime cortar o arquivo prometido
+  como "abaixo".
+- `patch` em arquivo uniformemente CRLF converte para CRLF todo LF solto da
+  substituição, inclusive quando o `expected` já trazia CRLF.
+- `read` não falha a página quando só a linha seguinte tem UTF-8 inválido; o
+  erro aparece ao ler aquela linha. `read` em diretório indica `list`, e o
+  arquivo ausente indica `list`/`search` antes de `write`.
+- `list` em caminho ausente indica o diretório pai ou `search`; em arquivo,
+  indica `read`. `patch` em arquivo ausente indica `write` sem `expected`.
+- `search` não segue nem abre symlinks (nem junctions no Windows), igual ao
+  inventário do workspace. Sem hits e com scan completo, declara
+  `[no matches after full scan]`. Arquivos binários, acima de 10 MiB ou com
+  UTF-8 inválido contam como não pesquisados e impedem afirmações de ausência
+  ou cobertura total.
+- `shell`: o rótulo `stderr:` sempre começa uma linha, mesmo quando o stdout
+  não termina em quebra de linha. Cada stream fica em até 7 KiB, de modo que
+  cabeçalho, os dois streams, marcadores, nota de admissão e referência de
+  artefato cabem no resultado padrão de 16 KiB sem segundo corte. O fim do
+  stdout, onde executores de teste imprimem o resumo, é preservado.
+- Recibos e cabeçalhos de erro de `patch`, `write`, `read` e `search` nomeiam
+  caminhos relativos ao workspace, e não mais a forma canônica absoluta
+  (`\\?\C:\Users\…`). O conteúdo de arquivo nas mensagens de recuperação não é
+  alterado.
+- `code_intel`: o texto completo e a projeção sob orçamento saem dos mesmos
+  registros e não divergem mais. O corte descarta registros inteiros e mantém
+  `[code] (source)` dos diagnósticos, a nota de locais em escopo da definição e
+  o aviso de anotações truncadas. Referências mostram `N of total` no
+  cabeçalho, o arquivo uma vez por grupo e a continuação na linha
+  `more results; pass "offset": …`.
+- `patch` bem-sucedido emite `EventKind::ToolEditApplied` (hunks redigidos, com
+  linhas no arquivo final, até 400 linhas) entre `ToolOutput` e `ToolFinished`.
+  A TUI mostra o diff no corpo expandido (DESIGN §11.4).
+- TUI: a row do `search` mostra o texto buscado (§11.4 do DESIGN). Resumos de
+  argumentos ficam em até 120 caracteres e marcam com `…` linhas omitidas. A
+  nota `[admission: …]` não substitui a prévia do resultado, e `edits` como
+  objeto único também recebe `+N -M`.
 
 Validação local de 12/09/2026: `cargo test --workspace --offline --no-fail-fast`
 concluiu com **1.521 aprovados, 33 ignorados e zero falhas** (incluídos os quatro
@@ -580,7 +624,7 @@ deltas OpenAI e os IDs de `content_block` Anthropic; somente chamadas legadas
 sem ID recebem identificador interno. JSON de tool malformado ou incompleto é
 rejeitado.
 
-O runtime aplica budgets separados read-only vs mutating por run (`max_read_tool_calls` default 96, `max_mutating_tool_calls` default 32; env `SLIM_MAX_READ_TOOL_CALLS` / `SLIM_MAX_MUTATING_TOOL_CALLS` e chaves `slim.toml`); esgotamento → `tool_limit` (exit 22). O teto de turns por run é 128 (`SLIM_MAX_TURNS` / `max_turns` em `slim.toml`, cap 1024); esgotamento → `turn_limit` (exit 12) com mensagem `Turn limit reached (N/N)`. A tool `search` respeita `.gitignore`, ignora árvores de build, cap default 200 hits e paginação `offset`/`max_hits`. Emite `ToolStarted`, mantém pares assistant/tool e o prompt raiz através da
+O runtime aplica budgets separados read-only vs mutating por run (`max_read_tool_calls` default 96, `max_mutating_tool_calls` default 32; env `SLIM_MAX_READ_TOOL_CALLS` / `SLIM_MAX_MUTATING_TOOL_CALLS` e chaves `slim.toml`); esgotamento → `tool_limit` (exit 22). O teto de turns por run é 128 (`SLIM_MAX_TURNS` / `max_turns` em `slim.toml`, cap 1024); esgotamento → `turn_limit` (exit 12) com mensagem `Turn limit reached (N/N)`. Quando o teto por turno corta calls de um batch, a mensagem seguinte ao modelo lista cada call não executada (nome e argumentos abreviados) para que só elas sejam repetidas. A tool `search` respeita `.gitignore`, ignora árvores de build, cap default 200 hits e paginação `offset`/`max_hits`. Emite `ToolStarted`, mantém pares assistant/tool e o prompt raiz através da
 compactação no mesmo adapter/modelo. O threshold soft prepara o checkpoint em
 background; o hard, `/compact` e uma única recuperação de overflow aplicam o
 resumo somente após validação. A última instrução de usuário é preservada

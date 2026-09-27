@@ -781,6 +781,15 @@ do terminal. A superfície textual (`view_model`) usa os mesmos verbos. O diff
 inline do `patch` fica fora desta revisão: a TUI não recebe o conteúdo das
 edições, e isso exige um evento novo no bridge.
 
+**Revisão de 27/09/2026 (diff inline do `patch`):** o core emite
+`EventKind::ToolEditApplied` entre o `ToolOutput` e o `ToolFinished` de um
+`patch` bem-sucedido, com os hunks já redigidos (linhas inteiras, sem fim de
+linha, posições no arquivo final). A projeção gera `UiEvent::ToolDiff`, e o
+bloco guarda o diff. O corpo expandido mede e desenha o mesmo texto (diff e
+depois a saída materializada), com a regra de §11.4. A row recolhida não muda.
+Expandir não depende de handle de conteúdo. Sessões restauradas não
+reconstroem o diff.
+
 **Revisão de 26/09/2026, fase 3 (pensamento e atividade):** pensamento e
 prompt do usuário quebram por palavra (§19.2). A mesma função produz desenho,
 medição e a prévia incremental do pensamento, cuja origem continua estável: só
@@ -1309,7 +1318,8 @@ pub enum UiEvent {
     ThinkingDelta(ThinkingDelta),
     ThinkingEnded(ThinkingEnd),
     ToolStarted(ToolStart),
-    ToolProgress(ToolProgress),
+    ToolOutput(ToolOutput),     // output final do executor; preview ≤ 512 + `…`
+    ToolProgress(ToolProgress), // snapshot intermediário; preview ≤ 512 + `…`
     ToolEnded(ToolEnd),
     CompactionStarted(CompactionView),
     CompactionEnded(CompactionView),
@@ -1460,7 +1470,8 @@ visível (`interaction route unavailable`); a TUI nunca simula sucesso local.
 - mensagens aguardando execução viram `QueuedUserBlock` visível no fim do
   transcript, em ordem FIFO, com estado `queued` até serem consumidas
   (implementado em G244, 2026-08-25: Enter/Alt+Enter durante run enfileira;
-  a fronteira de turno drena um prompt por vez via `SendPrompt`).
+  a fronteira de turno drena um prompt por vez via `PreparePrompt` com
+  `PromptOrigin::Queued`).
 
 Em sessões persistidas, a fila usa um journal separado por sessão em
 `.slim/queues/`, com o mesmo lock, sincronização e limite de tamanho do JSONL
@@ -1766,8 +1777,9 @@ lossless ao atingir capacity; nenhum lifecycle/data event é descartado.
 O canal core→projector usa `sync_channel(1_024)`. O sender faz `try_send` em
 loop curto e consulta o mesmo `CancellationToken` da run: antes do cancel todo
 evento aplica backpressure; depois do cancel texto/reasoning visual e
-`ToolOutput` ainda não entregue podem ser abandonados. Accounting, boundaries
-de tool, `AssistantEnded` e interação continuam lossless. O receiver permanece
+`ToolProgress` ainda não entregues podem ser abandonados. `ToolOutput` final,
+accounting, boundaries de tool, `AssistantEnded` e interação continuam
+lossless. O receiver permanece
 ativo até o sender fechar. Se a fila estiver cheia no instante do cancel, um
 evento causal pode substituir o payload visual mais antigo já retido; assim o
 handoff permanece bounded, não bloqueia atrás de apresentação descartável e
@@ -1936,6 +1948,10 @@ Cada tool call mostra:
 - tamanho da edição do `patch` como `+N -M` (linhas alteradas por edit,
   descontadas as linhas comuns no início e no fim), colorido por
   `diff_add`/`diff_remove`;
+- no corpo expandido de um `patch` bem-sucedido, o diff aplicado antes do
+  recibo: `@@ caminho:linha` (linha no arquivo final, em `muted`) e as linhas
+  `- ` e `+ ` em `diff_remove`/`diff_add`, até 400 linhas por chamada e 1.000
+  caracteres por linha, com `@@ diff truncated` além disso;
 - duração;
 - status;
 - progress curto;
@@ -3270,6 +3286,7 @@ Política de recuperação do provider (revisada em 20/09/2026):
 
 - até duas recuperações consecutivas por requisição; sucesso reinicia esse contador,
   sem reiniciar o teto global de seis recuperações por execução nem `max_turns`;
+  desde 27/09/2026 cada retry reenvia o turno atual e não consome `max_turns`;
 - resposta normalmente encerrada sem texto útil nem ferramentas admite uma
   recuperação por requisição, contando no teto global; vazio repetido é falha explícita;
 - preservar efeitos já executados e não reenviar uma requisição que já emitiu ferramentas;

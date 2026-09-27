@@ -413,9 +413,20 @@ impl JevJudge for HttpJevJudge {
             .json(&body);
         let response = request.send().await.map_err(|error| error.to_string())?;
         let status = response.status();
-        let bytes = response.bytes().await.map_err(|error| error.to_string())?;
-        if bytes.len() as u64 > MAX_RESPONSE_BYTES {
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RESPONSE_BYTES)
+        {
             return Err(format!("response exceeds {MAX_RESPONSE_BYTES} bytes"));
+        }
+        let mut bytes = Vec::new();
+        let mut chunks = response.bytes_stream();
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk.map_err(|error| error.to_string())?;
+            if bytes.len().saturating_add(chunk.len()) as u64 > MAX_RESPONSE_BYTES {
+                return Err(format!("response exceeds {MAX_RESPONSE_BYTES} bytes"));
+            }
+            bytes.extend_from_slice(&chunk);
         }
         if !status.is_success() {
             let detail = String::from_utf8_lossy(&bytes)

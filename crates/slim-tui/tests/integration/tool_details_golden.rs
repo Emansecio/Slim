@@ -688,3 +688,100 @@ fn projected_patch_and_shell_rows_read_as_verb_target_and_outcome() {
     );
     assert!(shell.contains("4.2s"), "{shell}");
 }
+
+#[test]
+fn expanded_patch_shows_its_applied_diff_before_the_receipt() {
+    use slim_core::EventKind as Kind;
+    let mut state = AppState::new();
+    for kind in [
+        Kind::ToolStarted {
+            batch_id: "b1".into(),
+            call_id: "c1".into(),
+            name: "patch".into(),
+            arguments: r#"{"path":"src/lib.rs","edits":[{"expected":"old","replacement":"new\nmore"}]}"#.into(),
+        },
+        Kind::ToolOutput {
+            batch_id: "b1".into(),
+            call_id: "c1".into(),
+            name: "patch".into(),
+            output: "patched src/lib.rs:2; replaced 3 bytes with 8 bytes; bytes=9; sha256=ab; do not re-read".into(),
+        },
+        Kind::ToolEditApplied {
+            batch_id: "b1".into(),
+            call_id: "c1".into(),
+            name: "patch".into(),
+            diff: slim_core::ToolEditDiff {
+                path: "src/lib.rs".into(),
+                hunks: vec![slim_core::ToolEditHunk {
+                    start_line: 2,
+                    removed: vec!["old".into()],
+                    added: vec!["new".into(), "more".into()],
+                }],
+                truncated: false,
+            },
+        },
+        Kind::ToolFinished {
+            batch_id: "b1".into(),
+            call_id: "c1".into(),
+            name: "patch".into(),
+            success: true,
+            duration_ms: 8,
+        },
+    ] {
+        project(&mut state, kind);
+    }
+    let collapsed = render_at_width(&state, 100);
+    assert!(!collapsed.contains("@@ src/lib.rs:2"), "{collapsed}");
+
+    let block_id = state.blocks()[0].id.clone();
+    // No content handle: expanding needs no page request to show the diff.
+    assert_eq!(
+        reduce(&mut state, Action::ToggleBlock(block_id)),
+        vec![Effect::RequestRender]
+    );
+    assert_eq!(state.blocks()[0].fold, FoldState::Expanded);
+
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let mut cache = WrapCache::default();
+    terminal
+        .draw(|frame| {
+            render_frame(
+                frame,
+                &state,
+                Capabilities {
+                    color_depth: ColorDepth::TrueColor,
+                    mouse: false,
+                    clipboard: false,
+                    images: false,
+                    reduced_motion: false,
+                },
+                &mut cache,
+            )
+        })
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let rows = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let row_of = |needle: &str| {
+        rows.iter()
+            .position(|row| row.trim_end() == format!("    {needle}"))
+            .unwrap_or_else(|| panic!("missing {needle:?}\n{}", rows.join("\n")))
+    };
+    let header = row_of("@@ src/lib.rs:2");
+    let removed = row_of("- old");
+    let added = row_of("+ new");
+    assert_eq!(
+        (removed, added, row_of("+ more")),
+        (header + 1, header + 2, header + 3)
+    );
+    let color = |row: usize| buffer[(4, row as u16)].fg;
+    assert_ne!(color(removed), color(added));
+    assert_ne!(color(header), color(added));
+    assert_ne!(color(header), color(removed));
+}

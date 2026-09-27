@@ -389,9 +389,10 @@ async fn autonomous_reconciler_releases_pending_owner_after_other_service_logout
 
     let cleared_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let state = lock_mutex(&owner.worker.shared);
-        let cleared = state.pending[slot].is_none() && !state.reconciling[slot];
-        drop(state);
+        let cleared = {
+            let state = lock_mutex(&owner.worker.shared);
+            state.pending[slot].is_none() && !state.reconciling[slot]
+        };
         if cleared {
             break;
         }

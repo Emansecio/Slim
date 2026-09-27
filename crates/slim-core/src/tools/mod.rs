@@ -101,6 +101,11 @@ pub fn summarize_tool_arguments_for(name: &str, arguments: &str) -> String {
             _ => summarize_tool_arguments(arguments),
         };
     }
+    if name == "search" {
+        // The row target is the searched text, not the scope (TUI spec §11.4).
+        return summarize_search_arguments(arguments)
+            .unwrap_or_else(|| summarize_tool_arguments(arguments));
+    }
     if name != "shell" {
         return summarize_tool_arguments(arguments);
     }
@@ -156,6 +161,11 @@ pub fn edit_line_stats(name: &str, arguments: &str) -> Option<(usize, usize)> {
     let single;
     let edits: &[Value] = match value.get("edits") {
         Some(Value::Array(edits)) => edits,
+        // Admission normalizes a single edit object to a one-item array.
+        Some(edit @ Value::Object(_)) => {
+            single = [edit.clone()];
+            &single
+        }
         _ => {
             single = [value.clone()];
             &single
@@ -187,15 +197,46 @@ pub fn edit_line_stats(name: &str, arguments: &str) -> Option<(usize, usize)> {
     counted.then_some((added, removed))
 }
 
+/// First non-blank line bounded to `limit` characters; `…` marks both a cut
+/// line and dropped later lines.
 fn bound_argument_summary_exact(text: &str, limit: usize) -> String {
-    let first = text.lines().next().unwrap_or("").trim();
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .skip_while(|line| line.is_empty());
+    let first = lines.next().unwrap_or("");
+    let more_lines = lines.any(|line| !line.is_empty());
     let mut chars = first.chars();
     let mut out = chars.by_ref().take(limit).collect::<String>();
-    if chars.next().is_some() && limit > 0 {
-        out.pop();
+    let cut = chars.next().is_some();
+    if (cut || more_lines) && limit > 0 {
+        if cut {
+            out.pop();
+        }
         out.push('…');
     }
     out
+}
+
+fn summarize_search_arguments(arguments: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(arguments).ok()?;
+    let text = match value.get("query").and_then(Value::as_str) {
+        Some(query) if !query.is_empty() => query.to_owned(),
+        _ => {
+            let patterns = value
+                .get("patterns")?
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|pattern| !pattern.is_empty())
+                .collect::<Vec<_>>();
+            if patterns.is_empty() {
+                return None;
+            }
+            patterns.join(" | ")
+        }
+    };
+    Some(bound_argument_summary(&format!("query={text}")))
 }
 
 fn summarize_todos(map: &serde_json::Map<String, Value>) -> Option<String> {
@@ -226,13 +267,7 @@ fn json_scalar(value: &Value) -> Option<String> {
 }
 
 fn bound_argument_summary(text: &str) -> String {
-    let first = text.lines().next().unwrap_or("").trim();
-    let mut chars = first.chars();
-    let mut out: String = chars.by_ref().take(ARGUMENT_SUMMARY_LIMIT).collect();
-    if chars.next().is_some() {
-        out.push('…');
-    }
-    out
+    bound_argument_summary_exact(text, ARGUMENT_SUMMARY_LIMIT)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -521,6 +556,7 @@ struct ExecutedTool {
     mutations: Vec<MutationObservation>,
     bytes_read: u64,
     synced_text: Option<crate::codeintel::CodeIntelFileUpdate>,
+    edit_diff: Option<crate::ToolEditDiff>,
     process: Option<ProcessExecutionFacts>,
     presentation: Option<ToolPresentationSource>,
 }
@@ -535,6 +571,7 @@ impl ExecutedTool {
             mutations: Vec::new(),
             bytes_read: 0,
             synced_text: None,
+            edit_diff: None,
             process: None,
             presentation: None,
         }
@@ -879,44 +916,57 @@ impl ToolRegistry {
                 .as_ref()
                 .err()
                 .is_some_and(|failure| failure.effects_uncertain);
-        let (result, dependencies, mutations, bytes_read, synced_text, process, presentation) =
-            match result {
-                Ok(executed) => (
+        let (
+            result,
+            dependencies,
+            mutations,
+            bytes_read,
+            synced_text,
+            edit_diff,
+            process,
+            presentation,
+        ) = match result {
+            Ok(executed) => (
+                ToolResult {
+                    name: prepared.name.clone(),
+                    success: executed.success,
+                    output: executed.output,
+                    artifact: executed.artifact,
+                },
+                executed.dependencies,
+                executed.mutations,
+                executed.bytes_read,
+                executed.synced_text,
+                executed.edit_diff,
+                executed.process,
+                executed.presentation,
+            ),
+            Err(failure) => {
+                let mut output = workspace_relative_text(
+                    &tool_error_message(failure.error),
+                    &prepared.canonical_workspace,
+                );
+                if let Some(context) = failure.context {
+                    output.push('\n');
+                    output.push_str(&context);
+                }
+                (
                     ToolResult {
                         name: prepared.name.clone(),
-                        success: executed.success,
-                        output: executed.output,
-                        artifact: executed.artifact,
+                        success: false,
+                        output,
+                        artifact: None,
                     },
-                    executed.dependencies,
-                    executed.mutations,
-                    executed.bytes_read,
-                    executed.synced_text,
-                    executed.process,
-                    executed.presentation,
-                ),
-                Err(failure) => {
-                    let mut output = tool_error_message(failure.error);
-                    if let Some(context) = failure.context {
-                        output.push('\n');
-                        output.push_str(&context);
-                    }
-                    (
-                        ToolResult {
-                            name: prepared.name.clone(),
-                            success: false,
-                            output,
-                            artifact: None,
-                        },
-                        failure.dependencies,
-                        failure.mutations,
-                        failure.bytes_read,
-                        None,
-                        None,
-                        None,
-                    )
-                }
-            };
+                    failure.dependencies,
+                    failure.mutations,
+                    failure.bytes_read,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }
+        };
         let changed = effects_uncertain || mutations.iter().any(MutationObservation::changed);
         let revision_after = if changed {
             self.services
@@ -949,6 +999,7 @@ impl ToolRegistry {
                 execution_us,
                 finalization_us,
                 synced_text,
+                edit_diff,
                 process,
                 fused_shell,
                 presentation,
@@ -1061,13 +1112,17 @@ impl ToolRegistry {
             .into());
         };
         let path = prepared_path(prepared)?;
-        let page = self.services.read.read_file_range_resolved(
-            &path,
-            *offset,
-            *max_lines,
-            false,
-            cancellation,
-        )?;
+        let page = self
+            .services
+            .read
+            .read_file_range_resolved(&path, *offset, *max_lines, false, cancellation)
+            .map_err(|mut failure| {
+                // Read failures carry only generated guidance, never content.
+                failure.context = failure.context.map(|context| {
+                    workspace_relative_text(&context, &prepared.canonical_workspace)
+                });
+                failure
+            })?;
         let presentation = Some(ToolPresentationSource::Read {
             prefix: String::new(),
             full: page.output.clone(),
@@ -1083,6 +1138,7 @@ impl ToolRegistry {
             mutations: Vec::new(),
             bytes_read: page.bytes_read,
             synced_text: None,
+            edit_diff: None,
             process: None,
             presentation,
         })
@@ -1146,6 +1202,7 @@ impl ToolRegistry {
             mutations: Vec::new(),
             bytes_read: page.bytes_read,
             synced_text: None,
+            edit_diff: None,
             process: None,
             presentation,
         })
@@ -1195,6 +1252,7 @@ impl ToolRegistry {
             mutations: Vec::new(),
             bytes_read: page.bytes_read,
             synced_text: None,
+            edit_diff: None,
             process: None,
             presentation,
         })
@@ -1264,9 +1322,7 @@ impl ToolRegistry {
         } else {
             self.services.read.invalidate(&path);
         }
-        let display = path
-            .strip_prefix(&prepared.canonical_workspace)
-            .unwrap_or(&path);
+        let display = workspace_display(&path, &prepared.canonical_workspace);
         Ok(ExecutedTool {
             success: true,
             output: format!(
@@ -1277,7 +1333,12 @@ impl ToolRegistry {
                 written
                     .recovery_note
                     .as_ref()
-                    .map(|note| format!("; {note}"))
+                    .map(|note| {
+                        format!(
+                            "; {}",
+                            workspace_relative_text(note, &prepared.canonical_workspace)
+                        )
+                    })
                     .unwrap_or_default(),
                 written
                     .syntax_diagnostic
@@ -1301,6 +1362,7 @@ impl ToolRegistry {
             }],
             bytes_read: written.bytes_read,
             synced_text: None,
+            edit_diff: None,
             process: None,
             presentation: None,
         })
@@ -1322,19 +1384,33 @@ impl ToolRegistry {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Err(ToolError::Cancelled.into());
         }
-        let content =
-            patch::apply_exact_patches_with_content(&path, edits, cancellation, &mut || {
+        let content = patch::apply_exact_patches_with_content(
+            &path,
+            workspace_display(&path, &prepared.canonical_workspace),
+            edits,
+            cancellation,
+            &mut || {
                 on_progress(ToolExecutionProgress {
                     preview: "Waiting for file lock".into(),
                 })
-            })?;
+            },
+        )?;
         self.services
             .read
             .remember_complete_digest(&path, write::content_sha256(content.text.as_bytes()));
         let before_digest = content.before_digest;
+        let edit_diff = (!content.hunks.is_empty()).then(|| crate::ToolEditDiff {
+            path: workspace_display(&path, &prepared.canonical_workspace)
+                .display()
+                .to_string(),
+            hunks: content.hunks,
+            truncated: content.hunks_truncated,
+        });
         Ok(ExecutedTool {
+            edit_diff,
             success: true,
-            output: content.summary,
+            // The summary may carry a displaced-version note with its path.
+            output: workspace_relative_text(&content.summary, &prepared.canonical_workspace),
             artifact: None,
             dependencies: vec![content.dependency],
             mutations: vec![MutationObservation {
@@ -1406,14 +1482,19 @@ impl ToolRegistry {
             },
         )?;
         let success = result.output.status.success() && !result.timed_out && !result.cancelled;
+        let mut stdout = cap_shell_stream(&result.output.stdout, result.stdout_discarded_bytes);
+        // The stderr label must start its own line even when stdout does not
+        // end with a newline.
+        if !stdout.is_empty() && !stdout.ends_with('\n') {
+            stdout.push('\n');
+        }
         let mut output = format!(
-            "{}\nstdout:\n{}stderr:\n{}",
+            "{}\nstdout:\n{stdout}stderr:\n{}",
             format_shell_status_header(
                 result.output.status.code(),
                 result.timed_out,
                 result.cancelled,
             ),
-            cap_shell_stream(&result.output.stdout, result.stdout_discarded_bytes),
             cap_shell_stream(&result.output.stderr, result.stderr_discarded_bytes),
         );
         if result.capture_may_be_incomplete {
@@ -1534,8 +1615,10 @@ fn format_shell_status_header(code: Option<i32>, timed_out: bool, cancelled: boo
 
 /// Maximum bytes of one stdout/stderr stream placed into model context.
 /// Larger streams are truncated with an explicit marker that also accounts for
-/// bytes discarded by the bounded raw shell capture.
-const SHELL_STREAM_CAP_BYTES: usize = 8 * 1024;
+/// bytes discarded by the bounded raw shell capture. Two capped streams plus
+/// header, markers, an admission note and an artifact reference stay under the
+/// default 16 KiB per-result allowance, so presentation never cuts them again.
+const SHELL_STREAM_CAP_BYTES: usize = 7 * 1024;
 const SHELL_LOG_CAPTURE_CAP_BYTES: usize = 8 * 1024 * 1024;
 
 fn captured_shell_stream_text(raw: &[u8], discarded_bytes: usize) -> String {
@@ -1646,7 +1729,7 @@ fn tool_definition(name: &str) -> Value {
                 "content": {"type": "string"},
                 "expected": {
                     "type": ["string", "null"],
-                    "description": "Current full-file text. Omit/null to create or after a complete read or successful write/patch of this path. LF matches uniform CRLF."
+                    "description": "Current full-file text. Omit/null to create, or after a complete read, overwrite or patch of this path (not after creating it). LF matches uniform CRLF."
                 },
                 "then_run": then_run_schema
             }),
@@ -1783,6 +1866,17 @@ fn ensure_workspace_containment(root: &Path, resolved: PathBuf) -> Result<PathBu
     }
 }
 
+/// Names workspace paths relative to the workspace in text Slim generates
+/// (receipts, notes, error headers). Never apply it to file content.
+fn workspace_relative_text(text: &str, workspace: &Path) -> String {
+    let prefix = format!("{}{}", workspace.display(), std::path::MAIN_SEPARATOR);
+    text.replace(&prefix, "")
+}
+
+fn workspace_display<'a>(path: &'a Path, workspace: &Path) -> &'a Path {
+    path.strip_prefix(workspace).unwrap_or(path)
+}
+
 fn tool_error_message(error: ToolError) -> String {
     match error {
         ToolError::Io { message } => format!("io error: {message}"),
@@ -1801,12 +1895,69 @@ fn tool_error_message(error: ToolError) -> String {
 }
 
 #[cfg(test)]
+mod argument_summary_tests {
+    use super::{summarize_tool_arguments_for, ARGUMENT_SUMMARY_LIMIT};
+    use serde_json::json;
+
+    #[test]
+    fn long_summaries_stay_within_the_limit() {
+        let arguments = json!({"path": "p".repeat(300)}).to_string();
+        let summary = summarize_tool_arguments_for("read", &arguments);
+        assert_eq!(summary.chars().count(), ARGUMENT_SUMMARY_LIMIT);
+        assert!(summary.ends_with('…'), "{summary}");
+    }
+
+    #[test]
+    fn later_lines_of_a_multiline_value_are_marked() {
+        assert_eq!(
+            summarize_tool_arguments_for("shell", r#"{"command":"cd crates\ncargo test"}"#),
+            "command=cd crates… · limit 600s"
+        );
+        assert_eq!(
+            summarize_tool_arguments_for("read", r#"{"path":"src/lib.rs\n"}"#),
+            "path=src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn search_summary_names_the_searched_text() {
+        assert_eq!(
+            summarize_tool_arguments_for("search", r#"{"path":"crates","query":"fn run"}"#),
+            "query=fn run"
+        );
+        assert_eq!(
+            summarize_tool_arguments_for("search", r#"{"patterns":["alpha","beta"]}"#),
+            "query=alpha | beta"
+        );
+        assert_eq!(
+            summarize_tool_arguments_for("search", r#"{"path":"crates"}"#),
+            "path=crates"
+        );
+    }
+}
+
+#[cfg(test)]
 mod timeout_bound_tests {
     use super::{
         admission_output_prefix, summarize_tool_arguments_for, tool_definition,
         ADMISSION_OUTPUT_PREFIX_BYTES, MAX_SHELL_TIMEOUT_MS,
     };
     use serde_json::json;
+
+    /// Mirrors `write_null_creates_nested_unicode_file_without_relaxing_overwrite_checks`:
+    /// a create does not authorize the next write without `expected`.
+    #[test]
+    fn write_expected_description_matches_create_semantics() {
+        let description = tool_definition("write")["input_schema"]["properties"]["expected"]
+            ["description"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            description.contains("not after creating it"),
+            "{description}"
+        );
+    }
 
     #[test]
     fn shell_timeout_is_bounded_and_advertised() {
@@ -1879,11 +2030,13 @@ mod timeout_bound_tests {
 
     #[test]
     fn shell_head_tail_cuts_do_not_invent_invalid_utf8() {
+        // Each `é` straddles one cut: the head ends and the tail starts mid-char.
+        let half = super::SHELL_STREAM_CAP_BYTES / 2;
         let raw = format!(
             "{}é{}é{}",
-            "A".repeat(4095),
+            "A".repeat(half - 1),
             "B".repeat(4095),
-            "C".repeat(4095)
+            "C".repeat(half - 1)
         );
         let preview = super::cap_shell_stream(raw.as_bytes(), 0);
         assert!(!preview.contains('\u{fffd}'));
@@ -1978,6 +2131,16 @@ mod edit_line_stats_tests {
             serde_json::json!({"path": "a", "expected": "keep\ndrop\n", "replacement": "keep\n"})
                 .to_string();
         assert_eq!(edit_line_stats("patch", &arguments), Some((0, 1)));
+    }
+
+    #[test]
+    fn single_edit_object_is_counted_like_admission_normalizes_it() {
+        let arguments = serde_json::json!({
+            "path": "a",
+            "edits": {"expected": "one\n", "replacement": "one\ntwo\n"}
+        })
+        .to_string();
+        assert_eq!(edit_line_stats("patch", &arguments), Some((1, 0)));
     }
 
     #[test]

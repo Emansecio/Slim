@@ -46,6 +46,7 @@ fn build_corpus() -> AppState {
                     materialized_output: String::new(),
                     next_cursor: None,
                     pending_page: None,
+                    edit_diff: None,
                 }),
                 5 => BlockKind::Error("stack frame: provider request failed\n".repeat(40)),
                 6 => BlockKind::System("system checkpoint complete\n".repeat(24)),

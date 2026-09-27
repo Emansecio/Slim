@@ -721,7 +721,7 @@ fn write_http_response_with_content_type(
 ) {
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.as_bytes().len()
+        body.len()
     );
     let _ = stream.write_all(response.as_bytes());
 }
@@ -1027,7 +1027,7 @@ fn codex_api_key_and_environment_credentials_are_used_during_tui_startup() {
     crate::save_api_key_file(&auth, provider, &saved_key).expect("select saved API key");
     std::env::set_var("SLIM_AUTH_FILE", &auth);
 
-    let observed = (|| {
+    let observed = {
         let oauth = OAuthService::new(
             OAuthEndpoints::default(),
             Arc::new(NoBrowser),
@@ -1069,7 +1069,7 @@ fn codex_api_key_and_environment_credentials_are_used_during_tui_startup() {
             from_slim_env.api_key,
             from_slim_env.account_id,
         )
-    })();
+    };
 
     for (name, value) in variables.into_iter().zip(previous) {
         match value {

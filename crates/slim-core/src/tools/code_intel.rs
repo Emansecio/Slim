@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use super::execution::{CodeIntelContinuation, CodeIntelHeaderKind, CodeIntelPresentation};
+use super::execution::{
+    CodeIntelContinuation, CodeIntelHeaderKind, CodeIntelPresentation, CodeIntelRecord,
+};
 use crate::codeintel::{
     CodeIntelCompleteness, CodeIntelDiagnosticsQuery, CodeIntelMeta, CodeIntelOutcome,
     CodeIntelPositionQuery, CodeIntelServerState, CodeIntelSymbolQuery, DEFAULT_CODE_INTEL_LIMIT,
@@ -531,70 +533,74 @@ fn symbol_annotations(
 }
 
 /// Renders a CodeIntelOutcome into the compact text returned to the model.
+/// It is the complete projection of [`presentation_for_code_intel`].
 pub fn render_code_intel(action: &str, outcome: &CodeIntelOutcome) -> String {
-    match action {
-        "status" => render_status(outcome),
-        "definition" => render_definition(outcome),
-        "references" => render_references(outcome),
-        "hover" => render_hover(outcome),
-        "symbol" => render_symbols(outcome),
-        "diagnostics" => render_diagnostics(outcome),
-        _ => format!("{action}\n{}", meta_line(&outcome.meta)),
-    }
+    presentation_for_code_intel(action, outcome).full
 }
 
 /// Captures the semantic records that may be presented under an aggregate
-/// request budget. The complete rendered response remains available in
-/// `full`; record boundaries here are derived from the structured outcome, so
-/// continuation metadata is never recovered by parsing model-facing text.
+/// request budget. Record boundaries are derived from the structured outcome,
+/// so continuation metadata is never recovered by parsing model-facing text,
+/// and the complete text is the rendering of every record.
 pub(crate) fn presentation_for_code_intel(
     action: &str,
     outcome: &CodeIntelOutcome,
-    full: String,
 ) -> CodeIntelPresentation {
     let meta = meta_line(&outcome.meta);
-    if outcome.payload.get("error").is_some() {
-        return CodeIntelPresentation {
-            full,
-            header: format!("code_intel {action}: {}", outcome_error(outcome)),
-            records: Vec::new(),
-            header_kind: CodeIntelHeaderKind::Static,
-            continuation: None,
+    let label = if action == "symbol" {
+        "action=symbol"
+    } else {
+        action
+    };
+    let presentation = if outcome.payload.get("error").is_some() {
+        static_presentation(
+            format!("code_intel {label}: {}", outcome_error(outcome)),
+            Vec::new(),
             meta,
-        };
-    }
-    match action {
-        "references" => references_presentation(outcome, full, meta),
-        "symbol" => symbols_presentation(outcome, full, meta),
-        "diagnostics" => diagnostics_presentation(outcome, full, meta),
-        "status" => status_presentation(outcome, full, meta),
-        "definition" => definition_presentation(outcome, full, meta),
-        "hover" => hover_presentation(outcome, full, meta),
-        _ => CodeIntelPresentation {
-            full: full.clone(),
-            header: full,
-            records: Vec::new(),
-            header_kind: CodeIntelHeaderKind::Static,
-            continuation: None,
-            meta: String::new(),
-        },
+        )
+    } else {
+        match action {
+            "references" => references_presentation(outcome, meta),
+            "symbol" => symbols_presentation(outcome, meta),
+            "diagnostics" => diagnostics_presentation(outcome, meta),
+            "status" => status_presentation(outcome, meta),
+            "definition" => definition_presentation(outcome, meta),
+            "hover" => hover_presentation(outcome, meta),
+            _ => static_presentation(action.to_owned(), Vec::new(), meta),
+        }
+    };
+    presentation.sealed()
+}
+
+fn static_presentation(
+    header: String,
+    records: Vec<CodeIntelRecord>,
+    meta: String,
+) -> CodeIntelPresentation {
+    CodeIntelPresentation {
+        full: String::new(),
+        header,
+        notes: Vec::new(),
+        records,
+        trailer: Vec::new(),
+        header_kind: CodeIntelHeaderKind::Static,
+        continuation: None,
+        meta,
     }
 }
 
-fn status_presentation(
-    outcome: &CodeIntelOutcome,
-    full: String,
-    meta: String,
-) -> CodeIntelPresentation {
+fn status_presentation(outcome: &CodeIntelOutcome, meta: String) -> CodeIntelPresentation {
     let mut records = Vec::new();
     if let Some(summary) = outcome.payload.get("summary").and_then(Value::as_str) {
         if !summary.is_empty() {
-            records.push(summary.to_owned());
+            records.push(CodeIntelRecord::line(summary));
         }
     }
     if let Some(servers) = outcome.payload.get("servers").and_then(Value::as_array) {
         for server in servers {
             let state = server.get("state").and_then(Value::as_str).unwrap_or("?");
+            // Absolute paths carry machine-local segments (e.g. the user name);
+            // the model only needs the leaf to tell servers apart.
             let root = server
                 .get("root")
                 .and_then(Value::as_str)
@@ -619,137 +625,87 @@ fn status_presentation(
             {
                 row.push_str(" binary_missing=true");
             }
-            records.push(row);
+            records.push(CodeIntelRecord::line(row));
         }
     }
-    CodeIntelPresentation {
-        full,
-        header: "code_intel status".into(),
-        records,
-        header_kind: CodeIntelHeaderKind::Static,
-        continuation: None,
-        meta,
-    }
+    static_presentation("code_intel status".into(), records, meta)
 }
 
-fn definition_presentation(
-    outcome: &CodeIntelOutcome,
-    full: String,
-    meta: String,
-) -> CodeIntelPresentation {
-    let found = outcome
-        .payload
+fn definition_presentation(outcome: &CodeIntelOutcome, meta: String) -> CodeIntelPresentation {
+    let payload = &outcome.payload;
+    let received = payload
+        .get("locations_received")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let skipped = payload
+        .get("locations_out_of_scope")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if !payload
         .get("found")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let mut header = String::from("code_intel definition");
-    let mut records = Vec::new();
-    if found {
-        let file = outcome
-            .payload
-            .get("file")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let line = outcome
-            .payload
-            .get("line")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let column = outcome
-            .payload
-            .get("column")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        if let Some(symbol) = outcome
-            .payload
-            .get("symbol")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-        {
-            header = format!("code_intel definition: {symbol}");
-        }
-        records.push(format!("{file}:{line}:{column}"));
-        if let Some(preview) = outcome.payload.get("preview").and_then(Value::as_str) {
-            records.push(format!("  {preview}"));
-        }
-    } else {
-        header = format!("code_intel definition: {}", {
-            let received = outcome
-                .payload
-                .get("locations_received")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let skipped = outcome
-                .payload
-                .get("locations_out_of_scope")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            if received > 0 && skipped == received {
-                format!("{received} location(s) reported, all outside the workspace scope")
-            } else if skipped > 0 {
-                format!("not found in workspace ({skipped} out-of-scope location(s) skipped)")
-            } else {
-                "not found".into()
-            }
-        });
+        .unwrap_or(false)
+    {
+        let reason = if received > 0 && skipped == received {
+            format!("{received} location(s) reported, all outside the workspace scope")
+        } else if skipped > 0 {
+            format!("not found in workspace ({skipped} out-of-scope location(s) skipped)")
+        } else {
+            "not found".into()
+        };
+        return static_presentation(format!("code_intel definition: {reason}"), Vec::new(), meta);
     }
-    CodeIntelPresentation {
-        full,
-        header,
-        records,
-        header_kind: CodeIntelHeaderKind::Static,
-        continuation: None,
-        meta,
+    let file = payload.get("file").and_then(Value::as_str).unwrap_or("");
+    let line = payload.get("line").and_then(Value::as_u64).unwrap_or(0);
+    let column = payload.get("column").and_then(Value::as_u64).unwrap_or(0);
+    let header = match payload
+        .get("symbol")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        Some(symbol) => format!("code_intel definition: {symbol}"),
+        None => "code_intel definition".into(),
+    };
+    let mut records = vec![CodeIntelRecord::line(format!("{file}:{line}:{column}"))];
+    if let Some(preview) = payload.get("preview").and_then(Value::as_str) {
+        records.push(CodeIntelRecord::line(format!("  {preview}")));
     }
+    let mut presentation = static_presentation(header, records, meta);
+    let in_scope = received.saturating_sub(skipped);
+    if in_scope > 1 {
+        presentation.trailer.push(format!(
+            "  ({in_scope} in-scope locations; showing the first)"
+        ));
+    }
+    presentation
 }
 
-fn hover_presentation(
-    outcome: &CodeIntelOutcome,
-    full: String,
-    meta: String,
-) -> CodeIntelPresentation {
-    let found = outcome
-        .payload
+fn hover_presentation(outcome: &CodeIntelOutcome, meta: String) -> CodeIntelPresentation {
+    let payload = &outcome.payload;
+    if !payload
         .get("found")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let truncated = outcome
-        .payload
+        .unwrap_or(false)
+    {
+        return static_presentation(
+            "code_intel hover: no documentation".into(),
+            Vec::new(),
+            meta,
+        );
+    }
+    let mut header = String::from("code_intel hover");
+    if payload
         .get("truncated")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let mut header = String::from("code_intel hover");
-    let mut records = Vec::new();
-    if found {
-        if truncated {
-            header.push_str(" [truncated]");
-        }
-        records.push(
-            outcome
-                .payload
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned(),
-        );
-    } else {
-        header.push_str(": no documentation");
+        .unwrap_or(false)
+    {
+        header.push_str(" [truncated]");
     }
-    CodeIntelPresentation {
-        full,
-        header,
-        records,
-        header_kind: CodeIntelHeaderKind::Static,
-        continuation: None,
-        meta,
-    }
+    let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
+    static_presentation(header, vec![CodeIntelRecord::line(text)], meta)
 }
 
-fn references_presentation(
-    outcome: &CodeIntelOutcome,
-    full: String,
-    meta: String,
-) -> CodeIntelPresentation {
+fn references_presentation(outcome: &CodeIntelOutcome, meta: String) -> CodeIntelPresentation {
     let total = outcome
         .payload
         .get("total")
@@ -767,61 +723,51 @@ fn references_presentation(
         .and_then(Value::as_u64)
         .unwrap_or(files.len() as u64);
     let completeness = completeness_name(outcome.meta.completeness);
-    let header = match outcome
+    let symbol = outcome
         .payload
         .get("symbol")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-    {
-        Some(symbol) => {
-            format!("code_intel references: {symbol} - {total} across {file_count} file(s) | {completeness}")
-        }
-        None => {
-            format!("code_intel references: {total} across {file_count} file(s) | {completeness}")
-        }
-    };
+        .map(str::to_owned);
     let mut records = Vec::new();
     for file in files {
         let name = file.get("file").and_then(Value::as_str).unwrap_or("");
-        if let Some(results) = file.get("results").and_then(Value::as_array) {
-            for result in results {
-                let line = result.get("line").and_then(Value::as_u64).unwrap_or(0);
-                let column = result.get("column").and_then(Value::as_u64).unwrap_or(0);
-                let mut record = name.to_owned();
-                record.push_str(&format!("\n  {line}:{column}"));
-                if let Some(context) = result.get("context").and_then(Value::as_str) {
-                    record.push_str(&format!(": {context}"));
-                }
-                records.push(record);
-            }
+        for result in file
+            .get("results")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let line = result.get("line").and_then(Value::as_u64).unwrap_or(0);
+            let column = result.get("column").and_then(Value::as_u64).unwrap_or(0);
+            let text = match result.get("context").and_then(Value::as_str) {
+                Some(context) => format!("  {line}:{column}: {context}"),
+                None => format!("  {line}:{column}"),
+            };
+            records.push(CodeIntelRecord {
+                group: Some(name.to_owned()),
+                text,
+            });
         }
     }
-    let continuation = continuation_for_page(outcome);
     CodeIntelPresentation {
-        full,
-        header,
+        full: String::new(),
+        header: String::new(),
+        notes: Vec::new(),
         records,
+        trailer: Vec::new(),
         header_kind: CodeIntelHeaderKind::References {
-            symbol: outcome
-                .payload
-                .get("symbol")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned),
+            symbol,
             total: total as usize,
             file_count: file_count as usize,
             completeness: completeness.to_owned(),
         },
-        continuation,
+        continuation: continuation_for_page(outcome),
         meta,
     }
 }
 
-fn symbols_presentation(
-    outcome: &CodeIntelOutcome,
-    full: String,
-    meta: String,
-) -> CodeIntelPresentation {
+fn symbols_presentation(outcome: &CodeIntelOutcome, meta: String) -> CodeIntelPresentation {
     let kind = outcome
         .payload
         .get("kind")
@@ -835,39 +781,30 @@ fn symbols_presentation(
         .unwrap_or_default();
     let query = outcome.payload.get("query").and_then(Value::as_str);
     let total = outcome.payload.get("total").and_then(Value::as_u64);
-    let header = match (kind, total) {
-        ("document", Some(total)) => format!(
-            "code_intel action=symbol (document): {} of {} shown",
-            symbols.len(),
-            total
-        ),
-        ("document", None) => format!(
-            "code_intel action=symbol (document): {} shown",
-            symbols.len()
-        ),
-        (_, Some(total)) => format!(
-            "code_intel action=symbol (workspace): {} - {} of {} shown",
-            query.unwrap_or(""),
-            symbols.len(),
-            total
-        ),
-        _ => format!(
-            "code_intel action=symbol (workspace): {} - {} shown",
-            query.unwrap_or(""),
-            symbols.len()
-        ),
-    };
-    let (annotations, _, _) = symbol_annotations(&symbols, query, SYMBOL_ANNOTATION_BUDGET_BYTES);
+    // Basic rows stay in server/flattened order. Only annotation ownership is
+    // ranked, so a strong textual match cannot lose its detail to earlier
+    // irrelevant rows. Annotation bytes include labels and UTF-8 safely.
+    let (mut annotations, mut annotations_truncated, remaining_budget) =
+        symbol_annotations(&symbols, query, SYMBOL_ANNOTATION_BUDGET_BYTES);
+    // Count truncation notice inside same aggregate budget. Reserve it only
+    // when needed, so complete small responses keep all available bytes.
+    if annotations_truncated && remaining_budget < SYMBOL_ANNOTATION_TRUNCATION_NOTICE.len() {
+        (annotations, annotations_truncated, _) = symbol_annotations(
+            &symbols,
+            query,
+            SYMBOL_ANNOTATION_BUDGET_BYTES - SYMBOL_ANNOTATION_TRUNCATION_NOTICE.len(),
+        );
+    }
     let records = symbols
         .iter()
-        .enumerate()
-        .map(|(index, symbol)| {
+        .zip(annotations)
+        .map(|(symbol, annotation)| {
             let name = symbol.get("name").and_then(Value::as_str).unwrap_or("");
             let symbol_kind = symbol
                 .get("kind")
                 .and_then(Value::as_str)
                 .unwrap_or("symbol");
-            let mut record = match (
+            let mut row = match (
                 symbol.get("file").and_then(Value::as_str),
                 symbol.get("line").and_then(Value::as_u64),
                 symbol.get("column").and_then(Value::as_u64),
@@ -880,14 +817,20 @@ fn symbols_presentation(
                 }
                 _ => format!("{symbol_kind:>12} {name}"),
             };
-            record.push_str(&annotations[index]);
-            record
+            row.push_str(&annotation);
+            CodeIntelRecord::line(row)
         })
         .collect();
+    let mut trailer = Vec::new();
+    if annotations_truncated {
+        trailer.push(SYMBOL_ANNOTATION_TRUNCATION_NOTICE.trim_start().to_owned());
+    }
     CodeIntelPresentation {
-        full,
-        header,
+        full: String::new(),
+        header: String::new(),
+        notes: Vec::new(),
         records,
+        trailer,
         header_kind: CodeIntelHeaderKind::Symbols {
             document: kind == "document",
             query: query.map(str::to_owned),
@@ -898,52 +841,48 @@ fn symbols_presentation(
     }
 }
 
-fn diagnostics_presentation(
-    outcome: &CodeIntelOutcome,
-    full: String,
-    meta: String,
-) -> CodeIntelPresentation {
+fn diagnostics_presentation(outcome: &CodeIntelOutcome, meta: String) -> CodeIntelPresentation {
     let files = outcome
         .payload
         .get("files")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let shown: u64 = files
-        .iter()
-        .map(|file| file.get("count").and_then(Value::as_u64).unwrap_or(0))
-        .sum();
-    let counts = match outcome.payload.get("total").and_then(Value::as_u64) {
-        Some(total) => format!("{shown} shown of {total}"),
-        None => format!("{shown} shown; total unknown"),
-    };
-    let header = if outcome.payload.get("scope").and_then(Value::as_str) == Some("published") {
-        format!("code_intel diagnostics (published cache): {counts}")
-    } else {
-        format!("code_intel diagnostics: {counts}")
-    };
+    let mut notes = Vec::new();
     let mut records = Vec::new();
     for file in &files {
         let file_name = file.get("file").and_then(Value::as_str).unwrap_or("");
-        if let Some(diagnostics) = file.get("diagnostics").and_then(Value::as_array) {
-            for diagnostic in diagnostics {
-                let severity = diagnostic
-                    .get("severity")
-                    .and_then(Value::as_str)
-                    .unwrap_or("diagnostic");
-                let line = diagnostic.get("line").and_then(Value::as_u64).unwrap_or(0);
-                let column = diagnostic
-                    .get("column")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let message = diagnostic
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                records.push(format!("{severity} {file_name}:{line}:{column}: {message}"));
+        if file.get("received").and_then(Value::as_bool) == Some(false) {
+            notes.push(format!("{file_name}: awaiting diagnostics publication"));
+        }
+        for diagnostic in file
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let severity = diagnostic
+                .get("severity")
+                .and_then(Value::as_str)
+                .unwrap_or("diagnostic");
+            let line = diagnostic.get("line").and_then(Value::as_u64).unwrap_or(0);
+            let column = diagnostic
+                .get("column")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let message = diagnostic
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let mut row = format!("{severity} {file_name}:{line}:{column}");
+            if let Some(code) = diagnostic.get("code").and_then(Value::as_str) {
+                row.push_str(&format!(" [{code}]"));
             }
-        } else if file.get("received").and_then(Value::as_bool) == Some(false) {
-            records.push(format!("{file_name}: awaiting diagnostics publication"));
+            if let Some(source) = diagnostic.get("source").and_then(Value::as_str) {
+                row.push_str(&format!(" ({source})"));
+            }
+            row.push_str(&format!(": {message}"));
+            records.push(CodeIntelRecord::line(row));
         }
     }
     let mut continuation = continuation_for_page(outcome);
@@ -953,21 +892,22 @@ fn diagnostics_presentation(
         .and_then(Value::as_bool)
         == Some(true)
     {
-        if let Some(value) = continuation.as_mut() {
-            value.scan_notice = Some("diagnostic cache truncated".into());
-        } else {
-            continuation = Some(CodeIntelContinuation {
+        continuation
+            .get_or_insert(CodeIntelContinuation {
                 offset: None,
                 next_offset: None,
                 revision: None,
-                scan_notice: Some("diagnostic cache truncated".into()),
-            });
-        }
+                scan_notice: None,
+                has_more: false,
+            })
+            .scan_notice = Some("diagnostic cache truncated".into());
     }
     CodeIntelPresentation {
-        full,
-        header,
+        full: String::new(),
+        header: String::new(),
+        notes,
         records,
+        trailer: Vec::new(),
         header_kind: CodeIntelHeaderKind::Diagnostics {
             published: outcome.payload.get("scope").and_then(Value::as_str) == Some("published"),
             total: outcome
@@ -1010,7 +950,7 @@ fn continuation_for_page(outcome: &CodeIntelOutcome) -> Option<CodeIntelContinua
                 .get("scanned")
                 .and_then(Value::as_u64)
                 .unwrap_or(received);
-            format!("server reported {received} locations; only the first {scanned} were scanned")
+            format!("[server reported {received} locations; only the first {scanned} were scanned]")
         });
     if !has_more
         && next.is_none()
@@ -1025,480 +965,8 @@ fn continuation_for_page(outcome: &CodeIntelOutcome) -> Option<CodeIntelContinua
         next_offset: next,
         revision,
         scan_notice,
+        has_more,
     })
-}
-
-fn render_status(outcome: &CodeIntelOutcome) -> String {
-    if let Some(error) = outcome.payload.get("error").and_then(Value::as_str) {
-        return format!("code_intel status: {error}\n{}", meta_line(&outcome.meta));
-    }
-    let summary = outcome
-        .payload
-        .get("summary")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let servers = outcome
-        .payload
-        .get("servers")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut out = String::from("code_intel status");
-    if !summary.is_empty() {
-        out.push_str(&format!("\n{summary}"));
-    }
-    for server in servers {
-        let state = server.get("state").and_then(Value::as_str).unwrap_or("?");
-        // Absolute paths carry machine-local segments (e.g. the user name);
-        // the model only needs the leaf to tell servers apart.
-        let root = server
-            .get("root")
-            .and_then(Value::as_str)
-            .map(path_leaf)
-            .unwrap_or("");
-        let binary = server
-            .get("binary")
-            .and_then(Value::as_str)
-            .map(path_leaf)
-            .unwrap_or("");
-        let mut line = format!("\n- {state} root={root} binary={binary}");
-        if let Some(open) = server.get("open_documents").and_then(Value::as_u64) {
-            line.push_str(&format!(" open_documents={open}"));
-        }
-        if let Some(indexing) = server.get("indexing").and_then(Value::as_bool) {
-            line.push_str(&format!(" indexing={indexing}"));
-        }
-        if server
-            .get("binary_missing")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            line.push_str(" binary_missing=true");
-        }
-        out.push_str(&line);
-    }
-    out.push_str(&format!("\n{}", meta_line(&outcome.meta)));
-    out
-}
-
-fn render_definition(outcome: &CodeIntelOutcome) -> String {
-    let mut out = String::new();
-    if outcome.payload.get("error").is_some() {
-        out.push_str(&format!(
-            "code_intel definition: {}",
-            outcome_error(outcome)
-        ));
-    } else {
-        let found = outcome
-            .payload
-            .get("found")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if found {
-            let file = outcome
-                .payload
-                .get("file")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let line = outcome
-                .payload
-                .get("line")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let column = outcome
-                .payload
-                .get("column")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let symbol = outcome
-                .payload
-                .get("symbol")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty());
-            match symbol {
-                Some(symbol) => {
-                    out.push_str(&format!(
-                        "code_intel definition: {symbol}\n{file}:{line}:{column}"
-                    ));
-                }
-                None => out.push_str(&format!("code_intel definition\n{file}:{line}:{column}")),
-            }
-            if let Some(preview) = outcome.payload.get("preview").and_then(Value::as_str) {
-                out.push_str(&format!("\n  {preview}"));
-            }
-            let in_scope = outcome
-                .payload
-                .get("locations_received")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                .saturating_sub(
-                    outcome
-                        .payload
-                        .get("locations_out_of_scope")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                );
-            if in_scope > 1 {
-                out.push_str(&format!(
-                    "\n  ({in_scope} in-scope locations; showing the first)"
-                ));
-            }
-        } else {
-            let received = outcome
-                .payload
-                .get("locations_received")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let skipped = outcome
-                .payload
-                .get("locations_out_of_scope")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            if received > 0 && skipped == received {
-                out.push_str(&format!(
-                    "code_intel definition: {received} location(s) reported, all outside the workspace scope"
-                ));
-            } else if skipped > 0 {
-                out.push_str(&format!(
-                    "code_intel definition: not found in workspace ({skipped} out-of-scope location(s) skipped)"
-                ));
-            } else {
-                out.push_str("code_intel definition: not found");
-            }
-        }
-    }
-    out.push_str(&format!("\n{}", meta_line(&outcome.meta)));
-    out
-}
-
-fn render_references(outcome: &CodeIntelOutcome) -> String {
-    let mut out = String::new();
-    if outcome.payload.get("error").is_some() {
-        out.push_str(&format!(
-            "code_intel references: {}",
-            outcome_error(outcome)
-        ));
-        out.push_str(&format!("\n{}", meta_line(&outcome.meta)));
-        return out;
-    }
-    let total = outcome
-        .payload
-        .get("total")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let shown = outcome
-        .payload
-        .get("shown")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let has_more = outcome
-        .payload
-        .get("has_more")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let next_offset = outcome.payload.get("next_offset").and_then(Value::as_u64);
-    let revision = outcome.payload.get("revision").and_then(Value::as_u64);
-    let total_files = outcome.payload.get("total_files").and_then(Value::as_u64);
-    let scan_truncated = outcome
-        .payload
-        .get("scan_truncated")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let received = outcome
-        .payload
-        .get("received")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let scanned = outcome
-        .payload
-        .get("scanned")
-        .and_then(Value::as_u64)
-        .unwrap_or(received);
-    let completeness = completeness_name(outcome.meta.completeness);
-    let symbol = outcome
-        .payload
-        .get("symbol")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty());
-    let files = outcome
-        .payload
-        .get("files")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let file_count = total_files.unwrap_or(files.len() as u64);
-    match symbol {
-        Some(symbol) => out.push_str(&format!(
-            "code_intel references: {symbol} - {total} across {file_count} file(s) | {completeness}"
-        )),
-        None => out.push_str(&format!(
-            "code_intel references: {total} across {file_count} file(s) | {completeness}"
-        )),
-    }
-    if has_more {
-        match (next_offset, revision) {
-            // Executable continuation: offset pages are bounded and do not
-            // depend on the model guessing a larger max_results; `revision`
-            // binds the page to the workspace state it was enumerated under.
-            (Some(next), Some(revision)) => out.push_str(&format!(
-                " (showing {shown}; pass \"offset\": {next}, \"revision\": {revision} for the next page)"
-            )),
-            (Some(next), None) => out.push_str(&format!(
-                " (showing {shown}; pass \"offset\": {next} for the next page)"
-            )),
-            (None, _) => out.push_str(&format!(" (showing {shown})")),
-        }
-    }
-    if scan_truncated {
-        out.push_str(&format!(
-            "\n[server reported {received} locations; only the first {scanned} were scanned]"
-        ));
-    }
-    for file in files {
-        let file_name = file.get("file").and_then(Value::as_str).unwrap_or("");
-        out.push_str(&format!("\n{file_name}"));
-        let results = file
-            .get("results")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        for result in results {
-            let line = result.get("line").and_then(Value::as_u64).unwrap_or(0);
-            let column = result.get("column").and_then(Value::as_u64).unwrap_or(0);
-            match result.get("context").and_then(Value::as_str) {
-                Some(context) => out.push_str(&format!("\n  {line}:{column}: {context}")),
-                None => out.push_str(&format!("\n  {line}:{column}")),
-            }
-        }
-    }
-    out.push_str(&format!("\n{}", meta_line(&outcome.meta)));
-    out
-}
-
-fn render_hover(outcome: &CodeIntelOutcome) -> String {
-    let mut out = String::new();
-    if outcome.payload.get("error").is_some() {
-        out.push_str(&format!("code_intel hover: {}", outcome_error(outcome)));
-        out.push_str(&format!("\n{}", meta_line(&outcome.meta)));
-        return out;
-    }
-    let found = outcome
-        .payload
-        .get("found")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let text = outcome
-        .payload
-        .get("text")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let truncated = outcome
-        .payload
-        .get("truncated")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if found {
-        out.push_str("code_intel hover");
-        if truncated {
-            out.push_str(" [truncated]");
-        }
-        out.push_str(&format!("\n{text}"));
-    } else {
-        out.push_str("code_intel hover: no documentation");
-    }
-    out.push_str(&format!("\n{}", meta_line(&outcome.meta)));
-    out
-}
-
-fn render_symbols(outcome: &CodeIntelOutcome) -> String {
-    let mut out = String::new();
-    if outcome.payload.get("error").is_some() {
-        out.push_str(&format!(
-            "code_intel action=symbol: {}",
-            outcome_error(outcome)
-        ));
-        out.push_str(&format!("\n{}", meta_line(&outcome.meta)));
-        return out;
-    }
-    let kind = outcome
-        .payload
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("?");
-    let symbols = outcome
-        .payload
-        .get("symbols")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let query = outcome.payload.get("query").and_then(Value::as_str);
-    let total = outcome.payload.get("total").and_then(Value::as_u64);
-    match (kind, total) {
-        ("document", Some(total)) => out.push_str(&format!(
-            "code_intel action=symbol (document): {} of {} shown",
-            symbols.len(),
-            total
-        )),
-        ("document", None) => out.push_str(&format!(
-            "code_intel action=symbol (document): {} shown",
-            symbols.len()
-        )),
-        (_, Some(total)) => out.push_str(&format!(
-            "code_intel action=symbol (workspace): {} - {} of {} shown",
-            query.unwrap_or(""),
-            symbols.len(),
-            total
-        )),
-        _ => {
-            out.push_str(&format!(
-                "code_intel action=symbol (workspace): {} - {} shown",
-                query.unwrap_or(""),
-                symbols.len()
-            ));
-        }
-    }
-
-    // Basic rows stay in server/flattened order. Only annotation ownership is
-    // ranked, so a strong textual match cannot lose its detail to earlier
-    // irrelevant rows. Annotation bytes include labels and UTF-8 safely.
-    let (mut annotations, mut annotations_truncated, remaining_budget) =
-        symbol_annotations(&symbols, query, SYMBOL_ANNOTATION_BUDGET_BYTES);
-    // Count truncation notice inside same aggregate budget. Reserve it only
-    // when needed, so complete small responses keep all available bytes.
-    if annotations_truncated && remaining_budget < SYMBOL_ANNOTATION_TRUNCATION_NOTICE.len() {
-        (annotations, annotations_truncated, _) = symbol_annotations(
-            &symbols,
-            query,
-            SYMBOL_ANNOTATION_BUDGET_BYTES - SYMBOL_ANNOTATION_TRUNCATION_NOTICE.len(),
-        );
-    }
-
-    for (index, symbol) in symbols.iter().enumerate() {
-        let name = symbol.get("name").and_then(Value::as_str).unwrap_or("");
-        let symbol_kind = symbol
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or("symbol");
-        let file = symbol.get("file").and_then(Value::as_str);
-        let line = symbol.get("line").and_then(Value::as_u64);
-        let column = symbol.get("column").and_then(Value::as_u64);
-        match (file, line, column) {
-            (Some(file), Some(line), Some(column)) => {
-                out.push_str(&format!(
-                    "\n{symbol_kind:>12} {name}  -> {file}:{line}:{column}"
-                ));
-            }
-            (Some(file), _, _) => out.push_str(&format!(
-                "\n{symbol_kind:>12} {name}  -> {file} (position unavailable)"
-            )),
-            _ => out.push_str(&format!("\n{symbol_kind:>12} {name}")),
-        }
-        out.push_str(&annotations[index]);
-    }
-    if annotations_truncated {
-        out.push_str(SYMBOL_ANNOTATION_TRUNCATION_NOTICE);
-    }
-    if outcome.payload.get("has_more").and_then(Value::as_bool) == Some(true) {
-        // Executable continuation: `revision` binds the page to the workspace
-        // state it was enumerated under; a changed workspace is rejected
-        // instead of mixing pages.
-        let next_offset = outcome.payload.get("next_offset").and_then(Value::as_u64);
-        let revision = outcome.payload.get("revision").and_then(Value::as_u64);
-        match (next_offset, revision) {
-            (Some(next), Some(revision)) => out.push_str(&format!(
-                "\nmore results; pass \"offset\": {next}, \"revision\": {revision} for the next page"
-            )),
-            (Some(next), None) => out.push_str(&format!(
-                "\nmore results; pass \"offset\": {next} for the next page"
-            )),
-            _ => out.push_str("\nmore results omitted"),
-        }
-    }
-    out.push_str(&format!("\n{}", meta_line(&outcome.meta)));
-    out
-}
-
-fn render_diagnostics(outcome: &CodeIntelOutcome) -> String {
-    let mut out = String::new();
-    if outcome.payload.get("error").is_some() {
-        out.push_str(&format!(
-            "code_intel diagnostics: {}",
-            outcome_error(outcome)
-        ));
-        out.push_str(&format!("\n{}", meta_line(&outcome.meta)));
-        return out;
-    }
-    let files = outcome
-        .payload
-        .get("files")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let shown: u64 = files
-        .iter()
-        .map(|file| file.get("count").and_then(Value::as_u64).unwrap_or(0))
-        .sum();
-    let counts = match outcome.payload.get("total").and_then(Value::as_u64) {
-        Some(total) => format!("{shown} shown of {total}"),
-        None => format!("{shown} shown; total unknown"),
-    };
-    if outcome.payload.get("scope").and_then(Value::as_str) == Some("published") {
-        out.push_str(&format!(
-            "code_intel diagnostics (published cache): {counts}"
-        ));
-    } else {
-        out.push_str(&format!("code_intel diagnostics: {counts}"));
-    }
-    if outcome.payload.get("has_more").and_then(Value::as_bool) == Some(true) {
-        out.push_str("\nmore results omitted");
-    }
-    if outcome
-        .payload
-        .get("storage_truncated")
-        .and_then(Value::as_bool)
-        == Some(true)
-    {
-        out.push_str("\ndiagnostic cache truncated");
-    }
-    for file in files {
-        let file_name = file.get("file").and_then(Value::as_str).unwrap_or("");
-        if file.get("received").and_then(Value::as_bool) == Some(false) {
-            out.push_str(&format!("\n{file_name}: awaiting diagnostics publication"));
-        }
-        let diagnostics = file
-            .get("diagnostics")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        for diagnostic in diagnostics {
-            let severity = diagnostic
-                .get("severity")
-                .and_then(Value::as_str)
-                .unwrap_or("diagnostic");
-            let code = diagnostic.get("code").and_then(Value::as_str);
-            let source = diagnostic.get("source").and_then(Value::as_str);
-            let line = diagnostic.get("line").and_then(Value::as_u64).unwrap_or(0);
-            let column = diagnostic
-                .get("column")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let message = diagnostic
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let mut row = format!("\n{severity} {file_name}:{line}:{column}");
-            if let Some(code) = code {
-                row.push_str(&format!(" [{code}]"));
-            }
-            if let Some(source) = source {
-                row.push_str(&format!(" ({source})"));
-            }
-            row.push_str(&format!(": {message}"));
-            out.push_str(&row);
-        }
-    }
-    out.push_str(&format!("\n{}", meta_line(&outcome.meta)));
-    out
 }
 
 #[cfg(test)]
@@ -2046,9 +1514,12 @@ mod tests {
             }),
         };
         let text = render_code_intel("references", &outcome);
-        assert!(text.contains("execute_tool_call - 18 across 1 file(s) | complete"));
-        assert!(text.contains("runtime/mod.rs"));
-        assert!(text.contains("599:3: client.stream_messages(...)"));
+        assert!(
+            text.starts_with(
+                "code_intel references: execute_tool_call - 2 of 18 across 1 file(s) | complete\nruntime/mod.rs\n  599:3: client.stream_messages(...)\n  978:5: build_messages_request(...)\nmore results omitted\n"
+            ),
+            "{text}"
+        );
         assert!(text.contains("document_version: 7"));
     }
 

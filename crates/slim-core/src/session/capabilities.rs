@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use crate::agents::ChildStatus;
 use crate::mcp::{canonical_name, McpCatalog};
-use crate::skills::{DiscoveryResult, SkillEntry};
+use crate::skills::DiscoveryResult;
 use crate::tools::ToolRegistry;
 use crate::OperatingMode;
 
@@ -229,10 +229,6 @@ impl CapabilityCatalog {
         Ok(())
     }
 
-    pub fn add_skill_entry(&mut self, entry: &SkillEntry) -> Result<(), CapabilityLedgerError> {
-        self.add_skill(entry.name.clone())
-    }
-
     pub fn add_mcp_catalog(&mut self, catalog: &McpCatalog) -> Result<(), CapabilityLedgerError> {
         validate_identifier(catalog.server_name())?;
         let entry_count = catalog
@@ -332,13 +328,6 @@ impl CapabilityCatalog {
 
     pub fn list(&self) -> Vec<&CapabilityDescriptor> {
         self.descriptors.values().collect()
-    }
-
-    pub fn for_mode(&self, mode: OperatingMode) -> Vec<&CapabilityDescriptor> {
-        self.descriptors
-            .values()
-            .filter(|descriptor| descriptor.allows_mode(mode))
-            .collect()
     }
 
     pub fn authorize(
@@ -1186,19 +1175,6 @@ impl<R> CapabilityService<R> {
         R: DurableRepoLike,
     {
         self.dispatch(request, |descriptor, effect_id| {
-            adapter.dispatch(effect_id, descriptor)
-        })
-    }
-
-    pub fn retry_in_flight_with_adapter<D: CapabilityDispatcher>(
-        &mut self,
-        queue_id: &str,
-        adapter: &mut D,
-    ) -> Result<CapabilityDispatch, CapabilityLedgerError>
-    where
-        R: DurableRepoLike,
-    {
-        self.retry_in_flight(queue_id, |descriptor, effect_id| {
             adapter.dispatch(effect_id, descriptor)
         })
     }

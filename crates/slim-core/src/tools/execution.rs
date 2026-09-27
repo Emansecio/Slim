@@ -39,14 +39,38 @@ pub(crate) enum ToolPresentationSource {
     },
 }
 
+/// One semantic code-intelligence result. The complete text and every
+/// budgeted projection render the same records through
+/// [`CodeIntelPresentation::render`], so they cannot diverge.
 #[derive(Clone, Debug)]
 pub(crate) struct CodeIntelPresentation {
+    /// `render(records.len())`, cached.
     pub(crate) full: String,
     pub(crate) header: String,
-    pub(crate) records: Vec<String>,
+    /// Lines always kept right after the header.
+    pub(crate) notes: Vec<String>,
+    pub(crate) records: Vec<CodeIntelRecord>,
+    /// Lines always kept after the delivered records.
+    pub(crate) trailer: Vec<String>,
     pub(crate) header_kind: CodeIntelHeaderKind,
     pub(crate) continuation: Option<CodeIntelContinuation>,
     pub(crate) meta: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CodeIntelRecord {
+    /// Printed once before a run of records sharing it (e.g. a file name).
+    pub(crate) group: Option<String>,
+    pub(crate) text: String,
+}
+
+impl CodeIntelRecord {
+    pub(crate) fn line(text: impl Into<String>) -> Self {
+        Self {
+            group: None,
+            text: text.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +102,8 @@ pub(crate) struct CodeIntelContinuation {
     pub(crate) next_offset: Option<usize>,
     pub(crate) revision: Option<u64>,
     pub(crate) scan_notice: Option<String>,
+    /// The backend reported results beyond this page.
+    pub(crate) has_more: bool,
 }
 
 impl ToolPresentationSource {
@@ -246,42 +272,49 @@ fn present_read_records(
 }
 
 impl CodeIntelPresentation {
+    /// Seals the presentation: the complete text is the rendering of every
+    /// record, so no second renderer can drift from the budgeted one.
+    pub(crate) fn sealed(mut self) -> Self {
+        self.full = self.render(self.records.len());
+        self
+    }
+
+    /// Text for the first `count` records: header, notes, records (group
+    /// lines once per run), trailer, continuation or omission notice, meta.
+    pub(crate) fn render(&self, count: usize) -> String {
+        let mut lines = vec![self.header_for_count(count)];
+        lines.extend(self.notes.iter().cloned());
+        let mut group = None;
+        for record in &self.records[..count] {
+            if record.group.is_some() && record.group != group {
+                lines.extend(record.group.clone());
+            }
+            group.clone_from(&record.group);
+            lines.push(record.text.clone());
+        }
+        lines.extend(self.trailer.iter().cloned());
+        if let Some(continuation) = self.continuation_for_count(count) {
+            lines.push(continuation);
+        }
+        if count < self.records.len() && self.continuation.is_none() {
+            lines.push(if count == 0 {
+                "[semantic item and metadata exceed presentation budget; no item delivered; request a narrower page; not safe for patch.expected]".into()
+            } else {
+                "[semantic items omitted by presentation budget; request a narrower page; not safe for patch.expected]".into()
+            });
+        }
+        if !self.meta.is_empty() {
+            lines.push(self.meta.clone());
+        }
+        lines.retain(|line| !line.is_empty());
+        lines.join("\n")
+    }
+
     fn present(&self, budget: PresentationBudget) -> ToolPresentation {
         if self.full.len() <= budget.max_bytes {
             return ToolPresentation::complete(self.full.clone());
         }
-        let render = |count: usize| {
-            let mut text = self.header_for_count(count);
-            for record in &self.records[..count] {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(record);
-            }
-            if let Some(continuation) = self.continuation_for_count(count) {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(&continuation);
-            }
-            if count < self.records.len() && self.continuation.is_none() {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                if count == 0 {
-                    text.push_str("[semantic item and metadata exceed presentation budget; no item delivered; request a narrower page; not safe for patch.expected]");
-                } else {
-                    text.push_str("[semantic items omitted by presentation budget; request a narrower page; not safe for patch.expected]");
-                }
-            }
-            if !self.meta.is_empty() {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(&self.meta);
-            }
-            text
-        };
+        let render = |count: usize| self.render(count);
         let full = render(self.records.len());
         if full.len() <= budget.max_bytes {
             return ToolPresentation {
@@ -364,24 +397,18 @@ impl CodeIntelPresentation {
 
     fn continuation_for_count(&self, count: usize) -> Option<String> {
         let continuation = self.continuation.as_ref()?;
-        let next = continuation.next_offset.map_or_else(
-            || {
-                (count < self.records.len())
-                    .then(|| {
-                        continuation
-                            .offset
-                            .map(|offset| offset.saturating_add(count))
-                    })
-                    .flatten()
-            },
-            |offset| {
-                Some(
-                    offset
-                        .saturating_sub(self.records.len())
-                        .saturating_add(count),
-                )
-            },
-        );
+        let trimmed = count < self.records.len();
+        let next = match continuation.next_offset {
+            Some(offset) => Some(
+                offset
+                    .saturating_sub(self.records.len())
+                    .saturating_add(count),
+            ),
+            None if trimmed => continuation
+                .offset
+                .map(|offset| offset.saturating_add(count)),
+            None => None,
+        };
         let mut parts = Vec::new();
         if let Some(next) = next {
             parts.push(match continuation.revision {
@@ -390,13 +417,13 @@ impl CodeIntelPresentation {
                 ),
                 None => format!("more results; pass \"offset\": {next} for the next page"),
             });
-        } else if continuation.scan_notice.is_none() {
+        } else if (trimmed || continuation.has_more) && continuation.scan_notice.is_none() {
             parts.push("more results omitted".into());
         }
         if let Some(notice) = &continuation.scan_notice {
             parts.push(notice.clone());
         }
-        Some(parts.join("\n"))
+        (!parts.is_empty()).then(|| parts.join("\n"))
     }
 }
 
@@ -796,6 +823,8 @@ pub(crate) struct ToolExecutionReceipt {
     pub(crate) execution_us: u64,
     pub(crate) finalization_us: u64,
     pub(crate) synced_text: Option<crate::codeintel::CodeIntelFileUpdate>,
+    /// Display diff of a successful patch; emitted as `ToolEditApplied`.
+    pub(crate) edit_diff: Option<crate::ToolEditDiff>,
     pub(crate) process: Option<crate::process::ProcessExecutionFacts>,
     pub(crate) fused_shell: Option<Box<(PreparedToolInvocation, ToolResult)>>,
     pub(crate) presentation: Option<ToolPresentationSource>,
@@ -820,6 +849,7 @@ impl ToolExecutionReceipt {
             execution_us,
             finalization_us: 0,
             synced_text: None,
+            edit_diff: None,
             process: None,
             fused_shell: None,
             presentation: None,
@@ -2231,8 +2261,7 @@ mod tests {
             }),
         };
         let full = code_intel::render_code_intel("references", &outcome);
-        let presentation =
-            code_intel::presentation_for_code_intel("references", &outcome, full.clone());
+        let presentation = code_intel::presentation_for_code_intel("references", &outcome);
         assert_eq!(presentation.full, full);
         assert_eq!(presentation.records.len(), 3);
         assert_eq!(
@@ -2243,6 +2272,77 @@ mod tests {
             presentation.continuation_for_count(1).as_deref(),
             Some("more results; pass \"offset\": 6, \"revision\": 19 for the next page")
         );
+    }
+
+    fn ready_outcome(payload: Value) -> crate::codeintel::CodeIntelOutcome {
+        crate::codeintel::CodeIntelOutcome {
+            meta: crate::codeintel::CodeIntelMeta {
+                server: "fixture".into(),
+                state: crate::codeintel::CodeIntelServerState::Ready,
+                completeness: crate::codeintel::CodeIntelCompleteness::Complete,
+                document_version: Some(1),
+                stale: false,
+                elapsed_ms: 1,
+            },
+            payload,
+        }
+    }
+
+    /// The budgeted projection is built from the same records as the full
+    /// text: trimming drops whole records, never the details of kept ones.
+    #[test]
+    fn code_intel_budgeted_text_keeps_the_details_of_the_full_text() {
+        let long_detail = "d".repeat(400);
+        let symbols = (0..8)
+            .map(|index| {
+                json!({"name": format!("item{index}"), "kind": "function", "file": "src/lib.rs",
+                    "line": index + 1, "column": 1, "detail": long_detail})
+            })
+            .collect::<Vec<_>>();
+        for (action, payload, detail) in [
+            (
+                "diagnostics",
+                json!({"total": 2, "files": [{"file": "src/lib.rs", "count": 2, "diagnostics": [
+                    {"severity": "error", "line": 3, "column": 5, "code": "E0308",
+                        "source": "rustc", "message": "mismatched types"},
+                    {"severity": "warning", "line": 9, "column": 1, "code": "unused",
+                        "source": "rustc", "message": format!("unused variable {}", "x".repeat(300))}
+                ]}]}),
+                "[E0308] (rustc): mismatched types",
+            ),
+            (
+                "definition",
+                json!({"found": true, "file": "src/lib.rs", "line": 2, "column": 4,
+                    "preview": format!("fn target() {{ {} }}", "y".repeat(300)), "locations_received": 3,
+                    "locations_out_of_scope": 0}),
+                "(3 in-scope locations; showing the first)",
+            ),
+            (
+                "symbol",
+                json!({"kind": "document", "symbols": symbols}),
+                "symbol details truncated",
+            ),
+        ] {
+            let outcome = ready_outcome(payload);
+            let full = code_intel::render_code_intel(action, &outcome);
+            assert!(full.contains(detail), "{action} full: {full}");
+            let presentation = code_intel::presentation_for_code_intel(action, &outcome);
+            let one_record = presentation.render(1).len();
+            assert!(one_record < full.len(), "{action}");
+            let source = ToolPresentationSource::CodeIntel {
+                prefix: String::new(),
+                presentation,
+            };
+            let limited = source.present(PresentationBudget {
+                max_bytes: one_record,
+            });
+            assert_eq!(limited.delivered_records, 1, "{action}: {}", limited.text);
+            assert!(limited.text.contains(detail), "{action}: {}", limited.text);
+            let complete = source.present(PresentationBudget {
+                max_bytes: usize::MAX,
+            });
+            assert_eq!(complete.text, full, "{action}");
+        }
     }
 
     #[test]
@@ -2267,8 +2367,7 @@ mod tests {
                 ]
             }),
         };
-        let full = code_intel::render_code_intel("symbol", &outcome);
-        let presentation = code_intel::presentation_for_code_intel("symbol", &outcome, full);
+        let presentation = code_intel::presentation_for_code_intel("symbol", &outcome);
         let continuation = presentation
             .continuation
             .as_ref()
@@ -2296,11 +2395,7 @@ mod tests {
             },
             payload: json!({"kind":"document", "offset":3, "revision":24, "has_more":false, "symbols":[]}),
         };
-        let empty = code_intel::presentation_for_code_intel(
-            "symbol",
-            &empty_outcome,
-            code_intel::render_code_intel("symbol", &empty_outcome),
-        );
+        let empty = code_intel::presentation_for_code_intel("symbol", &empty_outcome);
         let empty_source = ToolPresentationSource::CodeIntel {
             prefix: String::new(),
             presentation: empty,

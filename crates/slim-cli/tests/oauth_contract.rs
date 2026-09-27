@@ -894,9 +894,11 @@ async fn refresh_ownership_isolated_by_store_and_provider() {
     });
 
     let origin = format!("http://{address}");
-    let mut endpoints = OAuthEndpoints::default();
-    endpoints.anthropic_token = format!("{origin}/anthropic");
-    endpoints.codex_token = format!("{origin}/codex");
+    let endpoints = OAuthEndpoints {
+        anthropic_token: format!("{origin}/anthropic"),
+        codex_token: format!("{origin}/codex"),
+        ..OAuthEndpoints::default()
+    };
     let first =
         OAuthService::new(endpoints.clone(), Arc::new(NoopBrowser), store_one.clone()).unwrap();
     let second = oauth_service(format!("{origin}/anthropic"), store_two.clone());

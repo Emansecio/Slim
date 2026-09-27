@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
-use std::os::windows::fs::symlink_file;
+#[path = "../../../tests/support/windows_symlink.rs"]
+mod windows_symlink;
 
 use serde_json::json;
 use slim_core::session::{
@@ -410,14 +411,14 @@ fn lock_and_alias_cannot_open_same_repository_until_owner_drops() {
             .as_nanos()
     ));
     let _ = fs::remove_file(&alias);
-    match symlink_file(&path, &alias) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            drop(repo);
-            cleanup(&path);
-            return;
-        }
-        Err(error) => panic!("symlink setup failed: {error}"),
+    if !windows_symlink::symlink_file_or_skip(
+        &path,
+        &alias,
+        "lock_and_alias_cannot_open_same_repository_until_owner_drops",
+    ) {
+        drop(repo);
+        cleanup(&path);
+        return;
     }
     assert!(JsonlRepo::open(&alias).is_err());
     drop(repo);
@@ -487,13 +488,13 @@ fn symlinked_lock_sentinel_is_rejected_without_redirecting() {
     let target = parent.join("redirect-target.lock");
     let original = b"unrelated sentinel";
     fs::write(&target, original).expect("target");
-    match symlink_file(&target, &lock_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            cleanup(&path);
-            return;
-        }
-        Err(error) => panic!("symlink setup failed: {error}"),
+    if !windows_symlink::symlink_file_or_skip(
+        &target,
+        &lock_path,
+        "session_jsonl_repo::symlinked_lock_sentinel_is_rejected_without_redirecting",
+    ) {
+        cleanup(&path);
+        return;
     }
     assert!(JsonlRepo::create(&path, header("redirect")).is_err());
     assert_eq!(fs::read(&target).expect("target read"), original);

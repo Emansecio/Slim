@@ -40,7 +40,16 @@ fn shell_summary_keeps_the_effective_timeout_visible() {
     );
     assert!(summary.starts_with("command="), "{summary}");
     assert!(summary.ends_with("limit 120s"), "{summary}");
-    assert!(summary.chars().count() <= 48, "{summary}");
+    // Stored summaries are bounded at 120 characters; tool rows still fit
+    // them to the terminal width. A truncated command keeps the limit.
+    assert!(summary.chars().count() <= 120, "{summary}");
+    let long = summarize_tool_arguments_for(
+        "shell",
+        &format!(r#"{{"command":"{}","timeout_ms":120000}}"#, "x".repeat(300)),
+    );
+    assert!(long.chars().count() <= 120, "{long}");
+    assert!(long.contains('…'), "{long}");
+    assert!(long.ends_with("limit 120s"), "{long}");
     let direct =
         summarize_tool_arguments_for("shell", r#"{"command":"python","args":["check.py"]}"#);
     assert_eq!(direct, "program=python \"check.py\" · limit 600s");

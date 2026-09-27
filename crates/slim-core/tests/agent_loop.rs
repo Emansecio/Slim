@@ -1569,6 +1569,84 @@ fn tool_limit_blocks_excess_mutating_calls_before_execution() {
 }
 
 #[test]
+fn per_turn_cap_names_the_suppressed_calls_in_the_next_request() {
+    let root = std::env::temp_dir().join(format!("slim-cap-steer-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("root");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let mut steer = String::new();
+        for turn in 0..2 {
+            let mut stream = accept_with_deadline(&listener);
+            let request = read_http_request(&mut stream);
+            let wire: Value = serde_json::from_str(request.split_once("\r\n\r\n").expect("body").1)
+                .expect("json");
+            let body = if turn == 0 {
+                let first = json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"write-1","function":{"name":"write","arguments":json!({"path":"first.txt","content":"first"}).to_string()}},
+                    {"index":1,"id":"write-2","function":{"name":"write","arguments":json!({"path":"second.txt","content":"second"}).to_string()}}
+                ]}}]});
+                format!("data: {first}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n")
+            } else {
+                steer = wire["messages"]
+                    .as_array()
+                    .expect("messages")
+                    .iter()
+                    .rev()
+                    .find(|message| message["role"] == "user")
+                    .and_then(|message| message["content"].as_str())
+                    .expect("steer")
+                    .to_owned();
+                SSE_FINAL_ANSWER.to_owned()
+            };
+            write_sse(&mut stream, &body);
+        }
+        steer
+    });
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+    let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let mut runtime = Runtime::new();
+    let result = tokio_runtime
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "write two files",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig {
+                max_turns: 3,
+                max_mutating_tool_calls: 1,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .expect("loop");
+    let steer = server.join().expect("server");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(result.tool_results.len(), 1);
+    assert!(
+        steer.starts_with("1 tool call(s) this turn were not executed (per-turn cap):"),
+        "{steer}"
+    );
+    assert!(
+        steer.contains("- write {\"content\":\"second\",\"path\":\"second.txt\"}")
+            || steer.contains("- write {\"path\":\"second.txt\",\"content\":\"second\"}"),
+        "suppressed call must be named with its arguments: {steer}"
+    );
+    assert!(
+        !steer.contains("first.txt"),
+        "executed calls are not listed: {steer}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn one_provider_batch_runs_disjoint_mutations_with_ordered_results() {
     let root = std::env::temp_dir().join(format!("slim-serial-tool-order-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("root");
@@ -1783,6 +1861,45 @@ fn json_diagnostics_from_two_patches_reach_the_next_model_request_together() {
         assert!(content.contains("\r\n"));
         assert!(serde_json::from_str::<Value>(&content).is_err());
     }
+    // Each successful patch publishes its display diff between its output and
+    // its terminal event, keyed by the same call identity.
+    let events = runtime.app.events();
+    for (call, path) in [
+        ("patch-dev", "development.json"),
+        ("patch-prod", "production.json"),
+    ] {
+        let position = |matches: &dyn Fn(&EventKind) -> bool| {
+            events
+                .iter()
+                .position(|event| matches(&event.kind))
+                .unwrap_or_else(|| panic!("{call}: missing event"))
+        };
+        let output = position(
+            &|kind| matches!(kind, EventKind::ToolOutput { call_id, .. } if call_id == call),
+        );
+        let diff = position(
+            &|kind| matches!(kind, EventKind::ToolEditApplied { call_id, .. } if call_id == call),
+        );
+        let finished = position(
+            &|kind| matches!(kind, EventKind::ToolFinished { call_id, .. } if call_id == call),
+        );
+        assert!(output < diff && diff < finished, "{call}");
+        let EventKind::ToolEditApplied { diff, .. } = &events[diff].kind else {
+            unreachable!()
+        };
+        assert_eq!(
+            diff,
+            &slim_core::ToolEditDiff {
+                path: path.into(),
+                hunks: vec![slim_core::ToolEditHunk {
+                    start_line: 2,
+                    removed: vec!["  \"a\": 1,".into()],
+                    added: vec!["  \"a\": 1".into()],
+                }],
+                truncated: false,
+            }
+        );
+    }
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -1946,7 +2063,8 @@ fn bounded_truncation_fixture(reject_growth: bool) {
             AgentLoopStop::ProviderTruncated
         }
     );
-    assert_eq!(result.turns, 3);
+    // The rejected request is a transport retry of the same turn.
+    assert_eq!(result.turns, if reject_growth { 2 } else { 3 });
     assert!(result.tool_results.is_empty());
     assert_eq!(
         result.usage.output_tokens,
@@ -8597,7 +8715,8 @@ fn provider_recovery_is_bounded_and_does_not_retry_permanent_errors() {
         (408, 10, 3),
         (401, 10, 1),
         (403, 10, 1),
-        (503, 1, 1),
+        // Retries resend the current turn and do not consume the turn budget.
+        (503, 1, 3),
     ] {
         let (client, done, server) = recovery_fixture(vec![(status, "failed".into()); 3]);
         let mut runtime = Runtime::new();

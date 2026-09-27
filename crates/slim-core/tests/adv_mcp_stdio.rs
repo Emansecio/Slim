@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use slim_core::mcp::{McpError, McpManager, McpServerSpec, McpTransport};
+use slim_core::mcp::{
+    McpCleanupStatus, McpError, McpInterruption, McpManager, McpServerSpec, McpTransport,
+};
 use slim_core::process::ExecutableResolver;
 
 /// Mode selected via the `ADV_STDIO_MODE` env var.
@@ -174,15 +176,24 @@ fn stdio_over_limit_line_fails_the_connection() {
 
 /// Documents strict id typing on stdio: a response id echoed as a string does
 /// not satisfy the numeric pending id and the request stalls until the spec
-/// timeout.
+/// timeout. `initialize` was already written, so the deadline classifies the
+/// interruption as an uncertain outcome that closes the transport, not as a
+/// pre-send timeout.
 #[test]
 fn stdio_string_id_response_never_resolves_numeric_pending() {
+    let timeout = Duration::from_secs(3);
     let runtime = tokio::runtime::Runtime::new().expect("tokio");
-    let result = runtime.block_on(manager("string-id", Duration::from_secs(3)).test("adv"));
+    let result = runtime.block_on(manager("string-id", timeout).test("adv"));
     let error = result.expect_err("string id must not resolve");
     assert!(
-        format!("{error:?}").contains("imeout") || format!("{error:?}").contains("losed"),
-        "expected Timeout/Closed, got: {error:?}"
+        matches!(
+            &error,
+            McpError::OutcomeUncertain {
+                interruption: McpInterruption::TimedOut(elapsed),
+                cleanup: McpCleanupStatus::Confirmed | McpCleanupStatus::Unconfirmed,
+            } if *elapsed == timeout
+        ),
+        "expected the sent request to stay pending until its deadline, got: {error:?}"
     );
 }
 

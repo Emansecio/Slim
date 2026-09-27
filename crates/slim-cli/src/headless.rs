@@ -15,7 +15,7 @@ use slim_core::provider::{
     ProviderKind, ProviderPricing, ProviderTimeouts, XaiAdapter, DEFAULT_MAX_OUTPUT_TOKENS,
 };
 use slim_core::runtime::{
-    tool_call_is_read_only, AgentLoopConfig, AgentLoopStop, CancellationToken,
+    tool_call_is_read_only, AgentLoopConfig, AgentLoopResult, AgentLoopStop, CancellationToken,
 };
 use slim_core::session::{
     preflight_session, provider_messages_from_entries, provider_messages_from_records,
@@ -992,6 +992,36 @@ fn keep_live_history(live: &[ProviderMessage], durable: &[ProviderMessage]) -> b
             .all(|(left, right)| durable_visible_eq(left, right))
 }
 
+/// Binds the history cache scope, builds the shared-transport client and runs
+/// the loop. The outer error is a client setup failure, which the caller
+/// returns before any loop result exists; the inner result is the loop outcome.
+/// The loop future is boxed: it is large, and the eight call sites would
+/// otherwise each reserve a copy on the caller's (main-thread) stack.
+#[allow(clippy::too_many_arguments)]
+async fn run_bound_agent_loop<A: ProviderAdapter + Send + Sync + 'static>(
+    runtime: &mut Runtime,
+    adapter: A,
+    bind: impl FnOnce(A, u64) -> A,
+    initial_messages: &[ProviderMessage],
+    mode: OperatingMode,
+    cwd: &Path,
+    config: AgentLoopConfig,
+    timeouts: ProviderTimeouts,
+) -> Result<Result<AgentLoopResult, ProviderError>, ProviderError> {
+    let model = adapter.model().to_owned();
+    let adapter = bind_history_scope(adapter, &model, initial_messages, bind);
+    let client = HttpProviderClient::with_shared_transport(adapter, timeouts)?;
+    Ok(Box::pin(runtime.run_agent_loop_with_messages(
+        &client,
+        initial_messages,
+        mode,
+        cwd,
+        1,
+        config,
+    ))
+    .await)
+}
+
 fn bind_history_scope<A>(
     adapter: A,
     model: &str,
@@ -1556,16 +1586,35 @@ async fn execute_provider_turn_with_local_lsp(
     result
 }
 
-fn block_on_provider<T>(
-    future: impl std::future::Future<Output = Result<T, ProviderError>>,
+fn block_on_provider<T: Send>(
+    future: impl std::future::Future<Output = Result<T, ProviderError>> + Send,
 ) -> Result<T, ProviderError> {
     provider_runtime_block_on(future)?
 }
 
-pub(crate) fn provider_runtime_block_on<T>(
-    future: impl std::future::Future<Output = T>,
+/// Stack for threads that poll an agent loop. Its future is large in debug
+/// builds; the Windows main thread (1 MiB) and the Rust default (2 MiB) leave
+/// little headroom.
+pub(crate) const AGENT_LOOP_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Polls on a dedicated thread with [`AGENT_LOOP_STACK_BYTES`] instead of the
+/// caller's stack; a panic in the future resumes on the caller.
+pub(crate) fn provider_runtime_block_on<T: Send>(
+    future: impl std::future::Future<Output = T> + Send,
 ) -> Result<T, ProviderError> {
-    Ok(shared_provider_runtime()?.block_on(future))
+    let runtime = shared_provider_runtime()?;
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("slim-provider".into())
+            .stack_size(AGENT_LOOP_STACK_BYTES)
+            .spawn_scoped(scope, || runtime.block_on(future))
+            .map_err(|error| ProviderError::InvalidResponse {
+                message: format!("provider thread: {error}"),
+            })?;
+        worker
+            .join()
+            .map_err(|panic| std::panic::resume_unwind(panic))
+    })
 }
 
 /// Process-wide Tokio runtime for synchronous headless entry points.
@@ -1866,24 +1915,17 @@ pub(crate) async fn execute_provider_turn_async(
                 config = config.with_reasoning_effort(effort);
             }
             let adapter = OpenAiCompatibleAdapter::new(config)?;
-            let model = adapter.model().to_owned();
-            let adapter = bind_history_scope(
+            run_bound_agent_loop(
+                &mut runtime,
                 adapter,
-                &model,
-                &initial_messages,
                 OpenAiCompatibleAdapter::with_response_cache_scope_id,
-            );
-            let client = HttpProviderClient::with_shared_transport(adapter, provider_timeouts)?;
-            runtime
-                .run_agent_loop_with_messages(
-                    &client,
-                    &initial_messages,
-                    request.mode,
-                    &cwd,
-                    1,
-                    loop_config,
-                )
-                .await
+                &initial_messages,
+                request.mode,
+                &cwd,
+                loop_config,
+                provider_timeouts,
+            )
+            .await?
         }
         ProviderKind::OpenAiCodex => {
             let account_id =
@@ -1904,24 +1946,17 @@ pub(crate) async fn execute_provider_turn_async(
                 config = config.with_reasoning_effort(effort);
             }
             let adapter = OpenAiCodexAdapter::new(config)?.with_fast_mode(options.codex_fast);
-            let model = adapter.model().to_owned();
-            let adapter = bind_history_scope(
+            run_bound_agent_loop(
+                &mut runtime,
                 adapter,
-                &model,
-                &initial_messages,
                 OpenAiCodexAdapter::with_response_cache_scope_id,
-            );
-            let client = HttpProviderClient::with_shared_transport(adapter, provider_timeouts)?;
-            runtime
-                .run_agent_loop_with_messages(
-                    &client,
-                    &initial_messages,
-                    request.mode,
-                    &cwd,
-                    1,
-                    loop_config,
-                )
-                .await
+                &initial_messages,
+                request.mode,
+                &cwd,
+                loop_config,
+                provider_timeouts,
+            )
+            .await?
         }
         ProviderKind::Anthropic => {
             let mut config = if request.account_id.is_some() {
@@ -1933,24 +1968,17 @@ pub(crate) async fn execute_provider_turn_async(
                 config = config.with_reasoning_effort(effort);
             }
             let adapter = AnthropicAdapter::new(config.with_max_output_tokens(max_output_tokens))?;
-            let model = adapter.model().to_owned();
-            let adapter = bind_history_scope(
+            run_bound_agent_loop(
+                &mut runtime,
                 adapter,
-                &model,
-                &initial_messages,
                 AnthropicAdapter::with_response_cache_scope_id,
-            );
-            let client = HttpProviderClient::with_shared_transport(adapter, provider_timeouts)?;
-            runtime
-                .run_agent_loop_with_messages(
-                    &client,
-                    &initial_messages,
-                    request.mode,
-                    &cwd,
-                    1,
-                    loop_config,
-                )
-                .await
+                &initial_messages,
+                request.mode,
+                &cwd,
+                loop_config,
+                provider_timeouts,
+            )
+            .await?
         }
         ProviderKind::OpenCodeGo => {
             let adapter = OpenCodeGoAdapter::new(
@@ -1965,24 +1993,17 @@ pub(crate) async fn execute_provider_turn_async(
                 None => adapter,
             };
             adapter.validate_messages(&initial_messages)?;
-            let model = adapter.model().to_owned();
-            let adapter = bind_history_scope(
+            run_bound_agent_loop(
+                &mut runtime,
                 adapter,
-                &model,
-                &initial_messages,
                 OpenCodeGoAdapter::with_response_cache_scope_id,
-            );
-            let client = HttpProviderClient::with_shared_transport(adapter, provider_timeouts)?;
-            runtime
-                .run_agent_loop_with_messages(
-                    &client,
-                    &initial_messages,
-                    request.mode,
-                    &cwd,
-                    1,
-                    loop_config,
-                )
-                .await
+                &initial_messages,
+                request.mode,
+                &cwd,
+                loop_config,
+                provider_timeouts,
+            )
+            .await?
         }
         ProviderKind::OpenCodeZen => {
             let adapter = OpenCodeZenAdapter::new(
@@ -1997,24 +2018,17 @@ pub(crate) async fn execute_provider_turn_async(
                 None => adapter,
             };
             adapter.validate_messages(&initial_messages)?;
-            let model = adapter.model().to_owned();
-            let adapter = bind_history_scope(
+            run_bound_agent_loop(
+                &mut runtime,
                 adapter,
-                &model,
-                &initial_messages,
                 OpenCodeZenAdapter::with_response_cache_scope_id,
-            );
-            let client = HttpProviderClient::with_shared_transport(adapter, provider_timeouts)?;
-            runtime
-                .run_agent_loop_with_messages(
-                    &client,
-                    &initial_messages,
-                    request.mode,
-                    &cwd,
-                    1,
-                    loop_config,
-                )
-                .await
+                &initial_messages,
+                request.mode,
+                &cwd,
+                loop_config,
+                provider_timeouts,
+            )
+            .await?
         }
         ProviderKind::ClinePass => {
             let adapter = ClinePassAdapter::new(
@@ -2024,24 +2038,17 @@ pub(crate) async fn execute_provider_turn_async(
                 reasoning_effort.as_deref(),
             )?
             .with_max_output_tokens(max_output_tokens);
-            let model = adapter.model().to_owned();
-            let adapter = bind_history_scope(
+            run_bound_agent_loop(
+                &mut runtime,
                 adapter,
-                &model,
-                &initial_messages,
                 ClinePassAdapter::with_response_cache_scope_id,
-            );
-            let client = HttpProviderClient::with_shared_transport(adapter, provider_timeouts)?;
-            runtime
-                .run_agent_loop_with_messages(
-                    &client,
-                    &initial_messages,
-                    request.mode,
-                    &cwd,
-                    1,
-                    loop_config,
-                )
-                .await
+                &initial_messages,
+                request.mode,
+                &cwd,
+                loop_config,
+                provider_timeouts,
+            )
+            .await?
         }
         ProviderKind::CommandCode => {
             let adapter = CommandCodeAdapter::new(
@@ -2052,24 +2059,17 @@ pub(crate) async fn execute_provider_turn_async(
             )?
             .with_max_output_tokens(max_output_tokens)
             .with_zero_data_retention(command_code_zero_data_retention());
-            let model = adapter.model().to_owned();
-            let adapter = bind_history_scope(
+            run_bound_agent_loop(
+                &mut runtime,
                 adapter,
-                &model,
-                &initial_messages,
                 CommandCodeAdapter::with_response_cache_scope_id,
-            );
-            let client = HttpProviderClient::with_shared_transport(adapter, provider_timeouts)?;
-            runtime
-                .run_agent_loop_with_messages(
-                    &client,
-                    &initial_messages,
-                    request.mode,
-                    &cwd,
-                    1,
-                    loop_config,
-                )
-                .await
+                &initial_messages,
+                request.mode,
+                &cwd,
+                loop_config,
+                provider_timeouts,
+            )
+            .await?
         }
         ProviderKind::Xai => {
             let adapter = XaiAdapter::new(
@@ -2079,24 +2079,17 @@ pub(crate) async fn execute_provider_turn_async(
                 reasoning_effort.as_deref(),
             )?
             .with_max_output_tokens(max_output_tokens);
-            let model = adapter.model().to_owned();
-            let adapter = bind_history_scope(
+            run_bound_agent_loop(
+                &mut runtime,
                 adapter,
-                &model,
-                &initial_messages,
                 XaiAdapter::with_response_cache_scope_id,
-            );
-            let client = HttpProviderClient::with_shared_transport(adapter, provider_timeouts)?;
-            runtime
-                .run_agent_loop_with_messages(
-                    &client,
-                    &initial_messages,
-                    request.mode,
-                    &cwd,
-                    1,
-                    loop_config,
-                )
-                .await
+                &initial_messages,
+                request.mode,
+                &cwd,
+                loop_config,
+                provider_timeouts,
+            )
+            .await?
         }
     }
     .map_err(|error| redact_provider_error(error, &api_key));
@@ -3676,3 +3669,6 @@ mod resume_preflight_transport_tests;
 
 #[cfg(test)]
 mod live_history_resume_tests;
+
+#[cfg(test)]
+mod provider_thread_tests;

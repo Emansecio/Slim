@@ -107,7 +107,7 @@ pub async fn refresh_with_dispatch(
         .await
         .map_err(|_| OAuthError::Transport("Anthropic token refresh failed".into()))?;
     let mut refreshed = parse_token(response, Some(&credential.refresh)).await?;
-    refreshed.account_id = credential.account_id.clone();
+    refreshed.account_id.clone_from(&credential.account_id);
     Ok(refreshed)
 }
 

@@ -164,25 +164,32 @@ fn workspace_skill_names(workspace_root: &Path, warnings: &mut String) -> Vec<St
 
 /// Memoized variant of [`workspace_skill_names`] so the startup
 /// WorkspaceChanged + SessionRestored pair scans the same workspace once.
-fn memoized_skill_names(
-    memo: &mut Option<(PathBuf, Vec<String>, String)>,
-    root: Option<PathBuf>,
-    warnings: &mut String,
-) -> Vec<String> {
-    let Some(root) = root else {
-        warnings.clear();
-        return Vec::new();
-    };
-    let root = root.canonicalize().unwrap_or(root);
-    if let Some((_, names, cached_warnings)) =
-        memo.as_ref().filter(|(cached, _, _)| *cached == root)
-    {
-        warnings.clone_from(cached_warnings);
-        return names.clone();
+/// `warnings` holds the discovery diagnostics of the latest lookup.
+#[derive(Default)]
+struct SkillNameMemo {
+    cached: Option<(PathBuf, Vec<String>, String)>,
+    warnings: String,
+}
+
+impl SkillNameMemo {
+    fn names(&mut self, root: Option<PathBuf>) -> Vec<String> {
+        let Some(root) = root else {
+            self.warnings.clear();
+            return Vec::new();
+        };
+        let root = root.canonicalize().unwrap_or(root);
+        if let Some((_, names, cached_warnings)) = self
+            .cached
+            .as_ref()
+            .filter(|(cached, _, _)| *cached == root)
+        {
+            self.warnings.clone_from(cached_warnings);
+            return names.clone();
+        }
+        let names = workspace_skill_names(&root, &mut self.warnings);
+        self.cached = Some((root, names.clone(), self.warnings.clone()));
+        names
     }
-    let names = workspace_skill_names(&root, warnings);
-    *memo = Some((root, names.clone(), warnings.clone()));
-    names
 }
 
 fn resolve_slash_skill_command(
@@ -1157,6 +1164,7 @@ fn spawn_tui_session(
     };
     let worker = thread::Builder::new()
         .name("slim-tui-runtime".into())
+        .stack_size(crate::headless::AGENT_LOOP_STACK_BYTES)
         .spawn(move || run_worker(startup, oauth, command_rx, sink))
         .map_err(|error| ProviderError::InvalidResponse {
             message: format!("tui runtime thread: {error}"),
@@ -1348,18 +1356,27 @@ struct ActivePromptPreparation {
     task: tokio::task::JoinHandle<Result<Option<FreshCredential>, OAuthError>>,
 }
 
-fn start_prompt_run(
+/// Prompt text and its admission identity for a run about to start.
+struct PromptRunInput {
     prompt: String,
     admission: Option<PromptAdmission>,
     skill_instructions: Option<SkillInstructions>,
+}
+
+fn start_prompt_run(
+    input: PromptRunInput,
     startup: &mut TuiStartup,
     sink: &EventSink,
     content_store: SharedContentStore,
     next_run_id: &mut u64,
     active: &mut Option<ActiveRun>,
-    skill_memo: &mut Option<(PathBuf, Vec<String>, String)>,
-    skill_warnings: &mut String,
+    skill_memo: &mut SkillNameMemo,
 ) -> Result<(), String> {
+    let PromptRunInput {
+        prompt,
+        admission,
+        skill_instructions,
+    } = input;
     if startup.request.is_none() {
         return Err("No provider connected. Use /login.".into());
     }
@@ -1370,19 +1387,15 @@ fn start_prompt_run(
     }
     match create_tui_session(startup) {
         Ok(Some((session_id, cwd))) => {
-            let skill_names = memoized_skill_names(
-                skill_memo,
-                startup.options.workspace_root.clone(),
-                skill_warnings,
-            );
+            let skill_names = skill_memo.names(startup.options.workspace_root.clone());
             let _ = sink.send(UiEvent::SessionSnapshot {
                 session_id: slim_tui::api::SessionId(session_id.into()),
                 cwd,
                 skill_names,
             });
-            if !skill_warnings.is_empty() {
+            if !skill_memo.warnings.is_empty() {
                 let _ = sink.send(UiEvent::Notification {
-                    message: skill_warnings.clone(),
+                    message: skill_memo.warnings.clone(),
                 });
             }
         }
@@ -1716,16 +1729,14 @@ fn run_worker(
                 }
             }
         });
-        let mut skill_memo = None;
-        let mut skill_warnings = String::new();
+        let mut skill_memo = SkillNameMemo::default();
         let cwd = startup
             .options
             .workspace_root
             .as_deref()
             .map(display_workspace_path)
             .unwrap_or_default();
-        let skill_names =
-            memoized_skill_names(&mut skill_memo, startup.options.workspace_root.clone(), &mut skill_warnings);
+        let skill_names = skill_memo.names(startup.options.workspace_root.clone());
         sink.send(UiEvent::WorkspaceChanged { cwd, skill_names });
         if let Some(preflight) = startup.resume_preflight.as_ref() {
             match session_transcript(preflight) {
@@ -1735,11 +1746,7 @@ fn run_worker(
                         Err(message) => { sink.send(UiEvent::RunFailed { run_id: None, message }); return Vec::new(); }
                     };
                     if let Some(header) = preflight.header.as_ref() {
-                        let skill_names = memoized_skill_names(
-                            &mut skill_memo,
-                            Some(PathBuf::from(&header.cwd)),
-                            &mut skill_warnings,
-                        );
+                        let skill_names = skill_memo.names(Some(PathBuf::from(&header.cwd)));
                         sink.send(UiEvent::SessionRestored {
                             session_id: slim_tui::api::SessionId(header.id.clone().into()),
                             cwd: header.cwd.clone(),
@@ -1755,11 +1762,7 @@ fn run_worker(
         if startup.initial_prompt.is_some() && startup.resume_path.is_none() {
             match create_tui_session(&mut startup) {
                 Ok(Some((session_id, cwd))) => {
-                    let skill_names = memoized_skill_names(
-                        &mut skill_memo,
-                        startup.options.workspace_root.clone(),
-                        &mut skill_warnings,
-                    );
+                    let skill_names = skill_memo.names(startup.options.workspace_root.clone());
                     sink.send(UiEvent::SessionSnapshot {
                         session_id: slim_tui::api::SessionId(session_id.into()),
                         cwd,
@@ -1773,8 +1776,8 @@ fn run_worker(
             }
         }
         // Restore clears old notifications; publish discovery diagnostics afterwards.
-        if !skill_warnings.is_empty() {
-            sink.send(UiEvent::Notification { message: skill_warnings.clone() });
+        if !skill_memo.warnings.is_empty() {
+            sink.send(UiEvent::Notification { message: skill_memo.warnings.clone() });
         }
         sink.send(UiEvent::ModeChanged { mode: startup.mode });
         let provider = startup
@@ -1973,16 +1976,17 @@ fn run_worker(
                             }
                         }
                         if let Err(message) = start_prompt_run(
-                            prompt_prep.prompt,
-                            Some(prompt_prep.admission),
-                            prompt_prep.skill_instructions,
+                            PromptRunInput {
+                                prompt: prompt_prep.prompt,
+                                admission: Some(prompt_prep.admission),
+                                skill_instructions: prompt_prep.skill_instructions,
+                            },
                             &mut startup,
                             &sink,
                             content_store.clone(),
                             &mut next_run_id,
                             &mut active,
                             &mut skill_memo,
-                            &mut skill_warnings,
                         ) {
                             let _ = sink.send(UiEvent::PromptPreparationFailed {
                                 admission: prompt_prep.admission,
@@ -2415,11 +2419,8 @@ fn run_worker(
                     if startup.resume_path.is_none() {
                         match create_tui_session(&mut startup) {
                             Ok(Some((session_id, cwd))) => {
-                                let skill_names = memoized_skill_names(
-                                    &mut skill_memo,
-                                    startup.options.workspace_root.clone(),
-                                    &mut skill_warnings,
-                                );
+                                let skill_names =
+                                    skill_memo.names(startup.options.workspace_root.clone());
                                 let _ = sink.send(UiEvent::SessionSnapshot {
                                     session_id: slim_tui::api::SessionId(session_id.into()),
                                     cwd,
@@ -2529,8 +2530,7 @@ fn run_worker(
                             startup.options.ensure_shared_tool_registry();
                             startup.resume_path = Some(selected.preflight.path.clone());
                             startup.resume_preflight = Some(selected.preflight);
-                            let skill_names =
-                                memoized_skill_names(&mut skill_memo, Some(workspace.clone()), &mut skill_warnings);
+                            let skill_names = skill_memo.names(Some(workspace.clone()));
                             let _ = sink.send(UiEvent::SessionRestored {
                                 session_id: slim_tui::api::SessionId(session_id.into()),
                                 cwd,
@@ -2538,8 +2538,8 @@ fn run_worker(
                                 skill_names,
                             });
                             let _ = sink.send(todo_event);
-                            if !skill_warnings.is_empty() {
-                                sink.send(UiEvent::Notification { message: skill_warnings.clone() });
+                            if !skill_memo.warnings.is_empty() {
+                                sink.send(UiEvent::Notification { message: skill_memo.warnings.clone() });
                             }
                             let _ = sink.send(UiEvent::Notification {
                                 message: "Previous session restored. Send a prompt to continue."
@@ -3441,11 +3441,8 @@ fn run_worker(
                     }
                     match create_tui_session(&mut startup) {
                         Ok(Some((session_id, cwd))) => {
-                            let skill_names = memoized_skill_names(
-                                &mut skill_memo,
-                                startup.options.workspace_root.clone(),
-                                &mut skill_warnings,
-                            );
+                            let skill_names =
+                                skill_memo.names(startup.options.workspace_root.clone());
                             let _ = sink.send(UiEvent::SessionSnapshot {
                                 session_id: slim_tui::api::SessionId(session_id.into()),
                                 cwd,
@@ -4371,6 +4368,18 @@ fn namespace_projected_ids(event: UiEvent, scope: &str) -> UiEvent {
                 name,
                 output,
                 content_handle,
+            }
+        }
+        UiEvent::ToolDiff {
+            batch_id,
+            call_id,
+            diff,
+        } => {
+            let (batch_id, call_id) = identity(batch_id, call_id);
+            UiEvent::ToolDiff {
+                batch_id,
+                call_id,
+                diff,
             }
         }
         UiEvent::ToolEnded {

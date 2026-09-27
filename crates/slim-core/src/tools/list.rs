@@ -281,6 +281,21 @@ fn build_page(
     }
 }
 
+/// Wrong-kind and missing paths name the tool that recovers in one call.
+fn directory_open_error(path: &Path, error: std::io::Error) -> ToolExecutionError {
+    let message = if path.is_file() {
+        "path is a file; use read to see its contents"
+    } else if error.kind() == std::io::ErrorKind::NotFound {
+        "directory does not exist; list a parent directory or search for the name"
+    } else {
+        return ToolError::from(error).into();
+    };
+    ToolError::InvalidInput {
+        message: message.into(),
+    }
+    .into()
+}
+
 fn collect_directory(
     path: &Path,
     cancellation: Option<&CancellationToken>,
@@ -289,7 +304,8 @@ fn collect_directory(
     if let Err(error) = check_cancelled(cancellation) {
         return Err(observed_directory_failure(path, &entries, error));
     }
-    for entry in std::fs::read_dir(path)? {
+    let directory = std::fs::read_dir(path).map_err(|error| directory_open_error(path, error))?;
+    for entry in directory {
         if let Err(error) = check_cancelled(cancellation) {
             return Err(observed_directory_failure(path, &entries, error));
         }

@@ -201,6 +201,69 @@ fn patch_accepts_lf_excerpt_from_crlf_read_and_preserves_other_bytes() {
 }
 
 #[test]
+fn patch_with_crlf_excerpt_keeps_uniform_crlf_for_lf_replacement_lines() {
+    let path = temp_path("patch-crlf-exact.txt");
+    let root = path.parent().expect("parent");
+    fs::create_dir_all(root).expect("mkdir");
+    for replacement in [
+        "fn a() {\n    x();\n    y();",
+        "fn a() {\r\n    x();\n    y();",
+    ] {
+        fs::write(&path, "fn a() {\r\n    old();\r\n}\r\n").expect("fixture");
+        apply_exact_patch(&path, "fn a() {\r\n    old();", replacement).expect("patch");
+        assert_eq!(
+            fs::read(&path).expect("patched bytes"),
+            b"fn a() {\r\n    x();\r\n    y();\r\n}\r\n",
+            "{replacement:?}"
+        );
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn wrong_kind_or_missing_paths_name_the_recovery_tool() {
+    let path = temp_path("recovery-hints.txt");
+    let root = path.parent().expect("parent");
+    fs::create_dir_all(root.join("dir")).expect("mkdir");
+    fs::write(&path, "text\n").expect("fixture");
+    let registry = ToolRegistry::default();
+    let call = |name: &str, args: serde_json::Value| {
+        let result = registry.execute(OperatingMode::Auto, root, name, &args.to_string());
+        assert!(!result.success, "{name}: {}", result.output);
+        result.output
+    };
+    assert_eq!(
+        call("read", serde_json::json!({"path":"dir"})),
+        "path is a directory; use list to see its entries"
+    );
+    let missing_read = call("read", serde_json::json!({"path":"missing.txt"}));
+    assert!(
+        missing_read.contains("use list or search to locate it"),
+        "{missing_read}"
+    );
+    let missing_patch = call(
+        "patch",
+        serde_json::json!({"path":"missing.txt", "edits":[{"expected":"a","replacement":"b"}]}),
+    );
+    assert!(
+        missing_patch.ends_with(
+            "file does not exist; patch edits existing files. To create it, use write with expected omitted."
+        ),
+        "{missing_patch}"
+    );
+    assert!(!root.join("missing.txt").exists());
+    assert_eq!(
+        call("list", serde_json::json!({"path":"no/such/dir"})),
+        "directory does not exist; list a parent directory or search for the name"
+    );
+    assert_eq!(
+        call("list", serde_json::json!({"path":"recovery-hints.txt"})),
+        "path is a file; use read to see its contents"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn patch_crlf_matching_still_rejects_ambiguity_and_different_content() {
     let path = temp_path("strict-crlf.txt");
     let root = path.parent().expect("parent");
@@ -799,7 +862,7 @@ fn shell_caps_raw_streams_while_draining_the_remainder() {
 #[test]
 fn shell_marker_counts_raw_and_context_discarded_bytes() {
     const PRODUCED_BYTES: usize = 8196 * 1024;
-    const RETAINED_CONTEXT_BYTES: usize = 8 * 1024;
+    const RETAINED_CONTEXT_BYTES: usize = 7 * 1024;
     const RETAINED_HEAD_BYTES: usize = RETAINED_CONTEXT_BYTES / 2;
     const RETAINED_TAIL_BYTES: usize = RETAINED_CONTEXT_BYTES / 2;
     const STDOUT_HEAD: &str = "STDOUT_HEAD";
@@ -831,6 +894,64 @@ fn shell_marker_counts_raw_and_context_discarded_bytes() {
     let tail = result.output.find(STDOUT_TAIL).expect("stdout tail");
     assert!(head < marker && marker < tail);
     assert!(!result.output.contains(STDOUT_MIDDLE));
+}
+
+/// Both capped streams, their markers and the header must fit the default
+/// per-result allowance with room for an artifact reference and an admission
+/// note; otherwise the presentation cuts the middle again and drops the end of
+/// stdout, where test runners print their summary.
+#[test]
+fn shell_output_with_two_large_streams_fits_the_result_budget() {
+    let budget = slim_core::runtime::AgentLoopConfig::default().max_result_bytes;
+    let headroom = 512 + 256;
+    let registry = ToolRegistry::default();
+    let result = registry.execute(
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        "shell",
+        &serde_json::json!({
+            "command": "1..3000 | ForEach-Object { [Console]::Out.WriteLine(\"stdout line $_ ...........\"); [Console]::Error.WriteLine(\"stderr line $_ ...........\") }; [Console]::Out.WriteLine('test result: FAILED. 1 passed; 1 failed')",
+            "timeout_ms": 60_000
+        })
+        .to_string(),
+    );
+    assert!(result.success, "{}", result.output);
+    assert!(
+        result.output.len() + headroom <= budget,
+        "{} bytes",
+        result.output.len()
+    );
+    let (stdout, _) = result.output.split_once("\nstderr:\n").expect("stderr");
+    assert!(
+        stdout
+            .trim_end()
+            .ends_with("test result: FAILED. 1 passed; 1 failed"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn shell_stream_labels_start_their_own_line() {
+    let registry = ToolRegistry::default();
+    let result = registry.execute(
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        "shell",
+        &serde_json::json!({
+            "command": "[Console]::Out.Write('no newline'); [Console]::Error.Write('err')",
+            "timeout_ms": 20_000
+        })
+        .to_string(),
+    );
+    assert!(result.success, "{}", result.output);
+    assert_eq!(result.output, "exit 0\nstdout:\nno newline\nstderr:\nerr");
+    let empty = registry.execute(
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        "shell",
+        &serde_json::json!({"command": "exit 0", "timeout_ms": 20_000}).to_string(),
+    );
+    assert_eq!(empty.output, "exit 0\nstdout:\nstderr:\n");
 }
 
 #[test]

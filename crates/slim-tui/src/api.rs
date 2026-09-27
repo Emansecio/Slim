@@ -553,6 +553,12 @@ pub enum UiEvent {
         preview: String,
         content_handle: Option<ContentHandle>,
     },
+    /// Changed lines of a successful patch, shown in the expanded tool body.
+    ToolDiff {
+        batch_id: ToolBatchId,
+        call_id: ToolCallId,
+        diff: slim_core::ToolEditDiff,
+    },
     ToolEnded {
         batch_id: ToolBatchId,
         call_id: ToolCallId,
@@ -926,6 +932,19 @@ impl UiEvent {
                     preview: process_preview(&process),
                 })
             }
+            slim_core::EventKind::ToolEditApplied {
+                batch_id,
+                call_id,
+                name: _,
+                diff,
+            } => {
+                let (batch_id, call_id) = projected_tool_identity(request_id, 1, batch_id, call_id);
+                Some(Self::ToolDiff {
+                    batch_id,
+                    call_id,
+                    diff,
+                })
+            }
             slim_core::EventKind::ToolFinished {
                 batch_id,
                 call_id,
@@ -1147,6 +1166,14 @@ fn process_preview(process: &slim_core::process::ProcessExecutionFacts) -> Strin
 
 /// Bounded summary for the transcript; the complete output remains in the content store.
 pub fn tool_output_preview(name: &str, output: &str) -> String {
+    // Core prefixes admission notes as one `[admission: …]` line; the preview
+    // describes the result that follows it.
+    let output = output
+        .strip_prefix("[admission: ")
+        .and_then(|rest| rest.split_once("]\n"))
+        .map(|(_, result)| result)
+        .filter(|result| !result.trim().is_empty())
+        .unwrap_or(output);
     if name == "todo" {
         if let Some(reason) = output
             .lines()
@@ -2206,6 +2233,28 @@ mod output_preview_tests {
         assert_eq!(
             tool_output_preview("shell", "exit 0\nstdout:\nok\nstderr:\nwarning"),
             "exit 0"
+        );
+    }
+
+    #[test]
+    fn admission_note_does_not_replace_the_result_preview() {
+        assert_eq!(
+            tool_output_preview(
+                "shell",
+                "[admission: possible bash syntax]\nexit 1\nstdout:\nstderr:\nParserError"
+            ),
+            "exit 1 · ParserError"
+        );
+        assert_eq!(
+            tool_output_preview(
+                "search",
+                "[admission: context_lines 4 -> 3; maximum]\n[a.rs]\n1: x"
+            ),
+            "[a.rs]"
+        );
+        assert_eq!(
+            tool_output_preview("read", "[admission: note]\n"),
+            "[admission: note]"
         );
     }
 }

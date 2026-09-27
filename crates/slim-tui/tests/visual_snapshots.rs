@@ -253,11 +253,7 @@ fn html(name: &str, state: &AppState, width: u16, height: u16) -> String {
                 cell.symbol()
             });
         }
-        let _ = write!(
-            page,
-            "<span style=\"{run_style}\">{}</span>\n",
-            escape(&run)
-        );
+        let _ = writeln!(page, "<span style=\"{run_style}\">{}</span>", escape(&run));
     }
     page.push_str("</pre></body>");
     page

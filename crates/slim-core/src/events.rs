@@ -210,6 +210,16 @@ pub enum EventKind {
         name: String,
         process: crate::process::ProcessExecutionFacts,
     },
+    /// Line view of the edits a successful `patch` applied, for display.
+    /// It follows the call's `ToolOutput` and precedes its `ToolFinished`.
+    ToolEditApplied {
+        #[serde(default)]
+        batch_id: String,
+        #[serde(default)]
+        call_id: String,
+        name: String,
+        diff: ToolEditDiff,
+    },
     ToolFinished {
         #[serde(default)]
         batch_id: String,
@@ -519,4 +529,24 @@ pub struct TodoChangedItem {
     pub id: Option<u64>,
     pub title: String,
     pub status: String,
+}
+
+/// Changed lines of one file after a successful `patch`, bounded for display.
+/// Lines carry no line endings; hunks are ordered by position.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ToolEditDiff {
+    /// Workspace-relative path of the patched file.
+    pub path: String,
+    pub hunks: Vec<ToolEditHunk>,
+    /// Lines beyond the display bound were omitted.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ToolEditHunk {
+    /// 1-based line of the first changed line in the patched file.
+    pub start_line: usize,
+    pub removed: Vec<String>,
+    pub added: Vec<String>,
 }

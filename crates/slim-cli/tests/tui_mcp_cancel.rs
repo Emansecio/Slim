@@ -188,6 +188,11 @@ fn spawn_mcp_fixture() -> McpFixture {
                 }
                 Err(error) => panic!("MCP accept: {error}"),
             };
+            // Windows accepted sockets inherit the listener's nonblocking mode;
+            // an early WouldBlock read would silently drop the request.
+            stream
+                .set_nonblocking(false)
+                .expect("blocking MCP connection");
             let Some(request) = read_http_json(&mut stream) else {
                 continue;
             };

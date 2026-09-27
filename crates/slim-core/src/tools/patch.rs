@@ -19,7 +19,8 @@ pub fn apply_exact_patch(
 ) -> Result<(), ToolError> {
     let path = resolved_public_path(path.as_ref())?;
     apply_exact_patches_with_content(
-        path,
+        &path,
+        &path,
         &[(expected.to_owned(), replacement.to_owned())],
         None,
         &mut || {},
@@ -37,10 +38,15 @@ pub(crate) struct PatchContent {
     pub(crate) bytes_read: u64,
     pub(crate) text: String,
     pub(crate) edits: Option<Vec<crate::codeintel::CodeIntelTextEdit>>,
+    /// Display-only line view of the applied edits, in final-file positions.
+    pub(crate) hunks: Vec<crate::ToolEditHunk>,
+    pub(crate) hunks_truncated: bool,
 }
 
 pub(crate) fn apply_exact_patches_with_content(
     path: impl AsRef<Path>,
+    // How messages name the file (workspace-relative for the model).
+    display: &Path,
     edits: &[(String, String)],
     cancellation: Option<&CancellationToken>,
     on_lock_wait: &mut impl FnMut(),
@@ -48,11 +54,21 @@ pub(crate) fn apply_exact_patches_with_content(
     let path = path.as_ref();
     let slot = super::write::mutation_lock_slot(path);
     let _mutation_guard = lock_mutations(&slot, cancellation)?;
-    let observed = read_existing_file_observed(path, cancellation, on_lock_wait)?;
+    let observed =
+        read_existing_file_observed(path, cancellation, on_lock_wait).map_err(|failure| {
+            if path.exists() {
+                return failure;
+            }
+            ToolError::InvalidInput {
+                message: "file does not exist; patch edits existing files. To create it, use write with expected omitted.".into(),
+            }
+            .into()
+        })?;
     let mut updated = observed.content.clone();
     let mut summary = String::new();
     let mut resolved_edits = Some(Vec::with_capacity(edits.len()));
     let mut sync_bytes = 0usize;
+    let mut diff = EditDiffBuilder::default();
     for (edit_index, (expected, replacement)) in edits.iter().enumerate() {
         let mut expected = Cow::Borrowed(expected.as_str());
         let mut replacement = Cow::Borrowed(replacement.as_str());
@@ -67,24 +83,19 @@ pub(crate) fn apply_exact_patches_with_content(
             expected = Cow::Owned(expected.replace('\n', "\r\n"));
             replacement = Cow::Owned(replacement.replace("\r\n", "\n").replace('\n', "\r\n"));
             count = updated.matches(expected.as_ref()).count();
-        } else if count == 1
-            && !expected.contains(['\r', '\n'])
-            && replacement.contains('\n')
-            && !replacement.contains('\r')
-            && has_only_crlf_newlines(&updated)
-        {
-            // A one-line match carries no newline convention. New LF lines
-            // must inherit the file's CRLF style, or later LF excerpts would
-            // encounter a mixed file introduced by this patch itself.
-            replacement = Cow::Owned(replacement.replace('\n', "\r\n"));
+        } else if count == 1 && contains_bare_lf(&replacement) && has_only_crlf_newlines(&updated) {
+            // New LF lines must inherit the file's CRLF style, whatever the
+            // excerpt carried, or later LF excerpts would encounter a mixed
+            // file introduced by this patch itself.
+            replacement = Cow::Owned(replacement.replace("\r\n", "\n").replace('\n', "\r\n"));
             normalized_crlf = true;
         }
         if count != 1 {
             let context = if count == 0 {
                 let mut context = if edits.len() == 1 {
-                    format!("{}: file unchanged.", path.display())
+                    format!("{}: file unchanged.", display.display())
                 } else {
-                    format!("{}:", path.display())
+                    format!("{}:", display.display())
                 };
                 if expected.contains('\u{FFFD}') {
                     context.push_str(" U+FFFD; copy current text verbatim.");
@@ -118,10 +129,10 @@ pub(crate) fn apply_exact_patches_with_content(
                 let mut message = if edits.len() == 1 {
                     format!(
                         "{}: file unchanged. Matches at lines {lines}{omitted}.",
-                        path.display()
+                        display.display()
                     )
                 } else {
-                    format!("{}: Matches at lines {lines}{omitted}.", path.display())
+                    format!("{}: Matches at lines {lines}{omitted}.", display.display())
                 };
                 if let Some((first_match_offset, first_match_line)) = first_match {
                     if let Some(excerpt) =
@@ -185,12 +196,12 @@ pub(crate) fn apply_exact_patches_with_content(
         summary = if expected == replacement {
             format!(
                 "unchanged {}:{start_line}; expected equals replacement",
-                path.display()
+                display.display()
             )
         } else {
             format!(
                 "patched {}:{start_line}; replaced {} bytes with {} bytes{}",
-                path.display(),
+                display.display(),
                 expected.len(),
                 replacement.len(),
                 if normalized_crlf {
@@ -208,12 +219,19 @@ pub(crate) fn apply_exact_patches_with_content(
             &replacement,
             (start_line - 1) as u32,
         );
+        diff.record(
+            &updated,
+            offset..offset + expected.len(),
+            &replacement,
+            start_line,
+        );
         updated = updated.replacen(expected.as_ref(), replacement.as_ref(), 1);
     }
+    let (hunks, hunks_truncated) = diff.finish();
     if edits.len() > 1 {
         summary = format!(
             "patched {}; {} edits applied atomically",
-            path.display(),
+            display.display(),
             edits.len()
         );
     }
@@ -245,7 +263,127 @@ pub(crate) fn apply_exact_patches_with_content(
         bytes_read: written.bytes_read,
         text: updated,
         edits: resolved_edits,
+        hunks,
+        hunks_truncated,
     })
+}
+
+/// Total changed lines kept for display across one patch call.
+const MAX_EDIT_DIFF_LINES: usize = 400;
+const MAX_EDIT_DIFF_LINE_CHARS: usize = 1000;
+
+/// Builds display hunks from edits already resolved by patch. Each edit is
+/// widened to whole lines, lines shared at its start and end are dropped, and
+/// hunks recorded below a later edit move by that edit's line delta, so every
+/// `start_line` names a line of the final file.
+#[derive(Default)]
+struct EditDiffBuilder {
+    hunks: Vec<crate::ToolEditHunk>,
+    kept_lines: usize,
+    truncated: bool,
+}
+
+impl EditDiffBuilder {
+    fn record(
+        &mut self,
+        text: &str,
+        range: std::ops::Range<usize>,
+        replacement: &str,
+        start_line: usize,
+    ) {
+        let block_start = text[..range.start].rfind('\n').map_or(0, |index| index + 1);
+        let block_end = if range.end > range.start && text[..range.end].ends_with('\n') {
+            range.end
+        } else {
+            text[range.end..]
+                .find('\n')
+                .map_or(text.len(), |index| range.end + index)
+        };
+        let old_block = &text[block_start..block_end];
+        let new_block = format!(
+            "{}{replacement}{}",
+            &text[block_start..range.start],
+            &text[range.end..block_end]
+        );
+        let old_newlines = old_block.matches('\n').count();
+        let delta = new_block.matches('\n').count() as isize - old_newlines as isize;
+        let old_end = start_line + old_newlines + usize::from(!old_block.ends_with('\n'));
+        for hunk in &mut self.hunks {
+            if hunk.start_line >= old_end {
+                hunk.start_line = hunk.start_line.saturating_add_signed(delta);
+            }
+        }
+        // A block cut before `\n` keeps the `\r` of a CRLF line.
+        let lines = |block: &str| {
+            if block.is_empty() {
+                return Vec::new();
+            }
+            block
+                .split('\n')
+                .map(|line| line.strip_suffix('\r').unwrap_or(line).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let mut old = lines(old_block);
+        let mut new = lines(&new_block);
+        // A trailing newline ends the last line; it does not start another.
+        for block in [&mut old, &mut new] {
+            if block.len() > 1 && block.last().is_some_and(String::is_empty) {
+                block.pop();
+            }
+        }
+        let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+        let suffix = old[prefix..]
+            .iter()
+            .rev()
+            .zip(new[prefix..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let removed = &old[prefix..old.len() - suffix];
+        let added = &new[prefix..new.len() - suffix];
+        if removed.is_empty() && added.is_empty() {
+            return;
+        }
+        let mut take = |lines: &[String]| {
+            let room = MAX_EDIT_DIFF_LINES.saturating_sub(self.kept_lines);
+            if lines.len() > room {
+                self.truncated = true;
+            }
+            let kept = lines
+                .iter()
+                .take(room)
+                .map(|line| bounded_diff_line(line))
+                .collect::<Vec<_>>();
+            self.kept_lines += kept.len();
+            kept
+        };
+        let removed = take(removed);
+        let added = take(added);
+        if removed.is_empty() && added.is_empty() {
+            return;
+        }
+        self.hunks.push(crate::ToolEditHunk {
+            start_line: start_line + prefix,
+            removed,
+            added,
+        });
+    }
+
+    fn finish(mut self) -> (Vec<crate::ToolEditHunk>, bool) {
+        self.hunks.sort_by_key(|hunk| hunk.start_line);
+        (self.hunks, self.truncated)
+    }
+}
+
+fn bounded_diff_line(line: &str) -> String {
+    let mut chars = line.chars();
+    let mut kept = chars
+        .by_ref()
+        .take(MAX_EDIT_DIFF_LINE_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        kept.push('…');
+    }
+    kept
 }
 
 /// Record positions already resolved by patch, without diffing or indexing the
@@ -324,6 +462,14 @@ fn unique_context_excerpt(text: &str, expected: &str, first_match: usize) -> Opt
     None
 }
 
+fn contains_bare_lf(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes
+        .iter()
+        .enumerate()
+        .any(|(index, byte)| *byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r'))
+}
+
 pub(super) fn has_only_crlf_newlines(text: &str) -> bool {
     let bytes = text.as_bytes();
     text.contains("\r\n")
@@ -331,4 +477,101 @@ pub(super) fn has_only_crlf_newlines(text: &str) -> bool {
             .iter()
             .enumerate()
             .all(|(index, byte)| *byte != b'\n' || (index > 0 && bytes[index - 1] == b'\r'))
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::apply_exact_patches_with_content;
+    use crate::ToolEditHunk;
+    use std::path::{Path, PathBuf};
+
+    fn patched(
+        name: &str,
+        body: &str,
+        edits: &[(&str, &str)],
+    ) -> (Vec<ToolEditHunk>, bool, String) {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("slim-patch-diff-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("file.txt");
+        std::fs::write(&path, body).expect("fixture");
+        let path = path.canonicalize().expect("canonical");
+        let edits = edits
+            .iter()
+            .map(|(expected, replacement)| ((*expected).to_owned(), (*replacement).to_owned()))
+            .collect::<Vec<_>>();
+        let content = apply_exact_patches_with_content(
+            &path,
+            Path::new("file.txt"),
+            &edits,
+            None,
+            &mut || {},
+        )
+        .map_err(|failure| failure.error)
+        .expect("patch");
+        let text = std::fs::read_to_string(&path).expect("patched");
+        let _ = std::fs::remove_dir_all(dir);
+        (content.hunks, content.hunks_truncated, text)
+    }
+
+    fn hunk(start_line: usize, removed: &[&str], added: &[&str]) -> ToolEditHunk {
+        ToolEditHunk {
+            start_line,
+            removed: removed.iter().map(|line| (*line).to_owned()).collect(),
+            added: added.iter().map(|line| (*line).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn partial_line_edits_show_whole_changed_lines() {
+        let (hunks, truncated, _) = patched("partial", "a\nlet x = 1;\nc\n", &[("1;", "2;")]);
+        assert_eq!(hunks, vec![hunk(2, &["let x = 1;"], &["let x = 2;"])]);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn earlier_edits_shift_later_hunks_to_final_file_lines() {
+        let (hunks, _, text) = patched(
+            "shift",
+            "l1\nl2\nl3\nl4\nl5\nl6\n",
+            &[("l5", "l5\nx\ny"), ("l2", "L2\nz")],
+        );
+        assert_eq!(text, "l1\nL2\nz\nl3\nl4\nl5\nx\ny\nl6\n");
+        assert_eq!(
+            hunks,
+            vec![hunk(2, &["l2"], &["L2", "z"]), hunk(7, &[], &["x", "y"])]
+        );
+    }
+
+    #[test]
+    fn crlf_lines_are_shown_without_line_endings() {
+        let (hunks, _, text) = patched("crlf", "a\r\nb\r\nc\r\n", &[("b\r\n", "B\r\nB2\r\n")]);
+        assert_eq!(text, "a\r\nB\r\nB2\r\nc\r\n");
+        assert_eq!(hunks, vec![hunk(2, &["b"], &["B", "B2"])]);
+    }
+
+    #[test]
+    fn mid_line_crlf_edits_and_deleted_lines_carry_no_line_endings() {
+        let (hunks, _, text) = patched("crlf-mid", "a\r\nb = 1,\r\nc\r\n", &[("1,", "1")]);
+        assert_eq!(text, "a\r\nb = 1\r\nc\r\n");
+        assert_eq!(hunks, vec![hunk(2, &["b = 1,"], &["b = 1"])]);
+        let (hunks, _, _) = patched("delete", "a\nb\nc\n", &[("b\n", "")]);
+        assert_eq!(hunks, vec![hunk(2, &["b"], &[])]);
+    }
+
+    #[test]
+    fn unchanged_edits_have_no_hunk_and_large_edits_are_bounded() {
+        let (hunks, _, _) = patched("same", "a\nb\n", &[("b", "b")]);
+        assert!(hunks.is_empty());
+        let many = (0..500)
+            .map(|index| format!("n{index}\n"))
+            .collect::<String>();
+        let (hunks, truncated, _) = patched("many", "a\nb\n", &[("b\n", &many)]);
+        assert!(truncated);
+        let kept: usize = hunks
+            .iter()
+            .map(|hunk| hunk.removed.len() + hunk.added.len())
+            .sum();
+        assert_eq!(kept, super::MAX_EDIT_DIFF_LINES);
+    }
 }

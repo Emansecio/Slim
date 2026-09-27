@@ -3058,6 +3058,7 @@ impl AppState {
                         materialized_output: String::new(),
                         next_cursor: None,
                         pending_page: None,
+                        edit_diff: None,
                     }),
                     lifecycle,
                 );
@@ -3158,6 +3159,29 @@ impl AppState {
                     self.revisions.status += 1;
                 } else {
                     self.last_tool_progress_ms = Some(self.clock.elapsed_ms);
+                }
+                self.revisions.content += 1;
+            }
+            UiEvent::ToolDiff {
+                batch_id,
+                call_id,
+                diff,
+            } => {
+                let found = self
+                    .blocks
+                    .iter_mut()
+                    .find(|block| {
+                        matches!(block.kind(), BlockKind::Tool(state)
+                            if state.batch_id == batch_id && state.call_id == call_id)
+                    })
+                    .is_some_and(|block| block.set_tool_diff(diff));
+                if !found {
+                    self.snapshot_resync_needed = true;
+                    self.push_notification_with_priority(
+                        "Diff órfão do ciclo de vida da ferramenta ignorado".into(),
+                        NotificationPriority::Error,
+                    );
+                    self.revisions.status += 1;
                 }
                 self.revisions.content += 1;
             }

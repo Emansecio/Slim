@@ -27,6 +27,45 @@ pub struct ToolState {
     pub materialized_output: String,
     pub next_cursor: Option<PageCursor>,
     pub pending_page: Option<PendingContentPage>,
+    /// Changed lines of a successful patch, rendered before the output.
+    pub edit_diff: Option<slim_core::ToolEditDiff>,
+}
+
+impl ToolState {
+    /// Diff lines for the expanded body: one `@@ path:line` header per hunk,
+    /// then `- ` removed and `+ ` added lines.
+    pub fn diff_lines(&self) -> Vec<String> {
+        let Some(diff) = &self.edit_diff else {
+            return Vec::new();
+        };
+        let mut lines = Vec::new();
+        for hunk in &diff.hunks {
+            lines.push(format!("@@ {}:{}", diff.path, hunk.start_line));
+            lines.extend(hunk.removed.iter().map(|line| format!("- {line}")));
+            lines.extend(hunk.added.iter().map(|line| format!("+ {line}")));
+        }
+        if diff.truncated {
+            lines.push("@@ diff truncated".into());
+        }
+        lines
+    }
+
+    pub fn has_expanded_body(&self) -> bool {
+        self.edit_diff.is_some() || !self.materialized_output.is_empty()
+    }
+
+    /// Everything the expanded body shows: the diff, then the materialized
+    /// output. Layout and rendering measure this same text.
+    pub fn expanded_body(&self) -> String {
+        let mut body = self.diff_lines().join("\n");
+        if !self.materialized_output.is_empty() {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&self.materialized_output);
+        }
+        body
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -767,6 +806,15 @@ impl Block {
             return false;
         };
         state.preview = preview;
+        self.touch_content();
+        true
+    }
+
+    pub fn set_tool_diff(&mut self, diff: slim_core::ToolEditDiff) -> bool {
+        let BlockKind::Tool(state) = &mut self.kind else {
+            return false;
+        };
+        state.edit_diff = Some(diff);
         self.touch_content();
         true
     }

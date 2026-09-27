@@ -197,7 +197,7 @@ pub async fn refresh_with_dispatch(
         .map_err(|_| OAuthError::Transport("Codex token refresh failed".into()))?;
     let mut refreshed = parse_token(response, Some(&credential.refresh)).await?;
     if refreshed.account_id.is_none() {
-        refreshed.account_id = credential.account_id.clone();
+        refreshed.account_id.clone_from(&credential.account_id);
     }
     Ok(refreshed)
 }

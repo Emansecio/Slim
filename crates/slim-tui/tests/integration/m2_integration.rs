@@ -117,10 +117,12 @@ fn tool_output_notification_preview_is_bounded() {
         },
     ))
     .expect("projected event");
-    let UiEvent::ToolProgress { preview, .. } = event else {
-        panic!("expected tool progress");
+    // Final executor output projects to ToolOutput; its visible preview keeps
+    // the same bound as progress: 512 chars plus an ellipsis.
+    let UiEvent::ToolOutput { output, .. } = &event else {
+        panic!("expected tool output, got {event:?}");
     };
-    assert!(preview.chars().count() <= 513); // 512 + ellipsis
+    assert_eq!(*output, format!("{}…", "x".repeat(512)));
 }
 
 #[test]

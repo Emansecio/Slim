@@ -3,43 +3,34 @@
 Este arquivo registra somente o deploy vigente e o procedimento reproduzível.
 Deploys anteriores estão em [`history/2026-09.md`](history/2026-09.md).
 
-## Deploy local vigente — cinco correções de resiliência (2026-09-24)
+## Deploy local vigente — revisão de compactação (2026-09-27)
 
-`.\refresh-slim.ps1` terminou com exit 0 e `OK: Slim slim 0.1.0`.
-Executável no PATH: `C:\Users\Thiago Emanuel\bin\Slim.exe`, **19.850.240 bytes**,
-build **2026-09-24T23:31:21.0977596-03:00**. SHA-256 instalado e release
-idênticos: `F011A9D0715BBBC5CA382008008AE84BEFB3A0B7AFD54ABF0412B03E58DEE877`.
-Revisão: `6a8e66b306d298ce564af4a2ae851e5212d6151a-dirty`.
-`Get-Command slim`, `--version` (exit 0) e comparação de hashes confirmaram
-identidade e publicação. Build release padrão: 376,81 s pelo wrapper.
+.\refresh-slim.ps1 terminou novamente com exit 0 e OK: Slim slim 0.1.0
+após a comparação B1. O build incremental levou 0,25 s e reutilizou o mesmo
+binário, pois B1 e B2 adicionaram apenas testes. O build release inicial levou
+354,60 s.
+Executável no PATH: C:\Users\Thiago Emanuel\bin\Slim.exe, 19.590.144 bytes,
+build 2026-09-27T01:08:31.9879464-03:00. SHA-256 do instalado e do
+target/release/slim.exe: C91EAD9B2E6D7FD118C75B3848010FFD4F632BB1C752F9375BF094775886EAAD.
+Revisão do build: edcc6708574b956ab2629e90351ae44dab8416e4-dirty.
+Get-Command Slim apontou para essa cópia e --version terminou com exit 0.
 
-OAuth mantém a credencial renovada durante falha de persistência, reconcilia
-sem novo POST e coordena refresh entre processos Windows. A preferência opcional
-de método respeita seleção explícita sem apagar a credencial alternativa.
-A preparação TUI é cancelável, correlacionada por identidade e recupera o prompt
-sem replay automático. Busca informa cobertura parcial por falhas I/O.
-MCP distingue interrupção anterior ao envio de efeito remoto incerto, encerra
-recursos e preserva output terminal, inclusive durante cancelamento com fila cheia.
-Contratos na [referência de runtime](../docs/reference/CLI-AND-RUNTIME.md) e no
-[design da TUI](../docs/DESIGN-SLIM-TUI.md).
+O leitor HTTP do Jev agora aplica o limite existente de 1 MiB enquanto recebe
+o corpo. O teste com stream localhost excessivo falhou antes e passou após a
+correção; os 29 testes Jev passaram. Após adicionar os testes integrados B1/B2
+da TUI, test-slim.ps1 -Workspace terminou com exit 0 em 74,39 s: 80 alvos,
+2.130 testes aprovados, 39 ignorados e zero falhas. Clippy -D warnings passou
+em cada crate separadamente com --no-deps; rustfmt e diff-check dos testes novos
+passaram. O worktree inclui alterações não commitadas preexistentes, preservadas
+no build.
 
-Validação direcionada nesta sessão: CLI lib 149/149, TUI lib 284/284,
-prompt_admission 4/4, tui_bridge 25/25, integração TUI/MCP 1/1 e compatibilidade
-do snapshot v1 1/1. Integrações finais: oauth_contract 35/35, headless_resume
-12/12, session_continuation 5/5 e sec_secret_flow 2/2. MCP: stdio 13/13,
-mcp_manager 16 aprovados e 2 fixtures auxiliares ignoradas, runtime_abort 10/10;
-teste bounded do output terminal 1/1. Busca: unitários 29/29, search_bounded 9/9
-e tool_contracts 30/30. Agent_loop passou 104/104 no checkpoint MCP.
-Revisões independentes finais sem bloqueadores; rustfmt dirigido e
-`git diff --check` passaram. Os resultados não representam uma execução de toda
-a suíte workspace. A publicação sem `-Test` compilou release e passou no smoke.
-
-Não houve login OAuth comercial nem validação em console físico. A ordem dos
-avisos finais após restauração do terminal foi conferida no código. Cancelar
-HTTP não garante parada/rollback remoto; cleanup pode ser `Unconfirmed`.
-Crash após rotação remota e antes de persistir o token pode exigir novo login.
-Arquivos com `preferred_method` são incompatíveis com binários antigos de schema
-estrito. A exclusão entre processos OAuth foi validada no Windows.
+Não houve chamada comercial, medida de cache faturado, latência de inferência
+de resumo ou console físico. A medição offline da TUI confirmou que a
+preparação B2 já estava habilitada. A comparação B1 preservou 5/6 fatos no
+extrato local e 6/6 no resumo HTTP simulado, que cobrou mais tokens estimados
+e atrasou o request de tarefa. O padrão local foi mantido.
+Os dados e as propostas de política constam no artefato de revisão da categoria
+4; nenhuma mudança de limiar, prompt, modelo ou destino de dados do Jev foi feita.
 
 ## Build e deploy local
 

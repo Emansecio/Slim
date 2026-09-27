@@ -81,6 +81,9 @@ pub(crate) struct SearchScan {
     pub capped: bool,
     pub scan_complete: bool,
     pub work_limited: bool,
+    /// Binary, oversized or invalid UTF-8 files whose text was not (fully)
+    /// searched; absence claims must not cover them.
+    pub unsearched_files: usize,
     pub coverage: Vec<SearchPatternCoverage>,
     pub io_failures: SearchIoSummary,
     pub dependency: DependencyObservation,
@@ -182,6 +185,7 @@ pub(crate) struct SearchBatchPage {
     pub capped: bool,
     pub scan_complete: bool,
     pub work_limited: bool,
+    pub unsearched_files: usize,
     pub coverage: Arc<Vec<SearchPatternCoverage>>,
     pub io_failures: Arc<SearchIoSummary>,
     pub next_cursor: Option<String>,
@@ -230,9 +234,11 @@ impl SearchBatchPage {
                     text = minimal;
                 }
             }
-            if text.len().saturating_add(omitted_hit.len()) <= max_bytes {
-                text.insert_str(0, omitted_hit);
-            } else if !self.io_failures.has_failures() && !self.work_limited && self.scan_complete {
+            // A clean, complete scan always explains the omission; otherwise
+            // only when it fits the budget.
+            let clean_scan =
+                !self.io_failures.has_failures() && !self.work_limited && self.scan_complete;
+            if text.len().saturating_add(omitted_hit.len()) <= max_bytes || clean_scan {
                 text.insert_str(0, omitted_hit);
             }
         }
@@ -271,6 +277,7 @@ struct SearchSnapshot {
     capped: bool,
     scan_complete: bool,
     work_limited: bool,
+    unsearched_files: usize,
     coverage: Arc<Vec<SearchPatternCoverage>>,
     io_failures: Arc<SearchIoSummary>,
     dependency: DependencyObservation,
@@ -439,6 +446,7 @@ impl SearchService {
             capped: scan.capped,
             scan_complete: scan.scan_complete,
             work_limited: scan.work_limited,
+            unsearched_files: scan.unsearched_files,
             coverage: Arc::clone(&coverage),
             io_failures,
             dependency: scan.dependency,
@@ -550,6 +558,7 @@ impl SearchSnapshot {
             capped: self.capped,
             scan_complete: self.scan_complete,
             work_limited: self.work_limited,
+            unsearched_files: self.unsearched_files,
             coverage: Arc::clone(&self.coverage),
             io_failures: Arc::clone(&self.io_failures),
             next_cursor,
@@ -720,6 +729,22 @@ pub(crate) fn format_search_batch_page(page: &SearchBatchPage, display_root: &Pa
         legend.push_str(&output);
         output = legend;
     }
+    // Multi-pattern absence is reported per pattern by the coverage notice;
+    // incomplete scans carry their own notices below.
+    if page.total == 0
+        && page.patterns.len() == 1
+        && page.scan_complete
+        && !page.work_limited
+        && !page.io_failures.has_failures()
+    {
+        output = match page.unsearched_files {
+            0 => "[no matches after full scan]".to_owned(),
+            count => format!(
+                "[no matches in searched text ({})]",
+                unsearched_notice(count)
+            ),
+        };
+    }
     if let Some(cursor) = &page.next_cursor {
         let last = page.first.saturating_add(page.hits.len()).saturating_sub(1);
         if !output.is_empty() {
@@ -779,6 +804,13 @@ pub(crate) fn format_search_batch_page(page: &SearchBatchPage, display_root: &Pa
     output
 }
 
+fn unsearched_notice(count: usize) -> String {
+    format!(
+        "{count} file(s) not searched: binary, over {} MiB or invalid UTF-8",
+        MAX_FILE_BYTES / (1024 * 1024)
+    )
+}
+
 fn format_search_coverage(page: &SearchBatchPage) -> Option<String> {
     if page.patterns.len() <= 1 && !page.io_failures.has_failures() {
         return None;
@@ -795,10 +827,17 @@ fn format_search_coverage(page: &SearchBatchPage) -> Option<String> {
         let coverage = page.coverage.get(index).cloned().unwrap_or_default();
         let notice = if coverage.observed == 0 {
             if page.scan_complete && !page.io_failures.has_failures() {
-                format!(
-                    "pattern {} `{pattern}`: not found after full scan",
-                    index + 1
-                )
+                match page.unsearched_files {
+                    0 => format!(
+                        "pattern {} `{pattern}`: not found after full scan",
+                        index + 1
+                    ),
+                    count => format!(
+                        "pattern {} `{pattern}`: not found in searched text ({})",
+                        index + 1,
+                        unsearched_notice(count)
+                    ),
+                }
             } else if page.io_failures.has_failures() {
                 format!(
                     "pattern {}: not confirmed absent; I/O errors left part of the scan unread",
@@ -829,11 +868,19 @@ fn format_search_coverage(page: &SearchBatchPage) -> Option<String> {
                 coverage.omitted
             )
         } else if page.scan_complete && !page.io_failures.has_failures() {
-            format!(
-                "pattern {} `{pattern}`: {} retained; full coverage",
-                index + 1,
-                coverage.retained
-            )
+            match page.unsearched_files {
+                0 => format!(
+                    "pattern {} `{pattern}`: {} retained; full coverage",
+                    index + 1,
+                    coverage.retained
+                ),
+                count => format!(
+                    "pattern {} `{pattern}`: {} retained ({})",
+                    index + 1,
+                    coverage.retained,
+                    unsearched_notice(count)
+                ),
+            }
         } else {
             format!(
                 "pattern {} `{pattern}`: {} retained; scan incomplete",
@@ -899,10 +946,9 @@ fn bounded_search_error_path(root: &Path, path: &Path) -> String {
         display.as_ref()
     };
     let mut output = String::with_capacity(MAX_SEARCH_IO_EXAMPLE_BYTES);
-    let mut characters = display.chars().peekable();
     let mut truncated = false;
     let prefix_limit = MAX_SEARCH_IO_EXAMPLE_BYTES.saturating_sub(3);
-    while let Some(character) = characters.next() {
+    for character in display.chars() {
         let character = if character.is_control() {
             '?'
         } else {
@@ -1022,7 +1068,12 @@ fn search_with_walker(
         .git_exclude(true)
         .hidden(false)
         .follow_links(false);
-    walker.filter_entry(|entry| !should_skip_entry(entry.path()));
+    // Links are neither followed nor opened: a file symlink would expose a
+    // target outside the workspace that `read` rejects. On Windows std also
+    // reports junctions as symlinks.
+    walker.filter_entry(|entry| {
+        !should_skip_entry(entry.path()) && !entry.file_type().is_some_and(|kind| kind.is_symlink())
+    });
 
     let entries = walker
         .build()
@@ -1034,7 +1085,7 @@ fn search_with_walker(
         context_lines,
         cancellation,
         entries,
-        |path, evidence| open_search_file(path, evidence),
+        open_search_file,
     )
 }
 
@@ -1069,6 +1120,7 @@ where
     let mut capped = false;
     let mut scan_complete = true;
     let mut work_limited = false;
+    let mut unsearched_files = 0usize;
     let mut io_failures = SearchIoSummary::default();
     let mut coverage = vec![SearchPatternCoverage::default(); patterns.len()];
     let mut scanned_files = 0usize;
@@ -1124,6 +1176,7 @@ where
             }
         };
         if opened.len > MAX_FILE_BYTES {
+            unsearched_files = unsearched_files.saturating_add(1);
             continue;
         }
         let mut reader = opened.reader;
@@ -1141,6 +1194,7 @@ where
                 work_limited = true;
                 break 'walk;
             }
+            unsearched_files = unsearched_files.saturating_add(1);
             continue;
         }
 
@@ -1236,6 +1290,7 @@ where
             // files above) instead of failing the whole search: one bad
             // file must not invalidate hits already collected.
             let Ok(line_str) = std::str::from_utf8(&line_bytes) else {
+                unsearched_files = unsearched_files.saturating_add(1);
                 break;
             };
             let line = strip_line_ending_str(line_str);
@@ -1307,6 +1362,7 @@ where
         capped,
         scan_complete,
         work_limited,
+        unsearched_files,
         coverage,
         io_failures,
         dependency,
@@ -2199,6 +2255,128 @@ mod tests {
         std::env::temp_dir().join(unique).join(name)
     }
 
+    fn formatted_search(root: &Path, patterns: &[&str]) -> String {
+        let canonical = root.canonicalize().expect("canonical");
+        let page = SearchService::default()
+            .page(
+                &canonical,
+                patterns
+                    .iter()
+                    .map(|pattern| (*pattern).to_owned())
+                    .collect(),
+                SearchPageOptions {
+                    offset: 1,
+                    max_hits: DEFAULT_MAX_HITS,
+                    context_lines: 0,
+                },
+                None,
+                None,
+            )
+            .expect("search");
+        format_search_batch_page(&page, &canonical)
+    }
+
+    #[test]
+    fn empty_search_states_absence_only_when_every_file_was_searched() {
+        let root = temp_root("absence");
+        fs::create_dir_all(&root).expect("root");
+        fs::write(root.join("a.txt"), "nothing here\n").expect("text");
+        let clean = formatted_search(&root, &["marker"]);
+        assert!(
+            clean.starts_with("[no matches after full scan]\n"),
+            "{clean}"
+        );
+
+        fs::write(root.join("blob.bin"), b"marker\0binary").expect("binary");
+        fs::write(root.join("bad.txt"), b"\xff marker\n").expect("invalid utf-8");
+        let partial = formatted_search(&root, &["marker"]);
+        assert!(
+            partial.starts_with(
+                "[no matches in searched text (2 file(s) not searched: binary, over 10 MiB or invalid UTF-8)]\n"
+            ),
+            "{partial}"
+        );
+        let multiple = formatted_search(&root, &["marker", "nothing"]);
+        assert!(!multiple.contains("full scan"), "{multiple}");
+        assert!(!multiple.contains("full coverage"), "{multiple}");
+        assert!(
+            multiple
+                .contains("pattern 1 `marker`: not found in searched text (2 file(s) not searched"),
+            "{multiple}"
+        );
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    /// Links inside the workspace are not searched: a file symlink would
+    /// expose a target outside the workspace that `read` rejects.
+    #[test]
+    fn search_does_not_follow_links_out_of_the_workspace() {
+        let base = temp_root("links");
+        let root = base.join("workspace");
+        let outside = base.join("outside");
+        fs::create_dir_all(&root).expect("root");
+        fs::create_dir_all(&outside).expect("outside");
+        fs::write(root.join("inside.txt"), "marker inside\n").expect("inside");
+        fs::write(outside.join("secret.txt"), "marker outside\n").expect("secret");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("file-link.txt"))
+                .expect("file symlink");
+            std::os::unix::fs::symlink(&outside, root.join("dir-link")).expect("dir symlink");
+        }
+        #[cfg(windows)]
+        {
+            match std::os::windows::fs::symlink_file(
+                outside.join("secret.txt"),
+                root.join("file-link.txt"),
+            ) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(1314) => {
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "SKIPPED file symlink case: requires Developer Mode or \
+                         SeCreateSymbolicLinkPrivilege ({error})"
+                    );
+                }
+                Err(error) => panic!("file symlink: {error}"),
+            }
+            // Junctions need no privilege; std reports them as symlinks.
+            let junction = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(root.join("dir-link"))
+                .arg(&outside)
+                .output()
+                .expect("mklink");
+            assert!(junction.status.success(), "{junction:?}");
+        }
+        let canonical = root.canonicalize().expect("canonical");
+        let page = SearchService::default()
+            .page(
+                &canonical,
+                vec!["marker".into()],
+                SearchPageOptions {
+                    offset: 1,
+                    max_hits: DEFAULT_MAX_HITS,
+                    context_lines: 0,
+                },
+                None,
+                None,
+            )
+            .expect("search");
+        let paths = page
+            .hits
+            .iter()
+            .map(|hit| hit.hit.path.display().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        assert!(paths[0].ends_with("inside.txt"), "{paths:?}");
+        assert!(!page.io_failures.has_failures(), "{:?}", page.io_failures);
+        let _ = fs::remove_dir_all(base);
+    }
+
     #[test]
     fn search_respects_gitignore_and_skip_dirs() {
         let root = temp_root("ignore");
@@ -2463,10 +2641,7 @@ mod tests {
     impl Read for FailAfterBytes {
         fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
             if self.position == self.bytes.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "synthetic mid-read failure",
-                ));
+                return Err(io::Error::other("synthetic mid-read failure"));
             }
             let count = buffer.len().min(self.bytes.len() - self.position);
             buffer[..count].copy_from_slice(&self.bytes[self.position..self.position + count]);

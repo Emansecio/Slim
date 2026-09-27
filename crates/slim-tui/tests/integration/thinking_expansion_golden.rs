@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
-use slim_tui::api::{UiCommand, UiEvent};
+use slim_tui::api::{PromptOrigin, UiCommand, UiEvent};
 use slim_tui::app::{AppState, FollowMode};
 use slim_tui::block::{Block, BlockKind, BlockLifecycle, FoldState};
 use slim_tui::reducer::{reduce, Action, Effect, ScrollIntent};
@@ -234,7 +234,17 @@ fn nonempty_composer_keeps_enter_submit_priority() {
 
     let effects = reduce(&mut state, Action::Key(enter()));
 
-    assert!(effects.contains(&Effect::Send(UiCommand::SendPrompt("send this".into()))));
+    let admitted = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Send(UiCommand::PreparePrompt { prompt, admission }) => {
+                Some((prompt.as_str(), admission.origin))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(admitted, vec![("send this", PromptOrigin::Direct)]);
+    assert!(state.prompt_is_busy());
     assert!(matches!(
         state
             .blocks()

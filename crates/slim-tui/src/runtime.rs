@@ -2840,19 +2840,35 @@ fn tool_member_lines(
     ];
     header_spans.extend(tool_detail_spans(&detail, &title, name_style, palette));
     let mut lines = vec![Line::from(header_spans)];
-    if block.fold == FoldState::Expanded && !state.materialized_output.is_empty() {
+    if block.fold == FoldState::Expanded && state.has_expanded_body() {
         let body_width = width.saturating_sub(4).max(1);
-        let output_style = palette.secondary;
-        let materialized = &state.materialized_output;
         lines.extend(cache.wrapped_body(
             block,
             BodyKind::ToolOutput,
             width,
             block.lifecycle != BlockLifecycle::Streaming,
             || {
-                render_plain(materialized, body_width)
-                    .into_iter()
-                    .map(|row| Line::from(Span::styled(format!("    {row}"), output_style)))
+                // Same text the layout measures; the diff lines come first
+                // and take their style from their marker.
+                let diff_lines = state.diff_lines().len();
+                state
+                    .expanded_body()
+                    .split('\n')
+                    .enumerate()
+                    .flat_map(|(index, source)| {
+                        let style = if index >= diff_lines {
+                            palette.secondary
+                        } else if source.starts_with("+ ") {
+                            palette.diff_add
+                        } else if source.starts_with("- ") {
+                            palette.diff_remove
+                        } else {
+                            palette.muted
+                        };
+                        render_plain(source, body_width)
+                            .into_iter()
+                            .map(move |row| Line::from(Span::styled(format!("    {row}"), style)))
+                    })
                     .collect()
             },
             cached_lines_bytes,
