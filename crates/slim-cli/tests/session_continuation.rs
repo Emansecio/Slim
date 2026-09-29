@@ -855,7 +855,7 @@ fn interrupted_batch_recovers_known_results_and_marks_missing_results_unknown() 
             Ok((stream, _)) => break stream,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 assert!(Instant::now() < deadline, "shell did not signal its effect");
-                thread::yield_now();
+                thread::sleep(Duration::from_millis(1));
             }
             Err(error) => panic!("effect barrier: {error}"),
         }

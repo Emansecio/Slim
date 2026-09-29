@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::mcp::spec::{
-    MCP_PROTOCOL_VERSION, McpCancellation, McpCleanupStatus, McpConnection, McpError,
-    McpInterruption, McpRequestOutcome,
+    McpCancellation, McpCleanupStatus, McpConnection, McpError, McpInterruption, McpRequestOutcome,
+    MCP_PROTOCOL_VERSION,
 };
 
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;

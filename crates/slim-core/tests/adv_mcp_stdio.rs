@@ -129,11 +129,8 @@ fn stdio_healthy_fixture_connects() {
     );
 }
 
-/// BUG: an initialize response carrying `"error": null` plus a valid result
-/// fails the handshake with `server error 0: unknown server error`.
-/// `dispatch_inbound` (stdio.rs:423) checks `message.get("error").is_some()`
-/// without excluding the null sentinel. Expected: connect succeeds.
-/// Actual today: `Err(McpError::Server { code: 0, .. })`.
+/// Regression: an initialize response carrying `"error": null` plus a valid
+/// result must complete the handshake; the null member is not a server error.
 #[test]
 fn stdio_null_error_member_completes_connect() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio");
@@ -152,17 +149,11 @@ fn stdio_noise_lines_between_frames_are_tolerated() {
     );
 }
 
-/// BUG: a newline-free line larger than `MAX_MESSAGE_BYTES` (16 MiB,
-/// stdio.rs:16) should close the transport promptly, but
-/// `JsonLineFramer::push` rescans the whole pending buffer for `b'\n'` on
-/// every 8 KiB chunk (stdio.rs:36-63) — an O(n^2) scan. The reader only checks
-/// the size bound *before* pushing (stdio.rs:376), so it reaches the break
-/// ~33 s late for 17 MiB in debug builds. Every pending request therefore hits
-/// its spec timeout instead of a prompt Closed/Protocol failure.
-///
-/// Evidence: spec timeout 15 s -> `McpError::Timeout(15s)` (deterministic);
-/// spec timeout 60 s -> `Protocol("connection closed; stdout noise: running 1
-/// test")` only after 32.9 s elapsed.
+/// Regression: a newline-free line larger than `MAX_MESSAGE_BYTES` (16 MiB)
+/// must close the transport promptly, so the pending request fails with a
+/// Closed/Protocol error instead of waiting out its spec timeout. (It once
+/// took ~33 s in debug builds because of an O(n^2) rescan; it now fails in
+/// well under a second.)
 #[test]
 fn stdio_over_limit_line_fails_the_connection() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio");
@@ -181,7 +172,9 @@ fn stdio_over_limit_line_fails_the_connection() {
 /// pre-send timeout.
 #[test]
 fn stdio_string_id_response_never_resolves_numeric_pending() {
-    let timeout = Duration::from_secs(3);
+    // Long enough for the request to be written before its deadline; the
+    // fixture never answers with a matching id, so the wait is the timeout.
+    let timeout = Duration::from_millis(500);
     let runtime = tokio::runtime::Runtime::new().expect("tokio");
     let result = runtime.block_on(manager("string-id", timeout).test("adv"));
     let error = result.expect_err("string id must not resolve");

@@ -37,7 +37,11 @@ Escolha os alvos pelo comportamento e pelas dependencias afetadas; os exemplos
 nao constituem cobertura suficiente para toda alteracao. O script exige `-Lib`
 ou `-TestTarget` no modo direcionado e interrompe em qualquer falha do Cargo.
 `-Package` aceita varios pacotes para validar uma mudanca entre crates em uma
-unica chamada, evitando alternar conjuntos de features das dependencias.
+unica chamada. `tokio`, `windows-sys` e as dev-dependencies `proptest` e
+`portable-pty` vem de `[workspace.dependencies]` com a uniao de features, para
+que qualquer selecao (`-p` ou `-Workspace`) reutilize os mesmos artefatos de
+`slim-core` e das dependencias. Ao adicionar uma feature a uma dessas
+dependencias, adicione-a nessa uniao; confira com `cargo tree -e features`.
 
 O wrapper aponta `SLIM_CONFIG_FILE` e `SLIM_AUTH_FILE` para caminhos temporarios
 vazios e remove do processo as variaveis de autenticacao reconhecidas pelo CLI.
@@ -59,18 +63,32 @@ Oito alvos de contratos em memoria do `slim-core` compartilham
 `-TestTarget contracts` e `-Filter modulo::` para selecionar um conjunto antigo;
 as assertivas continuam nos mesmos arquivos, agora dentro desse modulo.
 
+Dezesseis alvos de armazenamento, recuperacao e reducer de sessao do
+`slim-core` compartilham [`sessions`](../crates/slim-core/tests/sessions/main.rs);
+use `-TestTarget sessions` e `-Filter modulo::` da mesma forma. No CLI, seis
+fluxos em processo sobre fixtures loopback (`adv_cli_args`, `ask_question_tui`,
+`headless_resume`, `opencode_go_headless`, `sec_secret_flow`, `tui_runtime`)
+compartilham [`flows`](../crates/slim-cli/tests/flows/main.rs). Cada executavel
+de teste custa um link separado com um job de compilacao; agrupe alvos novos
+sem subprocessos, tempo real ou ambiente proprio no grupo do seu dominio.
+
 O perfil de testes usa `debug=1` nos pacotes locais: mantem nomes, arquivos e
 linhas para backtraces, mas omite informacao detalhada de tipos/variaveis.
-Dependencias externas e de build conservam os perfis originais para reutilizar o cache de dev.
-Para depurar variaveis, acrescente `-FullDebug`; a troca recompila os alvos
-afetados. Builds de desenvolvimento e release mantem seus perfis anteriores.
+Dependencias externas usam `debug="line-tables-only"` no perfil dev, herdado
+pelos testes: backtraces mantem simbolos e linhas, e os PDBs de cada executavel
+de teste encolhem (por exemplo, `rt_session_lock` de 55 MB para 12 MB).
+Para depurar variaveis dos pacotes locais, acrescente `-FullDebug`; a troca
+recompila os alvos afetados. O perfil release mantem as configuracoes anteriores.
 
 Os testes unitarios de runtime e Jev, assim como os de `headless`, `tui`,
 `main`, `reducer` e runtime da TUI, ficam em arquivos de modulos carregados
 somente com `cfg(test)`. Esses arquivos nao sao dependencias Rust do release;
 mantenha novos casos nesses modulos para evitar recompilar producao por uma
-mudanca de assertiva. Mudancas na revisao embutida (incluindo clean/dirty),
-toolchain, perfil ou dependencias ainda podem exigir recompilacao.
+mudanca de assertiva. A revisao embutida (`SLIM_BUILD_REVISION`, lida por
+`option_env!`) so existe durante o build release de `refresh-slim.ps1`, e
+`test-slim.ps1` a remove do ambiente dos testes; assim, publicar ou mudar o
+estado clean/dirty nao recompila os alvos de teste. Toolchain, perfil ou
+dependencias ainda podem exigir recompilacao.
 
 O servidor de `sec_secret_flow` recebe um sinal quando a chamada sincrona
 testada termina e confere as conexoes ja enfileiradas antes de encerrar.

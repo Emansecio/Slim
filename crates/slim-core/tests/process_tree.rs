@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 use std::ffi::OsString;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use slim_core::process::{ProcessOutputBudget, ProcessRequest, ProcessRunner};
 use slim_core::runtime::CancellationToken;
@@ -10,8 +10,12 @@ use slim_core::runtime::CancellationToken;
 #[ignore = "subprocess fixture"]
 fn descendant() {
     std::fs::write("ready", "ready").unwrap();
-    std::thread::sleep(Duration::from_millis(1500));
-    std::fs::write("late", "unexpected descendant effect").unwrap();
+    // A descendant that survives interruption keeps advancing this counter.
+    // The loop is bounded so a leaked process still exits by itself.
+    for beat in 0..600_u32 {
+        std::fs::write("beat", beat.to_string()).unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[test]
@@ -44,9 +48,16 @@ fn interrupted_tree(cancel: bool) {
     std::fs::create_dir(&root).unwrap();
     let token = CancellationToken::new();
     let worker_token = token.clone();
+    let ready_path = root.join("ready");
     let canceller = cancel.then(|| {
+        let ready_path = ready_path.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(500));
+            // Cancel once the descendant demonstrably runs, not after a guess
+            // about how long two executable start-ups take.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !ready_path.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             worker_token.cancel();
         })
     });
@@ -57,19 +68,24 @@ fn interrupted_tree(cancel: bool) {
             .into_iter()
             .map(OsString::from)
             .collect(),
-        timeout: Duration::from_millis(if cancel { 5000 } else { 500 }),
+        // The timeout case cannot observe readiness, so its budget must cover
+        // starting the executable twice; the cancel case is bounded by the
+        // readiness wait above.
+        timeout: Duration::from_millis(if cancel { 30_000 } else { 1500 }),
         cancellation: Some(token),
         output_budget: ProcessOutputBudget::per_stream(4096),
     });
     if let Some(canceller) = canceller {
         canceller.join().unwrap();
     }
-    let ready = root.join("ready").exists();
-    std::thread::sleep(Duration::from_millis(1800));
-    let late = root.join("late").exists();
+    let ready = ready_path.exists();
+    let beat = || std::fs::read_to_string(root.join("beat")).unwrap_or_default();
+    let before = beat();
+    std::thread::sleep(Duration::from_millis(300));
+    let survived = beat() != before;
     std::fs::remove_dir_all(&root).unwrap();
     assert!(ready, "descendant must actually have started");
-    assert!(!late, "descendant survived interruption: {result:?}");
+    assert!(!survived, "descendant survived interruption: {result:?}");
     let result = result.expect("tree termination must be confirmed");
     assert_eq!(result.cancelled, cancel);
     assert_eq!(result.timed_out, !cancel);

@@ -3,34 +3,73 @@
 Este arquivo registra somente o deploy vigente e o procedimento reproduzível.
 Deploys anteriores estão em [`history/2026-09.md`](history/2026-09.md).
 
-## Deploy local vigente — revisão de compactação (2026-09-27)
+## Deploy local vigente — experiência de uso da TUI (2026-09-28)
 
-.\refresh-slim.ps1 terminou novamente com exit 0 e OK: Slim slim 0.1.0
-após a comparação B1. O build incremental levou 0,25 s e reutilizou o mesmo
-binário, pois B1 e B2 adicionaram apenas testes. O build release inicial levou
-354,60 s.
-Executável no PATH: C:\Users\Thiago Emanuel\bin\Slim.exe, 19.590.144 bytes,
-build 2026-09-27T01:08:31.9879464-03:00. SHA-256 do instalado e do
-target/release/slim.exe: C91EAD9B2E6D7FD118C75B3848010FFD4F632BB1C752F9375BF094775886EAAD.
-Revisão do build: edcc6708574b956ab2629e90351ae44dab8416e4-dirty.
-Get-Command Slim apontou para essa cópia e --version terminou com exit 0.
+`.\refresh-slim.ps1` terminou com exit 0 e `OK: Slim slim 0.1.0`.
+Build release padrão: 234,73 s pelo wrapper, com um job Cargo.
+Executável no PATH: `C:\Users\Thiago Emanuel\bin\Slim.exe`, 20.132.352 bytes,
+build UTC `2026-09-29T00:41:14Z`. SHA-256 do instalado e do
+`target/release/slim.exe` idênticos:
+`60AE6FAD3FE80B2EA38D4FF74956A178DB28FE89619D000DAF30E34FD227EDAF`.
+Revisão do build: `e248c687785f4e101cd3e0bebde809b9311739a2-dirty`.
+`Get-Command Slim` confirmou essa cópia; `--version` terminou com exit 0.
+As alterações preexistentes do checkout (inclusive de outras frentes em andamento)
+foram preservadas e incluídas no build.
 
-O leitor HTTP do Jev agora aplica o limite existente de 1 MiB enquanto recebe
-o corpo. O teste com stream localhost excessivo falhou antes e passou após a
-correção; os 29 testes Jev passaram. Após adicionar os testes integrados B1/B2
-da TUI, test-slim.ps1 -Workspace terminou com exit 0 em 74,39 s: 80 alvos,
-2.130 testes aprovados, 39 ignorados e zero falhas. Clippy -D warnings passou
-em cada crate separadamente com --no-deps; rustfmt e diff-check dos testes novos
-passaram. O worktree inclui alterações não commitadas preexistentes, preservadas
-no build.
+Muda a TUI e três pontos do core, sem timer novo. Contrato em
+[§1.2 do DESIGN](../docs/DESIGN-SLIM-TUI.md), parágrafos "Experiência de uso":
 
-Não houve chamada comercial, medida de cache faturado, latência de inferência
-de resumo ou console físico. A medição offline da TUI confirmou que a
-preparação B2 já estava habilitada. A comparação B1 preservou 5/6 fatos no
-extrato local e 6/6 no resumo HTTP simulado, que cobrou mais tokens estimados
-e atrasou o request de tarefa. O padrão local foi mantido.
-Os dados e as propostas de política constam no artefato de revisão da categoria
-4; nenhuma mudança de limiar, prompt, modelo ou destino de dados do Jev foi feita.
+- **Presença desde o envio:** `● Slim` aparece sob o prompt no instante do envio e
+  vira o cabeçalho do primeiro bloco do agente sem deslocar nada.
+- **Recibo de fim de turno:** `✓ 3 arquivos · +42 -7 · 2 comandos · 6s   Ctrl+D`.
+- **Entrada:** `↑`/`↓` recuperam prompts (com composer vazio no live edge; `PageUp`
+  fixa a viewport e daí `↑`/`↓` navegam blocos como antes), `@arquivo` com busca
+  aproximada e anexo do conteúdo (8 arquivos, 256 KiB cada, 1 MiB no total; nome de
+  segredo, binário e caminho fora do workspace recusam o prompt), `!comando` no
+  shell do usuário só no modo Auto, pela ferramenta `shell` do agente.
+- **Sessões:** `/resume` com lista, título, idade e filtro; `/rename` (arquivo
+  `.meta.json` ao lado da sessão); `/rewind` forka a sessão antes de um turno
+  concluído, troca para o fork e devolve o prompt ao composer. Só a conversa volta,
+  arquivos alterados não são restaurados; a sessão original fica intacta.
+- **Progresso de chamada longa:** `Preparando edição · 4,2 KB` enquanto o modelo
+  escreve uma chamada grande. Antes, o `PreparingTool` só chegava ao fim do
+  stream (medido com um SSE segurado por 1,5 s).
+
+Pontos de segurança tocados, todos aditivos: o `ProviderEventRedactor` agora conta
+bytes de argumentos e emite `ProviderEvent::ToolCallProgress { name, bytes }` (nome
+redigido, sem conteúdo; a retenção do conteúdo e o portão de segredo em `Stopped`
+não mudaram; teste com credencial registrada na chamada em escrita); leitura de
+arquivo por `@` usa `resolve_workspace_path_from_root` com limites próprios; `!`
+usa o gate de modo do core sem alterá-lo; o fork de `/rewind` cria uma sessão nova
+com `id == stem` e não toca o original. `resolve_workspace_path*`,
+`workspace_sessions_dir`, `ensure_resume_preflight`, `allows_mutation` e
+`names_for_mode` não foram alterados.
+
+Checks desta rodada (execuções feitas antes do build):
+
+- `cargo test --offline -p slim-tui`: lib 362 e integração 287 aprovados, 0 falhas.
+- `slim-cli` (`test-slim.ps1 -Lib -TestTarget tui_bridge,tui_runtime,session_continuation,tui_pty,ask_question_tui`):
+  lib 186, ask_question_tui 4, session_continuation 5, tui_bridge 27, tui_pty 4
+  (1 ignorado, exige ConPTY real), tui_runtime 3; todos aprovados.
+- `slim-core`: lib 360 aprovados (13 ignorados) e os alvos de integração, incluindo
+  os novos `provider_tool_progress` (2) e `session_turns`/`workspace_files`. **Uma
+  falha:** `agent_loop::provider_recovery_retries_headers_timeout_when_no_tools_ran`
+  (timeout de headers esgota a recuperação automática em 2/2). Ela está em
+  `tests/agent_loop.rs`, arquivo com alterações não commitadas de outra frente, e
+  trata de recuperação de conexão, não de chamadas de ferramenta; não a investiguei
+  contra o HEAD, então não afirmo que seja anterior a esta mudança.
+- `cargo clippy --offline -p slim-tui -p slim-cli --all-targets` e
+  `-p slim-core --lib --test provider_tool_progress --test provider_http`, com
+  `-D warnings` permitindo `manual_clamp` e `bool_to_int_with_if`: exit 0.
+  rustfmt dos três crates e `git diff --check` passaram.
+
+Não foram executados: a suíte completa do workspace, `slim-lsp`, o console físico
+(ConPTY real), uma sessão com provider real, `!`/`@`/`/rewind` num terminal de
+verdade (só via estado, quadros renderizados e o worker com providers de teste), o
+movimento (varredura, caret) em terminal físico, e a sonda de lock de sessão em
+Unix (só o caminho de Windows foi exercitado). O agente que implementou o lado host
+das sessões rodou os mesmos alvos do `slim-cli` e o clippy do crate; os números
+acima são da minha execução final.
 
 ## Build e deploy local
 

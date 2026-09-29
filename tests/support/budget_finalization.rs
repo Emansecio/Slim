@@ -12,7 +12,7 @@ pub fn reject_budget_finalization(listener: &TcpListener) {
             Ok((stream, _)) => break stream,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 assert!(Instant::now() < deadline, "finalization request missing");
-                std::thread::yield_now();
+                std::thread::sleep(Duration::from_millis(1));
             }
             Err(error) => panic!("finalization accept: {error}"),
         }

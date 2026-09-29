@@ -143,6 +143,14 @@ pub enum ProviderEvent {
         name: String,
         arguments: String,
     },
+    /// Progress of a tool call the model is still writing: the tool name (already
+    /// redacted, when known) and the argument bytes received so far. Carries no
+    /// argument content, so it may be emitted while the call itself is still held
+    /// back by the secret gate; it is display-only and never cached or replayed.
+    ToolCallProgress {
+        name: Option<String>,
+        bytes: u64,
+    },
     /// Additive usage observed before the provider's terminal accounting.
     UsagePartial {
         input_tokens: u64,
@@ -395,6 +403,13 @@ pub(crate) fn normalized_provider_code(value: &str) -> Option<String> {
         "too_many_requests",
         "slow_down",
         "request_timeout",
+        "transport",
+        "cancelled",
+        "malformed_tool_call",
+        "transient_remote",
+        "remote",
+        "invalid_response",
+        "provider_error",
     ];
     if SAFE_CODES.contains(&value.as_str()) {
         return Some(value);
@@ -409,7 +424,9 @@ pub(crate) fn normalized_provider_code(value: &str) -> Option<String> {
     Some("provider_error".into())
 }
 
-fn provider_call_error_fields(error: &ProviderError) -> (Option<u16>, Option<String>, Option<u64>) {
+pub(crate) fn provider_call_error_fields(
+    error: &ProviderError,
+) -> (Option<u16>, Option<String>, Option<u64>) {
     match error {
         ProviderError::Api { metadata, .. } => {
             let code = [
@@ -1442,23 +1459,15 @@ pub async fn run_http_provider_messages<A: ProviderAdapter>(
     .with_reasoning_classification(client.adapter().reasoning_classification());
     let request_started = Instant::now();
     let provider_call_journal = app.run_journal.clone();
+    let mut provider_call_id = None;
     let stream_result = client
         .stream_prepared_cancellable_observed(
             request,
             std::future::pending(),
             |event| normalizer.push(app, event),
             |telemetry| {
-                if let Some(journal) = &provider_call_journal {
-                    journal
-                        .lock()
-                        .map_err(|_| ProviderError::InvalidResponse {
-                            message: "durable run lock poisoned".into(),
-                        })?
-                        .record_provider_call(&telemetry)
-                        .map_err(|error| ProviderError::InvalidResponse {
-                            message: error.to_string(),
-                        })?;
-                }
+                provider_call_id =
+                    crate::runtime::persist_provider_call(&provider_call_journal, telemetry)?;
                 Ok(())
             },
         )
@@ -1483,6 +1492,13 @@ pub async fn run_http_provider_messages<A: ProviderAdapter>(
         return Err(error);
     }
     let result = normalizer.finish_free(app);
+    if let Err(error) = &result {
+        crate::runtime::persist_provider_validation_failure(
+            &provider_call_journal,
+            provider_call_id.as_deref(),
+            error,
+        )?;
+    }
     let completion_seq = app
         .events()
         .last()
@@ -2488,7 +2504,10 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
                     _ => {}
                 }
             }
-            if matches!(event, ProviderEvent::Phase { .. }) {
+            if matches!(
+                event,
+                ProviderEvent::Phase { .. } | ProviderEvent::ToolCallProgress { .. }
+            ) {
                 on_event(event);
                 return;
             }
@@ -2520,13 +2539,13 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
             }
             on_event(event);
         };
-        // OpenCode Go's Chat Completions gateway can publish more than one
+        // These Chat Completions gateways can publish more than one
         // cumulative terminal usage snapshot for the same request. Keep a
         // single conservative envelope and expose it only after the stream;
         // other providers retain the strict one-terminal-usage contract.
         let coalesce_terminal_usage = matches!(
             self.adapter.kind(),
-            ProviderKind::OpenCodeGo | ProviderKind::OpenCodeZen
+            ProviderKind::OpenCodeGo | ProviderKind::OpenCodeZen | ProviderKind::CommandCode
         ) && self.adapter.wire_kind()
             == ProviderKind::OpenAiCompatible;
         let mut terminal_usage = None::<(u64, u64)>;
@@ -2874,6 +2893,7 @@ fn provider_events_have_semantic_output(events: &[ProviderEvent]) -> bool {
         | ProviderEvent::ToolCallComplete { .. }
         | ProviderEvent::ToolCall { .. } => true,
         ProviderEvent::Phase { .. }
+        | ProviderEvent::ToolCallProgress { .. }
         | ProviderEvent::ReasoningStarted
         | ProviderEvent::ReasoningEnded
         | ProviderEvent::ContentBlockStop { .. }
@@ -3116,7 +3136,16 @@ struct ProviderEventRedactor {
     error: Option<ProviderError>,
     text_pending: String,
     reasoning_pending: String,
+    /// Redacted name of the tool call being written, for progress events.
+    tool_progress_name: Option<String>,
+    /// Argument bytes seen across the response's tool calls.
+    tool_progress_bytes: u64,
+    /// `tool_progress_bytes` at the last progress event.
+    tool_progress_reported: u64,
 }
+
+/// Growth of received tool-call arguments between two progress events.
+const TOOL_PROGRESS_STEP_BYTES: u64 = 1024;
 
 impl ProviderEventRedactor {
     fn new(mut sensitive_values: Vec<String>) -> Self {
@@ -3127,6 +3156,45 @@ impl ProviderEventRedactor {
             error: None,
             text_pending: String::new(),
             reasoning_pending: String::new(),
+            tool_progress_name: None,
+            tool_progress_bytes: 0,
+            tool_progress_reported: 0,
+        }
+    }
+
+    /// Counts tool-call argument bytes and announces progress **without releasing
+    /// any held content**. The event carries a redacted tool name and a byte
+    /// total only; whether the call itself ever reaches the runtime is still
+    /// decided by the secret gate at `Stopped`.
+    fn note_tool_progress(&mut self, event: &ProviderEvent, output: &mut Vec<ProviderEvent>) {
+        let (name, added) = match event {
+            ProviderEvent::ToolCallDelta {
+                name, arguments, ..
+            } => (name.as_deref(), arguments.len()),
+            ProviderEvent::ToolCallStart { name, .. } => (Some(name.as_str()), 0),
+            ProviderEvent::ToolCallInputDelta { partial_json, .. } => (None, partial_json.len()),
+            // Final snapshots repeat bytes already counted from their deltas.
+            _ => return,
+        };
+        let mut announce = false;
+        if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
+            let redacted = redact_values(name, &self.sensitive_values);
+            if self.tool_progress_name.as_deref() != Some(redacted.as_str()) {
+                self.tool_progress_name = Some(redacted);
+                announce = true;
+            }
+        }
+        self.tool_progress_bytes = self
+            .tool_progress_bytes
+            .saturating_add(u64::try_from(added).unwrap_or(u64::MAX));
+        if announce
+            || self.tool_progress_bytes - self.tool_progress_reported >= TOOL_PROGRESS_STEP_BYTES
+        {
+            self.tool_progress_reported = self.tool_progress_bytes;
+            output.push(ProviderEvent::ToolCallProgress {
+                name: self.tool_progress_name.clone(),
+                bytes: self.tool_progress_bytes,
+            });
         }
     }
 
@@ -3172,6 +3240,7 @@ impl ProviderEventRedactor {
             | ProviderEvent::ContentBlockStop { .. }
             | ProviderEvent::ToolCall { .. }) => {
                 self.flush_reasoning(&mut output);
+                self.note_tool_progress(&event, &mut output);
                 self.tool_pending.push(event);
             }
             ProviderEvent::Usage {
@@ -3215,6 +3284,7 @@ impl ProviderEventRedactor {
                 });
             }
             ProviderEvent::Phase { .. }
+            | ProviderEvent::ToolCallProgress { .. }
             | ProviderEvent::ResponsesReasoning(_)
             | ProviderEvent::ChatReasoning(_) => output.push(event),
         }
@@ -4171,6 +4241,7 @@ fn encode_standard_base64(bytes: &[u8]) -> String {
 fn provider_event_retained_bytes(event: &ProviderEvent) -> usize {
     let dynamic = match event {
         ProviderEvent::Phase { .. }
+        | ProviderEvent::ToolCallProgress { .. }
         | ProviderEvent::ReasoningStarted
         | ProviderEvent::ReasoningEnded
         | ProviderEvent::ContentBlockStop { .. }
@@ -4279,6 +4350,7 @@ fn compact_provider_event(event: &mut ProviderEvent) {
         ProviderEvent::ResponsesReasoning(_)
         | ProviderEvent::ChatReasoning(_)
         | ProviderEvent::Phase { .. }
+        | ProviderEvent::ToolCallProgress { .. }
         | ProviderEvent::ReasoningStarted
         | ProviderEvent::ReasoningEnded
         | ProviderEvent::ContentBlockStop { .. }
@@ -4321,7 +4393,7 @@ fn prepare_cached_events(events: Vec<ProviderEvent>) -> Option<Vec<ProviderEvent
             }
         }
         match event {
-            ProviderEvent::Phase { .. } => {}
+            ProviderEvent::Phase { .. } | ProviderEvent::ToolCallProgress { .. } => {}
             ProviderEvent::ResponseCacheHit => return None,
             ProviderEvent::UsageBreakdown { .. } => {}
             ProviderEvent::Usage {
@@ -5585,6 +5657,60 @@ mod finalization_tests {
     use super::*;
 
     #[test]
+    fn internal_error_codes_survive_durable_normalization_without_messages() {
+        for (error, expected) in [
+            (
+                ProviderError::Transport {
+                    safe_to_retry: false,
+                    message: "secret-transport".into(),
+                },
+                "transport",
+            ),
+            (ProviderError::Cancelled, "cancelled"),
+            (ProviderError::MalformedToolCall, "malformed_tool_call"),
+            (
+                ProviderError::TransientRemote {
+                    message: "secret-transient".into(),
+                },
+                "transient_remote",
+            ),
+            (
+                ProviderError::Remote {
+                    message: "secret-remote".into(),
+                },
+                "remote",
+            ),
+            (
+                ProviderError::InvalidResponse {
+                    message: "secret-response".into(),
+                },
+                "invalid_response",
+            ),
+        ] {
+            let (_, code, _) = provider_call_error_fields(&error);
+            assert_eq!(code.as_deref(), Some(expected));
+            assert_eq!(
+                normalized_provider_code(code.as_deref().unwrap()).as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            normalized_provider_code("unknown-secret-code").as_deref(),
+            Some("provider_error")
+        );
+        assert_eq!(
+            normalized_provider_code("provider_error").as_deref(),
+            Some("provider_error")
+        );
+        assert_eq!(
+            normalized_provider_code(" HTTP_429 ").as_deref(),
+            Some("http_429")
+        );
+        assert!(normalized_provider_code(&"s".repeat(65)).is_none());
+        assert!(normalized_provider_code(" ").is_none());
+    }
+
+    #[test]
     fn stream_request_timeout_overrides_only_its_generic_envelope() {
         let adapter = OpenAiCodexAdapter::new(ProviderConfig::openai_codex(
             "http://localhost",
@@ -5871,6 +5997,108 @@ mod finalization_tests {
         });
         assert!(redactor.error.is_some());
         assert!(!format!("{events:?}").contains("secret-"));
+    }
+
+    fn progress_of(events: &[ProviderEvent]) -> Vec<(Option<String>, u64)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ToolCallProgress { name, bytes } => Some((name.clone(), *bytes)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tool_progress_counts_bytes_in_steps_and_releases_no_content() {
+        let mut redactor = ProviderEventRedactor::new(vec!["secret-value".into()]);
+        let mut all = Vec::new();
+        let first = redactor.push(ProviderEvent::ToolCallDelta {
+            index: Some(0),
+            id: Some("call".into()),
+            name: Some("write".into()),
+            arguments: "{\"content\":\"".into(),
+        });
+        assert_eq!(
+            progress_of(&first),
+            [(Some("write".into()), 12)],
+            "name announces at once"
+        );
+        all.extend(first);
+        // Small continuations stay under one step: no event yet.
+        let quiet = redactor.push(ProviderEvent::ToolCallDelta {
+            index: Some(0),
+            id: None,
+            name: Some("write".into()),
+            arguments: "a".repeat(500),
+        });
+        assert!(progress_of(&quiet).is_empty(), "same name, under one step");
+        all.extend(quiet);
+        let step = redactor.push(ProviderEvent::ToolCallDelta {
+            index: Some(0),
+            id: None,
+            name: None,
+            arguments: "b".repeat(600),
+        });
+        assert_eq!(progress_of(&step), [(Some("write".into()), 1112)]);
+        all.extend(step);
+        let next = redactor.push(ProviderEvent::ToolCallDelta {
+            index: Some(0),
+            id: None,
+            name: None,
+            arguments: "c".repeat(2048),
+        });
+        assert_eq!(
+            progress_of(&next),
+            [(Some("write".into()), 3160)],
+            "monotonic total"
+        );
+        all.extend(next);
+        // Nothing held back has been released: the call and its content are
+        // still pending, and the progress events carry no argument text.
+        assert!(!all.iter().any(|event| matches!(
+            event,
+            ProviderEvent::ToolCallDelta { .. } | ProviderEvent::ToolCall { .. }
+        )));
+        let text = format!("{all:?}");
+        assert!(!text.contains("aaaa") && !text.contains("bbbb") && !text.contains("content"));
+        let stopped = redactor.push(ProviderEvent::Stopped {
+            reason: "tool_calls".into(),
+        });
+        assert_eq!(
+            stopped
+                .iter()
+                .filter(|event| matches!(event, ProviderEvent::ToolCallDelta { .. }))
+                .count(),
+            4,
+            "the held call is still released only at Stopped, in order"
+        );
+    }
+
+    #[test]
+    fn tool_progress_never_carries_a_registered_secret_and_anthropic_input_counts() {
+        let mut redactor = ProviderEventRedactor::new(vec!["secret-value".into()]);
+        let start = redactor.push(ProviderEvent::ToolCallStart {
+            index: 0,
+            id: "toolu_1".into(),
+            name: "secret-value".into(),
+        });
+        let text = format!("{start:?}");
+        assert!(!text.contains("secret-value"), "{text}");
+        assert_eq!(progress_of(&start), [(Some("[REDACTED]".into()), 0)]);
+        let delta = redactor.push(ProviderEvent::ToolCallInputDelta {
+            index: 0,
+            partial_json: "x".repeat(1500),
+        });
+        assert_eq!(progress_of(&delta), [(Some("[REDACTED]".into()), 1500)]);
+        // Final snapshots repeat bytes already counted and add nothing.
+        let complete = redactor.push(ProviderEvent::ToolCallComplete {
+            index: 0,
+            id: "toolu_1".into(),
+            name: "write".into(),
+            arguments: "x".repeat(1500),
+        });
+        assert!(progress_of(&complete).is_empty());
     }
 
     #[test]

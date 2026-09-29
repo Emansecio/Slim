@@ -263,6 +263,10 @@ fn execution(code: ExitCode) -> ProviderExecution {
     }
 }
 
+pub(super) fn sink_for_tests() -> (EventSink, mpsc::Receiver<UiEvent>, mpsc::Receiver<UiEvent>) {
+    sink()
+}
+
 fn sink() -> (EventSink, mpsc::Receiver<UiEvent>, mpsc::Receiver<UiEvent>) {
     let (control, control_rx) = mpsc::sync_channel(4);
     let (data, data_rx) = mpsc::sync_channel(4);
@@ -689,6 +693,7 @@ fn exact_full_pending_delivery_services_cancel_without_losing_truth() {
         durable: false,
         cancel_requested: false,
         content_store: Default::default(),
+        workspace_root: None,
     };
     let (commands, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
     commands.send(UiCommand::CancelRun).expect("cancel");
@@ -733,6 +738,7 @@ fn exact_full_pending_delivery_services_shutdown() {
         durable: false,
         cancel_requested: false,
         content_store: Default::default(),
+        workspace_root: None,
     };
     let (commands, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
     commands.send(UiCommand::Shutdown).expect("shutdown");
@@ -769,6 +775,7 @@ fn exact_full_pending_delivery_queues_unbound_interaction_ack_without_blocking()
         durable: false,
         cancel_requested: false,
         content_store: Default::default(),
+        workspace_root: None,
     };
     let (commands, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
     commands
@@ -831,6 +838,7 @@ fn pending_run_cancel_is_recorded_and_interrupts_projector() {
         durable: false,
         cancel_requested: false,
         content_store: Default::default(),
+        workspace_root: None,
     };
 
     run.request_cancel();

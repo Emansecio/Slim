@@ -649,6 +649,8 @@ async fn background_refresh_is_reused(expires_in: u32) {
     let address = listener.local_addr().expect("refresh address");
     let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let server_hits = hits.clone();
+    let extra_watch = ExtraConnectionWatch::new();
+    let stop_flag = extra_watch.flag();
     let server = thread::spawn(move || {
         listener.set_nonblocking(false).expect("blocking accept");
         let (mut stream, _) = listener.accept().expect("refresh accept");
@@ -667,13 +669,8 @@ async fn background_refresh_is_reused(expires_in: u32) {
                 .as_bytes(),
             )
             .expect("refresh response");
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking extra accept");
-        thread::sleep(Duration::from_millis(150));
-        if listener.accept().is_ok() {
-            server_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
+        let extra = count_connections_until(&listener, &stop_flag);
+        server_hits.fetch_add(extra as u32, std::sync::atomic::Ordering::SeqCst);
     });
     let endpoints = OAuthEndpoints {
         anthropic_token: format!("http://{address}"),
@@ -707,6 +704,8 @@ async fn background_refresh_is_reused(expires_in: u32) {
         .await
         .expect("reread store");
     assert_eq!(next.credential.access, "rotated-access");
+    // Everything the test needed has been observed: end the extra-request watch.
+    extra_watch.stop();
     let _ = server.join();
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     let _ = std::fs::remove_dir_all(root);
@@ -811,15 +810,16 @@ async fn distinct_services_sharing_a_store_refresh_one_base_once() {
     let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();
+    let extra_watch = ExtraConnectionWatch::new();
+    let stop_flag = extra_watch.flag();
     let server = thread::spawn(move || {
         let (mut stream, _) = accept_fixture(&listener);
         let request = read_http_request(&mut stream);
         assert!(request.contains("shared-expired"));
+        // Keep the first POST in flight so the second service really contends.
         thread::sleep(Duration::from_millis(100));
         write_refresh_response(&mut stream, "shared-access", "shared-refresh", 3600);
-        listener.set_nonblocking(true).unwrap();
-        thread::sleep(Duration::from_millis(200));
-        usize::from(listener.accept().is_ok())
+        count_connections_until(&listener, &stop_flag)
     });
 
     let endpoint = format!("http://{address}");
@@ -829,6 +829,7 @@ async fn distinct_services_sharing_a_store_refresh_one_base_once() {
         first.fresh_credential(OAuthProvider::Anthropic, expired.clone()),
         second.fresh_credential(OAuthProvider::Anthropic, expired),
     );
+    extra_watch.stop();
     let extra_requests = server.join().unwrap();
     assert_eq!(one.unwrap().credential.access, "shared-access");
     assert_eq!(two.unwrap().credential.access, "shared-access");
@@ -1152,9 +1153,11 @@ async fn unreadable_store_and_expired_fallback_fail_closed_without_refreshing() 
     let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
+    let extra_watch = ExtraConnectionWatch::new();
+    let stop_flag = extra_watch.flag();
     let server = thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_millis(500);
         loop {
+            let stopping = stop_flag.load(std::sync::atomic::Ordering::SeqCst);
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let _ = read_http_request(&mut stream);
@@ -1163,10 +1166,11 @@ async fn unreadable_store_and_expired_fallback_fail_closed_without_refreshing() 
                     return true;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if std::time::Instant::now() >= deadline {
+                    // Raised only after the service has already failed and shut down.
+                    if stopping {
                         return false;
                     }
-                    thread::sleep(Duration::from_millis(5));
+                    thread::sleep(Duration::from_millis(1));
                 }
                 Err(error) => panic!("loopback listener failed: {error}"),
             }
@@ -1184,6 +1188,10 @@ async fn unreadable_store_and_expired_fallback_fail_closed_without_refreshing() 
         error,
         OAuthError::Store(_) | OAuthError::CredentialsChanged
     ));
+    // Drain any supervised task, then end the watch: a refresh POST issued at
+    // any point before this would already sit in the listener backlog.
+    let _ = service.shutdown().await;
+    extra_watch.stop();
     assert!(
         !server.join().unwrap(),
         "malformed auth must fail before any refresh POST"
@@ -1222,9 +1230,12 @@ async fn two_windows_processes_share_refresh_ownership_for_one_store() {
     let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
+    let extra_watch = ExtraConnectionWatch::new();
+    let stop_flag = extra_watch.flag();
     let server = thread::spawn(move || {
         let (mut stream, _) = accept_fixture(&listener);
         assert!(read_http_request(&mut stream).contains("process-shared-base"));
+        // Keep the first POST in flight so the second process really contends.
         thread::sleep(Duration::from_millis(150));
         write_refresh_response(
             &mut stream,
@@ -1232,9 +1243,7 @@ async fn two_windows_processes_share_refresh_ownership_for_one_store() {
             "process-shared-next",
             3600,
         );
-        listener.set_nonblocking(true).unwrap();
-        thread::sleep(Duration::from_millis(400));
-        usize::from(listener.accept().is_ok())
+        count_connections_until(&listener, &stop_flag)
     });
 
     let current_exe = std::env::current_exe().unwrap();
@@ -1256,6 +1265,8 @@ async fn two_windows_processes_share_refresh_ownership_for_one_store() {
     let second = start_child();
     let first_output = first.wait_with_output().unwrap();
     let second_output = second.wait_with_output().unwrap();
+    // Both processes have exited: any second POST would already be queued.
+    extra_watch.stop();
     assert!(
         first_output.status.success(),
         "{}",
@@ -1567,8 +1578,9 @@ async fn dropping_an_unpolled_request_prevents_refresh_send() {
         .request_fresh_credential(OAuthProvider::Anthropic, expired)
         .unwrap();
     drop(request);
+    // Shutdown joins every supervised task, so a dispatched POST would already
+    // be queued in the loopback listener; no grace period is needed.
     assert!(service.shutdown().await.is_empty());
-    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         matches!(listener.accept(), Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock)
     );
@@ -1707,6 +1719,57 @@ fn oauth_service(endpoint: String, store: OAuthStore) -> OAuthService {
         store,
     )
     .unwrap()
+}
+
+/// Ends a fixture's "no extra request" watch. It replaces a fixed grace sleep:
+/// the test raises it once it has observed everything it needs, and dropping it
+/// (for example on a failed assertion) also releases the fixture thread.
+struct ExtraConnectionWatch(Arc<std::sync::atomic::AtomicBool>);
+
+impl ExtraConnectionWatch {
+    fn new() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    }
+
+    fn flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.0)
+    }
+
+    fn stop(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for ExtraConnectionWatch {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Counts connections accepted until `stop` is raised. A connection made before
+/// the flag is raised is counted even if it is still queued in the loopback
+/// backlog, because the flag is read before each accept attempt.
+fn count_connections_until(
+    listener: &StdTcpListener,
+    stop: &std::sync::atomic::AtomicBool,
+) -> usize {
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking extra accept");
+    let mut count = 0;
+    loop {
+        let stopping = stop.load(std::sync::atomic::Ordering::SeqCst);
+        match listener.accept() {
+            Ok(_) => count += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if stopping {
+                    return count;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("loopback listener failed: {error}"),
+        }
+    }
 }
 
 fn accept_fixture(listener: &StdTcpListener) -> (StdTcpStream, SocketAddr) {

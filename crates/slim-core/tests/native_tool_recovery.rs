@@ -240,6 +240,16 @@ fn shell_direct_arguments_are_literal_and_legacy_scripts_stay_available() {
     );
     assert!(legacy.success, "{}", legacy.output);
     assert!(legacy.output.contains("script-mode"));
+    let powershell = program.to_string_lossy().replace('\'', "''");
+    let script_path = script.to_string_lossy().replace('\'', "''");
+    let check = root.call("shell", json!({
+        "command": format!(
+            "& '{powershell}' -NoLogo -NoProfile -NonInteractive -File '{script_path}' check; $validationExit = $LASTEXITCODE; Write-Output 'check completed'; exit $validationExit"
+        ),
+    }));
+    assert!(!check.success, "{}", check.output);
+    assert!(check.output.starts_with("exit 7\n"), "{}", check.output);
+    assert!(check.output.contains("check completed"), "{}", check.output);
     for args in [json!("not-an-array"), json!([1]), json!([null])] {
         let invalid = root.call(
             "shell",

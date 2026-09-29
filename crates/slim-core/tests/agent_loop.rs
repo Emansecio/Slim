@@ -23,6 +23,14 @@ use slim_core::{
     QuestionAnswer, Runtime, SessionEventSender,
 };
 
+/// Keeps recovery tests off the 500 ms production backoff; Retry-After still applies.
+fn test_loop_config() -> AgentLoopConfig {
+    AgentLoopConfig {
+        provider_recovery_backoff: Duration::from_millis(2),
+        ..AgentLoopConfig::default()
+    }
+}
+
 struct DelayedCodeIntel;
 
 fn code_intel_fixture_outcome(label: &str, elapsed_ms: u64) -> CodeIntelOutcome {
@@ -110,11 +118,23 @@ fn accept_with_deadline(listener: &TcpListener) -> TcpStream {
                     Instant::now() < deadline,
                     "fixture accept deadline exceeded"
                 );
-                thread::yield_now();
+                thread::sleep(Duration::from_millis(1));
             }
             Err(error) => panic!("fixture accept: {error}"),
         }
     }
+}
+
+/// Deterministic replacement for a timing sleep in the fixtures below: the final
+/// answer ends the loop, which can abort a background summary whose request has
+/// not connected yet. Until that request is accepted, the final answer is held
+/// back. Returns the summary connection to serve on the next iteration, or
+/// `None` when the summary was already served.
+fn hold_final_answer_until_summary_connects(
+    listener: &TcpListener,
+    summary_seen: bool,
+) -> Option<TcpStream> {
+    (!summary_seen).then(|| accept_with_deadline(listener))
 }
 
 fn read_http_request(stream: &mut TcpStream) -> String {
@@ -205,7 +225,7 @@ fn provider_catalog_refreshes_when_tool_work_changes_backend_availability() {
             OperatingMode::Auto,
             &root,
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ))
         .expect("loop");
     server.join().expect("server");
@@ -282,7 +302,7 @@ fn deepseek_thinking_replays_exact_scoped_state_after_native_tools() {
             OperatingMode::Auto,
             &root,
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ))
         .expect("loop");
     server.join().expect("server");
@@ -380,7 +400,7 @@ fn reasoning_details_replay_in_order_after_tools_without_persisting() {
             OperatingMode::Auto,
             &root,
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ))
         .unwrap();
     server.join().unwrap();
@@ -522,7 +542,7 @@ fn compact_tool_results_preserve_a_complete_task_across_provider_wires() {
             OperatingMode::Auto,
             &root,
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ))
         .expect("loop");
     let captures = server.join().expect("server");
@@ -799,7 +819,7 @@ fn patch_recovery_returns_locations_and_crlf_receipt_to_the_next_request() {
             OperatingMode::Auto,
             &root,
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ))
         .expect("loop");
     server.join().expect("server");
@@ -884,7 +904,7 @@ fn superseded_read_output_is_elided_from_later_requests() {
             OperatingMode::Auto,
             &root,
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ))
         .expect("loop");
     server.join().expect("server");
@@ -1007,7 +1027,7 @@ fn question_round_trip(truncate_after_answer: bool) {
                 Err(slim_core::InteractionError::StaleRequest { .. })
                     if Instant::now() < deadline =>
                 {
-                    thread::yield_now();
+                    thread::sleep(Duration::from_millis(1));
                 }
                 Err(error) => panic!("answer question: {error}"),
             }
@@ -1026,7 +1046,7 @@ fn question_round_trip(truncate_after_answer: bool) {
                 max_turns: if truncate_after_answer { 3 } else { 2 },
                 context_window_tokens: 128_000,
                 max_mutating_tool_calls: 1,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -1159,7 +1179,7 @@ fn cancelling_while_ask_question_waits_closes_the_tool_and_rejects_a_late_answer
             OperatingMode::Auto,
             std::env::temp_dir(),
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ))
         .expect("cancelled loop");
     watcher.join().expect("watcher");
@@ -1205,7 +1225,7 @@ fn agent_loop_rejects_max_minus_one_before_network_or_snapshot() {
             OperatingMode::Auto,
             std::env::temp_dir(),
             u64::MAX - 1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ))
         .expect_err("snapshot and terminal sequences must fit");
     assert!(matches!(error, ProviderError::InvalidResponse { .. }));
@@ -1292,7 +1312,7 @@ fn repeated_failed_tool_call_stops_the_multi_turn_loop() {
                 max_turns: 4,
                 max_mutating_tool_calls: 8,
                 max_result_bytes: 4096,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -1388,7 +1408,7 @@ fn structural_rejection_aliases_share_identity_and_valid_call_still_runs() {
             1,
             AgentLoopConfig {
                 max_turns: 1,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -1492,7 +1512,7 @@ fn tool_limit_blocks_excess_mutating_calls_before_execution() {
             AgentLoopConfig {
                 max_turns: 1,
                 max_mutating_tool_calls: 1,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -1623,7 +1643,7 @@ fn per_turn_cap_names_the_suppressed_calls_in_the_next_request() {
             AgentLoopConfig {
                 max_turns: 3,
                 max_mutating_tool_calls: 1,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -1698,7 +1718,7 @@ fn one_provider_batch_runs_disjoint_mutations_with_ordered_results() {
             AgentLoopConfig {
                 max_turns: 1,
                 max_mutating_tool_calls: 2,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -1849,7 +1869,7 @@ fn json_diagnostics_from_two_patches_reach_the_next_model_request_together() {
             OperatingMode::Auto,
             &root,
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ))
         .unwrap();
     server.join().unwrap();
@@ -1964,7 +1984,7 @@ fn length_stop_blocks_all_tool_side_effects() {
             1,
             AgentLoopConfig {
                 max_turns: 1,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -2050,7 +2070,7 @@ fn bounded_truncation_fixture(reject_growth: bool) {
             AgentLoopConfig {
                 max_turns: 10,
                 context_window_tokens: 128_000,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -2111,7 +2131,7 @@ fn content_filter_stop_is_not_reported_as_provider_success() {
             1,
             AgentLoopConfig {
                 max_turns: 1,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -2346,7 +2366,7 @@ fn codex_subscription_responses_execute_tool_and_send_function_output() {
             OperatingMode::Auto,
             &root,
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ))
         .expect("loop");
     server.join().expect("server");
@@ -2626,7 +2646,7 @@ fn large_tool_output_is_materialized_and_referenced_in_the_next_turn() {
                 max_turns: 3,
                 max_mutating_tool_calls: 4,
                 max_result_bytes: 16,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -2697,7 +2717,7 @@ fn context_below_threshold_sends_only_the_normal_request() {
             OperatingMode::Auto,
             std::env::temp_dir(),
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ))
         .expect("loop");
     let body = server.join().expect("server");
@@ -2793,7 +2813,7 @@ fn sole_prompt_above_threshold_but_within_window_is_sent_unchanged() {
             AgentLoopConfig {
                 context_window_tokens: fixed_tokens + 256,
                 context_reserve_tokens: 0,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -2840,7 +2860,7 @@ fn sole_prompt_beyond_window_fails_without_a_provider_call() {
             AgentLoopConfig {
                 context_window_tokens: 64,
                 context_reserve_tokens: 0,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect_err("oversized sole prompt must fail before sending");
@@ -2948,7 +2968,7 @@ fn threshold_requests_summary_then_real_turn_with_same_provider_model() {
             AgentLoopConfig {
                 context_window_tokens: fixed_tokens + 512,
                 context_reserve_tokens: 120,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -3211,7 +3231,7 @@ b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE
             AgentLoopConfig {
                 context_window_tokens: fixed_tokens + 40_000,
                 context_reserve_tokens: 120,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -3421,7 +3441,7 @@ b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE
             AgentLoopConfig {
                 context_window_tokens: fixed_tokens + 40_000,
                 context_reserve_tokens: 120,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -3522,7 +3542,7 @@ fn foreground_cancellation_interrupts_slow_jev_without_committing_checkpoint() {
             OperatingMode::Auto,
             std::env::temp_dir(),
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ))
         .expect("cancellation is a normal stop");
     watcher.join().unwrap();
@@ -3664,7 +3684,7 @@ fn economy_projection_keeps_written_bytes_and_reconciles_todo_in_normal_turn() {
             1,
             AgentLoopConfig {
                 context_window_tokens: 1_000_000,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .unwrap();
@@ -3807,8 +3827,11 @@ fn uneconomic_jev_prepass_still_runs_the_background_summary() {
     let address = listener.local_addr().expect("address");
     let server = thread::spawn(move || {
         let mut summary_seen = false;
+        let mut pending = None;
         for index in 0..3 {
-            let mut stream = accept_with_deadline(&listener);
+            let mut stream = pending
+                .take()
+                .unwrap_or_else(|| accept_with_deadline(&listener));
             let request = read_http_request(&mut stream);
             let body = if request.contains("You are a context compactor") {
                 summary_seen = true;
@@ -3816,7 +3839,7 @@ fn uneconomic_jev_prepass_still_runs_the_background_summary() {
             } else if index == 0 {
                 sse_read_call_body("economic-read")
             } else {
-                thread::sleep(Duration::from_millis(250));
+                pending = hold_final_answer_until_summary_connects(&listener, summary_seen);
                 SSE_FINAL_ANSWER.to_owned()
             };
             write_sse(&mut stream, &body);
@@ -3876,7 +3899,7 @@ fn run_loop_to_completion(
                 max_turns,
                 context_window_tokens: window_tokens,
                 context_reserve_tokens: 0,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop")
@@ -4085,8 +4108,11 @@ fn over_limit_jev_candidates_still_allow_background_summary() {
     let server = thread::spawn(move || {
         let mut summary_body = String::new();
         let mut turn_requests = 0;
+        let mut pending = None;
         for _ in 0..3 {
-            let mut stream = accept_with_deadline(&listener);
+            let mut stream = pending
+                .take()
+                .unwrap_or_else(|| accept_with_deadline(&listener));
             let request = read_http_request(&mut stream);
             let body = if request.contains("You are a context compactor") {
                 summary_body = request;
@@ -4096,7 +4122,10 @@ fn over_limit_jev_candidates_still_allow_background_summary() {
                 if turn_requests == 1 {
                     sse_read_call_body("over-limit-read")
                 } else {
-                    thread::sleep(Duration::from_millis(250));
+                    pending = hold_final_answer_until_summary_connects(
+                        &listener,
+                        !summary_body.is_empty(),
+                    );
                     SSE_FINAL_ANSWER.to_owned()
                 }
             };
@@ -4176,8 +4205,11 @@ fn jev_runs_once_inside_the_settled_background_task() {
     let server = thread::spawn(move || {
         let mut summary_body = String::new();
         let mut turn_requests = 0;
+        let mut pending = None;
         for _ in 0..3 {
-            let mut stream = accept_with_deadline(&listener);
+            let mut stream = pending
+                .take()
+                .unwrap_or_else(|| accept_with_deadline(&listener));
             let request = read_http_request(&mut stream);
             let body = if request.contains("You are a context compactor") {
                 summary_body = request;
@@ -4187,7 +4219,10 @@ fn jev_runs_once_inside_the_settled_background_task() {
                 if turn_requests == 1 {
                     sse_read_call_body("bg-read-call")
                 } else {
-                    thread::sleep(Duration::from_millis(250));
+                    pending = hold_final_answer_until_summary_connects(
+                        &listener,
+                        !summary_body.is_empty(),
+                    );
                     SSE_FINAL_ANSWER.to_owned()
                 }
             };
@@ -4383,8 +4418,11 @@ fn jev_failure_in_background_falls_back_to_unpruned_summary() {
     let server = thread::spawn(move || {
         let mut summary_body = String::new();
         let mut turn_requests = 0;
+        let mut pending = None;
         for _ in 0..3 {
-            let mut stream = accept_with_deadline(&listener);
+            let mut stream = pending
+                .take()
+                .unwrap_or_else(|| accept_with_deadline(&listener));
             let request = read_http_request(&mut stream);
             let body = if request.contains("You are a context compactor") {
                 summary_body = request;
@@ -4394,7 +4432,10 @@ fn jev_failure_in_background_falls_back_to_unpruned_summary() {
                 if turn_requests == 1 {
                     sse_read_call_body("bg-fallback-read")
                 } else {
-                    thread::sleep(Duration::from_millis(250));
+                    pending = hold_final_answer_until_summary_connects(
+                        &listener,
+                        !summary_body.is_empty(),
+                    );
                     SSE_FINAL_ANSWER.to_owned()
                 }
             };
@@ -4474,8 +4515,11 @@ fn jev_outcome_is_metered_when_the_summary_attempt_is_aborted() {
         let mut summary_handlers = Vec::new();
         let mut saw_summary = false;
         let mut turn_requests = 0;
+        let mut pending = None;
         for _ in 0..3 {
-            let mut stream = accept_with_deadline(&listener);
+            let mut stream = pending
+                .take()
+                .unwrap_or_else(|| accept_with_deadline(&listener));
             let request = read_http_request(&mut stream);
             if request.contains("You are a context compactor") {
                 saw_summary = true;
@@ -4495,7 +4539,7 @@ fn jev_outcome_is_metered_when_the_summary_attempt_is_aborted() {
                 if turn_requests == 1 {
                     write_sse(&mut stream, &sse_read_call_body("aborted-jev-read"));
                 } else {
-                    thread::sleep(Duration::from_millis(250));
+                    pending = hold_final_answer_until_summary_connects(&listener, saw_summary);
                     write_sse(&mut stream, SSE_FINAL_ANSWER);
                 }
             }
@@ -4669,7 +4713,7 @@ fn post_compaction_reacquisition_emits_one_event_per_call() {
             1,
             AgentLoopConfig {
                 max_turns: 5,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -4881,7 +4925,7 @@ fn manual_compaction_retains_native_execution_facts_without_model_summary() {
             1,
             AgentLoopConfig {
                 max_turns: 3,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -4995,7 +5039,7 @@ fn soft_threshold_final_response_does_not_start_background_compaction() {
                 max_turns: 3,
                 context_window_tokens: used.saturating_mul(100).div_ceil(80),
                 context_reserve_tokens: 0,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -5121,7 +5165,7 @@ fn fast_main_tool_turn_does_not_wait_for_slow_background_summary() {
         max_turns: 3,
         context_window_tokens,
         context_reserve_tokens: 0,
-        ..AgentLoopConfig::default()
+        ..test_loop_config()
     };
     let handle = CompactionHandle::default();
     let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
@@ -5281,7 +5325,7 @@ fn tool_call_below_break_even_skips_background_compaction() {
                 max_turns: 2,
                 context_window_tokens: used.saturating_mul(100).div_ceil(80),
                 context_reserve_tokens: 0,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -5414,7 +5458,7 @@ fn completed_background_summary_is_reused_before_overflow_retry() {
                 max_turns: 3,
                 context_window_tokens: used.saturating_mul(100).div_ceil(80),
                 context_reserve_tokens: 0,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("overflow retry");
@@ -5526,7 +5570,7 @@ fn volatile_code_intel_calls_remain_serial_barriers_in_provider_order() {
             1,
             AgentLoopConfig {
                 max_turns: 2,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -5641,7 +5685,7 @@ fn mixed_batch_hoists_independent_reads_and_preserves_result_order() {
             1,
             AgentLoopConfig {
                 max_turns: 1,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -5768,7 +5812,7 @@ fn validation_shell_is_serialized_as_a_workspace_boundary() {
             1,
             AgentLoopConfig {
                 max_turns: 1,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -5812,13 +5856,13 @@ fn validation_shell_is_serialized_as_a_workspace_boundary() {
 
 #[test]
 fn default_max_result_bytes_is_sixteen_kib() {
-    assert_eq!(AgentLoopConfig::default().max_result_bytes, 16 * 1024);
+    assert_eq!(test_loop_config().max_result_bytes, 16 * 1024);
 }
 
 #[test]
 fn default_max_turns_is_one_hundred_twenty_eight() {
     assert_eq!(
-        AgentLoopConfig::default().max_turns,
+        test_loop_config().max_turns,
         AgentLoopConfig::DEFAULT_MAX_TURNS
     );
     assert_eq!(AgentLoopConfig::DEFAULT_MAX_TURNS, 128);
@@ -5878,7 +5922,7 @@ fn hard_threshold_without_prepared_compacts_locally_without_summary_post() {
         max_turns: 1,
         context_window_tokens,
         context_reserve_tokens: 0,
-        ..AgentLoopConfig::default()
+        ..test_loop_config()
     };
     let handle = CompactionHandle::default();
     let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
@@ -6044,7 +6088,7 @@ fn discarded_background_summary_still_counts_observed_usage() {
                 max_turns: 3,
                 context_window_tokens: used.saturating_mul(100).div_ceil(80),
                 context_reserve_tokens: 0,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -6145,7 +6189,7 @@ fn context_overflow_compacts_and_retries_once_without_consuming_turn_budget() {
                 max_turns: 1,
                 context_window_tokens: 64_000,
                 context_reserve_tokens: 0,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("overflow recovery");
@@ -6242,7 +6286,7 @@ fn truncated_summary_publishes_usage_but_never_compacts() {
             AgentLoopConfig {
                 context_window_tokens: fixed_tokens + 256,
                 context_reserve_tokens: 0,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect_err("truncated summary must fail");
@@ -6353,7 +6397,7 @@ fn tool_call_summary_is_rejected_without_replacing_the_transcript() {
             AgentLoopConfig {
                 context_window_tokens: fixed_tokens + 256,
                 context_reserve_tokens: 0,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect_err("tool-call summary must fail");
@@ -6451,7 +6495,7 @@ fn duplicate_tool_output_goes_on_the_wire_as_a_pointer_and_context_snapshot_is_l
             AgentLoopConfig {
                 max_turns: 4,
                 context_window_tokens: 64_000,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -6570,7 +6614,7 @@ fn resumed_turn_deduplicates_retained_read_but_sends_changed_content_in_full() {
                 AgentLoopConfig {
                     max_turns: 4,
                     context_window_tokens: 64_000,
-                    ..AgentLoopConfig::default()
+                    ..test_loop_config()
                 },
             ))
             .unwrap();
@@ -6713,7 +6757,7 @@ fn post_compaction_identical_reread_reuses_retained_full_output() {
                 // and the kept tool-result suffix.
                 context_window_tokens: fixed_tokens + 2048,
                 context_reserve_tokens: 120,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -6890,7 +6934,7 @@ fn agent_loop_announces_todo_and_applies_add_with_ledger_event() {
             AgentLoopConfig {
                 max_turns: 4,
                 max_mutating_tool_calls: 1,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -7021,7 +7065,7 @@ fn agent_loop_skill_script_requires_trust() {
         AgentLoopConfig {
             max_turns: 2,
             max_mutating_tool_calls: 1,
-            ..AgentLoopConfig::default()
+            ..test_loop_config()
         },
     ));
     let _ = std::fs::remove_dir_all(&root);
@@ -7146,7 +7190,7 @@ fn agent_loop_skill_list_returns_names_only_after_explicit_call() {
         AgentLoopConfig {
             max_turns: 2,
             max_mutating_tool_calls: 1,
-            ..AgentLoopConfig::default()
+            ..test_loop_config()
         },
     ));
     let _ = std::fs::remove_dir_all(&root);
@@ -7281,7 +7325,7 @@ fn read_calls_do_not_consume_mutating_budget() {
                 max_turns: 3,
                 max_mutating_tool_calls: 1,
                 max_read_tool_calls: 96,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -7383,7 +7427,7 @@ fn read_exhaustion_stops_with_tool_limit() {
             AgentLoopConfig {
                 max_turns: 1,
                 max_read_tool_calls: 2,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -7480,7 +7524,7 @@ fn max_total_tool_calls_stops_across_multiple_turns_with_tool_limit() {
                 max_turns: 4,
                 max_read_tool_calls: 10,
                 max_total_tool_calls: 3,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -7560,7 +7604,7 @@ fn mixed_batch_budget_preserves_the_execution_prefix() {
                 max_turns: 1,
                 max_read_tool_calls: 2,
                 max_mutating_tool_calls: 5,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -7672,7 +7716,7 @@ fn sequential_read_calls_refresh_per_turn_budget() {
             AgentLoopConfig {
                 max_turns: 3,
                 max_read_tool_calls: 1,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -7770,7 +7814,7 @@ fn per_turn_mutating_overflow_continues_when_turns_remain() {
             AgentLoopConfig {
                 max_turns: 3,
                 max_mutating_tool_calls: 1,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -7868,7 +7912,7 @@ fn budget_exhaustion_still_returns_final_answer_without_tools() {
             1,
             AgentLoopConfig {
                 max_turns: 1,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -7968,7 +8012,7 @@ fn duplicate_read_injects_between_turns_steer_once() {
             1,
             AgentLoopConfig {
                 max_turns: 3,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -8076,7 +8120,7 @@ fn repeated_identical_reads_stop_with_no_progress_and_final_answer() {
             1,
             AgentLoopConfig {
                 max_turns: 8,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -8158,7 +8202,7 @@ fn failed_validation_can_retry_after_an_observed_external_change() {
             1,
             AgentLoopConfig {
                 max_turns: 6,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .unwrap();
@@ -8208,7 +8252,7 @@ fn cancellation_during_budget_finalization_reports_cancelled() {
             1,
             AgentLoopConfig {
                 max_turns: 1,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .unwrap();
@@ -8262,7 +8306,7 @@ fn failed_volatile_shell_keeps_its_side_effects_and_allows_continuation() {
             1,
             AgentLoopConfig {
                 max_turns: 4,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .unwrap();
@@ -8297,7 +8341,7 @@ fn structured_budget_errors_stop_without_retrying() {
                 OperatingMode::ReadOnly,
                 std::env::temp_dir(),
                 1,
-                AgentLoopConfig::default(),
+                test_loop_config(),
             ));
         let _ = done.send(());
         let requests = server.join().unwrap();
@@ -8330,7 +8374,7 @@ fn chat_stream_recovers_structured_overload_before_output() {
             OperatingMode::ReadOnly,
             std::env::temp_dir(),
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ));
     let _ = done.send(());
     let requests = server.join().unwrap();
@@ -8414,7 +8458,7 @@ fn reasoning_only_completion_is_not_success() {
             1,
             AgentLoopConfig {
                 max_turns: 3,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ));
     let _ = done.send(());
@@ -8439,7 +8483,7 @@ fn repeated_empty_completion_stops_after_one_recovery() {
             1,
             AgentLoopConfig {
                 max_turns: 3,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ));
     let _ = done.send(());
@@ -8453,6 +8497,8 @@ fn repeated_empty_completion_stops_after_one_recovery() {
 #[test]
 fn provider_recovery_counter_resets_after_successful_tool_turn() {
     let root = std::env::temp_dir().join(format!("slim-retry-reset-{}", std::process::id()));
+    // A same-PID leftover can only come from an earlier crashed run of this binary.
+    let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("source.txt"), "evidence").unwrap();
     let tool = |id: &str| {
@@ -8479,7 +8525,7 @@ fn provider_recovery_counter_resets_after_successful_tool_turn() {
             1,
             AgentLoopConfig {
                 max_turns: 8,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ));
     let _ = done.send(());
@@ -8496,6 +8542,8 @@ fn provider_recovery_counter_resets_after_successful_tool_turn() {
 #[test]
 fn global_recovery_tally_stops_after_six_recoveries() {
     let root = std::env::temp_dir().join(format!("slim-retry-global-{}", std::process::id()));
+    // A same-PID leftover can only come from an earlier crashed run of this binary.
+    let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir(&root).unwrap();
     for index in 0..6 {
         std::fs::write(
@@ -8528,7 +8576,7 @@ fn global_recovery_tally_stops_after_six_recoveries() {
             1,
             AgentLoopConfig {
                 max_turns: 20,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ));
     let _ = done.send(());
@@ -8569,7 +8617,7 @@ fn empty_recovery_counts_toward_consecutive_provider_limit() {
                     1,
                     AgentLoopConfig {
                         max_turns: 6,
-                        ..AgentLoopConfig::default()
+                        ..test_loop_config()
                     },
                 ));
         let _ = done.send(());
@@ -8584,6 +8632,8 @@ fn empty_recovery_counts_toward_consecutive_provider_limit() {
 #[test]
 fn transient_recovery_preserves_completed_tools_and_retries_only_the_failed_request() {
     let root = std::env::temp_dir().join(format!("slim-recovery-tools-{}", std::process::id()));
+    // A same-PID leftover can only come from an earlier crashed run of this binary.
+    let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir(&root).expect("exclusive fixture");
     let call = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"write-once","function":{"name":"write","arguments":json!({"path":"result.txt","content":"saved once"}).to_string()}}]},"finish_reason":"tool_calls"}]});
     let incomplete =
@@ -8604,7 +8654,7 @@ fn transient_recovery_preserves_completed_tools_and_retries_only_the_failed_requ
             OperatingMode::Auto,
             &root,
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ));
     let _ = done.send(());
     let requests = server.join().unwrap();
@@ -8640,6 +8690,8 @@ fn transient_recovery_preserves_completed_tools_and_retries_only_the_failed_requ
 #[test]
 fn manual_retry_preserves_completed_tools_and_exact_failed_request() {
     let root = std::env::temp_dir().join(format!("slim-manual-retry-tools-{}", std::process::id()));
+    // A same-PID leftover can only come from an earlier crashed run of this binary.
+    let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir(&root).expect("exclusive fixture");
     let call = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"write-once","function":{"name":"write","arguments":json!({"path":"result.txt","content":"saved once"}).to_string()}}]},"finish_reason":"tool_calls"}]});
     let final_answer = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
@@ -8665,7 +8717,7 @@ fn manual_retry_preserves_completed_tools_and_exact_failed_request() {
                 OperatingMode::Auto,
                 &root,
                 1,
-                AgentLoopConfig::default(),
+                test_loop_config(),
             );
             let request = async {
                 while !retry.is_waiting() {
@@ -8722,7 +8774,7 @@ fn provider_recovery_is_bounded_and_does_not_retry_permanent_errors() {
         let mut runtime = Runtime::new();
         let config = AgentLoopConfig {
             max_turns,
-            ..AgentLoopConfig::default()
+            ..test_loop_config()
         };
         let result = tokio::runtime::Runtime::new()
             .unwrap()
@@ -8773,7 +8825,7 @@ fn provider_recovery_continues_from_a_visible_partial_answer() {
             OperatingMode::ReadOnly,
             std::env::temp_dir(),
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ));
     let _ = done.send(());
     let requests = server.join().unwrap();
@@ -8834,7 +8886,7 @@ fn cancellation_interrupts_provider_recovery_backoff() {
             OperatingMode::ReadOnly,
             std::env::temp_dir(),
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ));
     let _ = done.send(());
     let requests = server.join().unwrap();
@@ -8857,6 +8909,8 @@ fn artifact_failure_keeps_completed_batch_in_transcript() {
             .unwrap()
             .as_nanos()
     ));
+    // A same-PID leftover can only come from an earlier crashed run of this binary.
+    let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("source.txt"), "evidence ".repeat(1000)).unwrap();
     let mut runtime = Runtime::with_artifact_store(root.join("artifacts")).unwrap();
@@ -8878,7 +8932,7 @@ fn artifact_failure_keeps_completed_batch_in_transcript() {
             1,
             AgentLoopConfig {
                 max_result_bytes: 128,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ));
     let _ = done.send(());
@@ -8930,7 +8984,7 @@ fn provider_recovery_respects_retry_after() {
             OperatingMode::ReadOnly,
             std::env::temp_dir(),
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ));
     let _ = done.send(());
     assert_eq!(server.join().unwrap().len(), 2);
@@ -8960,7 +9014,7 @@ fn provider_recovery_does_not_send_when_retry_after_exceeds_wait_budget() {
             OperatingMode::ReadOnly,
             std::env::temp_dir(),
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ));
     let _ = done.send(());
     let requests = server.join().unwrap();
@@ -8985,6 +9039,9 @@ fn provider_recovery_retries_headers_timeout_when_no_tools_ran() {
     );
     let server = thread::spawn(move || {
         let mut requests = Vec::new();
+        // Unanswered connections stay open until the fixture ends, so the retry
+        // can be accepted at once instead of after a fixed stall.
+        let mut unanswered = Vec::new();
         for (index, body) in [None, Some(success)].into_iter().enumerate() {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut stream = loop {
@@ -9012,7 +9069,7 @@ fn provider_recovery_retries_headers_timeout_when_no_tools_ran() {
                 );
                 stream.write_all(response.as_bytes()).expect("response");
             } else {
-                thread::sleep(Duration::from_millis(400));
+                unanswered.push(stream);
             }
         }
         requests
@@ -9031,7 +9088,7 @@ fn provider_recovery_retries_headers_timeout_when_no_tools_ran() {
             OperatingMode::ReadOnly,
             std::env::temp_dir(),
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ));
     let _ = done.send(());
     let requests = server.join().unwrap();
@@ -9045,6 +9102,8 @@ fn provider_recovery_retries_headers_timeout_when_no_tools_ran() {
 #[test]
 fn malformed_arguments_are_repaired_without_executing_the_rejected_batch() {
     let root = std::env::temp_dir().join(format!("slim-argument-repair-{}", std::process::id()));
+    // A same-PID leftover can only come from an earlier crashed run of this binary.
+    let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("source.txt"), "retained evidence").unwrap();
     let malformed = json!({"choices":[{"delta":{"content":"Inspecting the source.", "tool_calls":[
@@ -9071,7 +9130,7 @@ fn malformed_arguments_are_repaired_without_executing_the_rejected_batch() {
             OperatingMode::Auto,
             &root,
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ));
     let _ = done.send(());
     let requests = server.join().unwrap();
@@ -9097,6 +9156,8 @@ fn malformed_arguments_are_repaired_without_executing_the_rejected_batch() {
 #[test]
 fn invalid_json_escape_is_repaired_and_executed_without_a_repair_request() {
     let root = std::env::temp_dir().join(format!("slim-escape-repair-{}", std::process::id()));
+    // A same-PID leftover can only come from an earlier crashed run of this binary.
+    let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir(&root).unwrap();
     let arguments = r#"{"path":"escaped.txt","content":"literal \* star"}"#;
     let call = json!({"choices":[{"delta":{"tool_calls":[
@@ -9116,7 +9177,7 @@ fn invalid_json_escape_is_repaired_and_executed_without_a_repair_request() {
             OperatingMode::Auto,
             &root,
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ));
     let _ = done.send(());
     let requests = server.join().unwrap();
@@ -9234,6 +9295,8 @@ fn anthropic_malformed_arguments_are_repaired_without_executing_the_rejected_bat
         "slim-anthropic-argument-repair-{}",
         std::process::id()
     ));
+    // A same-PID leftover can only come from an earlier crashed run of this binary.
+    let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("source.txt"), "retained evidence").unwrap();
     let malformed = anthropic_tool_sse(
@@ -9273,7 +9336,7 @@ fn anthropic_malformed_arguments_are_repaired_without_executing_the_rejected_bat
             OperatingMode::Auto,
             &root,
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ));
     let _ = done.send(());
     let requests = server.join().unwrap();
@@ -9314,7 +9377,7 @@ fn argument_repair_is_bounded_and_requires_known_identity() {
                 1,
                 AgentLoopConfig {
                     max_turns,
-                    ..AgentLoopConfig::default()
+                    ..test_loop_config()
                 },
             ))
             .unwrap_err();
@@ -9363,7 +9426,7 @@ fn foreground_compaction_recovers_transient_failure_and_preserves_original_on_pe
                     OperatingMode::ReadOnly,
                     std::env::temp_dir(),
                     1,
-                    AgentLoopConfig::default(),
+                    test_loop_config(),
                 ));
         let _ = done.send(());
         let requests = server.join().unwrap();
@@ -9434,7 +9497,7 @@ fn foreground_compaction_backoff_is_cancellable_and_does_not_replace_history() {
                 OperatingMode::ReadOnly,
                 std::env::temp_dir(),
                 1,
-                AgentLoopConfig::default(),
+                test_loop_config(),
             ));
     let _ = done.send(());
     assert_eq!(server.join().unwrap().len(), 1);
@@ -9470,7 +9533,7 @@ fn foreground_compaction_stops_after_two_retries_without_replacing_history() {
                 OperatingMode::ReadOnly,
                 std::env::temp_dir(),
                 1,
-                AgentLoopConfig::default(),
+                test_loop_config(),
             ));
     let _ = done.send(());
     assert_eq!(server.join().unwrap().len(), 3);
@@ -9550,7 +9613,7 @@ fn responses_error_continues_partial_without_replaying_completed_tools(error: Va
             OperatingMode::ReadOnly,
             std::env::temp_dir(),
             1,
-            AgentLoopConfig::default(),
+            test_loop_config(),
         ))
         .unwrap();
     let requests = server.join().unwrap();
@@ -9640,7 +9703,7 @@ fn mcp_call_in_readonly_mode_is_rejected_by_the_gate() {
             1,
             AgentLoopConfig {
                 max_turns: 2,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .expect("loop");
@@ -9718,7 +9781,7 @@ fn managed_shell_job_allows_work_then_resumes_once_on_completion() {
             1,
             AgentLoopConfig {
                 max_turns: 6,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .unwrap();
@@ -9824,7 +9887,7 @@ fn managed_shell_job_can_be_inspected_and_cancelled_by_the_agent() {
             1,
             AgentLoopConfig {
                 max_turns: 6,
-                ..AgentLoopConfig::default()
+                ..test_loop_config()
             },
         ))
         .unwrap();

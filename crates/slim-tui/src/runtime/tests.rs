@@ -180,7 +180,7 @@ fn assistant_prose_breathes_before_tools_while_thinking_stays_flush() {
         .unwrap_or_else(|| panic!("assistant body missing\n{frame}"));
     let second_tools = rows
         .iter()
-        .rposition(|row| row.contains("Leu, list"))
+        .rposition(|row| row.contains("1 leitura, list"))
         .unwrap_or_else(|| panic!("second tools missing\n{frame}"));
     let thinking = rows
         .iter()
@@ -269,15 +269,16 @@ fn left_drag_selects_and_right_click_copies_or_pastes() {
         .unwrap();
     let area = cache.selection_regions[0].unwrap();
     let row = area.bottom() - 1;
+    // Agent prose starts in the text column, after the two-cell gutter.
     let start = terminal_action(
-        mouse_event(MouseEventKind::Down(MouseButton::Left), 2, row),
+        mouse_event(MouseEventKind::Down(MouseButton::Left), 4, row),
         &state,
         size,
         &mut cache,
     );
     reduce(&mut state, start.expect("start"));
     let drag = terminal_action(
-        mouse_event(MouseEventKind::Drag(MouseButton::Left), 6, row),
+        mouse_event(MouseEventKind::Drag(MouseButton::Left), 8, row),
         &state,
         size,
         &mut cache,
@@ -286,8 +287,8 @@ fn left_drag_selects_and_right_click_copies_or_pastes() {
     assert_eq!(
         state.selection,
         Some(ScreenSelection {
-            anchor: ScreenPos::new(2, row),
-            head: ScreenPos::new(6, row),
+            anchor: ScreenPos::new(4, row),
+            head: ScreenPos::new(8, row),
         })
     );
     let mut copied = String::new();
@@ -410,9 +411,10 @@ fn transcript_selection_survives_unrelated_growth_without_following_tail() {
         .unwrap();
     let area = cache.selection_regions[0].unwrap();
     let row = area.bottom() - 1;
+    // The selection region starts at the gutter; prose starts two cells in.
     for event in [
-        mouse_event(MouseEventKind::Down(MouseButton::Left), area.x, row),
-        mouse_event(MouseEventKind::Drag(MouseButton::Left), area.x + 4, row),
+        mouse_event(MouseEventKind::Down(MouseButton::Left), area.x + 2, row),
+        mouse_event(MouseEventKind::Drag(MouseButton::Left), area.x + 6, row),
     ] {
         let action = terminal_action(event, &state, (80, 24), &mut cache).unwrap();
         reduce(&mut state, action);
@@ -1105,6 +1107,53 @@ fn microtransition_expires_at_249ms_and_reduced_motion_is_immediate() {
 }
 
 #[test]
+fn palette_focus_flash_expires_once_and_reduced_motion_keeps_the_stable_row() {
+    let mut state = AppState::new();
+    state.palette_query = Some("model".into());
+    state.menu_focus_at_ms = Some(0);
+    let selected_bg = |state: &AppState, capabilities: Capabilities| {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render_frame(frame, state, capabilities, &mut WrapCache::default()))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let row = (0..buffer.area.height)
+            .find(|&y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("/model")
+            })
+            .expect("model command row");
+        (0..buffer.area.width)
+            .find(|&x| buffer[(x, row)].symbol() == ">")
+            .map(|x| buffer[(x, row)].bg)
+            .expect("selected row marker")
+    };
+    assert_eq!(
+        super::next_transition_visual_deadline_ms(&state, 0, caps()),
+        Some(super::MENU_FOCUS_FLASH_MS)
+    );
+    assert_eq!(selected_bg(&state, caps()), Color::Rgb(0x34, 0x3B, 0x43));
+    state.clock.elapsed_ms = super::MENU_FOCUS_FLASH_MS;
+    assert_eq!(
+        super::next_transition_visual_deadline_ms(&state, state.clock.elapsed_ms, caps()),
+        None
+    );
+    assert_eq!(selected_bg(&state, caps()), Color::Rgb(0x2A, 0x2A, 0x2A));
+    let reduced = Capabilities {
+        reduced_motion: true,
+        ..caps()
+    };
+    state.clock.elapsed_ms = 0;
+    assert_eq!(
+        super::next_transition_visual_deadline_ms(&state, 0, reduced),
+        None
+    );
+    assert_eq!(selected_bg(&state, reduced), Color::Rgb(0x2A, 0x2A, 0x2A));
+}
+
+#[test]
 fn idle_completed_block_keeps_frame_emphasis_when_spinner_is_suppressed() {
     let mut state = AppState::new();
     state.authenticated = true;
@@ -1260,11 +1309,7 @@ fn thinking_pulse_moves_to_visible_header_and_freezes_with_motion_disabled() {
             .enumerate()
             .filter_map(|(i, (a, b))| (a != b).then_some(i))
             .collect::<Vec<_>>();
-        assert_eq!(
-            changed.len(),
-            1,
-            "only one pulse across transcript and rail"
-        );
+        assert!(!changed.is_empty(), "the pulse must move");
         let thinking_rows = (0..24)
             .filter(|y| {
                 (0..80)
@@ -1278,26 +1323,41 @@ fn thinking_pulse_moves_to_visible_header_and_freezes_with_motion_disabled() {
             1,
             "Thinking belongs to the visible header or the ActivityRail, never both"
         );
-        assert_eq!(
-            changed[0] / 80,
-            thinking_rows[0] as usize,
-            "pulse belongs to the visible reasoning header, or rail if offscreen"
+        // The pulse is one indicator: the spinner cell and the sweep across
+        // the label, all on the row that owns Thinking (the header, or the
+        // rail when the header is out of view) and nowhere else.
+        assert!(
+            changed
+                .iter()
+                .all(|index| index / 80 == thinking_rows[0] as usize),
+            "pulse belongs to the visible reasoning header, or rail if offscreen: {changed:?}"
         );
-        for capabilities in [
-            Capabilities {
-                reduced_motion: true,
-                ..caps()
-            },
-            Capabilities {
-                color_depth: ColorDepth::None,
-                ..caps()
-            },
-        ] {
-            let still = render(&state, capabilities);
-            state.clock.frame = 12;
-            assert_eq!(still, render(&state, capabilities));
-            state.clock.frame = 6;
-        }
+        let reduced = Capabilities {
+            reduced_motion: true,
+            ..caps()
+        };
+        let still = render(&state, reduced);
+        state.clock.frame = 12;
+        assert_eq!(still, render(&state, reduced));
+        state.clock.frame = 6;
+
+        // Without color the same pulse moves, as weight: NO_COLOR is not a
+        // request for stillness.
+        let plain = Capabilities {
+            color_depth: ColorDepth::None,
+            ..caps()
+        };
+        state.clock.frame = 0;
+        let first = render(&state, plain);
+        state.clock.frame = 6;
+        let next = render(&state, plain);
+        let moved = first
+            .content
+            .iter()
+            .zip(&next.content)
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(moved >= 1, "the ASCII spinner moves under NO_COLOR");
     }
     state.apply_event(UiEvent::RunCompleted { run_id: 1 });
     let finished = render(&state, caps());
@@ -1389,14 +1449,31 @@ fn thinking_header_patch_handles_boundary_anchor_offsets_without_body_work() {
                 .contains("Pensando")
         });
         if header_expected {
-            let header_row = header_row.expect("visible Thinking header");
-            assert_eq!(changed, vec![header_row as usize * 80 + 2]);
+            let header_row = header_row.expect("visible Thinking header") as usize;
+            // The spinner cell, then the sweep across the label ("Pensando"
+            // starts in column 4); the clock beside it and the body stay put.
+            let columns: Vec<usize> = changed
+                .iter()
+                .map(|index| {
+                    assert_eq!(index / 80, header_row, "only the header row may change");
+                    index % 80
+                })
+                .collect();
+            assert!(columns.contains(&2), "spinner cell moves: {columns:?}");
+            assert!(
+                columns
+                    .iter()
+                    .all(|column| *column == 2 || (4..12).contains(column)),
+                "sweep stays inside the label: {columns:?}"
+            );
         } else {
             assert!(
                 header_row.is_none(),
                 "row_offset=1 should leave the boundary-prefixed header offscreen"
             );
-            assert_eq!(changed.len(), 1, "offscreen Thinking pulses the rail only");
+            let rows: std::collections::BTreeSet<_> =
+                changed.iter().map(|index| index / 80).collect();
+            assert_eq!(rows.len(), 1, "offscreen Thinking pulses the rail only");
         }
     }
 }
@@ -1687,9 +1764,59 @@ fn spinner_glyph_cycles_braille_and_honors_fallbacks() {
     assert_eq!(super::spinner_glyph(0, reduced), '\u{25cb}');
     assert_eq!(super::spinner_glyph(1, reduced), '\u{25cb}');
 
+    // NO_COLOR removes hue, not movement: an ASCII spinner, half the speed of
+    // the braille one because it has four frames instead of ten.
     let no_color = Capabilities {
         color_depth: ColorDepth::None,
         ..full
     };
-    assert_eq!(super::spinner_glyph(0, no_color), '~');
+    let ascii: Vec<char> = (0..10)
+        .map(|frame| super::spinner_glyph(frame, no_color))
+        .collect();
+    assert_eq!(ascii, ['|', '|', '/', '/', '-', '-', '\\', '\\', '|', '|']);
+    // Only the reduced-motion preference stops it, and then it is the static
+    // ASCII marker.
+    let plain_and_reduced = Capabilities {
+        reduced_motion: true,
+        ..no_color
+    };
+    assert_eq!(super::spinner_glyph(0, plain_and_reduced), '~');
+    assert_eq!(super::spinner_glyph(6, plain_and_reduced), '~');
+}
+
+#[test]
+fn no_color_keeps_the_motion_clock_and_only_reduced_motion_stops_it() {
+    let mut state = AppState::new();
+    state.authenticated = true;
+    state.apply_event(UiEvent::run_started(1));
+    let mut cache = WrapCache::default();
+    let plain = Capabilities {
+        color_depth: ColorDepth::None,
+        ..caps()
+    };
+    assert!(super::motion_needed(&state, caps(), &mut cache));
+    assert!(super::motion_needed(&state, plain, &mut cache));
+    let reduced = Capabilities {
+        reduced_motion: true,
+        ..plain
+    };
+    assert!(!super::motion_needed(&state, reduced, &mut cache));
+}
+
+#[test]
+fn slow_spinner_steps_once_a_second_and_falls_back_to_ascii() {
+    let full = caps();
+    let steps: Vec<char> = [0, 999, 1_000, 2_000, 3_000, 4_000, 5_500]
+        .into_iter()
+        .map(|elapsed_ms| super::slow_spinner_glyph(elapsed_ms, full))
+        .collect();
+    assert_eq!(steps, ['⠋', '⠋', '⠹', '⠼', '⠧', '⠋', '⠹']);
+    let no_color = Capabilities {
+        color_depth: ColorDepth::None,
+        ..full
+    };
+    let ascii: Vec<char> = (0..5)
+        .map(|second| super::slow_spinner_glyph(second * 1_000, no_color))
+        .collect();
+    assert_eq!(ascii, ['|', '/', '-', '\\', '|']);
 }

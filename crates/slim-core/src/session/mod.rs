@@ -18,6 +18,7 @@ mod resume;
 mod schema_v2;
 mod tool_phases;
 mod transcript;
+mod turns;
 
 pub use prompt_queue::{PromptQueueJournal, PromptQueueSnapshot};
 use serde::{Deserialize, Serialize};
@@ -77,6 +78,9 @@ pub use tool_phases::{
 };
 pub use transcript::{
     provider_messages_from_entries, provider_messages_from_records, recovery_tool_results,
+};
+pub use turns::{
+    fork_session_before_turn, list_turns, peek_session, SessionPeek, TurnError, TurnInfo,
 };
 
 pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 1;

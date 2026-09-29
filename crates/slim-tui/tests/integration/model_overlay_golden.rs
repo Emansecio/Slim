@@ -1,11 +1,14 @@
-//! Model overlay interaction: unified provider-grouped list, key routing
-//! (G233) and typed filtering with Space fold/unfold (G234).
+//! Model overlay interaction: provider groups, inline effort/speed and
+//! stable selection through filtering and catalog refreshes.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
-use slim_tui::api::{LoginProvider, ModelAlias, OpenCodeModelView, ReasoningEffort, UiCommand};
+use slim_tui::api::{
+    LoginProvider, ModelAlias, OpenCodeCatalogSource, OpenCodeModelView, ReasoningEffort,
+    UiCommand, UiEvent,
+};
 use slim_tui::app::{AppState, EffortTarget, ModelRow};
 use slim_tui::reducer::{reduce, Action, Effect};
 use slim_tui::render::WrapCache;
@@ -112,10 +115,9 @@ fn arrows_reach_the_unified_overlay() {
     );
 }
 
-/// Typing filters across groups; Enter on a Codex alias opens the effort
-/// step; non-matching providers hide their models (G233).
+/// Filtering lands on an actionable model. Effort changes in that same list.
 #[test]
-fn codex_alias_filters_and_enter_opens_effort() {
+fn codex_alias_filters_and_adjusts_effort_inline() {
     let mut state = state_with_opencode_catalog();
     type_text(&mut state, "lu");
 
@@ -131,15 +133,22 @@ fn codex_alias_filters_and_enter_opens_effort() {
         "mismatched provider models hide"
     );
 
-    // Filtered rows: Header(0), Alias(Luna), Header(1) → Down to Luna.
-    reduce(&mut state, Action::Key(press(KeyCode::Down)));
-    reduce(&mut state, Action::Key(press(KeyCode::Enter)));
-    let effort = state.effort_overlay.expect("effort step");
-    assert_eq!(effort.target, EffortTarget::Alias(ModelAlias::Luna));
-    assert!(
-        effort.speed_toggle(),
-        "Codex aliases keep the Normal/Fast toggle"
+    assert_eq!(state.model_overlay.as_ref().unwrap().selected, 0);
+    reduce(&mut state, Action::Key(press(KeyCode::Right)));
+    let overlay = state.model_overlay.as_ref().expect("picker stays open");
+    assert_eq!(
+        overlay.pending_efforts,
+        vec![(
+            EffortTarget::Alias(ModelAlias::Luna),
+            ReasoningEffort::XHigh
+        )]
     );
+    let effects = reduce(&mut state, Action::Key(press(KeyCode::Enter)));
+    assert!(effects.contains(&Effect::Send(UiCommand::SetModel {
+        model: ModelAlias::Luna,
+        effort: ReasoningEffort::XHigh,
+        fast: false,
+    })));
 }
 
 #[test]
@@ -172,25 +181,27 @@ fn astra_picker_selects_reasoning_and_speed_and_cancel_does_not_apply_speed() {
     let mut state = state_with_opencode_catalog();
     type_text(&mut state, "astra");
     assert!(render_to_string(&state).contains("GPT-6 Astra"));
-    reduce(&mut state, Action::Key(press(KeyCode::Down)));
-    reduce(&mut state, Action::Key(press(KeyCode::Enter)));
     let normal = render_to_string(&state);
-    assert!(normal.contains("Velocidade: Normal"));
+    assert!(normal.contains("velocidade Normal"));
     assert!(!normal.contains("Ultra"));
     reduce(&mut state, Action::Key(press(KeyCode::Tab)));
     let fast = render_to_string(&state);
-    assert!(fast.contains("Rápida (maior uso)"));
+    assert!(fast.contains("velocidade Rápida"));
     assert!(fast.contains("Tab alternar"));
     reduce(&mut state, Action::Key(press(KeyCode::Esc)));
     assert!(
         !state.codex_fast,
         "cancel must not change the session speed"
     );
-    reduce(&mut state, Action::Key(press(KeyCode::Enter)));
-    assert!(!state.effort_overlay.as_ref().unwrap().fast);
+    reduce(
+        &mut state,
+        Action::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+    );
+    type_text(&mut state, "astra");
+    assert!(!state.model_overlay.as_ref().unwrap().pending_fast);
     reduce(&mut state, Action::Key(press(KeyCode::Tab)));
-    reduce(&mut state, Action::Key(press(KeyCode::Down)));
-    reduce(&mut state, Action::Key(press(KeyCode::Down)));
+    reduce(&mut state, Action::Key(press(KeyCode::Right)));
+    reduce(&mut state, Action::Key(press(KeyCode::Right)));
     let effects = reduce(&mut state, Action::Key(press(KeyCode::Enter)));
     assert!(effects.contains(&Effect::Send(UiCommand::SetModel {
         model: ModelAlias::Astra,
@@ -244,38 +255,30 @@ fn select_row(state: &mut AppState, predicate: impl Fn(&ModelRow) -> bool) {
     );
 }
 
-/// A catalog model with declared levels opens the effort step; that step must
-/// not advertise the Codex Normal/Fast toggle and Esc returns to the picker.
+/// Catalog levels stay in the model list; Codex speed is absent there.
 #[test]
-fn catalog_effort_step_hides_the_codex_speed_row() {
+fn catalog_effort_is_inline_without_codex_speed() {
     let mut state = state_with_zen_catalog();
     select_row(&mut state, |row| matches!(row, ModelRow::Zen(0)));
-    reduce(&mut state, Action::Key(press(KeyCode::Enter)));
-
     let frame = render_to_string(&state);
     assert!(
-        frame.contains("Selecionar esforço"),
-        "effort step is rendered:\n{frame}"
+        frame.contains("← High →"),
+        "effort control is rendered:\n{frame}"
     );
     assert!(
-        frame.contains("XHigh"),
-        "declared levels are listed:\n{frame}"
-    );
-    assert!(
-        !frame.contains("Velocidade"),
+        !frame.contains("velocidade"),
         "catalog models have no service tier:\n{frame}"
     );
-    assert!(
-        !frame.contains("Tab alternar"),
-        "no inert Tab hint:\n{frame}"
-    );
-
-    reduce(&mut state, Action::Key(press(KeyCode::Esc)));
+    reduce(&mut state, Action::Key(press(KeyCode::Left)));
+    let effects = reduce(&mut state, Action::Key(press(KeyCode::Enter)));
     assert!(state.effort_overlay.is_none());
-    assert!(
-        state.model_overlay.is_some(),
-        "Esc returns to the picker with the model still selected (G239)"
-    );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Send(UiCommand::SetZenModel {
+            effort: ReasoningEffort::Medium,
+            ..
+        })
+    )));
 }
 
 /// Space folds and unfolds the group under the cursor; a collapsed group
@@ -325,6 +328,109 @@ fn space_folds_and_unfolds_provider_groups() {
 }
 
 #[test]
+fn spaces_in_a_model_search_are_text_and_enter_uses_the_first_match() {
+    let mut state = state_with_opencode_catalog();
+    type_text(&mut state, "grok 4");
+    let overlay = state.model_overlay.as_ref().expect("picker");
+    assert_eq!(overlay.filter, "grok 4");
+    assert_eq!(
+        overlay.selected, 0,
+        "filtered headers are not focus targets"
+    );
+    let effects = reduce(&mut state, Action::Key(press(KeyCode::Enter)));
+    assert!(effects.iter().any(|effect| matches!(effect,
+        Effect::Send(UiCommand::SetOpenCodeModel { model, .. }) if model == "grok-4"
+    )));
+}
+
+#[test]
+fn catalog_refresh_keeps_model_identity_and_removed_focus_cannot_apply() {
+    let mut state = state_with_long_opencode_catalog();
+    select_row(&mut state, |row| matches!(row, ModelRow::Catalog(50)));
+    let mut updated = state.open_code_models.clone();
+    updated.insert(
+        0,
+        OpenCodeModelView {
+            id: "new-model".into(),
+            name: "New Model".into(),
+            context_window_tokens: 128_000,
+            max_output_tokens: 16_000,
+            reasoning_levels: Vec::new(),
+            accepts_images: false,
+        },
+    );
+    state.apply_event(UiEvent::OpenCodeCatalogLoaded {
+        models: updated.clone(),
+        source: OpenCodeCatalogSource::Live,
+    });
+    let overlay = state.model_overlay.as_ref().unwrap();
+    let rows = overlay.rows(
+        &state.open_code_models,
+        &state.cline_pass_models,
+        &state.command_code_models,
+        &state.zen_models,
+    );
+    assert!(matches!(rows[overlay.selected], ModelRow::Catalog(51)));
+    assert!(!overlay.selection_lost);
+
+    updated.retain(|model| model.id != "model-050");
+    state.apply_event(UiEvent::OpenCodeCatalogLoaded {
+        models: updated.clone(),
+        source: OpenCodeCatalogSource::Live,
+    });
+    assert!(state.model_overlay.as_ref().unwrap().selection_lost);
+    state.apply_event(UiEvent::OpenCodeCatalogLoaded {
+        models: updated,
+        source: OpenCodeCatalogSource::Live,
+    });
+    assert!(
+        state.model_overlay.as_ref().unwrap().selection_lost,
+        "another refresh cannot silently validate a different numeric row"
+    );
+    let effects = reduce(&mut state, Action::Key(press(KeyCode::Enter)));
+    assert!(!effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Send(UiCommand::SetOpenCodeModel { .. }))));
+    assert!(state.model_overlay.is_some());
+}
+
+#[test]
+fn active_model_identity_includes_the_provider_when_catalog_ids_overlap() {
+    let mut state = state_with_opencode_catalog();
+    state.model = "gpt-5.6-sol".into();
+    state.auth_provider = Some(slim_tui::api::LoginProvider::OpenCodeGo);
+    state.open_code_models.insert(
+        0,
+        OpenCodeModelView {
+            id: "gpt-5.6-sol".into(),
+            name: "Catalog Sol".into(),
+            context_window_tokens: 128_000,
+            max_output_tokens: 16_000,
+            reasoning_levels: Vec::new(),
+            accepts_images: false,
+        },
+    );
+    reduce(&mut state, Action::Key(press(KeyCode::Esc)));
+    reduce(
+        &mut state,
+        Action::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('l'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )),
+    );
+    let overlay = state.model_overlay.as_ref().expect("picker");
+    let rows = overlay.rows(
+        &state.open_code_models,
+        &state.cline_pass_models,
+        &state.command_code_models,
+        &state.zen_models,
+    );
+    assert!(matches!(rows[overlay.selected], ModelRow::Catalog(0)));
+    let frame = render_to_string(&state);
+    assert!(frame.contains("● Catalog Sol"), "{frame}");
+}
+
+#[test]
 fn selected_model_stays_visible_in_a_hundred_row_catalog() {
     let mut state = state_with_long_opencode_catalog();
     for _ in 0..80 {
@@ -334,22 +440,21 @@ fn selected_model_stays_visible_in_a_hundred_row_catalog() {
     let frame = render_at(&state, 80, 24);
 
     assert!(
-        frame.contains("> Model 080"),
+        frame.contains(">   Model 080"),
         "selected model must remain visible in the picker viewport:\n{frame}"
     );
     assert!(frame.contains('/'), "picker must expose position feedback");
 }
 
-/// The picker box hugs its rows (no 22-row padding), keeps the footer on the
-/// last inner row and uses rounded corners like the composer.
+/// Filtering does not move the panel or its search cursor.
 #[test]
-fn overlay_box_fits_content_with_rounded_corners() {
-    let state = state_with_opencode_catalog();
+fn overlay_geometry_is_stable_while_filtering() {
+    let mut state = state_with_opencode_catalog();
     let frame = render_to_string(&state);
     let lines: Vec<&str> = frame.lines().collect();
     let top = lines
         .iter()
-        .position(|line| line.contains("╭ Selecionar modelo"))
+        .position(|line| line.contains("╭ Modelo e esforço"))
         .unwrap_or_else(|| panic!("rounded title row missing:\n{frame}"));
     let bottom = top
         + lines[top..]
@@ -361,13 +466,14 @@ fn overlay_box_fits_content_with_rounded_corners() {
         "square corners must be gone:\n{frame}"
     );
     assert!(
-        lines[bottom - 1].contains("Enter selecionar"),
+        lines[bottom - 1].contains("Enter aplicar"),
         "footer must sit on the last inner row:\n{frame}"
     );
-    assert!(
-        bottom - top - 1 < 12,
-        "box must be sized to content, not the fixed cap:\n{frame}"
-    );
+    type_text(&mut state, "astra");
+    let filtered = render_to_string(&state);
+    let filtered_lines: Vec<&str> = filtered.lines().collect();
+    assert!(filtered_lines[top].contains("╭ Modelo e esforço"));
+    assert!(filtered_lines[bottom].contains('╰'));
 }
 
 fn render_to_string(state: &AppState) -> String {

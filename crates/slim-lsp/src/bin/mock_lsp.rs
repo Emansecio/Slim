@@ -19,6 +19,9 @@ const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 struct Arguments {
     log: Option<PathBuf>,
     initialize_delay: Duration,
+    /// Holds the `initialize` response until this file exists, so a test
+    /// decides when startup completes instead of racing a fixed delay.
+    initialize_gate: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -28,6 +31,8 @@ struct MockConfig {
     responses: serde_json::Map<String, Value>,
     log_path: Option<PathBuf>,
     request_delay: Duration,
+    /// Holds every delayed request response until this file exists.
+    request_gate: Option<PathBuf>,
     definition_uri: Option<String>,
     publish_diagnostics: bool,
     diagnostic_version_delta: i64,
@@ -112,7 +117,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let params = message.get("params").cloned().unwrap_or(Value::Null);
 
         if let Some(result) = config.responses.get(method).filter(|_| id.is_some()) {
-            delay(config.request_delay);
+            hold(&config);
             respond(&mut writer, &mut logger, id, result.clone())?;
             continue;
         }
@@ -126,6 +131,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 if !arguments.initialize_delay.is_zero() {
                     thread::sleep(arguments.initialize_delay);
+                }
+                if let Some(gate) = &arguments.initialize_gate {
+                    wait_for_gate(gate);
                 }
                 respond(
                     &mut writer,
@@ -218,7 +226,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "textDocument/didSave" | "textDocument/didClose" => {}
             "textDocument/hover" => {
-                delay(config.request_delay);
+                hold(&config);
                 let uri = params
                     .pointer("/textDocument/uri")
                     .and_then(Value::as_str)
@@ -241,7 +249,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             }
             "textDocument/definition" => {
-                delay(config.request_delay);
+                hold(&config);
                 let uri = config
                     .definition_uri
                     .clone()
@@ -266,7 +274,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             }
             "textDocument/references" => {
-                delay(config.request_delay);
+                hold(&config);
                 let uri = params
                     .pointer("/textDocument/uri")
                     .and_then(Value::as_str)
@@ -305,7 +313,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             "textDocument/documentSymbol" => {
-                delay(config.request_delay);
+                hold(&config);
                 if config.document_symbol_nested {
                     respond(
                         &mut writer,
@@ -357,7 +365,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "workspace/symbol" => {
-                delay(config.request_delay);
+                hold(&config);
                 respond(&mut writer, &mut logger, id, json!([]))?;
             }
             "mock/barrier" => respond(&mut writer, &mut logger, id, Value::Null)?,
@@ -449,6 +457,10 @@ impl MockConfig {
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
             ),
+            request_gate: mock
+                .and_then(|value| value.get("requestGate"))
+                .and_then(Value::as_str)
+                .map(PathBuf::from),
             definition_uri: mock
                 .and_then(|value| value.get("definitionUri"))
                 .and_then(Value::as_str)
@@ -551,15 +563,32 @@ fn parse_arguments() -> Result<Arguments, Box<dyn std::error::Error>> {
                     .parse::<u64>()?;
                 parsed.initialize_delay = Duration::from_millis(value);
             }
+            "--initialize-gate" => {
+                parsed.initialize_gate = Some(PathBuf::from(
+                    arguments.next().ok_or("--initialize-gate needs a path")?,
+                ));
+            }
             other => return Err(format!("unknown argument: {other}").into()),
         }
     }
     Ok(parsed)
 }
 
-fn delay(duration: Duration) {
-    if !duration.is_zero() {
-        thread::sleep(duration);
+fn hold(config: &MockConfig) {
+    if !config.request_delay.is_zero() {
+        thread::sleep(config.request_delay);
+    }
+    if let Some(gate) = &config.request_gate {
+        wait_for_gate(gate);
+    }
+}
+
+/// Blocks until `gate` exists. The cap keeps an abandoned mock from outliving a
+/// failed test forever; a healthy test releases the gate within milliseconds.
+fn wait_for_gate(gate: &std::path::Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !gate.exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(2));
     }
 }
 

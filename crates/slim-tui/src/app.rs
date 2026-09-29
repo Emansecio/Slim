@@ -308,6 +308,10 @@ pub struct ExecutionSummary {
 }
 
 const MAX_ACTIVITY_TIMELINE: usize = 64;
+/// Prompts kept for Up/Down recall (DESIGN §15.3).
+const MAX_PROMPT_HISTORY: usize = 100;
+/// Ceiling on the `@` candidate list kept in memory (host already bounds it).
+const MAX_WORKSPACE_FILES: usize = 50_000;
 const MAX_EXECUTION_HISTORY: usize = 32;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -367,6 +371,12 @@ pub struct ModelOverlay {
     /// Collapsed state per group: 0 = OpenAI Codex, 1 = OpenCode Go,
     /// 2 = ClinePass, 3 = Command Code, 4 = OpenCode Zen.
     pub collapsed: [bool; 5],
+    /// Edits made in the picker are local until Enter confirms the model.
+    pub pending_efforts: Vec<(EffortTarget, ReasoningEffort)>,
+    pub pending_fast: bool,
+    /// A catalog refresh removed the focused model. Require a deliberate
+    /// navigation key before Enter can apply a different row.
+    pub selection_lost: bool,
 }
 
 /// `/mcp` overlay: flat server list with an inline remove confirmation.
@@ -398,6 +408,62 @@ pub enum ModelRow {
     Zen(usize),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelChoice {
+    pub target: EffortTarget,
+    pub name: String,
+    pub id: String,
+    pub levels: Vec<ReasoningEffort>,
+    pub context_window_tokens: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub accepts_images: Option<bool>,
+}
+
+impl ModelRow {
+    pub fn choice(
+        &self,
+        opencode: &[OpenCodeModelView],
+        clinepass: &[OpenCodeModelView],
+        command_code: &[OpenCodeModelView],
+        zen: &[OpenCodeModelView],
+    ) -> Option<ModelChoice> {
+        let catalog_choice = |model: &OpenCodeModelView, target| ModelChoice {
+            target,
+            name: model.name.clone(),
+            id: model.id.clone(),
+            levels: model.reasoning_levels.clone(),
+            context_window_tokens: (model.context_window_tokens > 0)
+                .then_some(model.context_window_tokens),
+            max_output_tokens: (model.max_output_tokens > 0).then_some(model.max_output_tokens),
+            accepts_images: Some(model.accepts_images),
+        };
+        match self {
+            Self::Header(_) => None,
+            Self::Alias(alias) => Some(ModelChoice {
+                target: EffortTarget::Alias(*alias),
+                name: alias.label().to_owned(),
+                id: alias.id().to_owned(),
+                levels: ReasoningEffort::supported(*alias).to_vec(),
+                context_window_tokens: None,
+                max_output_tokens: None,
+                accepts_images: None,
+            }),
+            Self::Catalog(index) => opencode
+                .get(*index)
+                .map(|model| catalog_choice(model, EffortTarget::OpenCodeGo(model.id.clone()))),
+            Self::ClinePass(index) => clinepass
+                .get(*index)
+                .map(|model| catalog_choice(model, EffortTarget::ClinePass(model.id.clone()))),
+            Self::CommandCode(index) => command_code
+                .get(*index)
+                .map(|model| catalog_choice(model, EffortTarget::CommandCode(model.id.clone()))),
+            Self::Zen(index) => zen
+                .get(*index)
+                .map(|model| catalog_choice(model, EffortTarget::Zen(model.id.clone()))),
+        }
+    }
+}
+
 impl ModelOverlay {
     /// Builds the flattened row list respecting the filter and collapsed state.
     ///
@@ -421,7 +487,9 @@ impl ModelOverlay {
             if rows.is_empty() {
                 return;
             }
-            out.push(ModelRow::Header(group));
+            if query.is_empty() {
+                out.push(ModelRow::Header(group));
+            }
             if !(self.collapsed[group] && query.is_empty()) {
                 out.extend(rows);
             }
@@ -496,6 +564,39 @@ impl ModelOverlay {
         }
     }
 
+    pub fn pending_effort(
+        &self,
+        choice: &ModelChoice,
+        current: ReasoningEffort,
+    ) -> ReasoningEffort {
+        if let Some((_, effort)) = self
+            .pending_efforts
+            .iter()
+            .find(|(target, _)| target == &choice.target)
+        {
+            return *effort;
+        }
+        if choice.levels.contains(&current) {
+            current
+        } else if let EffortTarget::Alias(alias) = choice.target {
+            ReasoningEffort::default_for(alias)
+        } else {
+            choice.levels.first().copied().unwrap_or(current)
+        }
+    }
+
+    pub fn set_pending_effort(&mut self, target: EffortTarget, effort: ReasoningEffort) {
+        if let Some((_, current)) = self
+            .pending_efforts
+            .iter_mut()
+            .find(|(existing, _)| existing == &target)
+        {
+            *current = effort;
+        } else {
+            self.pending_efforts.push((target, effort));
+        }
+    }
+
     /// Returns a fresh overlay with the selection positioned at the currently
     /// active model, or the first non-header row as fallback.
     /// The four catalogs stay explicit: bundling them into a struct would touch
@@ -508,7 +609,39 @@ impl ModelOverlay {
         command_code_models: &[OpenCodeModelView],
         zen_models: &[OpenCodeModelView],
     ) -> Self {
-        let active_group = if ModelAlias::parse(current_model).is_some() {
+        let provider_group = active_provider.and_then(|provider| match provider {
+            LoginProvider::OpenAiCodex if ModelAlias::parse(current_model).is_some() => Some(0),
+            LoginProvider::OpenCodeGo
+                if opencode_models
+                    .iter()
+                    .any(|model| model.id == current_model) =>
+            {
+                Some(1)
+            }
+            LoginProvider::ClinePass
+                if clinepass_models
+                    .iter()
+                    .any(|model| model.id == current_model) =>
+            {
+                Some(2)
+            }
+            LoginProvider::CommandCode
+                if command_code_models
+                    .iter()
+                    .any(|model| model.id == current_model) =>
+            {
+                Some(3)
+            }
+            LoginProvider::OpenCodeZen
+                if zen_models.iter().any(|model| model.id == current_model) =>
+            {
+                Some(4)
+            }
+            _ => None,
+        });
+        let active_group = if let Some(group) = provider_group {
+            group
+        } else if ModelAlias::parse(current_model).is_some() {
             0
         } else if opencode_models
             .iter()
@@ -551,19 +684,18 @@ impl ModelOverlay {
         );
         overlay.selected = rows
             .iter()
-            .position(|row| match row {
-                ModelRow::Alias(alias) => alias.id() == current_model,
-                ModelRow::Catalog(idx) => opencode_models
-                    .get(*idx)
-                    .is_some_and(|m| m.id == current_model),
-                ModelRow::ClinePass(idx) => clinepass_models
-                    .get(*idx)
-                    .is_some_and(|m| m.id == current_model),
-                ModelRow::CommandCode(idx) => command_code_models
-                    .get(*idx)
-                    .is_some_and(|m| m.id == current_model),
-                ModelRow::Zen(idx) => zen_models.get(*idx).is_some_and(|m| m.id == current_model),
-                _ => false,
+            .position(|row| {
+                row.choice(
+                    opencode_models,
+                    clinepass_models,
+                    command_code_models,
+                    zen_models,
+                )
+                .is_some_and(|choice| {
+                    choice.id == current_model
+                        && active_provider
+                            .is_none_or(|provider| choice.target.provider() == provider)
+                })
             })
             .unwrap_or_else(|| {
                 rows.iter()
@@ -582,6 +714,17 @@ pub struct SlashSuggestions {
     pub selected: usize,
 }
 
+/// `@file` completion state: `start..end` is the char span of the token under
+/// edit, `matches` indexes `AppState::workspace_files` best-first.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MentionSuggestions {
+    pub query: String,
+    pub selected: usize,
+    pub start: usize,
+    pub end: usize,
+    pub matches: Vec<usize>,
+}
+
 /// Destination of a confirmed effort choice. Codex aliases also carry the
 /// Normal/Fast speed toggle; provider-catalog models send model + effort only,
 /// because speed is a Codex service tier.
@@ -595,6 +738,19 @@ pub enum EffortTarget {
     ClinePass(String),
     CommandCode(String),
     Xai(String),
+}
+
+impl EffortTarget {
+    pub fn provider(&self) -> LoginProvider {
+        match self {
+            Self::Alias(_) => LoginProvider::OpenAiCodex,
+            Self::OpenCodeGo(_) => LoginProvider::OpenCodeGo,
+            Self::Zen(_) => LoginProvider::OpenCodeZen,
+            Self::ClinePass(_) => LoginProvider::ClinePass,
+            Self::CommandCode(_) => LoginProvider::CommandCode,
+            Self::Xai(_) => LoginProvider::Xai,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -675,6 +831,8 @@ pub struct AppState {
     /// Last effective model/effort/mode change and its semantic clock time.
     /// Focus movement in an overlay never updates this value.
     pub confirmed_setting: Option<(ConfirmedSetting, u64)>,
+    /// One short visual acknowledgement after moving through a picker.
+    pub menu_focus_at_ms: Option<u64>,
     pub codex_fast: bool,
     pub auth_provider: Option<LoginProvider>,
     pub authenticated: bool,
@@ -707,9 +865,39 @@ pub struct AppState {
     /// Slash autocomplete while the token under edit matches a command
     /// (None = closed). Triggered by `/` anywhere in the draft.
     pub slash_suggestions: Option<SlashSuggestions>,
+    /// `@` file completion (None = closed). Triggered by a token starting with `@`.
+    pub mention_suggestions: Option<MentionSuggestions>,
+    /// Workspace files offered to `@` completion (host order, no whitespace in paths).
+    pub workspace_files: Vec<String>,
+    pub workspace_files_loaded: bool,
+    pub workspace_files_truncated: bool,
+    /// The list may miss files created since it was fetched; refetched on next open.
+    workspace_files_stale: bool,
+    workspace_files_request: Option<u64>,
+    next_workspace_files_request: u64,
+    /// Set when the popup needs a fetch; `reduce` turns it into a command.
+    wants_workspace_files: bool,
+    /// Request id of the `!command` the host is running for the user (None = idle).
+    pub user_shell: Option<u64>,
+    next_user_shell_id: u64,
+    /// `/resume` or `/rewind` list while open (None = closed).
+    pub session_picker: Option<crate::session_picker::SessionPicker>,
+    next_session_request_id: u64,
+    /// Name given with `/rename`; shown in the session rail.
+    pub session_title: Option<String>,
     pub inspector: InspectorState,
     pub search: Option<SearchState>,
     blocks: Vec<Block>,
+    /// Index of the prompt block currently drawing the pending agent header.
+    awaiting_agent: Option<usize>,
+    /// Prompts sent in this conversation, oldest first (DESIGN §15.3: 100).
+    prompt_history: VecDeque<String>,
+    /// Position while recalling with Up/Down, counted from the newest (0).
+    history_cursor: Option<usize>,
+    /// The draft the user was typing when recall started.
+    history_stash: String,
+    /// Composer revision right after a recall: an edit changes it and ends recall.
+    history_revision: u64,
     block_ids: HashSet<Arc<str>>,
     pub notifications: Vec<Notification>,
     /// Bounded compact history; transient expiry only affects `notifications`.
@@ -826,6 +1014,7 @@ impl Default for AppState {
             model: ModelAlias::Sol.id().into(),
             effort: ReasoningEffort::High,
             confirmed_setting: None,
+            menu_focus_at_ms: None,
             codex_fast: false,
             auth_provider: None,
             authenticated: false,
@@ -850,9 +1039,27 @@ impl Default for AppState {
             palette_selected: 0,
             palette_viewport_start: 0,
             slash_suggestions: None,
+            mention_suggestions: None,
+            workspace_files: Vec::new(),
+            workspace_files_loaded: false,
+            workspace_files_truncated: false,
+            workspace_files_stale: false,
+            workspace_files_request: None,
+            next_workspace_files_request: 1,
+            wants_workspace_files: false,
+            user_shell: None,
+            next_user_shell_id: 1,
+            session_picker: None,
+            next_session_request_id: 1,
+            session_title: None,
             inspector: InspectorState::default(),
             search: None,
             blocks: Vec::new(),
+            awaiting_agent: None,
+            prompt_history: VecDeque::new(),
+            history_cursor: None,
+            history_stash: String::new(),
+            history_revision: 0,
             block_ids: HashSet::new(),
             notifications: Vec::new(),
             notification_history: Vec::new(),
@@ -1134,8 +1341,13 @@ impl AppState {
         skill_names: Vec<String>,
     ) {
         self.session_id = Some(session_id);
+        self.session_picker = None;
+        self.session_title = None;
         self.set_workspace(cwd, skill_names);
         self.blocks.clear();
+        self.awaiting_agent = None;
+        self.prompt_history.clear();
+        self.history_cursor = None;
         self.block_ids.clear();
         self.notifications.clear();
         self.notification_history.clear();
@@ -1151,6 +1363,7 @@ impl AppState {
         self.inspector = InspectorState::default();
         self.search = None;
         self.slash_suggestions = None;
+        self.mention_suggestions = None;
         self.working = false;
         self.prompt_preparation = None;
         self.cancelling_preparation = None;
@@ -1209,6 +1422,7 @@ impl AppState {
             });
             let mut block = match message.role {
                 TranscriptRole::User => {
+                    self.remember_prompt(&message.text);
                     let mut block =
                         Block::new(id, BlockKind::User(message.text), BlockLifecycle::Complete);
                     if saw_user {
@@ -1675,6 +1889,7 @@ impl AppState {
             }
         }
         self.revisions.content += 1;
+        self.sync_awaiting_agent();
         true
     }
 
@@ -1893,6 +2108,61 @@ impl AppState {
         self.execution_history.push_back(summary);
     }
 
+    /// Closes the turn with what it changed, when it changed or ran anything.
+    /// Runs after `finish_execution`, which fixes the duration it reports.
+    fn append_turn_receipt(&mut self, outcome: crate::receipt::ReceiptOutcome) {
+        let duration_ms = self
+            .last_execution
+            .as_ref()
+            .map_or(0, |summary| summary.duration_ms);
+        let receipt = crate::receipt::turn_receipt(&self.blocks, duration_ms, outcome);
+        if !receipt.is_worth_showing() {
+            return;
+        }
+        let id = self.fresh_id("receipt");
+        self.blocks.push(Block::new(
+            id,
+            BlockKind::Receipt(receipt),
+            BlockLifecycle::Complete,
+        ));
+        self.note_new_content();
+    }
+
+    /// A call still being written reports `Preparing tool · <name> · <size>` as it
+    /// grows. When the current activity is already that tool's preparation, only
+    /// the size changes: the phase clock and the timeline stay put, so one long
+    /// call does not look like a new phase every KiB. Returns whether it did.
+    fn refresh_preparing_tool_size(&mut self, label: &str) -> bool {
+        const PREFIX: &str = "Preparing tool · ";
+        let tool = |label: &str| {
+            label
+                .strip_prefix(PREFIX)
+                .and_then(|rest| rest.split(" · ").next())
+                .map(str::to_owned)
+        };
+        let Some(next) = tool(label) else {
+            return false;
+        };
+        let Some(activity) = self.activity.as_mut() else {
+            return false;
+        };
+        let ActivityPhase::External(current) = &mut activity.phase else {
+            return false;
+        };
+        if tool(current).as_deref() != Some(next.as_str()) || current == label {
+            return current == label;
+        }
+        label.clone_into(current);
+        if let Some(entry) = self.activity_timeline.back_mut() {
+            if matches!(&entry.phase, ActivityPhase::External(last) if tool(last).as_deref() == Some(next.as_str()))
+            {
+                entry.phase = ActivityPhase::External(label.to_owned());
+            }
+        }
+        self.revisions.status += 1;
+        true
+    }
+
     fn transition_activity(&mut self, phase: ActivityPhase) {
         if self.activity.as_ref().map(|activity| &activity.phase) == Some(&phase) {
             return;
@@ -1943,6 +2213,7 @@ impl AppState {
         self.approval_scroll = InspectorScroll::default();
         self.approval_content_accessible = false;
         self.slash_suggestions = None;
+        self.mention_suggestions = None;
         // G220/§16.4: the pending interaction owns the keyboard. Search,
         // palette and inspector dispatch before it and would keep stealing
         // (or, for the inspector, silently forwarding) its keys.
@@ -2250,7 +2521,259 @@ impl AppState {
         }
     }
 
+    fn focused_model_target(&self) -> Option<EffortTarget> {
+        let overlay = self.model_overlay.as_ref()?;
+        if overlay.selection_lost {
+            return None;
+        }
+        overlay
+            .rows(
+                &self.open_code_models,
+                &self.cline_pass_models,
+                &self.command_code_models,
+                &self.zen_models,
+            )
+            .get(overlay.selected)?
+            .choice(
+                &self.open_code_models,
+                &self.cline_pass_models,
+                &self.command_code_models,
+                &self.zen_models,
+            )
+            .map(|choice| choice.target)
+    }
+
+    fn restore_model_focus(&mut self, focused: Option<EffortTarget>) {
+        let Some(overlay) = self.model_overlay.as_mut() else {
+            return;
+        };
+        let rows = overlay.rows(
+            &self.open_code_models,
+            &self.cline_pass_models,
+            &self.command_code_models,
+            &self.zen_models,
+        );
+        if let Some(target) = focused {
+            if let Some(index) = rows.iter().position(|row| {
+                row.choice(
+                    &self.open_code_models,
+                    &self.cline_pass_models,
+                    &self.command_code_models,
+                    &self.zen_models,
+                )
+                .is_some_and(|choice| choice.target == target)
+            }) {
+                overlay.selected = index;
+                overlay.selection_lost = false;
+            } else {
+                overlay.selected = overlay.selected.min(rows.len().saturating_sub(1));
+                overlay.selection_lost = true;
+            }
+        } else {
+            overlay.selected = overlay.selected.min(rows.len().saturating_sub(1));
+        }
+    }
+
     pub fn apply_event(&mut self, event: UiEvent) {
+        if matches!(
+            event,
+            UiEvent::ToolEnded { .. } | UiEvent::WorkspaceChanged { .. }
+        ) {
+            self.workspace_files_stale = true;
+        }
+        self.apply_event_inner(event);
+        self.sync_awaiting_agent();
+    }
+
+    /// Keeps the `● Slim` header under the last prompt while its run is active
+    /// and the agent has produced nothing yet. The header then belongs to the
+    /// first agent block, which sits in the same row, so nothing jumps. The
+    /// scan stops at the first agent output, so it is O(1) mid-turn.
+    fn sync_awaiting_agent(&mut self) {
+        let mut target = None;
+        for (index, block) in self.blocks.iter().enumerate().rev() {
+            match block.kind() {
+                BlockKind::User(_) => {
+                    target = self.working.then_some(index);
+                    break;
+                }
+                BlockKind::Assistant(_) | BlockKind::Thinking(_) | BlockKind::Tool(_) => break,
+                _ => {}
+            }
+        }
+        if self.awaiting_agent == target {
+            return;
+        }
+        let mut changed = false;
+        if let Some(previous) = self.awaiting_agent.take() {
+            if let Some(block) = self.blocks.get_mut(previous) {
+                changed |= block.set_awaiting_agent(false);
+            }
+        }
+        if let Some(index) = target {
+            changed |= self.blocks[index].set_awaiting_agent(true);
+        }
+        self.awaiting_agent = target;
+        if changed {
+            self.revisions.content += 1;
+        }
+    }
+
+    /// Remembers a submitted prompt for Up/Down recall. Consecutive repeats
+    /// collapse; the history keeps the newest [`MAX_PROMPT_HISTORY`].
+    pub(crate) fn remember_prompt(&mut self, prompt: &str) {
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return;
+        }
+        self.history_cursor = None;
+        self.history_stash.clear();
+        if self
+            .prompt_history
+            .back()
+            .is_some_and(|last| last == prompt)
+        {
+            return;
+        }
+        if self.prompt_history.len() == MAX_PROMPT_HISTORY {
+            self.prompt_history.pop_front();
+        }
+        self.prompt_history.push_back(prompt.to_owned());
+    }
+
+    /// Whether Up/Down recall prompts instead of scrolling: while a recalled
+    /// prompt is untouched in the composer, in both directions; and to start,
+    /// on `Up` with an empty composer at the live edge.
+    /// Re-derives `@` completion from the composer after a draft edit. The
+    /// ranked list is reused while the token text is unchanged (cursor moves).
+    pub(crate) fn sync_mention_suggestions(&mut self) {
+        self.derive_mention_suggestions(false);
+    }
+
+    fn derive_mention_suggestions(&mut self, force: bool) {
+        if self.pending_interaction().is_some() {
+            self.mention_suggestions = None;
+            return;
+        }
+        let Some((start, end, query)) = self.composer.token_at_cursor('@') else {
+            self.mention_suggestions = None;
+            return;
+        };
+        if (!self.workspace_files_loaded || self.workspace_files_stale)
+            && self.workspace_files_request.is_none()
+        {
+            self.wants_workspace_files = true;
+        }
+        let previous = self.mention_suggestions.take();
+        let (matches, selected) = match previous {
+            Some(previous) if !force && previous.query == query => {
+                (previous.matches, previous.selected)
+            }
+            _ => (crate::mention::rank(&self.workspace_files, &query), 0),
+        };
+        // Once the list is known, no candidate means nothing to offer; while
+        // it loads the popup stays open with a placeholder row.
+        if self.workspace_files_loaded && matches.is_empty() {
+            return;
+        }
+        self.mention_suggestions = Some(MentionSuggestions {
+            query,
+            selected: selected.min(matches.len().saturating_sub(1)),
+            start,
+            end,
+            matches,
+        });
+    }
+
+    /// Opens the `/resume` or `/rewind` list and returns the command that
+    /// fills it. `None` when request ids are exhausted.
+    pub(crate) fn open_session_picker(
+        &mut self,
+        kind: crate::session_picker::PickerKind,
+    ) -> Option<UiCommand> {
+        use crate::session_picker::PickerKind;
+        let request_id = self.next_session_request_id;
+        self.next_session_request_id = request_id.checked_add(1)?;
+        self.session_picker = Some(crate::session_picker::SessionPicker::new(kind, request_id));
+        self.slash_suggestions = None;
+        self.mention_suggestions = None;
+        self.revisions.focus += 1;
+        Some(match kind {
+            PickerKind::Resume => UiCommand::ListSessions { request_id },
+            PickerKind::Rewind => UiCommand::ListTurns { request_id },
+        })
+    }
+
+    /// Marks a `!command` as running and returns its request id.
+    pub(crate) fn begin_user_shell(&mut self) -> Option<u64> {
+        let request_id = self.next_user_shell_id;
+        self.next_user_shell_id = request_id.checked_add(1)?;
+        self.user_shell = Some(request_id);
+        Some(request_id)
+    }
+
+    /// Command that fetches the workspace file list, when the popup asked for it.
+    pub(crate) fn take_workspace_files_request(&mut self) -> Option<UiCommand> {
+        if !std::mem::take(&mut self.wants_workspace_files) {
+            return None;
+        }
+        let request_id = self.next_workspace_files_request;
+        self.next_workspace_files_request = request_id.wrapping_add(1).max(1);
+        self.workspace_files_request = Some(request_id);
+        self.workspace_files_stale = false;
+        Some(UiCommand::RequestWorkspaceFiles { request_id })
+    }
+
+    pub fn history_recall_applies(&self, older: bool) -> bool {
+        if self.recalling_prompt() {
+            return true;
+        }
+        older
+            && !self.prompt_history.is_empty()
+            && self.composer.is_empty()
+            && self.scroll.is_live_edge()
+    }
+
+    fn recalling_prompt(&self) -> bool {
+        self.history_cursor.is_some() && self.composer.revision() == self.history_revision
+    }
+
+    /// Puts an older (`Up`) or newer (`Down`) prompt in the composer. Passing
+    /// the newest one restores the draft that was being typed.
+    pub(crate) fn recall_prompt(&mut self, older: bool) -> bool {
+        let len = self.prompt_history.len();
+        if len == 0 {
+            return false;
+        }
+        let current = self
+            .recalling_prompt()
+            .then_some(self.history_cursor)
+            .flatten();
+        let target = match (current, older) {
+            (None, true) => {
+                self.history_stash = self.composer.payload();
+                Some(0)
+            }
+            (Some(index), true) => Some((index + 1).min(len - 1)),
+            (Some(0), false) => None,
+            (Some(index), false) => Some(index - 1),
+            (None, false) => return false,
+        };
+        let text = match target {
+            Some(index) => self.prompt_history[len - 1 - index].clone(),
+            None => std::mem::take(&mut self.history_stash),
+        };
+        self.composer.clear();
+        self.composer.insert_text(text);
+        self.history_cursor = target;
+        self.history_revision = self.composer.revision();
+        self.slash_suggestions = None;
+        self.mention_suggestions = None;
+        self.revisions.content += 1;
+        true
+    }
+
+    fn apply_event_inner(&mut self, event: UiEvent) {
         match event {
             UiEvent::SessionSnapshot {
                 session_id,
@@ -2461,6 +2984,7 @@ impl AppState {
                     self.close_request_usage(true);
                     let pending = self.pending_todo_count();
                     self.finish_execution(run_id, RunOutcomeKind::Completed, pending);
+                    self.append_turn_receipt(crate::receipt::ReceiptOutcome::Completed);
                     if pending > 0 {
                         let id = self.fresh_id("pending-tasks");
                         self.blocks.push(Block::new(
@@ -2513,6 +3037,7 @@ impl AppState {
                     block.fold = FoldState::Collapsed;
                     self.blocks.push(block);
                     self.note_new_content();
+                    self.append_turn_receipt(crate::receipt::ReceiptOutcome::Interrupted);
                     self.turns_used = 0;
                     self.turn_budget_warned = false;
                     self.reset_this_turn_tool_budget();
@@ -2534,6 +3059,7 @@ impl AppState {
                     self.terminalize_latest_assistant(BlockLifecycle::Cancelled);
                     self.close_request_usage(false);
                     self.finish_execution(run_id, RunOutcomeKind::Interrupted, pending_count);
+                    self.append_turn_receipt(crate::receipt::ReceiptOutcome::Interrupted);
                     self.run_started_ms = None;
                     self.cancellation = None;
                     self.retry = None;
@@ -2871,65 +3397,35 @@ impl AppState {
                 self.revisions.status += 1;
             }
             UiEvent::OpenCodeCatalogLoaded { models, source } => {
+                let focused = self.focused_model_target();
                 self.open_code_models = models;
                 self.open_code_catalog_source = Some(source);
                 self.catalog_revision += 1;
-                // When the unified overlay is open, rebuild its layout so the
-                // catalog items appear as soon as they arrive.
-                if let Some(overlay) = self.model_overlay.as_mut() {
-                    let rows = overlay.rows(
-                        &self.open_code_models,
-                        &self.cline_pass_models,
-                        &self.command_code_models,
-                        &self.zen_models,
-                    );
-                    overlay.selected = overlay.selected.min(rows.len().saturating_sub(1));
-                }
+                self.restore_model_focus(focused);
                 self.revisions.status += 1;
             }
             UiEvent::ClinePassCatalogLoaded { models, source } => {
+                let focused = self.focused_model_target();
                 self.cline_pass_models = models;
                 self.cline_pass_catalog_source = Some(source);
                 self.catalog_revision += 1;
-                if let Some(overlay) = self.model_overlay.as_mut() {
-                    let rows = overlay.rows(
-                        &self.open_code_models,
-                        &self.cline_pass_models,
-                        &self.command_code_models,
-                        &self.zen_models,
-                    );
-                    overlay.selected = overlay.selected.min(rows.len().saturating_sub(1));
-                }
+                self.restore_model_focus(focused);
                 self.revisions.status += 1;
             }
             UiEvent::CommandCodeCatalogLoaded { models, source } => {
+                let focused = self.focused_model_target();
                 self.command_code_models = models;
                 self.command_code_catalog_source = Some(source);
                 self.catalog_revision += 1;
-                if let Some(overlay) = self.model_overlay.as_mut() {
-                    let rows = overlay.rows(
-                        &self.open_code_models,
-                        &self.cline_pass_models,
-                        &self.command_code_models,
-                        &self.zen_models,
-                    );
-                    overlay.selected = overlay.selected.min(rows.len().saturating_sub(1));
-                }
+                self.restore_model_focus(focused);
                 self.revisions.status += 1;
             }
             UiEvent::ZenCatalogLoaded { models, source } => {
+                let focused = self.focused_model_target();
                 self.zen_models = models;
                 self.zen_catalog_source = Some(source);
                 self.catalog_revision += 1;
-                if let Some(overlay) = self.model_overlay.as_mut() {
-                    let rows = overlay.rows(
-                        &self.open_code_models,
-                        &self.cline_pass_models,
-                        &self.command_code_models,
-                        &self.zen_models,
-                    );
-                    overlay.selected = overlay.selected.min(rows.len().saturating_sub(1));
-                }
+                self.restore_model_focus(focused);
                 self.revisions.status += 1;
             }
             UiEvent::McpServersChanged { servers } => {
@@ -3285,6 +3781,11 @@ impl AppState {
                 // turns as a textual response.
                 if self.terminal_tail.is_none() && phase != slim_core::ProviderPhase::FirstSemantic
                 {
+                    if phase == slim_core::ProviderPhase::PreparingTool
+                        && self.refresh_preparing_tool_size(&label)
+                    {
+                        return;
+                    }
                     self.transition_activity(ActivityPhase::External(label));
                 }
             }
@@ -3397,6 +3898,71 @@ impl AppState {
                 } else {
                     self.todo_dock_open = self.pending_todo_count() > 0;
                 }
+                self.revisions.status += 1;
+            }
+            UiEvent::SessionTitleChanged { title } => {
+                self.session_title = title.filter(|title| !title.trim().is_empty());
+                self.revisions.status += 1;
+            }
+            UiEvent::SessionsListed {
+                request_id,
+                now_ms,
+                items,
+                error,
+            } => {
+                if let Some(picker) = self
+                    .session_picker
+                    .as_mut()
+                    .filter(|picker| picker.request_id == request_id)
+                {
+                    match error {
+                        Some(message) => picker.fail(message),
+                        None => picker.set_sessions(now_ms, items),
+                    }
+                    self.revisions.focus += 1;
+                }
+            }
+            UiEvent::TurnsListed {
+                request_id,
+                items,
+                error,
+            } => {
+                if let Some(picker) = self
+                    .session_picker
+                    .as_mut()
+                    .filter(|picker| picker.request_id == request_id)
+                {
+                    match error {
+                        Some(message) => picker.fail(message),
+                        None => picker.set_turns(items),
+                    }
+                    self.revisions.focus += 1;
+                }
+            }
+            UiEvent::UserShellFinished { request_id } => {
+                if self.user_shell == Some(request_id) {
+                    self.user_shell = None;
+                    self.revisions.status += 1;
+                }
+            }
+            UiEvent::WorkspaceFiles {
+                request_id,
+                paths,
+                truncated,
+            } => {
+                if self.workspace_files_request != Some(request_id) {
+                    return;
+                }
+                self.workspace_files_request = None;
+                // A path with whitespace cannot round-trip through a `@token`.
+                self.workspace_files = paths
+                    .into_iter()
+                    .filter(|path| !path.chars().any(char::is_whitespace))
+                    .take(MAX_WORKSPACE_FILES)
+                    .collect();
+                self.workspace_files_loaded = true;
+                self.workspace_files_truncated = truncated;
+                self.derive_mention_suggestions(true);
                 self.revisions.status += 1;
             }
             UiEvent::ContentPageLoaded {

@@ -477,9 +477,9 @@ milestone correspondente passou seu gate.
   `TodoChanged` abre o dock. Skills Slim em `%USERPROFILE%/.slim/skills`
   (override `cwd/.slim/skills`) só carregam com `list`/`name`; roots compatíveis
   `cwd/.claude/skills`, `cwd/.agents/skills` e `~/.agents/skills` são descobertas.
-  Motion (2026-08-25): composer usa `border_focus` com pulso BOLD no clock de
-  12 fps durante run; spinner normativo `◒◓◑◐` também nas tools/thinking
-  streaming; palette/slash agrupam `session` e `runtime`; `/mode` cicla o modo.
+  Motion (2026-08-25, histórico; o pulso do composer e o spinner `◒◓◑◐` foram
+  substituídos, ver §1.2): palette/slash agrupam `session` e `runtime`; `/mode`
+  cicla o modo.
   Retoque visual (2026-08-25): user band `user_prompt_bg` inclusive no label;
   labels de papel usam capitalização consistente (`You`, `Slim`, `Thinking`);
   queued muted; grupo de tools com `Enter details` se couber; glyphs ASCII
@@ -751,6 +751,151 @@ real, com degradação explícita e testes golden (G340–G341).
 
 ### 1.2 Direção visual revisada
 
+**Revisão de 28/09/2026 (pensamento em streaming):** o cabeçalho e o resumo de
+um pensamento em curso ganham quatro cuidados, todos só de estilo. Nada muda de
+lugar, nenhum texto espera, e não há timer novo.
+
+- **Varredura no rótulo.** Um destaque de quatro passos, do violeta de repouso
+  (um tom abaixo de `reasoning_accent`) até um marfim arroxeado, percorre as
+  oito células de `Pensando`, uma célula a cada dois ticks (a cada tick em
+  rótulos longos), com duas células de halo e uma pausa antes de recomeçar. Isso
+  dá cerca de dois segundos por passagem. O relógio ao lado nunca é varrido.
+  Sem cor, o pico é negrito. Movimento reduzido mostra o rótulo parado em
+  `reasoning_accent`.
+- **Um indicador só.** Spinner e varredura são o mesmo indicador do cabeçalho.
+  Quando o cabeçalho sai da tela, a ActivityRail assume o spinner e passa a
+  varrer o rótulo `Pensando` no lugar dele. Nunca os dois ao mesmo tempo.
+- **Relógio em segundos inteiros** enquanto o pensamento roda (`Pensando · 3s`,
+  nada no primeiro segundo), como o relógio de uma ferramenta. A casa decimal
+  só aparece depois de concluído, quando a duração é medida.
+- **Duas linhas do resumo.** A mais antiga fica um passo atrás: `reasoning_accent`
+  misturado 25% com o fundo, ou `DIM` em ANSI16 e sem cor. O olho segue a mais
+  nova.
+- **Brilho na borda de escrita.** Por 450 ms depois de cada conteúdo do
+  provider, até 14 células no fim da linha mais recente sobem do violeta ao
+  pico, mais fortes na borda onde o texto está sendo escrito, e voltam ao
+  repouso. É o que mostra que o pensamento continua chegando quando ele vem em
+  rajadas, já que o resumo não tem caret. Precisa do clock de movimento e não
+  aparece com movimento reduzido.
+
+A revelação gradual do texto continua descartada: o brilho ilumina palavras que
+já estão na tela, não as atrasa. O rótulo em streaming deixa de usar
+`secondary_text` e passa a `reasoning_accent`, como o pensamento concluído.
+
+**Revisão de 28/09/2026 (sinais de vida e movimento):** cinco mudanças, sem
+timer novo. Os sinais usam o clock de 83 ms que já roda durante execução ou
+streaming, ou o tick de status de 1 Hz. Parado, continuam zero ticks.
+
+- **`NO_COLOR` não é movimento reduzido.** Antes, `NO_COLOR` desligava toda
+  animação. Agora ele só retira matiz: o spinner vira `| / - \` (quatro quadros,
+  um a cada dois ticks) e o cabeçalho Thinking continua animando. Só a
+  preferência de movimento reduzido para o movimento.
+- **Preferência de movimento.** `SLIM_REDUCED_MOTION=1` ou `=0` decide sempre.
+  Sem a variável vale a opção de efeitos de animação do Windows
+  (`SPI_GETCLIENTAREAANIMATION`). Se o sistema não responder, o movimento fica
+  ligado.
+- **Ferramenta em execução.** A row mostra segundos inteiros (`12s`, `1m05s`) no
+  mesmo lugar em que a duração aparecerá ao concluir, sem nada no primeiro
+  segundo. Em um lote paralelo cada chamada tem o relógio da sua própria
+  partida. É texto, não animação: movimento reduzido mantém.
+- **Caret de streaming.** Pisca a cada seis ticks (498 ms) e, depois de 2 s sem
+  conteúdo do provider, fica fixo e esmaecido (`muted`) até chegar conteúdo.
+  Isso antecede em alguns segundos o aviso textual da rail. A célula é reservada
+  nas duas fases, então o texto nunca se move. Movimento reduzido não mostra
+  caret.
+- **Espera de retry e de cancelamento.** O marcador avança uma vez por segundo
+  (quatro quadros do braille, ou ASCII sem cor), no tick de status, sem ligar o
+  clock de movimento. Ele substitui o `↻`/`!` estático, e o rótulo e a cor
+  continuam dizendo qual espera é. Movimento reduzido mantém o marcador antigo.
+
+Correções de texto neste documento, que descrevia o que o código não faz: o
+spinner é o braille de dez quadros a 12 fps, não `◒◓◑◐` nem um pulso `○/●`; o
+composer não pulsa; e a célula do cabeçalho Thinking anima no transcript, uma
+só por vez, no lugar do spinner da rail. Esta revisão substitui as prescrições
+conflitantes de §15.4 e §21.4.
+
+**Revisão de 28/09/2026 (marcadores e cores por caso):** o transcript usava
+poucos matizes e três cinzas quase iguais (`secondary_text`, `thinking_accent`
+e `muted` ficam entre 1,19:1 e 1,49:1 de contraste entre si, medidos sobre os
+valores do tema). Pensamento, verbo de ferramenta, metadado e aviso liam como
+um cinza só, e só o formato do glifo os separava. Cada matiz passa a ter um
+significado: verde é identidade e mudança aplicada, azul é navegação, foco e
+atividade em curso, violeta é raciocínio e planejamento, âmbar é interrupção, e
+vermelho é falha. O cinza fica para o resto. O violeta é o token novo
+`reasoning_accent = #A99FD6`, com a claridade do `secondary_text`, de modo que
+pensamento se separa de ação por matiz, não por brilho. Ele degrada para
+magenta claro em ANSI16 e para um índice distinto do azul em 256 cores.
+
+- **Marcador do turno:** o `●` de `● Slim` é o estado do turno. Verde durante e
+  depois de um turno bem-sucedido, âmbar quando interrompido, vermelho quando
+  algum trecho falhou. O nome `Slim` continua neutro nos dois casos, para não
+  emprestar cor de aviso à identidade.
+- **Pensamento:** marcador `▸`/`▾`, rótulo e corpo em itálico usam
+  `reasoning_accent` depois de concluído. Enquanto transmite, o marcador mantém
+  o azul dos indicadores vivos. H3 continua em `thinking_accent`.
+- **Ferramentas concluídas:** o efeito da chamada define o peso da row. Leitura,
+  busca, listagem e ferramentas não nativas recuam: `✓` e verbo em `muted`.
+  Comando (`shell`) sobe o verbo para `secondary_text`, mas mantém o `✓` neutro.
+  Edição (`patch`, `write`) recebe `✓` em `success` e verbo em `secondary_text`.
+  Só uma mudança aplicada ganha o `✓` verde, e o `+N -M` já colorido reforça a
+  leitura. Um grupo dobrado assume o peso da chamada mais forte que contém.
+  Falha, cancelamento, execução e histórico não mudam. Sem cor, os glifos ASCII
+  continuam iguais e o tipo da chamada segue no verbo.
+- **Modo de operação:** no rodapé, `Auto` permanece neutro, `Read-only` usa
+  `accent` e `Plan` usa `reasoning_accent`. O nome continua em negrito nos casos
+  destacados, então a leitura não depende do matiz. A ênfase de 249 ms de uma
+  troca recente continua valendo.
+
+Não há animação, timer, largura ou altura novos nesta revisão, só estilo. Ela substitui as
+prescrições conflitantes de §21.3 sobre o uso de `thinking_accent` no
+raciocínio e as anteriores que deixavam toda ferramenta concluída em `muted`,
+sem distinguir o efeito da chamada.
+
+**Revisão de 28/09/2026 (organização do turno do agente):** a resposta do
+agente passa a ter um dono e uma grade. `● Slim` abre o lado do agente no
+primeiro que ele emitir depois do prompt, seja pensamento, ferramenta ou
+prosa, no mesmo canal (coluna 2) do `● Você`, com o mesmo marcador (`*` sem
+cor). Antes, o cabeçalho só aparecia no primeiro trecho de prosa, e o pensamento
+e as leituras iniciais ficavam sem dono acima dele. Todo texto do transcript
+começa na coluna 4: prompt, prosa do agente, texto de ferramenta e pensamento.
+Só marcadores (`●`, `✓`, `✕`, `▸`, `○`) vivem no canal das colunas 2–3. A prosa
+do agente sai da coluna 2, e sua largura de quebra é `largura − 5` (recuo de
+quatro células e a célula do caret). Entre o prompt e o cabeçalho há sempre uma
+única row vazia, a que já termina o prompt. Antes eram duas quando a resposta
+abria com texto e uma quando abria com trabalho. O cabeçalho só acrescenta uma
+row vazia própria quando o bloco anterior não é um prompt. Uma row vazia ainda
+separa prosa de trabalho nos dois sentidos, agora também entre o trabalho que
+abre o turno e a primeira prosa. Sem prompt anterior (transcript avulso), só a
+prosa abre cabeçalho, como antes.
+
+Grupos de ferramentas concluídas passam a ser uma contagem de substantivos, uma
+por tipo e sempre nesta ordem: `3 leituras, 1 busca, 2 edições, 1 comando`. Eles
+não misturam mais verbos e contagens, como `Editou, Executou 1 comando`.
+Ferramentas de outro nome mantêm `nome ×N`, e as frases de atividade em curso
+(`Lendo · 2 chamadas`) não mudam. Citações (`>`) mantêm a régua `│` na mesma row
+do texto e em toda row quebrada, e parágrafos da mesma citação dividem uma régua
+separados por uma row só com a régua. Antes o parser emitia uma régua isolada,
+uma row vazia e o texto sem régua. Esta revisão substitui as prescrições
+conflitantes de §15.2.1 e §21.4, do refinamento de agrupamento de 12/09/2026 e
+da revisão de 26/09/2026 sobre a row de respiro do primeiro trecho.
+
+**Revisão de 27/09/2026 (menus e seleção de modelo):** a navegação usa azul
+frio (`accent`/`border_focus = #8AADD4`) e seleção textual azul-cinza
+(`#303842`); menus mantêm o fundo neutro `#2A2A2A`. Verde fica para
+identidade, sucesso e diffs positivos. A paleta
+de comandos pesquisa nome e descrição sem distinguir maiúsculas, apresenta
+descrições e atalhos em colunas responsivas e preserva o rascunho do composer
+ao executar um comando. O seletor de modelos conserva sua altura enquanto o
+filtro muda, omite cabeçalhos dos resultados filtrados e foca o primeiro
+resultado acionável. No painel, `←/→` ajustam o esforço disponível, Tab alterna
+Normal/Rápida somente para Codex e Enter confirma modelo, esforço e velocidade
+em conjunto. Espaço recolhe grupos apenas sobre cabeçalhos sem filtro; nos
+outros casos participa da busca. Atualizações de catálogo preservam o foco por
+provedor e ID; se o item desaparecer, Enter exige nova escolha. O foco dos
+menus recebe 166 ms de ênfase de fundo após interação, sem deslocar texto;
+reduced motion mostra diretamente o estilo estável. Esta revisão substitui as
+prescrições conflitantes de §§7.4.1, 10.3, 21.3 e 21.4.
+
 **Revisão de 26/09/2026, fase 1 da revisão visual solicitada pelo usuário:**
 profundidade por superfície em vez de cor. A faixa do usuário usa
 `user_prompt_bg = #141414` em toda a largura da conversa (label e texto; a row
@@ -911,6 +1056,84 @@ estáveis do corpo; um draw por evento consome os marcos de animação/status j�
 pintados, evitando solicitar imediatamente o mesmo frame. O índice de alturas e o
 memo do grupo de tools mudam de época só quando o conjunto de tools dentro da
 janela de 249 ms muda; frames do spinner, a 83 ms, não reconstroem o transcript.
+
+Experiência de uso (revisão de 2026-09-28). Cinco lacunas fecham sem chrome
+novo e sem tocar as garantias de segurança do core.
+
+*Presença desde o envio.* Do `UserMessageAdded` até o primeiro bloco do agente, o
+transcript mostra `● Slim` logo abaixo do prompt, com o nome varrendo como no
+pensamento (marcador verde fixo, varredura só nas quatro células de `Slim`). O
+cabeçalho ocupa a mesma linha que o primeiro bloco do agente ocupará, então nada
+salta quando ele chega; run que termina sem saída do agente o remove. Não é um
+bloco: é a flag `awaiting_agent` do último bloco `User`, ligada durante a run e
+limpa por um epílogo de `apply_event` quando existe saída do agente ou
+`!working`. Sessão restaurada não a ganha. Reduced motion e `NO_COLOR` mantêm o
+nome parado.
+
+*Recibo de fim de turno.* Run concluído ou interrompido que alterou arquivos ou
+rodou comandos fecha o turno com `BlockKind::Receipt`: uma linha imutável na
+coluna do texto, como `✓ 3 arquivos · +42 -7 · 2 comandos · 6s   Ctrl+D`. O
+marcador é `✓` verde (muted se nenhum arquivo mudou), `✕` vermelho se o último
+comando falhou e `■` âmbar com `interrompido` quando a run foi interrompida.
+`+N` usa `diff_add`, `-M` usa `diff_remove`, `~` marca limite inferior (um `write`
+não carrega diff). Nada mudou e nenhum comando rodou, ou a run falhou: sem
+recibo. É derivado dos blocos do turno (arquivos distintos por `edit_diff.path`
+ou `path=`, comandos e falhas pelo lifecycle), sem acumulador de eventos, e não
+existe em sessão restaurada. Ctrl+D lista `+N -M` por arquivo. Uma ferramenta
+após o recibo (um `!comando`) ganha a linha de respiro do turno encerrado.
+
+*Entrada.* `↑`/`↓` recuperam prompts enviados (100 no máximo, sem duplicata
+consecutiva) quando o composer está vazio no live edge, sem popup, overlay ou
+modal; edição ou `Esc` sai do modo recall e o rascunho anterior volta quando
+`↓` passa do mais recente. A navegação de blocos por `↑` sai do live edge:
+`PageUp` fixa a viewport e daí `↑`/`↓` navegam como antes. Um token que começa
+com `@` no rascunho abre, sobre o composer, o mesmo dropdown do `/` com arquivos
+do workspace: subsequência sem distinção de caixa, bônus para o nome do arquivo e
+para o prefixo, no máximo 500 candidatos, nome em destaque e diretório apagado.
+`↑`/`↓` navegam, `Tab` ou `Enter` completam (Enter nunca envia), `Esc` fecha,
+e um `@` dentro de colagem ou colado a um chip não abre nada. O `@caminho` é
+texto literal do rascunho; ao enviar, o host relê o texto, resolve cada token que
+nomeia um arquivo regular dentro do workspace e anexa o conteúdo (até 8 arquivos,
+256 KiB cada, 1 MiB no total; binário, nome de segredo como `.env`/`*.pem`,
+caminho fora do workspace ou limite excedido recusam o prompt inteiro e preservam
+o rascunho). O transcript mostra `[arquivo · caminho · tamanho]` sob o prompt.
+`@override` ou `a@b.com`, que não nomeiam arquivo, continuam texto. Um rascunho
+que começa com `!` (e não `!!`) roda o comando no shell do workspace **somente
+no modo Auto**, pela mesma ferramenta `shell` do agente (portanto com o mesmo
+gate de modo, confinamento e cancelamento; `Esc` cancela). Aparece como bloco
+`shell` com `! comando`, a saída fica expansível, e até 8 KiB dela seguem como
+contexto no próximo prompt (`[shell · comando]`) para o agente saber o que o
+usuário fez. Um por vez, nunca durante run ou preparação, nunca enfileirado; nos
+modos Plan e Read-only é recusado e o rascunho fica.
+
+*Sessões.* `/resume` abre uma lista das sessões do workspace (título ou primeira
+mensagem, idade relativa, tamanho, `atual`/`em uso`) com filtro por termos; o
+foco inicial é a primeira sessão que pode ser retomada, então Enter logo após
+abrir equivale ao antigo `/resume`. A sessão aberta e a trancada por outro
+processo são recusadas no lugar. `/rename TÍTULO` nomeia a sessão (`--clear`
+remove o nome) em um arquivo `.meta.json` ao lado do `.jsonl`; o nome lidera o
+rail (`SLIM · nome · diretório`). `/rewind` lista os turnos concluídos, do mais
+recente ao mais antigo (`volta N turnos`); confirmar cria uma **nova sessão**
+com a conversa até antes daquele turno, troca para ela e devolve o prompt
+removido ao composer. A sessão original permanece intacta e continua na lista.
+Só a conversa volta: arquivos alterados não são restaurados, e o painel diz isso.
+Os três exigem run inativa.
+
+*Progresso de chamada longa.* Enquanto o modelo escreve os argumentos de uma
+chamada grande, a ActivityRail mostra `Preparando edição · 4,2 KB` (nome da
+ferramenta e bytes recebidos), sem reiniciar o relógio da fase: o tamanho muda no
+lugar, o timeline não ganha uma entrada por KiB, e outra ferramenta abre fase
+nova. Medido com um SSE segurado por 1,5 s (`crates/slim-core/tests/provider_tool_progress.rs`),
+antes desta revisão o `PreparingTool` só chegava **ao fim do stream**, porque o
+`ProviderEventRedactor` retém todo evento de chamada até `Stopped`. A retenção
+não mudou: o redator agora só conta bytes dos argumentos e emite um
+`ProviderEvent::ToolCallProgress { name, bytes }` sem conteúdo, com o nome já
+redigido, na primeira vez que o nome aparece e a cada 1 KiB de crescimento. O
+conteúdo da chamada, os eventos que o carregam e o portão de segredo em `Stopped`
+ficam como estavam; o evento de progresso nunca é capturado em cache nem
+reexibido. O normalizador o entrega como `ProviderPhase::PreparingTool` com
+`detail = "<nome> · <tamanho>"` por evento transitório (fora do journal), então
+nenhum contrato de `EventKind`/`UiEvent` muda.
 
 Esta revisão substitui as prescrições conflitantes de palette
 fria, welcome centralizado e modelo no contorno do composer descritas no
@@ -1398,6 +1621,18 @@ Regras:
   de expor a identidade à TUI; reuso do ID bruto pelo provider em runs
   diferentes nunca cruza autorização nem lifecycle.
 
+Eventos e comandos das revisões de 2026-09-28 (fora do bloco acima por serem
+aditivos): `UiEvent::{WorkspaceFiles, UserShellFinished, SessionTitleChanged,
+SessionsListed, TurnsListed}` e `UiCommand::{RequestWorkspaceFiles,
+RunUserShell, RenameSession, ListSessions, ResumeSession, ListTurns,
+RewindSession}`. Toda requisição de lista carrega `request_id` e a TUI descarta
+respostas de outro id; o host responde sempre, com `error` quando não pôde
+listar, para que nenhum overlay espere indefinidamente. `UserShellFinished`
+viaja na lane de dados, atrás do `ToolEnded` do mesmo comando, para não
+ultrapassá-lo; `WorkspaceFiles` e as listas usam a lane de controle. O lado
+host trata os comandos em todos os pontos de despacho (ocioso, preparando,
+login, run ativa, entrega pendente).
+
 ### 7.3 Comandos emitidos
 
 ```rust
@@ -1494,25 +1729,24 @@ seus workers. Limites e detalhes: [contrato do shell](reference/CLI-AND-RUNTIME.
 
 ### 7.4.1 Seleção de Astra e velocidade Codex
 
-`/models` inclui GPT-6 Astra; Enter abre a escolha de reasoning
-`low`, `medium`, `high`, `xhigh` ou `max`. Tab alterna Normal/Fast
-sem aplicar; Enter envia modelo, esforço e velocidade juntos. Esc retorna
-ao picker sem alterar a velocidade ativa. O backend confirma a projeção com
+`/models` inclui GPT-6 Astra. O seletor interativo apresenta os níveis de
+reasoning disponíveis na própria lista; `←/→` ajustam o esforço do item em
+foco. Tab alterna Normal/Fast sem aplicar somente nos modelos Codex. Enter
+envia modelo, esforço e velocidade juntos; Esc descarta a escolha pendente.
+O backend confirma a projeção com
 `ModelChanged`, `EffortChanged` e `CodexSpeedChanged`; falha de autenticação
 mantém a seleção anterior. Persistência usa `model`, `effort` e `codex_fast`.
 Fast solicita prioridade de processamento com maior uso; não reduz reasoning
 e não habilita novas ferramentas. Disponibilidade continua sujeita à conta Codex.
 
-O passo de esforço não é exclusivo do Codex. Qualquer modelo de catálogo
-(OpenCode Go, Zen, ClinePass ou Command Code) que declare níveis abre a mesma escolha ao receber Enter,
-listando os níveis do próprio registro e mantendo destacado o esforço ativo da
-sessão quando ele é suportado. Nesse passo a linha Normal/Fast e a tecla Tab
-não aparecem: velocidade é service tier do Codex. Modelo de catálogo sem
-nenhum nível declarado continua sendo aplicado direto, sem passo
-intermediário. Esc devolve o picker de modelo com seleção, filtro e folds
-intactos (G239). Em ClinePass, Command Code e xAI, `/model <id>` também
-abre a escolha quando há níveis conhecidos. Em Go/Zen, o comando textual
-mantém o esforço da sessão quando suportado, senão o primeiro nível.
+O controle de esforço também aparece para modelos de catálogo (OpenCode Go,
+Zen, ClinePass ou Command Code) que declarem níveis. O painel mantém o esforço
+ativo quando suportado e mostra apenas os níveis do registro. Velocidade e Tab
+ficam restritos a Codex. Modelo sem níveis declarados aplica diretamente com
+Enter. Esc fecha o painel sem aplicar alterações. O comando textual
+`/model <id>` mantém a etapa de esforço para ClinePass, Command Code e xAI
+quando há níveis conhecidos; em Go/Zen mantém o esforço da sessão quando
+suportado, senão o primeiro nível.
 
 ClinePass e Command Code usam `gateway_reasoning_levels` tanto no fallback
 quanto no catálogo atualizado: DeepSeek V4.1 Flash oferece low/high/max;
@@ -1820,7 +2054,8 @@ disconnect ou deadline. Uma mudança de entidade nunca atravessa o flush causal.
 - welcome-only é estática e não agenda redraws periódicos;
 - reduced motion ou motion desativado elimina ticks ambientais e caret animado;
   enquanto a ActivityRail estiver visível, um `StatusTick` semântico de 1 Hz
-  ainda atualiza elapsed; modal cobrindo a superfície suspende ambos;
+  ainda atualiza elapsed, o relógio das tools em execução e o marcador de
+  espera de retry/cancelamento; modal cobrindo a superfície suspende ambos;
 - sem animação/status visível e sem estado dirty, não existe timer periódico:
   no Windows, o runtime bloqueia em `WaitForMultipleObjects` sobre input do
   console + evento waitable sinalizado pelos producers das lanes; input/resize
@@ -1895,6 +2130,10 @@ pub enum BlockKind {
     Custom(CustomBlock),
 }
 ```
+
+`ReceiptBlock` (variante `Receipt` no código) é uma linha imutável de fim de
+turno (arquivos, linhas, comandos, duração, desfecho), derivada dos blocos do
+turno; altura fixa de uma row e cópia (Ctrl+Y) em texto simples.
 
 `QueuedUserBlock` preserva o texto integral, posição FIFO, timestamp e estado
 `queued`; ele vira `UserBlock` somente quando o harness emitir o evento de
@@ -2258,9 +2497,11 @@ largura >=80 e altura >=12. Cwd trivial, welcome e emergência não gastam essa
 row. Contexto fica no footer; nenhuma rail repete contadores ou estado READY.
 
 `ActivityRail` ocupa zero ou uma row acima do composer e abaixo do Todo. Mostra
-fase e elapsed reais; near-limit continua warning. O indicador é o único glyph
-animado, alternando ○/● a cada seis ticks. Tools/thinking no transcript mantêm
-marcadores estáticos. Modal/input capturando navegação pausa a animação. Estado
+fase e elapsed reais; near-limit continua warning. O indicador é o spinner
+braille de dez quadros, um por tick de 83 ms (§1.2, revisão de 28/09/2026).
+Com o cabeçalho Thinking visível, quem anima é a célula desse cabeçalho, nunca
+os dois. Tools no transcript mantêm marcadores estáticos e mostram o relógio de
+segundos da chamada. Modal/input capturando navegação pausa a animação. Estado
 crítico e cancelamento migram para o footer quando a atividade não cabe.
 
 ### 14.2 Breakpoints
@@ -2431,12 +2672,16 @@ o `row_offset` dentro da nova altura.
   usa o estado estático desde o início; NO_COLOR usa `*` sem cor;
 - após o corpo do user há exatamente uma row vazia antes de thinking, tools
   ou assistant; `HeightIndex` conta cabeçalho, corpo e separador;
-- o primeiro assistant da resposta mostra `Slim` em accent/bold antes do corpo,
-  precedido por uma row de respiro; continuações não repetem o cabeçalho.
-  Cancelamento/falha em qualquer trecho permanece indicado no cabeçalho do
-  grupo em estilo secundário. H1 permanece em `assistant_accent`. Medição,
-  materialização, caches e projeção textual usam o mesmo agrupamento;
-- thinking colapsado ocupa uma row muted `▸ Thought` quando completo;
+- o primeiro que o agente emite depois do prompt (pensamento, tool ou prosa)
+  é precedido por `● Slim` em `assistant_accent`/bold, no canal do `● Você`;
+  o cabeçalho fica direto sob a row que termina o prompt e só traz row vazia
+  própria quando o bloco anterior não é um prompt. O restante do turno não
+  repete o cabeçalho. Cancelamento/falha em qualquer trecho de prosa do turno
+  permanece indicado nele, em estilo secundário. A prosa do agente começa na
+  coluna 4, como o corpo do prompt. H1 permanece em `assistant_accent`. Medição
+  (`leading_rows`), materialização, caches e projeção textual derivam o
+  cabeçalho da mesma função sobre os vizinhos;
+- thinking colapsado ocupa uma row em `reasoning_accent` (`▸ Pensamento`) quando completo;
   `▾` indica expandido; seleção mostra `Enter expand`/`Enter collapse` se couber.
   em streaming, `{spinner} Thinking` é seguido pela cauda atualizada de até
   duas rows físicas dos 256 grafemas finais do reasoning, com `…` quando o
@@ -2445,7 +2690,7 @@ o `row_offset` dentro da nova altura.
   `FoldState::Auto` conta
   como colapsado; bloco omitido se reasoning vazio;
 - tools colapsados ocupam uma row: glyph de lifecycle discreto, resumo verbal
-  do grupo (`3 reads`, `Ran 2 commands`) ou o nome da call isolada, e duração em
+  do grupo (`3 leituras, 1 comando`) ou o nome da call isolada, e duração em
   `muted`; concluídos não exibem `command=` nem preview, mas tools ativas
   mantêm nome, limite e progresso e tools falhas mantêm uma razão curta
   redigida, sem telemetria `key=value`. Toda summary ocupa exatamente uma row
@@ -2461,7 +2706,8 @@ o `row_offset` dentro da nova altura.
   publicação/execução da tool continua dependente do terminal autoritativo;
 - footer `ctx`: percentual inteiro com piso de 1% quando `tokens > 0`;
 - dentro de um turno, thinking e tools são adjacentes; somente o primeiro
-  trecho da resposta do agente abre com respiro e seu cabeçalho;
+  bloco do agente abre o turno com o cabeçalho `● Slim`, e uma row vazia separa
+  prosa de trabalho nos dois sentidos;
 - antes de todo `User` posterior ao primeiro há exatamente uma row física vazia,
   medida pelo `HeightIndex` e materializada pelo renderer; o primeiro user não
   recebe espaçamento superior;
@@ -2475,7 +2721,8 @@ o `row_offset` dentro da nova altura.
   tabela, hr) têm exatamente uma row vazia entre si; itens de lista não ganham
   gap extra; tabelas GFM que cabem alinham colunas; as largas usam campos com wrap;
 - texto longo quebra na borda direita; linhas de continuação alinham com o
-  texto, nunca com um rail;
+  texto, nunca com um rail. A exceção são citações e código, cuja régua `│`
+  acompanha toda row física;
 - inspector aberto e scrollbar reduzem a largura útil; não mudam a regra;
 - timestamp aparece dim e alinhado à direita quando largura `≥100`; some abaixo
   disso. O instante continua metadata para replay/diagnóstico;
@@ -2550,6 +2797,17 @@ Regras:
   correção e reenvio sem redigitar após o toast expirar;
 - secret-looking paste não entra em telemetry.
 
+Histórico, `@` e `!` (§1.2, revisão de 2026-09-28):
+
+- `↑`/`↓` com composer vazio no live edge, sem popup, overlay ou modal,
+  recuperam o prompt anterior/seguinte; `Esc` ou qualquer edição sai do recall;
+  a viewport pinned continua navegando blocos com `↑`/`↓`;
+- `@` no início de um token (fora de colagem) abre a lista de arquivos; a
+  completação troca só o token (`Composer::replace_range`), preserva chips e é
+  um passo de undo;
+- `!comando` roda o shell do workspace do usuário somente no modo Auto, um por
+  vez, fora de run/preparação; `!!` é prompt literal.
+
 Bracketed paste é armazenado como `PasteSegment`, separado do texto digitado.
 No caminho de teclas do ConPTY, CRLF pode chegar como Enter seguido de
 Ctrl+Enter. Após um Enter identificado como quebra de burst, o Ctrl+Enter
@@ -2578,6 +2836,10 @@ estado completo mantêm a célula como espaço, sem reflow. O caret nunca entra 
 
 ### 15.4 Sinais operacionais e ActivityRail
 
+Uma chamada ainda em escrita reporta `Preparing tool · <nome> · <tamanho>`; a
+rail troca só o tamanho quando a ferramenta é a mesma (sem novo `started_ms` nem
+entrada no timeline) e o rodapé usa o mesmo rótulo quando a rail está oculta.
+
 `ActivityRail` materializa a fase transitória corrente: Thinking, Responding,
 resumo verbal das tools em voo, awaiting input, elapsed e cancelamento no
 footer. HTTP de conexão (`Connecting`, headers, first byte) e `AwaitingProvider`
@@ -2605,7 +2867,8 @@ comum usa texto e o indicador usa accent, sem sinalizar alerta.
 Reads/edits referem-se ao lote atual. Os avisos de orçamento do harness continuam
 existindo e não são suprimidos. O atalho `Ctrl+C cancel` permanece no footer.
 
-O clock continua a 12 fps nominais; o pulso ○/● muda a cada seis ticks (498 ms). O
+O clock continua a 12 fps nominais e o spinner avança um quadro por tick. O
+caret de streaming alterna a cada seis ticks (498 ms). O
 elapsed deriva de `FrameClock.elapsed_ms - ActivityState.started_ms`, nunca de
 `Instant` no AppState. Tool com
 progresso conhecido usa `progress_track/progress_fill`; sem progresso conhecido,
@@ -2702,6 +2965,12 @@ pub struct OverlayEntry {
 
 Stack visual e focus order são iguais. Overlay não-capturante não recebe tecla,
 mas pode receber hit test quando explicitamente permitido.
+
+`SessionPicker` (`/resume`, `/rewind`): modal centrado com linha de filtro,
+lista, linha de detalhe e rodapé `n/total`. Altura definida pela lista sem
+filtro, para que digitar não redimensione o painel. Enter age, Esc fecha; o
+filtro captura texto e colagem. O painel de `/rewind` avisa que só a conversa
+volta.
 
 Máximo de 16 overlays simultâneos. Ao atingir o limite, rejeitar o novo overlay,
 registrar diagnóstico e manter o stack existente.
@@ -2863,6 +3132,10 @@ por terminal.
 | início/fim da linha | Home / End |
 | apagar à frente | Delete |
 | live edge | End |
+| prompt anterior/seguinte | ↑ / ↓ com composer vazio no live edge |
+| completar `` | `@` + Tab ou Enter |
+| rodar comando do usuário (só Auto) | `!comando` |
+| retomar / renomear / voltar turno | /resume, /rename TÍTULO, /rewind |
 | expand/collapse block | Enter sobre bloco focado |
 | responder input pendente | digitar no composer e Enter |
 | aprovar/rejeitar request | Y / N, sem modificadores |
@@ -3077,6 +3350,7 @@ pub struct Theme {
     pub user_accent: Color,
     pub assistant_accent: Color,
     pub thinking_accent: Color,
+    pub reasoning_accent: Color,
     pub tool_accent: Color,
     pub diff_add: Color,
     pub diff_remove: Color,
@@ -3120,25 +3394,26 @@ Paleta truecolor normativa:
 | `text` | `#E8E5DB` | texto principal marfim |
 | `muted` | `#99978E` | metadata, pendente e hints legíveis |
 | `secondary_text` | `#BCB9AF` | labels, counters e paste token |
-| `accent` | `#72CC91` | controles; verde Slim em assistant/success |
+| `accent` | `#8AADD4` | navegação e controles; verde reservado à identidade e sucesso |
 | `heading_accent` | `#E8E5DB` | headings; hierarquia por peso, não por cor |
 | `link_accent` | `#8AADD4` | links e targets navegáveis |
 | `border` | `#3A3A3A` | separadores e boxes funcionais |
-| `border_focus` | `#4F7D5A` | composer/drawer focado, verde contido |
+| `border_focus` | `#8AADD4` | composer/drawer focado |
 | `operational_divider` | `#3A3A3A` | rails operacionais |
 | `progress_track` | `#262D35` | trilho de progresso |
 | `progress_fill` | `#78D99B` | progresso conhecido e saudável |
 | `scrollbar_track` | `#24231A` | trilho quase invisível da scrollbar |
 | `scrollbar_thumb` | `#626756` | posição da viewport |
 | `user_accent` | `#BCB9AF` | label/rail do usuário |
-| `assistant_accent` | `#72CC91` | label Slim, cursor e foco |
-| `thinking_accent` | `#AFA99D` | reasoning e elapsed |
-| `tool_accent` | `#72CC91` | tools e activity estrutural |
+| `assistant_accent` | `#72CC91` | label Slim e cursor de streaming |
+| `thinking_accent` | `#AFA99D` | H3 de Markdown |
+| `reasoning_accent` | `#A99FD6` | linhas de pensamento (marcador, rótulo, corpo em itálico) e modo Plan |
+| `tool_accent` | `#BCB9AF` | tools e activity estrutural |
 | `success` | `#72CC91` | conclusão/healthy |
 | `warning` | `#E7C15A` | atenção e limites próximos |
 | `error` | `#E87973` | falha/cancelamento relevante |
 | `code_rail` | `#68665A` | rail de code/output expandido |
-| `selection` | `#2A4C38` | seleção/foco textual |
+| `selection` | `#303842` | seleção/foco textual |
 | `diff_add` | `#72CC91` | `+` e metadata de adição |
 | `diff_remove` | `#E87973` | `-` e metadata de remoção |
 | `diff_add_bg` | `#172A1E` | row adicionada |
@@ -3156,7 +3431,8 @@ Componentes não podem inferir semântica a partir do RGB resolvido; usam tokens
 - boxes são funcionais: composer, overlays e drawers; não envolver cada mensagem;
 - profundidade vem de surfaces near-black e borders, não de sombras simuladas;
 - user prompt usa cabeçalho `● Você` e corpo sobre `user_prompt_bg`, em
-  largura total; assistant mantém um único cabeçalho `Slim` por resposta;
+  largura total; o agente mantém um único cabeçalho `● Slim` por turno, no
+  mesmo canal, com todo texto na coluna 4;
 - SessionRail e ActivityRail têm uma row cada; OperationalBar tem uma a três rows;
   SessionRail é conversacional e adaptativa, nunca aparece no welcome/emergência;
 - composer tem uma a cinco rows de conteúdo conforme draft/altura e uma row no
@@ -3165,19 +3441,24 @@ Componentes não podem inferir semântica a partir do RGB resolvido; usam tokens
   indentação de quatro células;
 - output textual de tool expandida usa `secondary_text`; resumo concluído usa
   `muted`. Não há mudança de paginação, retenção ou quantidade de linhas;
-- uma row vazia depois do user band; thinking e tools são adjacentes; a
-  resposta abre com respiro e cabeçalho Slim; uma row separa prosa do
-  assistente de tools/thinking nos dois sentidos; exatamente uma row antes de
-  cada novo user após o primeiro;
+- uma row vazia depois do user band; thinking e tools são adjacentes; o
+  cabeçalho `● Slim` fica direto sob essa row e abre o turno; uma row separa
+  prosa do assistente de tools/thinking nos dois sentidos; exatamente uma row
+  antes de cada novo user após o primeiro;
 - thinking colapsado e tool rows colapsados têm uma row cada;
 - números dinâmicos usam largura/tabulação estável para não deslocar layout;
 - glyphs normativos: `✓` tool complete, `○` running/pending no transcript,
-  `○`/`●` no único pulso (Thinking visível ou ActivityRail), `✕` failed,
+  spinner braille no único indicador animado (Thinking visível ou
+  ActivityRail; `| / - \` sem cor), `✕` failed,
   `▸`/`▾` para pensamento recolhido/expandido (fallback `>`/`v`),
   `>` composer (sempre ASCII: `›` é Ambiguous no Windows, G264);
 - fallback ASCII: `+`, `~`, `o`, `x`, `>` respectivamente;
-- no-color mantém significado por glyph, label e texto de status;
-- reduced motion congela spinner, remove caret e mantém status textual;
+- no-color mantém significado por glyph, label e texto de status, e continua
+  animando: `NO_COLOR` retira matiz, não movimento;
+- reduced motion congela spinner, remove caret e mantém status textual e os
+  relógios de segundos;
+- foco nos menus pode receber uma ênfase de fundo por 166 ms após tecla,
+  com uma única transição agendada; reduced motion exibe o fundo estável;
 - motion nunca altera largura, alinhamento ou posição de texto.
 
 O default é near-black estratificado com profundidade contida. Themes
@@ -3567,6 +3848,24 @@ M4 Unix (referência histórica, não planejado):
 - fixar corpus e seed;
 - publicar máquina, OS, terminal, profile e commit;
 - comparar p50/p95, não só média.
+
+### 29.4 Medições manuais de streaming
+
+Dois testes ignorados por padrão em `crates/slim-tui/tests/thinking_performance.rs`
+cobrem o que o corpus long-session não cobre, que é uma única mensagem grande
+em streaming. Rode em release:
+
+```powershell
+cargo test --release -p slim-tui --test thinking_performance -- --ignored --nocapture streaming_
+```
+
+`streaming_delta_cost_by_size` mede o custo de aplicar um delta e desenhar o
+quadro em ~2 KB, 20 KB, 100 KB e 400 KB de texto acumulado, para a resposta e
+para o resumo do pensamento. `streaming_output_bytes_per_frame` mede os bytes
+que o terminal recebe por quadro, com prosa de linhas distintas: linhas
+repetidas ou quase iguais fazem a rolagem parecer gratuita, porque o diff vê
+poucas células diferentes. Os resultados de uma execução ficam em
+`release/README.md`, não aqui.
 
 ## 30. Milestones normativos
 

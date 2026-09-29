@@ -17,6 +17,7 @@ mod navigation_visibility;
 mod overlay_polish_golden;
 mod poc2_golden;
 mod scroll_golden;
+mod state_markers_golden;
 mod thinking_expansion_golden;
 mod tool_details_golden;
 mod welcome_golden;

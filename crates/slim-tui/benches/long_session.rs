@@ -80,6 +80,7 @@ fn corpus_bytes(state: &AppState) -> usize {
             | BlockKind::QueuedUser(text) => text.len(),
             BlockKind::Tool(tool) => tool.name.len() + tool.preview.len(),
             BlockKind::InteractionRequest(interaction) => interaction.display_text().len(),
+            BlockKind::Receipt(receipt) => receipt.summary().len(),
         })
         .sum()
 }

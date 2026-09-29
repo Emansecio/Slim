@@ -11,6 +11,9 @@ Uso:
 import argparse
 import hashlib
 import json
+import random
+from fractions import Fraction
+from math import comb
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import Counter
@@ -74,6 +77,78 @@ def classify_error(tool, text):
     if "timeout" in t or "timed out" in t:
         return "timeout"
     return "other-error"
+
+
+def tool_outcomes(tool_list):
+    """Unica definicao da contagem de resultado de ferramenta usada pelos normalizadores.
+
+    `success=None` significa resultado nao comprovado (fact/evento ausente), nao falha.
+    """
+    failed = sum(1 for t in tool_list if t.get("success") is False)
+    unknown = sum(1 for t in tool_list if t.get("success") is None)
+    return {"succeeded": len(tool_list) - failed - unknown, "failed": failed, "unknown": unknown}
+
+
+def slim_usage_identity(usage_requests, manifest=None):
+    """Provider/modelo observados por request Slim e consistencia interna do par.
+
+    O rotulo do produto nao e assumido igual ao nome do provider no manifesto: a
+    divergencia e registrada e reprova o braco no gate, porque o numero so vale
+    para a rota rotulada. Requests do mesmo par tambem devem concordar entre si
+    (fallback silencioso de modelo/rota no meio da tarefa).
+    """
+    pairs = [((r.get("provider") or ""), (r.get("model") or "")) for r in usage_requests]
+    known = [pair for pair in pairs if pair[0] or pair[1]]
+    counts = Counter(known)
+    dominant = counts.most_common(1)[0][0] if counts else ("", "")
+    expected_model = (manifest or {}).get("model")
+    expected_provider = (manifest or {}).get("provider")
+    return {
+        "provider": dominant[0] or None, "model": dominant[1] or None,
+        "turns": len(pairs), "turns_with_identity": len(known),
+        "distinct": [{"provider": p, "model": m, "turns": n} for (p, m), n in counts.most_common()],
+        "inconsistent_turns": [i for i, pair in enumerate(pairs, 1) if pair in known and pair != dominant],
+        "manifest_model": expected_model, "manifest_provider": expected_provider,
+        "model_matches_manifest": (dominant[1] == expected_model) if (dominant[1] and expected_model) else None,
+        "provider_matches_manifest": (dominant[0] == expected_provider) if (dominant[0] and expected_provider) else None,
+    }
+
+
+def slim_request_counters(usage_requests):
+    """Campos por request que o ledger Slim ja entrega e o harness ignorava."""
+    def total(key):
+        return sum(r.get(key) or 0 for r in usage_requests)
+    return {"retries": total("retry_count"), "cancelled_requests": total("cancelled"),
+            "cache_hits": total("response_cache_hit"), "unknown_requests": total("usage_unknown"),
+            "failed_requests": total("failed"), "ttfb_ms_sum": total("time_to_first_byte_ms"),
+            "ttfs_ms_sum": total("time_to_first_semantic_ms"),
+            "estimation_error_tokens_sum": total("estimation_error_tokens")}
+
+
+def sign_test_p(wins, trials):
+    """p bilateral exato (metodo minlike) do teste de sinais, sem dependencias externas."""
+    if not trials or wins < 0 or wins > trials:
+        return None
+    probabilities = [Fraction(comb(trials, k), 2 ** trials) for k in range(trials + 1)]
+    observed = probabilities[wins]
+    return float(sum(p for p in probabilities if p <= observed))
+
+
+def bootstrap_median_ci(values, resamples=10000, seed=20260915, percentiles=(2.5, 97.5)):
+    """IC percentil bootstrap da mediana, com semente fixa para repetibilidade."""
+    if not values:
+        return None
+    rng = random.Random(seed)
+    count = len(values)
+    medians = sorted(median([values[rng.randrange(count)] for _ in range(count)]) for _ in range(resamples))
+    def percentile(p):
+        position = (len(medians) - 1) * p / 100
+        low = int(position)
+        high = min(low + 1, len(medians) - 1)
+        weight = position - low
+        return medians[low] * (1 - weight) + medians[high] * weight
+    return {"low": percentile(percentiles[0]), "high": percentile(percentiles[1]),
+            "resamples": resamples, "seed": seed, "method": "percentile-bootstrap-median"}
 
 
 def pi_request_components(request):
@@ -197,8 +272,16 @@ def summarize_pi(cdir):
         all(isinstance(e["message"].get("usage", {}).get(key), (int, float))
             for key in ("input", "output", "cacheRead", "cacheWrite"))
         and e["message"].get("stopReason") != "error" for e in messages)
+    models_seen = Counter(r["model"] for r in rows if r.get("model"))
+    dominant = models_seen.most_common(1)[0][0] if models_seen else None
+    identity = {"provider": None, "model": dominant, "turns": len(rows),
+                "turns_with_identity": sum(models_seen.values()),
+                "distinct": [{"provider": None, "model": m, "turns": n} for m, n in models_seen.most_common()],
+                "inconsistent_turns": [r["turn"] for r in rows if r.get("model") and r["model"] != dominant],
+                "source": "wire"}
     return {"rows": rows, "tools": tool_list, "request_count": len(requests),
-            "message_count": len(messages), "metrics_complete": complete}
+            "message_count": len(messages), "metrics_complete": complete,
+            "identity": identity, "counters": {}}
 
 
 def infer_new_failure(name, content):
@@ -279,6 +362,7 @@ def summarize_slim(cdir):
                 "turn": tool.get("turn", 0),
                 "seq": tool.get("seq"),
                 "success": bool(ok) if ok is not None else None,
+                "evidence": "tool-finished" if ok is not None else "absence",
                 "duration_ms": tool.get("duration_ms", 0),
                 "args": short_args(tool.get("arguments")),
                 "error_kind": classify_error(tool.get("name"), err_text) if ok is False else "",
@@ -287,6 +371,8 @@ def summarize_slim(cdir):
             })
         tool_ms = sum(t.get("duration_ms", 0) or 0 for t in tool_list if isinstance(t.get("duration_ms"), (int, float)))
         return {"rows": rows, "tools": tool_list, "tool_ms_sum": tool_ms,
+                "identity": slim_usage_identity(usage_requests),
+                "counters": slim_request_counters(usage_requests),
                 "provider_turns": usage.get("provider_turns"),
                 "metrics_complete": bool(rows) and len(rows) == len(usage_requests) == usage.get("provider_turns") and bool(slim.get("usage_complete")) and not slim.get("usage_unknown"),
                 "usage_complete": slim.get("usage_complete"), "usage_unknown": slim.get("usage_unknown")}
@@ -331,9 +417,10 @@ def summarize_slim(cdir):
         content = tool_outputs.get(c["call_id"], "")
         ok, err = infer_new_failure(c["name"], content)
         decided = tool_facts.get(c["call_id"])
+        proven = isinstance(decided, dict) and isinstance(decided.get("success"), bool)
         duration = None
         if isinstance(decided, dict):
-            if isinstance(decided.get("success"), bool):
+            if proven:
                 ok = decided["success"]
                 err = "" if ok else content
             duration = decided.get("duration_ms")
@@ -343,6 +430,7 @@ def summarize_slim(cdir):
             "turn": c["turn"],
             "seq": None,
             "success": ok,
+            "evidence": "fact" if proven else "inferred",
             "duration_ms": duration,
             "args": short_args(c["arguments"]),
             "error_kind": classify_error(c["name"], err) if ok is False else "",
@@ -351,6 +439,8 @@ def summarize_slim(cdir):
         })
     tool_ms = sum(u.get("tool_latency_ms", 0) or 0 for u in usage_requests)
     return {"rows": rows, "tools": tool_list, "tool_ms_sum": tool_ms,
+            "identity": slim_usage_identity(usage_requests),
+            "counters": slim_request_counters(usage_requests),
             "provider_turns": usage.get("provider_turns"),
             "metrics_complete": bool(rows) and turn == len(rows) == usage.get("provider_turns") and bool(slim.get("usage_complete")) and not slim.get("usage_unknown"),
             "usage_complete": slim.get("usage_complete"), "usage_unknown": slim.get("usage_unknown")}
@@ -418,15 +508,33 @@ def summarize_arm(cdir, arm):
     wall = timing.get("total_ms", 0) or 0
     residual = wall - totals.get("provider_ms", 0) - tool_ms
     failures = [t for t in tool_list if t.get("success") is False]
+    outcomes = tool_outcomes(tool_list)
+    counters = detail.get("counters") or {}
+    identity = detail.get("identity") or {}
+    if identity:
+        identity["manifest_model"] = manifest.get("model")
+        identity["manifest_provider"] = manifest.get("provider", "openai-codex")
+        if identity.get("model") and identity["manifest_model"]:
+            identity["model_matches_manifest"] = identity["model"] == identity["manifest_model"]
+        if identity.get("provider") and identity["manifest_provider"]:
+            identity["provider_matches_manifest"] = identity["provider"] == identity["manifest_provider"]
     return {
         "campaign": cdir.name, "campaign_path": str(cdir),
         "wall_ms": wall, "exit_code": timing.get("exit_code"), "timed_out": timing.get("timed_out"),
         "validation_exit": validation.get("exit_code"), "fixtures_unchanged": validation.get("fixtures_unchanged"),
         "metrics_complete": detail.get("metrics_complete", False),
         "arm": arm,
-        "model_calls": len(rows), "tool_calls": len(tool_list), "tool_failures": len(failures),
+        "model_calls": len(rows), "tool_calls": len(tool_list), "tool_failures": outcomes["failed"],
+        "tool_unknown": outcomes["unknown"], "tool_succeeded": outcomes["succeeded"],
+        "tool_inferred": sum(1 for t in tool_list if t.get("evidence") == "inferred"),
         "tool_ms_sum": tool_ms, "provider_ms_sum": totals.get("provider_ms", 0), "residual_ms": residual,
         "total_tokens": totals.get("input", 0) + totals.get("output", 0), **totals,
+        "retries": counters.get("retries", 0), "cancelled_requests": counters.get("cancelled_requests", 0),
+        "cache_hits": counters.get("cache_hits", 0), "unknown_requests": counters.get("unknown_requests", 0),
+        "failed_requests": counters.get("failed_requests", 0), "ttfb_ms_sum": counters.get("ttfb_ms_sum", 0),
+        "ttfs_ms_sum": counters.get("ttfs_ms_sum", 0),
+        "estimation_error_tokens_sum": counters.get("estimation_error_tokens_sum", 0),
+        "identity": identity,
         "error_breakdown": dict(Counter(t.get("error_kind", "") for t in failures if t.get("error_kind"))),
         "workspace_diff": workspace_diff(cdir, arm, manifest),
         "rows": rows, "tools": tool_list,
@@ -434,9 +542,59 @@ def summarize_arm(cdir, arm):
 
 
 def gate_ok(summary):
+    """Gate de execucao + rota: uso so entra na comparacao se a identidade nao se contradiz.
+
+    Rotulo nao observado (`turns_with_identity == 0`) gera aviso, nao reprovacao: ausencia
+    de prova nao e prova de troca de rota.
+    """
+    identity = summary.get("identity") or {}
+    if identity.get("inconsistent_turns"):
+        return False
+    if any(identity.get(field) is False for field in ("model_matches_manifest", "provider_matches_manifest")):
+        return False
     return (summary["exit_code"] == 0 and not summary["timed_out"]
             and summary["validation_exit"] == 0 and summary["fixtures_unchanged"]
             and summary.get("metrics_complete", False))
+
+
+SUMMARY_SUM_KEYS = ("wall_ms", "model_calls", "tool_calls", "tool_failures", "tool_unknown", "tool_succeeded",
+                    "tool_inferred",
+                    "tool_ms_sum", "provider_ms_sum", "residual_ms", "total_tokens", "input", "uncached",
+                    "cache", "cache_write", "output", "reasoning", "retries", "cancelled_requests",
+                    "cache_hits", "unknown_requests", "failed_requests", "ttfb_ms_sum", "ttfs_ms_sum",
+                    "estimation_error_tokens_sum")
+
+
+def aggregate_arms(arms_by_arm):
+    """Agrega bracos por arm; quem entra no denominador e decisao de quem chama.
+
+    Cada arm agrega as campanhas que passaram no proprio gate, portanto os
+    denominadores de Slim e Pi podem diferir quando um arm reprova e o outro nao.
+    `campaigns` registra o denominador dentro do proprio total e a tabela principal
+    imprime os dois, para nao comparar populacoes diferentes sem aviso; comparacao
+    estritamente pareada fica na secao de pareamento, que so usa campanhas com os
+    dois bracos aprovados.
+    """
+    aggs = {}
+    for arm, arms in arms_by_arm.items():
+        if not arms:
+            continue
+        tot = {key: sum(a.get(key, 0) or 0 for a in arms) for key in SUMMARY_SUM_KEYS}
+        tot["campaigns"] = len(arms)
+        tot["files_modified"] = sum(len((a.get("workspace_diff") or {}).get("modified", [])) for a in arms)
+        tot["files_added"] = sum(len((a.get("workspace_diff") or {}).get("added", [])) for a in arms)
+        kinds = Counter()
+        by_tool = {}
+        for a in arms:
+            kinds.update(a.get("error_breakdown", {}))
+            for t in a["tools"]:
+                e = by_tool.setdefault(t.get("name") or "?", {"calls": 0, "failures": 0, "unknown": 0, "ms": 0})
+                e["calls"] += 1
+                e["failures"] += 1 if t.get("success") is False else 0
+                e["unknown"] += 1 if t.get("success") is None else 0
+                e["ms"] += t.get("duration_ms") or 0
+        aggs[arm] = {"arms": arms, "total": tot, "errors": dict(kinds), "pairs": len(arms), "by_tool": by_tool}
+    return aggs
 
 
 def main():
@@ -477,36 +635,41 @@ def main():
             cells[(d.name, arm)] = summary
             pairs.append(summary)
             if not gate_ok(summary):
+                identity = summary.get("identity") or {}
+                route = (identity.get("inconsistent_turns")
+                         or any(identity.get(field) is False for field in ("model_matches_manifest", "provider_matches_manifest")))
                 cause = ("timeout" if summary["timed_out"]
                          else "processo" if summary["exit_code"] != 0
                          else "usage-incompleto" if not summary["metrics_complete"]
                          else "fixtures" if not summary["fixtures_unchanged"]
+                         else "rota" if route
                          else "oracle")
                 causes[cause] += 1
                 problems.append(d.name + "/" + arm + ": gate falhou (exit=" + str(summary["exit_code"]) + ", valid=" + str(summary["validation_exit"]) + ", fixtures=" + str(summary["fixtures_unchanged"]) + ")")
-    if not pairs:
+    if not cells:
         raise SystemExit("nenhum braco aproveitavel")
-    aggs = {}
-    for arm in ("pi", "slim"):
-        arms = [cells[(d.name, arm)] for d in dirs if (d.name, arm) in cells]
-        if not arms:
-            continue
-        tot = {}
-        for key in ("wall_ms", "model_calls", "tool_calls", "tool_failures", "tool_ms_sum", "provider_ms_sum", "residual_ms", "total_tokens", "input", "uncached", "cache", "output", "reasoning"):
-            tot[key] = sum(a.get(key, 0) for a in arms)
-        tot["files_modified"] = sum(len((a.get("workspace_diff") or {}).get("modified", [])) for a in arms)
-        tot["files_added"] = sum(len((a.get("workspace_diff") or {}).get("added", [])) for a in arms)
-        kinds = Counter()
-        for a in arms:
-            kinds.update(a.get("error_breakdown", {}))
-        by_tool = {}
-        for a in arms:
-            for t in a["tools"]:
-                e = by_tool.setdefault(t.get("name") or "?", {"calls": 0, "failures": 0, "ms": 0})
-                e["calls"] += 1
-                e["failures"] += 1 if t.get("success") is False else 0
-                e["ms"] += t.get("duration_ms") or 0
-        aggs[arm] = {"arms": arms, "total": tot, "errors": dict(kinds), "pairs": len(arms), "by_tool": by_tool}
+    for summary in cells.values():
+        label = summary["campaign"] + "/" + summary["arm"]
+        identity = summary.get("identity") or {}
+        if identity.get("inconsistent_turns"):
+            causes["identidade-instavel"] += 1
+            problems.append(label + ": provider/modelo mudou no meio da tarefa (turnos "
+                            + str(identity["inconsistent_turns"]) + "); uso nao atribuivel a uma rota unica")
+        if identity.get("provider_matches_manifest") is False:
+            problems.append(label + ": provider do ledger `" + str(identity.get("provider"))
+                            + "` difere do rotulado no manifesto `" + str(identity.get("manifest_provider"))
+                            + "` (rota nao confirmada pelo registro)")
+        if identity.get("model_matches_manifest") is False:
+            problems.append(label + ": modelo do registro `" + str(identity.get("model"))
+                            + "` difere do manifesto `" + str(identity.get("manifest_model")) + "`")
+        if identity and not identity.get("turns_with_identity"):
+            problems.append(label + ": nenhum request traz provider/model; a rota rotulada no manifesto nao foi observada no registro")
+        if summary.get("tool_unknown"):
+            problems.append(label + ": " + str(summary["tool_unknown"])
+                            + " ferramenta(s) sem resultado comprovado (success ausente); contadas como incognitas, nao como falha")
+    approved = {key: s for key, s in cells.items() if gate_ok(s)}
+    aggs = aggregate_arms({arm: [approved[key] for key in sorted(approved) if key[1] == arm] for arm in ("pi", "slim")})
+    aggs_all = aggregate_arms({arm: [cells[key] for key in sorted(cells) if key[1] == arm] for arm in ("pi", "slim")})
     paired = []
     for d in dirs:
         s, p = cells.get((d.name, "slim")), cells.get((d.name, "pi"))
@@ -537,10 +700,20 @@ def main():
             agg["pi_tokens"] += x["pi_tokens"]
             if x["token_ratio"] is not None:
                 agg["ratios"].append(x["token_ratio"])
+        token_wins = sum(1 for x in paired if x["token_ratio"] is not None and x["token_ratio"] < 1)
+        wall_wins = sum(1 for x in paired if x["wall_ratio"] is not None and x["wall_ratio"] < 1)
         stats = {"pairs": len(paired),
-                 "slim_token_wins": sum(1 for x in paired if x["token_ratio"] is not None and x["token_ratio"] < 1),
+                 "slim_token_wins": token_wins,
+                 "slim_wall_wins": wall_wins,
                  "median_token_ratio": median(ratios) if ratios else None,
                  "median_wall_ratio": median(wratios) if wratios else None,
+                 "sign_test_tokens": {"wins": token_wins, "trials": len(ratios),
+                                      "p_two_sided": sign_test_p(token_wins, len(ratios))},
+                 "sign_test_wall": {"wins": wall_wins, "trials": len(wratios),
+                                    "p_two_sided": sign_test_p(wall_wins, len(wratios))},
+                 "bootstrap_ci95_token_ratio": bootstrap_median_ci(ratios),
+                 "bootstrap_ci95_wall_ratio": bootstrap_median_ci(wratios),
+                 "advisory": ("n<8 pares: teste de sinais e IC sao exploratorios, nao conclusivos" if len(paired) < 8 else None),
                  "per_scenario": by_scenario}
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
     lines = []
@@ -548,22 +721,33 @@ def main():
     lines.append("")
     lines.append("Modelo: `" + "|".join(sorted(models)) + "`; provider: `" + "|".join(sorted(providers)) + "`; effort high.")
     lines.append("")
-    lines.append("## Resumo (todos os bracos com registros, incluindo falhas; uso pode ser parcial)")
+    lines.append("## Resumo (por escopo de gate; o denominador vai na propria tabela)")
     lines.append("")
-    lines.append("| Metrica | Slim | Pi | Delta (Slim-Pi) |")
-    lines.append("|---|---:|---:|---:|")
-    if "slim" in aggs and "pi" in aggs:
-        s, p = aggs["slim"]["total"], aggs["pi"]["total"]
+    lines.append("Aprovado = exit 0, sem timeout, `check.py` externo PASS, fixtures intactas e metricas completas. O braco so entra na comparacao principal se ele proprio passou no gate, entao queda de execucao nao vira vantagem falsa de tokens.")
+
+    def summary_scope(scope, caption):
+        lines.append("")
+        lines.append("### " + caption)
+        lines.append("")
+        if "slim" not in scope or "pi" not in scope:
+            lines.append("Escopo sem os dois bracos; sem comparacao.")
+            return
+        s, p = scope["slim"]["total"], scope["pi"]["total"]
+        lines.append("| Metrica | Slim | Pi | Delta (Slim-Pi) |")
+        lines.append("|---|---:|---:|---:|")
         def row(label, key, suffix=""):
-            delta = s[key] - p[key]
+            delta = s.get(key, 0) - p.get(key, 0)
             sign = "+" if delta > 0 else ""
-            lines.append("| " + label + " | " + str(s[key]) + suffix + " | " + str(p[key]) + suffix + " | " + sign + str(delta) + suffix + " |")
+            lines.append("| " + label + " | " + str(s.get(key, 0)) + suffix + " | " + str(p.get(key, 0)) + suffix + " | " + sign + str(delta) + suffix + " |")
+        row("Campanhas no denominador", "campaigns")
         row("Chamadas ao modelo", "model_calls")
         row("Ferramentas executadas", "tool_calls")
         row("Falhas de ferramenta", "tool_failures")
+        row("Ferramentas sem resultado comprovado", "tool_unknown")
         row("Tokens totais (in+out)", "total_tokens")
         row("Entrada (inclui cache)", "input")
         row("Cache lido", "cache")
+        row("Escrita em cache", "cache_write")
         row("Saida (inclui reasoning)", "output")
         row("Reasoning", "reasoning")
         row("Arquivos modificados", "files_modified")
@@ -571,23 +755,65 @@ def main():
         row("Tempo wall soma (ms)", "wall_ms", " ms")
         row("Tempo provider soma (ms)", "provider_ms_sum", " ms")
         row("Tempo tools soma (ms)", "tool_ms_sum", " ms")
-        if s["input"] and p["input"]:
+        if s.get("input") and p.get("input"):
             hs, hp = s["cache"] / s["input"], p["cache"] / p["input"]
             lines.append("| Taxa de acerto de cache | " + format(hs * 100, ".1f") + "% | " + format(hp * 100, ".1f") + "% | " + format((hs - hp) * 100, "+.1f") + " pp |")
+    summary_scope(aggs, "Aprovados no gate (comparacao principal)")
+    if any(aggs_all[arm]["pairs"] > aggs.get(arm, {}).get("pairs", 0) for arm in aggs_all):
+        summary_scope(aggs_all, "Todos os bracos com registros, incluindo reprovados (uso pode ser parcial)")
     lines.append("")
     lines.append("Wall = processo inteiro por braco; provider = soma das latencias informadas pelo harness; tools = soma das duracoes. Residuo = wall-provider-tools: diferenca aritmetica que nao isola startup, pois duracoes de ferramentas podem se sobrepor. Arquivos = diff do workspace vs fixtures originais.")
+    lines.append("")
+    lines.append("## Identidade e configuracao observada (o que o registro prova)")
+    lines.append("")
+    lines.append("Celula `-` significa que o braco nao expoe o campo, nao um zero medido. Robusto = a rota do braco Slim e o modelo efetivamente observados batem com o rotulo do manifesto e nao mudam no meio da tarefa.")
+    lines.append("")
+    lines.append("| Campanha | Braco | provider | modelo | turnos c/ identidade | turnos divergentes | modelo=manifesto | provider=manifesto | retries | canceladas | cache hit local | usage incognito | requests falhos | TTFB soma (ms) | erro estimativa tokens |")
+    lines.append("|---|---|---|---|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|")
+    for key in sorted(cells):
+        a = cells[key]
+        ident = a.get("identity") or {}
+        slim_side = a["arm"] == "slim"
+        def value(field):
+            raw = ident.get(field)
+            return "-" if raw is None or raw == "" else str(raw)
+        def counter(field):
+            return str(a.get(field, 0)) if slim_side else "-"
+        divergent = ",".join(str(t) for t in ident.get("inconsistent_turns") or []) or "-"
+        lines.append("| `" + a["campaign"] + "` | " + a["arm"] + " | " + value("provider") + " | " + value("model")
+                     + " | " + str(ident.get("turns_with_identity", "-")) + " | " + divergent
+                     + " | " + value("model_matches_manifest") + " | " + value("provider_matches_manifest")
+                     + " | " + counter("retries") + " | " + counter("cancelled_requests")
+                     + " | " + counter("cache_hits") + " | " + counter("unknown_requests")
+                     + " | " + counter("failed_requests") + " | " + counter("ttfb_ms_sum")
+                     + " | " + counter("estimation_error_tokens_sum") + " |")
+    lines.append("")
     if stats:
         lines.append("")
         lines.append("## Pareamento (somente pares com gate aprovado nos dois bracos)")
         lines.append("")
         lines.append("| Medida | Valor |")
         lines.append("|---|---:|")
+        def ptext(block):
+            value = (block or {}).get("p_two_sided")
+            return "n/d" if value is None else format(value, ".4f")
+        def citext(interval):
+            return "n/d" if not interval else "[" + format(interval["low"], ".4f") + ", " + format(interval["high"], ".4f") + "]"
         lines.append("| Pares aproveitados | " + str(stats["pairs"]) + " |")
         lines.append("| Slim mais economico em tokens | " + str(stats["slim_token_wins"]) + "/" + str(stats["pairs"]) + " |")
+        lines.append("| Slim mais rapido em wall | " + str(stats["slim_wall_wins"]) + "/" + str(stats["sign_test_wall"]["trials"]) + " |")
         if stats["median_token_ratio"] is not None:
             lines.append("| Mediana razao tokens Slim/Pi | " + format(stats["median_token_ratio"], ".4f") + " |")
         if stats["median_wall_ratio"] is not None:
             lines.append("| Mediana razao wall Slim/Pi | " + format(stats["median_wall_ratio"], ".4f") + " |")
+        lines.append("| p bilateral (sinais, tokens) | " + ptext(stats["sign_test_tokens"]) + " |")
+        lines.append("| p bilateral (sinais, wall) | " + ptext(stats["sign_test_wall"]) + " |")
+        lines.append("| IC95 mediana razao tokens (bootstrap) | " + citext(stats["bootstrap_ci95_token_ratio"]) + " |")
+        lines.append("| IC95 mediana razao wall (bootstrap) | " + citext(stats["bootstrap_ci95_wall_ratio"]) + " |")
+        if stats.get("advisory"):
+            lines.append("| Aviso de amostra | " + stats["advisory"] + " |")
+        lines.append("")
+        lines.append("Teste de sinais bilateral exato sobre os pares (empates contam como nao-vitoria) e IC percentil bootstrap da mediana com semente fixa `" + str((stats["bootstrap_ci95_token_ratio"] or {}).get("seed", 20260915)) + "`, " + str((stats["bootstrap_ci95_token_ratio"] or {}).get("resamples", 10000)) + " reamostragens; quem nao domina intervalo nao deve reivindicar ganho.")
         lines.append("")
         lines.append("| Cenario | Pares | Tokens Slim | Tokens Pi | Delta Slim | Razao min/med/max |")
         lines.append("|---|---:|---:|---:|---:|---:|")
@@ -610,60 +836,86 @@ def main():
                 lines.append("")
             except Exception as error:
                 problems.append("baseline ilegivel: " + str(error))
-    lines.append("## Por campanha")
+    lines.append("## Por campanha (todas, aprovadas ou nao)")
     lines.append("")
-    lines.append("| Campanha | Cenario | Slim (chamadas/falhas/tokens/wall/arq) | Pi (chamadas/falhas/tokens/wall/arq) |")
-    lines.append("|---|---|---|---|")
+    lines.append("Formato do braco: chamadas/falhas/incognitas/tokens/wall/arquivos; a coluna gate diz aprovado ou o primeiro motivo de reprovacao.")
+    lines.append("")
+    lines.append("| Campanha | Cenario | Gate Slim | Gate Pi | Slim (cham/falh/incog/tokens/wall/arq) | Pi (cham/falh/incog/tokens/wall/arq) |")
+    lines.append("|---|---|---|---|---|---|")
     for d in dirs:
         manifest = manifests[d.name]
         scen = manifest.get("scenario", "?")
-        sm = next((a for a in aggs.get("slim", {}).get("arms", []) if a["campaign"] == d.name), None)
-        pm = next((a for a in aggs.get("pi", {}).get("arms", []) if a["campaign"] == d.name), None)
+        sm, pm = cells.get((d.name, "slim")), cells.get((d.name, "pi"))
         def cell(a):
             if a is None:
                 return "-"
             diff = a.get("workspace_diff") or {}
             arq = str(len(diff.get("modified", []))) + "mod+" + str(len(diff.get("added", []))) + "novos"
-            return (str(a["model_calls"]) + "/" + str(a["tool_failures"]) + "/" + str(a["total_tokens"])
-                    + "/" + str(a["wall_ms"]) + "ms/" + arq)
-        lines.append("| `" + d.name + "` | " + scen + " | " + cell(sm) + " | " + cell(pm) + " |")
+            return (str(a["model_calls"]) + "/" + str(a["tool_failures"]) + "/" + str(a.get("tool_unknown", 0))
+                    + "/" + str(a["total_tokens"]) + "/" + str(a["wall_ms"]) + "ms/" + arq)
+        def gate(a):
+            if a is None:
+                return "nao executado"
+            if gate_ok(a):
+                return "aprovado"
+            if a["timed_out"]:
+                return "timeout"
+            if a["exit_code"] != 0:
+                return "exit=" + str(a["exit_code"])
+            if not a["metrics_complete"]:
+                return "uso incompleto"
+            if not a["fixtures_unchanged"]:
+                return "fixtures alteradas"
+            identity = a.get("identity") or {}
+            if identity.get("inconsistent_turns"):
+                return "rota do registro instavel"
+            if any(identity.get(field) is False for field in ("model_matches_manifest", "provider_matches_manifest")):
+                return "rota do registro != manifesto"
+            return "validacao externa"
+        lines.append("| `" + d.name + "` | " + scen + " | " + gate(sm) + " | " + gate(pm) + " | " + cell(sm) + " | " + cell(pm) + " |")
     lines.append("")
-    lines.append("## Por ferramenta (uso agregado por braco)")
+    lines.append("## Por ferramenta (uso agregado por braco, incluindo bracos reprovados)")
     lines.append("")
-    tool_names = sorted(set().union(*[set(aggs[a]["by_tool"]) for a in aggs]),
-                      key=lambda n: -(sum(aggs[a]["by_tool"].get(n, {}).get("calls", 0) for a in aggs)))
+    lines.append("Formato: chamadas/falhas/incognitas/ms; incognita = sem resultado comprovado (`success` ausente), nunca somada a falhas.")
+    lines.append("")
+    tool_names = sorted(set().union(*[set(aggs_all[a]["by_tool"]) for a in aggs_all]),
+                      key=lambda n: -(sum(aggs_all[a]["by_tool"].get(n, {}).get("calls", 0) for a in aggs_all)))
     if tool_names:
-        lines.append("| Ferramenta | Slim calls/falhas/ms | Pi calls/falhas/ms |")
+        lines.append("| Ferramenta | Slim cham/falh/incog/ms | Pi cham/falh/incog/ms |")
         lines.append("|---|---:|---:|")
         for name in tool_names:
             def tcell(arm):
-                e = aggs.get(arm, {}).get("by_tool", {}).get(name)
-                return "-" if e is None else str(e["calls"]) + "/" + str(e["failures"]) + "/" + str(e["ms"]) + "ms"
+                e = aggs_all.get(arm, {}).get("by_tool", {}).get(name)
+                return "-" if e is None else (str(e["calls"]) + "/" + str(e["failures"]) + "/" + str(e["unknown"])
+                                              + "/" + str(e["ms"]) + "ms")
             lines.append("| " + name + " | " + tcell("slim") + " | " + tcell("pi") + " |")
     else:
         lines.append("Nenhuma ferramenta registrada.")
     lines.append("")
-    lines.append("## Erros de ferramenta (para achar fraqueza)")
+    lines.append("## Erros de ferramenta (para achar fraqueza; inclui bracos reprovados)")
     lines.append("")
     for arm in ("slim", "pi"):
-        if arm not in aggs:
+        if arm not in aggs_all:
             continue
-        lines.append("### " + arm + ": " + str(aggs[arm]["total"]["tool_failures"]) + " falha(s) em " + str(aggs[arm]["total"]["tool_calls"]) + " execucoes")
+        lines.append("### " + arm + ": " + str(aggs_all[arm]["total"]["tool_failures"]) + " falha(s), "
+                     + str(aggs_all[arm]["total"]["tool_unknown"]) + " sem resultado comprovado, "
+                     + str(aggs_all[arm]["total"].get("tool_inferred", 0)) + " por heuristica de texto, em "
+                     + str(aggs_all[arm]["total"]["tool_calls"]) + " execucoes")
         lines.append("")
-        if aggs[arm]["errors"]:
+        if aggs_all[arm]["errors"]:
             lines.append("| Classe | Qtd |")
             lines.append("|---|---:|")
-            for kind, count in sorted(aggs[arm]["errors"].items(), key=lambda kv: -kv[1]):
+            for kind, count in sorted(aggs_all[arm]["errors"].items(), key=lambda kv: -kv[1]):
                 lines.append("| " + kind + " | " + str(count) + " |")
             lines.append("")
-        failures = [t for a in aggs[arm]["arms"] for t in a["tools"] if t.get("success") is False]
+        failures = [t for a in aggs_all[arm]["arms"] for t in a["tools"] if t.get("success") is False]
         if not failures:
             lines.append("Nenhuma falha registrada.")
             lines.append("")
             continue
         lines.append("| Campanha | Turno | Tool | Args | Classe | Trecho do erro | Rastro |")
         lines.append("|---|---|---|---|---|---|---|")
-        for a in aggs[arm]["arms"]:
+        for a in aggs_all[arm]["arms"]:
             for t in a["tools"]:
                 if t.get("success") is False:
                     lines.append("| `" + a["campaign"] + "` | " + str(t.get("turn")) + " | " + str(t.get("name")) + " | `" + excerpt(t.get("args"), 80).replace("|", "/") + "` | " + str(t.get("error_kind")) + " | " + excerpt(t.get("error"), 140).replace("|", "/") + " | " + str(t.get("trace")) + " |")
@@ -674,17 +926,22 @@ def main():
         lines.append("### `" + d.name + "`")
         lines.append("")
         for arm in ("slim", "pi"):
-            if arm not in aggs:
+            if arm not in aggs_all:
                 continue
-            a = next((x for x in aggs[arm]["arms"] if x["campaign"] == d.name), None)
+            a = next((x for x in aggs_all[arm]["arms"] if x["campaign"] == d.name), None)
             if a is None:
                 continue
             lines.append("#### " + arm)
             lines.append("")
-            lines.append("| turno | in | out | reasoning | hist_bytes | provider_ms | tools |")
-            lines.append("|---|---:|---:|---:|---:|---:|---|")
+            lines.append("| turno | in | in_acum | out | reasoning | hist_bytes | tool_result_bytes | provider_ms | tools |")
+            lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---|")
+            cumulative = 0
             for r in a["rows"]:
-                lines.append("| " + str(r.get("turn")) + " | " + str(r.get("input")) + " | " + str(r.get("output")) + " | " + str(r.get("reasoning")) + " | " + str(r.get("history_bytes") or "-") + " | " + str(r.get("provider_ms")) + " | " + ",".join(r.get("tools") or []) + " |")
+                cumulative += r.get("input") or 0
+                lines.append("| " + str(r.get("turn")) + " | " + str(r.get("input")) + " | " + str(cumulative) + " | "
+                             + str(r.get("output")) + " | " + str(r.get("reasoning")) + " | "
+                             + str(r.get("history_bytes") or "-") + " | " + str(r.get("tool_result_bytes") or "-") + " | "
+                             + str(r.get("provider_ms")) + " | " + ",".join(r.get("tools") or []) + " |")
             lines.append("")
     lines.append("## Rastreabilidade")
     lines.append("")
@@ -713,7 +970,10 @@ def main():
     lines.append("- Instrumentacao assimetrica: Pi via extensao observadora, Slim via ledger/sessao; contagens sao turnos do modelo, nao TCP/retries de transporte. Residuo nao isola startup: duracoes de tools podem se sobrepor.")
     lines.append("- history_bytes exclui resultados de tools nos dois bracos; tool_result_bytes os registra separadamente. Campanhas Pi antigas reconstroem bytes do payload com reasoning opaco omitido, portanto seus bytes de historico sao parciais.")
     lines.append("- Tokens sao usos informados pelos providers; sem inferencia de custo monetario.")
-    lines.append("- Outcomes Slim: facts estruturados tool.v1 quando presentes; senao heuristica sobre o texto da tool.")
+    lines.append("- Outcomes Slim (v2): fact estruturado `tool.v1` quando existe (`evidence=fact`); sem ele o desfecho vem da heuristica de texto e fica marcado como `evidence=inferred` no JSON, nao como prova. Execucao sem fact e sem `ToolFinished` (v1) fica `evidence=absence`, com `success=None`: incognita, nunca falha. Separe `tool_failures` de `tool_unknown`/`tool_inferred`: muitas incognitas significam braco subinstrumentado, nao braco perfeito.")
+    lines.append("- Denominador: a comparacao principal usa so bracos com gate aprovado. Um braco reprovado sai da comparacao e continua visivel em 'todos' e nas secoes de erro; portanto a reducao de n nao e silenciosa.")
+    lines.append("- Estatistica: o teste de sinais bilateral trata empates como nao-vitoria e o IC bootstrap pressupoe pares independentes; repeticoes do mesmo cenario no mesmo host, com cache do servidor, violam essa suposicao em algum grau.")
+    lines.append("- Identidade: provider/modelo do Slim vem do ledger por request; no Pi o provider nao consta do payload, entao `provider=manifesto` fica `-` nesse braco. Identidade nao medida nunca e exibida como 0.")
     if problems:
         if causes:
             lines.append("- Falhas por causa: " + ", ".join(k + "=" + str(v) for k, v in causes.most_common()))
@@ -721,11 +981,36 @@ def main():
     else:
         lines.append("- Todos os bracos passaram no gate (exit 0, validacao externa PASS, fixtures intactas, metricas completas).")
     args.output_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    args.output_json.write_text(json.dumps({"generated_utc": generated, "manifests": {k: manifests[k] for k in manifests}, "aggregate": {arm: {"total": aggs[arm]["total"], "errors": aggs[arm]["errors"], "pairs": aggs[arm]["pairs"], "by_tool": aggs[arm]["by_tool"]} for arm in aggs}, "paired": {"stats": stats, "pairs": paired}, "arms": pairs, "problems": problems, "failure_causes": dict(causes)}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    def scope_json(scope):
+        return {arm: {"total": scope[arm]["total"], "errors": scope[arm]["errors"],
+                      "pairs": scope[arm]["pairs"], "by_tool": scope[arm]["by_tool"]} for arm in scope}
+    payload = {"generated_utc": generated,
+               "manifests": {k: manifests[k] for k in manifests},
+               "gate": {"arms_with_records": len(pairs),
+                        "arms_approved": sum(len(scope["arms"]) for scope in aggs.values()),
+                        "campaigns": [d.name for d in dirs]},
+               "aggregate": scope_json(aggs),
+               "aggregate_all": scope_json(aggs_all),
+               "identity": {key[0] + "/" + key[1]: {"gate_ok": gate_ok(cells[key]),
+                                                     "identity": cells[key].get("identity"),
+                                                     "tool_unknown": cells[key].get("tool_unknown"),
+                                                     "retries": cells[key].get("retries"),
+                                                     "cancelled_requests": cells[key].get("cancelled_requests"),
+                                                     "cache_hits": cells[key].get("cache_hits"),
+                                                     "unknown_requests": cells[key].get("unknown_requests"),
+                                                     "failed_requests": cells[key].get("failed_requests"),
+                                                     "ttfb_ms_sum": cells[key].get("ttfb_ms_sum"),
+                                                     "ttfs_ms_sum": cells[key].get("ttfs_ms_sum"),
+                                                     "estimation_error_tokens_sum": cells[key].get("estimation_error_tokens_sum")} for key in sorted(cells)},
+               "paired": {"stats": stats, "pairs": paired},
+               "arms": pairs, "problems": problems, "failure_causes": dict(causes)}
+    args.output_json.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print("md: " + str(args.output_md))
     print("json: " + str(args.output_json))
-    for arm in sorted(aggs):
-        print(arm + " " + json.dumps(aggs[arm]["total"], ensure_ascii=False))
+    for arm in sorted(aggs_all):
+        approved_total = aggs.get(arm, {}).get("total")
+        print(arm + " aprovados: " + (json.dumps(approved_total, ensure_ascii=False) if approved_total else "sem bracos aprovados"))
+        print(arm + " todos: " + json.dumps(aggs_all[arm]["total"], ensure_ascii=False))
 
 
 if __name__ == "__main__":

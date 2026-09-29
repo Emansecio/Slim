@@ -337,6 +337,7 @@ async fn http_judge_rejects_oversized_stream_before_eof() {
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let address = listener.local_addr().expect("address");
+    let (result_obtained, wait_for_result) = std::sync::mpsc::channel::<()>();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
         let mut first_request_byte = [0_u8; 1];
@@ -352,8 +353,10 @@ async fn http_judge_rejects_oversized_stream_before_eof() {
         stream.write_all(b"\r\n").expect("chunk suffix");
         stream.flush().expect("flush");
         // Leave the chunked response unfinished. The client must reject the
-        // body limit without waiting for a terminal chunk or connection close.
-        std::thread::sleep(Duration::from_secs(3));
+        // body limit without waiting for a terminal chunk or connection close:
+        // keep the stream open until the test has its result. The timeout is
+        // only a safety net so the server thread cannot outlive a failed test.
+        let _ = wait_for_result.recv_timeout(Duration::from_secs(10));
     });
 
     let judge = HttpJevJudge::new(JevPruneConfig::new(JevBackend::Typesafe, "fixture-key"))
@@ -364,6 +367,7 @@ async fn http_judge_rejects_oversized_stream_before_eof() {
         judge.judge(&serde_json::json!({ "task": "test" }), &questions),
     )
     .await;
+    let _ = result_obtained.send(());
     server.join().expect("server");
     let error = result
         .expect("oversized response must be rejected before EOF")

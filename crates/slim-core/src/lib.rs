@@ -16,6 +16,7 @@ pub mod session;
 pub mod skills;
 pub mod task;
 pub mod tools;
+pub mod workspace_files;
 
 pub use codeintel::{
     CodeIntelCompleteness, CodeIntelDiagnosticsQuery, CodeIntelMeta, CodeIntelOutcome,
@@ -45,4 +46,8 @@ pub use provider::{
 pub use runtime::{
     tool_call_is_read_only, without_workspace_snapshot, AgentLoopConfig, AgentLoopResult,
     AgentLoopStop, RequestUsage, Runtime, RuntimeCapabilityBridge, UsageTotals,
+};
+pub use workspace_files::{
+    is_sensitive_file_name, list_workspace_files, load_mention_file, mention_paths_in_prompt,
+    MentionError, MentionFile,
 };

@@ -2146,7 +2146,6 @@ fn run_tui_compaction_corpus(background: bool) -> TuiCompactionMetrics {
             } else if normal_count == 0 {
                 let content = "turn-padding ".repeat(7_000);
                 first_writer = Some(thread::spawn(move || {
-                    thread::sleep(Duration::from_millis(150));
                     let event = json!({"choices":[{"delta":{
                         "content":content,
                         "tool_calls":[{"index":0,"id":"fixture-question","function":{
@@ -2211,7 +2210,14 @@ fn run_tui_compaction_corpus(background: bool) -> TuiCompactionMetrics {
                 UiEvent::CompactionState { state, .. } => states.push(state),
                 UiEvent::QuestionRequired { request_id, .. } => {
                     assert!(!answered);
-                    thread::sleep(Duration::from_millis(120));
+                    if background {
+                        // The background summary request starts once this tool call
+                        // arrives. Its completion is not observable from here (the
+                        // handle stays `Preparing` until the loop resumes), so give
+                        // the fixture time to answer it before resuming the loop.
+                        // Only the background run has a summary to wait for.
+                        thread::sleep(Duration::from_millis(120));
+                    }
                     channels
                         .commands
                         .send(UiCommand::AnswerQuestion {

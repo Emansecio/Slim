@@ -152,6 +152,77 @@ fn inline_markdown_renders_without_control_markers() {
 }
 
 #[test]
+fn blockquote_keeps_text_on_the_rail_row_instead_of_leaving_a_lone_rail() {
+    let rendered = render("Antes.\n\n> Não rodei o build release.\n\nDepois.", 60);
+    let quote = rendered
+        .rows
+        .iter()
+        .position(|row| row.contains("Não rodei"))
+        .expect("quote text");
+    assert!(
+        rendered.rows[quote].starts_with("    │ Não rodei o build release."),
+        "{}",
+        rendered.text()
+    );
+    assert!(
+        rendered.rows.iter().all(|row| row.trim() != "│"),
+        "a rail must never stand alone above its text:\n{}",
+        rendered.text()
+    );
+    // One breathing row on each side, like any other root block.
+    assert!(rendered.rows[quote - 1].trim().is_empty());
+    assert!(rendered.rows[quote + 1].trim().is_empty());
+    assert!(rendered.rows[quote - 2].contains("Antes."));
+    assert!(rendered.rows[quote + 2].contains("Depois."));
+}
+
+#[test]
+fn long_blockquote_wraps_under_its_rail_and_measures_the_same() {
+    let text = "> primeira frase da citação segue por bastante texto até quebrar em várias linhas";
+    let rendered = render(text, 30);
+    let rows: Vec<&String> = rendered
+        .rows
+        .iter()
+        .filter(|row| row.contains('│'))
+        .collect();
+    assert!(rows.len() >= 3, "{}", rendered.text());
+    assert!(
+        rows.iter().all(|row| row.starts_with("    │ ")),
+        "every wrapped row keeps the rail:\n{}",
+        rendered.text()
+    );
+
+    let mut state = AppState::new();
+    reduce(
+        &mut state,
+        Action::UiEventReceived(UiEvent::AssistantDelta { text: text.into() }),
+    );
+    let measured = HeightIndex::build(state.blocks(), 30, &mut WrapCache::default()).total_rows;
+    // A lone block also carries the turn header and its blank row above it.
+    assert_eq!(measured, rows.len() as u64 + 2, "{}", rendered.text());
+}
+
+#[test]
+fn quote_paragraphs_share_one_rail_separated_by_a_rail_only_row() {
+    let rendered = render("> um\n>\n> dois", 40);
+    let first = rendered
+        .rows
+        .iter()
+        .position(|row| row.contains("│ um"))
+        .expect("first paragraph");
+    assert!(
+        rendered.rows[first + 1].trim_end() == "    │",
+        "{}",
+        rendered.text()
+    );
+    assert!(
+        rendered.rows[first + 2].starts_with("    │ dois"),
+        "{}",
+        rendered.text()
+    );
+}
+
+#[test]
 fn inline_code_uses_raised_surface_not_green() {
     let rendered = render("see `target\\debug` and more", 80);
     assert_eq!(
@@ -242,7 +313,9 @@ fn narrow_tables_stack_fields_without_dropping_cell_tails() {
 #[test]
 fn narrow_unicode_tables_keep_graphemes_and_sanitized_text() {
     let markdown = "| Campo | Conteúdo |\n| --- | --- |\n| chave | 東京 👨‍👩‍👧‍👦 fim-unicode\u{1b}]52;c2VjcmV0\u{7} |";
-    let rendered = render(markdown, 16);
+    // 18 columns leave the same 13-cell prose width the 16-column case had
+    // before the text column moved to the prompt's four-cell indent.
+    let rendered = render(markdown, 18);
     let text = rendered.text();
     assert!(text.contains("Campo: chave"), "{text}");
     assert!(text.contains("東京"), "wide Unicode cell was lost:\n{text}");
@@ -328,6 +401,84 @@ fn assistant_body_uses_role_label_and_foreground() {
 }
 
 #[test]
+fn agent_header_shares_the_prompt_gutter_and_degrades_to_ascii() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::UserMessageAdded { text: "oi".into() });
+    state.apply_event(UiEvent::ToolStarted {
+        batch_id: slim_tui::api::ToolBatchId("batch".into()),
+        call_id: slim_tui::api::ToolCallId("call".into()),
+        name: "read".into(),
+        arguments_summary: "arquivo".into(),
+    });
+    state.apply_event(UiEvent::ToolEnded {
+        batch_id: slim_tui::api::ToolBatchId("batch".into()),
+        call_id: slim_tui::api::ToolCallId("call".into()),
+        name: "read".into(),
+        success: true,
+        duration_ms: 1,
+    });
+    state.apply_event(UiEvent::AssistantDelta {
+        text: "pronto".into(),
+    });
+    state.apply_event(UiEvent::AssistantEnded);
+
+    let color = render_state(&state, 60);
+    let header = color
+        .rows
+        .iter()
+        .position(|row| role_header(row))
+        .expect("header");
+    let prompt = color
+        .rows
+        .iter()
+        .position(|row| row.contains("● Você"))
+        .expect("prompt");
+    assert_eq!(
+        color.rows[header].find('●'),
+        color.rows[prompt].find('●'),
+        "both roles put their marker in the same gutter column"
+    );
+    assert_eq!(
+        color.foreground[header][2],
+        Color::Rgb(0x72, 0xCC, 0x91),
+        "the agent marker carries the Slim identity color"
+    );
+    // Work rows hang their markers in that gutter; prose starts in the text
+    // column, four cells in, like the prompt body.
+    let tool = color
+        .rows
+        .iter()
+        .position(|row| row.contains("✓"))
+        .expect("tool row");
+    assert_eq!(tool, header + 1, "{}", color.text());
+    assert!(color.rows[tool].starts_with("  ✓ "), "{}", color.text());
+    let answer = color
+        .rows
+        .iter()
+        .position(|row| row.contains("pronto"))
+        .expect("prose");
+    assert!(
+        color.rows[answer].starts_with("    pronto"),
+        "{}",
+        color.text()
+    );
+
+    let plain = render_state_with_caps(
+        &state,
+        60,
+        Capabilities {
+            color_depth: ColorDepth::None,
+            ..caps()
+        },
+    );
+    assert!(
+        plain.rows.iter().any(|row| row.starts_with("  * Slim")),
+        "{}",
+        plain.text()
+    );
+}
+
+#[test]
 fn user_header_and_body_are_followed_by_one_blank_row() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::UserMessageAdded {
@@ -357,16 +508,17 @@ fn user_header_and_body_are_followed_by_one_blank_row() {
     assert!(rendered.rows[you].starts_with("  ● Você"));
     assert!(rendered.rows[question].starts_with("    question"));
     assert!(rendered.rows[question + 1].trim().is_empty());
+    // One breathing row, the same whether the agent opens with prose or work.
+    assert_eq!(rendered.rows[question + 2].trim_end(), "  ● Slim");
+    assert_eq!(answer, question + 3);
     assert!(
-        rendered.rows[question + 2].trim().is_empty(),
-        "agent breathing row"
+        rendered.rows[answer].starts_with("    answer"),
+        "agent prose shares the prompt's text column"
     );
-    assert_eq!(rendered.rows[question + 3].trim(), "Slim");
-    assert_eq!(answer, question + 4);
 }
 
 #[test]
-fn agent_response_is_separated_from_thinking_and_explicitly_attributed() {
+fn agent_turn_opens_with_one_header_above_thinking_and_prose() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::UserMessageAdded { text: "oi".into() });
     state.apply_event(UiEvent::ThinkingStarted);
@@ -379,19 +531,41 @@ fn agent_response_is_separated_from_thinking_and_explicitly_attributed() {
     });
     state.apply_event(UiEvent::AssistantEnded);
     let rendered = render_state(&state, 80);
+    let prompt = rendered
+        .rows
+        .iter()
+        .position(|row| row.contains("● Você"))
+        .expect("prompt");
+    let header = rendered
+        .rows
+        .iter()
+        .position(|row| role_header(row))
+        .expect("agent header");
     let thought = rendered
         .rows
         .iter()
         .position(|row| row.contains("Pensamento"))
         .expect("thought");
+    // The header owns the work that precedes the first prose of the turn.
+    assert_eq!(header, prompt + 3, "{}", rendered.text());
+    assert_eq!(thought, header + 1, "{}", rendered.text());
     assert!(rendered.rows[thought + 1].trim().is_empty());
-    assert_eq!(rendered.rows[thought + 2].trim(), "Slim");
-    assert_eq!(rendered.rows[thought + 3].trim(), "Oi! Tudo certo?");
+    assert!(
+        rendered.rows[thought + 2].starts_with("    Oi! Tudo certo?"),
+        "{}",
+        rendered.text()
+    );
+    assert_eq!(
+        rendered.rows.iter().filter(|row| role_header(row)).count(),
+        1,
+        "{}",
+        rendered.text()
+    );
 }
 
 fn role_header(row: &str) -> bool {
     let trimmed = row.trim();
-    trimmed == "Slim" || trimmed.starts_with("Slim ·")
+    trimmed == "● Slim" || trimmed.starts_with("● Slim ·")
 }
 
 #[test]
@@ -438,7 +612,7 @@ fn later_assistant_segments_keep_one_header_for_the_turn() {
         .position(|row| row.contains("depois"))
         .expect("continuation");
     assert!(second > first);
-    assert_ne!(rendered.rows[second - 1].trim(), "Slim");
+    assert!(!role_header(&rendered.rows[second - 1]));
 
     state.apply_event(UiEvent::UserMessageAdded {
         text: "de novo".into(),
@@ -450,11 +624,7 @@ fn later_assistant_segments_keep_one_header_for_the_turn() {
     state.scroll.mode = slim_tui::app::FollowMode::Top;
     let next_turn = render_state(&state, 80);
     assert_eq!(
-        next_turn
-            .rows
-            .iter()
-            .filter(|row| row.trim() == "Slim")
-            .count(),
+        next_turn.rows.iter().filter(|row| role_header(row)).count(),
         2,
         "a new user message opens another header\n{}",
         next_turn.text()
@@ -497,7 +667,7 @@ fn collapsed_thinking_is_single_muted_metadata_row() {
         text: "secret plan\nmore\nlast line".into(),
     });
     state.apply_event(UiEvent::ThinkingEnded);
-    // The completed header returns to its muted style after the brief
+    // The completed header settles into the reasoning hue after the brief
     // confirmation emphasis; the retained preview keeps the same geometry.
     state.clock.elapsed_ms = 249;
     let rendered = render_state(&state, 80);
@@ -508,7 +678,7 @@ fn collapsed_thinking_is_single_muted_metadata_row() {
     assert!(text.contains("last line"), "{text}");
     assert_eq!(
         rendered.word_style("Pensamento").0,
-        Color::Rgb(0x99, 0x97, 0x8E)
+        Color::Rgb(0xA9, 0x9F, 0xD6)
     );
 }
 
@@ -541,7 +711,7 @@ fn user_marker_settles_without_changing_the_label_or_layout() {
         text: "mensagem".into(),
     });
     let recent = render_state(&state, 80);
-    assert_eq!(recent.word_style("●").0, Color::Rgb(0x72, 0xCC, 0x91));
+    assert_eq!(recent.word_style("●").0, Color::Rgb(0xBC, 0xB9, 0xAF));
     assert!(recent.word_style("●").1.contains(Modifier::BOLD));
     assert!(!recent.word_style("Você").1.contains(Modifier::BOLD));
     let reduced = render_state_with_caps(

@@ -3,8 +3,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 #[cfg(windows)]
-#[path = "../../../tests/support/windows_symlink.rs"]
-mod windows_symlink;
+use crate::windows_symlink;
 
 use slim_core::events::{EventKind, SessionEvent};
 use slim_core::session::{recover, SessionWriter, MAX_DURABLE_SESSION_BYTES};

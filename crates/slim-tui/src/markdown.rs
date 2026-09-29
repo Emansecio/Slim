@@ -44,6 +44,8 @@ struct Piece {
 enum LineKind {
     #[default]
     Text,
+    /// Quoted prose: wrapped inside a two-cell rail drawn on every row.
+    Quote,
     Code,
     DiffAdd,
     DiffRemove,
@@ -53,7 +55,16 @@ enum LineKind {
 
 impl LineKind {
     fn is_code(self) -> bool {
-        self != Self::Text
+        !matches!(self, Self::Text | Self::Quote)
+    }
+
+    /// Cells taken by the rail that precedes every row of this kind.
+    fn rail_width(self) -> usize {
+        if matches!(self, Self::Text) {
+            0
+        } else {
+            2
+        }
     }
 }
 
@@ -107,6 +118,9 @@ struct Projection {
     code_depth: usize,
     list_stack: Vec<Option<u64>>,
     item_depth: usize,
+    /// Open block quotes, and whether the innermost one already holds text.
+    quote_depth: usize,
+    quote_has_text: bool,
     width: usize,
     table: Option<TableBuilder>,
 }
@@ -130,6 +144,8 @@ impl Default for Projection {
             code_depth: 0,
             list_stack: Vec::new(),
             item_depth: 0,
+            quote_depth: 0,
+            quote_has_text: false,
             width: 1,
             table: None,
         }
@@ -183,7 +199,8 @@ impl Projection {
             self.current.kind = match self.block_tone {
                 BlockTone::Code { diff: false } => LineKind::Code,
                 BlockTone::Code { diff: true } => classify_diff_line(&self.current),
-                BlockTone::Text | BlockTone::Heading(_) | BlockTone::Quote => LineKind::Text,
+                BlockTone::Quote => LineKind::Quote,
+                BlockTone::Text | BlockTone::Heading(_) => LineKind::Text,
             };
             self.lines.push(std::mem::take(&mut self.current));
         }
@@ -542,20 +559,40 @@ fn project(source: &str, width: usize) -> Vec<LogicalLine> {
                 projection.finish_line(false);
                 projection.block_tone = BlockTone::Text;
             }
+            Event::Start(Tag::Paragraph) if projection.quote_depth > 0 => {
+                // Paragraphs of one quote share its rail; a rail-only row
+                // separates them instead of a gap that would break the rail.
+                projection.finish_line(false);
+                if projection.quote_has_text {
+                    projection.lines.push(LogicalLine {
+                        kind: LineKind::Quote,
+                        ..LogicalLine::default()
+                    });
+                }
+            }
             Event::Start(Tag::Paragraph) => {
                 projection.gap_before_block();
             }
-            Event::End(TagEnd::Paragraph) => projection.finish_line(false),
+            Event::End(TagEnd::Paragraph) => {
+                projection.finish_line(false);
+                if projection.quote_depth > 0 {
+                    projection.quote_has_text = true;
+                }
+            }
             Event::Start(Tag::BlockQuote(_)) => {
-                projection.gap_before_block();
+                if projection.quote_depth == 0 {
+                    projection.gap_before_block();
+                }
+                projection.quote_depth += 1;
+                projection.quote_has_text = false;
                 projection.block_tone = BlockTone::Quote;
-                projection
-                    .current
-                    .push("│ ", Tone::Quote, Modifier::empty());
             }
             Event::End(TagEnd::BlockQuote(_)) => {
                 projection.finish_line(false);
-                projection.block_tone = BlockTone::Text;
+                projection.quote_depth = projection.quote_depth.saturating_sub(1);
+                if projection.quote_depth == 0 {
+                    projection.block_tone = BlockTone::Text;
+                }
             }
             Event::Start(Tag::CodeBlock(kind)) => {
                 projection.gap_before_block();
@@ -650,10 +687,11 @@ fn wrapped_line_count(line: &LogicalLine, width: usize) -> usize {
     if is_horizontal_rule(line) {
         return 1;
     }
-    let width = if line.kind.is_code() {
-        width.saturating_sub(2).max(1)
-    } else {
+    let rail = line.kind.rail_width();
+    let width = if rail == 0 {
         width
+    } else {
+        width.saturating_sub(rail).max(1)
     };
     let count = if line.kind.is_code() {
         count_hard_wrapped(&line.pieces, width)
@@ -781,13 +819,17 @@ fn wrap(logical: &[LogicalLine], width: usize, styles: MarkdownStyles) -> Vec<Li
             continue;
         }
         let kind = line.kind;
-        let content_width = if kind.is_code() {
-            width.saturating_sub(2).max(1)
-        } else {
+        let rail = kind.rail_width();
+        let content_width = if rail == 0 {
             width
+        } else {
+            width.saturating_sub(rail).max(1)
         };
         for row in wrap_pieces(line, content_width) {
             let mut spans = Vec::new();
+            if kind == LineKind::Quote {
+                spans.push(Span::styled("│ ", styles.quote));
+            }
             for piece in row {
                 let style = style_for(piece.tone, piece.modifiers, styles);
                 push_span(&mut spans, &piece.text, style);
@@ -994,7 +1036,7 @@ fn decorate_code_row(
         LineKind::DiffAdd => styles.diff_add_bg,
         LineKind::DiffRemove => styles.diff_remove_bg,
         LineKind::Code | LineKind::DiffHeader | LineKind::DiffContext => styles.code_block,
-        LineKind::Text => Style::default(),
+        LineKind::Text | LineKind::Quote => Style::default(),
     };
     for span in &mut spans {
         span.style = span.style.patch(background);

@@ -52,7 +52,9 @@ $cargoArguments += @('--', '--test-threads', "$TestThreads")
 $isolatedNames = @('SLIM_CONFIG_FILE', 'SLIM_AUTH_FILE', 'SLIM_API_KEY',
     'OPENAI_API_KEY', 'CODEX_ACCESS_TOKEN', 'ANTHROPIC_API_KEY', 'OPENCODE_API_KEY',
     'CLINEPASS_API_KEY', 'COMMANDCODE_API_KEY', 'CMD_API_KEY', 'XAI_API_KEY',
-    'TYPESAFE_API_KEY', 'AI_GATEWAY_API_KEY')
+    'TYPESAFE_API_KEY', 'AI_GATEWAY_API_KEY',
+    # Release-only revision; tracked by option_env!, so leaking it rebuilds slim-cli tests.
+    'SLIM_BUILD_REVISION')
 $savedEnvironment = @{}
 $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('slim-test-env-' + [guid]::NewGuid().ToString('N'))
 try {

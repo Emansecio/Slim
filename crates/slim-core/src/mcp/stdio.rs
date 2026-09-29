@@ -3,11 +3,11 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Barrier, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Barrier, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::Notify;
 
 use crate::mcp::spec::{

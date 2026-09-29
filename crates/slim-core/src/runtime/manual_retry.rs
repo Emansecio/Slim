@@ -65,6 +65,7 @@ impl Runtime {
         &mut self,
         error: &ProviderError,
         event_start: usize,
+        backoff: std::time::Duration,
         next_seq: &mut u64,
     ) -> Result<bool, ProviderError> {
         let Some(handle) = self.manual_retry.clone() else {
@@ -81,7 +82,7 @@ impl Runtime {
         {
             return Ok(false);
         }
-        let delay = requested_provider_recovery_delay(error, 1);
+        let delay = requested_provider_recovery_delay(error, 1, backoff);
         let Some(deadline) = tokio::time::Instant::now().checked_add(delay) else {
             return Ok(false);
         };

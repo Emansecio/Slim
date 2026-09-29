@@ -149,15 +149,12 @@ fn surface_levels_stay_distinguishable_across_color_depths() {
             use ratatui::style::Color;
             assert_eq!(to_terminal_color(depth, theme.warning), Color::Yellow);
             assert_eq!(to_terminal_color(depth, theme.error), Color::LightRed);
-            assert_eq!(
-                to_terminal_color(depth, theme.tool_accent),
-                Color::LightGreen
-            );
+            assert_eq!(to_terminal_color(depth, theme.tool_accent), Color::White);
             // Headings carry hierarchy by weight on ivory, not by green.
             assert_eq!(to_terminal_color(depth, theme.heading_accent), Color::White);
             assert_eq!(
                 to_terminal_color(depth, theme.border_focus),
-                Color::LightGreen
+                Color::LightCyan
             );
         }
         // The raised user band stays one distinct step above the transcript.

@@ -14,9 +14,10 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Cell;
 use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
-use slim_core::{EventKind, SessionEvent};
+use slim_core::{EventKind, OperatingMode, SessionEvent};
 use slim_tui::api::{LoginProvider, SessionId, UiEvent};
-use slim_tui::app::AppState;
+use slim_tui::app::{AppState, FrameClock};
+use slim_tui::block::{Block, BlockKind, BlockLifecycle};
 use slim_tui::reducer::{reduce, Action};
 use slim_tui::render::WrapCache;
 use slim_tui::runtime::render_frame;
@@ -147,6 +148,79 @@ fn session(running: bool) -> AppState {
     state
 }
 
+/// A long agent turn: thinking, grouped reads, prose between tool runs, a
+/// failed check and a structured final answer. This is the scene that shows
+/// how the agent's work and words are organized on screen.
+fn agent_turn() -> AppState {
+    let mut state = connected();
+    state.apply_event(UiEvent::UserMessageAdded {
+        text: "O parser quebra com CRLF e a lista de erros sai duplicada. Corrija os dois problemas e cubra com testes.".into(),
+    });
+    state.apply_event(UiEvent::run_started(1));
+    state.apply_event(UiEvent::ThinkingStarted);
+    state.apply_event(UiEvent::ThinkingDelta {
+        text: "Dois sintomas, possivelmente uma causa só. Vou ler o parser e os testes antes de mexer.".into(),
+    });
+    state.clock.elapsed_ms += 3_200;
+    state.apply_event(UiEvent::ThinkingEnded);
+    for (id, name, arguments, output) in [
+        ("1", "read", r#"{"path":"src/parser.rs"}"#, "fn parse()"),
+        ("2", "read", r#"{"path":"src/errors.rs"}"#, "fn collect()"),
+        ("3", "read", r#"{"path":"tests/parser.rs"}"#, "#[test]"),
+        ("4", "search", r#"{"pattern":"split\\("}"#, "3 matches"),
+    ] {
+        tool(&mut state, id, name, arguments, output, true);
+    }
+    state.apply_event(UiEvent::AssistantDelta {
+        text: "Encontrei a causa. Há dois pontos, ligados entre si:\n\n1. `parser.rs` divide por `\\n` e deixa o `\\r` no fim da linha.\n2. `errors.rs` acumula o mesmo erro por linha em vez de por arquivo.\n\nVou corrigir o parser primeiro e validar antes de tocar nos erros.".into(),
+    });
+    state.apply_event(UiEvent::AssistantEnded);
+    tool(
+        &mut state,
+        "5",
+        "patch",
+        r#"{"path":"src/parser.rs","edits":[{"expected":"t.split('\\n')","replacement":"t.lines()"}]}"#,
+        "patched src/parser.rs:3; replaced 13 bytes with 9 bytes; bytes=90; sha256=ab",
+        true,
+    );
+    tool(
+        &mut state,
+        "6",
+        "shell",
+        r#"{"command":"cargo test parser"}"#,
+        "exit 101\nstderr:\nerror: test failed",
+        false,
+    );
+    state.apply_event(UiEvent::AssistantDelta {
+        text: "Um teste ainda falha: o segundo problema aparece agora. Corrigindo `errors.rs`."
+            .into(),
+    });
+    state.apply_event(UiEvent::AssistantEnded);
+    tool(
+        &mut state,
+        "7",
+        "patch",
+        r#"{"path":"src/errors.rs","edits":[{"expected":"push(line)","replacement":"push(file)"}]}"#,
+        "patched src/errors.rs:9; replaced 10 bytes with 10 bytes; bytes=120; sha256=cd",
+        true,
+    );
+    tool(
+        &mut state,
+        "8",
+        "shell",
+        r#"{"command":"cargo test"}"#,
+        "exit 0\nstdout:\ntest result: ok",
+        true,
+    );
+    state.apply_event(UiEvent::AssistantDelta {
+        text: "## Resultado\n\nOs dois problemas tinham a mesma origem e estão corrigidos.\n\n| Arquivo | Mudança |\n| --- | --- |\n| `src/parser.rs` | `split('\\n')` por `lines()` |\n| `src/errors.rs` | erro agregado por arquivo |\n\n### Verificação\n\n- `cargo test`: **passou**\n- Casos novos: CRLF e erro duplicado\n\n> Não rodei o build release.\n".into(),
+    });
+    state.apply_event(UiEvent::AssistantEnded);
+    state.apply_event(UiEvent::RunCompleted { run_id: 1 });
+    state.clock.elapsed_ms += 12_000;
+    state
+}
+
 fn key(state: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
     reduce(state, Action::Key(KeyEvent::new(code, modifiers)));
 }
@@ -170,15 +244,163 @@ fn scenes() -> Vec<(&'static str, AppState, u16, u16)> {
     key(&mut slash, KeyCode::Char('m'), KeyModifiers::NONE);
     let mut model = session(false);
     key(&mut model, KeyCode::Char('l'), KeyModifiers::CONTROL);
+    let mut read_only = session(false);
+    read_only.mode = OperatingMode::ReadOnly;
+    let mut plan = session(false);
+    plan.mode = OperatingMode::Plan;
+    // The turn marker follows how the turn ended.
+    let ended = |lifecycle| {
+        let mut state = connected();
+        state.apply_event(UiEvent::UserMessageAdded {
+            text: "Rode a suíte e corrija o que falhar.".into(),
+        });
+        state.append_block(Block::new(
+            "tail",
+            BlockKind::Assistant("Rodei a suíte e três testes falharam. Comecei pelo".into()),
+            lifecycle,
+        ));
+        state
+    };
+
+    let mut mention = session(false);
+    for character in "veja @lib".chars() {
+        key(&mut mention, KeyCode::Char(character), KeyModifiers::NONE);
+    }
+    mention.apply_event(UiEvent::WorkspaceFiles {
+        request_id: 1,
+        paths: [
+            "crates/slim-core/src/lib.rs",
+            "crates/slim-tui/src/lib.rs",
+            "crates/slim-lsp/src/lib.rs",
+            "crates/slim-tui/src/reducer/slash_tests.rs",
+            "docs/DESIGN-SLIM-TUI.md",
+            "README.md",
+        ]
+        .map(String::from)
+        .to_vec(),
+        truncated: false,
+    });
+    let mut resume = session(false);
+    for character in "/resume".chars() {
+        key(&mut resume, KeyCode::Char(character), KeyModifiers::NONE);
+    }
+    key(&mut resume, KeyCode::Enter, KeyModifiers::NONE);
+    let now_ms = 900_000_000u64;
+    let entry = |id: &str, title: Option<&str>, prompt: &str, minutes_ago: u64| {
+        slim_tui::api::SessionListItem {
+            id: id.into(),
+            title: title.map(str::to_owned),
+            first_prompt: prompt.into(),
+            updated_ms: now_ms - minutes_ago * 60_000,
+            bytes: 4_300 + minutes_ago * 97,
+            in_use: false,
+            current: false,
+        }
+    };
+    let mut open = entry("tui-open", None, "Rode a suíte e corrija o que falhar.", 1);
+    open.current = true;
+    let mut locked = entry(
+        "tui-locked",
+        Some("Migração do banco"),
+        "trocar sqlite por postgres",
+        35,
+    );
+    locked.in_use = true;
+    resume.apply_event(UiEvent::SessionsListed {
+        request_id: 1,
+        now_ms,
+        items: vec![
+            open,
+            locked,
+            entry(
+                "tui-login",
+                Some("Refatorar login"),
+                "corrigir o bug do token expirado",
+                130,
+            ),
+            entry(
+                "tui-docs",
+                None,
+                "escrever a documentação da API pública",
+                1_900,
+            ),
+            entry(
+                "tui-perf",
+                None,
+                "por que o build incremental está lento?",
+                9_400,
+            ),
+        ],
+        error: None,
+    });
+    let mut rewind = session(false);
+    for character in "/rewind".chars() {
+        key(&mut rewind, KeyCode::Char(character), KeyModifiers::NONE);
+    }
+    key(&mut rewind, KeyCode::Enter, KeyModifiers::NONE);
+    rewind.apply_event(UiEvent::TurnsListed {
+        request_id: 1,
+        items: [
+            "Explique como o parser trata CRLF",
+            "Corrija o split para lidar com CRLF",
+            "Adicione um teste de regressão",
+            "Rode a suíte e corrija o que falhar",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(index, prompt)| slim_tui::api::TurnListItem {
+            index,
+            first_seq: index as u64 * 12 + 2,
+            prompt: (*prompt).into(),
+        })
+        .collect(),
+        error: None,
+    });
+    let mut named = session(false);
+    named.apply_event(UiEvent::SessionTitleChanged {
+        title: Some("Corrigir CRLF no parser".into()),
+    });
+    let mut user_shell = session(false);
+    user_shell.apply_event(UiEvent::ToolStarted {
+        batch_id: slim_tui::api::ToolBatchId("user-shell-1".into()),
+        call_id: slim_tui::api::ToolCallId("user-shell-1".into()),
+        name: "shell".into(),
+        arguments_summary: "! cargo test -q parser".into(),
+    });
+    user_shell.apply_event(UiEvent::ToolOutput {
+        batch_id: slim_tui::api::ToolBatchId("user-shell-1".into()),
+        call_id: slim_tui::api::ToolCallId("user-shell-1".into()),
+        name: "shell".into(),
+        output: "exit 0\nstdout:\nrunning 3 tests\ntest parser::crlf ... ok\ntest result: ok. 3 passed\nstderr:\n".into(),
+        content_handle: None,
+    });
+    user_shell.apply_event(UiEvent::ToolEnded {
+        batch_id: slim_tui::api::ToolBatchId("user-shell-1".into()),
+        call_id: slim_tui::api::ToolCallId("user-shell-1".into()),
+        name: "shell".into(),
+        success: true,
+        duration_ms: 2_300,
+    });
 
     vec![
         ("welcome", connected(), 120, 30),
         ("session-running", session(true), 120, 44),
         ("session-done-80", session(false), 80, 40),
+        ("agent-turn", agent_turn(), 100, 60),
+        ("agent-turn-80", agent_turn(), 80, 60),
         ("thinking-streaming", thinking, 120, 24),
+        ("turn-interrupted", ended(BlockLifecycle::Cancelled), 80, 14),
+        ("turn-failed", ended(BlockLifecycle::Failed), 80, 14),
+        ("mode-read-only", read_only, 80, 24),
+        ("mode-plan", plan, 80, 24),
         ("palette", palette, 120, 40),
         ("slash", slash, 120, 40),
         ("model", model, 120, 40),
+        ("mention", mention, 120, 40),
+        ("resume", resume, 120, 40),
+        ("rewind", rewind, 120, 40),
+        ("session-named", named, 100, 30),
+        ("user-shell", user_shell, 100, 40),
     ]
 }
 
@@ -214,7 +436,7 @@ fn escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn html(name: &str, state: &AppState, width: u16, height: u16) -> String {
+fn html(name: &str, state: &AppState, width: u16, height: u16, reduced_motion: bool) -> String {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
     let mut cache = WrapCache::default();
     let capabilities = Capabilities {
@@ -222,7 +444,7 @@ fn html(name: &str, state: &AppState, width: u16, height: u16) -> String {
         mouse: false,
         clipboard: false,
         images: false,
-        reduced_motion: true,
+        reduced_motion,
     };
     terminal
         .draw(|frame| render_frame(frame, state, capabilities, &mut cache))
@@ -269,10 +491,49 @@ fn write_visual_snapshots() {
         });
     std::fs::create_dir_all(&directory).expect("snapshot directory");
     for (name, state, width, height) in scenes() {
-        let page = html(name, &state, width, height);
+        let page = html(name, &state, width, height, true);
         assert!(page.contains("<span"), "{name} rendered nothing");
         let path = directory.join(format!("{name}.html"));
         std::fs::write(&path, page).expect("write snapshot");
         eprintln!("{}", path.display());
     }
+    // The thinking display with motion on, a few moments apart.
+    for (name, state) in thinking_motion() {
+        let page = html(&name, &state, 100, 10, false);
+        assert!(page.contains("<span"), "{name} rendered nothing");
+        let path = directory.join(format!("{name}.html"));
+        std::fs::write(&path, page).expect("write snapshot");
+        eprintln!("{}", path.display());
+    }
+}
+
+/// A thought that just received text, shown 0, 166, 332, 498, 664 and 830 ms
+/// later: the sweep moves along the label, the glow at the edge of the newest
+/// row fades out, and the older preview row sits a step back.
+fn thinking_motion() -> Vec<(String, AppState)> {
+    const ARRIVED_MS: u64 = 3_400;
+    [0u64, 166, 332, 498, 664, 830]
+        .into_iter()
+        .map(|later| {
+            let mut state = connected();
+            state.apply_event(UiEvent::UserMessageAdded {
+                text: "Refatore o cache para LRU com peso por bytes.".into(),
+            });
+            state.apply_event(UiEvent::run_started(1));
+            state.apply_event(UiEvent::ThinkingStarted);
+            state.clock = FrameClock {
+                frame: ARRIVED_MS / 83,
+                elapsed_ms: ARRIVED_MS,
+            };
+            state.apply_event(UiEvent::ThinkingDelta {
+                text: "O cache atual conta entradas, não bytes. Preciso ver quem chama insert e se o tamanho é conhecido no ponto de inserção antes de escolher entre o crate lru e um wrapper.".into(),
+            });
+            let elapsed_ms = ARRIVED_MS + later;
+            state.clock = FrameClock {
+                frame: elapsed_ms / 83,
+                elapsed_ms,
+            };
+            (format!("thinking-motion-{later:03}"), state)
+        })
+        .collect()
 }

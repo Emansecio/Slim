@@ -121,10 +121,15 @@ fn external_activity_label(label: &str) -> String {
     if label.starts_with("Retrying") || label.starts_with("Compacting") {
         return safe(label);
     }
-    if let Some(name) = label.strip_prefix("Preparing tool · ") {
-        let name = name.trim();
+    if let Some(rest) = label.strip_prefix("Preparing tool · ") {
+        // `<name>` or `<name> · <size>` while the call is still being written.
+        let mut parts = rest.splitn(2, " · ");
+        let name = parts.next().unwrap_or_default().trim();
         if !name.is_empty() {
-            return preparation_label(name);
+            return match parts.next().map(str::trim).filter(|size| !size.is_empty()) {
+                Some(size) => format!("{} · {}", preparation_label(name), safe(size)),
+                None => preparation_label(name),
+            };
         }
     }
     safe(label)
@@ -185,45 +190,34 @@ fn tool_phrase(names: &[&str], completed: bool) -> String {
         }
     }
     let mut parts = Vec::new();
+    // A settled group is a tally of calls, one noun per kind, so it never
+    // mixes verbs and counts in the same row.
+    let tally = |count: usize, one: &str, many: &str| {
+        format!("{count} {}", if count == 1 { one } else { many })
+    };
     match reading {
         0 => {}
-        1 => parts.push(if completed { "Leu" } else { "Lendo" }.into()),
-        n => parts.push(if completed {
-            format!("{n} chamadas de leitura")
-        } else {
-            format!("Lendo · {n} chamadas")
-        }),
+        1 if !completed => parts.push("Lendo".into()),
+        n if completed => parts.push(tally(n, "leitura", "leituras")),
+        n => parts.push(format!("Lendo · {n} chamadas")),
     }
     match searching {
         0 => {}
-        1 => parts.push(if completed {
-            "1 busca".into()
-        } else {
-            "Buscando".into()
-        }),
+        1 if !completed => parts.push("Buscando".into()),
+        n if completed => parts.push(tally(n, "busca", "buscas")),
         n => parts.push(format!("{n} chamadas de busca")),
     }
     match editing {
         0 => {}
-        1 => parts.push(if completed { "Editou" } else { "Editando" }.into()),
-        n => parts.push(if completed {
-            format!("{n} chamadas de edição")
-        } else {
-            format!("Editando · {n} chamadas")
-        }),
+        1 if !completed => parts.push("Editando".into()),
+        n if completed => parts.push(tally(n, "edição", "edições")),
+        n => parts.push(format!("Editando · {n} chamadas")),
     }
     match shell {
         0 => {}
-        1 => parts.push(if completed {
-            "Executou 1 comando".into()
-        } else {
-            "Executando comando".into()
-        }),
-        n => parts.push(if completed {
-            format!("Executou {n} comandos")
-        } else {
-            format!("Executando · {n} comandos")
-        }),
+        1 if !completed => parts.push("Executando comando".into()),
+        n if completed => parts.push(tally(n, "comando", "comandos")),
+        n => parts.push(format!("Executando · {n} comandos")),
     }
     for (name, count) in others {
         let name = safe(name);
@@ -234,6 +228,25 @@ fn tool_phrase(names: &[&str], completed: bool) -> String {
         }
     }
     parts.join(", ")
+}
+
+/// What a settled tool call did to the world, which sets the weight of its
+/// row: reads recede, commands and edits stand out, and only an applied
+/// change earns the green marker. Tools that are not native keep the
+/// quietest weight.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum ToolEffect {
+    Observes,
+    Runs,
+    Changes,
+}
+
+pub(crate) fn tool_effect(name: &str) -> ToolEffect {
+    match name {
+        "patch" | "write" => ToolEffect::Changes,
+        "shell" => ToolEffect::Runs,
+        _ => ToolEffect::Observes,
+    }
 }
 
 /// Row title: a verb in the progressive while the call runs (or was
@@ -300,6 +313,8 @@ pub(crate) fn activity_elapsed(state: &AppState) -> u64 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SessionRailProjection {
     pub identity: String,
+    /// Byte range of the `/rename` title inside `identity`, when one is shown.
+    pub title: Option<std::ops::Range<usize>>,
     pub status: String,
     pub gap: usize,
 }
@@ -387,19 +402,44 @@ pub(crate) fn session_rail_projection(
     available: usize,
     _activity_rail_visible: bool,
 ) -> SessionRailProjection {
+    let mut title_range = None;
     let identity = if is_trivial_cwd(&state.cwd) {
         truncate_display_width("SLIM", available)
     } else {
         let safe_cwd = display_cwd(&state.cwd);
         let prefix = "SLIM · ";
         let prefix_width = unicode_width::UnicodeWidthStr::width(prefix);
-        let cwd_budget = available.saturating_sub(prefix_width);
-        let cwd = truncate_middle(&safe_cwd, cwd_budget);
-        truncate_display_width(&format!("{prefix}{cwd}"), available)
+        // A session name leads the rail; the directory keeps whatever room is
+        // left, so a long name never hides where the session runs.
+        let title = state
+            .session_title
+            .as_deref()
+            .map(crate::markdown::sanitize_terminal_text)
+            .filter(|title| !title.trim().is_empty())
+            .map(|title| truncate_display_width(title.trim(), (available / 2).clamp(8, 40)));
+        match title {
+            Some(title) => {
+                let separator = " · ";
+                let used = prefix_width
+                    + unicode_width::UnicodeWidthStr::width(title.as_str())
+                    + unicode_width::UnicodeWidthStr::width(separator);
+                let cwd = truncate_middle(&safe_cwd, available.saturating_sub(used));
+                title_range = Some(prefix.len()..prefix.len() + title.len());
+                truncate_display_width(&format!("{prefix}{title}{separator}{cwd}"), available)
+            }
+            None => {
+                let cwd_budget = available.saturating_sub(prefix_width);
+                let cwd = truncate_middle(&safe_cwd, cwd_budget);
+                truncate_display_width(&format!("{prefix}{cwd}"), available)
+            }
+        }
     };
+    let title_range =
+        title_range.map(|range| range.start.min(identity.len())..range.end.min(identity.len()));
     let gap = available.saturating_sub(unicode_width::UnicodeWidthStr::width(identity.as_str()));
     SessionRailProjection {
         identity,
+        title: title_range.filter(|range| range.start < range.end),
         status: String::new(),
         gap,
     }
@@ -425,33 +465,28 @@ impl ViewModel {
             if block.turn_boundary_before() || crate::block::transition_gap(state.blocks(), index) {
                 lines.push(String::new());
             }
+            if let Some(header) = crate::block::response_header(state.blocks(), index) {
+                if !lines.is_empty() {
+                    lines.push(String::new());
+                }
+                let lifecycle = if header.cancelled {
+                    BlockLifecycle::Cancelled
+                } else {
+                    BlockLifecycle::Complete
+                };
+                lines.push(assistant_label(lifecycle).into());
+            }
             match block.kind() {
                 BlockKind::User(text) => {
                     lines.push("Você".into());
                     lines.push(format!("> {}", safe(text)));
-                }
-                BlockKind::Assistant(text) => {
-                    let chrome = crate::block::assistant_chrome(state.blocks(), index);
-                    if chrome.is_none_or(|chrome| chrome.shows_header()) {
-                        if !lines.is_empty() {
-                            lines.push(String::new());
-                        }
-                        let cancelled = matches!(
-                            chrome,
-                            Some(crate::block::AssistantChrome::Header {
-                                cancelled: true,
-                                ..
-                            })
-                        );
-                        let lifecycle = if cancelled {
-                            BlockLifecycle::Cancelled
-                        } else {
-                            block.lifecycle
-                        };
-                        lines.push(assistant_label(lifecycle).into());
+                    if block.awaiting_agent() {
+                        // The agent's header, already waiting for its first block.
+                        lines.push(String::new());
+                        lines.push(assistant_label(BlockLifecycle::Complete).into());
                     }
-                    lines.push(safe(text));
                 }
+                BlockKind::Assistant(text) => lines.push(safe(text)),
                 BlockKind::Thinking(text) if block.fold == FoldState::Collapsed => {
                     let text = safe(text);
                     let preview = text.lines().next().unwrap_or_default();
@@ -489,6 +524,9 @@ impl ViewModel {
                 BlockKind::Error(text) => lines.push(format!("error: {}", safe(text))),
                 BlockKind::Activity(text) => lines.push(format!("activity: {}", safe(text))),
                 BlockKind::QueuedUser(text) => lines.push(format!("> {}", safe(text))),
+                BlockKind::Receipt(receipt) => {
+                    lines.push(format!("receipt: {}", receipt.summary()))
+                }
             }
         }
         if state.activity.is_some() {
@@ -774,21 +812,33 @@ mod minimal_footer_tests {
     use crate::app::AppState;
     #[test]
     fn summaries_count_operations_without_claiming_unique_files() {
-        assert_eq!(
-            completed_tool_phrase(&["read", "read"]),
-            "2 chamadas de leitura"
-        );
+        assert_eq!(completed_tool_phrase(&["read", "read"]), "2 leituras");
         assert_eq!(
             completed_tool_phrase(&["read", "list", "code_intel"]),
-            "Leu, list, code_intel"
+            "1 leitura, list, code_intel"
+        );
+        assert_eq!(completed_tool_phrase(&["patch", "patch"]), "2 edições");
+        assert_eq!(completed_tool_phrase(&["shell", "shell"]), "2 comandos");
+    }
+
+    #[test]
+    fn settled_groups_are_a_tally_of_nouns_and_running_ones_keep_their_verbs() {
+        assert_eq!(
+            completed_tool_phrase(&["read", "search", "patch", "shell"]),
+            "1 leitura, 1 busca, 1 edição, 1 comando"
         );
         assert_eq!(
-            completed_tool_phrase(&["patch", "patch"]),
-            "2 chamadas de edição"
+            completed_tool_phrase(&["search", "search", "shell", "read", "read", "read"]),
+            "3 leituras, 2 buscas, 1 comando"
+        );
+        assert_eq!(super::tool_activity_phrase(&["read"]), "Lendo");
+        assert_eq!(
+            super::tool_activity_phrase(&["read", "read"]),
+            "Lendo · 2 chamadas"
         );
         assert_eq!(
-            completed_tool_phrase(&["shell", "shell"]),
-            "Executou 2 comandos"
+            super::tool_activity_phrase(&["shell", "shell"]),
+            "Executando · 2 comandos"
         );
     }
     #[test]

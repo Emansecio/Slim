@@ -5,8 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
-#[path = "../../../tests/support/windows_symlink.rs"]
-mod windows_symlink;
+use crate::windows_symlink;
 
 use serde_json::json;
 use slim_core::session::{

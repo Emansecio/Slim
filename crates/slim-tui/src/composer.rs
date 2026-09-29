@@ -600,6 +600,93 @@ impl Composer {
         true
     }
 
+    /// The whitespace-delimited token that holds the cursor (or ends right at
+    /// it) when it starts with `prefix`, as `(start, end, text_after_prefix)`
+    /// in char indices. Only plain `Text` elements are scanned: a paste chip is
+    /// opaque, so a `@` inside pasted content never opens a completion and a
+    /// token never spans a chip.
+    pub(crate) fn token_at_cursor(&self, prefix: char) -> Option<(usize, usize, String)> {
+        let mut offset = 0usize;
+        for element in &self.elements {
+            let len = element_chars(element);
+            let end = offset + len;
+            let holds_cursor = self.cursor > offset && self.cursor <= end
+                || (self.cursor == offset && offset == 0 && len > 0);
+            if holds_cursor {
+                let TextElement::Text(text) = element else {
+                    return None;
+                };
+                let chars: Vec<char> = text.chars().collect();
+                let local = (self.cursor - offset).min(chars.len());
+                let mut start = local;
+                while start > 0 && !chars[start - 1].is_whitespace() {
+                    start -= 1;
+                }
+                let mut stop = local;
+                while stop < chars.len() && !chars[stop].is_whitespace() {
+                    stop += 1;
+                }
+                // A token that touches a neighbouring chip is not a token.
+                if (start == 0 && offset > 0) || (stop == chars.len() && end < self.char_count) {
+                    return None;
+                }
+                if chars.get(start) != Some(&prefix) {
+                    return None;
+                }
+                let query: String = chars[start + 1..stop].iter().collect();
+                return Some((offset + start, offset + stop, query));
+            }
+            offset = end;
+        }
+        None
+    }
+
+    /// Replaces `start..end` (char indices) with `replacement` and parks the
+    /// cursor right after it. Unlike rebuilding the draft, chips outside the
+    /// range survive and the edit is one undo step. Returns `false` (draft
+    /// untouched) when the range is not fully inside one plain `Text` element
+    /// or the result would exceed `MAX_DRAFT_CHARS`.
+    pub(crate) fn replace_range(&mut self, start: usize, end: usize, replacement: &str) -> bool {
+        if start > end {
+            return false;
+        }
+        let mut offset = 0usize;
+        let mut found = None;
+        for (index, element) in self.elements.iter().enumerate() {
+            let len = element_chars(element);
+            if start >= offset && end <= offset + len && matches!(element, TextElement::Text(_)) {
+                found = Some((index, offset));
+                break;
+            }
+            offset += len;
+        }
+        let Some((index, offset)) = found else {
+            return false;
+        };
+        let added = replacement.chars().count();
+        if self
+            .char_count
+            .saturating_sub(end - start)
+            .checked_add(added)
+            .is_none_or(|count| count > MAX_DRAFT_CHARS)
+        {
+            return false;
+        }
+        self.record_edit(false);
+        let TextElement::Text(text) = &mut self.elements[index] else {
+            return false;
+        };
+        let range = char_byte_index(text, start - offset)..char_byte_index(text, end - offset);
+        self.newline_count -= text[range.clone()].bytes().filter(|b| *b == b'\n').count();
+        self.newline_count += replacement.bytes().filter(|b| *b == b'\n').count();
+        text.replace_range(range, replacement);
+        self.char_count = self.char_count - (end - start) + added;
+        self.cursor = start + added;
+        self.normalize_text_elements();
+        self.bump();
+        true
+    }
+
     fn insert_element(&mut self, inserted: TextElement) {
         if self.elements.is_empty() || self.cursor == self.char_count - element_chars(&inserted) {
             self.elements.push(inserted);
@@ -1103,5 +1190,74 @@ mod tests {
         assert_eq!(snapshot.cursor_line, 1);
         assert_eq!(snapshot.cursor_cell, 0);
         assert_eq!(composer.payload(), "ab\u{1b}[31mcd");
+    }
+
+    #[test]
+    fn token_at_cursor_finds_prefixed_token_mid_sentence() {
+        let mut draft = Composer::default();
+        draft.insert_text("veja @src/li e depois");
+        for _ in 0..(" e depois".chars().count()) {
+            draft.move_left();
+        }
+        assert_eq!(
+            draft.token_at_cursor('@'),
+            Some((5, 12, "src/li".to_owned()))
+        );
+        draft.move_home();
+        assert_eq!(draft.token_at_cursor('@'), None);
+    }
+
+    #[test]
+    fn token_at_cursor_ignores_paste_chips() {
+        let mut draft = Composer::default();
+        draft.insert_text("a ");
+        draft.paste("x\n@inside\ny");
+        assert_eq!(draft.token_at_cursor('@'), None);
+        draft.insert_text(" @ok");
+        assert_eq!(
+            draft.token_at_cursor('@').map(|t| t.2),
+            Some("ok".to_owned())
+        );
+        // A token glued to a chip is not a token.
+        let mut glued = Composer::default();
+        glued.paste("x\ny");
+        glued.insert_text("@nope");
+        assert_eq!(glued.token_at_cursor('@'), None);
+    }
+
+    #[test]
+    fn replace_range_keeps_chips_and_is_one_undo_step() {
+        let mut draft = Composer::default();
+        draft.insert_text("ver @sr ");
+        draft.paste("l1\nl2");
+        draft.insert_text(" fim");
+        assert!(draft.replace_range(4, 7, "@src/lib.rs"));
+        assert_eq!(draft.payload(), "ver @src/lib.rs l1\nl2 fim");
+        assert_eq!(draft.cursor(), 4 + "@src/lib.rs".chars().count());
+        assert!(
+            draft
+                .elements
+                .iter()
+                .any(|e| matches!(e, TextElement::Paste { .. })),
+            "paste chip must survive"
+        );
+        assert!(draft.undo());
+        assert_eq!(draft.payload(), "ver @sr l1\nl2 fim");
+    }
+
+    #[test]
+    fn replace_range_refuses_ranges_crossing_a_chip_or_the_limit() {
+        let mut draft = Composer::default();
+        draft.insert_text("ab");
+        draft.paste("x\ny");
+        draft.insert_text("cd");
+        let before = draft.payload();
+        assert!(!draft.replace_range(1, 4, "z"));
+        assert!(!draft.replace_range(3, 2, "z"));
+        assert_eq!(draft.payload(), before);
+        let mut big = Composer::default();
+        big.insert_text("@a");
+        assert!(!big.replace_range(0, 2, &"x".repeat(MAX_DRAFT_CHARS + 1)));
+        assert_eq!(big.payload(), "@a");
     }
 }

@@ -91,10 +91,13 @@ def audit(pi_dir, slim_dir, output=None):
             elif k['type'] == 'ToolStarted':
                 if slim_rows:
                     slim_rows[-1]['tools'].append(k['name'])
-                slim_tools[k['call_id']] = {'seq': event['seq'], **k, 'turn': len(slim_rows)}
+                slim_tools[k['call_id']] = {'seq': event['seq'], **k, 'turn': len(slim_rows),
+                                            'success': None, 'evidence': 'absence'}
             elif k['type'] in ['ToolOutput', 'ToolFinished']:
                 slim_tools.setdefault(k['call_id'], {'call_id': k['call_id'], 'seq': event['seq'],
                                                      'turn': len(slim_rows), 'orphan': True}).update(k)
+                if k['type'] == 'ToolFinished':
+                    slim_tools[k['call_id']]['evidence'] = 'tool-finished'
     else:
         # schema v2: assistant entries align 1:1 with provider turns; outcomes via tool.v1 facts
         for i, usage in enumerate(usage_requests, 1):
@@ -120,7 +123,7 @@ def audit(pi_dir, slim_dir, output=None):
                 for call in entry.get('tool_calls') or []:
                     cid = call.get('id')
                     slim_tools[cid] = {'call_id': cid, 'name': call.get('name'), 'turn': turn,
-                                       'duration_ms': 0, 'success': None}
+                                       'duration_ms': 0, 'success': None, 'evidence': 'absence'}
                     if 0 < turn <= len(slim_rows):
                         slim_rows[turn - 1]['tools'].append(call.get('name'))
             elif entry.get('role') == 'tool' and entry.get('tool_call_id') in slim_tools:
@@ -131,7 +134,8 @@ def audit(pi_dir, slim_dir, output=None):
                 if fact.get('namespace') == 'tool.v1' and fact.get('key') in slim_tools:
                     value = fact.get('value') or {}
                     slim_tools[fact['key']].update(success=value.get('success'),
-                                                   duration_ms=value.get('duration_ms') or 0)
+                                                   duration_ms=value.get('duration_ms') or 0,
+                                                   evidence='fact')
     usage = slim.get('usage', {})
     assert len(slim_rows) == usage.get('provider_turns') == len(usage_requests), (
         f'{slim_dir}: {len(slim_rows)} snapshots vs provider_turns={usage.get("provider_turns")} '
@@ -148,8 +152,11 @@ def audit(pi_dir, slim_dir, output=None):
         assert timing.get('exit_code') == 0 and not timing.get('timed_out'), 'arm not clean: ' + gate
         assert validation.get('exit_code') == 0 and validation.get('fixtures_unchanged'), 'oracle/fixtures failed: ' + gate
         totals = {key: sum(row[key] for row in rows) for key in ['input', 'uncached', 'cache', 'output', 'reasoning', 'provider_ms']}
+        # success ausente e resultado nao comprovado (v2 sem fact tool.v1), nao falha: nao inflar tool_failures
+        outcomes = {name: sum(1 for t in tools if t.get('success') is state) for name, state in
+                    [('tool_succeeded', True), ('tool_failures', False), ('tool_unknown', None)]}
         summary[arm] = {'campaign': str(directory), 'wall_ms': timing['total_ms'], 'model_calls': len(rows),
-            'tool_calls': len(tools), 'tool_failures': sum(not t.get('success') for t in tools),
+            'tool_calls': len(tools), **outcomes,
             'tool_ms_sum': sum(t.get('duration_ms') or 0 for t in tools), 'total_tokens': totals['input'] + totals['output'],
             **totals, 'requests': rows, 'tools': tools}
     if output is not None:

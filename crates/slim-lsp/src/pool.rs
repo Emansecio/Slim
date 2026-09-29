@@ -93,6 +93,8 @@ pub struct SpawnedServer {
     pub io: IoBox,
     pub stderr_tail: Arc<Mutex<String>>,
     pub process: Option<tokio::process::Child>,
+    /// Stdio reader retained so failed startup can drain stderr after reaping.
+    pub stderr_capture: Option<JoinHandle<()>>,
 }
 
 impl SpawnedServer {
@@ -105,6 +107,7 @@ impl SpawnedServer {
             io,
             stderr_tail,
             process,
+            stderr_capture: None,
         }
     }
 }
@@ -167,11 +170,13 @@ impl ProcessFactory for StdioProcessFactory {
         };
         let stderr_tail = Arc::new(Mutex::new(String::new()));
         let tail = stderr_tail.clone();
-        tokio::spawn(async move {
+        let stderr_capture = tokio::spawn(async move {
             crate::process::capture_stderr_tail(stderr, tail).await;
         });
         let io: IoBox = Box::new(crate::process::StdioPair { stdin, stdout });
-        Ok(SpawnedServer::new(io, stderr_tail, Some(child)))
+        let mut spawned = SpawnedServer::new(io, stderr_tail, Some(child));
+        spawned.stderr_capture = Some(stderr_capture);
+        Ok(spawned)
     }
 }
 
@@ -609,6 +614,7 @@ impl LspProcessPool {
             io,
             stderr_tail,
             process,
+            stderr_capture,
         } = spawned;
         let mut process = process.map(ServerProcess::new);
         let instance_config = ServerInstanceConfig {
@@ -619,13 +625,31 @@ impl LspProcessPool {
             settings: config_payload.clone(),
             max_open_documents,
         };
-        match LspServerInstance::open(io, stderr_tail, instance_config).await {
+        match LspServerInstance::open(io, stderr_tail.clone(), instance_config).await {
             Ok(instance) => Ok((Arc::new(instance), process)),
             Err(error) => {
                 if let Some(process) = process.take() {
                     process.force_kill_and_wait().await;
                 }
-                Err(format!("initialization failed: {error}"))
+                // Reaping the child does not guarantee its stderr reader has
+                // drained yet. Bound this wait in case a descendant kept the
+                // pipe open, then retain the same bounded tail as live status.
+                if let Some(mut capture) = stderr_capture {
+                    if tokio::time::timeout(PROCESS_EXIT_GRACE, &mut capture)
+                        .await
+                        .is_err()
+                    {
+                        capture.abort();
+                    }
+                }
+                let stderr = stderr_tail.lock().await;
+                let stderr = crate::process::bound_stderr_tail(stderr.trim());
+                let mut reason = format!("initialization failed: {error}");
+                if !stderr.is_empty() {
+                    reason.push_str("\nserver stderr:\n");
+                    reason.push_str(&stderr);
+                }
+                Err(reason)
             }
         }
     }

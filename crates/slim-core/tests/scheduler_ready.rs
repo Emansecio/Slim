@@ -121,7 +121,7 @@ fn accept_with_deadline(listener: &TcpListener) -> TcpStream {
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 assert!(Instant::now() < deadline, "provider request missing");
-                thread::yield_now();
+                thread::sleep(Duration::from_millis(1));
             }
             Err(error) => panic!("provider accept: {error}"),
         }

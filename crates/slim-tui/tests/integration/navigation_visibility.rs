@@ -125,7 +125,7 @@ fn model_cursor_highlight_does_not_move_the_active_model_marker() {
     );
     let active_row = frame
         .lines()
-        .find(|line| line.contains("GPT-5.6 Sol"))
+        .find(|line| line.contains("GPT-5.6 Sol") && line.contains('●'))
         .expect("active model row");
     assert!(
         active_row.contains("●"),
@@ -136,7 +136,7 @@ fn model_cursor_highlight_does_not_move_the_active_model_marker() {
         .find(|line| line.contains("GPT-5.6 Terra"))
         .expect("selected model row");
     assert!(
-        selected_row.contains("> GPT-5.6 Terra"),
+        selected_row.contains(">   GPT-5.6 Terra"),
         "cursor highlight follows the selected row:\n{frame}"
     );
     assert!(

@@ -20,21 +20,21 @@ fn temp_path(label: &str) -> PathBuf {
     let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
     let root = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
     let candidate = root.join(format!(
-        "slim-jsonl-repo-{}-{nanos}-{nonce}",
+        "slim-repo-conformance-{}-{nanos}-{nonce}",
         std::process::id()
     ));
     assert_eq!(candidate.parent(), Some(root.as_path()));
     assert!(candidate
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("slim-jsonl-repo-")));
+        .is_some_and(|name| name.starts_with("slim-repo-conformance-")));
     std::fs::create_dir(&candidate).expect("create unique test directory");
     let directory = std::fs::canonicalize(&candidate).expect("canonical test directory");
     assert_eq!(directory.parent(), Some(root.as_path()));
     assert!(directory
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("slim-jsonl-repo-")));
+        .is_some_and(|name| name.starts_with("slim-repo-conformance-")));
     directory.join(format!("{label}.jsonl"))
 }
 
@@ -48,7 +48,7 @@ fn cleanup(path: &Path) {
         parent
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("slim-jsonl-repo-")),
+            .is_some_and(|name| name.starts_with("slim-repo-conformance-")),
         "unexpected test cleanup directory: {}",
         parent.display()
     );

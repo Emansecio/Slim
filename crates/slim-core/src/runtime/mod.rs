@@ -25,7 +25,9 @@ use crate::context::{
     CompactionHandle, CompactionPolicy, CompactionReason, CompactionSelection, ContextBudget,
     PreparedCompaction, COMPACTION_SYSTEM_PROMPT,
 };
-use crate::interaction::{ask_question_definition, AskQuestion, InteractionRequestId, InteractionRoute};
+use crate::interaction::{
+    ask_question_definition, AskQuestion, InteractionRequestId, InteractionRoute,
+};
 use crate::mcp::{McpCancellation, McpManager, McpRequestOutcome};
 use crate::model::AppHandle;
 use crate::provider::{
@@ -208,6 +210,9 @@ pub struct AgentLoopConfig {
     pub context_window_tokens: u64,
     pub context_reserve_tokens: u64,
     pub context_compaction_enabled: bool,
+    /// First automatic provider-recovery delay; it doubles per attempt (at most 16x).
+    /// A provider's retry-after still wins when it is longer.
+    pub provider_recovery_backoff: std::time::Duration,
 }
 
 impl AgentLoopConfig {
@@ -215,6 +220,8 @@ impl AgentLoopConfig {
     pub const DEFAULT_MAX_MUTATING_TOOL_CALLS: usize = 32;
     pub const DEFAULT_MAX_READ_TOOL_CALLS: usize = 96;
     pub const DEFAULT_MAX_TOTAL_TOOL_CALLS: usize = 256;
+    pub const DEFAULT_PROVIDER_RECOVERY_BACKOFF: std::time::Duration =
+        std::time::Duration::from_millis(500);
 }
 
 impl Default for AgentLoopConfig {
@@ -228,6 +235,7 @@ impl Default for AgentLoopConfig {
             context_window_tokens: 32_000,
             context_reserve_tokens: 4_096,
             context_compaction_enabled: true,
+            provider_recovery_backoff: Self::DEFAULT_PROVIDER_RECOVERY_BACKOFF,
         }
     }
 }
@@ -696,6 +704,7 @@ impl CompactionSummary {
             | ProviderEvent::ReasoningStarted
             | ProviderEvent::ReasoningEnded
             | ProviderEvent::Phase { .. }
+            | ProviderEvent::ToolCallProgress { .. }
             | ProviderEvent::ContentBlockStop { .. } => {}
         }
     }
@@ -1460,6 +1469,7 @@ impl Runtime {
             }
         };
         let provider_call_journal = self.app.run_journal.clone();
+        let mut provider_call_id = None;
         let stream_result = client
             .stream_prepared_cancellable_observed(
                 request,
@@ -1467,9 +1477,13 @@ impl Runtime {
                 |event| {
                     normalizer.push(&mut self.app, event);
                 },
-                |telemetry| persist_provider_call(&provider_call_journal, telemetry),
+                |telemetry| {
+                    provider_call_id = persist_provider_call(&provider_call_journal, telemetry)?;
+                    Ok(())
+                },
             )
             .await;
+        let stream_succeeded = stream_result.is_ok();
         let cancelled = matches!(&stream_result, Err(ProviderError::Cancelled));
         if stream_result.is_err() {
             normalizer.flush_text(&mut self.app)?;
@@ -1507,6 +1521,15 @@ impl Runtime {
                 Ok(turn)
             }
         });
+        if stream_succeeded {
+            if let Err(error) = &result {
+                persist_provider_validation_failure(
+                    &provider_call_journal,
+                    provider_call_id.as_deref(),
+                    error,
+                )?;
+            }
+        }
         let provider_latency_ms = elapsed_millis(request_started);
         match result {
             Ok(mut turn) => {
@@ -3082,6 +3105,7 @@ impl Runtime {
                             &error,
                             recovery.compaction_recoveries + 1,
                             recovery.provider_recovery_wait,
+                            config.provider_recovery_backoff,
                         ) {
                             Ok(delay) => delay,
                             Err(blocked) => {
@@ -3404,6 +3428,7 @@ impl Runtime {
                     &error,
                     recovery.provider_recoveries + 1,
                     recovery.provider_recovery_wait,
+                    config.provider_recovery_backoff,
                 ) {
                     Ok(delay) => delay,
                     Err(blocked) => {
@@ -3416,7 +3441,12 @@ impl Runtime {
                             .await?,
                         );
                         if self
-                            .wait_for_manual_retry(&error, event_start, next_seq)
+                            .wait_for_manual_retry(
+                                &error,
+                                event_start,
+                                config.provider_recovery_backoff,
+                                next_seq,
+                            )
                             .await?
                         {
                             return Ok(ProviderAttempt::Retry);
@@ -3516,7 +3546,12 @@ impl Runtime {
                         "automatic recovery stopped"
                     };
                 if self
-                    .wait_for_manual_retry(&error, event_start, next_seq)
+                    .wait_for_manual_retry(
+                        &error,
+                        event_start,
+                        config.provider_recovery_backoff,
+                        next_seq,
+                    )
                     .await?
                 {
                     return Ok(ProviderAttempt::Retry);
@@ -7131,7 +7166,7 @@ impl Runtime {
                 serialized_request,
                 cancellation,
                 |event| collected.push(event),
-                |telemetry| persist_provider_call(&provider_call_journal, telemetry),
+                |telemetry| persist_provider_call(&provider_call_journal, telemetry).map(|_| ()),
             )
             .await;
 
@@ -8082,17 +8117,33 @@ fn journal_error(error: impl std::fmt::Display) -> ProviderError {
     }
 }
 
-fn persist_provider_call(
+pub(crate) fn persist_provider_call(
     journal: &Option<Arc<Mutex<crate::session::ManualRunJournal>>>,
     telemetry: ProviderCallTelemetry,
-) -> Result<(), ProviderError> {
+) -> Result<Option<String>, ProviderError> {
     let Some(journal) = journal else {
-        return Ok(());
+        return Ok(None);
     };
     journal
         .lock()
         .map_err(|_| journal_error("durable run lock poisoned"))?
         .record_provider_call(&telemetry)
+        .map(Some)
+        .map_err(journal_error)
+}
+
+pub(crate) fn persist_provider_validation_failure(
+    journal: &Option<Arc<Mutex<crate::session::ManualRunJournal>>>,
+    provider_call_id: Option<&str>,
+    error: &ProviderError,
+) -> Result<(), ProviderError> {
+    let (Some(journal), Some(provider_call_id)) = (journal, provider_call_id) else {
+        return Ok(());
+    };
+    journal
+        .lock()
+        .map_err(|_| journal_error("durable run lock poisoned"))?
+        .record_provider_validation_failure(provider_call_id, error)
         .map_err(journal_error)
 }
 
@@ -8255,7 +8306,9 @@ async fn run_background_compaction<A: ProviderAdapter>(
                     update_compaction_progress(&observers.progress, &event);
                     collected.push(event);
                 },
-                |telemetry| persist_provider_call(&observers.provider_call_journal, telemetry),
+                |telemetry| {
+                    persist_provider_call(&observers.provider_call_journal, telemetry).map(|_| ())
+                },
             )
             .await
     } else {
@@ -8303,6 +8356,20 @@ fn rebuild_pruned_compaction_request<A: ProviderAdapter>(
         return Err("jev pruned request exceeds context window and reserve".into());
     }
     Ok(request)
+}
+
+/// `write · 4,2 KB` (or just the size while the name is unknown): the detail of a
+/// `PreparingTool` phase that reports a call still being written.
+fn tool_progress_detail(name: Option<&str>, bytes: u64) -> String {
+    let size = if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KB", bytes as f64 / 1024.0).replace('.', ",")
+    };
+    match name.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => format!("{name} · {size}"),
+        None => size,
+    }
 }
 
 fn update_compaction_progress(
@@ -8512,13 +8579,17 @@ fn request_emitted_tools(app: &AppHandle, event_start: usize) -> bool {
 const MAX_PROVIDER_RECOVERIES: u32 = 2;
 const MAX_PROVIDER_RECOVERY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
-fn provider_recovery_backoff(attempt: u32) -> std::time::Duration {
+fn provider_recovery_backoff(base: std::time::Duration, attempt: u32) -> std::time::Duration {
     let shift = attempt.saturating_sub(1).min(4);
-    std::time::Duration::from_millis(500u64.saturating_mul(1u64 << shift))
+    base.saturating_mul(1u32 << shift)
 }
 
-fn requested_provider_recovery_delay(error: &ProviderError, attempt: u32) -> std::time::Duration {
-    let backoff = provider_recovery_backoff(attempt);
+fn requested_provider_recovery_delay(
+    error: &ProviderError,
+    attempt: u32,
+    base: std::time::Duration,
+) -> std::time::Duration {
+    let backoff = provider_recovery_backoff(base, attempt);
     match error {
         ProviderError::Api { metadata, .. } => {
             backoff.max(metadata.retry_after.unwrap_or_default())
@@ -8535,8 +8606,9 @@ fn provider_recovery_delay(
     error: &ProviderError,
     attempt: u32,
     waited: std::time::Duration,
+    base: std::time::Duration,
 ) -> Result<std::time::Duration, ProviderError> {
-    let requested = requested_provider_recovery_delay(error, attempt);
+    let requested = requested_provider_recovery_delay(error, attempt, base);
     let remaining = MAX_PROVIDER_RECOVERY_WAIT.saturating_sub(waited);
     if requested > remaining {
         return Err(retry_wait_budget_exceeded(error, requested, remaining));
@@ -9415,6 +9487,18 @@ impl ProviderStreamNormalizer {
                     phase,
                     elapsed_ms,
                     detail: None,
+                },
+            ),
+            // The call is still being written: show it as the preparing phase with
+            // its size. Transient (not journaled, coalescible), the same event the
+            // final, held tool call later announces without a size.
+            ProviderEvent::ToolCallProgress { name, bytes } => push_runtime_transient_event(
+                app,
+                &mut self.next_seq,
+                crate::EventKind::ProviderPhase {
+                    phase: crate::provider::ProviderPhase::PreparingTool,
+                    elapsed_ms: 0,
+                    detail: Some(tool_progress_detail(name.as_deref(), bytes)),
                 },
             ),
             ProviderEvent::ResponsesReasoning(state) => {

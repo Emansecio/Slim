@@ -5,11 +5,11 @@ use crate::api::{
     LoginProvider, ModelAlias, OpenCodeCatalogSource, OpenCodeModelView, ReasoningEffort,
     UiCommand, UiEvent,
 };
+use crate::app::ModelRow;
 use crate::app::{
     ActivityPhase, AppState, CancellationPhase, ConfirmedSetting, FrameClock, LoginStage,
     NotificationPriority, RunOutcomeKind,
 };
-use crate::app::{EffortTarget, ModelRow};
 
 fn enter() -> KeyEvent {
     KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
@@ -390,27 +390,29 @@ fn opencode_models_refresh_and_select_dynamic_catalog() {
         target
     );
 
-    // GLM 5.3 declares reasoning levels: Enter opens the effort step
-    // instead of committing a level the user never saw.
-    let effects = reduce(&mut state, Action::Key(enter()));
-    assert!(effects.contains(&Effect::RequestRender));
-    let effort = state.effort_overlay.clone().expect("effort step opens");
-    assert_eq!(effort.target, EffortTarget::OpenCodeGo("glm-5.3".into()));
+    // The catalog levels are visible and adjustable in the model picker.
+    let choice = rows[target]
+        .choice(
+            &state.open_code_models,
+            &state.cline_pass_models,
+            &state.command_code_models,
+            &state.zen_models,
+        )
+        .expect("catalog choice");
     assert_eq!(
-        effort.levels(),
+        choice.levels,
         &[ReasoningEffort::Low, ReasoningEffort::High]
     );
     assert_eq!(
-        effort.effort(),
+        state
+            .model_overlay
+            .as_ref()
+            .expect("overlay")
+            .pending_effort(&choice, state.effort),
         ReasoningEffort::High,
-        "the session effort stays highlighted"
+        "the session effort is the initial selection"
     );
-    assert!(
-        state.model_overlay.is_some(),
-        "parent model overlay survives the effort step (G239)"
-    );
-
-    // Confirming the highlighted level sends model + effort together.
+    // One confirmation sends model + effort together.
     let effects = reduce(&mut state, Action::Key(enter()));
     assert!(effects.contains(&Effect::Send(UiCommand::SetOpenCodeModel {
         model: "glm-5.3".into(),
@@ -471,9 +473,8 @@ fn zen_view(id: &str, levels: Vec<ReasoningEffort>) -> OpenCodeModelView {
 }
 
 #[test]
-fn zen_model_with_levels_asks_for_effort_before_sending() {
-    // Muse Spark 1.3 Free declares low/medium/high/xhigh: Enter must open
-    // the step instead of committing the session default (G-doc §7.5).
+fn zen_model_with_levels_adjusts_effort_inline_before_sending() {
+    // Muse Spark 1.3 Free declares low/medium/high/xhigh in the picker.
     let mut state = zen_catalog_state(zen_view(
         "muse-spark-1.3-contributor-free",
         vec![
@@ -486,56 +487,37 @@ fn zen_model_with_levels_asks_for_effort_before_sending() {
     state.effort = ReasoningEffort::Low;
     select_model_row(&mut state, |row| matches!(row, ModelRow::Zen(0)));
 
-    let effects = reduce(&mut state, Action::Key(enter()));
-
-    assert!(
-        !effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::Send(_))),
-        "no command leaves before the level is confirmed"
-    );
-    let effort = state.effort_overlay.clone().expect("effort step");
-    assert_eq!(
-        effort.target,
-        EffortTarget::Zen("muse-spark-1.3-contributor-free".into())
-    );
-    assert_eq!(
-        effort.levels(),
-        &[
-            ReasoningEffort::Low,
-            ReasoningEffort::Medium,
-            ReasoningEffort::High,
-            ReasoningEffort::XHigh
-        ]
-    );
-    assert_eq!(
-        effort.effort(),
-        ReasoningEffort::Low,
-        "the active session level stays highlighted"
-    );
-    assert!(
-        !effort.speed_toggle(),
-        "catalog models have no Normal/Fast service tier"
-    );
-    assert!(
-        state.model_overlay.is_some(),
-        "the picker stays alive under the step (G239)"
-    );
-
-    // Tab is inert for a catalog target, then Down picks xhigh.
+    // Tab is inert for a catalog target; Right moves through available levels.
     reduce(
         &mut state,
         Action::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
     );
-    assert!(!state.effort_overlay.as_ref().expect("step").fast);
+    assert!(!state.model_overlay.as_ref().expect("picker").pending_fast);
     for _ in 0..3 {
         reduce(
             &mut state,
-            Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            Action::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
         );
     }
+    let choice = state.model_overlay.as_ref().unwrap().rows(
+        &state.open_code_models,
+        &state.cline_pass_models,
+        &state.command_code_models,
+        &state.zen_models,
+    )[state.model_overlay.as_ref().unwrap().selected]
+        .choice(
+            &state.open_code_models,
+            &state.cline_pass_models,
+            &state.command_code_models,
+            &state.zen_models,
+        )
+        .unwrap();
     assert_eq!(
-        state.effort_overlay.as_ref().expect("step").effort(),
+        state
+            .model_overlay
+            .as_ref()
+            .unwrap()
+            .pending_effort(&choice, state.effort),
         ReasoningEffort::XHigh
     );
 
@@ -545,7 +527,7 @@ fn zen_model_with_levels_asks_for_effort_before_sending() {
         model: "muse-spark-1.3-contributor-free".into(),
         effort: ReasoningEffort::XHigh,
     })));
-    assert!(state.effort_overlay.is_none());
+    assert!(state.model_overlay.is_none());
 }
 
 #[test]
@@ -692,7 +674,7 @@ fn textual_model_command_selects_command_code_model() {
 }
 
 #[test]
-fn gateway_picker_preserves_effort_and_escape_returns_to_model_list() {
+fn gateway_picker_preserves_effort_and_escape_discards_inline_choice() {
     for (provider, id) in [
         (LoginProvider::ClinePass, "cline-pass/deepseek-v4-flash"),
         (LoginProvider::CommandCode, "deepseek/deepseek-v4.1-flash"),
@@ -722,19 +704,29 @@ fn gateway_picker_preserves_effort_and_escape_returns_to_model_list() {
             ModelRow::CommandCode(i) => provider == LoginProvider::CommandCode && *i == index,
             _ => false,
         });
-        let effects = reduce(&mut state, Action::Key(enter()));
-        assert!(!effects.iter().any(|e| matches!(e, Effect::Send(_))));
-        let overlay = state.effort_overlay.as_ref().unwrap();
-        assert_eq!(overlay.effort(), ReasoningEffort::Max);
-        assert!(!overlay.speed_toggle());
+        reduce(
+            &mut state,
+            Action::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+        );
+        assert!(state
+            .model_overlay
+            .as_ref()
+            .is_some_and(|overlay| !overlay.pending_fast));
         let effects = reduce(
             &mut state,
             Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         );
         assert!(!effects.iter().any(|e| matches!(e, Effect::Send(_))));
         assert!(state.effort_overlay.is_none());
-        assert!(state.model_overlay.is_some());
+        assert!(state.model_overlay.is_none());
+        assert_eq!(state.effort, ReasoningEffort::Max);
+        state.composer.insert_text("/models");
         reduce(&mut state, Action::Key(enter()));
+        select_model_row(&mut state, |row| match row {
+            ModelRow::ClinePass(i) => provider == LoginProvider::ClinePass && *i == index,
+            ModelRow::CommandCode(i) => provider == LoginProvider::CommandCode && *i == index,
+            _ => false,
+        });
         let effects = reduce(&mut state, Action::Key(enter()));
         let command = if provider == LoginProvider::ClinePass {
             UiCommand::SetClinePassModel {
@@ -838,7 +830,7 @@ fn ctrl_t_toggles_todo_dock() {
 }
 
 #[test]
-fn model_command_requires_effort_before_updating_runtime() {
+fn model_command_confirms_model_and_effort_together() {
     let mut state = AppState::new();
     state.auth_provider = Some(LoginProvider::OpenAiCodex);
     state.authenticated = true;
@@ -849,12 +841,6 @@ fn model_command_requires_effort_before_updating_runtime() {
         &mut state,
         Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
     );
-    reduce(&mut state, Action::Key(enter()));
-    assert!(
-        state.model_overlay.is_some(),
-        "parent model overlay survives the effort step (G239)"
-    );
-    assert!(state.effort_overlay.is_some());
     let effects = reduce(&mut state, Action::Key(enter()));
     assert!(effects.contains(&Effect::Send(UiCommand::SetModel {
         model: ModelAlias::Terra,
@@ -864,7 +850,7 @@ fn model_command_requires_effort_before_updating_runtime() {
 }
 
 #[test]
-fn effort_esc_returns_to_model_overlay_on_the_same_model() {
+fn model_picker_escape_discards_the_pending_choice() {
     let mut state = AppState::new();
     state.auth_provider = Some(LoginProvider::OpenAiCodex);
     state.authenticated = true;
@@ -875,17 +861,13 @@ fn effort_esc_returns_to_model_overlay_on_the_same_model() {
         &mut state,
         Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
     );
-    reduce(&mut state, Action::Key(enter()));
-    assert!(state.effort_overlay.is_some());
     reduce(
         &mut state,
         Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
     );
-    let overlay = state.model_overlay.expect("parent overlay survives Esc");
-    assert_eq!(
-        overlay.selected, 2,
-        "highlight stays on the chosen model row"
-    );
+    assert!(state.model_overlay.is_none());
+    assert!(state.effort_overlay.is_none());
+    assert_ne!(state.model, ModelAlias::Terra.id());
 }
 
 #[test]
@@ -1339,7 +1321,15 @@ fn resume_command_dispatches_only_while_idle() {
     let mut state = AppState::new();
     state.composer.insert_text("/resume");
     let effects = reduce(&mut state, Action::Key(enter()));
-    assert!(effects.contains(&Effect::Send(UiCommand::ResumePrevious)));
+    assert!(matches!(
+        effects.as_slice(),
+        [
+            Effect::Send(UiCommand::ListSessions { .. }),
+            Effect::RequestRender
+        ]
+    ));
+    assert!(state.session_picker.is_some());
+    state.session_picker = None;
 
     state.working = true;
     for character in "/re".chars() {
@@ -1351,7 +1341,10 @@ fn resume_command_dispatches_only_while_idle() {
     assert!(state.slash_suggestions.is_some());
     let effects = reduce(&mut state, Action::Key(enter()));
     assert_eq!(state.composer.payload().trim(), "/resume");
-    assert!(!effects.contains(&Effect::Send(UiCommand::ResumePrevious)));
+    assert!(state.session_picker.is_none());
+    assert!(!effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Send(UiCommand::ListSessions { .. }))));
 }
 
 #[test]

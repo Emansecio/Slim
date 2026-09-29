@@ -1962,3 +1962,94 @@ Checklist RULES §4 desta etapa:
 - [x] Limitações: amostra de 1 rodada/cenário; caches de servidor e
       contenção do host não controlados; sem teste de significância;
       instrumentação assimétrica permanece.
+
+## Correções do medidor — 2026-09-27
+
+Revisão do medidor sem mudança de produto, sem chamadas ao provider e sem
+reexecução de bateria. Escopo: `analyze.py`, `report.py` e
+`test_measurement.py`. Cenários, prompts, oráculos, binários e rotas
+permanecem os mesmos, e os relatórios versionados continuam sendo saída do
+medidor anterior.
+
+**Motivação, verificada nos próprios scripts:**
+
+- `analyze.py` contava falhas como `sum(not t['success'])`, de modo que
+  `success=None` — ausência de `ToolFinished` (v1) ou de fact `tool.v1` (v2) —
+  entrava em `tool_failures` do `summary.json`.
+- O resumo de `report.py` somava todos os braços com registros, inclusive os
+  reprovados no gate, embora o relatório publicado de 15/09 se apresentasse
+  como "soma das campanhas aproveitadas".
+- A verificação de configuração observada existia só no Pi
+  (`request.model == message.model == manifest.model`,
+  `reasoning.effort == 'high'`, `service_tier is None`); as linhas Slim não
+  carregavam `model`, embora `RequestUsage`
+  ([usage.rs](../../crates/slim-core/src/runtime/usage.rs)) já grave
+  `provider`, `model`, `retry_count`, `cancelled`, `response_cache_hit`,
+  `usage_unknown`, `failed`, `time_to_first_byte_ms`,
+  `time_to_first_semantic_ms` e `estimation_error_tokens` no ledger.
+- O pareamento expunha mediana, mínimo e máximo, sem teste de significância
+  nem intervalo.
+
+**Mudanças:**
+
+1. **Resultado de ferramenta.** Falha é somente `success is False`.
+   `success=None` passa a `tool_unknown`, e cada execução carrega
+   `evidence`: `fact` (fact `tool.v1`), `tool-finished` (evento v1),
+   `inferred` (heurística de texto no v2 sem fact) ou `absence`. O agregado
+   ganha `tool_failures`, `tool_unknown`, `tool_succeeded` e `tool_inferred`,
+   e `analyze.py`/`report.py` usam a mesma definição.
+2. **Denominador.** `aggregate` agrega apenas braços aprovados no gate e
+   `aggregate_all` mantém todos os que têm registro; `campaigns` é impresso
+   nas duas tabelas. Como cada braço agrega as campanhas que passaram no
+   próprio gate, os denominadores podem diferir e isso agora aparece em vez
+   de desaparecer. A comparação estritamente pareada continua sendo a seção
+   "Pareamento", que exige gate aprovado nos dois braços.
+3. **Campos do ledger antes ignorados.** `retries`, `cancelled_requests`,
+   `cache_hits` (`response_cache_hit`), `unknown_requests`, `failed_requests`,
+   `ttfb_ms_sum`, `ttfs_ms_sum` e `estimation_error_tokens_sum` entram no
+   total por braço, no JSON e na nova seção "Identidade e configuracao
+   observada". Onde o braço não expõe o campo, a célula é `-`: ausência de
+   medição não é zero.
+4. **Identidade e rota.** `inconsistent_turns` registra provider/modelo que
+   mudam no meio da tarefa; `model_matches_manifest` e
+   `provider_matches_manifest` comparam o observado com o rótulo do
+   manifesto. Contradição reprova o braço no gate; rótulo apenas não
+   observado avisa, porque ausência de prova não é prova de troca de rota.
+   No Pi o provider não consta do payload, então a coluna fica `-`.
+5. **Estatística do pareamento.** Teste de sinais bilateral exato (método
+   minlike, com `fractions`, sem dependência externa) sobre "Slim mais
+   econômico" e "Slim mais rápido", e IC percentil bootstrap da mediana da
+   razão, com semente fixa `20260915` e 10.000 reamostragens. Com menos de 8
+   pares, o relatório imprime aviso de que o resultado é exploratório.
+6. **Leitura do relatório.** A tabela principal tem denominador visível; a
+   seção por campanha mostra o gate dos dois braços junto das métricas; a
+   seção por ferramenta separa falhas de incógnitas; e a tabela por turno
+   ganhou `in_acum` e `tool_result_bytes`.
+
+**Verificação desta etapa (sem chamadas ao provider):** `py_compile` nos seis
+scripts do benchmark; `python -B -m unittest discover -s bench/luna-live` com
+**14/14 aprovados** (eram 9). Os cinco casos novos fixam as semânticas acima:
+`success=None` como incógnita nos dois medidores (v1 e v2), contradição de
+rota reprovando o gate enquanto ausência apenas avisa, contadores do ledger
+chegando ao JSON e ao Markdown, denominador assimétrico visível com o braço
+reprovado ainda listado, e determinismo do teste de sinais e do bootstrap.
+Dois deles executam `report.main` ponta a ponta sobre campanhas sintéticas.
+Nenhuma bateria live foi reexecutada nesta etapa.
+
+**Limites e decisões preservadas:**
+
+- A heurística de texto do v2 continua ativa, agora visível como
+  `evidence=inferred`. Rebaixá-la a "não comprovado" é mais rigoroso e
+  alteraria contagens de campanhas v2 sem facts; não foi feito nesta etapa.
+- `tool_inferred` alto significa medição fraca: sucesso inferido do texto não
+  é prova de sucesso.
+- A premissa aditiva de tokens (`input = usage.input + cacheRead +
+  cacheWrite`) continua sem teste próprio; `estimation_error_tokens` agora
+  está exposta e pode ser usada para confrontá-la.
+- A evidência bruta das campanhas anteriores não está no workspace: o
+  `bench/luna-live/AUDIT-2026-09-15.zip` foi removido na limpeza registrada em
+  [LIMPEZA-2026-09-16.md](../../analysis_outputs/LIMPEZA-2026-09-16.md).
+  Portanto os relatórios versionados **não podem ser reprocessados** aqui com
+  o medidor novo, e as diferenças de contagem do histórico não são
+  recalculáveis: o efeito destas correções só aparecerá na próxima bateria que
+  executar o medidor.

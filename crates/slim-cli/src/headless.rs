@@ -186,7 +186,7 @@ impl SharedToolRegistry {
         Self(Arc::new(ToolRegistry::default()))
     }
 
-    fn registry(&self) -> ToolRegistry {
+    pub(crate) fn registry(&self) -> ToolRegistry {
         self.0.as_ref().clone()
     }
 }

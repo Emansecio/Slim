@@ -103,7 +103,7 @@ fn accept_with_deadline(listener: &TcpListener, deadline: Instant) -> TcpStream 
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 assert!(Instant::now() < deadline, "fixture accept timed out");
-                thread::yield_now();
+                thread::sleep(Duration::from_millis(1));
             }
             Err(error) => panic!("fixture accept: {error}"),
         }

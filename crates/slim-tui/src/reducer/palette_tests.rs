@@ -36,6 +36,32 @@ fn palette_filters_and_submits_top_match() {
 }
 
 #[test]
+fn palette_searches_description_without_case_and_keeps_the_exact_draft() {
+    let mut state = AppState::new();
+    state.auth_provider = Some(crate::api::LoginProvider::OpenAiCodex);
+    state.authenticated = true;
+    state.composer.insert_text("rascunho de trabalho");
+    state.composer.move_left();
+    let draft = state.composer.clone();
+
+    reduce(&mut state, Action::Key(ctrl_p()));
+    for character in "MoDeLo".chars() {
+        reduce(
+            &mut state,
+            Action::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+        );
+    }
+    assert_eq!(super::palette_matches("MoDeLo")[0], "/model");
+    reduce(
+        &mut state,
+        Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    );
+
+    assert!(state.model_overlay.is_some());
+    assert_eq!(state.composer, draft, "cursor and undo history survive");
+}
+
+#[test]
 fn palette_query_without_slash_matches_and_executes_login() {
     let mut state = AppState::new();
     reduce(&mut state, Action::Key(ctrl_p()));

@@ -437,32 +437,30 @@ pub(crate) fn thinking_body_width(width: u16) -> u16 {
     width.saturating_sub(4).max(1)
 }
 
-fn block_height(
-    block: &Block,
-    width: u16,
-    cache: &mut WrapCache,
-    show_assistant_header: bool,
-) -> usize {
-    let body_width = width.saturating_sub(2).max(1) as usize; // rail/padding column
+/// Agent prose starts in the same text column as the user prompt, tool rows
+/// and reasoning; only markers live in the two-cell gutter before it.
+pub(crate) const ASSISTANT_PREFIX_COLS: u16 = 4;
+
+/// Wrap width of agent prose. One cell stays reserved for the streaming
+/// caret, so the width does not change when the message completes.
+pub(crate) fn assistant_text_width(width: u16) -> u16 {
+    width.saturating_sub(ASSISTANT_PREFIX_COLS + 1).max(1)
+}
+
+fn block_height(block: &Block, width: u16, cache: &mut WrapCache) -> usize {
     let content_rows = match block.kind() {
-        BlockKind::User(text) => prose_row_count(text, user_prompt_text_width(width) as usize) + 2,
+        BlockKind::User(text) => {
+            prose_row_count(text, user_prompt_text_width(width) as usize)
+                + 2
+                + usize::from(block.awaiting_agent())
+        }
         BlockKind::Assistant(text) => {
-            let text_width = if body_width > 1 {
-                body_width - 1 // reserved streaming-caret cell, stable after completion
-            } else {
-                body_width
-            };
             // The measured projection is shared with the render pass, so the
             // streaming body is parsed once per generation instead of twice.
-            // Continuations omit the breathing row and the role header.
-            let chrome = if show_assistant_header { 2 } else { 0 };
-            let body = cache.markdown_rows(block, text, text_width as u16);
-            chrome
-                + if show_assistant_header {
-                    body
-                } else {
-                    body.max(1)
-                }
+            // The turn header is a leading row of the entry, not of the body.
+            cache
+                .markdown_rows(block, text, assistant_text_width(width))
+                .max(1)
         }
         BlockKind::Thinking(text) => match block.fold {
             crate::block::FoldState::Expanded => {
@@ -520,7 +518,7 @@ fn block_height(
                 )
             }
         }
-        BlockKind::System(_) | BlockKind::Activity(_) => 1,
+        BlockKind::System(_) | BlockKind::Activity(_) | BlockKind::Receipt(_) => 1,
         BlockKind::Error(text) | BlockKind::QueuedUser(text) => {
             crate::markdown::plain_row_count(text, width.saturating_sub(4).max(1))
         }
@@ -630,9 +628,10 @@ impl<'a> HeightIndex<'a> {
         let mut index = 0usize;
         while index < blocks.len() {
             let block = &blocks[index];
-            // Grouped spans always start at `index`, so the leader's gap is
-            // the span's gap and precedes every member row.
-            let gap = u64::from(crate::block::transition_gap(blocks, index));
+            // Grouped spans always start at `index`, so the leader's leading
+            // rows (turn header or breathing row) are the span's and precede
+            // every member row.
+            let gap = crate::block::leading_rows(blocks, index) as u64;
             let tool_span = if cache.present_tool_hold {
                 crate::block::consecutive_presented_tool_span(
                     blocks,
@@ -734,9 +733,7 @@ impl<'a> HeightIndex<'a> {
                 height
             } else {
                 cache.height_misses = cache.height_misses.saturating_add(1);
-                let show_assistant_header = crate::block::assistant_chrome(blocks, index)
-                    .is_none_or(|chrome| chrome.shows_header());
-                let height = block_height(block, width, cache, show_assistant_header);
+                let height = block_height(block, width, cache);
                 pending_heights.push((key, height));
                 height
             };
@@ -1827,7 +1824,7 @@ mod height_cache_tests {
         // A standalone heading must not reuse the grouped body-only height.
         assert_eq!(
             HeightIndex::build(&blocks[..1], 12, &mut cache).total_rows,
-            block_height(&blocks[0], 12, &mut cache, true) as u64
+            block_height(&blocks[0], 12, &mut cache) as u64
         );
         let replacement = blocks[1].clone();
         blocks[1] = replacement;

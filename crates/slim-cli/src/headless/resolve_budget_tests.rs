@@ -30,15 +30,31 @@ use std::sync::{Mutex, OnceLock};
 
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+/// Restores the saved environment on drop, including when the test body panics.
+struct EnvRestore<'a>(Vec<(&'a str, Option<std::ffi::OsString>)>);
+
+impl Drop for EnvRestore<'_> {
+    fn drop(&mut self) {
+        for (name, prior) in self.0.drain(..) {
+            match prior {
+                Some(value) => unsafe { std::env::set_var(name, value) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
+    }
+}
+
 fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+    // A failed assertion in one test must not poison the lock for the others.
     let _guard = ENV_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("lock");
-    let saved = vars
-        .iter()
-        .map(|(name, _)| (*name, std::env::var_os(name)))
-        .collect::<Vec<_>>();
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _restore = EnvRestore(
+        vars.iter()
+            .map(|(name, _)| (*name, std::env::var_os(name)))
+            .collect(),
+    );
     for (name, value) in vars {
         match value {
             Some(value) => unsafe { std::env::set_var(name, value) },
@@ -46,12 +62,6 @@ fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
         }
     }
     f();
-    for (name, prior) in saved {
-        match prior {
-            Some(value) => unsafe { std::env::set_var(name, value) },
-            None => unsafe { std::env::remove_var(name) },
-        }
-    }
 }
 
 #[test]

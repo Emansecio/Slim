@@ -1,4 +1,4 @@
-#[path = "../../../tests/support/budget_finalization.rs"]
+#[path = "../../../../tests/support/budget_finalization.rs"]
 mod budget_finalization;
 
 use std::io::{Read, Write};
@@ -165,7 +165,7 @@ fn spawn_fixture(requests: Arc<AtomicUsize>) -> (String, thread::JoinHandle<()>)
                 Ok(pair) => break pair,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     assert!(Instant::now() < deadline, "fixture accept timed out");
-                    thread::yield_now();
+                    thread::sleep(Duration::from_millis(1));
                 }
                 Err(error) => panic!("fixture accept: {error}"),
             }
@@ -204,7 +204,7 @@ fn spawn_capturing_fixture(
                 Ok(pair) => break pair,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     assert!(Instant::now() < deadline, "fixture accept timed out");
-                    thread::yield_now();
+                    thread::sleep(Duration::from_millis(1));
                 }
                 Err(error) => panic!("fixture accept: {error}"),
             }

@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use crate::context::ArtifactStore;
 use crate::provider::{
-    normalized_provider_code, ProviderCallOutcome, ProviderCallTelemetry, ProviderMessage,
-    ProviderToolCall,
+    normalized_provider_code, provider_call_error_fields, ProviderCallOutcome,
+    ProviderCallTelemetry, ProviderError, ProviderMessage, ProviderToolCall,
 };
 use crate::EventKind;
 
@@ -306,7 +306,7 @@ impl ManualRunJournal {
     pub(crate) fn record_provider_call(
         &mut self,
         telemetry: &ProviderCallTelemetry,
-    ) -> io::Result<()> {
+    ) -> io::Result<String> {
         self.check()?;
         let ordinal = self
             .provider_call_ordinal
@@ -327,7 +327,7 @@ impl ManualRunJournal {
                 namespace: "provider.call.v1".into(),
                 key: id.clone(),
                 value: serde_json::json!({
-                    "id": id,
+                    "id": &id,
                     "ordinal": ordinal,
                     "operation_id": &self.spec.operation_id,
                     "attempt_id": &self.spec.attempt_id,
@@ -346,6 +346,40 @@ impl ManualRunJournal {
         self.remember_failure(result.map_err(|error| {
             io::Error::other(format!(
                 "provider call fact could not be persisted: {error}"
+            ))
+        }))?;
+        Ok(id)
+    }
+
+    /// Records runtime validation separately from the completed HTTP call.
+    /// The caller retains the exact call identity, including across concurrent
+    /// compaction calls. Error messages and response payloads stay out of facts.
+    pub(crate) fn record_provider_validation_failure(
+        &mut self,
+        provider_call_id: &str,
+        error: &ProviderError,
+    ) -> io::Result<()> {
+        self.check()?;
+        let (_, code, _) = provider_call_error_fields(error);
+        let code = code.as_deref().and_then(normalized_provider_code);
+        let seq = self.repo.next_seq()?;
+        let result = self.repo.append(DurableRecord::Fact {
+            seq,
+            fact: DurableFact {
+                namespace: "provider.validation.v1".into(),
+                key: provider_call_id.into(),
+                value: serde_json::json!({
+                    "provider_call_id": provider_call_id,
+                    "operation_id": &self.spec.operation_id,
+                    "attempt_id": &self.spec.attempt_id,
+                    "outcome": "failed",
+                    "code": code,
+                }),
+            },
+        });
+        self.remember_failure(result.map_err(|error| {
+            io::Error::other(format!(
+                "provider validation fact could not be persisted: {error}"
             ))
         }))
     }
@@ -776,6 +810,59 @@ mod tests {
         assert!(!raw.contains("prompt-marker"));
         assert!(!raw.contains("body-marker"));
         assert!(!raw.contains("header-secret"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_validation_keeps_the_exact_call_id_after_another_call_finishes() {
+        let (root, mut journal) = fixture();
+        let telemetry = ProviderCallTelemetry {
+            provider: "command-code".into(),
+            model: "fixture-model".into(),
+            duration_ms: 8,
+            headers_ms: Some(2),
+            first_semantic_ms: Some(5),
+            outcome: ProviderCallOutcome::Success,
+            status: Some(200),
+            code: None,
+            retry_after_ms: None,
+        };
+        let first = journal.record_provider_call(&telemetry).unwrap();
+        let later = journal.record_provider_call(&telemetry).unwrap();
+        journal
+            .record_provider_validation_failure(
+                &first,
+                &ProviderError::InvalidResponse {
+                    message: "private-response-payload".into(),
+                },
+            )
+            .unwrap();
+        drop(journal);
+        let report = preflight_session(root.join("session.jsonl")).unwrap();
+        let facts = report
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                DurableRecord::Fact { fact, .. } if fact.namespace.starts_with("provider.") => {
+                    Some(fact)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(facts.len(), 3);
+        assert_eq!(facts[0].key, first);
+        assert_eq!(facts[1].key, later);
+        assert_eq!(facts[0].value["outcome"], "success");
+        assert_eq!(facts[1].value["outcome"], "success");
+        assert_eq!(facts[2].namespace, "provider.validation.v1");
+        assert_eq!(facts[2].key, first);
+        assert_ne!(facts[2].key, later);
+        assert_eq!(facts[2].value["provider_call_id"], first);
+        assert_eq!(facts[2].value["attempt_id"], "attempt");
+        assert_eq!(facts[2].value["code"], "invalid_response");
+        assert!(!fs::read_to_string(root.join("session.jsonl"))
+            .unwrap()
+            .contains("private-response-payload"));
         fs::remove_dir_all(root).unwrap();
     }
 

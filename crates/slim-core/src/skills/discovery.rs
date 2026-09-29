@@ -137,6 +137,7 @@ fn discover_workspace_with_profile(
         SkillRoot::new(cwd.join(".slim").join("skills"), 0),
         SkillRoot::new(cwd.join(".claude").join("skills"), 1),
         SkillRoot::new(cwd.join(".agents").join("skills"), 2),
+        SkillRoot::new(cwd.join(".codex").join("skills"), 3),
     ];
     if let Some(profile) = profile {
         let global = profile.join(".slim").join("skills");
@@ -144,6 +145,7 @@ fn discover_workspace_with_profile(
             roots.push(SkillRoot::new(global, 10));
         }
         roots.push(SkillRoot::new(profile.join(".agents").join("skills"), 11));
+        roots.push(SkillRoot::new(profile.join(".codex").join("skills"), 12));
     }
     roots.retain(|root| root.path.is_dir());
     discover(&roots)
@@ -188,6 +190,27 @@ mod tests {
             "global compat",
         );
 
+        write_skill(
+            &workspace.join(".codex/skills"),
+            "codex-only",
+            "workspace codex",
+        );
+        write_skill(
+            &workspace.join(".codex/skills"),
+            "agents-only",
+            "loses to .agents",
+        );
+        write_skill(
+            &profile.join(".codex/skills"),
+            "codex-global",
+            "global codex",
+        );
+        write_skill(
+            &profile.join(".codex/skills"),
+            "global-only",
+            "loses to .slim",
+        );
+
         let discovery = discover_workspace_with_profile(&workspace, Some(&profile))
             .expect("workspace discovery");
 
@@ -202,6 +225,25 @@ mod tests {
         assert!(discovery.active("global-only").is_some());
         assert!(discovery.active("agents-only").is_some());
         assert!(discovery.active("agents-global").is_some());
+        assert!(discovery.active("codex-only").is_some());
+        assert!(discovery.active("codex-global").is_some());
+        // Earlier roots win a name shared with `.codex`.
+        assert_eq!(
+            discovery
+                .active("agents-only")
+                .unwrap()
+                .metadata
+                .description,
+            "workspace compat"
+        );
+        assert_eq!(
+            discovery
+                .active("global-only")
+                .unwrap()
+                .metadata
+                .description,
+            "global"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

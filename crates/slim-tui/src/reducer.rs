@@ -14,6 +14,7 @@ use crate::input::{classify_enter, cycle_mode, normalize, EnterIntent};
 use crate::inspector::{search_match_indices_filtered, InspectorKind, SearchState};
 use crate::picker::{ensure_visible_start, move_selection, PICKER_NOMINAL_CAPACITY};
 use crate::render::ScrollMetrics;
+use crate::session_picker::{PickerKind, PickerRow};
 
 const MAX_QUEUED_PROMPTS: usize = 8;
 
@@ -37,6 +38,10 @@ pub enum Action {
         message: String,
     },
     Resize,
+    /// Up/Down with an empty composer recalls a sent prompt (`older` is Up).
+    HistoryRecall {
+        older: bool,
+    },
     ToggleTodoDock,
     ToggleBlock(BlockId),
     Scroll {
@@ -127,6 +132,16 @@ fn prepare_prompt(state: &mut AppState, prompt: String, origin: PromptOrigin) ->
 /// Single mutation route (DESIGN-SLIM-TUI §4.1/§9.2): every state change flows
 /// through here; the runtime only executes the returned effects.
 pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
+    let mut effects = reduce_action(state, action);
+    // Completion popups only flag that they need data; the fetch is issued here
+    // so every edit path stays a plain state change.
+    if let Some(command) = state.take_workspace_files_request() {
+        effects.push(Effect::Send(command));
+    }
+    effects
+}
+
+fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
     match action {
         Action::UiEventReceived(event) => {
             // G244 (§7.4): a provider terminal or locally handled prompt is a
@@ -209,6 +224,7 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
             if state.model_overlay.is_some()
                 || state.effort_overlay.is_some()
                 || state.mcp_overlay.is_some()
+                || state.session_picker.is_some()
                 || state.search.is_some()
                 || state.palette_query.is_some()
             {
@@ -254,6 +270,7 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
                 || state.model_overlay.is_some()
                 || state.effort_overlay.is_some()
                 || state.mcp_overlay.is_some()
+                || state.session_picker.is_some()
                 || state.search.is_some()
                 || state.palette_query.is_some()
                 || paste_blocked(state);
@@ -275,6 +292,15 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
         }
         Action::Resize => {
             clear_screen_selection(state);
+            vec![Effect::RequestRender]
+        }
+        Action::HistoryRecall { older } => {
+            if state.recall_prompt(older) {
+                sync_slash_suggestions(state);
+                // A recalled prompt is history, not an edit in progress: its
+                // `@paths` must not pop the completion over the next Up.
+                state.mention_suggestions = None;
+            }
             vec![Effect::RequestRender]
         }
         Action::ToggleTodoDock => {
@@ -406,11 +432,13 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
     }
 }
 
-const PALETTE_COMMANDS: [&str; 16] = [
+const PALETTE_COMMANDS: [&str; 18] = [
     "/help",
     "/login",
     "/logout",
     "/resume",
+    "/rename",
+    "/rewind",
     "/queue",
     "/model",
     "/model --default",
@@ -446,7 +474,7 @@ pub const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     (
         "session",
         &[
-            "/login", "/logout", "/resume", "/queue", "/compact", "/retry",
+            "/login", "/logout", "/resume", "/rename", "/rewind", "/queue", "/compact", "/retry",
         ],
     ),
     (
@@ -460,16 +488,22 @@ pub const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Commands matching the palette query (G243): the query may or may not carry
-/// the leading `/`; matching is a substring on the bare command name, so the
-/// palette behaves as a search (`odel` finds `/model`). Slash completion keeps
-/// prefix matching; the model overlay filter is likewise substring-based.
+/// Search commands by their literal name or the visible Portuguese purpose.
+/// Slash completion remains prefix-based; the palette is an intent search.
 pub fn palette_matches(query: &str) -> Vec<&'static str> {
-    let needle = query.trim_start_matches('/');
+    let needle = query.trim_start_matches('/').to_lowercase();
     PALETTE_COMMANDS
         .iter()
         .copied()
-        .filter(|command| command.trim_start_matches('/').contains(needle))
+        .filter(|command| {
+            command
+                .trim_start_matches('/')
+                .to_lowercase()
+                .contains(&needle)
+                || palette_description(command)
+                    .to_lowercase()
+                    .contains(&needle)
+        })
         .collect()
 }
 
@@ -483,6 +517,8 @@ pub fn palette_description(command: &str) -> &'static str {
         "/login" => "conectar provedor",
         "/logout" => "sair",
         "/resume" => "retomar sessão",
+        "/rename" => "nomear esta sessão",
+        "/rewind" => "voltar a um turno",
         "/queue" => "gerenciar prompts pendentes",
         "/model" => "modelo desta sessão",
         "/model --default" => "salvar modelo atual como padrão",
@@ -622,12 +658,80 @@ fn replace_slash_token(state: &mut AppState, command: &str) {
 fn sync_slash_suggestions(state: &mut AppState) {
     if state.pending_interaction().is_some() {
         state.slash_suggestions = None;
+        state.mention_suggestions = None;
         return;
     }
     state.slash_suggestions = slash_token_span(&state.composer).and_then(|(_, _, query)| {
         let commands = slash_matches_with_skills(state, &query);
         (!commands.is_empty()).then_some(crate::app::SlashSuggestions { query, selected: 0 })
     });
+    state.sync_mention_suggestions();
+}
+
+/// Replaces the `@` token under edit with the chosen path and leaves the
+/// cursor after the separating space. Chips elsewhere in the draft survive.
+fn complete_mention(state: &mut AppState) {
+    let Some(suggestions) = state.mention_suggestions.take() else {
+        return;
+    };
+    let Some(path) = suggestions
+        .matches
+        .get(suggestions.selected)
+        .and_then(|index| state.workspace_files.get(*index))
+        .cloned()
+    else {
+        return;
+    };
+    let payload_len = state.composer.char_count();
+    let tail_is_space = suggestions.end < payload_len
+        && state
+            .composer
+            .payload_chars()
+            .nth(suggestions.end)
+            .is_some_and(char::is_whitespace);
+    let replacement = if tail_is_space {
+        format!("@{path}")
+    } else {
+        format!("@{path} ")
+    };
+    if state
+        .composer
+        .replace_range(suggestions.start, suggestions.end, &replacement)
+    {
+        if tail_is_space {
+            state.composer.move_right();
+        }
+        state.revisions.content += 1;
+    }
+}
+
+/// `@` completion keys: arrows navigate, Tab and Enter complete (Enter never
+/// sends), Esc dismisses. With no candidate yet (list still loading), only
+/// Esc is claimed so Enter still submits the draft.
+fn reduce_mention_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> {
+    let suggestions = state.mention_suggestions.as_ref()?;
+    let selected = suggestions.selected;
+    let total = suggestions.matches.len();
+    if key.code == KeyCode::Esc {
+        state.mention_suggestions = None;
+        return Some(vec![Effect::RequestRender]);
+    }
+    if total == 0 {
+        return None;
+    }
+    match key.code {
+        KeyCode::Up => {
+            state.mention_suggestions.as_mut()?.selected = move_selection(selected, total, -1);
+        }
+        KeyCode::Down => {
+            state.mention_suggestions.as_mut()?.selected = move_selection(selected, total, 1);
+        }
+        KeyCode::Home => state.mention_suggestions.as_mut()?.selected = 0,
+        KeyCode::End => state.mention_suggestions.as_mut()?.selected = total - 1,
+        KeyCode::Tab | KeyCode::Enter => complete_mention(state),
+        _ => return None,
+    }
+    Some(vec![Effect::RequestRender])
 }
 
 /// Slash autocomplete key handling (W7): arrows navigate, Tab completes into
@@ -659,12 +763,14 @@ fn reduce_slash_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> 
             if let Some(command) = matches.get(selected) {
                 replace_slash_token(state, command);
                 state.slash_suggestions = None;
+                state.mention_suggestions = None;
                 state.revisions.content += 1;
             }
             vec![Effect::RequestRender]
         }
         KeyCode::Esc => {
             state.slash_suggestions = None;
+            state.mention_suggestions = None;
             vec![Effect::RequestRender]
         }
         KeyCode::Enter => {
@@ -675,10 +781,11 @@ fn reduce_slash_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> 
                 replace_slash_token(state, command);
             }
             state.slash_suggestions = None;
+            state.mention_suggestions = None;
             if state.working && selected_is_skill {
                 return Some(enqueue_queued(state));
             }
-            if state.working && state.composer.payload().trim() == "/resume" {
+            if state.working && session_command(state.composer.payload().trim()) {
                 state.push_notification(
                     "Há uma execução ativa; aguarde ou cancele antes de retomar".into(),
                 );
@@ -700,6 +807,20 @@ fn enqueue_queued(state: &mut AppState) -> Vec<Effect> {
     if prompt.trim().is_empty() {
         return vec![];
     }
+    if session_command(prompt.trim()) {
+        state.push_notification(
+            "Comandos de sessão exigem uma execução inativa; aguarde ou cancele".into(),
+        );
+        state.revisions.status += 1;
+        return vec![Effect::RequestRender];
+    }
+    if user_shell_body(prompt.trim()).is_some() {
+        state.push_notification(
+            "Comandos com ! rodam só sem execução ativa; aguarde ou cancele".into(),
+        );
+        state.revisions.status += 1;
+        return vec![Effect::RequestRender];
+    }
     if state.queued_prompts.len() >= MAX_QUEUED_PROMPTS {
         state.push_notification_with_priority(
             format!("Fila de prompts cheia ({MAX_QUEUED_PROMPTS})."),
@@ -707,8 +828,10 @@ fn enqueue_queued(state: &mut AppState) -> Vec<Effect> {
         );
         return vec![Effect::RequestRender];
     }
+    state.remember_prompt(&prompt);
     state.composer.clear();
     state.slash_suggestions = None;
+    state.mention_suggestions = None;
     state.enqueue_queued_prompt(prompt);
     vec![Effect::RequestRender]
 }
@@ -737,6 +860,7 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         || state.effort_overlay.is_some()
         || state.model_overlay.is_some()
         || state.mcp_overlay.is_some()
+        || state.session_picker.is_some()
         || interaction_pending;
     if is_ctrl_c(&key) && crate::selection::has_copyable_text(&state.selection_text) {
         return vec![
@@ -780,11 +904,15 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             state.request_cancel_active_run();
             return vec![Effect::Send(UiCommand::CancelRun), Effect::RequestRender];
         }
+        if state.user_shell.is_some() {
+            return vec![Effect::Send(UiCommand::CancelRun), Effect::RequestRender];
+        }
         if state.composer.payload().is_empty() {
             return reduce(state, Action::RequestShutdown);
         }
         state.composer.clear();
         state.slash_suggestions = None;
+        state.mention_suggestions = None;
         state.revisions.content += 1;
         return vec![Effect::RequestRender];
     }
@@ -799,6 +927,7 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             None => {
                 state.palette_selected = 0;
                 state.palette_viewport_start = 0;
+                state.menu_focus_at_ms = Some(state.clock.elapsed_ms);
                 Some(String::new())
             }
         };
@@ -815,6 +944,7 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         state.search = state.search.take().is_none().then(SearchState::default);
         state.inspector.active = None;
         state.slash_suggestions = None;
+        state.mention_suggestions = None;
         state.revisions.focus += 1;
         return vec![Effect::RequestRender];
     }
@@ -823,6 +953,11 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     }
     if state.slash_suggestions.is_some() {
         if let Some(effects) = reduce_slash_key(state, key) {
+            return effects;
+        }
+    }
+    if state.mention_suggestions.is_some() {
+        if let Some(effects) = reduce_mention_key(state, key) {
             return effects;
         }
     }
@@ -839,6 +974,9 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     }
     if state.mcp_overlay.is_some() {
         return reduce_mcp_key(state, key);
+    }
+    if state.session_picker.is_some() {
+        return reduce_session_picker_key(state, key);
     }
     if state.inspector.active.is_some() {
         if let Some(effects) = reduce_inspector_key(state, key) {
@@ -924,6 +1062,9 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     }
     if key.code == KeyCode::Esc && state.working {
         state.request_cancel_active_run();
+        return vec![Effect::Send(UiCommand::CancelRun), Effect::RequestRender];
+    }
+    if key.code == KeyCode::Esc && state.user_shell.is_some() {
         return vec![Effect::Send(UiCommand::CancelRun), Effect::RequestRender];
     }
     if (key.code == KeyCode::BackTab
@@ -1145,6 +1286,7 @@ fn copyable_block_text(block: &crate::block::Block) -> Option<String> {
         | BlockKind::Error(text)
         | BlockKind::Activity(text)
         | BlockKind::QueuedUser(text) => Some(text.clone()),
+        BlockKind::Receipt(receipt) => Some(receipt.summary()),
         BlockKind::Tool(tool) => (!tool.materialized_output.is_empty())
             .then(|| tool.materialized_output.clone())
             .or_else(|| (!tool.preview.is_empty()).then(|| tool.preview.clone())),
@@ -1412,6 +1554,7 @@ fn submit_pending_question_custom(state: &mut AppState) -> Vec<Effect> {
     state.record_question_answer(&interaction.request_id, submitted);
     state.composer.clear();
     state.slash_suggestions = None;
+    state.mention_suggestions = None;
     state.revisions.content += 1;
     vec![
         Effect::Send(UiCommand::AnswerQuestion {
@@ -1440,6 +1583,7 @@ fn submit_pending_input(state: &mut AppState) -> Vec<Effect> {
     }
     state.composer.clear();
     state.slash_suggestions = None;
+    state.mention_suggestions = None;
     state.revisions.content += 1;
     vec![
         Effect::Send(UiCommand::AnswerInput {
@@ -1458,14 +1602,17 @@ fn open_model_overlay(state: &mut AppState) -> Vec<Effect> {
     // listed; selecting a model of a non-connected provider is
     // rejected by the CLI handler with a notification.
     state.effort_overlay = None;
-    state.model_overlay = Some(ModelOverlay::for_current(
+    let mut overlay = ModelOverlay::for_current(
         &state.model,
         state.auth_provider,
         &state.open_code_models,
         &state.cline_pass_models,
         &state.command_code_models,
         &state.zen_models,
-    ));
+    );
+    overlay.pending_fast = state.codex_fast;
+    state.model_overlay = Some(overlay);
+    state.menu_focus_at_ms = Some(state.clock.elapsed_ms);
     state.revisions.status += 1;
     vec![
         Effect::Send(UiCommand::RefreshOpenCodeModels),
@@ -1574,6 +1721,103 @@ fn parse_mcp_args(
     }
 }
 
+/// `/resume`, `/rewind` and `/rename` (with or without an argument): they swap
+/// or edit the session, so they wait for an idle worker.
+fn session_command(command: &str) -> bool {
+    let name = command.split_whitespace().next().unwrap_or_default();
+    matches!(name, "/resume" | "/rewind" | "/rename")
+}
+
+fn session_management_busy(state: &AppState) -> bool {
+    state.working || state.prompt_is_busy() || state.user_shell.is_some()
+}
+
+/// `/resume` and `/rewind` lists: type to filter, arrows move, Enter acts,
+/// Esc closes. Resuming the open or a locked session is refused in place.
+fn reduce_session_picker_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
+    let Some(picker) = state.session_picker.as_mut() else {
+        return vec![];
+    };
+    let total = picker.rows().len();
+    let page = PICKER_NOMINAL_CAPACITY as isize;
+    match key.code {
+        KeyCode::Esc => {
+            state.session_picker = None;
+            state.revisions.focus += 1;
+            return vec![Effect::RequestRender];
+        }
+        KeyCode::Up => picker.selected = move_selection(picker.selected, total, -1),
+        KeyCode::Down => picker.selected = move_selection(picker.selected, total, 1),
+        KeyCode::PageUp => picker.selected = move_selection(picker.selected, total, -page),
+        KeyCode::PageDown => picker.selected = move_selection(picker.selected, total, page),
+        KeyCode::Home => picker.selected = 0,
+        KeyCode::End => picker.selected = total.saturating_sub(1),
+        KeyCode::Backspace => {
+            if picker.filter.pop().is_none() {
+                return vec![];
+            }
+            picker.selected = 0;
+            picker.viewport_start = 0;
+            picker.clamp_selection();
+        }
+        KeyCode::Char(character)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            picker.filter.push(character);
+            picker.selected = 0;
+            picker.viewport_start = 0;
+            picker.clamp_selection();
+        }
+        KeyCode::Enter => return confirm_session_picker(state),
+        _ => return vec![],
+    }
+    let (selected, total) = (picker.selected, picker.rows().len());
+    picker.viewport_start = ensure_visible_start(
+        picker.viewport_start,
+        selected,
+        total,
+        PICKER_NOMINAL_CAPACITY,
+    );
+    state.revisions.focus += 1;
+    vec![Effect::RequestRender]
+}
+
+fn confirm_session_picker(state: &mut AppState) -> Vec<Effect> {
+    let Some(picker) = state.session_picker.as_ref() else {
+        return vec![];
+    };
+    let command = match picker.selected_row() {
+        Some(PickerRow::Session(session)) if session.current => {
+            state.push_notification("Esta já é a sessão aberta".into());
+            state.revisions.status += 1;
+            return vec![Effect::RequestRender];
+        }
+        Some(PickerRow::Session(session)) if session.in_use => {
+            state.push_notification("Sessão em uso por outro processo".into());
+            state.revisions.status += 1;
+            return vec![Effect::RequestRender];
+        }
+        Some(PickerRow::Session(session)) => UiCommand::ResumeSession {
+            id: session.id.clone(),
+        },
+        Some(PickerRow::Turn(turn)) => UiCommand::RewindSession {
+            first_seq: turn.first_seq,
+        },
+        None => return vec![],
+    };
+    state.session_picker = None;
+    state.revisions.focus += 1;
+    vec![Effect::Send(command), Effect::RequestRender]
+}
+
+/// Body of a `!command` draft; `None` for ordinary text and for `!!…`, which
+/// stays a literal prompt starting with `!`.
+fn user_shell_body(command: &str) -> Option<&str> {
+    let body = command.strip_prefix('!')?;
+    (!body.starts_with('!')).then(|| body.trim())
+}
+
 fn submit_composer(state: &mut AppState) -> Vec<Effect> {
     // One reverse scan over the blocks; the two dispatch arms used to run
     // `pending_interaction` once each.
@@ -1614,7 +1858,7 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
         }
         "/help" => {
             state.push_notification(
-                "F1 / Ctrl+P comandos · Ctrl+Z desfazer · Ctrl+Shift+Z refazer · Ctrl+←/→ palavra · Ctrl+Backspace/Delete apagar palavra · /model --default salvar padrão · /retry retomar conexão · Esc cancelar"
+                "F1 / Ctrl+P comandos · Ctrl+Z desfazer · Ctrl+Shift+Z refazer · Ctrl+←/→ palavra · Ctrl+Backspace/Delete apagar palavra · /model --default salvar padrão · /retry retomar conexão · ↑ prompt anterior · @arquivo anexa · !comando roda no modo Auto · Esc cancelar"
                     .into(),
             );
             state.revisions.status += 1;
@@ -1689,10 +1933,49 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
             effects.push(Effect::Send(UiCommand::Logout));
             state.revisions.status += 1;
         }
-        "/resume" => {
-            effects.push(Effect::Send(UiCommand::ResumePrevious));
+        "/resume" | "/rewind" => {
+            if session_management_busy(state) {
+                state.push_notification(
+                    "Há uma execução ativa; aguarde ou cancele antes de mudar de sessão".into(),
+                );
+                keep_draft = true;
+            } else {
+                let kind = if command == "/resume" {
+                    PickerKind::Resume
+                } else {
+                    PickerKind::Rewind
+                };
+                effects.extend(state.open_session_picker(kind).map(Effect::Send));
+            }
             state.revisions.status += 1;
         }
+        _ if command == "/rename" || command.starts_with("/rename ") => {
+            let title = command.strip_prefix("/rename").unwrap_or_default().trim();
+            if session_management_busy(state) {
+                state.push_notification(
+                    "Há uma execução ativa; aguarde ou cancele antes de renomear".into(),
+                );
+                keep_draft = true;
+            } else if title.is_empty() {
+                let current = state
+                    .session_title
+                    .as_deref()
+                    .map_or_else(|| "sem nome".to_owned(), |title| format!("\"{title}\""));
+                state.push_notification(format!(
+                    "Sessão {current} · Uso: /rename TÍTULO · /rename --clear remove o nome"
+                ));
+            } else {
+                effects.push(Effect::Send(UiCommand::RenameSession {
+                    title: if title == "--clear" {
+                        String::new()
+                    } else {
+                        title.to_owned()
+                    },
+                }));
+            }
+            state.revisions.status += 1;
+        }
+
         _ if command == "/queue" || command.starts_with("/queue ") => {
             if !reduce_queue_command(state, &command, &mut effects) {
                 keep_draft = true;
@@ -1932,6 +2215,30 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
             }
             state.revisions.status += 1;
         }
+        _ if user_shell_body(&command).is_some() => {
+            let body = user_shell_body(&command).unwrap_or_default().to_owned();
+            if body.is_empty() {
+                state.push_notification("Uso: !COMANDO".into());
+                keep_draft = true;
+            } else if state.working || state.prompt_is_busy() || state.user_shell.is_some() {
+                state.push_notification(
+                    "Há uma execução ativa; aguarde ou cancele antes de rodar um comando com !"
+                        .into(),
+                );
+                keep_draft = true;
+            } else if state.mode != slim_core::OperatingMode::Auto {
+                state.push_notification("Comandos com ! exigem o modo Auto (/mode auto)".into());
+                keep_draft = true;
+            } else if let Some(request_id) = state.begin_user_shell() {
+                effects.push(Effect::Send(UiCommand::RunUserShell {
+                    request_id,
+                    command: body,
+                }));
+            } else {
+                keep_draft = true;
+            }
+            state.revisions.status += 1;
+        }
         // Let the worker resolve dynamic skill commands. This also keeps
         // unknown slash commands fail-closed without losing the draft.
         _ if command.starts_with('/') => {
@@ -1950,6 +2257,13 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
             state.revisions.status += 1;
             return effects;
         }
+        _ if state.user_shell.is_some() => {
+            state.push_notification(
+                "Um comando com ! está rodando; aguarde ou cancele com Esc".into(),
+            );
+            state.revisions.status += 1;
+            keep_draft = true;
+        }
         _ => {
             if let Some(effect) = prepare_prompt(state, prompt, PromptOrigin::Direct) {
                 effects.push(effect);
@@ -1965,11 +2279,15 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
     // Draft is cleared on every accepted submission (slash command or send);
     // preserved when signed out with a plain prompt (spec §15.3) and when a
     // slash command is rejected locally (`keep_draft`) so the user can fix it.
-    if (command.starts_with('/') || state.authenticated) && !keep_draft {
+    if (command.starts_with('/') || user_shell_body(&command).is_some() || state.authenticated)
+        && !keep_draft
+    {
+        state.remember_prompt(&command);
         state.composer.clear();
         state.revisions.content += 1;
     }
     state.slash_suggestions = None;
+    state.mention_suggestions = None;
     effects.push(Effect::RequestRender);
     effects
 }
@@ -2101,40 +2419,91 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             state.model_overlay = None;
             return vec![Effect::RequestRender];
         }
-        KeyCode::Up => overlay.selected = move_selection(overlay.selected, rows.len(), -1),
-        KeyCode::Down => overlay.selected = move_selection(overlay.selected, rows.len(), 1),
-        KeyCode::Home => overlay.selected = 0,
-        KeyCode::End => overlay.selected = rows.len().saturating_sub(1),
-        KeyCode::Char(' ') => {
-            // Space toggles the collapsed state of the group under the cursor.
-            let group = match rows.get(overlay.selected) {
-                Some(row) => match row {
-                    ModelRow::Header(g) => *g,
-                    ModelRow::Alias(_) => 0,
-                    ModelRow::Catalog(_) => 1,
-                    ModelRow::ClinePass(_) => 2,
-                    ModelRow::CommandCode(_) => 3,
-                    ModelRow::Zen(_) => 4,
-                },
-                None => return vec![Effect::RequestRender],
+        KeyCode::Up => {
+            overlay.selected = move_selection(overlay.selected, rows.len(), -1);
+            overlay.selection_lost = false;
+        }
+        KeyCode::Down => {
+            overlay.selected = move_selection(overlay.selected, rows.len(), 1);
+            overlay.selection_lost = false;
+        }
+        KeyCode::Home => {
+            overlay.selected = 0;
+            overlay.selection_lost = false;
+        }
+        KeyCode::End => {
+            overlay.selected = rows.len().saturating_sub(1);
+            overlay.selection_lost = false;
+        }
+        KeyCode::Left | KeyCode::Right => {
+            let Some(choice) = rows.get(overlay.selected).and_then(|row| {
+                row.choice(
+                    &state.open_code_models,
+                    &state.cline_pass_models,
+                    &state.command_code_models,
+                    &state.zen_models,
+                )
+            }) else {
+                return vec![];
             };
-            overlay.toggle_collapsed(group);
-            overlay.selected = overlay.selected.min(
-                overlay
-                    .rows(
-                        &state.open_code_models,
-                        &state.cline_pass_models,
-                        &state.command_code_models,
-                        &state.zen_models,
-                    )
-                    .len()
-                    .saturating_sub(1),
-            );
+            if choice.levels.is_empty() {
+                return vec![];
+            }
+            let index = choice
+                .levels
+                .iter()
+                .position(|level| *level == overlay.pending_effort(&choice, state.effort))
+                .or_else(|| {
+                    choice
+                        .levels
+                        .iter()
+                        .position(|level| *level == state.effort)
+                })
+                .unwrap_or(0);
+            let next = if key.code == KeyCode::Left {
+                index.saturating_sub(1)
+            } else {
+                (index + 1).min(choice.levels.len() - 1)
+            };
+            overlay.set_pending_effort(choice.target, choice.levels[next]);
+        }
+        KeyCode::Tab => {
+            if rows
+                .get(overlay.selected)
+                .is_some_and(|row| matches!(row, ModelRow::Alias(_)))
+            {
+                overlay.pending_fast = !overlay.pending_fast;
+            } else {
+                return vec![];
+            }
+        }
+        KeyCode::Char(' ') if overlay.filter.is_empty() => {
+            if let Some(ModelRow::Header(group)) = rows.get(overlay.selected) {
+                overlay.toggle_collapsed(*group);
+            } else {
+                overlay.filter.push(' ');
+                let filtered = overlay.rows(
+                    &state.open_code_models,
+                    &state.cline_pass_models,
+                    &state.command_code_models,
+                    &state.zen_models,
+                );
+                overlay.selected = first_model_row(&filtered);
+                overlay.viewport_start = 0;
+                overlay.selection_lost = false;
+            }
         }
         KeyCode::Backspace => {
             if overlay.filter.pop().is_some() {
-                overlay.selected = 0;
+                let filtered = overlay.rows(
+                    &state.open_code_models,
+                    &state.cline_pass_models,
+                    &state.command_code_models,
+                    &state.zen_models,
+                );
+                overlay.selected = first_model_row(&filtered);
                 overlay.viewport_start = 0;
+                overlay.selection_lost = false;
             }
         }
         KeyCode::Char(character)
@@ -2142,132 +2511,65 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 || key.modifiers.contains(KeyModifiers::ALT) =>
         {
             overlay.filter.push(character);
-            overlay.selected = 0;
+            let filtered = overlay.rows(
+                &state.open_code_models,
+                &state.cline_pass_models,
+                &state.command_code_models,
+                &state.zen_models,
+            );
+            overlay.selected = first_model_row(&filtered);
             overlay.viewport_start = 0;
+            overlay.selection_lost = false;
         }
         KeyCode::Enter => {
+            if overlay.selection_lost {
+                state.push_notification(
+                    "O modelo em foco saiu do catálogo. Escolha outro modelo.".into(),
+                );
+                state.revisions.status += 1;
+                return vec![Effect::RequestRender];
+            }
             let Some(row) = rows.get(overlay.selected) else {
                 return vec![Effect::RequestRender];
             };
-            match row {
-                ModelRow::Header(_) => {
-                    state.model_overlay = Some(overlay);
-                    return vec![Effect::RequestRender];
-                }
-                ModelRow::Alias(alias) => {
-                    let levels = ReasoningEffort::supported(*alias);
-                    let preferred = if levels.contains(&state.effort) {
-                        state.effort
-                    } else {
-                        ReasoningEffort::default_for(*alias)
-                    };
-                    state.effort_overlay = Some(EffortOverlay::for_alias(
-                        *alias,
-                        preferred,
-                        state.codex_fast,
-                    ));
-                }
-                ModelRow::Catalog(model_index) => {
-                    let Some(model) = state.open_code_models.get(*model_index).cloned() else {
-                        state.model_overlay = Some(overlay);
-                        return vec![
-                            Effect::Send(UiCommand::RefreshOpenCodeModels),
-                            Effect::RequestRender,
-                        ];
-                    };
-                    if !model.reasoning_levels.is_empty() {
-                        // The step sits on top of the model overlay (G239), so
-                        // Esc returns to the same row, filter and folds.
-                        state.effort_overlay = Some(EffortOverlay::for_catalog(
-                            EffortTarget::OpenCodeGo(model.id),
-                            model.reasoning_levels,
-                            state.effort,
-                        ));
-                    } else {
-                        state.model_overlay = None;
-                        return vec![
-                            Effect::Send(UiCommand::SetOpenCodeModel {
-                                model: model.id,
-                                effort: catalog_effort(&model.reasoning_levels, state.effort),
-                            }),
-                            Effect::RequestRender,
-                        ];
-                    }
-                }
-                ModelRow::ClinePass(model_index) => {
-                    let Some(model) = state.cline_pass_models.get(*model_index).cloned() else {
-                        state.model_overlay = Some(overlay);
-                        return vec![Effect::RequestRender];
-                    };
-                    if !model.reasoning_levels.is_empty() {
-                        state.effort_overlay = Some(EffortOverlay::for_catalog(
-                            EffortTarget::ClinePass(model.id),
-                            model.reasoning_levels,
-                            state.effort,
-                        ));
-                    } else {
-                        state.model_overlay = None;
-                        return vec![
-                            Effect::Send(UiCommand::SetClinePassModel {
-                                model: model.id,
-                                effort: state.effort,
-                            }),
-                            Effect::RequestRender,
-                        ];
-                    }
-                }
-                ModelRow::CommandCode(model_index) => {
-                    let Some(model) = state.command_code_models.get(*model_index).cloned() else {
-                        state.model_overlay = Some(overlay);
-                        return vec![
-                            Effect::Send(UiCommand::RefreshCommandCodeModels),
-                            Effect::RequestRender,
-                        ];
-                    };
-                    if !model.reasoning_levels.is_empty() {
-                        state.effort_overlay = Some(EffortOverlay::for_catalog(
-                            EffortTarget::CommandCode(model.id),
-                            model.reasoning_levels,
-                            state.effort,
-                        ));
-                    } else {
-                        state.model_overlay = None;
-                        return vec![
-                            Effect::Send(UiCommand::SetCommandCodeModel {
-                                model: model.id,
-                                effort: state.effort,
-                            }),
-                            Effect::RequestRender,
-                        ];
-                    }
-                }
-                ModelRow::Zen(model_index) => {
-                    let Some(model) = state.zen_models.get(*model_index).cloned() else {
-                        state.model_overlay = Some(overlay);
-                        return vec![
-                            Effect::Send(UiCommand::RefreshZenModels),
-                            Effect::RequestRender,
-                        ];
-                    };
-                    if !model.reasoning_levels.is_empty() {
-                        state.effort_overlay = Some(EffortOverlay::for_catalog(
-                            EffortTarget::Zen(model.id),
-                            model.reasoning_levels,
-                            state.effort,
-                        ));
-                    } else {
-                        state.model_overlay = None;
-                        return vec![
-                            Effect::Send(UiCommand::SetZenModel {
-                                model: model.id,
-                                effort: catalog_effort(&model.reasoning_levels, state.effort),
-                            }),
-                            Effect::RequestRender,
-                        ];
-                    }
-                }
+            if let ModelRow::Header(group) = row {
+                overlay.toggle_collapsed(*group);
+                state.model_overlay = Some(overlay);
+                return vec![Effect::RequestRender];
             }
-            return vec![Effect::RequestRender];
+            let Some(choice) = row.choice(
+                &state.open_code_models,
+                &state.cline_pass_models,
+                &state.command_code_models,
+                &state.zen_models,
+            ) else {
+                return vec![Effect::RequestRender];
+            };
+            let effort = overlay.pending_effort(&choice, state.effort);
+            if !choice.levels.is_empty() && !choice.levels.contains(&effort) {
+                state.push_notification(
+                    "Os níveis de esforço deste modelo mudaram. Escolha um nível disponível."
+                        .into(),
+                );
+                state.revisions.status += 1;
+                return vec![Effect::RequestRender];
+            }
+            let command = match choice.target {
+                EffortTarget::Alias(model) => UiCommand::SetModel {
+                    model,
+                    effort,
+                    fast: overlay.pending_fast,
+                },
+                EffortTarget::OpenCodeGo(model) => UiCommand::SetOpenCodeModel { model, effort },
+                EffortTarget::Zen(model) => UiCommand::SetZenModel { model, effort },
+                EffortTarget::ClinePass(model) => UiCommand::SetClinePassModel { model, effort },
+                EffortTarget::CommandCode(model) => {
+                    UiCommand::SetCommandCodeModel { model, effort }
+                }
+                EffortTarget::Xai(model) => UiCommand::SetXaiModel { model, effort },
+            };
+            state.model_overlay = None;
+            return vec![Effect::Send(command), Effect::RequestRender];
         }
         _ => return vec![],
     }
@@ -2284,8 +2586,15 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         PICKER_NOMINAL_CAPACITY,
     );
     state.model_overlay = Some(overlay);
+    state.menu_focus_at_ms = Some(state.clock.elapsed_ms);
     state.revisions.status += 1;
     vec![Effect::RequestRender]
+}
+
+fn first_model_row(rows: &[ModelRow]) -> usize {
+    rows.iter()
+        .position(|row| !matches!(row, ModelRow::Header(_)))
+        .unwrap_or(0)
 }
 
 /// `/mcp` overlay keys: ↑↓/Home/End navigate, Enter tests (connects lazily),
@@ -2599,9 +2908,14 @@ fn reduce_palette_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                     Effect::RequestRender,
                 ];
             }
-            state.composer.clear();
+            // The palette is a temporary navigation surface. Dispatch through
+            // the same slash handler, then restore the exact draft (including
+            // cursor, attachments and undo history) behind it.
+            let draft = std::mem::take(&mut state.composer);
             state.composer.insert_text(command);
             let effects = submit_composer(state);
+            state.composer = draft;
+            state.revisions.content += 1;
             let mut all = effects;
             all.insert(0, Effect::RequestRender);
             return all;
@@ -2633,6 +2947,9 @@ fn reduce_palette_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         updated_total,
         PICKER_NOMINAL_CAPACITY,
     );
+    if state.palette_query.is_some() {
+        state.menu_focus_at_ms = Some(state.clock.elapsed_ms);
+    }
     state.revisions.focus += 1;
     vec![Effect::RequestRender]
 }
@@ -2736,3 +3053,12 @@ mod slash_tests;
 
 #[cfg(test)]
 mod queued_prompt_tests;
+
+#[cfg(test)]
+mod history_tests;
+#[cfg(test)]
+mod mention_tests;
+#[cfg(test)]
+mod picker_tests;
+#[cfg(test)]
+mod shell_tests;

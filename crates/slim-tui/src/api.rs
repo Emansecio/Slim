@@ -177,6 +177,35 @@ impl ReasoningEffort {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SessionId(pub Arc<str>);
 
+/// One row of the `/resume` list: a resumable durable session of this workspace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionListItem {
+    /// Session id, equal to the file stem (`tui-...`); what `ResumeSession` takes.
+    pub id: String,
+    /// Name set with `/rename`, when there is one.
+    pub title: Option<String>,
+    /// First user prompt, single line, possibly empty when it could not be read cheaply.
+    pub first_prompt: String,
+    /// Last modification, Unix epoch milliseconds.
+    pub updated_ms: u64,
+    pub bytes: u64,
+    /// Another process holds the session's lock; resuming it would fail.
+    pub in_use: bool,
+    /// The session currently open in this TUI (listed, not resumable from itself).
+    pub current: bool,
+}
+
+/// One row of the `/rewind` list: a finished turn the session can go back to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnListItem {
+    /// Zero-based position among the session's turns (oldest first).
+    pub index: usize,
+    /// Sequence of the turn's user entry; what `RewindSession` takes.
+    pub first_seq: u64,
+    /// First line of the turn's prompt (already redacted), at most 200 chars.
+    pub prompt: String,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BlockId(pub Arc<str>);
 
@@ -585,6 +614,39 @@ pub enum UiEvent {
         request_id: ContentRequestId,
         cursor: Option<PageCursor>,
         message: String,
+    },
+    /// The current session's name changed (`None` = unnamed). Sent after
+    /// `/rename` and after every session switch or creation.
+    SessionTitleChanged {
+        title: Option<String>,
+    },
+    /// Answer to `ListSessions`. `error` set means the list could not be built.
+    /// `now_ms` is the host clock (Unix epoch ms) when the list was built, so
+    /// ages render without the TUI reading a wall clock.
+    SessionsListed {
+        request_id: u64,
+        now_ms: u64,
+        items: Vec<SessionListItem>,
+        error: Option<String>,
+    },
+    /// Answer to `ListTurns`. `error` set means the list could not be built.
+    TurnsListed {
+        request_id: u64,
+        items: Vec<TurnListItem>,
+        error: Option<String>,
+    },
+    /// Last event of a `RunUserShell` request, sent whether the command ran,
+    /// failed, was refused or was cancelled. Its output travelled as the usual
+    /// `ToolStarted`/`ToolOutput`/`ToolEnded` events before it.
+    UserShellFinished {
+        request_id: u64,
+    },
+    /// Workspace-relative file paths for `@` completion (shallower first).
+    /// `truncated` is set when the host stopped at its listing limit.
+    WorkspaceFiles {
+        request_id: u64,
+        paths: Vec<String>,
+        truncated: bool,
     },
     UsagePartial {
         input_tokens: u64,
@@ -1326,6 +1388,45 @@ pub enum UiCommand {
         request_id: ContentRequestId,
         cursor: Option<PageCursor>,
     },
+    /// `/rename TITLE`: names the current session (empty clears the name). The
+    /// host persists it beside the session and answers `SessionTitleChanged`.
+    RenameSession {
+        title: String,
+    },
+    /// Lists the workspace's resumable sessions (`/resume` overlay); answered by
+    /// `UiEvent::SessionsListed` with the same `request_id`.
+    ListSessions {
+        request_id: u64,
+    },
+    /// Resumes the session whose id is `id` (as listed). Replaces the current
+    /// conversation exactly like `ResumePrevious`, which stays for startup.
+    ResumeSession {
+        id: String,
+    },
+    /// Lists the current session's finished turns (`/rewind` overlay); answered
+    /// by `UiEvent::TurnsListed`.
+    ListTurns {
+        request_id: u64,
+    },
+    /// Goes back to just before the turn whose user entry has sequence
+    /// `first_seq`: forks the session at that boundary (the original is left
+    /// untouched), switches to the fork and hands that turn's prompt back as a
+    /// draft. Conversation only; files are not restored.
+    RewindSession {
+        first_seq: u64,
+    },
+    /// Run `command` (a `!command` draft) in the workspace shell on the user's
+    /// behalf. Auto mode only; the host always ends it with
+    /// `UiEvent::UserShellFinished` carrying the same `request_id`.
+    RunUserShell {
+        request_id: u64,
+        command: String,
+    },
+    /// Enumerate workspace files for `@` completion; answered by
+    /// `UiEvent::WorkspaceFiles` carrying the same `request_id`.
+    RequestWorkspaceFiles {
+        request_id: u64,
+    },
 }
 
 struct WakeInner {
@@ -1607,6 +1708,12 @@ impl UiEvent {
                 | Self::ToolAdmitted { .. }
                 | Self::ToolOutput { .. }
                 | Self::ToolProgress { .. }
+                | Self::ToolDiff { .. }
+                | Self::UserShellFinished { .. }
+                // Both follow a `SessionRestored` (resume, rewind): on the control
+                // lane they could be reduced before it and then wiped by it.
+                | Self::SessionTitleChanged { .. }
+                | Self::RestoreDraft { .. }
                 | Self::ToolEnded { .. }
                 | Self::ActivityChanged { .. }
                 | Self::ProviderPhaseChanged { .. }
@@ -2164,6 +2271,10 @@ mod tests {
                 run_id: Some(7),
                 message: "fatal".into(),
             },
+            // Must not overtake the ToolEnded of its own command.
+            UiEvent::UserShellFinished { request_id: 1 },
+            UiEvent::SessionTitleChanged { title: None },
+            UiEvent::RestoreDraft { text: "x".into() },
             UiEvent::CompactionCompleted,
             UiEvent::RunCompleted { run_id: 1 },
         ] {

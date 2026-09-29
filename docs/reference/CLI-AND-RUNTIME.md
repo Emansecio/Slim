@@ -137,6 +137,11 @@ resultados e preserva a edição. Mutação e validação são registradas separ
 Como o comando pode alterar arquivos, uma nova sobrescrita do arquivo editado
 exige `expected` ou nova leitura; o LSP relê o estado após o comando.
 
+Falhas de inicialização do LSP incluem o final do stderr do servidor, limitado
+a 16 KiB. Após encerrar o processo, Slim aguarda a captura por até dois segundos;
+o diagnóstico passa pela redação de valores sensíveis do runtime antes de
+entrar nos resultados e eventos de `code_intel`.
+
 A ferramenta `skill` exige `list` booleano e `script` string quando fornecidos;
 tipos inválidos, inclusive `null`, são rejeitados antes do despacho. Campos
 omitidos mantêm os padrões de listagem e leitura do `SKILL.md`. Chamadas de
@@ -218,6 +223,10 @@ Revisão de 12/09/2026:
   e descartados. Código zero
   descreve o processo; não certifica todas as operações do script nem a tarefa.
   Ausência de diagnóstico estruturado continua sem classificação automática.
+  Para checks nativos, prefira `shell.command` com `args` literais. Em script
+  PowerShell, capture `$LASTEXITCODE` imediatamente após o comando nativo,
+  antes de filtrar ou imprimir, e encerre com `exit $codigoSalvo`. O retorno do
+  último comando do script pode esconder uma falha anterior.
 - Em uma execução durável, cada chamada HTTP efetivamente iniciada para um
   provider gera um fato aditivo `provider.call.v1`, com identidade e ordinal
   locais, operação/tentativa,
@@ -226,6 +235,12 @@ Revisão de 12/09/2026:
   persistidos nesse fato; cache hits e cancelamento anterior ao envio não contam
   como chamada. `run.telemetry.v1` também registra o SHA-256 do executável exato
   (ou uma categoria não sensível quando indisponível) e a revisão do build.
+  Códigos internos como `transport`, `invalid_response` e `malformed_tool_call`
+  preservam sua categoria; códigos desconhecidos continuam sanitizados.
+  Se o HTTP terminou com sucesso e a validação do runtime falhou, um fato
+  `provider.validation.v1` registra somente a categoria da falha e o ID exato
+  de `provider.call.v1`, sem criar outra chamada nem alterar o resultado HTTP.
+  Cache replay não gera esses fatos, pois não iniciou uma nova chamada HTTP.
 - No loop Auto, `shell` espera até `yield_ms` (padrão 1.000, faixa 0–10.000).
   Se continuar executando, retorna `job_id` e estado `running`; isso confirma
   apenas o início, não o sucesso do comando. `yield_ms: 0` libera imediatamente.
@@ -528,9 +543,10 @@ em `%USERPROFILE%\.slim\opencode-go-models.json`; offline, Slim usa cache ou
 registro embutido. Somente os 25 modelos documentados são aceitos. Cada modelo
 seleciona protocolo, contexto, reasoning e suporte a imagem por metadado
 explícito, sem heurística: Chat Completions, Responses ou Anthropic Messages.
-No wire Chat Completions, snapshots cumulativos de `usage` do OpenCode Go são
-consolidados em um único total conservador; providers irmãos continuam com
-validação terminal estrita.
+No wire Chat Completions, snapshots cumulativos de `usage` de OpenCode Go,
+OpenCode Zen e Command Code são consolidados em um único total conservador,
+preservando texto e ferramentas. Os demais providers e wires mantêm a validação
+terminal existente.
 `/logout` remove apenas a chave OpenCode persistida; variáveis de ambiente não
 são alteradas.
 
@@ -593,7 +609,7 @@ e [TEST-SUITE-OPTIMIZATION.md](../../analysis_outputs/TEST-SUITE-OPTIMIZATION.md
 | TUI | `Slim` abre a interface normal mesmo deslogado. `/login` abre seletor OAuth nativo para Claude Pro/Max ou ChatGPT Plus/Pro; Anthropic Messages e Codex Responses usam o mesmo agent loop/tools Slim. Reducer único normativo (`Action → reduce → Effect`), scrollback virtualizado e navegável (pin/live-edge/unseen), paleta estratificada §21.3, ActivityRail por fase/tempo, SessionRail conversacional adaptativa com contexto único e footer Grok-style responsivo (box alinhado + atalhos/metrics), tool blocks tipados agregados, lanes bounded com coalescer no runtime real, command palette Ctrl+P, markdown-light, motion básico com reduced motion e welcome estática com nome, conexão e próxima ação. Fixtures localhost provam OAuth/callback/store, streaming, tool round-trip e cancelamento. PTY E2E físico pendente de console real (teste `#[ignore]`). |
 | Cache/HTTP | Replay local de respostas (`ProviderCache`) desligado no produto; transporte HTTP compartilhado reaproveita conexões, enquanto adapters e autenticação continuam isolados por request. |
 | Sessões | Writer/recovery/branch e `--session` escrevem JSONL novo; `--resume`/recovery explícitos existem headless e TUI; UX geral de seleção/fork continua limitada. |
-| Skills, MCP, subagentes | Tool `skill` lazy (`list` / `name`); roots `.slim/skills`, `.claude/skills` e `.agents/skills` no projeto, `.slim/skills` e `.agents/skills` no perfil. Scripts chamados pelo modelo exigem trust explícito e são recusados sem grant; leitura de `SKILL.md` continua disponível. MCP stdio/HTTP lazy via meta-tool `mcp` + overlay `/mcp` (ver seção MCP). Sem child. |
+| Skills, MCP, subagentes | Tool `skill` lazy (`list` / `name`); roots `.slim/skills`, `.claude/skills`, `.agents/skills` e `.codex/skills` no projeto, `.slim/skills`, `.agents/skills` e `.codex/skills` no perfil (nesta ordem de prioridade; o projeto vence o perfil). Scripts chamados pelo modelo exigem trust explícito e são recusados sem grant; leitura de `SKILL.md` continua disponível. MCP stdio/HTTP lazy via meta-tool `mcp` + overlay `/mcp` (ver seção MCP). Sem child. |
 | Todo/Plan/Goal | Tool `todo` no loop Auto; `TodoChanged` abre o dock TUI. Plan/Goal sem UI; Plan headless continua abortando (N4). |
 | Release | Determinístico e hash-valid; empacota este checkpoint parcial, não uma v1 completa. |
 

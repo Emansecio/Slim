@@ -87,6 +87,9 @@ struct TuiStartup {
     image_labels: Vec<String>,
     resume_path: Option<PathBuf>,
     resume_preflight: Option<SessionPreflight>,
+    /// `/rename` before the session file exists (sessions are created lazily
+    /// by the first prompt); written beside the journal at creation.
+    pending_session_title: Option<String>,
     persist_sessions: bool,
     mode: slim_core::OperatingMode,
     effort: ReasoningEffort,
@@ -255,6 +258,12 @@ fn workspace_sessions_dir(workspace_root: &Path, create: bool) -> Result<Option<
     Ok(Some(sessions))
 }
 
+/// Fresh `tui-…` session id; callers retry with a new suffix on collision.
+fn tui_session_id(timestamp: u128) -> String {
+    let suffix = NEXT_TUI_SESSION_SUFFIX.fetch_add(1, Ordering::Relaxed);
+    format!("tui-{timestamp}-{}-{suffix}", std::process::id())
+}
+
 fn create_tui_session(startup: &mut TuiStartup) -> Result<Option<(String, String)>, String> {
     if !startup.persist_sessions || startup.resume_path.is_some() {
         return Ok(None);
@@ -278,8 +287,7 @@ fn create_tui_session(startup: &mut TuiStartup) -> Result<Option<(String, String
         .as_nanos();
 
     for _ in 0..16 {
-        let suffix = NEXT_TUI_SESSION_SUFFIX.fetch_add(1, Ordering::Relaxed);
-        let id = format!("tui-{timestamp}-{}-{suffix}", std::process::id());
+        let id = tui_session_id(timestamp);
         let path = sessions.join(format!("{id}.jsonl"));
         let header = DurableSessionHeader::new(&id, timestamp.to_string(), &cwd, None, None);
         match JsonlRepo::create(&path, header) {
@@ -305,68 +313,30 @@ fn system_time_nanos(time: SystemTime) -> u128 {
         .map_or(0, |duration| duration.as_nanos())
 }
 
+/// Validation chain every session switch shares (automatic, by id and rewind).
+/// `label` prefixes the refusal reason for the caller's audience.
+fn selected_from_preflight(
+    preflight: SessionPreflight,
+    label: &str,
+) -> Result<SelectedTuiSession, String> {
+    super::headless::ensure_resume_preflight(&preflight)
+        .map_err(|error| format!("{label}: {error}"))?;
+    slim_core::session::resume_plan_from_preflight(&preflight)
+        .map_err(|error| format!("{label}: {error}"))?;
+    let history = resume_messages_from_preflight(&preflight).map_err(provider_error_message)?;
+    Ok(SelectedTuiSession { preflight, history })
+}
+
 fn select_previous_tui_session(
     workspace_root: &Path,
     current_path: Option<&Path>,
 ) -> Result<Option<SelectedTuiSession>, String> {
-    let canonical_workspace =
-        fs::canonicalize(workspace_root).map_err(|error| format!("workspace path: {error}"))?;
-    let Some(sessions) = workspace_sessions_dir(&canonical_workspace, false)? else {
-        return Ok(None);
-    };
     let current_path = current_path.and_then(|path| fs::canonicalize(path).ok());
-    let mut candidates = Vec::new();
-
-    for entry in fs::read_dir(&sessions).map_err(|error| format!("read sessions: {error}"))? {
-        let entry = entry.map_err(|error| format!("read session entry: {error}"))?;
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("session entry type: {error}"))?;
-        if !file_type.is_file() || file_type.is_symlink() {
-            continue;
-        }
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let canonical_path = match fs::canonicalize(&path) {
-            Ok(path) if path.starts_with(&sessions) => path,
-            _ => continue,
-        };
-        if current_path.as_ref() == Some(&canonical_path) {
-            continue;
-        }
-        // Header-only scan: a full preflight parses every record line, which
-        // would make startup O(all session bytes) as sessions accumulate. The
-        // strict header decode already rejects non-v2 schema versions.
-        let Some(header) = read_session_header(&canonical_path) else {
-            continue;
-        };
-        if !header.id.starts_with("tui-")
-            || canonical_path.file_stem().and_then(|stem| stem.to_str()) != Some(header.id.as_str())
-        {
-            continue;
-        }
-        let header_cwd = match fs::canonicalize(&header.cwd) {
-            Ok(cwd) => cwd,
-            Err(_) => continue,
-        };
-        if header_cwd != canonical_workspace {
-            continue;
-        }
-        let created = header.timestamp.parse::<u128>().unwrap_or(0);
-        let modified = fs::metadata(&canonical_path)
-            .and_then(|metadata| metadata.modified())
-            .map(system_time_nanos)
-            .unwrap_or(created);
-        candidates.push((modified, created, header.id.clone(), canonical_path));
-    }
-
-    candidates.sort_by(|left, right| {
-        (&left.0, &left.1, &left.2, &left.3).cmp(&(&right.0, &right.1, &right.2, &right.3))
-    });
-    while let Some((_, _, _, path)) = candidates.pop() {
-        let preflight = match slim_core::session::preflight_session(&path) {
+    let mut candidates = sessions::scan_tui_sessions(workspace_root)?;
+    candidates.retain(|candidate| current_path.as_ref() != Some(&candidate.path));
+    candidates.sort_by(|left, right| left.order_key().cmp(&right.order_key()));
+    while let Some(candidate) = candidates.pop() {
+        let preflight = match slim_core::session::preflight_session(&candidate.path) {
             Ok(preflight) => preflight,
             Err(_) => continue,
         };
@@ -375,15 +345,20 @@ fn select_previous_tui_session(
         {
             continue;
         }
-        super::headless::ensure_resume_preflight(&preflight)
-            .map_err(|error| format!("previous session cannot be resumed: {error}"))?;
-        slim_core::session::resume_plan_from_preflight(&preflight)
-            .map_err(|error| format!("previous session cannot be resumed: {error}"))?;
-        let history = resume_messages_from_preflight(&preflight).map_err(provider_error_message)?;
-        let has_user = history.iter().any(|message| message.role == "user");
-        let has_assistant = history.iter().any(|message| message.role == "assistant");
-        if has_user && has_assistant && !preflight.summary.terminal_operation_ids.is_empty() {
-            return Ok(Some(SelectedTuiSession { preflight, history }));
+        let selected = selected_from_preflight(preflight, "previous session cannot be resumed")?;
+        let has_user = selected
+            .history
+            .iter()
+            .any(|message| message.role == "user");
+        let has_assistant = selected
+            .history
+            .iter()
+            .any(|message| message.role == "assistant");
+        if has_user
+            && has_assistant
+            && !selected.preflight.summary.terminal_operation_ids.is_empty()
+        {
+            return Ok(Some(selected));
         }
     }
     Ok(None)
@@ -450,6 +425,106 @@ fn session_transcript(preflight: &SessionPreflight) -> Result<Vec<TranscriptMess
     let history = slim_core::session::provider_messages_from_records(preflight.records.iter())
         .map_err(str::to_owned)?;
     Ok(transcript_messages(&history))
+}
+
+/// Persists a `/rename` made before the session file existed, then tells the
+/// TUI the current session's title (`None` when unnamed). Runs after every
+/// session creation and switch so the rail is right in each.
+fn announce_session_title(startup: &mut TuiStartup, sink: &EventSink) {
+    if let (Some(title), Some(path)) = (
+        startup.pending_session_title.take(),
+        startup.resume_path.as_deref(),
+    ) {
+        if let Err(message) = sessions::write_session_title(path, &title) {
+            let _ = sink.send(UiEvent::Notification { message });
+        }
+    }
+    let title = startup
+        .resume_path
+        .as_deref()
+        .and_then(sessions::read_session_title);
+    let _ = sink.send(UiEvent::SessionTitleChanged { title });
+}
+
+/// Replaces the conversation with `selected`: history, task state, artifact
+/// ids, tool registry, compaction state, pending `!` notes and the journal the
+/// next prompt appends to; then tells the TUI. Shared by `ResumePrevious`,
+/// `ResumeSession` and `RewindSession`. Returns false, changing nothing, when
+/// the transcript or task state to show cannot be built.
+fn switch_session(
+    startup: &mut TuiStartup,
+    sink: &EventSink,
+    skill_memo: &mut SkillNameMemo,
+    user_shell_context: &UserShellContext,
+    selected: SelectedTuiSession,
+    notice: &str,
+) -> bool {
+    let workspace = startup
+        .options
+        .workspace_root
+        .clone()
+        .expect("workspace root initialized");
+    let session_id = selected
+        .preflight
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "unknown".into());
+    let cwd = display_workspace_path(&workspace);
+    let messages = match session_transcript(&selected.preflight) {
+        Ok(messages) => messages,
+        Err(message) => {
+            sink.send(UiEvent::RunFailed {
+                run_id: None,
+                message,
+            });
+            return false;
+        }
+    };
+    let todo_event = match restored_todo_event(&selected.preflight) {
+        Ok(event) => event,
+        Err(message) => {
+            sink.send(UiEvent::RunFailed {
+                run_id: None,
+                message,
+            });
+            return false;
+        }
+    };
+    if let Some(policy) = startup
+        .options
+        .compaction
+        .as_ref()
+        .map(slim_core::context::CompactionHandle::policy)
+    {
+        startup.options.compaction = Some(slim_core::context::CompactionHandle::new(policy));
+    }
+    startup.options.history = selected.history;
+    startup.options.task_facts = crate::headless::session_task_facts(&selected.preflight);
+    startup.options.artifact_ids = crate::headless::session_artifact_ids(&selected.preflight);
+    startup.options.tool_registry = None;
+    startup.options.ensure_shared_tool_registry();
+    startup.resume_path = Some(selected.preflight.path.clone());
+    startup.resume_preflight = Some(selected.preflight);
+    startup.pending_session_title = None;
+    user_shell_context.clear();
+    let skill_names = skill_memo.names(Some(workspace));
+    let _ = sink.send(UiEvent::SessionRestored {
+        session_id: slim_tui::api::SessionId(session_id.into()),
+        cwd,
+        messages,
+        skill_names,
+    });
+    announce_session_title(startup, sink);
+    let _ = sink.send(todo_event);
+    if !skill_memo.warnings.is_empty() {
+        sink.send(UiEvent::Notification {
+            message: skill_memo.warnings.clone(),
+        });
+    }
+    let _ = sink.send(UiEvent::Notification {
+        message: notice.to_owned(),
+    });
+    true
 }
 
 pub fn run_tui(args: Vec<String>) -> Result<(), TuiError> {
@@ -776,6 +851,7 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
         image_labels,
         resume_path,
         resume_preflight,
+        pending_session_title: None,
         persist_sessions: true,
         mode: parsed.mode,
         effort,
@@ -1064,6 +1140,7 @@ pub fn spawn_tui_runtime(
             image_labels: Vec::new(),
             resume_path: None,
             resume_preflight: None,
+            pending_session_title: None,
             persist_sessions: false,
             endpoint_override: None,
             model_override: None,
@@ -1117,6 +1194,7 @@ pub fn spawn_tui_runtime_with_resume(
             image_labels: Vec::new(),
             resume_path: Some(preflight.path.clone()),
             resume_preflight: Some(preflight),
+            pending_session_title: None,
             persist_sessions: false,
             endpoint_override: None,
             model_override: None,
@@ -1329,6 +1407,7 @@ struct ActiveRun {
     content_store: SharedContentStore,
     interaction_responder: Option<InteractionResponder>,
     manual_retry: slim_core::runtime::ManualRetryHandle,
+    workspace_root: Option<PathBuf>,
 }
 
 struct ActiveRunLaunch {
@@ -1347,6 +1426,7 @@ struct PendingRun {
     durable: bool,
     cancel_requested: bool,
     content_store: SharedContentStore,
+    workspace_root: Option<PathBuf>,
 }
 
 struct ActivePromptPreparation {
@@ -1361,6 +1441,8 @@ struct PromptRunInput {
     prompt: String,
     admission: Option<PromptAdmission>,
     skill_instructions: Option<SkillInstructions>,
+    /// `!command` output not yet told to the model; delivered with this prompt.
+    user_shell_context: UserShellContext,
 }
 
 fn start_prompt_run(
@@ -1376,6 +1458,7 @@ fn start_prompt_run(
         prompt,
         admission,
         skill_instructions,
+        user_shell_context,
     } = input;
     if startup.request.is_none() {
         return Err("No provider connected. Use /login.".into());
@@ -1385,6 +1468,17 @@ fn start_prompt_run(
             return Err(message);
         }
     }
+    // Before any session or run event exists: a refused mention fails the
+    // prompt while the draft is still the user's.
+    let mentions = match startup
+        .options
+        .workspace_root
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+    {
+        Some(root) => load_prompt_mentions(&root, &prompt)?,
+        None => MentionAttachments::default(),
+    };
     match create_tui_session(startup) {
         Ok(Some((session_id, cwd))) => {
             let skill_names = skill_memo.names(startup.options.workspace_root.clone());
@@ -1393,6 +1487,7 @@ fn start_prompt_run(
                 cwd,
                 skill_names,
             });
+            announce_session_title(startup, sink);
             if !skill_memo.warnings.is_empty() {
                 let _ = sink.send(UiEvent::Notification {
                     message: skill_memo.warnings.clone(),
@@ -1446,10 +1541,26 @@ fn start_prompt_run(
         }
         display_prompt.pop();
     }
+    let shell_notes = user_shell_context.snapshot();
+    let labels = shell_notes
+        .iter()
+        .map(UserShellNote::label)
+        .chain(mentions.labels.iter().cloned())
+        .collect::<Vec<_>>();
+    if !labels.is_empty() {
+        display_prompt.push_str("\n\n");
+        display_prompt.push_str(&labels.join("\n"));
+    }
     let _ = sink.send(UiEvent::UserMessageAdded {
         text: display_prompt,
     });
-    let run_options = startup.options.clone();
+    let mut run_options = startup.options.clone();
+    run_options.content_blocks.extend(
+        shell_notes
+            .iter()
+            .map(|note| slim_core::provider::ProviderContentBlock::text(note.text.clone())),
+    );
+    run_options.content_blocks.extend(mentions.blocks);
     let resume_preflight = startup.resume_preflight.take();
     match start_active_run(
         run_id,
@@ -1469,6 +1580,7 @@ fn start_prompt_run(
             startup.image_labels.clear();
             let _ = sink.send(UiEvent::AttachmentsChanged { labels: Vec::new() });
             *active = Some(run);
+            user_shell_context.consume(&shell_notes);
         }
         Err(message) => {
             if let Some(admission) = admission {
@@ -1753,6 +1865,7 @@ fn run_worker(
                             messages,
                             skill_names,
                         });
+                        announce_session_title(&mut startup, &sink);
                         sink.send(todo_event);
                     }
                 }
@@ -1768,6 +1881,7 @@ fn run_worker(
                         cwd,
                         skill_names,
                     });
+                    announce_session_title(&mut startup, &sink);
                 }
                 Ok(None) => {}
                 Err(message) => {
@@ -1822,6 +1936,8 @@ fn run_worker(
             });
         }
         let mut active: Option<ActiveRun> = None;
+        let mut user_shell: Option<UserShellRun> = None;
+        let user_shell_context = UserShellContext::default();
         let mut preparing: Option<ActivePromptPreparation> = None;
         let mut ignored_prep_cancel = false;
         let mut pending: Option<PendingRun> = None;
@@ -1901,6 +2017,16 @@ fn run_worker(
                         mcp_watch = on;
                         preparing = Some(prompt_prep);
                     }
+                    PromptPreparationEvent::Command(Some(UiCommand::RequestWorkspaceFiles {
+                        request_id,
+                    })) => {
+                        serve_workspace_files(
+                            startup.options.workspace_root.clone(),
+                            &sink,
+                            request_id,
+                        );
+                        preparing = Some(prompt_prep);
+                    }
                     PromptPreparationEvent::Command(Some(UiCommand::McpRefresh)) => {
                         if let Some(manager) = mcp_manager.as_ref() {
                             let _ = sink.send(UiEvent::McpServersChanged {
@@ -1913,6 +2039,23 @@ fn run_worker(
                         let _ = sink.send(UiEvent::Notification {
                             message: "A preparação ativa pertence a outro prompt".into(),
                         });
+                        preparing = Some(prompt_prep);
+                    }
+                    PromptPreparationEvent::Command(Some(UiCommand::RunUserShell {
+                        request_id,
+                        ..
+                    })) => {
+                        reject_user_shell(&sink, request_id, "Aguarde ou cancele a preparação ativa");
+                        preparing = Some(prompt_prep);
+                    }
+                    PromptPreparationEvent::Command(Some(command))
+                        if sessions::is_session_command(&command) =>
+                    {
+                        sessions::refuse_session_command(
+                            &sink,
+                            &command,
+                            "Aguarde ou cancele a preparação ativa",
+                        );
                         preparing = Some(prompt_prep);
                     }
                     PromptPreparationEvent::Command(Some(_)) => {
@@ -1980,6 +2123,7 @@ fn run_worker(
                                 prompt: prompt_prep.prompt,
                                 admission: Some(prompt_prep.admission),
                                 skill_instructions: prompt_prep.skill_instructions,
+                                user_shell_context: user_shell_context.clone(),
                             },
                             &mut startup,
                             &sink,
@@ -2107,6 +2251,19 @@ fn run_worker(
                                 servers: mcp_server_views(manager),
                             });
                         }
+                    }
+                    LoginEvent::Command(Some(UiCommand::RequestWorkspaceFiles { request_id })) => {
+                        serve_workspace_files(startup.options.workspace_root.clone(), &sink, request_id);
+                    }
+                    LoginEvent::Command(Some(UiCommand::RunUserShell { request_id, .. })) => {
+                        reject_user_shell(&sink, request_id, "Conclua ou cancele o login antes de rodar comandos");
+                    }
+                    LoginEvent::Command(Some(command)) if sessions::is_session_command(&command) => {
+                        sessions::refuse_session_command(
+                            &sink,
+                            &command,
+                            "Conclua ou cancele o login",
+                        );
                     }
                     LoginEvent::Command(Some(_)) => {
                         let _ = sink.send(UiEvent::Notification {
@@ -2273,6 +2430,15 @@ fn run_worker(
                         let store = &active.as_ref().expect("active run").content_store;
                         serve_content_page(store, &sink, handle, request_id, cursor);
                     }
+                    ActiveEvent::Command(Some(UiCommand::RequestWorkspaceFiles {
+                        request_id,
+                    })) => {
+                        serve_workspace_files(
+                            startup.options.workspace_root.clone(),
+                            &sink,
+                            request_id,
+                        );
+                    }
                     ActiveEvent::Command(Some(UiCommand::AnswerQuestion {
                         request_id,
                         answer,
@@ -2296,6 +2462,20 @@ fn run_worker(
                                 servers: mcp_server_views(manager),
                             });
                         }
+                    }
+                    ActiveEvent::Command(Some(UiCommand::RunUserShell { request_id, .. })) => {
+                        reject_user_shell(
+                            &sink,
+                            request_id,
+                            "Aguarde ou cancele a execução antes de rodar um comando com !",
+                        );
+                    }
+                    ActiveEvent::Command(Some(command)) if sessions::is_session_command(&command) => {
+                        sessions::refuse_session_command(
+                            &sink,
+                            &command,
+                            "Aguarde ou cancele a execução",
+                        );
                     }
                     ActiveEvent::Command(Some(_)) => {
                         let _ = sink.send(UiEvent::Notification {
@@ -2354,6 +2534,7 @@ fn run_worker(
                                 durable,
                                 cancel_requested: esc_cancelled,
                                 content_store: run.content_store,
+                                workspace_root: run.workspace_root,
                             });
                         }
                     }
@@ -2426,6 +2607,7 @@ fn run_worker(
                                     cwd,
                                     skill_names,
                                 });
+                                announce_session_title(&mut startup, &sink);
                             }
                             Ok(None) => {}
                             Err(message) => {
@@ -2500,51 +2682,14 @@ fn run_worker(
                         startup.resume_path.as_deref(),
                     ) {
                         Ok(Some(selected)) => {
-                            let session_id = selected
-                                .preflight
-                                .session_id
-                                .clone()
-                                .unwrap_or_else(|| "unknown".into());
-                            let cwd = display_workspace_path(&workspace);
-                            let messages = match session_transcript(&selected.preflight) {
-                                Ok(messages) => messages,
-                                Err(message) => { sink.send(UiEvent::RunFailed { run_id: None, message }); continue; }
-                            };
-                            let todo_event = match restored_todo_event(&selected.preflight) {
-                                Ok(event) => event,
-                                Err(message) => { sink.send(UiEvent::RunFailed { run_id: None, message }); continue; }
-                            };
-                            if let Some(policy) = startup
-                                .options
-                                .compaction
-                                .as_ref()
-                                .map(slim_core::context::CompactionHandle::policy)
-                            {
-                                startup.options.compaction =
-                                    Some(slim_core::context::CompactionHandle::new(policy));
-                            }
-                            startup.options.history = selected.history;
-                            startup.options.task_facts = crate::headless::session_task_facts(&selected.preflight);
-                            startup.options.artifact_ids = crate::headless::session_artifact_ids(&selected.preflight);
-                            startup.options.tool_registry = None;
-                            startup.options.ensure_shared_tool_registry();
-                            startup.resume_path = Some(selected.preflight.path.clone());
-                            startup.resume_preflight = Some(selected.preflight);
-                            let skill_names = skill_memo.names(Some(workspace.clone()));
-                            let _ = sink.send(UiEvent::SessionRestored {
-                                session_id: slim_tui::api::SessionId(session_id.into()),
-                                cwd,
-                                messages,
-                                skill_names,
-                            });
-                            let _ = sink.send(todo_event);
-                            if !skill_memo.warnings.is_empty() {
-                                sink.send(UiEvent::Notification { message: skill_memo.warnings.clone() });
-                            }
-                            let _ = sink.send(UiEvent::Notification {
-                                message: "Previous session restored. Send a prompt to continue."
-                                    .into(),
-                            });
+                            switch_session(
+                                &mut startup,
+                                &sink,
+                                &mut skill_memo,
+                                &user_shell_context,
+                                selected,
+                                "Previous session restored. Send a prompt to continue.",
+                            );
                         }
                         Ok(None) => {
                             let _ = sink.send(UiEvent::Notification {
@@ -2555,6 +2700,40 @@ fn run_worker(
                             let _ = sink.send(UiEvent::Notification { message });
                         }
                     }
+                }
+                UiCommand::RenameSession { title } => {
+                    sessions::rename_session(&mut startup, &sink, &title);
+                }
+                UiCommand::ListSessions { request_id } => {
+                    sessions::serve_session_list(&startup, &sink, request_id);
+                }
+                UiCommand::ListTurns { request_id } => {
+                    sessions::serve_turn_list(&startup, &sink, request_id);
+                }
+                UiCommand::ResumeSession { .. } | UiCommand::RewindSession { .. }
+                    if user_shell.as_ref().is_some_and(UserShellRun::is_running) =>
+                {
+                    let _ = sink.send(UiEvent::Notification {
+                        message: "Aguarde o comando com ! terminar antes de trocar de sessão".into(),
+                    });
+                }
+                UiCommand::ResumeSession { id } => {
+                    sessions::resume_session_by_id(
+                        &mut startup,
+                        &sink,
+                        &mut skill_memo,
+                        &user_shell_context,
+                        &id,
+                    );
+                }
+                UiCommand::RewindSession { first_seq } => {
+                    sessions::rewind_current_session(
+                        &mut startup,
+                        &sink,
+                        &mut skill_memo,
+                        &user_shell_context,
+                        first_seq,
+                    );
                 }
                 UiCommand::StartLogin(provider) => {
                     if let Some(provider) = oauth_provider(provider) {
@@ -3448,6 +3627,7 @@ fn run_worker(
                                 cwd,
                                 skill_names,
                             });
+                            announce_session_title(&mut startup, &sink);
                         }
                         Ok(None) => {}
                         Err(message) => {
@@ -3895,8 +4075,34 @@ fn run_worker(
                         }
                     }
                 }
-                UiCommand::CancelRun => {}
+                UiCommand::CancelRun => {
+                    if let Some(run) = user_shell.as_ref() {
+                        run.cancellation.cancel();
+                    }
+                }
+                UiCommand::RunUserShell {
+                    request_id,
+                    command,
+                } => {
+                    if user_shell.as_ref().is_some_and(UserShellRun::is_running) {
+                        reject_user_shell(&sink, request_id, "Já há um comando com ! rodando");
+                    } else {
+                        match start_user_shell(
+                            request_id,
+                            command,
+                            &startup,
+                            &sink,
+                            &user_shell_context,
+                        ) {
+                            Ok(run) => user_shell = Some(run),
+                            Err(message) => reject_user_shell(&sink, request_id, &message),
+                        }
+                    }
+                }
                 UiCommand::Shutdown => {
+                    if let Some(run) = user_shell.as_ref() {
+                        run.cancellation.cancel();
+                    }
                     let _ = sink.send(UiEvent::Shutdown);
                     break;
                 }
@@ -3905,6 +4111,11 @@ fn run_worker(
                     request_id,
                     cursor,
                 } => serve_content_page(&content_store, &sink, handle, request_id, cursor),
+                UiCommand::RequestWorkspaceFiles { request_id } => serve_workspace_files(
+                    startup.options.workspace_root.clone(),
+                    &sink,
+                    request_id,
+                ),
             }
         }
         if let Some(manager) = mcp_manager.as_ref() {
@@ -4091,6 +4302,16 @@ fn dispatch_pending_command(
             request_id,
             cursor,
         }) => serve_content_page(&run.content_store, sink, handle, request_id, cursor),
+        Some(UiCommand::RequestWorkspaceFiles { request_id }) => {
+            serve_workspace_files(run.workspace_root.clone(), sink, request_id);
+        }
+        Some(UiCommand::RunUserShell { request_id, .. }) => {
+            reject_user_shell(
+                sink,
+                request_id,
+                "Aguarde a execução terminar antes de rodar um comando com !",
+            );
+        }
         Some(
             UiCommand::AnswerInput { request_id, .. }
             | UiCommand::Approve { request_id }
@@ -4105,6 +4326,9 @@ fn dispatch_pending_command(
                     servers: mcp_server_views(manager),
                 });
             }
+        }
+        Some(command) if sessions::is_session_command(&command) => {
+            sessions::refuse_session_command(sink, &command, "Aguarde a execução terminar");
         }
         Some(UiCommand::Shutdown) | None => {
             run.request_cancel();
@@ -4465,6 +4689,361 @@ fn display_workspace_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+const USER_SHELL_UI_BYTES: usize = 16 * 1024;
+const USER_SHELL_CONTEXT_BYTES: usize = 8 * 1024;
+const USER_SHELL_CONTEXT_NOTES: usize = 5;
+
+/// What one `!command` printed, kept until the next prompt tells the model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UserShellNote {
+    /// Assigned by `UserShellContext::push`; orders notes and identifies what a run carried.
+    seq: u64,
+    command: String,
+    /// Block text handed to the provider with the next prompt.
+    text: String,
+}
+
+impl UserShellNote {
+    fn label(&self) -> String {
+        format!("[shell · {}]", truncate_chars(&self.command, 60))
+    }
+}
+
+/// Notes from `!command` runs not yet delivered to the model. Shared with the
+/// runner thread, which appends when a command ends.
+#[derive(Clone, Debug, Default)]
+struct UserShellContext(Arc<Mutex<UserShellNotes>>);
+
+#[derive(Debug, Default)]
+struct UserShellNotes {
+    next_seq: u64,
+    notes: Vec<UserShellNote>,
+}
+
+impl UserShellContext {
+    fn push(&self, mut note: UserShellNote) {
+        if let Ok(mut held) = self.0.lock() {
+            note.seq = held.next_seq;
+            held.next_seq += 1;
+            held.notes.push(note);
+            let excess = held.notes.len().saturating_sub(USER_SHELL_CONTEXT_NOTES);
+            held.notes.drain(..excess);
+        }
+    }
+
+    fn snapshot(&self) -> Vec<UserShellNote> {
+        self.0
+            .lock()
+            .map(|held| held.notes.clone())
+            .unwrap_or_default()
+    }
+
+    /// Drops the notes a started run carried (`carried` is a snapshot). A note
+    /// pushed after the snapshot, even one that evicted an older note, stays.
+    fn consume(&self, carried: &[UserShellNote]) {
+        let Some(last) = carried.iter().map(|note| note.seq).max() else {
+            return;
+        };
+        if let Ok(mut held) = self.0.lock() {
+            held.notes.retain(|note| note.seq > last);
+        }
+    }
+
+    /// Drops every pending note; a session switch must not leak them into the new conversation.
+    fn clear(&self) {
+        if let Ok(mut held) = self.0.lock() {
+            held.notes.clear();
+        }
+    }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    let mut cut: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
+
+/// `text` cut to at most `max_bytes` on a char boundary, with a note when cut.
+fn cap_text_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n[saída cortada em {} KB]",
+        &text[..end],
+        max_bytes / 1024
+    )
+}
+
+/// A `!command` in flight on its own thread.
+struct UserShellRun {
+    cancellation: CancellationToken,
+    done: Arc<AtomicBool>,
+}
+
+impl UserShellRun {
+    fn is_running(&self) -> bool {
+        !self.done.load(Ordering::Acquire)
+    }
+}
+
+/// Always ends a `RunUserShell` request, also when the runner unwinds.
+struct UserShellFinish {
+    sink: EventSink,
+    request_id: u64,
+    done: Arc<AtomicBool>,
+}
+
+impl Drop for UserShellFinish {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+        let _ = self.sink.send(UiEvent::UserShellFinished {
+            request_id: self.request_id,
+        });
+    }
+}
+
+fn reject_user_shell(sink: &EventSink, request_id: u64, message: &str) {
+    let _ = sink.send(UiEvent::Notification {
+        message: message.to_owned(),
+    });
+    let _ = sink.send(UiEvent::UserShellFinished { request_id });
+}
+
+/// Runs `command` for the user through the same `shell` tool the agent uses,
+/// so mode gating, confinement to the workspace, the shared registry's
+/// workspace revision and process cancellation all apply unchanged. Only Auto
+/// mode may run it. The transcript shows it as a `shell` block marked `!`; a
+/// bounded copy of its output is held for the model's next prompt.
+fn start_user_shell(
+    request_id: u64,
+    command: String,
+    startup: &TuiStartup,
+    sink: &EventSink,
+    context: &UserShellContext,
+) -> Result<UserShellRun, String> {
+    if startup.mode != slim_core::OperatingMode::Auto {
+        return Err("Comandos com ! exigem o modo Auto (/mode auto)".into());
+    }
+    let command = command.trim().to_owned();
+    if command.is_empty() {
+        return Err("Uso: !COMANDO".into());
+    }
+    let cwd = startup.options.workspace_root.clone().map_or_else(
+        || std::env::current_dir().map_err(|error| format!("current directory: {error}")),
+        Ok,
+    )?;
+    let registry = startup
+        .options
+        .tool_registry
+        .as_ref()
+        .map(|shared| shared.registry())
+        .unwrap_or_default();
+    let secret = startup
+        .request
+        .as_ref()
+        .map(|request| request.api_key.clone())
+        .unwrap_or_default();
+    let cancellation = CancellationToken::new();
+    let done = Arc::new(AtomicBool::new(false));
+    let finish = UserShellFinish {
+        sink: sink.clone(),
+        request_id,
+        done: done.clone(),
+    };
+    let runner_sink = sink.clone();
+    let runner_context = context.clone();
+    let runner_cancellation = cancellation.clone();
+    thread::Builder::new()
+        .name("slim-user-shell".into())
+        .spawn(move || {
+            let _finish = finish;
+            let sink = runner_sink;
+            let batch_id = ToolBatchId(format!("user-shell-{request_id}").into());
+            let call_id = ToolCallId(format!("user-shell-{request_id}").into());
+            let shown = redact_for_ui(&command, &secret);
+            let _ = sink.send(UiEvent::ToolStarted {
+                batch_id: batch_id.clone(),
+                call_id: call_id.clone(),
+                name: "shell".into(),
+                arguments_summary: format!("! {}", truncate_chars(&shown, 200)),
+            });
+            let arguments = serde_json::json!({ "command": command }).to_string();
+            let started = Instant::now();
+            let result = registry.execute_with_cancellation_and_progress(
+                slim_core::OperatingMode::Auto,
+                &cwd,
+                "shell",
+                &arguments,
+                Some(&runner_cancellation),
+                |progress| {
+                    let _ = sink.send(UiEvent::ToolProgress {
+                        batch_id: batch_id.clone(),
+                        call_id: call_id.clone(),
+                        name: "shell".into(),
+                        preview: redact_for_ui(&progress.preview, &secret),
+                        content_handle: None,
+                    });
+                },
+            );
+            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let output = redact_for_ui(&result.output, &secret);
+            let _ = sink.send(UiEvent::ToolOutput {
+                batch_id: batch_id.clone(),
+                call_id: call_id.clone(),
+                name: "shell".into(),
+                output: cap_text_bytes(&output, USER_SHELL_UI_BYTES),
+                content_handle: None,
+            });
+            let _ = sink.send(UiEvent::ToolEnded {
+                batch_id,
+                call_id,
+                name: "shell".into(),
+                success: result.success,
+                duration_ms,
+            });
+            runner_context.push(UserShellNote {
+                seq: 0,
+                command: shown.clone(),
+                text: format!(
+                    "[Comando executado pelo usuário com !: {shown}]\n{}\n[Fim do comando]",
+                    cap_text_bytes(&output, USER_SHELL_CONTEXT_BYTES)
+                ),
+            });
+        })
+        .map_err(|error| format!("could not start the command thread: {error}"))?;
+    Ok(UserShellRun { cancellation, done })
+}
+
+/// Candidate ceiling for `@` completion; one more is requested to detect the cut.
+const WORKSPACE_FILE_LIMIT: usize = 20_000;
+
+/// Lists workspace files off the worker loop (a large tree can take a while)
+/// and answers `RequestWorkspaceFiles`. A failure still answers, with a
+/// notification and an empty list, so the popup never waits on a request that
+/// will not come back.
+fn serve_workspace_files(root: Option<PathBuf>, sink: &EventSink, request_id: u64) {
+    let answer = sink.clone();
+    let fallback = sink.clone();
+    let spawned = thread::Builder::new()
+        .name("slim-workspace-files".into())
+        .spawn(move || {
+            let root = root.or_else(|| std::env::current_dir().ok());
+            let listed = match root {
+                Some(root) => {
+                    slim_core::list_workspace_files(&root, WORKSPACE_FILE_LIMIT + 1, None)
+                        .map_err(|error| error.to_string())
+                }
+                None => Err("workspace directory is unavailable".to_owned()),
+            };
+            let mut paths = listed.unwrap_or_else(|message| {
+                let _ = answer.send(UiEvent::Notification {
+                    message: format!("Não foi possível listar arquivos: {message}"),
+                });
+                Vec::new()
+            });
+            let truncated = paths.len() > WORKSPACE_FILE_LIMIT;
+            paths.truncate(WORKSPACE_FILE_LIMIT);
+            let _ = answer.send(UiEvent::WorkspaceFiles {
+                request_id,
+                paths,
+                truncated,
+            });
+        });
+    if spawned.is_err() {
+        let _ = fallback.send(UiEvent::WorkspaceFiles {
+            request_id,
+            paths: Vec::new(),
+            truncated: false,
+        });
+    }
+}
+
+const MENTION_MAX_FILES: usize = 8;
+const MENTION_FILE_BYTES: usize = 256 * 1024;
+const MENTION_TOTAL_BYTES: usize = 1024 * 1024;
+
+/// File contents pulled in by the `@path` tokens of one prompt.
+#[derive(Debug, Default)]
+struct MentionAttachments {
+    blocks: Vec<slim_core::provider::ProviderContentBlock>,
+    /// One `[arquivo · path · size]` line per attached file, for the transcript.
+    labels: Vec<String>,
+}
+
+fn format_mention_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KB", bytes as f64 / 1024.0).replace('.', ",")
+    }
+}
+
+/// Resolves every `@path` in `prompt` that names an existing file inside the
+/// workspace and loads it through the confined core loader. Tokens that name
+/// nothing (`@override`, `a@b.com`) stay plain text. A refused file
+/// (secret-looking, binary, outside the workspace) or a hit limit fails the
+/// whole prompt, so the model never sees a half-attached request.
+fn load_prompt_mentions(root: &Path, prompt: &str) -> Result<MentionAttachments, String> {
+    let paths = slim_core::mention_paths_in_prompt(root, prompt);
+    if paths.len() > MENTION_MAX_FILES {
+        return Err(format!(
+            "Máximo de {MENTION_MAX_FILES} arquivos por prompt com @ (encontrados {})",
+            paths.len()
+        ));
+    }
+    let mut attachments = MentionAttachments::default();
+    let mut total = 0usize;
+    for path in paths {
+        let budget = MENTION_FILE_BYTES.min(MENTION_TOTAL_BYTES - total);
+        if budget == 0 {
+            return Err(format!(
+                "Limite de {} de arquivos anexados por prompt excedido em @{path}",
+                format_mention_size(MENTION_TOTAL_BYTES)
+            ));
+        }
+        let file = slim_core::load_mention_file(root, &path, budget).map_err(|error| {
+            let reason = match error {
+                slim_core::MentionError::Sensitive => {
+                    "o nome parece conter segredos e não é anexado".to_owned()
+                }
+                slim_core::MentionError::Binary => "não é um arquivo de texto".to_owned(),
+                slim_core::MentionError::OutsideWorkspace => "fora do workspace".to_owned(),
+                slim_core::MentionError::NotRegularFile => "não é um arquivo comum".to_owned(),
+                slim_core::MentionError::NotFound => "arquivo não encontrado".to_owned(),
+                other => other.to_string(),
+            };
+            format!("@{path}: {reason}")
+        })?;
+        total += file.bytes;
+        let note = if file.truncated {
+            format!(" (truncado em {})", format_mention_size(file.bytes))
+        } else {
+            String::new()
+        };
+        attachments
+            .blocks
+            .push(slim_core::provider::ProviderContentBlock::text(format!(
+                "[Arquivo anexado pelo usuário: {}{note}]\n{}\n[Fim de {}]",
+                file.path, file.text, file.path
+            )));
+        attachments.labels.push(format!(
+            "[arquivo · {} · {}{}]",
+            file.path,
+            format_mention_size(file.bytes),
+            if file.truncated { " · truncado" } else { "" }
+        ));
+    }
+    Ok(attachments)
+}
+
 fn serve_content_page(
     store: &SharedContentStore,
     sink: &EventSink,
@@ -4675,6 +5254,7 @@ fn start_active_run(
         content_store,
         interaction_responder: Some(interaction_responder),
         manual_retry,
+        workspace_root: Some(workspace_root),
     })
 }
 
@@ -4721,6 +5301,7 @@ async fn abort_active_with_grace(
             durable,
             cancel_requested: true,
             content_store: run.content_store,
+            workspace_root: run.workspace_root,
         })
     } else {
         None
@@ -4877,14 +5458,25 @@ fn provider_error_message(error: ProviderError) -> String {
     }
 }
 
+mod sessions;
+
 #[cfg(test)]
 mod local_session_tests;
+
+#[cfg(test)]
+mod session_management_tests;
 
 #[cfg(test)]
 mod slash_skill_tests;
 
 #[cfg(test)]
 mod cancel_tests;
+
+#[cfg(test)]
+mod mention_tests;
+
+#[cfg(test)]
+mod user_shell_tests;
 
 #[cfg(test)]
 mod tests;

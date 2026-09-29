@@ -237,16 +237,18 @@ mod semantic_utility {
                 io,
                 stderr_tail,
                 process,
+                stderr_capture,
             } = StdioProcessFactory.spawn(spec, root)?;
-            Ok(SpawnedServer::new(
-                Box::new(TracedIo {
+            Ok(SpawnedServer {
+                io: Box::new(TracedIo {
                     inner: io,
                     sent: self.sent.clone(),
                     received: self.received.clone(),
                 }),
                 stderr_tail,
                 process,
-            ))
+                stderr_capture,
+            })
         }
     }
     impl AsyncRead for TracedIo {

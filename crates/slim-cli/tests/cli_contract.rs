@@ -1,15 +1,51 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 
 use slim_cli::{run_cli, run_tui, ExitCode};
 
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+/// Every test here either mutates or reads (in-process or through a spawned
+/// child) the credential environment, so all of them serialize on this lock.
+/// A failed assertion must not poison it for the remaining tests.
+fn env_lock() -> MutexGuard<'static, ()> {
+    ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Restores the named variables on drop, including when the test panics.
+struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl EnvRestore {
+    fn capture(names: &[&'static str]) -> Self {
+        Self(
+            names
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect(),
+        )
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        for (name, previous) in self.0.drain(..) {
+            match previous {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
 #[test]
 fn stdin_is_used_when_prompt_argument_is_absent() {
+    let _lock = env_lock();
     let output = run_cli(["--fake", "--read-only"], "hello from stdin");
     assert_eq!(output.code, ExitCode::Success);
     assert_eq!(output.stdout, "success\n");
@@ -17,6 +53,7 @@ fn stdin_is_used_when_prompt_argument_is_absent() {
 
 #[test]
 fn option_values_are_consumed_even_when_they_look_like_flags() {
+    let _lock = env_lock();
     // `--prompt "--plan"` is prompt text, not a mode selection: the value is
     // consumed by `--prompt`, so it is never parsed as an unknown option.
     let output = run_cli(["--headless", "--prompt", "--plan"], "");
@@ -35,6 +72,7 @@ fn option_values_are_consumed_even_when_they_look_like_flags() {
 
 #[test]
 fn headless_without_provider_is_auth_not_silent_success() {
+    let _lock = env_lock();
     let output = run_cli(["--headless", "--prompt", "Reply exactly READY."], "");
     assert_eq!(output.code, ExitCode::Auth);
     assert!(
@@ -47,6 +85,7 @@ fn headless_without_provider_is_auth_not_silent_success() {
 
 #[test]
 fn headless_binary_reads_piped_stdin_without_prompt() {
+    let _lock = env_lock();
     let mut child = Command::new(env!("CARGO_BIN_EXE_slim"))
         .args(["--headless", "--fake", "--read-only"])
         .stdin(Stdio::piped())
@@ -67,6 +106,7 @@ fn headless_binary_reads_piped_stdin_without_prompt() {
 
 #[test]
 fn headless_binary_rejects_stdin_above_the_prompt_budget() {
+    let _lock = env_lock();
     let mut child = Command::new(env!("CARGO_BIN_EXE_slim"))
         .args(["--headless", "--fake", "--read-only"])
         .stdin(Stdio::piped())
@@ -89,6 +129,7 @@ fn headless_binary_rejects_stdin_above_the_prompt_budget() {
 
 #[test]
 fn recovery_does_not_wait_for_open_silent_stdin() {
+    let _lock = env_lock();
     let missing = std::env::temp_dir().join(format!(
         "slim-recover-missing-{}-{}",
         std::process::id(),
@@ -129,28 +170,15 @@ fn recovery_does_not_wait_for_open_silent_stdin() {
 
 #[test]
 fn headless_codex_without_jwt_account_id_is_auth() {
-    let _lock = ENV_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("env lock");
-    let previous_slim = std::env::var_os("SLIM_API_KEY");
-    let previous_codex = std::env::var_os("CODEX_ACCESS_TOKEN");
+    let _lock = env_lock();
+    let restore = EnvRestore::capture(&["SLIM_API_KEY", "CODEX_ACCESS_TOKEN"]);
     std::env::remove_var("SLIM_API_KEY");
     std::env::set_var("CODEX_ACCESS_TOKEN", "dummy-offline-token");
     let output = run_cli(
         ["--headless", "--provider", "openai-codex", "--prompt", "hi"],
         "",
     );
-    if let Some(value) = previous_slim {
-        std::env::set_var("SLIM_API_KEY", value);
-    } else {
-        std::env::remove_var("SLIM_API_KEY");
-    }
-    if let Some(value) = previous_codex {
-        std::env::set_var("CODEX_ACCESS_TOKEN", value);
-    } else {
-        std::env::remove_var("CODEX_ACCESS_TOKEN");
-    }
+    drop(restore);
     assert_eq!(output.code, ExitCode::Auth);
     assert!(
         output.stderr.contains("account id"),
@@ -161,10 +189,7 @@ fn headless_codex_without_jwt_account_id_is_auth() {
 
 #[test]
 fn headless_codex_oauth_store_is_not_missing_api_key() {
-    let _lock = ENV_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("env lock");
+    let _lock = env_lock();
     let root = std::env::temp_dir().join(format!(
         "slim-cli-oauth-{}-{}",
         std::process::id(),
@@ -180,9 +205,7 @@ fn headless_codex_oauth_store_is_not_missing_api_key() {
         r#"{"version":1,"providers":{"openai-codex":{"oauth":{"access":"oauth-access","refresh":"oauth-refresh","expires":4102444800,"account_id":"acct-1"}}}}"#,
     )
     .expect("write oauth auth.json");
-    let previous_auth = std::env::var_os("SLIM_AUTH_FILE");
-    let previous_slim = std::env::var_os("SLIM_API_KEY");
-    let previous_codex = std::env::var_os("CODEX_ACCESS_TOKEN");
+    let restore = EnvRestore::capture(&["SLIM_AUTH_FILE", "SLIM_API_KEY", "CODEX_ACCESS_TOKEN"]);
     std::env::set_var("SLIM_AUTH_FILE", &path);
     std::env::remove_var("SLIM_API_KEY");
     std::env::remove_var("CODEX_ACCESS_TOKEN");
@@ -263,18 +286,7 @@ fn headless_codex_oauth_store_is_not_missing_api_key() {
         "",
     );
     server.join().expect("server");
-    match previous_auth {
-        Some(value) => std::env::set_var("SLIM_AUTH_FILE", value),
-        None => std::env::remove_var("SLIM_AUTH_FILE"),
-    }
-    match previous_slim {
-        Some(value) => std::env::set_var("SLIM_API_KEY", value),
-        None => std::env::remove_var("SLIM_API_KEY"),
-    }
-    match previous_codex {
-        Some(value) => std::env::set_var("CODEX_ACCESS_TOKEN", value),
-        None => std::env::remove_var("CODEX_ACCESS_TOKEN"),
-    }
+    drop(restore);
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(output.code, ExitCode::Success, "stderr={}", output.stderr);
     assert!(output.stdout.contains("oauth-ok"));
@@ -287,6 +299,7 @@ fn headless_codex_oauth_store_is_not_missing_api_key() {
 
 #[test]
 fn plan_and_jsonl_flags_are_executable_contracts() {
+    let _lock = env_lock();
     let output = run_cli(
         ["--fake", "--plan", "--jsonl", "--prompt", "make a plan"],
         "",
@@ -300,6 +313,7 @@ fn plan_and_jsonl_flags_are_executable_contracts() {
 
 #[test]
 fn verbose_human_timeline_rejects_jsonl() {
+    let _lock = env_lock();
     let output = run_cli(
         [
             "--headless",
@@ -320,6 +334,7 @@ fn verbose_human_timeline_rejects_jsonl() {
 
 #[test]
 fn binary_defaults_to_tui_and_headless_requires_its_flag() {
+    let _lock = env_lock();
     let tui = Command::new(env!("CARGO_BIN_EXE_slim"))
         .args(["--provider", "unsupported"])
         .output()
@@ -337,6 +352,7 @@ fn binary_defaults_to_tui_and_headless_requires_its_flag() {
 
 #[test]
 fn tui_startup_preserves_provider_error_class() {
+    let _lock = env_lock();
     let error = run_tui(vec![
         "--tui".into(),
         "--provider".into(),
@@ -348,6 +364,7 @@ fn tui_startup_preserves_provider_error_class() {
 
 #[test]
 fn tui_help_uses_the_normal_cli_contract_without_opening_fullscreen() {
+    let _lock = env_lock();
     let output = Command::new(env!("CARGO_BIN_EXE_slim"))
         .args(["--tui", "--help"])
         .output()
@@ -358,6 +375,7 @@ fn tui_help_uses_the_normal_cli_contract_without_opening_fullscreen() {
 
 #[test]
 fn compactor_flag_rejects_unknown_name_and_accepts_known_ones() {
+    let _lock = env_lock();
     let unknown = run_cli(["--headless", "--fake", "--compactor", "guess"], "");
     assert_eq!(unknown.code, ExitCode::InputRequired);
     assert!(
@@ -379,6 +397,7 @@ fn compactor_flag_rejects_unknown_name_and_accepts_known_ones() {
 
 #[test]
 fn help_version_and_unknown_flags_are_stable() {
+    let _lock = env_lock();
     assert_eq!(
         run_cli(["--help"], "").stdout,
         "Slim coding agent\n\nUsage:\n  Slim [TUI OPTIONS]\n  Slim --headless [OPTIONS] [PROMPT...]\n\nModes:\n  --tui              Open the fullscreen TUI (default)\n  --headless         Run one prompt without the TUI\n  --fake             Use the deterministic offline provider\n  --plan             Allow inspection without workspace mutations\n  --read-only        Disable workspace mutations\n\nProvider:\n  --provider NAME    Provider route\n  --model MODEL      Model identifier (Codex: astra, sol, terra, luna)\n  --effort LEVEL     Reasoning effort\n  --fast             Enable Codex Fast (higher usage)\n  --normal           Use normal Codex speed\n  --endpoint URL     Override the provider endpoint\n\nInput and sessions:\n  --prompt TEXT      Prompt text; positional text or stdin also works\n  --image PATH       Attach a local image (repeatable)\n  --session PATH     Persist the run to a session file\n  --resume PATH      Continue an existing session\n  --recover PATH     Repair a durable session without running a prompt\n  --abandon-pending  With --recover: abandon unfinished work; effects stay unverified\n  --experiment-id ID Label durable run telemetry for a benchmark experiment\n  --task-id ID       Label durable run telemetry for a benchmark task\n  --compactor WHICH  Compaction strategy: jev (default, falls back to summary)\n                     or summary (LLM checkpoint). Env: SLIM_COMPACTOR\n\nOutput:\n  --verbose          Include detailed human-readable events\n  --jsonl            Emit machine-readable JSON Lines\n\nOther:\n  -h, --help         Show this help\n  -V, --version      Show the version\n\nExamples:\n  Slim\n  Slim --headless --fake \"Summarize this repository\"\n  Slim --headless --provider anthropic --model MODEL --prompt \"Review src\"\n"

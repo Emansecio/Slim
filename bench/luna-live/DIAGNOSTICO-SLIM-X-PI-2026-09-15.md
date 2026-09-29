@@ -142,6 +142,7 @@ Antes de declarar superioridade em todos os cenários, é necessário repetir a 
 - Sistema, schemas, histórico e resultados de ferramentas medidos separadamente. O observador Pi conta antes de omitir raciocínio opaco dos registros salvos. Registros Pi antigos continuam com reconstrução parcial de bytes de histórico.
 - Uso incompleto e erro de provider impedem entrada no pareamento. O Pi retornou código de processo zero mesmo com erro de quota; o novo gate o rejeitou corretamente.
 - Agenda completa emitida antes da execução, seed reproduzível, rodadas registradas e falhas retidas. O lote DeepSeek terminou com as oito falhas registradas; nenhuma foi substituída por uma tentativa escolhida depois.
+- **Correções de 27/09/2026, sem mudança de produto e sem chamadas ao provider:** `tool_failures` passou a significar somente `success is False`, com `success=None` indo para `tool_unknown` e `evidence` por execução (`fact`, `tool-finished`, `inferred`, `absence`); o resumo separa braços aprovados no gate (`aggregate`) de todos os que têm registro (`aggregate_all`), com o denominador impresso; os contadores do ledger que o harness ignorava (`retry_count`, `cancelled`, `response_cache_hit`, `usage_unknown`, `failed`, `time_to_first_byte_ms`, `time_to_first_semantic_ms`, `estimation_error_tokens`) passaram a aparecer; a identidade observada de provider/modelo virou condição de gate, com ausência apenas avisando; e o pareamento ganhou teste de sinais exato e IC bootstrap da mediana. Detalhamento e limites na seção "Correções do medidor — 2026-09-27" do [README](README.md). Os relatórios desta bateria continuam sendo saída do medidor anterior.
 
 Verificações desta sessão:
 
@@ -150,6 +151,7 @@ Verificações desta sessão:
 3. Auditoria dos 32 pares Luna: aprovada; conferidos completude, modelo, esforço, verificadores, balanceamento e hashes constantes.
 4. Reprocessamento dos sete pares antigos: aprovados, tokens preservados. O total correto de arquivos é quatro modificados e quatro criados por programa, em vez de oito modificados e quatro criados.
 5. `git -c core.whitespace=cr-at-eol diff --check`: aprovado; referências locais do diagnóstico verificadas. Os avisos de normalização CRLF/LF do Git não são falhas do check.
+6. Correções do medidor de 27/09/2026: `py_compile` nos seis scripts e `python -B -m unittest discover -s bench/luna-live` com **14/14 aprovados** (eram 9). Nenhuma bateria live foi reexecutada, e a evidência bruta das campanhas aqui descritas não está mais no workspace, portanto estes números não foram recalculados pelo medidor novo.
 
 A imagem inicial mostrava sete pares, mas somente seis cenários diferentes: `merge_ranges` apareceu duas vezes. Comparar “cinco categorias de sete” sem essa distinção superestimava a diversidade da amostra.
 

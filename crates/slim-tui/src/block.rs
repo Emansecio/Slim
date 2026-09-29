@@ -304,6 +304,8 @@ pub enum BlockKind {
     Error(String),
     Activity(String),
     QueuedUser(String),
+    /// What the turn that just ended changed (files, lines, commands).
+    Receipt(crate::receipt::ReceiptState),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -418,58 +420,88 @@ pub fn consecutive_presented_tool_span(
     })
 }
 
-/// Chrome for one assistant segment inside a user turn. Only the first
-/// segment after a user message opens the breathing row and the `Slim`
-/// header; later segments stay in the flow. A queued draft does not open
-/// another group. Cancellation or failure of any segment stays on that header.
+/// The `● Slim` header that opens the agent's side of a turn. It belongs to
+/// the first thing the agent emits after a user message (thinking, a tool
+/// call or prose), so everything the agent does in the turn reads under one
+/// owner. Later blocks of the turn stay in the flow; a queued draft does not
+/// open another group. Cancellation or failure of any assistant segment of the
+/// turn is reported on this header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AssistantChrome {
-    Continuation,
-    Header { cancelled: bool, failed: bool },
+pub struct ResponseHeader {
+    pub cancelled: bool,
+    pub failed: bool,
+    /// Blank row above the label. A user prompt already ends with its own
+    /// breathing row, so the header sits directly under it and adds none.
+    pub lead_blank: bool,
 }
 
-impl AssistantChrome {
-    pub fn shows_header(self) -> bool {
-        matches!(self, Self::Header { .. })
+impl ResponseHeader {
+    pub fn rows(self) -> usize {
+        1 + usize::from(self.lead_blank)
     }
 
     pub fn cache_tag(self) -> u64 {
-        match self {
-            Self::Continuation => 1,
-            Self::Header {
-                cancelled: false,
-                failed: false,
-            } => 2,
-            Self::Header {
-                cancelled: false,
-                failed: true,
-            } => 3,
-            Self::Header {
-                cancelled: true, ..
-            } => 4,
-        }
+        1 + u64::from(self.cancelled) + 2 * u64::from(self.failed) + 4 * u64::from(self.lead_blank)
     }
 }
 
-pub fn assistant_chrome(blocks: &[Block], index: usize) -> Option<AssistantChrome> {
-    if !matches!(blocks.get(index)?.kind(), BlockKind::Assistant(_)) {
+/// Blocks the agent produces inside a turn. Interaction requests render
+/// nothing until answered, and system, error and activity rows are notices.
+fn is_agent_output(block: &Block) -> bool {
+    matches!(
+        block.kind(),
+        BlockKind::Assistant(_) | BlockKind::Thinking(_) | BlockKind::Tool(_)
+    )
+}
+
+/// Header for the block at `index`, or `None` when the block is not the first
+/// agent output of its turn. Without a preceding user message (a bare
+/// transcript) only assistant prose opens a header, as before.
+pub fn response_header(blocks: &[Block], index: usize) -> Option<ResponseHeader> {
+    let block = blocks.get(index)?;
+    if !is_agent_output(block) {
         return None;
     }
-    let mut cursor = index;
-    while cursor > 0 {
-        cursor -= 1;
-        match blocks[cursor].kind() {
-            BlockKind::User(_) => break,
-            BlockKind::Assistant(_) => return Some(AssistantChrome::Continuation),
+    let is_prose = matches!(block.kind(), BlockKind::Assistant(_));
+    let mut earlier_output = false;
+    let mut earlier_prose = false;
+    let mut opened_by_user = false;
+    // Stop at the first fact that settles the answer, so a long run of tool
+    // calls costs O(1) per block instead of a scan back to the prompt.
+    for earlier in blocks[..index].iter().rev() {
+        match earlier.kind() {
+            BlockKind::User(_) => {
+                opened_by_user = true;
+                break;
+            }
+            BlockKind::Assistant(_) => {
+                earlier_output = true;
+                earlier_prose = true;
+                break;
+            }
+            _ if is_agent_output(earlier) => {
+                earlier_output = true;
+                if !is_prose {
+                    break;
+                }
+            }
             _ => {}
         }
     }
+    let opens = if opened_by_user {
+        !earlier_output
+    } else {
+        is_prose && !earlier_prose
+    };
+    if !opens {
+        return None;
+    }
     let mut cancelled = false;
     let mut failed = false;
-    for block in blocks.iter().skip(index) {
-        match block.kind() {
+    for later in &blocks[index..] {
+        match later.kind() {
             BlockKind::User(_) => break,
-            BlockKind::Assistant(_) => match block.lifecycle {
+            BlockKind::Assistant(_) => match later.lifecycle {
                 BlockLifecycle::Cancelled => cancelled = true,
                 BlockLifecycle::Failed => failed = true,
                 _ => {}
@@ -477,14 +509,18 @@ pub fn assistant_chrome(blocks: &[Block], index: usize) -> Option<AssistantChrom
             _ => {}
         }
     }
-    Some(AssistantChrome::Header { cancelled, failed })
+    let lead_blank = index == 0 || !matches!(blocks[index - 1].kind(), BlockKind::User(_));
+    Some(ResponseHeader {
+        cancelled,
+        failed,
+        lead_blank,
+    })
 }
 
 /// One breathing row where the agent switches between prose and work inside
-/// a turn: before tools/thinking that follow assistant text, and before an
-/// assistant continuation that follows them. Derived from neighbors at layout
-/// time, so it needs no per-block state; the first assistant segment already
-/// opens with its own breathing row and header.
+/// a turn: before tools/thinking that follow assistant text, and before
+/// prose that follows them. Derived from neighbors at layout time, so it
+/// needs no per-block state; the block that opens the turn has its own header.
 pub fn transition_gap(blocks: &[Block], index: usize) -> bool {
     let Some(block) = blocks.get(index) else {
         return false;
@@ -496,15 +532,23 @@ pub fn transition_gap(blocks: &[Block], index: usize) -> bool {
         |block: &Block| matches!(block.kind(), BlockKind::Tool(_) | BlockKind::Thinking(_));
     let previous = &blocks[index - 1];
     match block.kind() {
-        BlockKind::Assistant(_) => {
-            is_work(previous)
-                && assistant_chrome(blocks, index) == Some(AssistantChrome::Continuation)
-        }
+        // The receipt closes a turn: always set apart from what precedes it.
+        BlockKind::Receipt(_) => true,
+        BlockKind::Assistant(_) => is_work(previous) && response_header(blocks, index).is_none(),
+        // Work after a receipt is not part of the closed turn (a `!command`).
         _ if is_work(block) => {
-            matches!(previous.kind(), BlockKind::Assistant(text) if !text.trim().is_empty())
+            matches!(previous.kind(), BlockKind::Receipt(_))
+                || matches!(previous.kind(), BlockKind::Assistant(text) if !text.trim().is_empty())
         }
         _ => false,
     }
+}
+
+/// Rows that precede the block at `index`: the turn header, or the
+/// prose/work breathing row. Measured and drawn from the same derivation.
+pub fn leading_rows(blocks: &[Block], index: usize) -> usize {
+    response_header(blocks, index).map_or(0, ResponseHeader::rows)
+        + usize::from(transition_gap(blocks, index))
 }
 
 pub fn complete_tool_count(blocks: &[Block], start: usize, end: usize) -> usize {
@@ -578,6 +622,9 @@ pub struct Block {
     pub started_ms: Option<u64>,
     pub ended_ms: Option<u64>,
     pub preview_retained: bool,
+    /// A prompt whose run has not produced any agent output yet: the user
+    /// block also draws the `● Slim` header the first agent block will take over.
+    awaiting_agent: bool,
     pub reasoning_classification: Option<slim_core::events::ReasoningClassification>,
     turn_boundary_before: bool,
     content_generation: u64,
@@ -594,6 +641,7 @@ impl Clone for Block {
             started_ms: self.started_ms,
             ended_ms: self.ended_ms,
             preview_retained: self.preview_retained,
+            awaiting_agent: self.awaiting_agent,
             reasoning_classification: self.reasoning_classification,
             turn_boundary_before: self.turn_boundary_before,
             content_generation: self.content_generation,
@@ -611,6 +659,7 @@ impl PartialEq for Block {
             && self.started_ms == other.started_ms
             && self.ended_ms == other.ended_ms
             && self.preview_retained == other.preview_retained
+            && self.awaiting_agent == other.awaiting_agent
             && self.reasoning_classification == other.reasoning_classification
             && self.turn_boundary_before == other.turn_boundary_before
             && self.content_generation == other.content_generation
@@ -629,6 +678,7 @@ impl Block {
             started_ms: None,
             ended_ms: None,
             preview_retained: false,
+            awaiting_agent: false,
             reasoning_classification: None,
             turn_boundary_before: false,
             content_generation: 0,
@@ -778,6 +828,20 @@ impl Block {
         }
     }
 
+    pub(crate) fn awaiting_agent(&self) -> bool {
+        self.awaiting_agent
+    }
+
+    /// Returns whether the flag changed (and the block must be laid out again).
+    pub(crate) fn set_awaiting_agent(&mut self, value: bool) -> bool {
+        if self.awaiting_agent == value {
+            return false;
+        }
+        self.awaiting_agent = value;
+        self.touch_content();
+        true
+    }
+
     pub(crate) fn turn_boundary_before(&self) -> bool {
         self.turn_boundary_before
     }
@@ -839,6 +903,203 @@ impl Block {
 
     fn touch_content(&mut self) {
         self.content_generation = self.content_generation.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
+mod turn_layout_tests {
+    use super::{
+        leading_rows, response_header, transition_gap, Block, BlockKind, BlockLifecycle,
+        ResponseHeader, ToolState,
+    };
+
+    fn user() -> Block {
+        Block::new(
+            "u",
+            BlockKind::User("pergunta".into()),
+            BlockLifecycle::Complete,
+        )
+    }
+
+    fn thinking() -> Block {
+        Block::new(
+            "t",
+            BlockKind::Thinking("plano".into()),
+            BlockLifecycle::Complete,
+        )
+    }
+
+    fn tool() -> Block {
+        Block::new(
+            "w",
+            BlockKind::Tool(ToolState::default()),
+            BlockLifecycle::Complete,
+        )
+    }
+
+    fn prose(lifecycle: BlockLifecycle) -> Block {
+        Block::new("a", BlockKind::Assistant("resposta".into()), lifecycle)
+    }
+
+    fn system() -> Block {
+        Block::new(
+            "s",
+            BlockKind::System("aviso".into()),
+            BlockLifecycle::Complete,
+        )
+    }
+
+    fn receipt() -> Block {
+        Block::new(
+            "r",
+            BlockKind::Receipt(crate::receipt::ReceiptState {
+                files: 1,
+                added: 2,
+                removed: 1,
+                stats_partial: false,
+                commands: 0,
+                failed_commands: 0,
+                last_command_ok: None,
+                duration_ms: 1_000,
+                outcome: crate::receipt::ReceiptOutcome::Completed,
+            }),
+            BlockLifecycle::Complete,
+        )
+    }
+
+    #[test]
+    fn work_after_a_receipt_is_set_apart_from_the_closed_turn() {
+        // A `!command` run after a turn ended: the receipt closed that turn.
+        let blocks = [user(), tool(), receipt(), tool()];
+        assert!(transition_gap(&blocks, 2), "the receipt keeps its own gap");
+        assert!(transition_gap(&blocks, 3), "work after it gets a gap too");
+        // A prompt starts a turn: no gap, its own boundary.
+        let mut next_prompt = user();
+        next_prompt.set_turn_boundary_before(true);
+        let blocks = [user(), tool(), receipt(), next_prompt, tool()];
+        assert!(!transition_gap(&blocks, 4), "work right after a prompt");
+    }
+
+    fn headers(blocks: &[Block]) -> Vec<Option<ResponseHeader>> {
+        (0..blocks.len())
+            .map(|index| response_header(blocks, index))
+            .collect()
+    }
+
+    #[test]
+    fn the_first_agent_output_after_the_prompt_opens_the_header() {
+        for opener in [thinking(), tool(), prose(BlockLifecycle::Complete)] {
+            let blocks = [
+                user(),
+                opener,
+                tool(),
+                prose(BlockLifecycle::Complete),
+                thinking(),
+            ];
+            let found = headers(&blocks);
+            assert!(found[0].is_none(), "the prompt is not agent output");
+            assert_eq!(
+                found[1],
+                Some(ResponseHeader {
+                    cancelled: false,
+                    failed: false,
+                    lead_blank: false,
+                })
+            );
+            assert!(found[2..].iter().all(Option::is_none), "{found:?}");
+        }
+    }
+
+    #[test]
+    fn the_header_adds_a_blank_row_only_when_the_prompt_is_not_directly_above() {
+        let below_prompt = [user(), tool()];
+        assert_eq!(leading_rows(&below_prompt, 1), 1);
+
+        let after_notice = [user(), system(), tool()];
+        let header = response_header(&after_notice, 2).expect("header");
+        assert!(header.lead_blank);
+        assert_eq!(header.rows(), 2);
+        assert_eq!(leading_rows(&after_notice, 2), 2);
+        assert!(
+            response_header(&after_notice, 1).is_none(),
+            "notices do not open a turn"
+        );
+    }
+
+    #[test]
+    fn prose_after_the_opening_work_breathes_while_the_opener_does_not() {
+        let blocks = [
+            user(),
+            tool(),
+            prose(BlockLifecycle::Complete),
+            tool(),
+            prose(BlockLifecycle::Complete),
+        ];
+        assert_eq!(leading_rows(&blocks, 1), 1, "header only");
+        assert!(!transition_gap(&blocks, 1));
+        assert_eq!(leading_rows(&blocks, 2), 1, "breathing row before prose");
+        assert!(transition_gap(&blocks, 2));
+        assert!(transition_gap(&blocks, 3), "work after prose");
+        assert!(transition_gap(&blocks, 4), "prose after work");
+
+        let text_first = [user(), prose(BlockLifecycle::Complete), tool()];
+        assert_eq!(leading_rows(&text_first, 1), 1, "header only, no extra gap");
+        assert!(!transition_gap(&text_first, 1));
+        assert_eq!(leading_rows(&text_first, 2), 1, "work after prose");
+    }
+
+    #[test]
+    fn a_new_prompt_starts_a_new_turn_with_its_own_header() {
+        let blocks = [
+            user(),
+            prose(BlockLifecycle::Complete),
+            user(),
+            thinking(),
+            prose(BlockLifecycle::Complete),
+        ];
+        let found = headers(&blocks);
+        assert!(found[1].is_some());
+        assert!(found[3].is_some());
+        assert!(found[4].is_none());
+    }
+
+    #[test]
+    fn interruption_or_failure_of_any_prose_segment_lands_on_the_turn_header() {
+        let cancelled = [
+            user(),
+            tool(),
+            prose(BlockLifecycle::Complete),
+            prose(BlockLifecycle::Cancelled),
+        ];
+        let header = response_header(&cancelled, 1).expect("header");
+        assert!(header.cancelled && !header.failed);
+
+        let failed = [user(), thinking(), prose(BlockLifecycle::Failed)];
+        let header = response_header(&failed, 1).expect("header");
+        assert!(header.failed && !header.cancelled);
+
+        let next_turn = [
+            user(),
+            prose(BlockLifecycle::Cancelled),
+            user(),
+            prose(BlockLifecycle::Complete),
+        ];
+        let header = response_header(&next_turn, 3).expect("header");
+        assert!(!header.cancelled, "the previous turn's state does not leak");
+        assert_ne!(
+            response_header(&next_turn, 1).map(ResponseHeader::cache_tag),
+            Some(header.cache_tag())
+        );
+    }
+
+    #[test]
+    fn without_a_prompt_only_prose_carries_the_header() {
+        let blocks = [thinking(), prose(BlockLifecycle::Complete), tool()];
+        let found = headers(&blocks);
+        assert!(found[0].is_none(), "bare work has no owner to name");
+        assert!(found[1].expect("prose header").lead_blank);
+        assert!(found[2].is_none());
+        assert!(!transition_gap(&blocks, 1), "the header replaces the gap");
     }
 }
 

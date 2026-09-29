@@ -52,8 +52,7 @@ if ($LASTEXITCODE -ne 0) {
     throw 'nao foi possivel identificar se o worktree esta dirty.'
 }
 $dirtySuffix = if ([string]::IsNullOrWhiteSpace(($status -join "`n"))) { '' } else { '-dirty' }
-$env:SLIM_BUILD_REVISION = "$commit$dirtySuffix"
-Write-Host "Build revision: $env:SLIM_BUILD_REVISION"
+$buildRevision = "$commit$dirtySuffix"
 
 if ($Test) {
     & "$root/test-slim.ps1" -Workspace
@@ -66,7 +65,17 @@ if ($FastBuild) {
     $buildArguments += @('--config', 'profile.release.lto="off"',
         '--config', 'profile.release.codegen-units=8')
 }
-Invoke-SlimCargo -CargoArguments $buildArguments
+# option_env! tracks this variable: scope it to the release build so test builds
+# in this shell keep their fingerprints.
+$savedRevision = $env:SLIM_BUILD_REVISION
+try {
+    $env:SLIM_BUILD_REVISION = $buildRevision
+    Write-Host "Build revision: $buildRevision"
+    Invoke-SlimCargo -CargoArguments $buildArguments
+}
+finally {
+    $env:SLIM_BUILD_REVISION = $savedRevision
+}
 
 New-Item -ItemType Directory -Force -Path (Split-Path $deploy) | Out-Null
 Copy-Item $built $deploy -Force

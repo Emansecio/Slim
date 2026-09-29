@@ -7,6 +7,36 @@ members = [
 ]
 resolver = "2"
 
+# Every selection (`-p <crate>` or `--workspace`) must resolve the same features, or
+# each one compiles its own variant of slim-core and everything above it. These
+# carry the workspace-wide union; members opt in with `workspace = true`.
+[workspace.dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ProcessSnapshotting",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Kernel",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# Dev-only: slim-tui/slim-cli tests use them; the other members list them so their
+# test builds see the same regex-syntax/libc/getrandom/windows-sys features.
+portable-pty = "0.9"
+proptest = "1"
+
 [workspace.package]
 license = "Apache-2.0"
 
@@ -27,6 +57,12 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Third-party code is rarely stepped through: keep backtrace symbols and lines, but
+# drop its type information, which dominates every test binary's PDB and link time.
+# Set on dev so test builds keep reusing the dev dependency artifacts.
+[profile.dev.package."*"]
+debug = "line-tables-only"
 
 # Keep source locations/backtraces without generating all local type information.
 # Only workspace packages change; third-party/build dependencies reuse dev artifacts.

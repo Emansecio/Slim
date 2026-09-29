@@ -163,6 +163,63 @@ async fn wait_for_leases(pool: &LspProcessPool, expected: usize) {
     .expect("lease count converges");
 }
 
+/// A file the mock LSP blocks on (`--initialize-gate` / `requestGate`) until
+/// the test releases it, so the test controls when a response goes out.
+fn gate(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.gate"))
+}
+
+fn release(gate: &Path) {
+    std::fs::write(gate, b"").expect("release mock gate");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_subprocess_startup_failure_retains_bounded_stderr() {
+    for padding in [
+        String::new(),
+        "á".repeat(slim_lsp::process::STDERR_TAIL_BYTES),
+    ] {
+        let dir = TestDir::new("startup-stderr");
+        write_workspace(dir.path());
+        // The fixture exits before initialize on unknown arguments and prints
+        // the real diagnostic to stderr, exercising the production reader.
+        let diagnostic = format!("early-marker{padding}startup: sysroot unavailable");
+        let pool = LspProcessPool::new(PoolConfig {
+            idle_shutdown: None,
+            ..PoolConfig::default()
+        });
+        let result = pool
+            .acquire(
+                std::fs::canonicalize(dir.path()).expect("root"),
+                mock_spec(vec![diagnostic]),
+                &json!({}),
+                transport_options(),
+                8,
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("fixture must fail startup"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("initialization failed:"));
+        let (_, stderr) = error
+            .split_once("\nserver stderr:\n")
+            .expect("startup stderr retained");
+        assert!(stderr.ends_with("startup: sysroot unavailable"));
+        assert!(stderr.len() <= slim_lsp::process::STDERR_TAIL_BYTES);
+        if padding.is_empty() {
+            assert!(stderr.contains("early-marker"));
+        } else {
+            assert!(
+                !stderr.contains("early-marker"),
+                "only the bounded tail survives"
+            );
+        }
+        assert_eq!(pool.active_leases(), 0);
+        pool.close_all().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_subprocess_observes_dedup_and_lru_did_close() {
     let dir = TestDir::new("protocol");
@@ -292,6 +349,7 @@ async fn aborting_startup_leader_does_not_strand_followers_or_shutdown() {
     let dir = TestDir::new("abort-startup");
     write_workspace(dir.path());
     let log = dir.path().join("startup.jsonl");
+    let init_gate = gate(dir.path(), "initialize");
     let factory = Arc::new(CountingFactory::default());
     let pool = LspProcessPool::new(PoolConfig {
         idle_shutdown: None,
@@ -301,8 +359,8 @@ async fn aborting_startup_leader_does_not_strand_followers_or_shutdown() {
     let spec = mock_spec(vec![
         "--log".into(),
         log.to_string_lossy().into_owned(),
-        "--initialize-delay-ms".into(),
-        "250".into(),
+        "--initialize-gate".into(),
+        init_gate.to_string_lossy().into_owned(),
     ]);
     let leader = {
         let pool = pool.clone();
@@ -316,17 +374,25 @@ async fn aborting_startup_leader_does_not_strand_followers_or_shutdown() {
     wait_for_client_method(&log, "initialize").await;
     leader.abort();
     assert!(matches!(leader.await, Err(error) if error.is_cancelled()));
-    let follower = tokio::time::timeout(
-        Duration::from_secs(2),
-        pool.acquire(
-            dir.path().to_path_buf(),
-            spec,
-            &json!({}),
-            transport_options(),
-            8,
+    // The follower joins while initialize is still gated; the gate opens
+    // shortly after it starts waiting.
+    let no_settings = json!({});
+    let (follower, ()) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            pool.acquire(
+                dir.path().to_path_buf(),
+                spec,
+                &no_settings,
+                transport_options(),
+                8,
+            ),
         ),
-    )
-    .await;
+        async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            release(&init_gate);
+        }
+    );
     assert!(
         follower.is_ok(),
         "aborted startup stranded the single-flight entry"
@@ -354,11 +420,12 @@ async fn close_all_waits_for_inflight_initialize_and_prevents_reinsert() {
         factory: factory.clone(),
     });
     let log = dir.path().join("close-starting.jsonl");
+    let init_gate = gate(dir.path(), "initialize");
     let spec = mock_spec(vec![
         "--log".into(),
         log.to_string_lossy().into_owned(),
-        "--initialize-delay-ms".into(),
-        "250".into(),
+        "--initialize-gate".into(),
+        init_gate.to_string_lossy().into_owned(),
     ]);
     let acquire = {
         let pool = pool.clone();
@@ -377,7 +444,12 @@ async fn close_all_waits_for_inflight_initialize_and_prevents_reinsert() {
     .await
     .expect("startup begins");
 
-    pool.close_all().await;
+    // close_all must wait for the gated initialize; open the gate once it is
+    // already waiting.
+    tokio::join!(pool.close_all(), async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        release(&init_gate);
+    });
     let methods = read_client_methods(&log);
     assert!(methods
         .iter()
@@ -418,11 +490,25 @@ async fn different_pool_keys_initialize_concurrently() {
         max_servers: 2,
         factory: Arc::new(StdioProcessFactory),
     });
-    let spec = mock_spec(vec!["--initialize-delay-ms".into(), "500".into()]);
-    let started = Instant::now();
+    // Each server holds its initialize response behind a gate. Serialized
+    // startup would never deliver the second initialize while the first is
+    // pending, so both requests being received before either gate opens proves
+    // the keys initialize concurrently, without timing bounds.
+    let left_log = first.path().join("left.jsonl");
+    let right_log = second.path().join("right.jsonl");
+    let left_gate = gate(first.path(), "initialize");
+    let right_gate = gate(second.path(), "initialize");
+    let gated_spec = |log: &Path, gate: &Path| {
+        mock_spec(vec![
+            "--log".into(),
+            log.to_string_lossy().into_owned(),
+            "--initialize-gate".into(),
+            gate.to_string_lossy().into_owned(),
+        ])
+    };
     let left = {
         let pool = pool.clone();
-        let spec = spec.clone();
+        let spec = gated_spec(&left_log, &left_gate);
         let root = first.path().to_path_buf();
         tokio::spawn(async move {
             pool.acquire(root, spec, &json!({}), transport_options(), 8)
@@ -431,19 +517,23 @@ async fn different_pool_keys_initialize_concurrently() {
     };
     let right = {
         let pool = pool.clone();
+        let spec = gated_spec(&right_log, &right_gate);
         let root = second.path().to_path_buf();
         tokio::spawn(async move {
             pool.acquire(root, spec, &json!({}), transport_options(), 8)
                 .await
         })
     };
+    wait_for_client_method(&left_log, "initialize").await;
+    wait_for_client_method(&right_log, "initialize").await;
+    assert!(
+        !left.is_finished() && !right.is_finished(),
+        "initialize must still be pending while both are observed"
+    );
+    release(&left_gate);
+    release(&right_gate);
     let left = left.await.expect("left task").expect("left acquire");
     let right = right.await.expect("right task").expect("right acquire");
-    assert!(
-        started.elapsed() < Duration::from_millis(850),
-        "independent initialize calls were serialized: {:?}",
-        started.elapsed()
-    );
     drop((left, right));
     wait_for_leases(&pool, 0).await;
     pool.close_all().await;
@@ -453,6 +543,8 @@ async fn different_pool_keys_initialize_concurrently() {
 async fn manager_keeps_lease_for_the_entire_slow_query() {
     let dir = TestDir::new("manager-lease");
     let (first, _) = write_workspace(dir.path());
+    let log = dir.path().join("lease.jsonl");
+    let request_gate = gate(dir.path(), "request");
     let pool = LspProcessPool::new(PoolConfig {
         idle_shutdown: Some(Duration::ZERO),
         circuit_window: Duration::from_millis(10),
@@ -465,7 +557,12 @@ async fn manager_keeps_lease_for_the_entire_slow_query() {
             idle_shutdown: Some(Duration::ZERO),
             max_servers: 1,
             request_timeout: Duration::from_secs(3),
-            server_config: json!({ "mock": { "requestDelayMs": 500 } }),
+            server_config: json!({
+                "mock": {
+                    "logPath": log.to_string_lossy(),
+                    "requestGate": request_gate.to_string_lossy()
+                }
+            }),
             max_open_documents: 8,
             server_path: Some(PathBuf::from(mock_binary())),
         },
@@ -485,19 +582,14 @@ async fn manager_keeps_lease_for_the_entire_slow_query() {
         let manager = manager.clone();
         tokio::spawn(async move { manager.hover(&query).await })
     };
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while pool.running_servers().await == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("server starts");
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The server has the hover request and holds the response behind the gate.
+    wait_for_client_method(&log, "textDocument/hover").await;
     assert_eq!(
         pool.active_leases(),
         1,
         "query must retain its lease while awaiting the response"
     );
+    release(&request_gate);
     let outcome = query_task.await.expect("query task");
     assert_eq!(outcome.payload.get("found"), Some(&Value::Bool(true)));
     wait_for_leases(&pool, 0).await;
@@ -574,12 +666,13 @@ async fn slow_query_reports_version_and_staleness_after_concurrent_write() {
     let workspace = TestDir::new("stale-query");
     let (source, _) = write_workspace(workspace.path());
     let log = workspace.path().join("stale.jsonl");
+    let request_gate = gate(workspace.path(), "request");
     let (pool, manager) = manager_with_mock(
         workspace.path(),
         json!({
             "mock": {
                 "logPath": log.to_string_lossy(),
-                "requestDelayMs": 500
+                "requestGate": request_gate.to_string_lossy()
             }
         }),
     );
@@ -590,6 +683,7 @@ async fn slow_query_reports_version_and_staleness_after_concurrent_write() {
     };
     wait_for_client_method(&log, "textDocument/hover").await;
     std::fs::write(&source, "fn changed_during_query() {}\n").expect("mutate source");
+    release(&request_gate);
 
     let outcome = task.await.expect("hover task");
     assert_eq!(outcome.meta.document_version, Some(1));
@@ -603,12 +697,13 @@ async fn manager_cancellation_returns_promptly_and_reaches_subprocess() {
     let workspace = TestDir::new("cancel-query");
     let (source, _) = write_workspace(workspace.path());
     let log = workspace.path().join("cancel.jsonl");
+    let request_gate = gate(workspace.path(), "request");
     let (pool, manager) = manager_with_mock(
         workspace.path(),
         json!({
             "mock": {
                 "logPath": log.to_string_lossy(),
-                "requestDelayMs": 500
+                "requestGate": request_gate.to_string_lossy()
             }
         }),
     );
@@ -620,19 +715,21 @@ async fn manager_cancellation_returns_promptly_and_reaches_subprocess() {
         tokio::spawn(async move { manager.hover(&query).await })
     };
     wait_for_client_method(&log, "textDocument/hover").await;
-    let cancelled_at = Instant::now();
     cancellation.cancel();
+    // The response is held behind the gate, so the query can only finish by
+    // observing the cancellation, never by receiving a result.
     let outcome = tokio::time::timeout(Duration::from_secs(1), task)
         .await
         .expect("query cancellation must be prompt")
         .expect("hover task");
-    assert!(cancelled_at.elapsed() < Duration::from_millis(300));
     assert_eq!(outcome.meta.document_version, Some(1));
     assert!(outcome
         .payload
         .get("error")
         .and_then(Value::as_str)
         .is_some_and(|error| error.contains("cancelled")));
+    // The single-threaded mock reads the cancel notification once it leaves the gate.
+    release(&request_gate);
     wait_for_client_method(&log, "$/cancelRequest").await;
     pool.close_all().await;
 }
@@ -2037,14 +2134,15 @@ async fn manager_cancellation_during_shared_initialize_is_prompt() {
     let (source, _) = write_workspace(dir.path());
     let root = std::fs::canonicalize(dir.path()).unwrap();
     let log = dir.path().join("init.jsonl");
+    let init_gate = gate(dir.path(), "initialize");
     let (pool, manager) = manager_with_mock(dir.path(), json!({}));
     let leader = {
         let pool = pool.clone();
         let spec = mock_spec(vec![
             "--log".into(),
             log.to_string_lossy().into_owned(),
-            "--initialize-delay-ms".into(),
-            "500".into(),
+            "--initialize-gate".into(),
+            init_gate.to_string_lossy().into_owned(),
         ]);
         tokio::spawn(async move {
             pool.acquire(root, spec, &json!({}), transport_options(), 8)
@@ -2059,11 +2157,14 @@ async fn manager_cancellation_during_shared_initialize_is_prompt() {
         tokio::time::sleep(Duration::from_millis(20)).await;
         token.cancel();
     };
-    let (outcome, ()) = tokio::time::timeout(Duration::from_millis(200), async {
+    // Initialize stays gated for the whole query, so it can only finish by
+    // observing its own cancellation.
+    let (outcome, ()) = tokio::time::timeout(Duration::from_secs(2), async {
         tokio::join!(manager.definition(&query), cancel)
     })
     .await
     .expect("acquisition observes individual cancellation");
+    release(&init_gate);
     assert!(outcome.payload["error"]
         .as_str()
         .unwrap()

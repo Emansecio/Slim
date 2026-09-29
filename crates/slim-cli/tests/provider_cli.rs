@@ -39,7 +39,7 @@ fn spawn_one_turn_fixture(
                     Ok((stream, _)) => break stream,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         assert!(Instant::now() < deadline, "fixture accept timed out");
-                        thread::yield_now();
+                        thread::sleep(Duration::from_millis(1));
                     }
                     Err(error) => panic!("fixture accept: {error}"),
                 }
@@ -135,7 +135,7 @@ fn spawn_image_fixture(kind: ProviderKind, image_count: usize) -> (String, threa
                 Ok((stream, _)) => break stream,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     assert!(Instant::now() < deadline, "fixture accept timed out");
-                    thread::yield_now();
+                    thread::sleep(Duration::from_millis(1));
                 }
                 Err(error) => panic!("fixture accept: {error}"),
             }
@@ -831,7 +831,7 @@ fn repeated_failed_tool_stop_is_blocked_and_anti_loop_is_reported() {
                     Ok((stream, _)) => break stream,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         assert!(Instant::now() < deadline, "fixture accept timed out");
-                        thread::yield_now();
+                        thread::sleep(Duration::from_millis(1));
                     }
                     Err(error) => panic!("fixture accept: {error}"),
                 }

@@ -753,12 +753,14 @@ fn drive_case(
         command.env("SLIM_AUTH_FILE", &auth);
         command.env("NO_PROXY", "127.0.0.1,localhost");
         command.env_remove("NO_COLOR");
-        command.env_remove("SLIM_REDUCED_MOTION");
+        // Set both ways so the case does not depend on the machine's own
+        // animation setting, which the TUI follows when the variable is unset.
+        command.env(
+            "SLIM_REDUCED_MOTION",
+            if case.reduced_motion { "1" } else { "0" },
+        );
         if case.no_color {
             command.env("NO_COLOR", "1");
-        }
-        if case.reduced_motion {
-            command.env("SLIM_REDUCED_MOTION", "1");
         }
 
         let child = pair.slave.spawn_command(command).map_err(|error| {

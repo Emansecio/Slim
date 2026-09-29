@@ -224,8 +224,8 @@ fn activity_projects_known_phase_and_elapsed() {
 
     let frame = render_state(&state, caps(false)).join("\n");
     // The visible header owns the thinking time; the rail does not repeat it.
-    assert!(frame.contains("Pensando · 2.5s"), "{frame}");
-    assert!(!frame.contains(" 2s"), "{frame}");
+    assert!(frame.contains("Pensando · 2s"), "{frame}");
+    assert_eq!(frame.matches(" 2s").count(), 1, "{frame}");
 }
 
 #[test]
@@ -250,7 +250,7 @@ fn rail_labels_the_run_total_when_it_differs_from_the_thinking_time() {
     tick(&mut state, 80, 7_500);
 
     let frame = render_state(&state, caps(false)).join("\n");
-    assert!(frame.contains("Pensando · 2.5s"), "{frame}");
+    assert!(frame.contains("Pensando · 2s"), "{frame}");
     assert!(frame.contains("execução 6s"), "{frame}");
     let rail = frame
         .lines()

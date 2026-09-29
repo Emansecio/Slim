@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use slim_core::provider::{
-    run_http_provider_messages, AnthropicAdapter, HttpProviderClient, HttpRequest,
-    OpenAiCodexAdapter, OpenAiCompatibleAdapter, OpenCodeGoAdapter, ProviderAdapter, ProviderCache,
-    ProviderConfig, ProviderContentBlock, ProviderError, ProviderEvent, ProviderKind,
-    ProviderMessage, ProviderPhase, ProviderTimeouts,
+    run_http_provider_messages, AnthropicAdapter, CommandCodeAdapter, HttpProviderClient,
+    HttpRequest, OpenAiCodexAdapter, OpenAiCompatibleAdapter, OpenCodeGoAdapter, ProviderAdapter,
+    ProviderCache, ProviderConfig, ProviderContentBlock, ProviderError, ProviderEvent,
+    ProviderKind, ProviderMessage, ProviderPhase, ProviderTimeouts,
 };
 use slim_core::runtime::CancellationToken;
 use slim_core::{
@@ -1273,6 +1273,264 @@ fn opencode_go_progressive_terminal_usage_keeps_the_largest_snapshot() {
 }
 
 #[test]
+fn command_code_cumulative_usage_preserves_text_tools_and_one_terminal_total() {
+    for (first_output, last_output) in [(3, 3), (1, 9), (9, 1)] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            read_http_request(&mut stream);
+            let events = [
+                json!({"choices":[{"delta":{"content":"Ola"}}]}),
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"read","arguments":"{\"path\":\"main.rs\"}"}}]}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+                json!({"choices":[],"usage":{"prompt_tokens":1750,"completion_tokens":first_output,"prompt_tokens_details":{"cached_tokens":5}}}),
+                json!({"choices":[],"usage":{"prompt_tokens":1750,"completion_tokens":last_output,"prompt_tokens_details":{"cached_tokens":5}}}),
+            ];
+            let body = events
+                .into_iter()
+                .map(|value| format!("data: {value}\n\n"))
+                .chain(std::iter::once("data: [DONE]\n\n".to_owned()))
+                .collect::<String>();
+            write_fixture_response(&mut stream, &body, 200);
+        });
+        let adapter = CommandCodeAdapter::new(
+            &format!("http://{address}"),
+            "deepseek/deepseek-v4.1-flash",
+            "fixture-key",
+            None,
+        )
+        .expect("adapter");
+        let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+        let mut runtime = Runtime::new();
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(runtime.run_provider(&client, "hello", 1))
+            .expect("cumulative usage must not abort the turn");
+        server.join().expect("server");
+        let events = runtime.app.events();
+        let usage = events
+            .iter()
+            .filter_map(|event| match event.kind {
+                EventKind::Usage {
+                    input_tokens,
+                    output_tokens,
+                } => Some((input_tokens, output_tokens)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(usage, vec![(1750, first_output.max(last_output))]);
+        let breakdowns = events
+            .iter()
+            .filter_map(|event| match event.kind {
+                EventKind::UsageBreakdown { usage } => Some(usage),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(breakdowns.len(), 1);
+        assert_eq!(breakdowns[0].cache_read_tokens, 5);
+        assert_eq!(breakdowns[0].output_tokens, first_output.max(last_output));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(&event.kind,
+                    EventKind::AssistantTextDelta { text } if text == "Ola"
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(&event.kind,
+                    EventKind::ProviderToolCall { id, name, arguments }
+                        if id == "call-1" && name == "read" && arguments == "{\"path\":\"main.rs\"}"
+                ))
+                .count(),
+            1
+        );
+        let usage_index = events
+            .iter()
+            .position(|event| matches!(event.kind, EventKind::Usage { .. }))
+            .expect("usage");
+        let ended_index = events
+            .iter()
+            .position(|event| matches!(event.kind, EventKind::AssistantEnded { .. }))
+            .expect("ended");
+        assert!(usage_index < ended_index);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, EventKind::AssistantEnded { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            events.last().expect("completion").kind,
+            EventKind::RequestCompleted { failed: false, .. }
+        ));
+    }
+}
+
+#[test]
+fn command_code_preserves_usage_received_before_stream_failure() {
+    let (endpoint, server) = spawn_fixture_server(1, FixtureMode::UsageThenFailure);
+    let adapter = CommandCodeAdapter::new(
+        &endpoint,
+        "deepseek/deepseek-v4.1-flash",
+        "fixture-key",
+        None,
+    )
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+    let mut runtime = Runtime::new();
+    assert!(tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(runtime.run_provider(&client, "failure", 1))
+        .is_err());
+    assert_eq!(server.join().expect("server").len(), 1);
+    assert!(runtime.app.events().iter().any(|event| matches!(
+        event.kind,
+        EventKind::Usage {
+            input_tokens: 7,
+            output_tokens: 3
+        }
+    )));
+    assert!(matches!(
+        runtime.app.events().last().expect("completion").kind,
+        EventKind::RequestCompleted { failed: true, .. }
+    ));
+}
+
+#[test]
+fn durable_validation_failure_is_linked_to_http_success_without_counting_cache_replay() {
+    use slim_core::session::{
+        preflight_session, DurableRecord, DurableSessionHeader, JsonlRepo, ManualRunJournal,
+        ManualRunSpec,
+    };
+    for free_api in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            read_http_request(&mut stream);
+            write_fixture_response(&mut stream,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"body-marker\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n", 200);
+        });
+        let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+            format!("http://{address}"),
+            "fixture-model",
+            "fixture-secret",
+        ))
+        .expect("adapter");
+        let client = HttpProviderClient::with_cache(
+            adapter,
+            Duration::from_secs(2),
+            Arc::new(ProviderCache::new()),
+        )
+        .expect("client");
+        let path = std::env::temp_dir().join(format!(
+            "slim-provider-validation-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let repo = JsonlRepo::create(
+            &path,
+            DurableSessionHeader::new("validation", "now", ".", None, None),
+        )
+        .expect("repo");
+        let journal = Arc::new(std::sync::Mutex::new(
+            ManualRunJournal::start(
+                repo,
+                ManualRunSpec::new("op", "attempt", "input", "final", "prompt-marker", 0),
+            )
+            .expect("journal"),
+        ));
+        let mut runtime = Runtime::new();
+        runtime.app.set_run_journal(journal.clone());
+        let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let mut next_seq = 1;
+        for replay in [false, true] {
+            let result = if free_api {
+                tokio_runtime.block_on(run_http_provider_messages(
+                    &client,
+                    &mut runtime.app,
+                    &[ProviderMessage::user("prompt-marker")],
+                    next_seq,
+                ))
+            } else {
+                tokio_runtime.block_on(runtime.run_provider(&client, "prompt-marker", next_seq))
+            };
+            if replay {
+                // Cache replay excludes billing events, so it cannot repeat
+                // the original terminal-usage validation failure.
+                assert!(result.is_ok(), "free_api={free_api} result={result:?}");
+            } else {
+                assert!(
+                    matches!(result, Err(ProviderError::InvalidResponse { .. })),
+                    "free_api={free_api} result={result:?}"
+                );
+                assert!(matches!(
+                    runtime.app.events().last().expect("completion").kind,
+                    EventKind::RequestCompleted { failed: true, .. }
+                ));
+            }
+            next_seq = runtime.app.events().last().expect("completion").seq + 1;
+        }
+        server.join().expect("server");
+        assert!(runtime
+            .app
+            .events()
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ResponseCacheHit)));
+        assert!(matches!(
+            runtime.app.events().last().expect("completion").kind,
+            EventKind::RequestCompleted { failed: false, .. }
+        ));
+        drop(runtime);
+        drop(journal);
+        let report = preflight_session(&path).expect("valid session");
+        let facts = report
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                DurableRecord::Fact { fact, .. } if fact.namespace.starts_with("provider.") => {
+                    Some(fact)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].namespace, "provider.call.v1");
+        assert_eq!(facts[0].value["http_status"], 200);
+        assert_eq!(facts[0].value["outcome"], "success");
+        assert_eq!(facts[1].namespace, "provider.validation.v1");
+        assert_eq!(facts[1].key, facts[0].key);
+        assert_eq!(facts[1].value["provider_call_id"], facts[0].key);
+        assert_eq!(facts[1].value["outcome"], "failed");
+        assert_eq!(facts[1].value["code"], "invalid_response");
+        for fact in facts {
+            let text = serde_json::to_string(fact).expect("serialize fact");
+            for marker in [
+                "fixture-secret",
+                "prompt-marker",
+                "body-marker",
+                "provider emitted terminal usage more than once",
+            ] {
+                assert!(
+                    !text.contains(marker),
+                    "fact must exclude payloads and error messages"
+                );
+            }
+        }
+        std::fs::remove_file(path).expect("cleanup");
+    }
+}
+
+#[test]
 fn repeated_incomplete_post_stop_usage_component_is_rejected() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let address = listener.local_addr().expect("address");
@@ -2271,9 +2529,24 @@ fn provider_stream_exposes_identity_preserving_tool_fragments() {
         .expect("events");
     server.join().expect("server");
 
+    // Display-only progress rides along without touching the call fragments.
+    assert_eq!(
+        events
+            .iter()
+            .find(|event| matches!(event, ProviderEvent::ToolCallProgress { .. })),
+        Some(&ProviderEvent::ToolCallProgress {
+            name: Some("read".into()),
+            bytes: 8,
+        })
+    );
     let events = events
         .into_iter()
-        .filter(|event| !matches!(event, ProviderEvent::Phase { .. }))
+        .filter(|event| {
+            !matches!(
+                event,
+                ProviderEvent::Phase { .. } | ProviderEvent::ToolCallProgress { .. }
+            )
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         events[0],

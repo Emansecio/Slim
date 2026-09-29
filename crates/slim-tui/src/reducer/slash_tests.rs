@@ -86,7 +86,11 @@ fn filter_narrows_to_prefix() {
     assert_eq!(slash_matches("lo"), vec!["/login", "/logout"]);
     assert_eq!(slash_matches("logi"), vec!["/login"]);
     assert_eq!(slash_matches("he"), vec!["/help"]);
-    assert_eq!(slash_matches("").len(), 16);
+    assert_eq!(slash_matches("").len(), 18);
+    assert_eq!(
+        slash_matches("re"),
+        vec!["/resume", "/rename", "/rewind", "/retry"]
+    );
     assert!(slash_matches("zzz").is_empty());
 }
 

@@ -3,13 +3,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::mcp::http::HttpConnection;
 use crate::mcp::spec::{
-    MCP_PROTOCOL_VERSION, McpCancellation, McpCleanupStatus, McpConnection, McpError,
-    McpInterruption, McpRequestOutcome, McpServerInfo, McpServerSpec, McpServerStatus,
-    McpToolSummary, McpTransport,
+    McpCancellation, McpCleanupStatus, McpConnection, McpError, McpInterruption, McpRequestOutcome,
+    McpServerInfo, McpServerSpec, McpServerStatus, McpToolSummary, McpTransport,
+    MCP_PROTOCOL_VERSION,
 };
 use crate::mcp::stdio::StdioConnection;
 use crate::process::ExecutableResolver;

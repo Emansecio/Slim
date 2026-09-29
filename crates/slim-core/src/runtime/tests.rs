@@ -177,7 +177,7 @@ async fn manual_retry_rejects_auth_partial_output_and_tool_emission() {
             message: "failed".into(),
         };
         assert!(!runtime
-            .wait_for_manual_retry(&error, 0, &mut seq)
+            .wait_for_manual_retry(&error, 0, DEFAULT_BACKOFF, &mut seq)
             .await
             .unwrap());
         assert!(!handle.request());
@@ -192,7 +192,7 @@ async fn manual_retry_rejects_auth_partial_output_and_tool_emission() {
         message: "denied".into(),
     };
     assert!(!runtime
-        .wait_for_manual_retry(&error, 0, &mut seq)
+        .wait_for_manual_retry(&error, 0, DEFAULT_BACKOFF, &mut seq)
         .await
         .unwrap());
     assert!(!handle.request());
@@ -212,7 +212,7 @@ async fn manual_retry_wait_is_cancelled_and_does_not_bypass_retry_after() {
             message: "later".into(),
         };
         let mut seq = 1;
-        let waiting = runtime.wait_for_manual_retry(&error, 0, &mut seq);
+        let waiting = runtime.wait_for_manual_retry(&error, 0, DEFAULT_BACKOFF, &mut seq);
         let cancel = async {
             while !handle.is_waiting() {
                 tokio::task::yield_now().await;
@@ -1603,6 +1603,33 @@ fn context_overflow_does_not_match_auth_usage_or_output_limits() {
     }));
 }
 
+const DEFAULT_BACKOFF: std::time::Duration = AgentLoopConfig::DEFAULT_PROVIDER_RECOVERY_BACKOFF;
+
+#[test]
+fn recovery_backoff_doubles_from_the_configured_base_and_caps_at_sixteen_times() {
+    let base = std::time::Duration::from_millis(3);
+    assert_eq!(
+        provider_recovery_backoff(DEFAULT_BACKOFF, 1).as_millis(),
+        500
+    );
+    assert_eq!(
+        provider_recovery_backoff(DEFAULT_BACKOFF, 2).as_millis(),
+        1000
+    );
+    assert_eq!(provider_recovery_backoff(base, 1), base);
+    assert_eq!(provider_recovery_backoff(base, 3), base * 4);
+    assert_eq!(provider_recovery_backoff(base, 9), base * 16);
+    let error = ProviderError::Http {
+        status: 503,
+        retry_after: Some(std::time::Duration::from_secs(1)),
+        message: "busy".into(),
+    };
+    assert_eq!(
+        requested_provider_recovery_delay(&error, 1, base),
+        std::time::Duration::from_secs(1)
+    );
+}
+
 #[test]
 fn retry_wait_budget_is_shared_across_attempts() {
     let delay = std::time::Duration::from_secs(40);
@@ -1612,15 +1639,17 @@ fn retry_wait_budget_is_shared_across_attempts() {
         message: "rate limited".into(),
     };
     assert_eq!(
-        provider_recovery_delay(&error, 1, std::time::Duration::ZERO).unwrap(),
+        provider_recovery_delay(&error, 1, std::time::Duration::ZERO, DEFAULT_BACKOFF).unwrap(),
         delay
     );
-    let blocked = provider_recovery_delay(&error, 2, delay).unwrap_err();
+    let blocked = provider_recovery_delay(&error, 2, delay, DEFAULT_BACKOFF).unwrap_err();
     assert!(
         matches!(blocked, ProviderError::Http { retry_after: Some(actual), message, .. }
             if actual == delay && message.contains("40000 ms") && message.contains("20000 ms"))
     );
-    assert!(provider_recovery_delay(&error, 2, MAX_PROVIDER_RECOVERY_WAIT).is_err());
+    assert!(
+        provider_recovery_delay(&error, 2, MAX_PROVIDER_RECOVERY_WAIT, DEFAULT_BACKOFF).is_err()
+    );
     assert!(!recoverable_provider_error(&ProviderError::Remote {
         message: "http 429: payload text".into()
     }));
@@ -1633,13 +1662,15 @@ fn retry_after_over_budget_never_sends_an_early_retry() {
         retry_after: Some(std::time::Duration::from_secs(3600)),
         message: "slow down".into(),
     };
-    let blocked = provider_recovery_delay(&error, 1, std::time::Duration::ZERO).unwrap_err();
+    let blocked =
+        provider_recovery_delay(&error, 1, std::time::Duration::ZERO, DEFAULT_BACKOFF).unwrap_err();
     assert!(
         matches!(blocked, ProviderError::Http { retry_after: Some(actual), message, .. }
             if actual == std::time::Duration::from_secs(3600)
                 && message.contains("3600000 ms") && message.contains("no early retry"))
     );
-    let blocked = provider_recovery_delay(&error, 2, MAX_PROVIDER_RECOVERY_WAIT).unwrap_err();
+    let blocked = provider_recovery_delay(&error, 2, MAX_PROVIDER_RECOVERY_WAIT, DEFAULT_BACKOFF)
+        .unwrap_err();
     assert!(
         matches!(blocked, ProviderError::Http { status: 429, message, .. } if message.contains("exceeding") && message.contains("work remains pending"))
     );
@@ -1659,11 +1690,16 @@ fn retry_wait_accepts_exact_budget_and_preserves_structured_metadata() {
         message: "busy".into(),
     };
     assert_eq!(
-        provider_recovery_delay(&error, 1, std::time::Duration::ZERO).unwrap(),
+        provider_recovery_delay(&error, 1, std::time::Duration::ZERO, DEFAULT_BACKOFF).unwrap(),
         MAX_PROVIDER_RECOVERY_WAIT
     );
-    let blocked =
-        provider_recovery_delay(&error, 2, std::time::Duration::from_secs(1)).unwrap_err();
+    let blocked = provider_recovery_delay(
+        &error,
+        2,
+        std::time::Duration::from_secs(1),
+        DEFAULT_BACKOFF,
+    )
+    .unwrap_err();
     assert!(
         matches!(blocked, ProviderError::Api { metadata: actual, message }
             if actual == metadata && message.starts_with("busy") && message.contains("work remains pending"))
@@ -1964,6 +2000,7 @@ fn codex_completion_rejects_conflicting_identity_or_arguments() {
 #[derive(Default)]
 struct FixtureCodeIntel {
     fail: bool,
+    failure_reason: Option<&'static str>,
     rejects_workspace: bool,
     scoped_queries: std::sync::Mutex<Vec<Option<std::path::PathBuf>>>,
     updates: std::sync::Mutex<Vec<crate::codeintel::CodeIntelFileUpdate>>,
@@ -1980,7 +2017,10 @@ impl crate::codeintel::CodeIntelligence for FixtureCodeIntel {
 
     async fn status(&self, _workspace: &Path) -> crate::codeintel::CodeIntelOutcome {
         if self.fail {
-            return crate::codeintel::CodeIntelOutcome::unavailable("fixture", "request timed out");
+            return crate::codeintel::CodeIntelOutcome::unavailable(
+                "fixture",
+                self.failure_reason.unwrap_or("request timed out"),
+            );
         }
         crate::codeintel::CodeIntelOutcome {
             meta: crate::codeintel::CodeIntelMeta {
@@ -2000,7 +2040,10 @@ impl crate::codeintel::CodeIntelligence for FixtureCodeIntel {
         _query: &crate::codeintel::CodeIntelPositionQuery,
     ) -> crate::codeintel::CodeIntelOutcome {
         if self.fail {
-            return crate::codeintel::CodeIntelOutcome::unavailable("fixture", "request timed out");
+            return crate::codeintel::CodeIntelOutcome::unavailable(
+                "fixture",
+                self.failure_reason.unwrap_or("request timed out"),
+            );
         }
         crate::codeintel::CodeIntelOutcome {
             meta: crate::codeintel::CodeIntelMeta {
@@ -2317,6 +2360,60 @@ async fn code_intel_invalid_path_never_reaches_backend_and_valid_scope_is_preser
         vec![Some(std::fs::canonicalize(&path).unwrap()); 2]
     );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn target() {}\n");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn code_intel_startup_diagnostic_is_redacted_in_results_and_events() {
+    let root = batch_fixture_root("code-intel-stderr-redaction");
+    std::fs::write(root.join("main.rs"), "fn target() {}\n").unwrap();
+    let mut runtime = Runtime::new();
+    runtime.register_sensitive_value("private-lsp-token");
+    runtime.set_code_intelligence(Arc::new(FixtureCodeIntel {
+        fail: true,
+        failure_reason: Some(
+            "initialization failed: eof\nserver stderr:\nsysroot unavailable: private-lsp-token",
+        ),
+        ..Default::default()
+    }));
+    let calls = vec![provider_call(
+        "code-intel",
+        "code_intel",
+        json!({
+            "action":"definition", "path":"main.rs", "line":1, "column":4,
+        }),
+    )];
+    let (results, _) = runtime
+        .execute_provider_tool_batch(
+            crate::OperatingMode::Auto,
+            &root,
+            "startup-diagnostic",
+            &calls,
+            1,
+            &mut CausalGovernor::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].success);
+    assert!(results[0].output.contains("sysroot unavailable"));
+    assert!(results[0].output.contains("[REDACTED]"));
+    assert!(!results[0].output.contains("private-lsp-token"));
+    let event_output = runtime
+        .app
+        .events()
+        .iter()
+        .find_map(|event| match &event.kind {
+            crate::EventKind::ToolOutput { output, .. } => Some(output),
+            _ => None,
+        })
+        .expect("diagnostic event");
+    assert!(event_output.contains("sysroot unavailable"));
+    assert!(event_output.contains("[REDACTED]"));
+    assert!(!serde_json::to_string(runtime.app.events())
+        .unwrap()
+        .contains("private-lsp-token"));
+    drop(runtime);
     std::fs::remove_dir_all(root).unwrap();
 }
 

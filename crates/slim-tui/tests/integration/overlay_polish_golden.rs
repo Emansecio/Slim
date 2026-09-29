@@ -139,3 +139,272 @@ fn slash_list_rests_on_the_composer_at_its_width() {
         .expect("model row");
     assert!(model.contains("modelo desta sessão"), "{model}");
 }
+
+#[test]
+fn mention_list_rests_on_the_composer_with_name_first_and_muted_directory() {
+    let mut state = conversation();
+    key(&mut state, KeyCode::Char('@'), KeyModifiers::NONE);
+    key(&mut state, KeyCode::Char('l'), KeyModifiers::NONE);
+    // Loading placeholder before the host answers.
+    let loading = rows(&draw(&state));
+    assert!(
+        loading.iter().any(|row| row.contains("Buscando arquivos")),
+        "{}",
+        loading.join("\n")
+    );
+
+    state.apply_event(UiEvent::WorkspaceFiles {
+        request_id: 1,
+        paths: vec![
+            "README.md".into(),
+            "crates/slim-tui/src/lib.rs".into(),
+            "crates/slim-core/src/lib.rs".into(),
+        ],
+        truncated: false,
+    });
+    let buffer = draw(&state);
+    let text = rows(&buffer);
+
+    let prompt_y = text
+        .iter()
+        .rposition(|row| row.contains("│> @l"))
+        .expect("composer row") as u16;
+    let composer_top = prompt_y - 1;
+    let (_, hint_y) = find(&text, "Tab/Enter completar");
+    assert_eq!(hint_y + 1, composer_top, "{}", text.join("\n"));
+
+    // File name first, directory after it; selection marker on the first hit.
+    let selected = text
+        .iter()
+        .find(|row| row.contains("> lib.rs"))
+        .unwrap_or_else(|| panic!("selected row missing\n{}", text.join("\n")));
+    assert!(selected.contains("crates/slim-"), "{selected}");
+    let (x, y) = find(&text, "lib.rs");
+    let directory_x = find(&text[y as usize..=y as usize], "crates/").0;
+    assert!(directory_x > x, "directory must follow the name");
+    let directory_style = buffer[(directory_x, y)].style();
+    let name_style = buffer[(x, y)].style();
+    assert_ne!(directory_style.fg, name_style.fg, "directory is muted");
+}
+
+fn listed_sessions(state: &mut AppState) {
+    use slim_tui::api::SessionListItem;
+    key(state, KeyCode::Char('/'), KeyModifiers::NONE);
+    for character in "resume".chars() {
+        key(state, KeyCode::Char(character), KeyModifiers::NONE);
+    }
+    // The slash popup completes and executes on Enter.
+    key(state, KeyCode::Enter, KeyModifiers::NONE);
+    let item = |id: &str, title: Option<&str>, prompt: &str, minutes_ago: u64| SessionListItem {
+        id: id.into(),
+        title: title.map(str::to_owned),
+        first_prompt: prompt.into(),
+        updated_ms: 400_000_000 - minutes_ago * 60_000,
+        bytes: 4_300,
+        in_use: false,
+        current: false,
+    };
+    let mut current = item("tui-current", None, "conversa aberta agora", 1);
+    current.current = true;
+    let mut busy = item("tui-busy", Some("Migração"), "trocar o banco", 30);
+    busy.in_use = true;
+    state.apply_event(UiEvent::SessionsListed {
+        request_id: 1,
+        now_ms: 400_000_000,
+        items: vec![
+            current,
+            busy,
+            item(
+                "tui-login",
+                Some("Refatorar login"),
+                "corrigir o bug do token",
+                90,
+            ),
+            item("tui-docs", None, "escrever a documentação da API", 3_000),
+        ],
+        error: None,
+    });
+}
+
+#[test]
+fn resume_picker_lists_sessions_with_titles_ages_and_states() {
+    let mut state = conversation();
+    listed_sessions(&mut state);
+    let buffer = draw(&state);
+    let text = rows(&buffer);
+    let screen = text.join("\n");
+
+    assert!(screen.contains("Retomar sessão"), "{screen}");
+    assert!(screen.contains("Filtro: Digite para filtrar"), "{screen}");
+    // Title leads, the first prompt follows it.
+    let login = text
+        .iter()
+        .find(|row| row.contains("Refatorar login"))
+        .unwrap_or_else(|| panic!("titled row missing\n{screen}"));
+    assert!(login.contains("corrigir o bug do token"), "{login}");
+    assert!(
+        login.contains("há 1 h") && login.contains("4,2 KB"),
+        "{login}"
+    );
+    // Without a title the first prompt is the label.
+    assert!(
+        screen.contains("escrever a documentação da API"),
+        "{screen}"
+    );
+    // State tags; the open and the locked sessions are not the initial focus.
+    let open = text
+        .iter()
+        .find(|row| row.contains("conversa aberta"))
+        .unwrap();
+    assert!(open.contains("atual"), "{open}");
+    let busy = text.iter().find(|row| row.contains("Migração")).unwrap();
+    assert!(busy.contains("em uso"), "{busy}");
+    let focused = text
+        .iter()
+        .find(|row| row.contains("> "))
+        .expect("focus marker");
+    assert!(focused.contains("Refatorar login"), "{focused}");
+    // Detail line names the focused session; footer counts rows.
+    assert!(screen.contains("tui-login"), "{screen}");
+    assert!(
+        screen.contains("3/4 · ↑↓ navegar · Enter retomar · Esc sair"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn resume_picker_filters_and_shows_the_filtered_count() {
+    let mut state = conversation();
+    listed_sessions(&mut state);
+    for character in "api".chars() {
+        key(&mut state, KeyCode::Char(character), KeyModifiers::NONE);
+    }
+    let screen = rows(&draw(&state)).join("\n");
+    assert!(screen.contains("Filtro: api"), "{screen}");
+    assert!(
+        screen.contains("escrever a documentação da API"),
+        "{screen}"
+    );
+    assert!(!screen.contains("Refatorar login"), "{screen}");
+    assert!(screen.contains("1/1 de 4"), "{screen}");
+    for character in "zzz".chars() {
+        key(&mut state, KeyCode::Char(character), KeyModifiers::NONE);
+    }
+    let screen = rows(&draw(&state)).join("\n");
+    assert!(screen.contains("Nada corresponde ao filtro"), "{screen}");
+}
+
+#[test]
+fn picker_shows_loading_and_errors_in_place() {
+    let mut state = conversation();
+    for character in "/resume".chars() {
+        key(&mut state, KeyCode::Char(character), KeyModifiers::NONE);
+    }
+    key(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+    let screen = rows(&draw(&state)).join("\n");
+    assert!(screen.contains("Carregando"), "{screen}");
+    state.apply_event(UiEvent::SessionsListed {
+        request_id: 1,
+        now_ms: 1,
+        items: Vec::new(),
+        error: Some("não foi possível ler as sessões".into()),
+    });
+    let screen = rows(&draw(&state)).join("\n");
+    assert!(
+        screen.contains("não foi possível ler as sessões"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn rewind_picker_lists_turns_newest_first_with_the_conversation_only_note() {
+    use slim_tui::api::TurnListItem;
+    let mut state = conversation();
+    for character in "/rewind".chars() {
+        key(&mut state, KeyCode::Char(character), KeyModifiers::NONE);
+    }
+    key(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+    state.apply_event(UiEvent::TurnsListed {
+        request_id: 1,
+        items: (0..3)
+            .map(|index| TurnListItem {
+                index,
+                first_seq: index as u64 * 10 + 2,
+                prompt: format!("pedido número {index}"),
+            })
+            .collect(),
+        error: None,
+    });
+    let text = rows(&draw(&state));
+    let screen = text.join("\n");
+    assert!(screen.contains("Voltar a um turno"), "{screen}");
+    let newest = text
+        .iter()
+        .position(|row| row.contains("#3 pedido número 2"))
+        .expect("newest");
+    let oldest = text
+        .iter()
+        .position(|row| row.contains("#1 pedido número 0"))
+        .expect("oldest");
+    assert!(newest < oldest, "{screen}");
+    assert!(
+        text[newest].contains("> "),
+        "newest is focused: {}",
+        text[newest]
+    );
+    assert!(text[newest].contains("volta 1 turno"), "{}", text[newest]);
+    assert!(text[oldest].contains("volta 3 turnos"), "{}", text[oldest]);
+    assert!(
+        screen.contains("Só a conversa volta; arquivos alterados ficam como estão"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("1/3 · ↑↓ navegar · Enter voltar · Esc sair"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn session_name_leads_the_rail_and_reads_as_text() {
+    let mut state = conversation();
+    state.apply_event(UiEvent::WorkspaceChanged {
+        cwd: r"C:\Users\dev\projeto".into(),
+        skill_names: Vec::new(),
+    });
+    state.apply_event(UiEvent::SessionTitleChanged {
+        title: Some("Refatorar login".into()),
+    });
+    let buffer = draw(&state);
+    let text = rows(&buffer);
+    let (x, y) = find(&text, "Refatorar login");
+    assert!(
+        text[y as usize].contains("SLIM · Refatorar login · "),
+        "{}",
+        text[y as usize]
+    );
+    let name = buffer[(x, y)].style();
+    let (rest_x, _) = find(&text[y as usize..=y as usize], "projeto");
+    let rest = buffer[(rest_x, y)].style();
+    assert_ne!(name.fg, rest.fg, "the name is brighter than the directory");
+    // Clearing the name restores the plain rail.
+    state.apply_event(UiEvent::SessionTitleChanged { title: None });
+    let text = rows(&draw(&state));
+    assert!(!text.iter().any(|row| row.contains("Refatorar login")));
+}
+
+#[test]
+fn slash_popup_offers_rename_and_rewind_with_descriptions() {
+    let mut state = conversation();
+    key(&mut state, KeyCode::Char('/'), KeyModifiers::NONE);
+    key(&mut state, KeyCode::Char('r'), KeyModifiers::NONE);
+    key(&mut state, KeyCode::Char('e'), KeyModifiers::NONE);
+    let screen = rows(&draw(&state)).join("\n");
+    assert!(
+        screen.contains("/rename") && screen.contains("nomear esta sessão"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("/rewind") && screen.contains("voltar a um turno"),
+        "{screen}"
+    );
+}

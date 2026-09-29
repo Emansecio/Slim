@@ -59,7 +59,7 @@ fn same_batch_groups_different_names_and_expands_in_provider_order() {
 
     let collapsed = render_terminal_text(&state, 120, 30);
     assert!(
-        collapsed.contains("✓ Leu, Executou 1 comando · 12ms"),
+        collapsed.contains("✓ 1 leitura, 1 comando · 12ms"),
         "{collapsed}"
     );
     assert!(
@@ -81,7 +81,7 @@ fn same_batch_groups_different_names_and_expands_in_provider_order() {
     assert_eq!(state.blocks()[0].fold, FoldState::Expanded);
     let expanded = render_terminal_text(&state, 120, 30);
     assert!(
-        expanded.contains("✓ Leu, Executou 1 comando · 12ms"),
+        expanded.contains("✓ 1 leitura, 1 comando · 12ms"),
         "{expanded}"
     );
     assert!(
@@ -125,7 +125,7 @@ fn same_batch_groups_equal_names_by_batch_identity() {
     settle(&mut state);
 
     let frame = render_terminal_text(&state, 80, 24);
-    assert!(frame.contains("✓ 2 chamadas de leitura · 7ms"), "{frame}");
+    assert!(frame.contains("✓ 2 leituras · 7ms"), "{frame}");
     assert!(!frame.contains("✓ read"), "{frame}");
 }
 
@@ -139,10 +139,7 @@ fn grouped_header_summarizes_names_counts_and_total_duration() {
     settle(&mut state);
 
     let wide = render_terminal_text(&state, 120, 30);
-    let expected = format!(
-        "3 chamadas de leitura, Executou 1 comando {} 42ms",
-        '\u{00b7}'
-    );
+    let expected = format!("3 leituras, 1 comando {} 42ms", '\u{00b7}');
     assert!(wide.contains(&expected), "{wide}");
 
     let narrow = render_terminal_text(&state, 24, 12);
@@ -172,7 +169,7 @@ fn grouped_header_omits_duration_when_any_member_has_no_duration() {
     }
 
     let frame = render_terminal_text(&state, 80, 24);
-    assert!(frame.contains("Leu, Executou 1 comando"), "{frame}");
+    assert!(frame.contains("1 leitura, 1 comando"), "{frame}");
     assert!(
         !frame.contains("3ms"),
         "partial duration must be omitted\n{frame}"
@@ -216,7 +213,7 @@ fn collapsed_thinking_does_not_split_complete_tool_groups() {
 
     let frame = render_terminal_text(&state, 80, 24);
     assert!(
-        frame.contains("✓ 4 chamadas de leitura · 7ms"),
+        frame.contains("✓ 4 leituras · 7ms"),
         "collapsed thought must not split adjacent tool groups\n{frame}"
     );
     assert_eq!(
@@ -241,7 +238,7 @@ fn consecutive_complete_tools_group_across_batches() {
     settle(&mut state);
 
     let frame = render_terminal_text(&state, 80, 24);
-    assert!(frame.contains("✓ Executou 4 comandos · 6.2s"), "{frame}");
+    assert!(frame.contains("✓ 4 comandos · 6.2s"), "{frame}");
     assert_eq!(
         frame.matches("✓ shell").count(),
         0,
@@ -275,7 +272,7 @@ fn enter_details_only_on_selected_or_last_live_collapsed_group() {
         "only the last live collapsed group may hint\n{live}"
     );
     assert!(
-        hint_lines[0].contains("Editou, Executou 1 comando"),
+        hint_lines[0].contains("1 edição, 1 comando"),
         "{hint_lines:?}"
     );
 
@@ -301,10 +298,7 @@ fn enter_details_only_on_selected_or_last_live_collapsed_group() {
         1,
         "selected collapsed group must regain the hint\n{selected}"
     );
-    assert!(
-        hint_lines[0].contains("2 chamadas de leitura"),
-        "{hint_lines:?}"
-    );
+    assert!(hint_lines[0].contains("2 leituras"), "{hint_lines:?}");
 }
 
 #[test]
@@ -374,11 +368,14 @@ fn failed_and_cancelled_members_remain_individual_and_ordered() {
     state.apply_event(UiEvent::RunCancelled { run_id: 1 });
 
     let blocks = state.blocks();
-    assert_eq!(blocks.len(), 3);
+    // Three tool rows, then the receipt that closes an interrupted turn.
+    assert_eq!(blocks.len(), 4);
+    assert!(matches!(blocks[3].kind(), BlockKind::Receipt(receipt)
+        if receipt.summary().starts_with("interrompido") && receipt.summary().contains("1 comando, 1 falhou")));
     assert_eq!(blocks[0].lifecycle, BlockLifecycle::Complete);
     assert_eq!(blocks[1].lifecycle, BlockLifecycle::Failed);
     assert_eq!(blocks[2].lifecycle, BlockLifecycle::Cancelled);
-    let names = blocks
+    let names = blocks[..3]
         .iter()
         .map(|block| match block.kind() {
             BlockKind::Tool(tool) => tool.name.as_str(),
@@ -413,13 +410,13 @@ fn fresh_tool_keeps_its_row_until_the_emphasis_expires() {
         "each just-finished call keeps a row\n{fresh}"
     );
     assert!(
-        !fresh.contains("2 chamadas de leitura"),
+        !fresh.contains("2 leituras"),
         "the group waits out the emphasis\n{fresh}"
     );
 
     settle(&mut state);
     let grouped = render_terminal_text(&state, 80, 24);
-    assert!(grouped.contains("2 chamadas de leitura"), "{grouped}");
+    assert!(grouped.contains("2 leituras"), "{grouped}");
     assert!(
         !grouped.contains("✓ read"),
         "settled calls fold into the group\n{grouped}"
@@ -463,7 +460,7 @@ fn reduced_motion_folds_a_finished_tool_immediately() {
         text.push('\n');
     }
     assert!(
-        text.contains("2 chamadas de leitura"),
+        text.contains("2 leituras"),
         "reduced motion shows the settled group\n{text}"
     );
 }
