@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::fs::{File, Metadata};
 use std::path::{Path, PathBuf};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 #[derive(Clone, Debug)]
 pub(crate) enum ToolPresentationSource {
@@ -557,13 +557,18 @@ pub(crate) struct DependencyObservation {
     pub(crate) stamp: FastStamp,
 }
 
+/// Identity of an observed dependency: kind plus normalized path.
+pub(crate) fn dependency_key(kind: DependencyKind, path: &Path) -> String {
+    let kind = match kind {
+        DependencyKind::File => "file",
+        DependencyKind::Directory => "directory",
+    };
+    format!("{kind}:{}", path_identity(path))
+}
+
 impl DependencyObservation {
     pub(crate) fn key(&self) -> String {
-        let kind = match self.stamp.kind {
-            DependencyKind::File => "file",
-            DependencyKind::Directory => "directory",
-        };
-        format!("{kind}:{}", path_identity(&self.path))
+        dependency_key(self.stamp.kind, &self.path)
     }
 
     pub(crate) fn stamp_matches(&self) -> bool {
@@ -666,7 +671,6 @@ pub(crate) struct PreparedToolInvocation {
     pub(crate) target_paths: Vec<PathBuf>,
     pub(crate) spec: Option<ToolOperationalSpec>,
     pub(crate) canonical_fingerprint: String,
-    pub(crate) preparation_us: u64,
     pub(crate) error: Option<String>,
     /// The call was rejected by deterministic argument admission before any
     /// executor could run. Workspace/path resolution failures intentionally do
@@ -691,30 +695,18 @@ impl PreparedToolInvocation {
         raw_arguments: &str,
         native_spec: Option<ToolOperationalSpec>,
     ) -> Self {
-        let started = Instant::now();
         let workspace = canonical_workspace(cwd);
-        let workspace_preparation_us = elapsed_us(started);
-        Self::from_workspace(
-            mode,
-            cwd,
-            &workspace,
-            workspace_preparation_us,
-            name,
-            raw_arguments,
-            native_spec,
-        )
+        Self::from_workspace(mode, cwd, &workspace, name, raw_arguments, native_spec)
     }
 
     pub(crate) fn from_workspace(
         mode: OperatingMode,
         cwd: &Path,
         workspace: &Result<PathBuf, String>,
-        workspace_preparation_us: u64,
         name: &str,
         raw_arguments: &str,
         native_spec: Option<ToolOperationalSpec>,
     ) -> Self {
-        let started = Instant::now();
         let (canonical_workspace, workspace_error) = match workspace {
             Ok(workspace) => (workspace.clone(), None),
             Err(message) => (absolute_fallback(cwd), Some(message.clone())),
@@ -803,7 +795,6 @@ impl PreparedToolInvocation {
             target_paths,
             spec,
             canonical_fingerprint,
-            preparation_us: workspace_preparation_us.saturating_add(elapsed_us(started)),
             error,
             structural_rejection,
         }
@@ -818,8 +809,9 @@ pub(crate) struct ToolExecutionReceipt {
     pub(crate) modified_paths: Vec<PathBuf>,
     pub(crate) revision_before: u64,
     pub(crate) revision_after: u64,
+    // Measured evidence read by tests and the performance harness only.
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) bytes_read: u64,
-    pub(crate) preparation_us: u64,
     pub(crate) execution_us: u64,
     pub(crate) finalization_us: u64,
     pub(crate) synced_text: Option<crate::codeintel::CodeIntelFileUpdate>,
@@ -831,12 +823,7 @@ pub(crate) struct ToolExecutionReceipt {
 }
 
 impl ToolExecutionReceipt {
-    pub(crate) fn unobserved(
-        prepared: &PreparedToolInvocation,
-        revision_before: u64,
-        revision_after: u64,
-        execution_us: u64,
-    ) -> Self {
+    pub(crate) fn unobserved(revision_before: u64, revision_after: u64, execution_us: u64) -> Self {
         Self {
             dependencies: Vec::new(),
             mutations: Vec::new(),
@@ -845,7 +832,6 @@ impl ToolExecutionReceipt {
             revision_before,
             revision_after,
             bytes_read: 0,
-            preparation_us: prepared.preparation_us,
             execution_us,
             finalization_us: 0,
             synced_text: None,
@@ -926,10 +912,6 @@ pub(crate) fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
         write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
     }
     output
-}
-
-fn elapsed_us(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 pub(crate) fn canonical_workspace(cwd: &Path) -> Result<PathBuf, String> {
@@ -1620,7 +1602,6 @@ fn prepare_then_run(
         mode,
         workspace,
         &canonical_workspace,
-        0,
         "shell",
         &raw,
         Some(ToolOperationalSpec {
@@ -2135,6 +2116,35 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// The digest is part of persisted causal identities: pin the algorithm
+    /// (SHA-256 over big-endian u64 length prefix + bytes, per field).
+    #[test]
+    fn hash_fields_keeps_its_length_prefixed_sha256_encoding() {
+        fn reference(fields: &[&[u8]]) -> String {
+            let mut hasher = Sha256::new();
+            for field in fields {
+                hasher.update((field.len() as u64).to_be_bytes());
+                hasher.update(field);
+            }
+            hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        }
+        let inputs: [&[&[u8]]; 5] = [
+            &[],
+            &[b""],
+            &[b"slim-causal-call-v2", b"abc", b"", b"7"],
+            &[b"ab", b"c"],
+            &["olá\0\n".as_bytes(), &[0xff, 0x00, 0x7f]],
+        ];
+        for fields in inputs {
+            assert_eq!(hash_fields(fields), reference(fields));
+        }
+        assert_ne!(hash_fields(&[b"ab", b"c"]), hash_fields(&[b"a", b"bc"]));
+    }
 
     #[test]
     fn read_presentation_caps_preserve_source_and_continuation() {

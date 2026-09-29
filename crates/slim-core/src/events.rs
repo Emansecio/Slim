@@ -32,7 +32,8 @@ pub enum CausalAnomalyKind {
     NoProgressCandidate,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Ordered from least to most trusted: `Low < Medium < High`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CausalConfidence {
     Low,

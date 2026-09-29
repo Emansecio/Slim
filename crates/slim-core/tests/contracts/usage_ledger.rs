@@ -167,6 +167,8 @@ fn ledger_separates_request_cost_drivers_and_execution_outcomes() {
     assert_eq!(compaction_request.time_to_first_semantic_ms, 6);
     assert_eq!(ledger.provider_turns, 1);
     assert_eq!(ledger.tool_calls_executed, 1);
+    // The fixture's only `ToolEvidenceReused` is a post-compaction
+    // reacquisition (the tool ran again); it is not a reused call.
     assert_eq!(ledger.tool_calls_reused, 0);
     assert_eq!(ledger.tool_calls_suppressed, 1);
     assert_eq!(ledger.no_progress_turns, 1);
@@ -178,6 +180,41 @@ fn ledger_separates_request_cost_drivers_and_execution_outcomes() {
     assert_eq!(ledger.post_compaction_reacquisitions, 1);
     assert_eq!(ledger.estimation_error_tokens, -5);
     assert!(ledger.validated_completion);
+}
+
+#[test]
+fn only_in_context_evidence_reuse_counts_as_a_reused_tool_call() {
+    let events = vec![
+        SessionEvent::new(
+            1,
+            EventKind::ToolEvidenceReused {
+                original_bytes: 100,
+                emitted_bytes: 20,
+                post_compaction: false,
+            },
+        ),
+        SessionEvent::new(
+            2,
+            EventKind::ToolEvidenceReused {
+                original_bytes: 0,
+                emitted_bytes: 0,
+                post_compaction: true,
+            },
+        ),
+        SessionEvent::new(
+            3,
+            EventKind::ToolEvidenceReused {
+                original_bytes: 50,
+                emitted_bytes: 10,
+                post_compaction: false,
+            },
+        ),
+    ];
+
+    let ledger = UsageTotals::from_events(&events, false);
+    assert_eq!(ledger.tool_calls_reused, 2);
+    assert_eq!(ledger.post_compaction_reacquisitions, 1);
+    assert_eq!(ledger.duplicate_evidence_bytes_avoided, 120);
 }
 
 #[test]
@@ -403,6 +440,32 @@ fn legacy_jev_events_deserialize_with_new_telemetry_defaults() {
             ..
         }
     ));
+}
+
+#[test]
+fn compaction_input_overflow_marks_the_ledger() {
+    let events = vec![SessionEvent::new(
+        1,
+        EventKind::CompactionAttemptCompleted {
+            uncached_input_tokens: u64::MAX,
+            cache_write_tokens: 1,
+            cache_read_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            time_to_first_byte_ms: 0,
+            time_to_first_semantic_ms: 0,
+            duration_ms: 0,
+            usage_known: true,
+            system_bytes: None,
+            history_bytes: None,
+            estimated_input_tokens: None,
+        },
+    )];
+
+    let ledger = UsageTotals::from_events(&events, false);
+
+    assert!(ledger.overflowed);
+    assert_eq!(ledger.compaction_input_tokens, u64::MAX);
 }
 
 #[test]

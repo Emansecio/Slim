@@ -1,8 +1,54 @@
 //! Small manual fixtures for the active native dispatch and preparation paths.
+use super::temp_root::TempRoot;
 use super::*;
 use crate::provider::{OpenAiCodexAdapter, ProviderConfig};
 use crate::session::{DurableSessionHeader, JsonlRepo, ManualRunJournal, ManualRunSpec};
 use std::fs;
+
+/// Executor de thread única usado para conduzir os métodos assíncronos.
+fn executor() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+/// Como `executor`, com a primeira tarefa bloqueante já paga fora da medição.
+fn warmed_executor() -> tokio::runtime::Runtime {
+    let executor = executor();
+    executor
+        .block_on(async { tokio::task::spawn_blocking(|| {}).await })
+        .unwrap();
+    executor
+}
+
+/// Cliente HTTP sobre um adaptador Codex de fixture; nada é enviado à rede.
+fn offline_codex_client() -> HttpProviderClient<OpenAiCodexAdapter> {
+    let adapter = OpenAiCodexAdapter::new(ProviderConfig::openai_codex(
+        "http://127.0.0.1:1",
+        "gpt-5.3-codex",
+        "fixture-token",
+        "fixture-account",
+    ))
+    .unwrap();
+    HttpProviderClient::new(adapter, std::time::Duration::from_secs(1)).unwrap()
+}
+
+/// Diário de execução manual gravado em `root/<file>`.
+fn manual_journal(root: &std::path::Path, file: &str) -> Arc<Mutex<ManualRunJournal>> {
+    let repo = JsonlRepo::create(
+        root.join(file),
+        DurableSessionHeader::new("perf", "now", root.to_str().unwrap(), None, None),
+    )
+    .unwrap();
+    Arc::new(Mutex::new(
+        ManualRunJournal::start(
+            repo,
+            ManualRunSpec::new("op", "attempt", "input", "final", "inspect", 0),
+        )
+        .unwrap(),
+    ))
+}
 
 fn report(label: &str, samples: &mut [f64]) {
     samples.sort_by(f64::total_cmp);
@@ -18,15 +64,7 @@ fn report(label: &str, samples: &mut [f64]) {
 #[test]
 #[ignore = "manual release measurement of parallel cached reads; no network"]
 fn parallel_cached_read_sequence() {
-    let root = std::env::temp_dir().join(format!(
-        "slim-cache-perf-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir(&root).unwrap();
+    let root = TempRoot::new("cache-perf");
     let body = "source ação 日本語 line\n".repeat(200);
     let calls: Vec<_> = (0..8)
         .map(|index| {
@@ -39,10 +77,7 @@ fn parallel_cached_read_sequence() {
             }
         })
         .collect();
-    let executor = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let executor = executor();
     let mut first = Vec::new();
     let mut warm = Vec::new();
     let mut single = Vec::new();
@@ -102,41 +137,19 @@ fn parallel_cached_read_sequence() {
     report("eight_reads_first_cache_population", &mut first);
     report("eight_reads_warm_runtime_batch", &mut warm);
     report("one_prepared_cache_hit", &mut single);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 #[ignore = "manual release measurement; isolated files and no network"]
 fn native_dispatch_and_next_request() {
-    let root = std::env::temp_dir().join(format!(
-        "slim-native-perf-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir(&root).unwrap();
+    let root = TempRoot::new("native-perf");
     fs::write(
         root.join("source.txt"),
         "source line: ação 日本語\n".repeat(4096),
     )
     .unwrap();
-    let executor = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    executor
-        .block_on(async { tokio::task::spawn_blocking(|| {}).await })
-        .unwrap();
-    let adapter = OpenAiCodexAdapter::new(ProviderConfig::openai_codex(
-        "http://127.0.0.1:1",
-        "gpt-5.3-codex",
-        "fixture-token",
-        "fixture-account",
-    ))
-    .unwrap();
-    let client = HttpProviderClient::new(adapter, std::time::Duration::from_secs(1)).unwrap();
+    let executor = warmed_executor();
+    let client = offline_codex_client();
     let history: Vec<_> = (0..64)
         .map(|i| {
             let text = format!("{i}: {}", "source: ação 日本語 \\\"field\\\"\n".repeat(256));
@@ -156,18 +169,7 @@ fn native_dispatch_and_next_request() {
             name: "read".into(),
             arguments: r#"{"path":"source.txt","offset":1,"max_lines":200}"#.into(),
         };
-        let repo = JsonlRepo::create(
-            root.join(format!("session-{i}.jsonl")),
-            DurableSessionHeader::new("perf", "now", root.to_str().unwrap(), None, None),
-        )
-        .unwrap();
-        let journal = Arc::new(Mutex::new(
-            ManualRunJournal::start(
-                repo,
-                ManualRunSpec::new("op", "attempt", "input", "final", "inspect", 0),
-            )
-            .unwrap(),
-        ));
+        let journal = manual_journal(&root, &format!("session-{i}.jsonl"));
         runtime.app.set_run_journal(Arc::clone(&journal));
         let mut messages = history.clone();
         let assistant = ProviderMessage::assistant("", vec![call.clone()]);
@@ -249,8 +251,6 @@ fn native_dispatch_and_next_request() {
     {
         report(label, values);
     }
-    // All handles are scoped to the loop; the directory was created exclusively.
-    fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]
@@ -280,16 +280,17 @@ fn fragmented_stream_costs() {
             );
             normalizer.finish(&mut app).unwrap();
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            assert_eq!(
-                app.events()
-                    .iter()
-                    .filter(|event| matches!(
-                        event.kind,
-                        crate::EventKind::AssistantTextDelta { .. }
-                    ))
-                    .count(),
-                count
-            );
+            // Adjacent deltas coalesce in the ledger: compare the text, not
+            // the event count.
+            let emitted: usize = app
+                .events()
+                .iter()
+                .map(|event| match &event.kind {
+                    crate::EventKind::AssistantTextDelta { text } => text.len(),
+                    _ => 0,
+                })
+                .sum();
+            assert_eq!(emitted, count * "source ação 日本語\n".len());
             if i > 0 {
                 samples.push(elapsed);
             }
@@ -366,15 +367,7 @@ fn short_subprocess_costs() {
 #[cfg(windows)]
 #[test]
 fn subprocess_then_dependent_read_uses_runtime_and_journal() {
-    let root = std::env::temp_dir().join(format!(
-        "slim-runner-sequence-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir(&root).unwrap();
+    let root = TempRoot::new("runner-sequence");
     let mut runtime = Runtime::new();
     let calls = vec![
         ProviderToolCall {
@@ -390,23 +383,9 @@ fn subprocess_then_dependent_read_uses_runtime_and_journal() {
             arguments: json!({"path": "receipt.txt", "max_lines": 10}).to_string(),
         },
     ];
-    let repo = JsonlRepo::create(
-        root.join("session.jsonl"),
-        DurableSessionHeader::new("perf", "now", root.to_str().unwrap(), None, None),
-    )
-    .unwrap();
-    let journal = Arc::new(Mutex::new(
-        ManualRunJournal::start(
-            repo,
-            ManualRunSpec::new("op", "attempt", "input", "final", "inspect", 0),
-        )
-        .unwrap(),
-    ));
+    let journal = manual_journal(&root, "session.jsonl");
     runtime.app.set_run_journal(Arc::clone(&journal));
-    let executor = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let executor = executor();
     let start = Instant::now();
     journal
         .lock()
@@ -434,23 +413,14 @@ fn subprocess_then_dependent_read_uses_runtime_and_journal() {
     assert_eq!(results.len(), 2);
     assert!(results.iter().all(|result| result.success), "{results:?}");
     assert!(results[1].output.contains("runtime-receipt"));
-    drop(runtime);
-    drop(journal);
-    fs::remove_dir_all(root).unwrap();
+    // `root` was declared first, so it is removed after the runtime and the
+    // journal release their files.
 }
 
 #[test]
 #[ignore = "manual release search-inspect-patch sequence; no network"]
 fn search_context_sequence() {
-    let root = std::env::temp_dir().join(format!(
-        "slim-search-context-perf-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir(&root).unwrap();
+    let root = TempRoot::new("search-context-perf");
     let source = format!(
         "{}fn timeout() {{\n// adjust timeout\n    return 10;\n}}\n{}",
         "// unchanged prefix line\n".repeat(4000),
@@ -458,21 +428,8 @@ fn search_context_sequence() {
     );
     let expected = "fn timeout() {\n// adjust timeout\n    return 10;\n}";
     let replacement = "fn timeout() {\n// adjust timeout\n    return 30;\n}";
-    let executor = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    executor
-        .block_on(async { tokio::task::spawn_blocking(|| {}).await })
-        .unwrap();
-    let adapter = OpenAiCodexAdapter::new(ProviderConfig::openai_codex(
-        "http://127.0.0.1:1",
-        "gpt-5.3-codex",
-        "fixture-token",
-        "fixture-account",
-    ))
-    .unwrap();
-    let client = HttpProviderClient::new(adapter, std::time::Duration::from_secs(1)).unwrap();
+    let executor = warmed_executor();
+    let client = offline_codex_client();
     let mut sequence = [Vec::new(), Vec::new(), Vec::new()];
     let mut next_context = [Vec::new(), Vec::new(), Vec::new()];
     for sample in 0..32 {
@@ -589,5 +546,4 @@ fn search_context_sequence() {
         "omitted_context_all_next_request_preparation",
         &mut next_context[2],
     );
-    fs::remove_dir_all(root).unwrap();
 }

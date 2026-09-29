@@ -6,9 +6,15 @@ use std::sync::atomic::AtomicU8;
 #[derive(Clone, Debug, Default)]
 pub struct ManualRetryHandle(Arc<RetryState>);
 
+/// No provider request is paused: `request` is refused.
+const UNAVAILABLE: u8 = 0;
+/// The paused request waits for the user's `/retry`.
+const WAITING: u8 = 1;
+/// The user asked for the retry; the paused request may resume.
+const ACCEPTED: u8 = 2;
+
 #[derive(Debug, Default)]
 struct RetryState {
-    // 0: unavailable, 1: waiting for user, 2: request accepted.
     state: AtomicU8,
     notify: Notify,
 }
@@ -25,7 +31,7 @@ impl ManualRetryHandle {
         if self
             .0
             .state
-            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(WAITING, ACCEPTED, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return false;
@@ -35,13 +41,13 @@ impl ManualRetryHandle {
     }
 
     pub fn is_waiting(&self) -> bool {
-        self.0.state.load(Ordering::Acquire) == 1
+        self.0.state.load(Ordering::Acquire) == WAITING
     }
 
     async fn requested(&self) {
         loop {
             let notified = self.0.notify.notified();
-            if self.0.state.load(Ordering::Acquire) == 2 {
+            if self.0.state.load(Ordering::Acquire) == ACCEPTED {
                 return;
             }
             notified.await;
@@ -52,13 +58,50 @@ impl ManualRetryHandle {
 struct RetryWaitGuard(ManualRetryHandle);
 impl Drop for RetryWaitGuard {
     fn drop(&mut self) {
-        self.0 .0.state.store(0, Ordering::Release);
+        self.0 .0.state.store(UNAVAILABLE, Ordering::Release);
     }
+}
+
+/// Reports the paused connection to the user; `detail` says why or what next.
+fn push_connecting(
+    app: &mut AppHandle,
+    next_seq: &mut u64,
+    detail: String,
+) -> Result<(), ProviderError> {
+    push_runtime_event(
+        app,
+        next_seq,
+        crate::EventKind::ProviderPhase {
+            phase: ProviderPhase::Connecting,
+            elapsed_ms: 0,
+            detail: Some(detail),
+        },
+    )
 }
 
 impl Runtime {
     pub fn set_manual_retry_handle(&mut self, handle: ManualRetryHandle) {
         self.manual_retry = Some(handle);
+    }
+
+    /// A pause is only offered for a recoverable failure that has not yet
+    /// produced side effects or visible output that a retry would duplicate.
+    fn may_pause(&self, error: &ProviderError, event_start: usize) -> bool {
+        recoverable_provider_error(error)
+            && !self.shell_jobs.running()
+            && !request_emitted_tools(&self.app, event_start)
+            && !self
+                .app
+                .events()
+                .get(event_start..)
+                .unwrap_or_default()
+                .iter()
+                .any(|event| {
+                    matches!(&event.kind,
+                        crate::EventKind::AssistantTextDelta { text }
+                        | crate::EventKind::ReasoningDelta { text }
+                        if !text.is_empty())
+                })
     }
 
     pub(super) async fn wait_for_manual_retry(
@@ -71,15 +114,7 @@ impl Runtime {
         let Some(handle) = self.manual_retry.clone() else {
             return Ok(false);
         };
-        if !recoverable_provider_error(error)
-            || self.shell_jobs.running()
-            || request_emitted_tools(&self.app, event_start)
-            || self.app.events().get(event_start..).unwrap_or_default().iter().any(|event| {
-                matches!(&event.kind,
-                    crate::EventKind::AssistantTextDelta { text } | crate::EventKind::ReasoningDelta { text }
-                    if !text.is_empty())
-            })
-        {
+        if !self.may_pause(error, event_start) {
             return Ok(false);
         }
         let delay = requested_provider_recovery_delay(error, 1, backoff);
@@ -87,36 +122,26 @@ impl Runtime {
             return Ok(false);
         };
         let guard = RetryWaitGuard(handle.clone());
-        handle.0.state.store(1, Ordering::Release);
+        handle.0.state.store(WAITING, Ordering::Release);
         push_runtime_event(&mut self.app, next_seq, crate::EventKind::ThinkingEnded)?;
         let reason = self.redact_sensitive(&provider_retry_reason(error));
-        push_runtime_event(
+        push_connecting(
             &mut self.app,
             next_seq,
-            crate::EventKind::ProviderPhase {
-                phase: ProviderPhase::Connecting,
-                elapsed_ms: 0,
-                detail: Some(format!(
-                    "Conexão pausada · /retry para tentar novamente · Esc para cancelar · {reason}"
-                )),
-            },
+            format!(
+                "Conexão pausada · /retry para tentar novamente · Esc para cancelar · {reason}"
+            ),
         )?;
-        let cancellation = self.cancellation.clone();
         let resumed = tokio::select! {
             biased;
-            _ = async {
-                match cancellation {
-                    Some(token) => token.cancelled().await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => false,
+            _ = CancellationToken::cancelled_or_pending(self.cancellation.clone()) => false,
             result = async {
                 handle.requested().await;
-                push_runtime_event(&mut self.app, next_seq, crate::EventKind::ProviderPhase {
-                    phase: ProviderPhase::Connecting,
-                    elapsed_ms: 0,
-                    detail: Some("Retry solicitado · aguardando intervalo do provedor".into()),
-                })?;
+                push_connecting(
+                    &mut self.app,
+                    next_seq,
+                    "Retry solicitado · aguardando intervalo do provedor".into(),
+                )?;
                 push_runtime_event(&mut self.app, next_seq, crate::EventKind::RetryScheduled {
                     attempt: 1,
                     limit: 1,

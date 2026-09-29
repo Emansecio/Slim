@@ -1,3 +1,5 @@
+use crate::provider::{ProviderMessage, ProviderToolCall};
+
 pub fn mode_name(mode: crate::OperatingMode) -> &'static str {
     match mode {
         crate::OperatingMode::Auto => "Auto",
@@ -12,6 +14,8 @@ pub(super) const CHANNEL_MARKER: &str = "\n\nHarness channel:";
 
 const PROJECTION_CACHE_BYTES: usize = 1024 * 1024;
 const PROJECTION_CACHE_ENTRIES: usize = 16;
+/// Smaller `write` arguments are not worth eliding.
+const MIN_ELIDED_ARGUMENT_BYTES: usize = 4096;
 
 struct CachedWrite {
     id: String,
@@ -59,46 +63,40 @@ impl WriteProjectionCache {
 
 /// Facts that match advertised tools: `ask_question` only when Auto has a route.
 pub(super) struct ChannelOverlay<'a> {
-    messages: &'a mut [crate::provider::ProviderMessage],
-    index: usize,
-    original_len: usize,
-    applied: bool,
+    messages: &'a mut [ProviderMessage],
+    /// The user message carrying the stanza and its length without it.
+    applied: Option<(usize, usize)>,
     original_arguments: Vec<(usize, usize, String)>,
 }
 
 impl<'a> ChannelOverlay<'a> {
     pub(super) fn apply(
-        messages: &'a mut [crate::provider::ProviderMessage],
+        messages: &'a mut [ProviderMessage],
         mode: crate::OperatingMode,
         can_ask: bool,
         cache: Option<&mut WriteProjectionCache>,
     ) -> Self {
         let original_arguments = project_completed_writes(messages, cache);
-        let Some(index) = messages.iter().rposition(|message| message.role == "user") else {
-            return Self {
-                messages,
-                index: 0,
-                original_len: 0,
-                applied: false,
-                original_arguments,
-            };
-        };
-        let content = &mut messages[index].content;
-        if let Some(at) = content.find(CHANNEL_MARKER) {
-            content.truncate(at);
-        }
-        let original_len = content.len();
-        content.push_str(channel_stanza(mode, can_ask));
+        let applied = messages
+            .iter()
+            .rposition(|message| message.role == "user")
+            .map(|index| {
+                let content = &mut messages[index].content;
+                if let Some(at) = content.find(CHANNEL_MARKER) {
+                    content.truncate(at);
+                }
+                let original_len = content.len();
+                content.push_str(channel_stanza(mode, can_ask));
+                (index, original_len)
+            });
         Self {
             messages,
-            index,
-            original_len,
-            applied: true,
+            applied,
             original_arguments,
         }
     }
 
-    pub(super) fn view(&self) -> &[crate::provider::ProviderMessage] {
+    pub(super) fn view(&self) -> &[ProviderMessage] {
         self.messages
     }
 }
@@ -108,10 +106,8 @@ impl Drop for ChannelOverlay<'_> {
         for (message, call, original) in self.original_arguments.drain(..) {
             self.messages[message].tool_calls[call].arguments = original;
         }
-        if self.applied {
-            self.messages[self.index]
-                .content
-                .truncate(self.original_len);
+        if let Some((index, original_len)) = self.applied {
+            self.messages[index].content.truncate(original_len);
         }
     }
 }
@@ -120,21 +116,11 @@ impl Drop for ChannelOverlay<'_> {
 // Require the native success receipt to match the payload; errors and incomplete
 // calls must retain their content for recovery. Small writes are not worth eliding.
 fn project_completed_writes(
-    messages: &mut [crate::provider::ProviderMessage],
+    messages: &mut [ProviderMessage],
     mut cache: Option<&mut WriteProjectionCache>,
 ) -> Vec<(usize, usize, String)> {
-    use sha2::{Digest, Sha256};
-    if let Some(cache) = cache.as_deref_mut() {
-        // Compaction or revised history must free capacity for current writes.
-        cache.entries.retain(|entry| {
-            messages.iter().any(|message| {
-                message
-                    .tool_calls
-                    .iter()
-                    .any(|call| call.id == entry.id && call.arguments == entry.arguments)
-            })
-        });
-        cache.bytes = cache.entries.iter().map(CachedWrite::bytes).sum();
+    if let Some(cache) = &mut cache {
+        reconcile_cache(cache, messages);
     }
     let mut replacements = Vec::new();
     for (index, message) in messages.iter().enumerate() {
@@ -142,55 +128,7 @@ fn project_completed_writes(
             continue;
         }
         for (call_index, call) in message.tool_calls.iter().enumerate() {
-            if call.name != "write" || call.arguments.len() <= 4096 {
-                continue;
-            }
-            let succeeded = |receipt: &str| {
-                messages[index + 1..].iter().any(|result| {
-                    result.role == "tool"
-                        && result.name.as_deref() == Some("write")
-                        && result.tool_call_id.as_deref() == Some(call.id.as_str())
-                        && result.content.starts_with("written ")
-                        && result.content.contains(receipt)
-                })
-            };
-            if let Some(entry) = cache.as_deref().and_then(|cache| {
-                cache
-                    .entries
-                    .iter()
-                    .find(|entry| entry.id == call.id && entry.arguments == call.arguments)
-            }) {
-                // A cached projection is not a cached success: check the receipt again.
-                if succeeded(&entry.receipt) {
-                    replacements.push((index, call_index, entry.projected.clone()));
-                }
-                continue;
-            }
-            let Ok(mut arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments)
-            else {
-                continue;
-            };
-            let Some(content) = arguments.get("content").and_then(|value| value.as_str()) else {
-                continue;
-            };
-            let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
-            let receipt = format!(
-                "; bytes={}; sha256={}; exists=true;",
-                content.len(),
-                &hash[..12]
-            );
-            if !succeeded(&receipt) {
-                continue;
-            }
-            arguments["content"] = serde_json::Value::String(format!(
-                "[successful write content elided; bytes={}; sha256={hash}; read the file if needed]",
-                content.len()
-            ));
-            let projected = arguments.to_string();
-            if projected.len() < call.arguments.len() {
-                if let Some(cache) = cache.as_deref_mut() {
-                    cache.insert(&call.id, &call.arguments, receipt, &projected);
-                }
+            if let Some(projected) = project_call(messages, index, call, cache.as_deref_mut()) {
                 replacements.push((index, call_index, projected));
             }
         }
@@ -202,6 +140,75 @@ fn project_completed_writes(
         );
     }
     replacements
+}
+
+/// Compaction or revised history must free capacity for current writes.
+fn reconcile_cache(cache: &mut WriteProjectionCache, messages: &[ProviderMessage]) {
+    cache.entries.retain(|entry| {
+        messages.iter().any(|message| {
+            message
+                .tool_calls
+                .iter()
+                .any(|call| call.id == entry.id && call.arguments == entry.arguments)
+        })
+    });
+    cache.bytes = cache.entries.iter().map(CachedWrite::bytes).sum();
+}
+
+/// The elided arguments for the `write` call `call` (in `messages[index]`), or
+/// `None` when it must stay verbatim. A fresh projection is remembered in
+/// `cache`.
+fn project_call(
+    messages: &[ProviderMessage],
+    index: usize,
+    call: &ProviderToolCall,
+    cache: Option<&mut WriteProjectionCache>,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    if call.name != "write" || call.arguments.len() <= MIN_ELIDED_ARGUMENT_BYTES {
+        return None;
+    }
+    let succeeded = |receipt: &str| {
+        messages[index + 1..].iter().any(|result| {
+            result.role == "tool"
+                && result.name.as_deref() == Some("write")
+                && result.tool_call_id.as_deref() == Some(call.id.as_str())
+                && result.content.starts_with("written ")
+                && result.content.contains(receipt)
+        })
+    };
+    if let Some(entry) = cache.as_deref().and_then(|cache| {
+        cache
+            .entries
+            .iter()
+            .find(|entry| entry.id == call.id && entry.arguments == call.arguments)
+    }) {
+        // A cached projection is not a cached success: check the receipt again.
+        return succeeded(&entry.receipt).then(|| entry.projected.clone());
+    }
+    let mut arguments = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()?;
+    let content = arguments.get("content")?.as_str()?;
+    let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let receipt = format!(
+        "; bytes={}; sha256={}; exists=true;",
+        content.len(),
+        &hash[..12]
+    );
+    if !succeeded(&receipt) {
+        return None;
+    }
+    arguments["content"] = serde_json::Value::String(format!(
+        "[successful write content elided; bytes={}; sha256={hash}; read the file if needed]",
+        content.len()
+    ));
+    let projected = arguments.to_string();
+    if projected.len() >= call.arguments.len() {
+        return None;
+    }
+    if let Some(cache) = cache {
+        cache.insert(&call.id, &call.arguments, receipt, &projected);
+    }
+    Some(projected)
 }
 
 pub(super) fn channel_stanza(mode: crate::OperatingMode, can_ask: bool) -> &'static str {

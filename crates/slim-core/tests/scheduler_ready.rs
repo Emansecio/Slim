@@ -1,10 +1,14 @@
-use std::io::{Read, Write};
+#[path = "../../../tests/support/http_fixture.rs"]
+mod http_fixture;
+
+use http_fixture::{accept_within, bind_listener, write_sse};
+use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -110,22 +114,7 @@ impl CodeIntelligence for SchedulerIntel {
 }
 
 fn accept_with_deadline(listener: &TcpListener) -> TcpStream {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                stream
-                    .set_nonblocking(false)
-                    .expect("blocking provider stream");
-                return stream;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(Instant::now() < deadline, "provider request missing");
-                thread::sleep(Duration::from_millis(1));
-            }
-            Err(error) => panic!("provider accept: {error}"),
-        }
-    }
+    accept_within(listener, Duration::from_secs(5))
 }
 
 fn read_http_body(stream: &mut TcpStream) -> String {
@@ -159,16 +148,6 @@ fn read_http_body(stream: &mut TcpStream) -> String {
     }
 }
 
-fn send_sse(stream: &mut TcpStream, body: &str) {
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(), body
-    );
-    stream
-        .write_all(response.as_bytes())
-        .expect("provider response");
-}
-
 fn tool_call(index: usize, id: &str, name: &str, arguments: Value) -> Value {
     json!({
         "index": index,
@@ -190,9 +169,7 @@ fn mutation_releases_ready_queries_as_one_ordered_revisioned_wave() {
     std::fs::create_dir_all(&root).expect("workspace");
     std::fs::write(root.join("tracked.txt"), "old\n").expect("fixture");
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("provider bind");
-    listener.set_nonblocking(true).expect("nonblocking");
-    let address = listener.local_addr().expect("provider address");
+    let (listener, address) = bind_listener();
     let server = thread::spawn(move || {
         let mut first = accept_with_deadline(&listener);
         let _ = read_http_body(&mut first);
@@ -211,12 +188,12 @@ fn mutation_releases_ready_queries_as_one_ordered_revisioned_wave() {
         let body = format!(
             "data: {calls}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
         );
-        send_sse(&mut first, &body);
+        write_sse(&mut first, &body);
 
         let mut second = accept_with_deadline(&listener);
         let request = read_http_body(&mut second);
         let done = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-        send_sse(&mut second, done);
+        write_sse(&mut second, done);
         request
     });
 

@@ -3,73 +3,58 @@
 Este arquivo registra somente o deploy vigente e o procedimento reproduzível.
 Deploys anteriores estão em [`history/2026-09.md`](history/2026-09.md).
 
-## Deploy local vigente — experiência de uso da TUI (2026-09-28)
+## Deploy local vigente — governador, jobs de shell e contabilidade de uso (2026-09-29)
 
-`.\refresh-slim.ps1` terminou com exit 0 e `OK: Slim slim 0.1.0`.
-Build release padrão: 234,73 s pelo wrapper, com um job Cargo.
-Executável no PATH: `C:\Users\Thiago Emanuel\bin\Slim.exe`, 20.132.352 bytes,
-build UTC `2026-09-29T00:41:14Z`. SHA-256 do instalado e do
-`target/release/slim.exe` idênticos:
-`60AE6FAD3FE80B2EA38D4FF74956A178DB28FE89619D000DAF30E34FD227EDAF`.
-Revisão do build: `e248c687785f4e101cd3e0bebde809b9311739a2-dirty`.
+`.\refresh-slim.ps1 -Test` terminou com exit 0 e `OK: Slim slim 0.1.0`.
+Suíte do workspace inteiro: 2.415 aprovados, 0 falhas, 41 ignorados, 64 suítes
+(259 s de testes). Build release padrão: 427,29 s pelo wrapper, com um job Cargo.
+Executável no PATH: `C:\Users\Thiago Emanuel\bin\Slim.exe`, 19.953.152 bytes.
+SHA-256 do instalado e do `target/release/slim.exe` idênticos:
+`D25411F18E09422A1B0475F9C01CF03A6314C089067364A81EF0CDB9E7BEDB89`.
+Revisão do build: `a4d638691ca301ef56247616785d97d694e79db2-dirty`.
 `Get-Command Slim` confirmou essa cópia; `--version` terminou com exit 0.
-As alterações preexistentes do checkout (inclusive de outras frentes em andamento)
-foram preservadas e incluídas no build.
 
-Muda a TUI e três pontos do core, sem timer novo. Contrato em
-[§1.2 do DESIGN](../docs/DESIGN-SLIM-TUI.md), parágrafos "Experiência de uso":
+Segunda passada no `crates/slim-core/src/runtime/`, sobre `governor`, `loop_guard`,
+`shell_jobs`, `economy`, `usage`, `mode`, `workspace`, `capability_bridge` e
+`manual_retry`. Sem mudança de contrato público, exceto a contagem de
+`tool_calls_reused` (abaixo).
 
-- **Presença desde o envio:** `● Slim` aparece sob o prompt no instante do envio e
-  vira o cabeçalho do primeiro bloco do agente sem deslocar nada.
-- **Recibo de fim de turno:** `✓ 3 arquivos · +42 -7 · 2 comandos · 6s   Ctrl+D`.
-- **Entrada:** `↑`/`↓` recuperam prompts (com composer vazio no live edge; `PageUp`
-  fixa a viewport e daí `↑`/`↓` navegam blocos como antes), `@arquivo` com busca
-  aproximada e anexo do conteúdo (8 arquivos, 256 KiB cada, 1 MiB no total; nome de
-  segredo, binário e caminho fora do workspace recusam o prompt), `!comando` no
-  shell do usuário só no modo Auto, pela ferramenta `shell` do agente.
-- **Sessões:** `/resume` com lista, título, idade e filtro; `/rename` (arquivo
-  `.meta.json` ao lado da sessão); `/rewind` forka a sessão antes de um turno
-  concluído, troca para o fork e devolve o prompt ao composer. Só a conversa volta,
-  arquivos alterados não são restaurados; a sessão original fica intacta.
-- **Progresso de chamada longa:** `Preparando edição · 4,2 KB` enquanto o modelo
-  escreve uma chamada grande. Antes, o `PreparingTool` só chegava ao fim do
-  stream (medido com um SSE segurado por 1,5 s).
+- **Estrutura:** `governor.rs` virou `governor/{mod,compaction,evidence,observation,tests}.rs`;
+  `UsageTotals::from_events` (370 linhas) virou um `LedgerBuilder` com métodos por família de
+  evento; `observe_after`, `observe_evidence`, `compaction_snapshot`, `execute_managed_shell` e
+  `start` foram decompostos. Funções acima de 100 linhas no módulo: 9 para 1 (a que resta é
+  `initial_paths`, que contém a confinação de caminho e não foi tocada).
+- **Tamanho:** o módulo cresceu de 6.259 para 6.731 linhas (+7,5%): produção de 3.469 para
+  3.745 e testes de 2.790 para 2.986. Não houve redução de volume: helpers, tipos de fase e
+  guardas das correções custam mais do que a duplicação removida.
+- **Correções de comportamento**, cada uma com teste que falhava antes:
+  - a validação que termina depois de uma mutação não certifica mais o estado novo como
+    "verde" (a revisão gravada é a do início da chamada);
+  - `shell_jobs`: `elapsed_ms` é fixado na conclusão do job, não na entrega; a entrega segue
+    ordem numérica (`shell-2` antes de `shell-10`); um cancelamento já pedido impede o
+    comando de nascer (o executor de shell só conferia o token depois de criar o processo);
+  - no Windows, `write New.txt` e `write new.txt` de um arquivo ainda inexistente não entram
+    mais juntos no mesmo cluster de mutações paralelas (chave de agendamento sem distinção
+    de caixa; `path_identity` ficou intocado porque alguns chamadores usam o texto como caminho);
+  - `tool_calls_reused` passa a contar `ToolEvidenceReused` com `post_compaction:false` (antes
+    ficava sempre 0 no JSON e no texto do headless); o teste de contrato do fixture antigo
+    continua 0 porque aquele evento era `post_compaction:true` (reaquisição, não reuso);
+  - `normalize_output` só corta o sufixo ` | ms` quando há dígitos;
+  - `LoopGuard` guarda um hash do erro, não o texto inteiro, e usa um único slot para a
+    repetição imediata de shell/write/patch.
+- **Neutro:** `hash_fields` deixou de existir em duas cópias; a cadeia `preparation_us`, sem
+  leitor, foi removida; `CompactionSummary` acumula sobre `UsageBreakdown` em vez de um
+  `UsageTotals` inteiro; `Runtime::can_ask(mode)` substitui três cálculos do gate de
+  `ask_question`; `TempRoot` único de teste com limpeza automática; `Rig` de testes do governor.
+- **Testes:** `slim-core --lib` de 393 para 415; `contracts` de 59 para 61.
 
-Pontos de segurança tocados, todos aditivos: o `ProviderEventRedactor` agora conta
-bytes de argumentos e emite `ProviderEvent::ToolCallProgress { name, bytes }` (nome
-redigido, sem conteúdo; a retenção do conteúdo e o portão de segredo em `Stopped`
-não mudaram; teste com credencial registrada na chamada em escrita); leitura de
-arquivo por `@` usa `resolve_workspace_path_from_root` com limites próprios; `!`
-usa o gate de modo do core sem alterá-lo; o fork de `/rewind` cria uma sessão nova
-com `id == stem` e não toca o original. `resolve_workspace_path*`,
-`workspace_sessions_dir`, `ensure_resume_preflight`, `allows_mutation` e
-`names_for_mode` não foram alterados.
+Não alterado por decisão: `path_identity` (texto e chave são usados juntos), o `status` de job
+concluído que repete a saída, limites de tempo em `shutdown`/`await` dos jobs, os limites sem
+aviso do governador (256 dependências observadas, 4.096 fingerprints), a oscilação A→B→A que
+conta como progresso, e a divergência entre as duas definições de "uso conhecido" (ledger contra
+acumulador de compactação; nenhum provider atual as separa).
 
-Checks desta rodada (execuções feitas antes do build):
-
-- `cargo test --offline -p slim-tui`: lib 362 e integração 287 aprovados, 0 falhas.
-- `slim-cli` (`test-slim.ps1 -Lib -TestTarget tui_bridge,tui_runtime,session_continuation,tui_pty,ask_question_tui`):
-  lib 186, ask_question_tui 4, session_continuation 5, tui_bridge 27, tui_pty 4
-  (1 ignorado, exige ConPTY real), tui_runtime 3; todos aprovados.
-- `slim-core`: lib 360 aprovados (13 ignorados) e os alvos de integração, incluindo
-  os novos `provider_tool_progress` (2) e `session_turns`/`workspace_files`. **Uma
-  falha:** `agent_loop::provider_recovery_retries_headers_timeout_when_no_tools_ran`
-  (timeout de headers esgota a recuperação automática em 2/2). Ela está em
-  `tests/agent_loop.rs`, arquivo com alterações não commitadas de outra frente, e
-  trata de recuperação de conexão, não de chamadas de ferramenta; não a investiguei
-  contra o HEAD, então não afirmo que seja anterior a esta mudança.
-- `cargo clippy --offline -p slim-tui -p slim-cli --all-targets` e
-  `-p slim-core --lib --test provider_tool_progress --test provider_http`, com
-  `-D warnings` permitindo `manual_clamp` e `bool_to_int_with_if`: exit 0.
-  rustfmt dos três crates e `git diff --check` passaram.
-
-Não foram executados: a suíte completa do workspace, `slim-lsp`, o console físico
-(ConPTY real), uma sessão com provider real, `!`/`@`/`/rewind` num terminal de
-verdade (só via estado, quadros renderizados e o worker com providers de teste), o
-movimento (varredura, caret) em terminal físico, e a sonda de lock de sessão em
-Unix (só o caminho de Windows foi exercitado). O agente que implementou o lado host
-das sessões rodou os mesmos alvos do `slim-cli` e o clippy do crate; os números
-acima são da minha execução final.
+Não foram executados: console físico (ConPTY real) e sessão com provider real.
 
 ## Build e deploy local
 

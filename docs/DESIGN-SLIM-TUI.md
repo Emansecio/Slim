@@ -3566,8 +3566,14 @@ Se um renderer de bloco falha:
 Política de recuperação do provider (revisada em 20/09/2026):
 
 - até duas recuperações consecutivas por requisição; sucesso reinicia esse contador,
-  sem reiniciar o teto global de seis recuperações por execução nem `max_turns`;
-  desde 27/09/2026 cada retry reenvia o turno atual e não consome `max_turns`;
+  sem reiniciar `max_turns`; desde 27/09/2026 cada retry reenvia o turno atual e não
+  consome `max_turns`;
+- o teto global de seis recuperações (e a espera acumulada de `Retry-After`) vale por
+  episódio: reinicia depois de um lote de ferramentas que o governor classifica como
+  progresso (`WorkspaceChanged`, `ValidationGreen`, `NewEvidence`,
+  `DiagnosticsChanged`, `ExternalInput`). Falha distinta, dependência alterada,
+  resposta vazia, retry, texto parcial e evidência repetida não contam; sem progresso o
+  sétimo esgotamento continua terminal (29/09/2026);
 - resposta normalmente encerrada sem texto útil nem ferramentas admite uma
   recuperação por requisição, contando no teto global; vazio repetido é falha explícita;
 - preservar efeitos já executados e não reenviar uma requisição que já emitiu ferramentas;

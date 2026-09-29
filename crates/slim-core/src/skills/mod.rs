@@ -9,7 +9,6 @@ pub use invocation::{
     invoke_script, invoke_script_with_limits, launch_path_for_powershell, resolve_script_path,
     validate_invocation, SkillInvocationError, DEFAULT_SKILL_OUTPUT_BYTES, DEFAULT_SKILL_TIMEOUT,
 };
-pub(crate) use invocation::{invoke_script_with_limits_and_runner, SkillInvocationRequest};
 pub use metadata::{read_body, read_metadata, SkillMetadata};
 
 /// Default script name after treating blank / `./` prefixes as `run.ps1`.

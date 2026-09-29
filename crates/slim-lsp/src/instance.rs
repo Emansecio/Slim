@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use slim_core::runtime::CancellationToken;
 use tokio::sync::Mutex;
 
-use crate::diagnostics::DiagnosticsStore;
+use crate::diagnostics::{DiagnosticsStore, ErrorKey, StoredDiagnostics};
 use crate::discovery::ServerSpec;
 use crate::document::{DocumentContent, DocumentStore, DocumentUpdate, FileStamp};
 use crate::position::{encoding_from_lsp_name, PositionEncoding};
@@ -174,6 +174,17 @@ pub struct DiagnosticsSnapshot {
     pub items: Vec<lsp_types::Diagnostic>,
 }
 
+/// Answer for one edited file after the server validated it.
+pub(crate) struct EditDiagnosticsOutcome {
+    /// The server published for the document's current version.
+    pub(crate) fresh: bool,
+    /// `errors` excludes errors that existed before the edits.
+    pub(crate) baseline_known: bool,
+    pub(crate) errors: Vec<lsp_types::Diagnostic>,
+    pub(crate) encoding: PositionEncoding,
+    pub(crate) content: Arc<DocumentContent>,
+}
+
 struct InstanceState {
     ready: bool,
     caps: Option<ServerCapabilities>,
@@ -188,7 +199,20 @@ struct InstanceState {
     progress_overflow: usize,
     documents: DocumentStore,
     diagnostics: DiagnosticsStore,
+    /// Woken after every stored publication so post-edit waiters do not poll.
+    diagnostics_changed: Arc<tokio::sync::Notify>,
+    /// Errors known before the first unreported edit of a file. `None` inside
+    /// means nothing certified was known (no fresh publication, truncated
+    /// store, or the edit itself opened the document).
+    baselines: std::collections::HashMap<url::Url, Option<Vec<ErrorKey>>>,
 }
+
+/// Files whose pre-edit errors are remembered; bounded like the store itself.
+const MAX_EDIT_BASELINES: usize = crate::diagnostics::DEFAULT_MAX_DIAGNOSTIC_URIS;
+
+/// Quiet time after a fresh publication before the answer is taken, so a
+/// syntax pass followed by a semantic pass is read as one result.
+const EDIT_DIAGNOSTICS_SETTLE: Duration = Duration::from_millis(200);
 
 /// Distinct in-flight progress tokens tracked per server. WorkDone cycles
 /// number in the handful; the cap only bounds a misbehaving flood.
@@ -210,7 +234,29 @@ impl InstanceState {
                 crate::diagnostics::DEFAULT_MAX_DIAGNOSTICS_PER_URI,
                 crate::diagnostics::DEFAULT_MAX_DIAGNOSTIC_URIS,
             ),
+            diagnostics_changed: Arc::new(tokio::sync::Notify::new()),
+            baselines: std::collections::HashMap::new(),
         }
+    }
+
+    /// Remembers the certified errors of `uri` before an edit changes it. The
+    /// first edit since the last report wins; later edits keep that reference.
+    fn capture_baseline(&mut self, uri: &url::Url, previous_version: Option<i64>) {
+        let Some(version) = previous_version else {
+            // A fresh open certifies nothing about the file's earlier state, and
+            // its own first publication becomes the reference for later edits.
+            self.baselines.remove(uri);
+            return;
+        };
+        if self.baselines.contains_key(uri) || self.baselines.len() >= MAX_EDIT_BASELINES {
+            return;
+        }
+        let known = self
+            .diagnostics
+            .get(uri)
+            .filter(|stored| !stored.stale && stored.version == Some(version))
+            .and_then(StoredDiagnostics::error_keys);
+        self.baselines.insert(uri.clone(), known);
     }
 
     fn indexing_active(&self) -> bool {
@@ -416,6 +462,7 @@ impl LspServerInstance {
                     guard
                         .diagnostics
                         .set(canonical_uri, version, params.diagnostics);
+                    guard.diagnostics_changed.notify_waiters();
                 }
             }
             "$/progress" => {
@@ -558,7 +605,11 @@ impl LspServerInstance {
             transport: &self.transport,
             committed: false,
         };
-        self.state.lock().await.diagnostics.invalidate(&uri);
+        {
+            let mut state = self.state.lock().await;
+            state.capture_baseline(&uri, previous.as_ref().map(|document| document.version));
+            state.diagnostics.invalidate(&uri);
+        }
         if previous.is_none() {
             let evicted = self
                 .state
@@ -781,6 +832,135 @@ impl LspServerInstance {
             },
             truncated: stored.truncated,
             items,
+        })
+    }
+
+    /// Waits for the server to validate the current version of an open
+    /// document, then returns the errors introduced since the last report (all
+    /// errors when no certified reference exists). Waits at most until
+    /// `deadline`; `None` means the document is not open, the connection is
+    /// gone or the caller cancelled.
+    ///
+    /// The server is the only source of truth: a publication counts only when
+    /// it is not stale and carries exactly the document's current version. A
+    /// server that stays silent yields `fresh: false`, never "no errors".
+    pub(crate) async fn edit_diagnostics(
+        &self,
+        path: &Path,
+        deadline: tokio::time::Instant,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<EditDiagnosticsOutcome> {
+        let path = crate::path_policy::existing_workspace_path(&self.config.root, path)?;
+        let uri = file_uri(&path)?;
+        let changed = self.state.lock().await.diagnostics_changed.clone();
+        let cancelled = async {
+            match cancellation {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(cancelled);
+        loop {
+            // Register before reading state so a publication between the read
+            // and the wait cannot be missed.
+            let notified = changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let fresh = {
+                let state = self.state.lock().await;
+                let document = state.documents.get(&path)?;
+                state
+                    .diagnostics
+                    .get(&uri)
+                    .is_some_and(|stored| !stored.stale && stored.version == Some(document.version))
+            };
+            if self.transport.is_closed() {
+                return None;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let wake_at = if fresh {
+                deadline.min(now + EDIT_DIAGNOSTICS_SETTLE)
+            } else {
+                deadline
+            };
+            tokio::select! {
+                () = &mut notified => {}
+                () = tokio::time::sleep_until(wake_at) => break,
+                () = &mut cancelled => return None,
+            }
+        }
+        let mut state = self.state.lock().await;
+        let (version, content) = {
+            let document = state.documents.get(&path)?;
+            (document.version, Arc::clone(&document.content))
+        };
+        let encoding = state.encoding;
+        let stored = state
+            .diagnostics
+            .get(&uri)
+            .filter(|stored| !stored.stale && stored.version == Some(version))
+            .cloned();
+        let Some(stored) = stored else {
+            return Some(EditDiagnosticsOutcome {
+                fresh: false,
+                baseline_known: false,
+                errors: Vec::new(),
+                encoding,
+                content,
+            });
+        };
+        let errors = stored
+            .items
+            .iter()
+            .filter(|item| crate::diagnostics::is_error(item))
+            .cloned()
+            .collect::<Vec<_>>();
+        let baseline = state.baselines.get(&uri).cloned().flatten();
+        let current = stored.error_keys();
+        let baseline_known = baseline.is_some() && current.is_some();
+        let new_errors = match baseline {
+            Some(before) if baseline_known => {
+                let mut remaining = std::collections::HashMap::<ErrorKey, usize>::new();
+                for key in before {
+                    *remaining.entry(key).or_default() += 1;
+                }
+                errors
+                    .into_iter()
+                    .filter(
+                        |item| match remaining.get_mut(&crate::diagnostics::error_key(item)) {
+                            Some(count) if *count > 0 => {
+                                *count -= 1;
+                                false
+                            }
+                            _ => true,
+                        },
+                    )
+                    .collect()
+            }
+            _ => errors,
+        };
+        // Errors seen now become the reference for the next batch, so an error
+        // the agent chooses to keep is not reported again.
+        match current {
+            Some(keys) => {
+                if state.baselines.contains_key(&uri) || state.baselines.len() < MAX_EDIT_BASELINES
+                {
+                    state.baselines.insert(uri, Some(keys));
+                }
+            }
+            None => {
+                state.baselines.remove(&uri);
+            }
+        }
+        Some(EditDiagnosticsOutcome {
+            fresh: true,
+            baseline_known,
+            errors: new_errors,
+            encoding,
+            content,
         })
     }
 

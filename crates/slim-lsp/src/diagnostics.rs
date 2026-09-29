@@ -18,6 +18,35 @@ pub const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 8 * 1024;
 /// leaves at the lowest severities.
 pub const DEFAULT_MAX_DIAGNOSTIC_BYTES_PER_URI: usize = 256 * 1024;
 
+/// Identity of an error independent of its position, which shifts with edits.
+pub type ErrorKey = (Option<String>, String);
+
+pub fn error_key(item: &Diagnostic) -> ErrorKey {
+    let code = item.code.as_ref().map(|code| match code {
+        lsp_types::NumberOrString::Number(number) => number.to_string(),
+        lsp_types::NumberOrString::String(text) => text.clone(),
+    });
+    (code, item.message.clone())
+}
+
+pub fn is_error(item: &Diagnostic) -> bool {
+    item.severity == Some(DiagnosticSeverity::ERROR)
+}
+
+impl StoredDiagnostics {
+    /// Error identities of this publication, or `None` when the store dropped
+    /// items and the set can no longer serve as a complete reference.
+    pub fn error_keys(&self) -> Option<Vec<ErrorKey>> {
+        (!self.truncated).then(|| {
+            self.items
+                .iter()
+                .filter(|item| is_error(item))
+                .map(error_key)
+                .collect()
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StoredDiagnostics {
     pub uri: Url,

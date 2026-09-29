@@ -889,6 +889,36 @@ Toda resposta traz metadados: `server`, `state`, `completeness`, `document_versi
 `stale`, `elapsed_ms`. Resultados são limitados e truncados por `max_results` (sem cursor ou offset),
 agrupados por arquivo, e cada linha de referência/símbolo inclui contexto de uma linha.
 
+#### Diagnósticos pós-edição (29/09/2026)
+
+Sem chamar `code_intel`, o loop anexa ao próximo request uma mensagem curta com os
+**erros novos** dos arquivos que `write`/`patch` alteraram no lote
+(`CodeIntelligence::diagnostics_after_edits`, padrão "sem servidor"):
+
+- só com servidor **já quente**: nunca inicia processo; sem servidor, nada é dito;
+- vale apenas a publicação sem `stale` cuja versão é exatamente a do documento após o
+  `didChange`; publicação de versão anterior é descartada;
+- espera até 1,5 s (mais 200 ms de silêncio após a primeira publicação) e cancelamento
+  interrompe a espera. Servidor calado é **"não verificado"**, nunca "sem erros", e
+  isso é mencionado no máximo uma vez por execução;
+- regressão = erros de severidade *error* que não estavam na linha de base capturada
+  antes da primeira edição do lote (comparação por código e mensagem, sem posição;
+  a linha de base vira o estado relatado, então um erro mantido não se repete). Arquivo
+  aberto pela própria edição não tem linha de base e a mensagem avisa que os erros
+  podem ser anteriores;
+- limites: 8 erros (4 por arquivo), 160 caracteres por mensagem, 12 arquivos por lote;
+  edição limpa não gera mensagem;
+- o texto do diagnóstico vem do workspace: é achatado (sem quebras de linha,
+  controles nem bidi), passa por `redact_sensitive` e vem sob cabeçalho "dados não
+  confiáveis". Diagnósticos do editor não substituem build nem testes.
+
+Limites conhecidos: o rust-analyzer roda com `checkOnSave=false`, então só há
+diagnósticos nativos do arquivo editado; um chamador quebrado em **outro** arquivo não
+aparece (exigiria `cargo check`, que leva de segundos a minutos). Edições feitas por
+`shell` não sincronizam. A espera de 1,5 s pode ser paga integralmente se o servidor
+real não republicar diagnósticos inalterados (comportamento não medido aqui: o
+rust-analyzer não está instalado nesta máquina; a fixture usa o mock).
+
 ### 7.2 Arquitetura
 
 ```text

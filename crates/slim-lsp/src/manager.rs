@@ -42,6 +42,8 @@ pub const MAX_CONTEXT_LINE_CHARS: usize = 120;
 /// ~100k entries; scanning is cheap per item yet unbounded work is unbounded.
 const MAX_REFERENCE_SCAN: usize = 65_536;
 const MAX_DISCOVERY_CACHE_ENTRIES: usize = 32;
+/// Edited files validated per batch; the rest is left to `code_intel`.
+const MAX_POST_EDIT_FILES: usize = 12;
 
 #[derive(Clone, Debug)]
 pub struct LspManagerConfig {
@@ -1779,6 +1781,105 @@ impl CodeIntelligence for LspCodeIntelligence {
                 "files": files,
             }),
         }
+    }
+
+    async fn diagnostics_after_edits(
+        &self,
+        workspace: &Path,
+        paths: &[PathBuf],
+        deadline: Duration,
+        cancellation: Option<slim_core::runtime::CancellationToken>,
+    ) -> Option<slim_core::codeintel::EditDiagnosticsReport> {
+        use slim_core::codeintel::{
+            EditDiagnostic, EditDiagnosticsReport, EditFileDiagnostics, EditVerification,
+        };
+        let (root, spec) = self.resolve(workspace).ok()?;
+        // Warm only: validating an edit must never start a language server.
+        let lease = self
+            .pool
+            .acquire_warm(&root, &spec.id, &self.config.server_config)
+            .await?;
+        let instance = lease.instance();
+        let deadline = tokio::time::Instant::now() + deadline;
+        let mut documents = OperationDocuments::new(&root, self.workspace_revision(&root));
+        let mut files = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for path in paths.iter().take(MAX_POST_EDIT_FILES) {
+            if cancellation
+                .as_ref()
+                .is_some_and(slim_core::runtime::CancellationToken::is_cancelled)
+            {
+                return None;
+            }
+            let Some(path) = crate::path_policy::existing_workspace_path(&root, path) else {
+                continue;
+            };
+            if instance.language_id_for(&path).is_none() || !seen.insert(path.clone()) {
+                continue;
+            }
+            let relative = documents.relative_path(&path).unwrap_or_default();
+            let unverified = || EditFileDiagnostics {
+                path: relative.clone(),
+                verification: EditVerification::Unverified,
+                errors: Vec::new(),
+            };
+            if !instance.document_is_open(&path).await
+                && Self::ensure_document(instance, &mut documents, &path)
+                    .await
+                    .is_none()
+            {
+                files.push(unverified());
+                continue;
+            }
+            let Some(outcome) = instance
+                .edit_diagnostics(&path, deadline, cancellation.as_ref())
+                .await
+            else {
+                if cancellation
+                    .as_ref()
+                    .is_some_and(slim_core::runtime::CancellationToken::is_cancelled)
+                {
+                    return None;
+                }
+                files.push(unverified());
+                continue;
+            };
+            if !outcome.fresh {
+                files.push(unverified());
+                continue;
+            }
+            let errors = outcome
+                .errors
+                .into_iter()
+                .map(|item| {
+                    let (line, column) = Self::human_position(
+                        outcome.encoding,
+                        &outcome.content,
+                        item.range.start.line,
+                        item.range.start.character,
+                    );
+                    EditDiagnostic {
+                        line,
+                        column,
+                        code: item.code.as_ref().map(diagnostic_code_string),
+                        message: item.message,
+                    }
+                })
+                .collect();
+            files.push(EditFileDiagnostics {
+                path: relative,
+                verification: if outcome.baseline_known {
+                    EditVerification::Verified
+                } else {
+                    EditVerification::VerifiedWithoutBaseline
+                },
+                errors,
+            });
+        }
+        (!files.is_empty()).then(|| EditDiagnosticsReport {
+            server: spec.id.clone(),
+            files,
+        })
     }
 
     async fn notify_file_changed(&self, workspace: &Path, path: &Path, text: Option<String>) {

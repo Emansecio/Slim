@@ -194,6 +194,23 @@ impl UsageBreakdown {
             .saturating_add(self.cache_write_tokens)
             .saturating_add(self.cache_read_tokens)
     }
+
+    /// Adds `other` into this breakdown, saturating; an unknown figure stays
+    /// unknown.
+    pub(crate) fn absorb(&mut self, other: UsageBreakdown) {
+        self.uncached_input_tokens = self
+            .uncached_input_tokens
+            .saturating_add(other.uncached_input_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+        self.usage_unknown |= other.usage_unknown;
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -281,12 +298,19 @@ impl ProviderErrorMetadata {
                     | "slow_down"
             )
         );
-        let recognized_status = self
-            .status
-            .is_none_or(|status| matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 529));
+        let recognized_status = self.status.is_none_or(is_transient_http_status);
         (recognized_transient && recognized_status) || matches!(self.status, Some(502..=504))
     }
 }
+
+/// HTTP statuses the runtime may retry when nothing observable happened.
+pub(crate) fn is_transient_http_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 529)
+}
+
+/// Identity of a stream that closed without a terminal event; the runtime
+/// recognizes it by this text.
+pub(crate) const STREAM_ENDED_EARLY_MESSAGE: &str = "provider stream ended before completion";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderError {
@@ -362,6 +386,42 @@ impl ProviderError {
                 ..
             }
         )
+    }
+
+    /// The HTTP status carried by an HTTP or structured API failure.
+    pub(crate) fn status(&self) -> Option<u16> {
+        match self {
+            Self::Http { status, .. } => Some(*status),
+            Self::Api { metadata, .. } => metadata.status,
+            _ => None,
+        }
+    }
+
+    /// The human-readable message of every variant that carries one.
+    pub(crate) fn message(&self) -> Option<&str> {
+        match self {
+            Self::Transport { message, .. }
+            | Self::Remote { message }
+            | Self::TransientRemote { message }
+            | Self::Http { message, .. }
+            | Self::Api { message, .. }
+            | Self::InvalidResponse { message } => Some(message),
+            Self::MalformedToolCall | Self::Cancelled => None,
+        }
+    }
+
+    /// Appends `suffix` to the message; variants without one are unchanged.
+    pub(crate) fn with_suffix(mut self, suffix: &str) -> Self {
+        match &mut self {
+            Self::Transport { message, .. }
+            | Self::Remote { message }
+            | Self::TransientRemote { message }
+            | Self::Http { message, .. }
+            | Self::Api { message, .. }
+            | Self::InvalidResponse { message } => message.push_str(suffix),
+            Self::MalformedToolCall | Self::Cancelled => {}
+        }
+        self
     }
 }
 
@@ -1347,8 +1407,9 @@ fn harden_compaction_request<A: ProviderAdapter + ?Sized>(
     Ok(request)
 }
 
+pub(crate) const COMPACTION_MAX_OUTPUT_TOKENS: u64 = 2_048;
+
 fn harden_compaction_body(body: &mut Value, anthropic_wire: bool) -> Result<(), ProviderError> {
-    const COMPACTION_MAX_OUTPUT_TOKENS: u64 = 2_048;
     let object = body
         .as_object_mut()
         .ok_or_else(|| ProviderError::InvalidResponse {
@@ -1517,9 +1578,11 @@ pub async fn run_http_provider_messages<A: ProviderAdapter>(
     })?;
     if result.is_ok() && provider_messages_are_text_only(messages) {
         let ledger = crate::runtime::UsageTotals::from_events(&app.events()[event_start..], false);
-        if let Some(usage) = ledger.requests.first().filter(|usage| {
-            !usage.usage_unknown && !usage.response_cache_hit && !usage.cancelled && !usage.failed
-        }) {
+        if let Some(usage) = ledger
+            .requests
+            .first()
+            .filter(|usage| usage.usable_for_calibration())
+        {
             direct_token_estimator()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2617,7 +2680,7 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         }
         let result = match result {
             Ok(_) if !saw_stopped => Err(ProviderError::InvalidResponse {
-                message: "provider stream ended before completion".into(),
+                message: STREAM_ENDED_EARLY_MESSAGE.into(),
             }),
             result => result,
         };
@@ -3203,7 +3266,7 @@ impl ProviderEventRedactor {
         match event {
             ProviderEvent::TextDelta(text) => {
                 self.flush_reasoning(&mut output);
-                let ready = take_redacted_event_chunk(
+                let ready = crate::runtime::take_redacted_stream_chunk(
                     &mut self.text_pending,
                     &text,
                     &self.sensitive_values,
@@ -3215,7 +3278,7 @@ impl ProviderEventRedactor {
             }
             ProviderEvent::ReasoningDelta(text) => {
                 self.flush_text(&mut output);
-                let ready = take_redacted_event_chunk(
+                let ready = crate::runtime::take_redacted_stream_chunk(
                     &mut self.reasoning_pending,
                     &text,
                     &self.sensitive_values,
@@ -3294,15 +3357,19 @@ impl ProviderEventRedactor {
 
 impl ProviderEventRedactor {
     fn flush_textual(&mut self, output: &mut Vec<ProviderEvent>) {
-        let ready =
-            take_redacted_event_chunk(&mut self.text_pending, "", &self.sensitive_values, true);
+        let ready = crate::runtime::take_redacted_stream_chunk(
+            &mut self.text_pending,
+            "",
+            &self.sensitive_values,
+            true,
+        );
         if !ready.is_empty() {
             output.push(ProviderEvent::TextDelta(ready));
         }
     }
 
     fn flush_reasoning(&mut self, output: &mut Vec<ProviderEvent>) {
-        let ready = take_redacted_event_chunk(
+        let ready = crate::runtime::take_redacted_stream_chunk(
             &mut self.reasoning_pending,
             "",
             &self.sensitive_values,
@@ -3315,60 +3382,6 @@ impl ProviderEventRedactor {
 
     fn flush_text(&mut self, output: &mut Vec<ProviderEvent>) {
         self.flush_textual(output);
-    }
-}
-
-fn take_redacted_event_chunk(
-    pending: &mut String,
-    delta: &str,
-    sensitive_values: &[String],
-    flush: bool,
-) -> String {
-    pending.push_str(delta);
-    if sensitive_values.is_empty() {
-        return std::mem::take(pending);
-    }
-    let split_at = if flush {
-        pending.len()
-    } else {
-        safe_provider_stream_split(pending, sensitive_values)
-    };
-    let tail = pending[split_at..].to_owned();
-    let ready = redact_values(&pending[..split_at], sensitive_values);
-    *pending = tail;
-    ready
-}
-
-fn safe_provider_stream_split(input: &str, sensitive_values: &[String]) -> usize {
-    let held_bytes = sensitive_values
-        .iter()
-        .flat_map(|value| {
-            value
-                .char_indices()
-                .skip(1)
-                .map(move |(index, _)| &value[..index])
-        })
-        .filter(|prefix| input.ends_with(prefix))
-        .map(str::len)
-        .max()
-        .unwrap_or(0);
-    let mut split_at = input.len().saturating_sub(held_bytes);
-    loop {
-        let adjusted = sensitive_values
-            .iter()
-            .flat_map(|value| {
-                input
-                    .match_indices(value)
-                    .map(move |(start, _)| (start, start + value.len()))
-            })
-            .filter(|(start, end)| *start < split_at && split_at < *end)
-            .map(|(start, _)| start)
-            .min()
-            .unwrap_or(split_at);
-        if adjusted == split_at {
-            return split_at;
-        }
-        split_at = adjusted;
     }
 }
 
@@ -5997,6 +6010,59 @@ mod finalization_tests {
         });
         assert!(redactor.error.is_some());
         assert!(!format!("{events:?}").contains("secret-"));
+    }
+
+    #[test]
+    fn provider_and_runtime_stream_redaction_agree_on_every_fragmentation() {
+        let mut secrets = vec![
+            "sk-live-abc".to_owned(),
+            "abc".into(),
+            String::new(),
+            "segredo".into(),
+        ];
+        normalize_sensitive_values(&mut secrets);
+        let text = "x sk-live-abc y abc sk-live-ab segredo ação sk-live-abcabc \u{65e5}segred";
+        let expected = crate::runtime::redact_values(&secrets, text);
+        assert_eq!(redact_values(text, &secrets), expected);
+        let boundaries = (0..=text.len())
+            .filter(|index| text.is_char_boundary(*index))
+            .collect::<Vec<_>>();
+        for &first in &boundaries {
+            for &second in boundaries.iter().filter(|second| **second >= first) {
+                let parts = [&text[..first], &text[first..second], &text[second..]];
+                let mut redactor = ProviderEventRedactor::new(secrets.clone());
+                let mut streamed = String::new();
+                let mut collect = |events: Vec<ProviderEvent>| {
+                    for event in events {
+                        if let ProviderEvent::TextDelta(text) = event {
+                            streamed.push_str(&text);
+                        }
+                    }
+                };
+                let mut pending = String::new();
+                let mut direct = String::new();
+                for part in parts {
+                    collect(redactor.push(ProviderEvent::TextDelta(part.into())));
+                    direct.push_str(&crate::runtime::take_redacted_stream_chunk(
+                        &mut pending,
+                        part,
+                        &secrets,
+                        false,
+                    ));
+                }
+                collect(redactor.push(ProviderEvent::Stopped {
+                    reason: "stop".into(),
+                }));
+                direct.push_str(&crate::runtime::take_redacted_stream_chunk(
+                    &mut pending,
+                    "",
+                    &secrets,
+                    true,
+                ));
+                assert_eq!(streamed, expected, "split at {first}/{second}");
+                assert_eq!(direct, expected, "split at {first}/{second}");
+            }
+        }
     }
 
     fn progress_of(events: &[ProviderEvent]) -> Vec<(Option<String>, u64)> {

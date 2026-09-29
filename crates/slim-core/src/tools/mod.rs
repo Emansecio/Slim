@@ -24,10 +24,10 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 pub(crate) use execution::{
-    canonical_workspace, digest_bytes, path_identity, present_unstructured, CodeIntelPresentation,
-    DependencyKind, DependencyObservation, FastStamp, MutationObservation, PreparedToolArguments,
-    PreparedToolInvocation, ToolExecutionError, ToolExecutionOutcome, ToolExecutionReceipt,
-    ToolPresentationSource,
+    canonical_workspace, dependency_key, digest_bytes, hash_fields, path_identity,
+    present_unstructured, CodeIntelPresentation, DependencyKind, DependencyObservation, FastStamp,
+    MutationObservation, PreparedToolArguments, PreparedToolInvocation, ToolExecutionError,
+    ToolExecutionOutcome, ToolExecutionReceipt, ToolPresentationSource,
 };
 
 pub(crate) use code_intel::presentation_for_code_intel;
@@ -406,7 +406,8 @@ impl ToolServices {
     }
 }
 
-fn lock_mutex<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+/// Locks, recovering the guard when a panicking holder poisoned the mutex.
+pub(crate) fn lock_mutex<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     value
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -488,6 +489,25 @@ pub struct ToolResult {
     pub success: bool,
     pub output: String,
     pub artifact: Option<ArtifactHandle>,
+}
+
+impl ToolResult {
+    pub(crate) fn new(name: impl Into<String>, success: bool, output: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            success,
+            output: output.into(),
+            artifact: None,
+        }
+    }
+
+    pub(crate) fn ok(name: impl Into<String>, output: impl Into<String>) -> Self {
+        Self::new(name, true, output)
+    }
+
+    pub(crate) fn fail(name: impl Into<String>, output: impl Into<String>) -> Self {
+        Self::new(name, false, output)
+    }
 }
 
 /// Internal allowance for one model-facing tool projection.
@@ -678,10 +698,6 @@ impl ToolRegistry {
         self.sensitive_values = Arc::from(sensitive_values);
     }
 
-    pub(crate) fn process_runner(&self) -> &ProcessRunner {
-        &self.services.process_runner
-    }
-
     pub(crate) fn prepare_invocation(
         &self,
         mode: OperatingMode,
@@ -705,10 +721,7 @@ impl ToolRegistry {
         calls: &[(String, String)],
     ) -> Vec<PreparedToolInvocation> {
         let cwd = cwd.as_ref();
-        let started = Instant::now();
         let workspace = canonical_workspace(cwd);
-        let workspace_preparation_us =
-            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         calls
             .iter()
             .map(|(name, arguments)| {
@@ -716,7 +729,6 @@ impl ToolRegistry {
                     mode,
                     cwd,
                     &workspace,
-                    workspace_preparation_us,
                     name,
                     arguments,
                     self.operational_spec(name),
@@ -951,12 +963,7 @@ impl ToolRegistry {
                     output.push_str(&context);
                 }
                 (
-                    ToolResult {
-                        name: prepared.name.clone(),
-                        success: false,
-                        output,
-                        artifact: None,
-                    },
+                    ToolResult::fail(prepared.name.clone(), output),
                     failure.dependencies,
                     failure.mutations,
                     failure.bytes_read,
@@ -995,7 +1002,6 @@ impl ToolRegistry {
                 revision_before,
                 revision_after,
                 bytes_read,
-                preparation_us: prepared.preparation_us,
                 execution_us,
                 finalization_us,
                 synced_text,

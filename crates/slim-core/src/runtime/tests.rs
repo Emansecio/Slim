@@ -1,17 +1,12 @@
 use super::*;
 use serde_json::json;
 
+use super::temp_root::TempRoot;
+
 #[cfg(windows)]
 #[test]
 fn shell_log_is_redacted_and_paged_by_session_artifact_id() {
-    let root = std::env::temp_dir().join(format!(
-        "slim-shell-log-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root = TempRoot::new("shell-log");
     let workspace = root.join("workspace");
     let artifacts = root.join("artifacts");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -101,21 +96,12 @@ fn shell_log_is_redacted_and_paged_by_session_artifact_id() {
         .unwrap();
     assert!(!corrupt.success);
     assert!(corrupt.output.contains("InvalidData"));
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(windows)]
 #[test]
 fn then_run_preserves_its_long_validation_output() {
-    let root = std::env::temp_dir().join(format!(
-        "slim-then-run-log-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
+    let root = TempRoot::new("then-run-log");
     let mut runtime = Runtime::with_artifact_store(root.join(".slim/artifacts")).unwrap();
     let (result, seq) = runtime
         .execute_tool(
@@ -148,7 +134,6 @@ fn then_run_preserves_its_long_validation_output() {
         .unwrap();
     assert!(page.success, "{}", page.output);
     assert!(page.output.contains(&"Q".repeat(12000)));
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -275,14 +260,7 @@ fn jev_plan_gate_uses_cache_price_and_observed_reduction() {
         }
     }
     let summarized = vec![
-        ProviderMessage::assistant(
-            "read",
-            vec![ProviderToolCall {
-                id: "r".into(),
-                name: "read".into(),
-                arguments: "{}".into(),
-            }],
-        ),
+        ProviderMessage::assistant("read", vec![tool_call("r", "read", "{}")]),
         ProviderMessage::tool("read", "r", "x".repeat(8_000)),
     ];
     let selection = CompactionSelection {
@@ -327,14 +305,7 @@ fn valid_checkpoint(detail: &str) -> String {
 
 #[tokio::test]
 async fn compaction_archive_recovers_original_outputs_and_chains_checkpoints() {
-    let root = std::env::temp_dir().join(format!(
-        "slim-indexed-compaction-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root = TempRoot::new("indexed-compaction");
     let mut runtime = Runtime::with_artifact_store(&root).unwrap();
     runtime.register_sensitive_value("private-fixture-token");
     let original = ProviderMessage::tool(
@@ -427,18 +398,13 @@ async fn compaction_archive_recovers_original_outputs_and_chains_checkpoints() {
         .unwrap();
     assert!(outside.contains("native read cannot access this artifact outside the workspace"));
     assert!(!outside.contains("use read on"));
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
 async fn compaction_checkpoint_carries_the_tool_call_manifest() {
     let runtime = Runtime::new();
     let mut assistant = ProviderMessage::assistant("reading", Vec::new());
-    assistant.tool_calls = vec![crate::provider::ProviderToolCall {
-        id: "call-1".into(),
-        name: "read".into(),
-        arguments: "{\"path\":\"a.rs\"}".into(),
-    }];
+    assistant.tool_calls = vec![tool_call("call-1", "read", "{\"path\":\"a.rs\"}")];
     let selection = CompactionSelection {
         root_instruction: "root".into(),
         summarized: vec![
@@ -477,11 +443,7 @@ async fn compaction_manifest_yields_to_higher_priority_recovery_metadata() {
         ..CompactionPolicy::default()
     }));
     let mut assistant = ProviderMessage::assistant("reading", Vec::new());
-    assistant.tool_calls = vec![crate::provider::ProviderToolCall {
-        id: "call-1".into(),
-        name: "read".into(),
-        arguments: "{\"path\":\"a.rs\"}".into(),
-    }];
+    assistant.tool_calls = vec![tool_call("call-1", "read", "{\"path\":\"a.rs\"}")];
     let selection = CompactionSelection {
         root_instruction: "root".into(),
         summarized: vec![
@@ -569,14 +531,7 @@ async fn compaction_archive_reserves_bounded_facts_without_an_artifact_store() {
 
 #[tokio::test]
 async fn impossible_checkpoint_budget_does_not_create_recovery_artifact() {
-    let root = std::env::temp_dir().join(format!(
-        "slim-checkpoint-transaction-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root = TempRoot::reserved("checkpoint-transaction");
     let mut runtime = Runtime::with_artifact_store(&root).unwrap();
     runtime.set_compaction_handle(CompactionHandle::new(CompactionPolicy {
         summary_max_bytes: 128,
@@ -731,15 +686,7 @@ fn generic_reasoning_stream_does_not_invent_a_classification() {
 #[tokio::test]
 async fn journal_failure_cancels_and_drains_started_mutations() {
     use crate::session::{DurableSessionHeader, JsonlRepo, ManualRunJournal, ManualRunSpec};
-    let root = std::env::temp_dir().join(format!(
-        "slim-drain-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir(&root).unwrap();
+    let root = TempRoot::new("drain");
     for name in ["first.txt", "waiting.txt"] {
         std::fs::write(root.join(name), "before").unwrap();
     }
@@ -750,10 +697,12 @@ async fn journal_failure_cancels_and_drains_started_mutations() {
     let calls = ["first.txt", "waiting.txt"]
         .iter()
         .enumerate()
-        .map(|(i, name)| ProviderToolCall {
-            id: format!("write-{i}"),
-            name: "write".into(),
-            arguments: json!({"path":name,"content":"after","expected":"before"}).to_string(),
+        .map(|(i, name)| {
+            provider_call(
+                &format!("write-{i}"),
+                "write",
+                json!({"path":name,"content":"after","expected":"before"}),
+            )
         })
         .collect::<Vec<_>>();
     let repo = JsonlRepo::create(
@@ -826,7 +775,6 @@ async fn journal_failure_cancels_and_drains_started_mutations() {
         2
     );
     drop((first_lock, waiting_lock, runtime));
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -848,15 +796,7 @@ async fn ordinary_mcp_configuration_preserves_native_arguments_and_durable_ids()
     };
     let secrets = transport.sensitive_values().cloned().collect::<Vec<_>>();
     assert_eq!(secrets, ["synthetic-credential-long-42"]);
-    let root = std::env::temp_dir().join(format!(
-        "slim-ordinary-config-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir(&root).unwrap();
+    let root = TempRoot::new("ordinary-config");
     std::fs::write(root.join("production.json"), "first\nsecond\n").unwrap();
     let mut runtime = Runtime::new();
     for secret in &secrets {
@@ -924,7 +864,6 @@ async fn ordinary_mcp_configuration_preserves_native_arguments_and_durable_ids()
     let durable = std::fs::read_to_string(root.join("session.jsonl")).unwrap();
     assert!(durable.contains("call-0") && durable.contains("call-1"));
     assert!(!durable.contains("synthetic-credential-long-42"));
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1244,7 +1183,7 @@ fn fenced_and_double_encoded_arguments_are_accepted() {
 
 #[test]
 fn invalid_json_escapes_are_repaired_without_touching_valid_ones() {
-    let normalized = |raw: &str| normalize_tool_arguments(raw).into_owned();
+    let normalized = |raw: &str| object_arguments(raw).0.into_owned();
     assert_eq!(
         normalized(r#"{"path":"C:\Slim\src"}"#),
         r#"{"path":"C:\\Slim\\src"}"#
@@ -1268,14 +1207,85 @@ fn invalid_json_escapes_are_repaired_without_touching_valid_ones() {
 #[test]
 fn fenced_and_double_encoded_escapes_are_repaired_at_the_inner_layer() {
     assert_eq!(
-        normalize_tool_arguments("```json\n{\"path\":\"a.txt\"}\n```").as_ref(),
+        object_arguments("```json\n{\"path\":\"a.txt\"}\n```")
+            .0
+            .as_ref(),
         r#"{"path":"a.txt"}"#
     );
     let double_encoded = r#""{\"content\":\"literal \\* star\"}""#;
     assert_eq!(
-        normalize_tool_arguments(double_encoded).as_ref(),
+        object_arguments(double_encoded).0.as_ref(),
         r#"{"content":"literal \\* star"}"#
     );
+}
+
+#[test]
+fn object_arguments_matches_the_multi_parse_normalization() {
+    fn reference(raw: &str) -> String {
+        let trimmed = tool_arguments::strip_json_fence(raw.trim());
+        if let Ok(Value::String(inner)) = serde_json::from_str::<Value>(trimmed) {
+            if serde_json::from_str::<Value>(&inner).is_ok_and(|value| value.is_object()) {
+                return inner;
+            }
+            if let Some(repaired) = tool_arguments::repaired_json_object(&inner) {
+                return repaired;
+            }
+        }
+        if serde_json::from_str::<Value>(trimmed).is_ok_and(|value| value.is_object()) {
+            return trimmed.to_owned();
+        }
+        tool_arguments::repaired_json_object(trimmed).unwrap_or_else(|| trimmed.to_owned())
+    }
+    let cases = [
+        r#"{"path":"a.txt"}"#,
+        r#"  {"path":"a.txt"}  "#,
+        "```json\n{\"path\":\"a.txt\"}\n```",
+        "```JSON {\"path\":\"a.txt\"}```",
+        "```\n{\"path\":\"a.txt\"}",
+        r#""{\"path\":\"a.txt\"}""#,
+        r#""{\"content\":\"literal \\* star\"}""#,
+        r#""{\"content\":\"lone \\q\"}""#,
+        r#""not json""#,
+        r#""[1,2]""#,
+        r#""""#,
+        r#"{"path":"C:\Slim\src"}"#,
+        r#"{"a":"\u12","b":"\x"}"#,
+        r#"{"path":"a.txt""#,
+        r#"{"path":"a.txt"} tail"#,
+        r#"{"path":1e999}"#,
+        r#"["a"]"#,
+        r#"[1,2"#,
+        "42",
+        "null",
+        "true",
+        "",
+        "   ",
+        "not json at all",
+        r#""\q""#,
+        r#""{\"a\":1} extra""#,
+    ];
+    for raw in cases {
+        let (text, shape) = object_arguments(raw);
+        assert_eq!(text.as_ref(), reference(raw), "{raw}");
+        let parsed = serde_json::from_str::<Value>(text.as_ref());
+        assert_eq!(
+            shape.is_object(),
+            parsed.as_ref().is_ok_and(Value::is_object),
+            "{raw}"
+        );
+        let expected_issue = match &parsed {
+            Ok(value) if value.is_object() => None,
+            Ok(_) => Some("arguments must be a JSON object".to_owned()),
+            Err(error) => Some(error.to_string()),
+        };
+        assert_eq!(shape.issue(), expected_issue, "{raw}");
+        assert_eq!(
+            validate_tool_arguments("read", raw).is_ok(),
+            shape.is_object(),
+            "{raw}"
+        );
+        assert!(validate_tool_arguments(" ", raw).is_err(), "{raw}");
+    }
 }
 
 #[test]
@@ -1765,11 +1775,7 @@ fn evidence_dedup_requires_the_original_tool_content_in_active_history() {
         ProviderMessage::user("read the file"),
         ProviderMessage::assistant(
             "",
-            vec![ProviderToolCall {
-                id: "original".into(),
-                name: "read".into(),
-                arguments: r#"{"path":"file.txt"}"#.into(),
-            }],
+            vec![tool_call("original", "read", r#"{"path":"file.txt"}"#)],
         ),
         original,
         ProviderMessage::assistant("done", vec![]),
@@ -1792,12 +1798,16 @@ fn evidence_dedup_requires_the_original_tool_content_in_active_history() {
     assert!(!tool_output_already_in_context(&compacted, "read", pointer));
 }
 
-fn call(id: &str, name: &str, path: &str) -> ProviderToolCall {
+fn tool_call(id: &str, name: &str, arguments: impl Into<String>) -> ProviderToolCall {
     ProviderToolCall {
         id: id.into(),
         name: name.into(),
-        arguments: format!(r#"{{"path":"{path}"}}"#),
+        arguments: arguments.into(),
     }
+}
+
+fn call(id: &str, name: &str, path: &str) -> ProviderToolCall {
+    tool_call(id, name, format!(r#"{{"path":"{path}"}}"#))
 }
 
 #[test]
@@ -1915,6 +1925,78 @@ fn elision_keeps_the_read_taken_after_the_last_write() {
 }
 
 #[test]
+fn elision_scopes_recycled_call_ids_to_their_own_assistant_turn() {
+    let first = "a version ".repeat(40);
+    let second = "b version ".repeat(40);
+    let mut messages = vec![
+        ProviderMessage::user("fix b"),
+        ProviderMessage::assistant("", vec![call("0", "read", "a.txt")]),
+        ProviderMessage::tool("read", "0", &first),
+        ProviderMessage::assistant("", vec![call("0", "read", "b.txt")]),
+        ProviderMessage::tool("read", "0", &second),
+        ProviderMessage::assistant("", vec![call("0", "write", "b.txt")]),
+        ProviderMessage::tool(
+            "write",
+            "0",
+            "written b.txt; bytes=9; sha256=abc; exists=true; do not re-read",
+        ),
+    ];
+    let stats = elide_superseded_tool_outputs(&mut messages);
+    assert_eq!(stats.elided, 1);
+    assert_eq!(messages[2].content, first, "a.txt was never written");
+    assert_eq!(
+        messages[4].content,
+        "[superseded read output elided; b.txt was overwritten by a later write]"
+    );
+}
+
+#[test]
+fn tool_call_path_reads_the_same_path_as_a_full_parse() {
+    fn reference(arguments: &str) -> Option<(String, String)> {
+        let raw = serde_json::from_str::<Value>(arguments)
+            .ok()?
+            .get("path")?
+            .as_str()?
+            .to_owned();
+        let key = crate::tools::path_identity(Path::new(&raw));
+        (!key.is_empty()).then_some((key, raw))
+    }
+    let big = "x".repeat(4096);
+    let cases = [
+        r#"{"path":"a.txt"}"#.to_owned(),
+        r#"{"path":"dir\\sub/a.txt","content":"c"}"#.to_owned(),
+        format!(r#"{{"content":"{big}\nç\"","path":"src\\lib.rs","n":[1,{{"path":"no"}}]}}"#),
+        r#"{"path":"escaped-key.txt"}"#.to_owned(),
+        r#"{"path":"first","path":"second"}"#.to_owned(),
+        r#"{"path":"first","path":7}"#.to_owned(),
+        r#"{"path":7}"#.to_owned(),
+        r#"{"path":null,"x":true}"#.to_owned(),
+        r#"{"path":["a"]}"#.to_owned(),
+        r#"{"path":{"path":"nested"}}"#.to_owned(),
+        r#"{"path":""}"#.to_owned(),
+        r#"{"Path":"case.txt"}"#.to_owned(),
+        r#"{"a":1.5e3,"b":-2,"c":18446744073709551616,"path":"n.txt"}"#.to_owned(),
+        r#"{}"#.to_owned(),
+        r#"[]"#.to_owned(),
+        r#"["a.txt"]"#.to_owned(),
+        r#""a.txt""#.to_owned(),
+        r#"null"#.to_owned(),
+        String::new(),
+        r#"{"path":"a.txt""#.to_owned(),
+        r#"{"path":"a.txt"} trailing"#.to_owned(),
+        r#"{"path":"a.txt",}"#.to_owned(),
+        r#"{"path":"bad \q escape"}"#.to_owned(),
+    ];
+    for arguments in &cases {
+        assert_eq!(
+            super::history_elision::tool_call_path(arguments),
+            reference(arguments),
+            "{arguments}"
+        );
+    }
+}
+
+#[test]
 fn elision_ignores_other_paths_failed_mutations_and_reruns_idempotently() {
     let output = "content ".repeat(50);
     let mut messages = vec![
@@ -1929,14 +2011,7 @@ fn elision_ignores_other_paths_failed_mutations_and_reruns_idempotently() {
         ProviderMessage::assistant("", vec![call("w2", "write", "c.txt")]),
         ProviderMessage::tool("write", "w2", "stale read: c.txt; no write applied"),
         // No path in the arguments: nothing to key on, never elides.
-        ProviderMessage::assistant(
-            "",
-            vec![ProviderToolCall {
-                id: "r2".into(),
-                name: "read".into(),
-                arguments: "invalid".into(),
-            }],
-        ),
+        ProviderMessage::assistant("", vec![tool_call("r2", "read", "invalid")]),
         ProviderMessage::tool("read", "r2", &output),
     ];
     let stats = elide_superseded_tool_outputs(&mut messages);
@@ -1949,6 +2024,58 @@ fn elision_ignores_other_paths_failed_mutations_and_reruns_idempotently() {
         elide_superseded_tool_outputs(&mut messages),
         ElisionStats::default()
     );
+}
+
+#[test]
+fn truncate_result_marker_stays_within_the_byte_limit() {
+    assert_eq!(truncate_result("short", 50), "short");
+    for (input, limit) in [("x".repeat(100), 50), ("日本語".repeat(20), 50)] {
+        let truncated = truncate_result(&input, limit);
+        assert!(truncated.len() <= limit, "{} > {limit}", truncated.len());
+        assert!(truncated.ends_with("\n[truncated]"));
+        assert!(input.starts_with(truncated.trim_end_matches("\n[truncated]")));
+    }
+    // Too small for the marker: a plain cut still respects the limit.
+    assert_eq!(truncate_result(&"x".repeat(100), 5), "xxxxx");
+}
+
+#[test]
+fn redaction_ignores_empty_secrets() {
+    let secrets = vec![String::new(), "secret".to_owned()];
+    assert_eq!(redact_values(&secrets, "abc"), "abc");
+    assert_eq!(
+        redact_values(&secrets, "a secret b"),
+        "a [REDACTED] b",
+        "an empty value must not be spliced between characters"
+    );
+}
+
+#[test]
+fn tool_progress_announcement_redacts_the_tool_name() {
+    let mut normalizer =
+        ProviderStreamNormalizer::new(ProviderKind::OpenAiCompatible, 1, vec!["sk-secret".into()]);
+    let mut app = AppHandle::fake();
+    normalizer.push(
+        &mut app,
+        ProviderEvent::ToolCallProgress {
+            name: Some("sk-secret".into()),
+            bytes: 10,
+        },
+    );
+
+    let details: Vec<_> = app
+        .events()
+        .iter()
+        .filter_map(|event| match &event.kind {
+            crate::EventKind::ProviderPhase {
+                phase: ProviderPhase::PreparingTool,
+                detail,
+                ..
+            } => detail.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(details, ["[REDACTED] · 10 B"]);
 }
 
 #[test]
@@ -2107,29 +2234,20 @@ impl crate::codeintel::CodeIntelligence for FixtureCodeIntel {
 
 #[tokio::test]
 async fn native_patch_passes_sequential_ranges_through_runtime() {
-    let root = std::env::temp_dir().join(format!(
-        "slim-runtime-patch-sync-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
+    let root = TempRoot::new("runtime-patch-sync");
     let original = "fn \u{e9}\u{1f680}e\u{301}first() {}\r\nfn second() {}\r\n";
     std::fs::write(root.join("main.rs"), original).unwrap();
     let backend = Arc::new(FixtureCodeIntel::default());
     let mut runtime = Runtime::new();
     runtime.set_code_intelligence(backend.clone());
-    let calls = vec![ProviderToolCall {
-        id: "patch".into(),
-        name: "patch".into(),
-        arguments: json!({"path":"main.rs", "edits":[
+    let calls = vec![provider_call(
+        "patch",
+        "patch",
+        json!({"path":"main.rs", "edits":[
             {"expected":"first", "replacement":"first_longer() {}\nfn inserted"},
             {"expected":"second", "replacement":"updated"}
-        ]})
-        .to_string(),
-    }];
+        ]}),
+    )];
     let (results, _) = runtime
         .execute_provider_tool_batch(
             crate::OperatingMode::Auto,
@@ -2163,13 +2281,12 @@ async fn native_patch_passes_sequential_ranges_through_runtime() {
     assert_eq!(patch.edits[1].start.prefix, "fn ");
     drop(updates);
     drop(runtime);
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(windows)]
 #[tokio::test]
 async fn fused_shell_syncs_the_file_after_the_shell_runs() {
-    let root = batch_fixture_root("fused-sync");
+    let root = TempRoot::new("fused-sync");
     std::fs::write(root.join("source.rs"), "before").unwrap();
     let backend = Arc::new(FixtureCodeIntel::default());
     let mut runtime = Runtime::new();
@@ -2205,20 +2322,11 @@ async fn fused_shell_syncs_the_file_after_the_shell_runs() {
     assert!(backend.updates.lock().unwrap().is_empty());
     assert_eq!(backend.changes.lock().unwrap().as_slice(), &[None]);
     drop(runtime);
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
 async fn cancellation_interrupts_post_patch_synchronization() {
-    let root = std::env::temp_dir().join(format!(
-        "slim-runtime-sync-cancel-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
+    let root = TempRoot::new("runtime-sync-cancel");
     std::fs::write(root.join("main.rs"), "old").unwrap();
     let backend = Arc::new(FixtureCodeIntel {
         sync_blocked: true,
@@ -2228,12 +2336,11 @@ async fn cancellation_interrupts_post_patch_synchronization() {
     let mut runtime = Runtime::new();
     runtime.set_code_intelligence(backend.clone());
     runtime.set_cancellation_token(cancellation.clone());
-    let calls = vec![ProviderToolCall {
-        id: "patch".into(),
-        name: "patch".into(),
-        arguments: json!({"path":"main.rs", "edits":[{"expected":"old", "replacement":"new"}]})
-            .to_string(),
-    }];
+    let calls = vec![provider_call(
+        "patch",
+        "patch",
+        json!({"path":"main.rs", "edits":[{"expected":"old", "replacement":"new"}]}),
+    )];
     let mut governor = CausalGovernor::default();
     let execute = runtime.execute_provider_tool_batch(
         crate::OperatingMode::Auto,
@@ -2256,7 +2363,6 @@ async fn cancellation_interrupts_post_patch_synchronization() {
         std::fs::read_to_string(root.join("main.rs")).unwrap(),
         "new"
     );
-    std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[tokio::test]
@@ -2300,7 +2406,7 @@ async fn code_intel_completed_negative_answer_stays_successful() {
 
 #[tokio::test]
 async fn code_intel_invalid_path_never_reaches_backend_and_valid_scope_is_preserved() {
-    let root = batch_fixture_root("code-intel-path-types");
+    let root = TempRoot::new("code-intel-path-types");
     let path = root.join("ação com espaço.rs");
     std::fs::write(&path, "fn target() {}\n").unwrap();
     let backend = Arc::new(FixtureCodeIntel::default());
@@ -2360,12 +2466,11 @@ async fn code_intel_invalid_path_never_reaches_backend_and_valid_scope_is_preser
         vec![Some(std::fs::canonicalize(&path).unwrap()); 2]
     );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn target() {}\n");
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
 async fn code_intel_startup_diagnostic_is_redacted_in_results_and_events() {
-    let root = batch_fixture_root("code-intel-stderr-redaction");
+    let root = TempRoot::new("code-intel-stderr-redaction");
     std::fs::write(root.join("main.rs"), "fn target() {}\n").unwrap();
     let mut runtime = Runtime::new();
     runtime.register_sensitive_value("private-lsp-token");
@@ -2414,12 +2519,134 @@ async fn code_intel_startup_diagnostic_is_redacted_in_results_and_events() {
         .unwrap()
         .contains("private-lsp-token"));
     drop(runtime);
-    std::fs::remove_dir_all(root).unwrap();
+}
+
+const SEQUENTIAL_LSP_SECRET: &str = "sequential-lsp-secret";
+
+/// Runs a `code_intel` call whose backend echoes the secret in its diagnostic,
+/// straight through the sequential executor (not the batch scheduler).
+async fn sequential_code_intel_with_secret(
+    runtime: &mut Runtime,
+    root: &std::path::Path,
+) -> ToolResult {
+    runtime.register_sensitive_value(SEQUENTIAL_LSP_SECRET);
+    runtime.set_code_intelligence(Arc::new(FixtureCodeIntel {
+        fail: true,
+        failure_reason: Some(
+            "initialization failed: eof\nserver stderr:\nsysroot unavailable: sequential-lsp-secret",
+        ),
+        ..Default::default()
+    }));
+    let arguments = json!({
+        "action":"definition", "path":"main.rs", "line":1, "column":4,
+    })
+    .to_string();
+    let prepared = runtime.tools.prepare_invocation(
+        crate::OperatingMode::Auto,
+        root,
+        "code_intel",
+        &arguments,
+    );
+    let (result, _) = runtime
+        .execute_code_intel(
+            ToolInvocation {
+                batch_id: "sequential-redaction",
+                call_id: "code-intel",
+                name: "code_intel",
+                arguments: &arguments,
+            },
+            &prepared,
+            1,
+        )
+        .await
+        .unwrap();
+    result
+}
+
+#[tokio::test]
+async fn sequential_code_intel_returns_redacted_output_and_matching_event() {
+    let root = TempRoot::new("code-intel-sequential-redaction");
+    std::fs::write(root.join("main.rs"), "fn target() {}\n").unwrap();
+    let mut runtime = Runtime::new();
+    let result = sequential_code_intel_with_secret(&mut runtime, &root).await;
+    assert!(!result.success);
+    assert!(result.output.contains("sysroot unavailable"));
+    assert!(result.output.contains("[REDACTED]"));
+    assert!(!result.output.contains(SEQUENTIAL_LSP_SECRET));
+    let event_output = runtime
+        .app
+        .events()
+        .iter()
+        .find_map(|event| match &event.kind {
+            crate::EventKind::ToolOutput { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .expect("ToolOutput event");
+    assert_eq!(event_output, result.output);
+    assert!(!serde_json::to_string(runtime.app.events())
+        .unwrap()
+        .contains(SEQUENTIAL_LSP_SECRET));
+}
+
+#[tokio::test]
+async fn sequential_result_redacted_before_it_reaches_the_artifact_store() {
+    let root = TempRoot::new("code-intel-artifact-redaction");
+    std::fs::write(root.join("main.rs"), "fn target() {}\n").unwrap();
+    let mut runtime = Runtime::with_artifact_store(root.join(".slim/artifacts")).unwrap();
+    let result = sequential_code_intel_with_secret(&mut runtime, &root).await;
+    let mut results = [result];
+    // A one-byte cap forces the redacted output into the artifact store.
+    runtime
+        .materialize_results(&mut results, 1, None, 100)
+        .await
+        .unwrap();
+    let handle = results[0].artifact.clone().expect("output stored");
+    let stored = std::fs::read_to_string(&handle.path).unwrap();
+    assert!(stored.contains("sysroot unavailable"));
+    assert!(stored.contains("[REDACTED]"));
+    assert!(!stored.contains(SEQUENTIAL_LSP_SECRET));
+    assert!(!results[0].output.contains(SEQUENTIAL_LSP_SECRET));
+}
+
+#[test]
+fn todo_tool_returns_redacted_output_and_matching_event() {
+    let cwd = std::env::temp_dir();
+    let mut runtime = Runtime::new();
+    runtime.register_sensitive_value("todo-secret-value");
+    runtime.prepare_loop_capabilities(&cwd).unwrap();
+    let (result, _) = runtime
+        .execute_todo(
+            crate::OperatingMode::Auto,
+            ToolInvocation {
+                batch_id: "todo-redaction",
+                call_id: "create",
+                name: "todo",
+                arguments: &json!({"todos":[
+                    {"title":"rotate todo-secret-value", "status":"pending"}
+                ]})
+                .to_string(),
+            },
+            1,
+        )
+        .unwrap();
+    assert!(result.success, "{}", result.output);
+    assert!(result.output.contains("[REDACTED]"), "{}", result.output);
+    assert!(!result.output.contains("todo-secret-value"));
+    let event_output = runtime
+        .app
+        .events()
+        .iter()
+        .find_map(|event| match &event.kind {
+            crate::EventKind::ToolOutput { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .expect("ToolOutput event");
+    assert_eq!(event_output, result.output);
 }
 
 #[tokio::test]
 async fn code_intel_batch_preserves_admission_feedback_in_output_event() {
-    let root = batch_fixture_root("code-intel-admission");
+    let root = TempRoot::new("code-intel-admission");
     std::fs::write(root.join("main.rs"), "fn target() {}\n").unwrap();
     let mut runtime = Runtime::new();
     runtime.set_code_intelligence(Arc::new(FixtureCodeIntel::default()));
@@ -2469,12 +2696,11 @@ async fn code_intel_batch_preserves_admission_feedback_in_output_event() {
             _ => None,
         });
     assert_eq!(event_output, Some(&results[0].output));
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn native_shell_process_facts_keep_nonterminating_error_boundary() {
-    let root = batch_fixture_root("shell-process-facts");
+    let root = TempRoot::new("shell-process-facts");
     let mut runtime = Runtime::new();
     let (result, _) = runtime
         .execute_tool(
@@ -2502,7 +2728,6 @@ fn native_shell_process_facts_keep_nonterminating_error_boundary() {
     assert!(process.stderr_bytes > 0, "{process:?}");
     assert!(!process.timed_out, "{process:?}");
     assert!(!process.cancelled, "{process:?}");
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -2599,7 +2824,7 @@ fn todo_reviews_are_bounded_and_do_not_invent_statuses() {
 
 #[test]
 fn skill_listing_keeps_invalid_skill_diagnostics_accessible() {
-    let root = batch_fixture_root("skill-diagnostics");
+    let root = TempRoot::new("skill-diagnostics");
     let skill_root = root.join("skills");
     std::fs::create_dir_all(skill_root.join("broken")).unwrap();
     std::fs::write(skill_root.join("broken/SKILL.md"), "invalid").unwrap();
@@ -2620,21 +2845,20 @@ fn skill_listing_keeps_invalid_skill_diagnostics_accessible() {
         assert!(listing.output.contains("broken"));
         assert!(listing.output.contains("missing frontmatter"));
         assert_eq!(listing.output.contains("valid: works"), with_valid);
-        runtime.skill_discovery_cache = Some((root.clone(), Some(discovery)));
+        runtime.skill_discovery_cache = Some((root.to_path_buf(), Some(discovery)));
         assert!(runtime
             .workspace_tool_definitions(crate::OperatingMode::Auto, &root)
             .iter()
             .any(|tool| tool["name"] == "skill"));
     }
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn skill_profile_is_discovered_once_and_refreshed_next_run() {
-    let root = batch_fixture_root("skill-profile");
+    let root = TempRoot::new("skill-profile");
     let mut runtime = Runtime::new();
     runtime.prepare_loop_capabilities(&root).unwrap();
-    runtime.skill_discovery_cache = Some((root.clone(), Some(DiscoveryResult::default())));
+    runtime.skill_discovery_cache = Some((root.to_path_buf(), Some(DiscoveryResult::default())));
     let has_skill = |runtime: &Runtime| {
         runtime
             .workspace_tool_definitions(crate::OperatingMode::Auto, &root)
@@ -2652,7 +2876,6 @@ fn skill_profile_is_discovered_once_and_refreshed_next_run() {
     assert!(!has_skill(&runtime), "profile must not change mid-run");
     runtime.prepare_loop_capabilities(&root).unwrap();
     assert!(has_skill(&runtime));
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -2680,7 +2903,6 @@ async fn cache_pricing_gates_the_background_plan_without_touching_history() {
     let budget = ContextBudget::new(300_000, 220_000, 0);
     let baseline = runtime
         .build_background_compaction_plan(&client, &messages, &policy, budget, false, 10)
-        .await
         .unwrap();
     assert!(baseline.profitable);
     runtime.set_compaction_pricing(Some(CompactionPricing {
@@ -2691,7 +2913,6 @@ async fn cache_pricing_gates_the_background_plan_without_touching_history() {
     }));
     let priced = runtime
         .build_background_compaction_plan(&client, &messages, &policy, budget, false, 10)
-        .await
         .unwrap();
     assert!(!priced.profitable);
     assert!(priced.request.is_none());
@@ -3039,21 +3260,9 @@ fn single_redact_removes_sensitive_values_before_governor_relay() {
 async fn batch_prepare_dedups_identical_raw_calls_in_order() {
     let runtime = Runtime::new();
     let calls = vec![
-        ProviderToolCall {
-            id: "one".into(),
-            name: "read".into(),
-            arguments: r#"{"path":".","max_lines":1}"#.into(),
-        },
-        ProviderToolCall {
-            id: "two".into(),
-            name: "read".into(),
-            arguments: r#"{"path":".","max_lines":1}"#.into(),
-        },
-        ProviderToolCall {
-            id: "three".into(),
-            name: "list".into(),
-            arguments: r#"{"path":".","max_entries":1}"#.into(),
-        },
+        tool_call("one", "read", r#"{"path":".","max_lines":1}"#),
+        tool_call("two", "read", r#"{"path":".","max_lines":1}"#),
+        tool_call("three", "list", r#"{"path":".","max_entries":1}"#),
     ];
     let prepared = runtime
         .prepare_provider_tool_invocations(
@@ -3077,15 +3286,7 @@ async fn batch_prepare_dedups_identical_raw_calls_in_order() {
 
 #[tokio::test]
 async fn search_context_identity_results_and_response_budget() {
-    let root = std::env::temp_dir().join(format!(
-        "slim-context-runtime-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
+    let root = TempRoot::new("context-runtime");
     std::fs::write(
         root.join("data.txt"),
         format!(
@@ -3104,11 +3305,7 @@ async fn search_context_identity_results_and_response_budget() {
             if let Some(context) = context {
                 arguments["context_lines"] = serde_json::json!(context);
             }
-            ProviderToolCall {
-                id: format!("search-{index}"),
-                name: "search".into(),
-                arguments: arguments.to_string(),
-            }
+            provider_call(&format!("search-{index}"), "search", arguments)
         })
         .collect::<Vec<_>>();
     let prepared = runtime
@@ -3157,12 +3354,11 @@ async fn search_context_identity_results_and_response_budget() {
     assert!(preview.contains("truncated"));
     assert!(preview.len() < context.output.len());
     assert!(preview.contains("aggregate presentation budget"));
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
 async fn read_only_alias_keeps_the_current_admission_note() {
-    let root = batch_fixture_root("admission-alias");
+    let root = TempRoot::new("admission-alias");
     std::fs::write(root.join("data.txt"), "before\nneedle\nafter\n").unwrap();
 
     for (label, calls, expected_prefix) in [
@@ -3266,8 +3462,6 @@ async fn read_only_alias_keeps_the_current_admission_note() {
             "{label}: aliases must reuse the same evidence"
         );
     }
-
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -3282,14 +3476,7 @@ fn skill_discovery_is_memoized_per_cwd_for_the_run() {
         .expect("skill fixture");
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "slim-skill-memo-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = TempRoot::new("skill-memo");
     let workspace = root.join("workspace");
     write_skill(&workspace.join(".slim").join("skills"), "first");
     let mut runtime = Runtime::new();
@@ -3308,19 +3495,11 @@ fn skill_discovery_is_memoized_per_cwd_for_the_run() {
         .cached_skill_discovery(&elsewhere)
         .expect("other cwd discovery");
     assert!(other.active("first").is_none());
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn skill_dispatch_validates_list_and_script_types_before_dispatch() {
-    let root = std::env::temp_dir().join(format!(
-        "slim-skill-dispatch-types-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = TempRoot::new("skill-dispatch-types");
     let skill_dir = root.join(".slim").join("skills").join("fixture");
     std::fs::create_dir_all(&skill_dir).expect("skill dir");
     std::fs::write(
@@ -3329,14 +3508,11 @@ fn skill_dispatch_validates_list_and_script_types_before_dispatch() {
     )
     .expect("skill metadata");
     let discovery = discover_workspace(&root).expect("skill discovery");
-    let runner = crate::process::ProcessRunner::default();
     let dispatch = |arguments: Value| {
         run_skill_dispatch(
             crate::OperatingMode::Auto,
             &root,
             &arguments.to_string(),
-            None,
-            &runner,
             Some(discovery.clone()),
         )
     };
@@ -3403,8 +3579,42 @@ fn skill_dispatch_validates_list_and_script_types_before_dispatch() {
     let denied = dispatch(json!({"name": "fixture", "script": "run.ps1"}));
     assert!(!denied.success);
     assert!(denied.output.contains("skill requires user trust"));
+}
 
-    std::fs::remove_dir_all(root).expect("cleanup");
+#[test]
+fn skill_script_dispatch_never_runs_and_names_the_denial() {
+    let root = TempRoot::new("skill-dispatch-denied");
+    let skill_dir = root.join(".slim").join("skills").join("fixture");
+    std::fs::create_dir_all(&skill_dir).expect("skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: fixture\ndescription: dispatch fixture\n---\nbody\n",
+    )
+    .expect("skill metadata");
+    let marker = root.join("ran.txt");
+    std::fs::write(
+        skill_dir.join("run.ps1"),
+        format!("Set-Content -Path '{}' -Value ran", marker.display()),
+    )
+    .expect("skill script");
+    let discovery = discover_workspace(&root).expect("skill discovery");
+    let arguments = json!({"name": "fixture", "script": "run.ps1"}).to_string();
+
+    for (mode, expected) in [
+        (
+            crate::OperatingMode::ReadOnly,
+            "skill failed: skill unavailable outside Auto mode",
+        ),
+        (
+            crate::OperatingMode::Auto,
+            "skill failed: skill requires user trust",
+        ),
+    ] {
+        let result = run_skill_dispatch(mode, &root, &arguments, Some(discovery.clone()));
+        assert!(!result.success);
+        assert_eq!(result.output, expected);
+    }
+    assert!(!marker.exists(), "the model cannot grant user trust");
 }
 
 #[test]
@@ -3462,7 +3672,7 @@ fn request_component_bytes_follow_serialized_wire_values() {
     .to_string();
 
     assert_eq!(
-        request_component_bytes(&body),
+        crate::provider::provider_request_component_bytes(&body),
         (
             serde_json::to_vec(&system).expect("system").len() as u64,
             serde_json::to_vec(&tools).expect("tools").len() as u64,
@@ -3500,86 +3710,83 @@ fn runtime_goal_assurance_requires_validation_after_the_latest_mutation() {
     ]));
 }
 
+/// A background compaction whose task already finished without a summary.
+async fn finished_pending_background() -> PendingBackgroundCompaction {
+    let plan = BackgroundCompactionPlan {
+        selection: CompactionSelection {
+            root_instruction: "root".into(),
+            summarized: vec![ProviderMessage::user("root")],
+            pinned: Vec::new(),
+            kept: Vec::new(),
+            first_kept_index: 1,
+            recent_tokens: 0,
+        },
+        request: None,
+        provider: "provider".into(),
+        model: "model".into(),
+        provider_identity: "provider:model".into(),
+        strategy: crate::context::CompactionStrategy::Summary,
+        jev_plan: None,
+        previous_checkpoint: None,
+        context_window_tokens: 1,
+        reserve_tokens: 0,
+        serialized_chars: 1,
+        system_bytes: 0,
+        history_bytes: 0,
+        summary_max_bytes: 64 * 1024,
+        source_len: 1,
+        tokens_before: 1,
+        projected_tokens_after: 1,
+        request_bytes: 1,
+        estimated_input_tokens: 1,
+        projected_savings_tokens: 1,
+        estimated_cost_tokens: 1,
+        safety_margin_tokens: 1,
+        future_turns: 1,
+        profitable: true,
+    };
+    let task = tokio::spawn(async move {
+        BackgroundCompactionResult {
+            plan,
+            summary: String::new(),
+            usage: crate::UsageBreakdown::default(),
+            time_to_first_byte_ms: None,
+            time_to_first_semantic_ms: None,
+            duration_ms: 1,
+            valid: false,
+            usage_known: false,
+            cancelled: false,
+        }
+    });
+    while !task.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    PendingBackgroundCompaction {
+        task,
+        cancellation: CancellationToken::new(),
+        progress: Arc::new(Mutex::new(CompactionAttemptProgress::default())),
+        jev_outcome: Arc::new(Mutex::new(None)),
+        request_bytes: 1,
+        estimated_input_tokens: 1,
+        tokens_before: 1,
+        started: Instant::now(),
+    }
+}
+
 #[test]
 fn cancel_pending_background_harvests_finished_task() {
     tokio::runtime::Runtime::new()
         .expect("runtime")
         .block_on(async {
-            let plan = BackgroundCompactionPlan {
-                selection: CompactionSelection {
-                    root_instruction: "root".into(),
-                    summarized: vec![ProviderMessage::user("root")],
-                    pinned: Vec::new(),
-                    kept: Vec::new(),
-                    first_kept_index: 1,
-                    recent_tokens: 0,
-                },
-                request: None,
-                provider: "provider".into(),
-                model: "model".into(),
-                provider_identity: "provider:model".into(),
-                strategy: crate::context::CompactionStrategy::Summary,
-                jev_plan: None,
-                previous_checkpoint: None,
-                context_window_tokens: 1,
-                reserve_tokens: 0,
-                serialized_chars: 1,
-                system_bytes: 0,
-                history_bytes: 0,
-                summary_max_bytes: 64 * 1024,
-                source_len: 1,
-                tokens_before: 1,
-                projected_tokens_after: 1,
-                request_bytes: 1,
-                estimated_input_tokens: 1,
-                projected_savings_tokens: 1,
-                estimated_cost_tokens: 1,
-                safety_margin_tokens: 1,
-                future_turns: 1,
-                profitable: true,
-            };
-            let task = tokio::spawn(async move {
-                BackgroundCompactionResult {
-                    plan,
-                    summary: String::new(),
-                    usage: UsageTotals::default(),
-                    time_to_first_byte_ms: None,
-                    time_to_first_semantic_ms: None,
-                    duration_ms: 1,
-                    valid: false,
-                    usage_known: false,
-                    cancelled: false,
-                }
-            });
-            while !task.is_finished() {
-                tokio::task::yield_now().await;
-            }
-            let progress = Arc::new(Mutex::new(CompactionAttemptProgress::default()));
-            let mut pending = Some(PendingBackgroundCompaction {
-                task,
-                cancellation: CancellationToken::new(),
-                progress,
-                jev_outcome: Arc::new(Mutex::new(None)),
-                usage_request: RequestUsage {
-                    request_kind: crate::RequestKind::Compaction,
-                    provider: "provider".into(),
-                    model: "model".into(),
-                    history_bytes: 1,
-                    estimated_input_tokens: 1,
-                    ..RequestUsage::default()
-                },
-                request_bytes: 1,
-                estimated_input_tokens: 1,
-                tokens_before: 1,
-                started: Instant::now(),
-            });
+            let mut pending = Some(finished_pending_background().await);
             let mut runtime = Runtime::new();
             let mut next_seq = 1;
 
-            let usage = runtime
+            runtime
                 .cancel_pending_background(&mut pending, &mut next_seq, "loop_finished")
                 .await
                 .expect("settle finished task");
+            let usage = UsageTotals::from_events(runtime.app.events(), false);
 
             assert!(pending.is_none());
             assert_eq!(usage.provider_turns, 0);
@@ -3601,8 +3808,33 @@ fn cancel_pending_background_harvests_finished_task() {
 }
 
 #[tokio::test]
+async fn failed_background_settle_does_not_replace_the_original_event_error() {
+    let mut pending = Some(finished_pending_background().await);
+    let mut runtime = Runtime::new();
+    // The event lands, then the sequence cannot advance: the original error.
+    // Settling the background attempt afterwards fails with a different one.
+    let mut next_seq = u64::MAX;
+
+    let error = runtime
+        .push_or_cancel_background(
+            &mut pending,
+            &mut next_seq,
+            crate::EventKind::ThinkingEnded,
+            "test",
+        )
+        .await
+        .expect_err("sequence overflow");
+
+    assert!(pending.is_none());
+    assert!(
+        matches!(&error, ProviderError::InvalidResponse { message } if message == "event sequence overflow"),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
 async fn completed_background_usage_reports_the_rebuilt_pruned_request() {
-    let plan = BackgroundCompactionPlan {
+    let plan = || BackgroundCompactionPlan {
         selection: CompactionSelection {
             root_instruction: "root".into(),
             summarized: vec![ProviderMessage::user("root")],
@@ -3635,59 +3867,87 @@ async fn completed_background_usage_reports_the_rebuilt_pruned_request() {
         future_turns: 1,
         profitable: true,
     };
-    let result = BackgroundCompactionResult {
-        plan,
+    let result = |cancelled: bool| BackgroundCompactionResult {
+        plan: plan(),
         summary: "summary".into(),
-        usage: UsageTotals::default(),
+        usage: crate::UsageBreakdown::default(),
         time_to_first_byte_ms: None,
         time_to_first_semantic_ms: None,
         duration_ms: 1,
         valid: true,
         usage_known: true,
-        cancelled: false,
+        cancelled,
     };
-    let attempt = PendingBackgroundCompaction {
+    let attempt = || PendingBackgroundCompaction {
         task: tokio::spawn(std::future::pending::<BackgroundCompactionResult>()),
         cancellation: CancellationToken::new(),
         progress: Arc::new(Mutex::new(CompactionAttemptProgress::default())),
         jev_outcome: Arc::new(Mutex::new(None)),
-        usage_request: RequestUsage {
-            request_kind: crate::RequestKind::Compaction,
-            system_bytes: 99,
-            history_bytes: 99,
-            estimated_input_tokens: 99,
-            ..RequestUsage::default()
-        },
         request_bytes: 99,
         estimated_input_tokens: 99,
         tokens_before: 1,
         started: Instant::now(),
     };
-    let usage = background_compaction_completed_usage(&attempt, &result);
-    let request = usage
-        .requests
-        .iter()
-        .find(|request| request.request_kind == crate::RequestKind::Compaction)
-        .expect("compaction request");
+    let policy = CompactionPolicy::default();
+    let compaction_request = |runtime: &Runtime| {
+        UsageTotals::from_events(runtime.app.events(), false)
+            .requests
+            .into_iter()
+            .find(|request| request.request_kind == crate::RequestKind::Compaction)
+            .expect("compaction request")
+    };
+
+    // Completed: the ledger carries the rebuilt (pruned) request, not the
+    // stale figures the attempt was launched with.
+    let mut runtime = Runtime::new();
+    let mut next_seq = 1;
+    runtime
+        .finish_background_attempt(attempt(), Ok(result(false)), &policy, &mut next_seq)
+        .unwrap();
+    let request = compaction_request(&runtime);
     assert_eq!(request.system_bytes, 22);
     assert_eq!(request.history_bytes, 33);
     assert_eq!(request.estimated_input_tokens, 55);
 
-    let usage = background_compaction_cancellation_usage(&attempt, Some(&result.plan), 7);
-    let request = usage
-        .requests
-        .iter()
-        .find(|request| request.request_kind == crate::RequestKind::Compaction)
-        .expect("cancelled compaction request");
-    assert_eq!(request.system_bytes, 22);
-    assert_eq!(request.history_bytes, 33);
+    // Cancelled with a rebuilt plan: the cancellation event reports the
+    // plan's size, not the launch-time estimate.
+    let mut runtime = Runtime::new();
+    let mut next_seq = 1;
+    runtime
+        .finish_background_attempt(attempt(), Ok(result(true)), &policy, &mut next_seq)
+        .unwrap();
+    assert!(runtime.app.events().iter().any(|event| matches!(
+        event.kind,
+        crate::EventKind::CompactionAttemptCancelled {
+            request_bytes: 44,
+            estimated_input_tokens: 55,
+            ..
+        }
+    )));
+    let request = compaction_request(&runtime);
+    assert!(request.cancelled && request.usage_unknown);
     assert_eq!(request.estimated_input_tokens, 55);
-    let usage = background_compaction_cancellation_usage(&attempt, None, 7);
-    let request = usage
-        .requests
-        .iter()
-        .find(|request| request.request_kind == crate::RequestKind::Compaction)
-        .expect("aborted compaction request");
+
+    // Aborted without a result: only the launch-time figures exist.
+    let aborted = tokio::spawn(std::future::pending::<BackgroundCompactionResult>());
+    aborted.abort();
+    let joined = aborted.await;
+    assert!(joined.is_err());
+    let mut runtime = Runtime::new();
+    let mut next_seq = 1;
+    runtime
+        .finish_background_attempt(attempt(), joined, &policy, &mut next_seq)
+        .unwrap();
+    assert!(runtime.app.events().iter().any(|event| matches!(
+        event.kind,
+        crate::EventKind::CompactionAttemptCancelled {
+            request_bytes: 99,
+            estimated_input_tokens: 99,
+            ..
+        }
+    )));
+    let request = compaction_request(&runtime);
+    assert!(request.cancelled && request.usage_unknown);
     assert_eq!(request.estimated_input_tokens, 99);
 }
 
@@ -3705,9 +3965,6 @@ async fn dropping_pending_background_compaction_aborts_its_task() {
         cancellation: CancellationToken::new(),
         progress: Arc::new(Mutex::new(CompactionAttemptProgress::default())),
         jev_outcome: Arc::new(Mutex::new(None)),
-        usage_request: RequestUsage {
-            ..RequestUsage::default()
-        },
         request_bytes: 0,
         estimated_input_tokens: 0,
         tokens_before: 0,
@@ -3735,7 +3992,7 @@ fn per_turn_overflow_is_not_a_run_total_hit() {
         provider_call("w1", "write", serde_json::json!({"path":"a.txt"})),
         provider_call("w2", "write", serde_json::json!({"path":"b.txt"})),
     ];
-    let cut = truncate_calls_for_budget(&mut calls, config, 0);
+    let cut = split_calls_for_budget(&mut calls, config, 0).0;
     assert_eq!(cut.suppressed, 1);
     assert!(!cut.hit_run_total);
     assert_eq!(calls.len(), 1);
@@ -3753,7 +4010,7 @@ fn run_total_overflow_stops_even_when_turns_remain() {
         provider_call("r1", "read", serde_json::json!({"path":"a.txt"})),
         provider_call("r2", "read", serde_json::json!({"path":"b.txt"})),
     ];
-    let cut = truncate_calls_for_budget(&mut calls, config, 1);
+    let cut = split_calls_for_budget(&mut calls, config, 1).0;
     assert_eq!(cut.suppressed, 2);
     assert!(cut.hit_run_total);
     assert!(calls.is_empty());
@@ -3772,21 +4029,22 @@ fn fused_call_reserves_two_mutating_slots_before_execution() {
         }),
     );
     assert_eq!(tool_call_slots(&fused), 2);
-    let escaped = ProviderToolCall {
-        id: "escaped".into(),
-        name: "write".into(),
-        arguments: r#"{"path":"a.txt","content":"saved","\u0074hen_run":{"command":"cargo","args":["check"]}}"#.into(),
-    };
+    let escaped = tool_call(
+        "escaped",
+        "write",
+        r#"{"path":"a.txt","content":"saved","\u0074hen_run":{"command":"cargo","args":["check"]}}"#,
+    );
     assert_eq!(tool_call_slots(&escaped), 2);
     let mut one_slot = vec![escaped];
-    let cut = truncate_calls_for_budget(
+    let cut = split_calls_for_budget(
         &mut one_slot,
         AgentLoopConfig {
             max_mutating_tool_calls: 1,
             ..AgentLoopConfig::default()
         },
         0,
-    );
+    )
+    .0;
     assert_eq!(cut.suppressed, 1);
     assert!(one_slot.is_empty(), "no edit may start without both slots");
 
@@ -3794,7 +4052,7 @@ fn fused_call_reserves_two_mutating_slots_before_execution() {
         fused,
         provider_call("next", "patch", serde_json::json!({"path":"b.txt"})),
     ];
-    let cut = truncate_calls_for_budget(
+    let cut = split_calls_for_budget(
         &mut two_slots,
         AgentLoopConfig {
             max_mutating_tool_calls: 2,
@@ -3802,7 +4060,8 @@ fn fused_call_reserves_two_mutating_slots_before_execution() {
             ..AgentLoopConfig::default()
         },
         0,
-    );
+    )
+    .0;
     assert_eq!(two_slots.len(), 1);
     assert_eq!(cut.suppressed, 1);
     assert!(cut.hit_run_total);
@@ -3812,7 +4071,7 @@ fn fused_call_reserves_two_mutating_slots_before_execution() {
         serde_json::json!({"path":"b.txt"}),
     )];
     assert!(
-        truncate_calls_for_budget(
+        split_calls_for_budget(
             &mut next_turn,
             AgentLoopConfig {
                 max_total_tool_calls: 2,
@@ -3820,22 +4079,10 @@ fn fused_call_reserves_two_mutating_slots_before_execution() {
             },
             2
         )
+        .0
         .hit_run_total
     );
     assert!(next_turn.is_empty());
-}
-
-fn batch_fixture_root(label: &str) -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "slim-runtime-{label}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    root
 }
 
 fn prepared_calls(root: &std::path::Path, calls: &[(&str, &str)]) -> Vec<PreparedToolInvocation> {
@@ -3849,7 +4096,7 @@ fn prepared_calls(root: &std::path::Path, calls: &[(&str, &str)]) -> Vec<Prepare
 
 #[test]
 fn phase1_excludes_reads_after_a_same_file_write_or_shell() {
-    let root = batch_fixture_root("phase1");
+    let root = TempRoot::new("phase1");
     std::fs::write(root.join("a.txt"), "a\n").unwrap();
     std::fs::write(root.join("b.txt"), "b\n").unwrap();
     let tools = ToolRegistry::default();
@@ -3906,15 +4153,14 @@ fn phase1_excludes_reads_after_a_same_file_write_or_shell() {
         Vec::<usize>::new()
     );
     assert_eq!(
-        phase1_snapshot_indices_from(&tools, &prepared, 1),
+        phase1_snapshot_indices_ready(&tools, &prepared, 1, &vec![None; prepared.len()]),
         vec![1, 2]
     );
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn phase1_excludes_code_intel_after_any_workspace_mutation() {
-    let root = batch_fixture_root("phase1-code-intel");
+    let root = TempRoot::new("phase1-code-intel");
     std::fs::write(root.join("a.rs"), "fn target() {}\n").unwrap();
     std::fs::write(root.join("b.rs"), "fn caller() { target(); }\n").unwrap();
     let tools = ToolRegistry::default();
@@ -3949,20 +4195,138 @@ fn phase1_excludes_code_intel_after_any_workspace_mutation() {
         ],
     );
     assert_eq!(phase1_snapshot_indices(&tools, &prepared), vec![0, 1]);
-    let _ = std::fs::remove_dir_all(root);
+}
+
+fn write_call(path: &str) -> (&'static str, String) {
+    (
+        "write",
+        serde_json::json!({"path": path, "content": "x\n"}).to_string(),
+    )
+}
+
+fn cluster_of(calls: &[(&str, String)], done: &[usize], start: usize) -> Vec<usize> {
+    let root = TempRoot::new("cluster");
+    let borrowed = calls
+        .iter()
+        .map(|(name, arguments)| (*name, arguments.as_str()))
+        .collect::<Vec<_>>();
+    let prepared = prepared_calls(&root, &borrowed);
+    let mut results: Vec<Option<ToolResult>> = vec![None; calls.len()];
+    for &index in done {
+        results[index] = Some(ToolResult::ok("write", "done"));
+    }
+    independent_mutation_cluster(&prepared, &results, start)
+}
+
+#[test]
+fn mutation_cluster_stops_at_first_non_mutation_or_barrier() {
+    let read = ("read", r#"{"path":"a.txt"}"#.to_owned());
+    let shell = ("shell", r#"{"command":"echo x"}"#.to_owned());
+    assert_eq!(
+        cluster_of(
+            &[
+                write_call("a.txt"),
+                write_call("b.txt"),
+                read.clone(),
+                write_call("c.txt")
+            ],
+            &[],
+            0
+        ),
+        vec![0, 1]
+    );
+    assert_eq!(
+        cluster_of(
+            &[
+                write_call("a.txt"),
+                write_call("b.txt"),
+                shell.clone(),
+                write_call("c.txt")
+            ],
+            &[],
+            0
+        ),
+        vec![0, 1]
+    );
+    // A start that is not a plain file mutation opens no cluster at all.
+    let calls = [read, shell, write_call("a.txt")];
+    assert!(cluster_of(&calls, &[], 0).is_empty());
+    assert!(cluster_of(&calls, &[], 1).is_empty());
+    assert_eq!(cluster_of(&calls, &[], 2), vec![2]);
+}
+
+#[test]
+fn mutation_cluster_never_repeats_a_target_file() {
+    let calls = [
+        write_call("a.txt"),
+        write_call("b.txt"),
+        write_call("a.txt"),
+        write_call("c.txt"),
+    ];
+    assert_eq!(cluster_of(&calls, &[], 0), vec![0, 1]);
+    assert_eq!(cluster_of(&calls, &[], 2), vec![2, 3]);
+}
+
+#[test]
+fn mutation_cluster_keeps_call_order_and_skips_completed_calls() {
+    let calls = [
+        write_call("a.txt"),
+        write_call("b.txt"),
+        write_call("c.txt"),
+        write_call("d.txt"),
+    ];
+    assert_eq!(cluster_of(&calls, &[1], 0), vec![0, 2, 3]);
+    assert_eq!(cluster_of(&calls, &[0, 1], 2), vec![2, 3]);
+}
+
+#[test]
+fn mutation_cluster_never_repeats_an_identical_nested_path() {
+    let calls = [
+        write_call("sub/a.txt"),
+        write_call("sub/b.txt"),
+        write_call("sub/a.txt"),
+    ];
+    assert_eq!(cluster_of(&calls, &[], 0), vec![0, 1]);
+    assert_eq!(cluster_of(&calls, &[], 2), vec![2]);
+}
+
+#[cfg(windows)]
+#[test]
+fn mutation_cluster_treats_case_variants_of_a_new_file_as_one_file_on_windows() {
+    let calls = [
+        write_call("New.txt"),
+        write_call("new.txt"),
+        write_call("other.txt"),
+    ];
+    assert_eq!(cluster_of(&calls, &[], 0), vec![0]);
+    assert_eq!(cluster_of(&calls, &[], 1), vec![1, 2]);
+}
+
+#[cfg(windows)]
+#[test]
+fn phase1_blocks_a_read_after_a_case_variant_write_on_windows() {
+    let root = TempRoot::new("phase1-case");
+    let tools = ToolRegistry::default();
+    let prepared = prepared_calls(
+        &root,
+        &[
+            ("write", r#"{"path":"New.txt","content":"x\n"}"#),
+            ("read", r#"{"path":"new.txt"}"#),
+        ],
+    );
+    assert_eq!(
+        phase1_snapshot_indices(&tools, &prepared),
+        Vec::<usize>::new()
+    );
 }
 
 fn provider_call(id: &str, name: &str, arguments: serde_json::Value) -> ProviderToolCall {
-    ProviderToolCall {
-        id: id.into(),
-        name: name.into(),
-        arguments: arguments.to_string(),
-    }
+    tool_call(id, name, arguments.to_string())
 }
 
 #[tokio::test]
 async fn independent_writes_apply_and_same_file_stays_ordered() {
-    let root = batch_fixture_root("mut-batch");
+    let root = TempRoot::new("mut-batch");
     std::fs::write(root.join("a.txt"), "old-a\n").unwrap();
     std::fs::write(root.join("b.txt"), "old-b\n").unwrap();
     let mut runtime = Runtime::new();
@@ -4027,12 +4391,11 @@ async fn independent_writes_apply_and_same_file_stays_ordered() {
         std::fs::read_to_string(root.join("a.txt")).unwrap(),
         "final-a\n"
     );
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]
 async fn same_file_read_after_write_sees_new_bytes_when_other_reads_are_lifted() {
-    let root = batch_fixture_root("phase1-order");
+    let root = TempRoot::new("phase1-order");
     std::fs::write(root.join("a.txt"), "old-a\n").unwrap();
     std::fs::write(root.join("b.txt"), "keep-b\n").unwrap();
     let mut runtime = Runtime::new();
@@ -4060,5 +4423,492 @@ async fn same_file_read_after_write_sees_new_bytes_when_other_reads_are_lifted()
     assert!(results[2].success, "{}", results[2].output);
     assert_eq!(results[1].output, "new-a\n");
     assert_eq!(results[2].output, "keep-b\n");
-    let _ = std::fs::remove_dir_all(root);
+}
+
+fn stream_secret_deltas(events: &[ProviderEvent]) -> (Vec<String>, Vec<String>) {
+    let mut app = AppHandle::fake();
+    let mut normalizer =
+        ProviderStreamNormalizer::new(ProviderKind::OpenAiCompatible, 1, vec!["sk-secret".into()]);
+    for event in events {
+        normalizer.push(&mut app, event.clone());
+    }
+    normalizer.push(
+        &mut app,
+        ProviderEvent::Stopped {
+            reason: "stop".into(),
+        },
+    );
+    normalizer.finish(&mut app).unwrap();
+    let mut text = Vec::new();
+    let mut reasoning = Vec::new();
+    for event in app.events() {
+        match &event.kind {
+            crate::EventKind::AssistantTextDelta { text: delta } => text.push(delta.clone()),
+            crate::EventKind::ReasoningDelta { text: delta } => reasoning.push(delta.clone()),
+            _ => {}
+        }
+    }
+    (text, reasoning)
+}
+
+#[test]
+fn a_secret_split_across_a_reasoning_switch_is_never_emitted_in_pieces() {
+    let (text, _) = stream_secret_deltas(&[
+        ProviderEvent::TextDelta("token sk-sec".into()),
+        ProviderEvent::ReasoningDelta("hmm".into()),
+        ProviderEvent::TextDelta("ret done".into()),
+    ]);
+    assert_eq!(text.concat(), "token [REDACTED] done", "{text:?}");
+    assert!(
+        text.iter().all(|delta| !delta.contains("sk-")),
+        "no delta may carry a secret prefix: {text:?}"
+    );
+}
+
+#[test]
+fn a_reasoning_tail_that_could_start_a_secret_is_released_inside_its_lifecycle() {
+    // "s" could begin "sk-secret", so the tail is held while the block streams, but
+    // it must still be published before ThinkingEnded: a delta after the end event
+    // would fall outside the lifecycle the UI relies on.
+    let mut app = AppHandle::fake();
+    let mut normalizer =
+        ProviderStreamNormalizer::new(ProviderKind::OpenAiCompatible, 1, vec!["sk-secret".into()]);
+    for event in [
+        ProviderEvent::ReasoningDelta("plan s".into()),
+        ProviderEvent::TextDelta("visible".into()),
+    ] {
+        normalizer.push(&mut app, event);
+    }
+    normalizer.push(
+        &mut app,
+        ProviderEvent::Stopped {
+            reason: "stop".into(),
+        },
+    );
+    normalizer.finish(&mut app).unwrap();
+    let mut open = false;
+    let mut released = String::new();
+    for event in app.events() {
+        match &event.kind {
+            crate::EventKind::ThinkingStarted => open = true,
+            crate::EventKind::ThinkingEnded => open = false,
+            crate::EventKind::ReasoningDelta { text } => {
+                assert!(open, "reasoning delta outside its lifecycle: {text:?}");
+                released.push_str(text);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(released, "plan s");
+}
+
+#[test]
+fn a_held_secret_prefix_is_released_when_the_stream_stops() {
+    let (text, _) = stream_secret_deltas(&[
+        ProviderEvent::TextDelta("ends with sk-sec".into()),
+        ProviderEvent::ReasoningDelta("hmm".into()),
+    ]);
+    assert_eq!(text.concat(), "ends with sk-sec", "{text:?}");
+}
+
+#[test]
+fn largest_fitting_scale_finds_the_boundary_and_keeps_the_floor() {
+    use super::presentation::largest_fitting_scale;
+    let fits_up_to = |limit: usize| move |scale: &usize| *scale <= limit;
+    assert_eq!(largest_fitting_scale(|scale| scale, fits_up_to(1000)), 1000);
+    assert_eq!(largest_fitting_scale(|scale| scale, fits_up_to(999)), 999);
+    assert_eq!(largest_fitting_scale(|scale| scale, fits_up_to(640)), 640);
+    assert_eq!(largest_fitting_scale(|scale| scale, fits_up_to(1)), 1);
+    assert_eq!(largest_fitting_scale(|scale| scale, fits_up_to(0)), 0);
+    // Nothing fits, not even scale 0: the floor is still returned.
+    assert_eq!(largest_fitting_scale(|scale| scale, |_| false), 0);
+}
+
+#[test]
+fn completed_provider_turns_matches_the_usage_ledger() {
+    fn snapshot(kind: crate::RequestKind) -> crate::EventKind {
+        crate::EventKind::ContextSnapshot {
+            request_kind: kind,
+            provider: "p".into(),
+            model: "m".into(),
+            system_bytes: 0,
+            tool_schema_bytes: 0,
+            history_bytes: 0,
+            tool_result_bytes: 0,
+            serialized_chars: 0,
+            estimated_tokens: 0,
+            context_window_tokens: 0,
+        }
+    }
+    fn completed(cancelled: bool, failed: bool) -> crate::EventKind {
+        crate::EventKind::RequestCompleted {
+            provider_latency_ms: 1,
+            cancelled,
+            failed,
+        }
+    }
+    use crate::RequestKind::{Compaction, ProviderTurn};
+    let kinds = vec![
+        snapshot(ProviderTurn),
+        completed(false, false),
+        snapshot(ProviderTurn),
+        completed(false, true),
+        snapshot(Compaction),
+        completed(false, false),
+        snapshot(ProviderTurn),
+        completed(true, true),
+        snapshot(ProviderTurn),
+        snapshot(ProviderTurn),
+        completed(false, false),
+        snapshot(Compaction),
+        completed(true, true),
+        snapshot(ProviderTurn),
+    ];
+    let events = kinds
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| crate::SessionEvent::new(index as u64 + 1, kind))
+        .collect::<Vec<_>>();
+    for end in 0..=events.len() {
+        let ledger = UsageTotals::from_events(&events[..end], false)
+            .requests
+            .iter()
+            .filter(|request| {
+                request.request_kind == crate::RequestKind::ProviderTurn
+                    && !request.failed
+                    && !request.cancelled
+            })
+            .count();
+        assert_eq!(
+            events::completed_provider_turns(&events[..end]),
+            ledger,
+            "prefix of {end} events"
+        );
+    }
+    assert_eq!(events::completed_provider_turns(&events), 4);
+}
+
+#[test]
+fn compaction_economics_prices_savings_against_the_summary_cost() {
+    use super::compaction_background::{compaction_economics, TurnForecast};
+    let forecast = |remaining, observed, completed, open| TurnForecast {
+        remaining,
+        observed,
+        completed,
+        open,
+    };
+    let cost = 1_000 + COMPACTION_MAX_OUTPUT_TOKENS;
+    let margin = cost.div_ceil(4);
+
+    let paying = compaction_economics(None, forecast(8, 0, 0, 0), 10_000, 4_000, 1_000);
+    assert_eq!(paying.future_turns, 2);
+    assert_eq!(paying.projected_savings_tokens, 12_000);
+    assert_eq!(paying.estimated_cost_tokens, cost);
+    assert_eq!(paying.safety_margin_tokens, margin);
+    assert_eq!(paying.profitable, 12_000 > cost + margin);
+    assert!(paying.profitable);
+
+    // The turn budget caps how many turns the saving accrues on.
+    let two_turns = compaction_economics(None, forecast(8, 0, 0, 0), 10_000, 8_000, 1_000);
+    assert_eq!(two_turns.projected_savings_tokens, 4_000);
+    assert!(two_turns.profitable);
+    let last_turn = compaction_economics(None, forecast(1, 0, 0, 0), 10_000, 8_000, 1_000);
+    assert_eq!(last_turn.future_turns, 1);
+    assert_eq!(last_turn.projected_savings_tokens, 2_000);
+    assert!(!last_turn.profitable);
+
+    // Nothing saved is never profitable.
+    let no_saving = compaction_economics(None, forecast(8, 0, 0, 0), 4_000, 10_000, 1_000);
+    assert_eq!(no_saving.projected_savings_tokens, 0);
+    assert!(!no_saving.profitable);
+
+    // The savings must strictly exceed cost plus margin.
+    let edge_tokens = cost + margin;
+    let at_edge = compaction_economics(None, forecast(8, 0, 0, 0), edge_tokens, 0, 1_000);
+    assert_eq!(at_edge.projected_savings_tokens, edge_tokens * 2);
+    assert!(at_edge.profitable);
+    let below_edge = compaction_economics(None, forecast(8, 0, 0, 0), edge_tokens / 2, 0, 1_000);
+    assert_eq!(below_edge.projected_savings_tokens, edge_tokens / 2 * 2);
+    assert_eq!(below_edge.profitable, edge_tokens / 2 * 2 > edge_tokens);
+}
+
+#[test]
+fn projected_retained_tokens_equals_the_estimate_over_the_retained_history() {
+    let mut system = ProviderMessage::user("follow the repository rules");
+    system.role = "system".into();
+    let mut developer = ProviderMessage::user("tooling notes");
+    developer.role = "developer".into();
+    let selection = CompactionSelection {
+        root_instruction: "fix the build".into(),
+        summarized: vec![
+            system.clone(),
+            ProviderMessage::user("fix the build"),
+            ProviderMessage::assistant("looking", Vec::new()),
+            developer.clone(),
+            ProviderMessage::tool("read", "call-1", "file contents"),
+        ],
+        pinned: vec![ProviderMessage::user("also keep the tests green")],
+        kept: vec![
+            ProviderMessage::assistant("running tests", Vec::new()),
+            ProviderMessage::tool("shell", "call-2", "ok"),
+        ],
+        first_kept_index: 5,
+        recent_tokens: 0,
+    };
+    let mut retained = vec![system, developer];
+    retained.push(ProviderMessage::user(selection.root_instruction.clone()));
+    retained.extend(selection.pinned.iter().cloned());
+    retained.extend(selection.kept.iter().cloned());
+    assert_eq!(
+        super::compaction_background::projected_retained_tokens(&selection),
+        estimate_provider_message_tokens(&retained)
+    );
+}
+
+#[test]
+fn recovery_budget_gates_retries_on_both_limits() {
+    let mut recovery = RecoveryBudget::new(0);
+    assert!(recovery.can_retry(0));
+    assert!(recovery.can_retry(MAX_PROVIDER_RECOVERIES - 1));
+    assert!(!recovery.can_retry(MAX_PROVIDER_RECOVERIES));
+    recovery.automatic_recoveries = MAX_AUTOMATIC_RECOVERIES - 1;
+    assert!(recovery.can_retry(0));
+    recovery.automatic_recoveries = MAX_AUTOMATIC_RECOVERIES;
+    assert!(!recovery.can_retry(0));
+}
+
+#[test]
+fn terminal_recovery_reason_keeps_its_precedence() {
+    use super::recovery::terminal_recovery_reason;
+    let empty = ProviderError::InvalidResponse {
+        message: EMPTY_RESPONSE_MESSAGE.into(),
+    };
+    let transport = ProviderError::Transport {
+        message: "reset".into(),
+        safe_to_retry: true,
+    };
+    let mut recovery = RecoveryBudget::new(0);
+    recovery.empty_recovery_used = true;
+    recovery.automatic_recoveries = MAX_AUTOMATIC_RECOVERIES;
+    recovery.provider_recoveries = MAX_PROVIDER_RECOVERIES;
+    assert_eq!(
+        terminal_recovery_reason(&empty, &recovery, true),
+        "repeated empty provider response"
+    );
+    assert_eq!(
+        terminal_recovery_reason(&transport, &recovery, true),
+        "tool effects were emitted; request was not replayed"
+    );
+    assert_eq!(
+        terminal_recovery_reason(&transport, &recovery, false),
+        "global automatic recovery limit reached"
+    );
+    recovery.automatic_recoveries = 0;
+    assert_eq!(
+        terminal_recovery_reason(&transport, &recovery, false),
+        "consecutive provider recovery limit reached"
+    );
+    recovery.provider_recoveries = 0;
+    assert_eq!(
+        terminal_recovery_reason(&transport, &recovery, false),
+        "automatic recovery stopped"
+    );
+}
+
+mod stream_hot_path_equivalence {
+    use super::*;
+
+    fn reference_split(input: &str, sensitive_values: &[String]) -> usize {
+        let held_bytes = sensitive_values
+            .iter()
+            .flat_map(|value| {
+                value
+                    .char_indices()
+                    .skip(1)
+                    .map(move |(index, _)| &value[..index])
+            })
+            .filter(|prefix| input.ends_with(prefix))
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        let mut split_at = input.len().saturating_sub(held_bytes);
+        loop {
+            let adjusted = sensitive_values
+                .iter()
+                .flat_map(|value| {
+                    input
+                        .match_indices(value)
+                        .map(move |(start, _)| (start, start + value.len()))
+                })
+                .filter(|(start, end)| *start < split_at && split_at < *end)
+                .map(|(start, _)| start)
+                .min()
+                .unwrap_or(split_at);
+            if adjusted == split_at {
+                return split_at;
+            }
+            split_at = adjusted;
+        }
+    }
+
+    fn reference_chunk(
+        pending: &mut String,
+        delta: &str,
+        sensitive_values: &[String],
+        flush: bool,
+    ) -> String {
+        pending.push_str(delta);
+        if sensitive_values.is_empty() {
+            return std::mem::take(pending);
+        }
+        let split_at = if flush {
+            pending.len()
+        } else {
+            reference_split(pending, sensitive_values)
+        };
+        let tail = pending[split_at..].to_owned();
+        let ready = redact_values(sensitive_values, &pending[..split_at]);
+        *pending = tail;
+        ready
+    }
+
+    fn secrets() -> Vec<Vec<String>> {
+        let sorted = |mut values: Vec<&str>| {
+            values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+            values.into_iter().map(str::to_owned).collect::<Vec<_>>()
+        };
+        vec![
+            Vec::new(),
+            sorted(vec!["sk-live-abc", "abc", "segredo", "日本"]),
+            sorted(vec!["aaaa", "aa", "ab"]),
+        ]
+    }
+
+    #[test]
+    fn split_matches_the_reference_for_every_substring() {
+        let text = "x sk-live-abc y abc sk-live-ab segredo ação aaaab sk-live-abcabc 日本日 segred";
+        for values in secrets() {
+            for start in (0..=text.len()).filter(|i| text.is_char_boundary(*i)) {
+                for end in (start..=text.len()).filter(|i| text.is_char_boundary(*i)) {
+                    let input = &text[start..end];
+                    assert_eq!(
+                        stream_normalizer::safe_stream_split(input, &values),
+                        reference_split(input, &values),
+                        "{input:?} {values:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunks_match_the_reference_step_by_step_with_and_without_a_held_tail() {
+        let text = "x sk-live-abc y abc sk-live-ab segredo ação aaaab 日本日 segred";
+        let bounds = (0..=text.len())
+            .filter(|i| text.is_char_boundary(*i))
+            .collect::<Vec<_>>();
+        for values in secrets() {
+            for &first in &bounds {
+                for &second in bounds.iter().filter(|second| **second >= first) {
+                    let parts = [&text[..first], &text[first..second], &text[second..]];
+                    let (mut old, mut new) = (String::new(), String::new());
+                    for (step, part) in parts.into_iter().enumerate() {
+                        // A flush between the pieces too, as a stop does for good.
+                        for flush in [false, step == 1] {
+                            let expected = reference_chunk(&mut old, part, &values, flush);
+                            let actual = stream_normalizer::take_redacted_stream_chunk(
+                                &mut new, part, &values, flush,
+                            );
+                            assert_eq!(actual, expected, "{first}/{second} step {step} {values:?}");
+                            assert_eq!(new, old, "{first}/{second} step {step} {values:?}");
+                        }
+                    }
+                    assert_eq!(
+                        stream_normalizer::take_redacted_stream_chunk(&mut new, "", &values, true),
+                        reference_chunk(&mut old, "", &values, true)
+                    );
+                    assert!(new.is_empty() && old.is_empty());
+                }
+            }
+        }
+    }
+
+    fn reference_sensitive(arguments: &str, secrets: &[String]) -> bool {
+        const MAX_UNWRAP_DEPTH: u32 = 8;
+        fn contains(value: &Value, secret: &str, depth: u32) -> bool {
+            match value {
+                Value::String(text) => {
+                    text.contains(secret)
+                        || (depth > 0
+                            && serde_json::from_str::<Value>(text)
+                                .is_ok_and(|inner| contains(&inner, secret, depth - 1)))
+                }
+                Value::Array(values) => values.iter().any(|value| contains(value, secret, depth)),
+                Value::Object(values) => values
+                    .iter()
+                    .any(|(key, value)| key.contains(secret) || contains(value, secret, depth)),
+                _ => value.to_string().contains(secret),
+            }
+        }
+        let mut parsed = None;
+        secrets.iter().any(|secret| {
+            !secret.is_empty()
+                && (arguments.contains(secret)
+                    || parsed
+                        .get_or_insert_with(|| serde_json::from_str::<Value>(arguments).ok())
+                        .as_ref()
+                        .is_some_and(|value| contains(value, secret, MAX_UNWRAP_DEPTH)))
+        })
+    }
+
+    #[test]
+    fn sensitive_tool_arguments_matches_the_per_secret_walk() {
+        let mut nested = json!({"path": "secret-token"}).to_string();
+        for _ in 0..10 {
+            nested = json!({ "inner": nested }).to_string();
+        }
+        let mut shallow = json!({"path": "secret-token"}).to_string();
+        for _ in 0..5 {
+            shallow = json!({ "inner": shallow }).to_string();
+        }
+        let cases = [
+            r#"{"path":"a.txt"}"#.to_owned(),
+            r#"{"path":"secret-value"}"#.to_owned(),
+            r#"{"secret-key":1}"#.to_owned(),
+            r#"{"a":["x",{"b":"12345"}],"c":true,"d":null,"e":1.5}"#.to_owned(),
+            r#"{"a":1.5,"b":-7,"c":null,"d":false}"#.to_owned(),
+            json!({"x": json!({"y": json!({"z": "secret-token"}).to_string()}).to_string()})
+                .to_string(),
+            json!(json!({"path": "secret-token"}).to_string()).to_string(),
+            nested,
+            shallow,
+            "not json secret-value".to_owned(),
+            "not json at all".to_owned(),
+            r#"{"path":"a.txt""#.to_owned(),
+            String::new(),
+        ];
+        let lists: [Vec<String>; 6] = [
+            vec![],
+            vec![String::new()],
+            vec!["secret-value".into()],
+            vec!["secret-key".into(), "secret-token".into()],
+            vec![
+                "1.5".into(),
+                "-7".into(),
+                "null".into(),
+                "false".into(),
+                "true".into(),
+            ],
+            vec!["nomatch".into(), String::new(), "12345".into()],
+        ];
+        for arguments in &cases {
+            for secrets in &lists {
+                assert_eq!(
+                    sensitive_tool_arguments(arguments, secrets),
+                    reference_sensitive(arguments, secrets),
+                    "{arguments} {secrets:?}"
+                );
+            }
+        }
+    }
 }

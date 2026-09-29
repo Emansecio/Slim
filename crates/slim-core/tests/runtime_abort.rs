@@ -1,3 +1,7 @@
+#[path = "../../../tests/support/http_fixture.rs"]
+mod http_fixture;
+
+use http_fixture::{accept_within, write_sse};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -22,26 +26,7 @@ use slim_core::{
 };
 
 fn accept_with_deadline(listener: &TcpListener) -> TcpStream {
-    listener
-        .set_nonblocking(true)
-        .expect("nonblocking listener");
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                stream.set_nonblocking(false).expect("blocking stream");
-                return stream;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "fixture accept deadline"
-                );
-                thread::yield_now();
-            }
-            Err(error) => panic!("fixture accept: {error}"),
-        }
-    }
+    accept_within(listener, Duration::from_secs(3))
 }
 
 #[test]
@@ -504,11 +489,7 @@ fn cancellation_during_tool_closes_the_tool_lifecycle_and_preserves_next_seq() {
         });
         let finish = json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]});
         let body = format!("data: {tool}\n\ndata: {finish}\n\ndata: [DONE]\n\n");
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(), body
-        );
-        stream.write_all(response.as_bytes()).expect("response");
+        write_sse(&mut stream, &body);
     });
 
     let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
@@ -660,14 +641,7 @@ fn cancellation_during_mcp_call_finishes_lifecycle_with_uncertain_output_and_con
             }],
         });
         let body = format!("data: {call}\n\ndata: [DONE]\n\n");
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body,
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("provider response");
+        write_sse(&mut stream, &body);
     });
 
     let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
@@ -866,14 +840,7 @@ fn cancellation_during_initialized_notification_reports_unconfirmed_cleanup_with
             }],
         });
         let body = format!("data: {call}\n\ndata: [DONE]\n\n");
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body,
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("provider tool-call response");
+        write_sse(&mut stream, &body);
     });
 
     let mcp_listener = TcpListener::bind("127.0.0.1:0").expect("bind MCP fixture");

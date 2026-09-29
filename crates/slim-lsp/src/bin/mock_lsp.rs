@@ -36,6 +36,14 @@ struct MockConfig {
     definition_uri: Option<String>,
     publish_diagnostics: bool,
     diagnostic_version_delta: i64,
+    /// Publishes one error per document line containing `BROKEN`, with the
+    /// trimmed line as its message, so tests control diagnostics through text.
+    errors_from_document: bool,
+    /// Pause before each publication, to model a slow analysis.
+    publish_delay: Duration,
+    /// Skips a publication identical to the previous one for that document,
+    /// as rust-analyzer does when diagnostics did not change.
+    skip_unchanged: bool,
     document_symbol_nested: bool,
     semantic_from_document: bool,
 }
@@ -105,6 +113,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = MockConfig::default();
     let mut documents = HashMap::<String, String>::new();
     let mut document_versions = HashMap::<String, i64>::new();
+    let mut last_published = HashMap::<String, Value>::new();
     let mut shutdown_requested = false;
 
     while let Some(message) = read_frame(&mut reader)? {
@@ -193,7 +202,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 documents.insert(uri.clone(), text);
                 document_versions.insert(uri, version);
                 logger.write(&json!({"event":"didOpen_applied"}))?;
-                if config.publish_diagnostics {
+                if config.errors_from_document {
+                    let text = documents
+                        .get(&uri_key(&params))
+                        .cloned()
+                        .unwrap_or_default();
+                    publish_document_errors(
+                        &mut writer,
+                        &mut logger,
+                        &params,
+                        &text,
+                        &config,
+                        &mut last_published,
+                    )?;
+                } else if config.publish_diagnostics {
                     publish_diagnostics(&mut writer, &mut logger, &params, &config)?;
                 }
             }
@@ -220,7 +242,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     document_versions.insert(uri.clone(), version);
                 }
-                if config.publish_diagnostics {
+                if config.errors_from_document {
+                    let text = documents.get(&uri).cloned().unwrap_or_default();
+                    publish_document_errors(
+                        &mut writer,
+                        &mut logger,
+                        &params,
+                        &text,
+                        &config,
+                        &mut last_published,
+                    )?;
+                } else if config.publish_diagnostics {
                     publish_diagnostics(&mut writer, &mut logger, &params, &config)?;
                 }
             }
@@ -473,6 +505,19 @@ impl MockConfig {
                 .and_then(|value| value.get("diagnosticVersionDelta"))
                 .and_then(Value::as_i64)
                 .unwrap_or(0),
+            errors_from_document: mock
+                .and_then(|value| value.get("errorsFromDocument"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            publish_delay: Duration::from_millis(
+                mock.and_then(|value| value.get("publishDelayMs"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            ),
+            skip_unchanged: mock
+                .and_then(|value| value.get("skipUnchanged"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             document_symbol_nested: mock
                 .and_then(|value| value.get("documentSymbolNested"))
                 .and_then(Value::as_bool)
@@ -590,6 +635,62 @@ fn wait_for_gate(gate: &std::path::Path) {
     while !gate.exists() && std::time::Instant::now() < deadline {
         thread::sleep(Duration::from_millis(2));
     }
+}
+
+fn uri_key(params: &Value) -> String {
+    params
+        .pointer("/textDocument/uri")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn publish_document_errors<W: Write>(
+    writer: &mut W,
+    logger: &mut Logger,
+    params: &Value,
+    text: &str,
+    config: &MockConfig,
+    last_published: &mut HashMap<String, Value>,
+) -> io::Result<()> {
+    let uri = uri_key(params);
+    let version = params
+        .pointer("/textDocument/version")
+        .and_then(Value::as_i64)
+        .unwrap_or(1)
+        .saturating_add(config.diagnostic_version_delta);
+    let diagnostics = Value::Array(
+        text.lines()
+            .enumerate()
+            .filter_map(|(line, content)| {
+                content.find("BROKEN").map(|column| {
+                    json!({
+                        "range": {
+                            "start": { "line": line, "character": column },
+                            "end": { "line": line, "character": column + 6 }
+                        },
+                        "severity": 1,
+                        "code": "E0001",
+                        "source": "slim-lsp-mock",
+                        "message": content.trim()
+                    })
+                })
+            })
+            .collect(),
+    );
+    if config.skip_unchanged && last_published.get(&uri) == Some(&diagnostics) {
+        return Ok(());
+    }
+    last_published.insert(uri.clone(), diagnostics.clone());
+    if !config.publish_delay.is_zero() {
+        thread::sleep(config.publish_delay);
+    }
+    notify(
+        writer,
+        logger,
+        "textDocument/publishDiagnostics",
+        json!({ "uri": uri, "version": version, "diagnostics": diagnostics }),
+    )
 }
 
 fn publish_diagnostics<W: Write>(

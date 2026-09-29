@@ -13,14 +13,16 @@ pub(super) const SNAPSHOT_MARKER: &str = "\n\nWorkspace paths observed before th
 /// carry the listing [`initial_paths`] and harness channel facts appended after
 /// that prompt.
 pub fn without_workspace_snapshot(content: &str) -> &str {
-    let snapshot = content.find(SNAPSHOT_MARKER);
-    let channel = content.find(super::mode::CHANNEL_MARKER);
-    match (snapshot, channel) {
-        (None, None) => content,
-        (Some(index), None) | (None, Some(index)) => &content[..index],
-        (Some(left), Some(right)) => &content[..left.min(right)],
-    }
+    [
+        content.find(SNAPSHOT_MARKER),
+        content.find(super::mode::CHANNEL_MARKER),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .map_or(content, |index| &content[..index])
 }
+
 const MAX_PATHS: usize = 64;
 const MAX_WALK_ENTRIES: usize = 128;
 const MAX_PATH_BYTES: usize = 1536;
@@ -170,37 +172,18 @@ fn is_reparse_point(_path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::temp_root::TempRoot;
     use std::fs;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    static NEXT_WORKSPACE: AtomicU64 = AtomicU64::new(0);
-
-    struct Workspace(PathBuf);
+    struct Workspace(TempRoot);
     impl Workspace {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "slim-initial-paths-{}-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos(),
-                NEXT_WORKSPACE.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
+            Self(TempRoot::new("initial-paths"))
         }
         fn write(&self, path: &str, text: &str) {
             let path = self.0.join(path);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, text).unwrap();
-        }
-    }
-    impl Drop for Workspace {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
         }
     }
 
@@ -301,7 +284,7 @@ mod tests {
             let result = std::process::Command::new("cmd.exe")
                 .args(["/C", "mklink", "/J"])
                 .arg(&link)
-                .arg(&outside.0)
+                .arg(&*outside.0)
                 .output()
                 .unwrap();
             assert!(result.status.success(), "{:?}", result);
@@ -455,6 +438,44 @@ mod tests {
         assert_eq!(messages, original);
     }
 
+    /// The message contents the provider would see under the channel overlay
+    /// (the production path), leaving `messages` as the overlay restores them.
+    fn channel_view(
+        runtime: &crate::Runtime,
+        messages: &mut [crate::provider::ProviderMessage],
+        mode: crate::OperatingMode,
+    ) -> Vec<String> {
+        let overlay = runtime.overlay_channel(messages, mode);
+        overlay
+            .view()
+            .iter()
+            .map(|message| message.content.clone())
+            .collect()
+    }
+
+    #[test]
+    fn without_workspace_snapshot_cuts_at_the_earliest_marker() {
+        use super::super::mode::CHANNEL_MARKER;
+        assert_eq!(without_workspace_snapshot("plain prompt"), "plain prompt");
+        assert_eq!(without_workspace_snapshot(""), "");
+        assert_eq!(
+            without_workspace_snapshot(&format!("a{SNAPSHOT_MARKER}: x")),
+            "a"
+        );
+        assert_eq!(
+            without_workspace_snapshot(&format!("a{CHANNEL_MARKER} x")),
+            "a"
+        );
+        assert_eq!(
+            without_workspace_snapshot(&format!("a{SNAPSHOT_MARKER}: x{CHANNEL_MARKER} y")),
+            "a"
+        );
+        assert_eq!(
+            without_workspace_snapshot(&format!("a{CHANNEL_MARKER} y{SNAPSHOT_MARKER}: x")),
+            "a"
+        );
+    }
+
     #[test]
     fn session_channel_matches_route_and_is_stripped_from_resume_text() {
         use super::super::mode::CHANNEL_MARKER;
@@ -465,32 +486,36 @@ mod tests {
             ProviderMessage::assistant("Earlier answer", Vec::new()),
             ProviderMessage::user("Continue"),
         ];
-        runtime.add_session_channel_context(&mut messages, crate::OperatingMode::Auto);
-        assert_eq!(messages[0].content, "Inspect files");
-        assert!(messages[2].content.starts_with("Continue"));
-        assert!(messages[2].content.contains("Auto, unattended"));
-        assert!(!messages[2].content.contains("Auto, interactive"));
-        assert_eq!(
-            crate::without_workspace_snapshot(&messages[2].content),
-            "Continue"
-        );
+        let seen = channel_view(&runtime, &mut messages, crate::OperatingMode::Auto);
+        assert_eq!(seen[0], "Inspect files");
+        assert!(seen[2].starts_with("Continue"));
+        assert!(seen[2].contains("Auto, unattended"));
+        assert!(!seen[2].contains("Auto, interactive"));
+        assert_eq!(crate::without_workspace_snapshot(&seen[2]), "Continue");
+        // The overlay is a view: the transcript keeps only the prompt.
+        assert_eq!(messages[2].content, "Continue");
 
         let (route, _responder) = crate::interaction_route();
         runtime.set_interaction_route(route);
-        runtime.add_session_channel_context(&mut messages, crate::OperatingMode::Auto);
-        assert_eq!(messages[2].content.matches(CHANNEL_MARKER).count(), 1);
-        assert!(messages[2].content.contains("Auto, interactive"));
-        assert!(!messages[2].content.contains("Auto, unattended"));
+        // A stanza from an earlier turn is replaced, never duplicated.
+        messages[2].content = format!(
+            "Continue{}",
+            super::super::mode::channel_stanza(crate::OperatingMode::Auto, false)
+        );
+        let seen = channel_view(&runtime, &mut messages, crate::OperatingMode::Auto);
+        assert_eq!(seen[2].matches(CHANNEL_MARKER).count(), 1);
+        assert!(seen[2].contains("Auto, interactive"));
+        assert!(!seen[2].contains("Auto, unattended"));
 
-        runtime.add_session_channel_context(&mut messages, crate::OperatingMode::Plan);
-        assert_eq!(messages[2].content.matches(CHANNEL_MARKER).count(), 1);
-        assert!(messages[2].content.contains("Plan."));
-        assert!(!messages[2].content.contains("Use ask_question"));
+        let seen = channel_view(&runtime, &mut messages, crate::OperatingMode::Plan);
+        assert_eq!(seen[2].matches(CHANNEL_MARKER).count(), 1);
+        assert!(seen[2].contains("Plan."));
+        assert!(!seen[2].contains("Use ask_question"));
 
-        runtime.add_session_channel_context(&mut messages, crate::OperatingMode::ReadOnly);
-        assert_eq!(messages[2].content.matches(CHANNEL_MARKER).count(), 1);
-        assert!(messages[2].content.contains("Read-only, interactive"));
-        assert!(messages[2].content.contains("Use ask_question"));
+        let seen = channel_view(&runtime, &mut messages, crate::OperatingMode::ReadOnly);
+        assert_eq!(seen[2].matches(CHANNEL_MARKER).count(), 1);
+        assert!(seen[2].contains("Read-only, interactive"));
+        assert!(seen[2].contains("Use ask_question"));
 
         let snapshot = format!(
             "prompt{} (partial):\nfile.txt\n{} Auto, unattended.",
