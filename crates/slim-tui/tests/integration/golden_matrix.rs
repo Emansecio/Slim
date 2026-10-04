@@ -101,10 +101,8 @@ fn matrix_of_normative_sizes_never_panics_and_keeps_status_visible() {
             // Regions tile the full height exactly.
             let todo_rows = slim_tui::layout::todo_height(true, 2, false);
             let show_session_rail = width >= 80 && height >= 12;
-            let regions =
-                plan_with_session_rail(width, height, todo_rows, false, show_session_rail);
+            let regions = plan_with_session_rail(width, height, todo_rows, show_session_rail);
             let covered = regions.session_rail.height
-                + regions.activity_rail.height
                 + regions.scrollback.height
                 + regions.todo.height
                 + regions.todo_divider.height

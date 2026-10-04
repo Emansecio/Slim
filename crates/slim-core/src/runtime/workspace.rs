@@ -399,7 +399,16 @@ mod tests {
             "fixture-key",
         ))
         .unwrap();
-        let runtime = crate::Runtime::new();
+        let mut runtime = crate::Runtime::new();
+        // Pi's trigger line is the window minus the reserve; a zero reserve
+        // puts it at the window itself, so the window chosen below separates
+        // the request without the snapshot from the one with it.
+        runtime.set_compaction_handle(crate::context::CompactionHandle::new(
+            crate::context::CompactionPolicy {
+                reserve_tokens: 0,
+                ..crate::context::CompactionPolicy::default()
+            },
+        ));
         let mut messages = vec![ProviderMessage::user("Original user instruction")];
         let tools = runtime.workspace_tool_definitions(crate::OperatingMode::Auto, &root.0);
         let estimate = |messages: &[ProviderMessage]| {
@@ -422,12 +431,29 @@ mod tests {
             .push_str(&initial_paths(&root.0, None).unwrap());
         let after = estimate(&candidate);
         assert!(after > before);
-        let config = AgentLoopConfig {
-            context_window_tokens: (before + after) / 2 * 100 / 60,
+        let original = messages.clone();
+        let roomy = AgentLoopConfig {
+            context_window_tokens: after.saturating_mul(2),
             context_reserve_tokens: 0,
             ..AgentLoopConfig::default()
         };
-        let original = messages.clone();
+        runtime.add_initial_workspace_context(
+            &adapter,
+            &mut messages,
+            crate::OperatingMode::Auto,
+            &root.0,
+            roomy,
+        );
+        assert!(
+            messages[0].content.contains(SNAPSHOT_MARKER),
+            "a window with room appends the snapshot, so the early return is not what holds below"
+        );
+        messages = original.clone();
+        let config = AgentLoopConfig {
+            context_window_tokens: (before + after) / 2,
+            context_reserve_tokens: 0,
+            ..AgentLoopConfig::default()
+        };
         runtime.add_initial_workspace_context(
             &adapter,
             &mut messages,
@@ -445,7 +471,8 @@ mod tests {
         messages: &mut [crate::provider::ProviderMessage],
         mode: crate::OperatingMode,
     ) -> Vec<String> {
-        let overlay = runtime.overlay_channel(messages, mode);
+        let frame = runtime.channel_frame(mode, messages);
+        let overlay = runtime.overlay_channel(messages, mode, &frame);
         overlay
             .view()
             .iter()

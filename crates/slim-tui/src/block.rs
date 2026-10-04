@@ -32,22 +32,37 @@ pub struct ToolState {
 }
 
 impl ToolState {
-    /// Diff lines for the expanded body: one `@@ path:line` header per hunk,
-    /// then `- ` removed and `+ ` added lines.
-    pub fn diff_lines(&self) -> Vec<String> {
+    pub(crate) fn diff_rows(&self) -> Vec<(DiffRowKind, String)> {
         let Some(diff) = &self.edit_diff else {
             return Vec::new();
         };
-        let mut lines = Vec::new();
+        let mut rows = Vec::new();
         for hunk in &diff.hunks {
-            lines.push(format!("@@ {}:{}", diff.path, hunk.start_line));
-            lines.extend(hunk.removed.iter().map(|line| format!("- {line}")));
-            lines.extend(hunk.added.iter().map(|line| format!("+ {line}")));
+            rows.push((
+                DiffRowKind::Header,
+                format!("@@ {}:{}", diff.path, hunk.start_line),
+            ));
+            rows.extend(
+                hunk.removed
+                    .iter()
+                    .map(|line| (DiffRowKind::Removed, format!("- {line}"))),
+            );
+            rows.extend(
+                hunk.added
+                    .iter()
+                    .map(|line| (DiffRowKind::Added, format!("+ {line}"))),
+            );
         }
         if diff.truncated {
-            lines.push("@@ diff truncated".into());
+            rows.push((DiffRowKind::Header, "@@ diff truncated".into()));
         }
-        lines
+        rows
+    }
+
+    /// Diff lines for the expanded body: one `@@ path:line` header per hunk,
+    /// then `- ` removed and `+ ` added lines.
+    pub fn diff_lines(&self) -> Vec<String> {
+        self.diff_rows().into_iter().map(|(_, text)| text).collect()
     }
 
     pub fn has_expanded_body(&self) -> bool {
@@ -66,6 +81,13 @@ impl ToolState {
         }
         body
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DiffRowKind {
+    Header,
+    Added,
+    Removed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,33 +173,12 @@ impl InteractionRequestState {
         let InteractionRequestKind::Question { question, options } = &self.kind else {
             return self.display_text().lines().map(str::to_owned).collect();
         };
-        let width = width.max(8);
-        let mut lines = wrap_hanging("? ", question, width);
-        let collapsed = self.acknowledgement.is_some();
-        if collapsed {
-            let answer = self
-                .answered
-                .as_deref()
-                .or_else(|| {
-                    self.acknowledgement
-                        .as_ref()
-                        .map(|acknowledgement| acknowledgement.message.as_str())
-                        .filter(|message| !message.is_empty())
-                })
-                .unwrap_or(
-                    if self
-                        .acknowledgement
-                        .as_ref()
-                        .is_some_and(|ack| ack.accepted)
-                    {
-                        "confirmada"
-                    } else {
-                        "rejeitada"
-                    },
-                );
-            lines.extend(wrap_hanging("  · ", answer, width));
+        if let Some((mut lines, answer)) = self.question_record_rows(width) {
+            lines.extend(answer);
             return lines;
         }
+        let width = width.max(8);
+        let mut lines = wrap_hanging("? ", question, width);
         if !options.is_empty() {
             lines.push(String::new());
             for (index, option) in options.iter().enumerate() {
@@ -208,7 +209,36 @@ impl InteractionRequestState {
         }
         lines
     }
+
+    /// Transcript record of an acknowledged question, on the transcript grid:
+    /// the question rows behind the `?` marker, then the answer rows behind
+    /// `→` (markers on column 2, text on column 4).
+    pub(crate) fn question_record_rows(&self, width: usize) -> Option<(Vec<String>, Vec<String>)> {
+        let InteractionRequestKind::Question { question, .. } = &self.kind else {
+            return None;
+        };
+        let acknowledgement = self.acknowledgement.as_ref()?;
+        let width = width.max(8);
+        let answer = self
+            .answered
+            .as_deref()
+            .or_else(|| {
+                Some(acknowledgement.message.as_str()).filter(|message| !message.is_empty())
+            })
+            .unwrap_or(if acknowledgement.accepted {
+                "confirmada"
+            } else {
+                "rejeitada"
+            });
+        Some((
+            wrap_hanging(QUESTION_RECORD_MARKER, question, width),
+            wrap_hanging(QUESTION_ANSWER_MARKER, answer, width),
+        ))
+    }
 }
+
+pub(crate) const QUESTION_RECORD_MARKER: &str = "  ? ";
+pub(crate) const QUESTION_ANSWER_MARKER: &str = "  → ";
 
 pub(crate) fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
@@ -331,13 +361,12 @@ pub fn is_complete_tool(block: &Block) -> bool {
 
 pub fn is_collapsed_complete_thinking(block: &Block) -> bool {
     block.lifecycle == BlockLifecycle::Complete
-        && !block.preview_retained
         && matches!(block.kind(), BlockKind::Thinking(_))
         && block.fold != FoldState::Expanded
 }
 
 fn is_tool_group_bridge(block: &Block) -> bool {
-    is_collapsed_complete_thinking(block)
+    is_complete_thinking(block)
 }
 
 /// How long a just-finished tool keeps its own row before joining a group.
@@ -355,6 +384,20 @@ pub fn tool_hold_pending(block: &Block, now_ms: u64, reduced_motion: bool) -> bo
 
 pub fn is_presented_complete_tool(block: &Block, now_ms: u64, reduced_motion: bool) -> bool {
     is_complete_tool(block) && !tool_hold_pending(block, now_ms, reduced_motion)
+}
+
+/// A live call that has finished, successfully or not. Restored calls have no
+/// trustworthy outcome and never join a group.
+pub fn is_settled_tool(block: &Block) -> bool {
+    matches!(
+        block.lifecycle,
+        BlockLifecycle::Complete | BlockLifecycle::Failed
+    ) && matches!(block.kind(), BlockKind::Tool(tool) if !tool.historical)
+}
+
+fn is_presented_settled_tool(block: &Block, now_ms: u64, reduced_motion: bool) -> bool {
+    is_presented_complete_tool(block, now_ms, reduced_motion)
+        || (is_settled_tool(block) && block.lifecycle == BlockLifecycle::Failed)
 }
 
 /// Stable while the set of tools still inside [`TOOL_GROUP_HOLD_MS`] does not
@@ -399,16 +442,18 @@ fn consecutive_tool_span(
     Some((start, end))
 }
 
-/// Presentation-only span of consecutive successful tools (DESIGN §11.4.1).
-/// Collapsed complete thinking between those tools is a bridge, not a split,
+/// Presentation-only span of consecutive settled tools (DESIGN §11.4.1).
+/// A failure joins its neighbors instead of splitting the work; the group
+/// keeps it visible as a row of its own (see [`group_failure_rows`]).
+/// Complete thinking between those tools is a bridge, not a split,
 /// so a think→tools→think→tools streak collapses to one group.
-pub fn consecutive_complete_tool_span(blocks: &[Block], index: usize) -> Option<(usize, usize)> {
-    consecutive_tool_span(blocks, index, is_complete_tool)
+pub fn consecutive_settled_tool_span(blocks: &[Block], index: usize) -> Option<(usize, usize)> {
+    consecutive_tool_span(blocks, index, is_settled_tool)
 }
 
-/// Same span as [`consecutive_complete_tool_span`], excluding tools still
-/// inside the completion emphasis. Those keep a row of their own until the
-/// hold expires. Reduced motion settles immediately.
+/// Same span as [`consecutive_settled_tool_span`], excluding successful tools
+/// still inside the completion emphasis. Those keep a row of their own until
+/// the hold expires. Reduced motion settles immediately.
 pub fn consecutive_presented_tool_span(
     blocks: &[Block],
     index: usize,
@@ -416,8 +461,66 @@ pub fn consecutive_presented_tool_span(
     reduced_motion: bool,
 ) -> Option<(usize, usize)> {
     consecutive_tool_span(blocks, index, |block| {
-        is_presented_complete_tool(block, now_ms, reduced_motion)
+        is_presented_settled_tool(block, now_ms, reduced_motion)
     })
+}
+
+/// Whether a settled span reads as one group: more than one call, at least
+/// one of them successful. Failures alone keep their own rows (or the
+/// identical-failure row).
+pub fn is_tool_group(blocks: &[Block], start: usize, end: usize) -> bool {
+    let Some(span) = blocks.get(start..end) else {
+        return false;
+    };
+    span.iter().filter(|block| is_settled_tool(block)).count() > 1
+        && span.iter().any(is_complete_tool)
+}
+
+/// One failure row under a collapsed group: the first member of a run of
+/// identical failures, how many there were, and whether the same call later
+/// succeeded inside the group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GroupFailureRow {
+    pub member: usize,
+    pub repeats: usize,
+    pub recovered: bool,
+}
+
+/// Failures a collapsed group still shows. Identical consecutive failures
+/// share one row; a call retried with the same arguments that then succeeded
+/// is marked `recovered` instead of disappearing.
+pub fn group_failure_rows(members: &[Block]) -> Vec<GroupFailureRow> {
+    let call = |block: &Block| match block.kind() {
+        BlockKind::Tool(tool) => Some((tool.name.clone(), tool.arguments_summary.clone())),
+        _ => None,
+    };
+    let mut rows: Vec<GroupFailureRow> = Vec::new();
+    for (index, member) in members.iter().enumerate() {
+        if !is_failed_tool(member) {
+            continue;
+        }
+        if let Some(last) = rows.last_mut() {
+            let previous = &members[last.member];
+            if failed_tool_signature(previous) == failed_tool_signature(member)
+                && call(previous) == call(member)
+                && members[last.member..index]
+                    .iter()
+                    .all(|between| is_failed_tool(between) || !is_settled_tool(between))
+            {
+                last.repeats += 1;
+                continue;
+            }
+        }
+        let recovered = members[index + 1..]
+            .iter()
+            .any(|later| is_complete_tool(later) && call(later) == call(member));
+        rows.push(GroupFailureRow {
+            member: index,
+            repeats: 1,
+            recovered,
+        });
+    }
+    rows
 }
 
 /// The `● Slim` header that opens the agent's side of a turn. It belongs to
@@ -551,13 +654,6 @@ pub fn leading_rows(blocks: &[Block], index: usize) -> usize {
         + usize::from(transition_gap(blocks, index))
 }
 
-pub fn complete_tool_count(blocks: &[Block], start: usize, end: usize) -> usize {
-    blocks
-        .get(start..end)
-        .map(|span| span.iter().filter(|block| is_complete_tool(block)).count())
-        .unwrap_or(0)
-}
-
 pub fn is_failed_tool(block: &Block) -> bool {
     block.lifecycle == BlockLifecycle::Failed && matches!(block.kind(), BlockKind::Tool(_))
 }
@@ -573,9 +669,7 @@ fn failed_tool_signature(block: &Block) -> Option<(&str, &str)> {
 
 /// Consecutive failed tools that share name and reason, for one error row.
 pub fn is_complete_thinking(block: &Block) -> bool {
-    block.lifecycle == BlockLifecycle::Complete
-        && !block.preview_retained
-        && matches!(block.kind(), BlockKind::Thinking(_))
+    block.lifecycle == BlockLifecycle::Complete && matches!(block.kind(), BlockKind::Thinking(_))
 }
 
 pub fn consecutive_complete_thinking_span(
@@ -612,16 +706,34 @@ pub fn consecutive_identical_failed_tool_span(
     Some((start, end))
 }
 
+/// Presentation-only group of adjacent pending user messages; transcript
+/// output between messages keeps its position and breaks the group.
+pub fn consecutive_queued_user_span(blocks: &[Block], index: usize) -> Option<(usize, usize)> {
+    if !matches!(blocks.get(index)?.kind(), BlockKind::QueuedUser(_)) {
+        return None;
+    }
+    let mut start = index;
+    while start > 0 && matches!(blocks[start - 1].kind(), BlockKind::QueuedUser(_)) {
+        start -= 1;
+    }
+    let mut end = index + 1;
+    while end < blocks.len() && matches!(blocks[end].kind(), BlockKind::QueuedUser(_)) {
+        end += 1;
+    }
+    Some((start, end))
+}
+
 #[derive(Debug)]
 pub struct Block {
     pub id: BlockId,
     kind: BlockKind,
     pub lifecycle: BlockLifecycle,
     pub fold: FoldState,
+    /// The tool-group header folds independently of this member's details.
+    pub group_expanded: bool,
     /// Monotonic presentation timestamps; historical blocks may not have them.
     pub started_ms: Option<u64>,
     pub ended_ms: Option<u64>,
-    pub preview_retained: bool,
     /// A prompt whose run has not produced any agent output yet: the user
     /// block also draws the `● Slim` header the first agent block will take over.
     awaiting_agent: bool,
@@ -638,9 +750,9 @@ impl Clone for Block {
             kind: self.kind.clone(),
             lifecycle: self.lifecycle,
             fold: self.fold,
+            group_expanded: self.group_expanded,
             started_ms: self.started_ms,
             ended_ms: self.ended_ms,
-            preview_retained: self.preview_retained,
             awaiting_agent: self.awaiting_agent,
             reasoning_classification: self.reasoning_classification,
             turn_boundary_before: self.turn_boundary_before,
@@ -656,9 +768,9 @@ impl PartialEq for Block {
             && self.kind == other.kind
             && self.lifecycle == other.lifecycle
             && self.fold == other.fold
+            && self.group_expanded == other.group_expanded
             && self.started_ms == other.started_ms
             && self.ended_ms == other.ended_ms
-            && self.preview_retained == other.preview_retained
             && self.awaiting_agent == other.awaiting_agent
             && self.reasoning_classification == other.reasoning_classification
             && self.turn_boundary_before == other.turn_boundary_before
@@ -675,9 +787,9 @@ impl Block {
             kind,
             lifecycle,
             fold: FoldState::Auto,
+            group_expanded: false,
             started_ms: None,
             ended_ms: None,
-            preview_retained: false,
             awaiting_agent: false,
             reasoning_classification: None,
             turn_boundary_before: false,
@@ -688,10 +800,6 @@ impl Block {
 
     pub fn kind(&self) -> &BlockKind {
         &self.kind
-    }
-
-    pub(crate) fn shows_thinking_preview(&self) -> bool {
-        self.lifecycle == BlockLifecycle::Streaming || self.preview_retained
     }
 
     pub(crate) fn tool_state_mut(&mut self) -> Option<&mut ToolState> {
@@ -809,23 +917,23 @@ impl Block {
     /// Compact key for caches: `lifecycle` is assigned directly (bypassing
     /// `touch_content`), so presentation caches must key on it separately.
     pub(crate) fn lifecycle_tag(&self) -> u8 {
-        let tag = match self.lifecycle {
+        match self.lifecycle {
             BlockLifecycle::Pending => 0,
             BlockLifecycle::Streaming => 1,
             BlockLifecycle::Complete => 2,
             BlockLifecycle::Failed => 3,
             BlockLifecycle::Cancelled => 4,
-        };
-        tag | (u8::from(self.preview_retained) << 4)
+        }
     }
 
     /// Compact key for caches: `fold` is likewise assigned directly.
     pub(crate) fn fold_tag(&self) -> u8 {
-        match self.fold {
+        let fold = match self.fold {
             FoldState::Auto => 0,
             FoldState::Collapsed => 1,
             FoldState::Expanded => 2,
-        }
+        };
+        fold | (u8::from(self.group_expanded) << 2)
     }
 
     pub(crate) fn awaiting_agent(&self) -> bool {

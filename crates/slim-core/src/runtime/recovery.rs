@@ -1,4 +1,5 @@
 use super::agent_loop::LoopState;
+use super::overflow::is_context_overflow_message;
 use super::*;
 
 /// Retries after an output-limit truncation and after rejected tool arguments.
@@ -44,6 +45,8 @@ pub(super) fn classify_provider_stop_reason(
         reason
             if reason == "length"
                 || reason == "incomplete"
+                // Anthropic: the context window, not `max_tokens`, ended the response.
+                || reason == "model_context_window_exceeded"
                 || reason.contains("max_tokens")
                 || reason.contains("max_output_tokens")
                 || reason.contains("max_completion_tokens")
@@ -51,7 +54,9 @@ pub(super) fn classify_provider_stop_reason(
         {
             Ok(ProviderTurnStop::Truncated)
         }
-        reason if reason.contains("filter") || reason == "safety" => Ok(ProviderTurnStop::Filtered),
+        reason if reason.contains("filter") || matches!(reason, "safety" | "refusal") => {
+            Ok(ProviderTurnStop::Filtered)
+        }
         _ => {
             let reason: String = redact_values(sensitive_values, raw_stop_reason.trim())
                 .chars()
@@ -85,8 +90,7 @@ pub(super) struct RecoveryBudget {
     pub(super) initial_context_reserve: u64,
     /// The single overflow recovery of this run was spent (a limit).
     pub(super) overflow_retry_used: bool,
-    /// The next compaction comes from that overflow (a label, consumed by
-    /// the next preflight).
+    /// The next preflight compacts because of that overflow (consumed there).
     pub(super) overflow_compaction_pending: bool,
     pub(super) provider_recoveries: u32,
     pub(super) truncation_recoveries: u32,
@@ -170,50 +174,43 @@ pub(super) fn is_output_limit_rejection(error: &ProviderError) -> bool {
         .any(|key| lower.contains(key))
 }
 
+/// Pi's overflow patterns over the error text, plus the provider's own error
+/// code. Pi matches the text of any failed response; Slim also knows the HTTP
+/// status, and a request the provider rejected can only overflow when it was
+/// rejected as a client error: a server failure, an authentication or
+/// permission failure, a timeout and rate limiting (401, 403, 408, 429) are
+/// never an overflow, whatever their wording.
 pub(super) fn is_context_overflow_error(error: &ProviderError) -> bool {
+    if error.status().is_some_and(|status| {
+        !(400..500).contains(&status) || matches!(status, 401 | 403 | 408 | 429)
+    }) {
+        return false;
+    }
     if let ProviderError::Api { metadata, .. } = error {
-        if metadata
-            .status
-            .is_some_and(|status| !matches!(status, 400 | 413 | 422))
-        {
-            return false;
-        }
         if matches!(
             metadata.classification_code(),
-            Some("context_length_exceeded" | "context_window_exceeded" | "prompt_too_long")
+            Some(
+                "context_length_exceeded"
+                    | "context_window_exceeded"
+                    | "model_context_window_exceeded"
+                    | "prompt_too_long"
+            )
         ) {
             return true;
         }
-        if !matches!(
-            metadata.classification_code(),
-            Some("invalid_request_error" | "bad_request")
-        ) {
-            return false;
-        }
     }
-    if matches!(error, ProviderError::Http { status, .. } if !matches!(status, 400 | 413 | 422)) {
-        return false;
-    }
-    let message = match error {
-        ProviderError::Api { message, .. }
-        | ProviderError::TransientRemote { message }
-        | ProviderError::Remote { message }
-        | ProviderError::Http { message, .. } => message.as_str(),
-        ProviderError::InvalidResponse { message } => message.as_str(),
-        _ => return false,
-    };
-    let lower = message.to_ascii_lowercase();
-    [
-        "maximum context length",
-        "context length exceeded",
-        "context window exceeded",
-        "exceeds context window",
-        "prompt too long",
-        "prompt is too long",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    matches!(
+        error,
+        ProviderError::Api { .. }
+            | ProviderError::TransientRemote { .. }
+            | ProviderError::Remote { .. }
+            | ProviderError::Http { .. }
+            | ProviderError::InvalidResponse { .. }
+    ) && error.message().is_some_and(is_context_overflow_message)
 }
+
+/// Pi's text for an overflow that survived its one compact-and-retry.
+const OVERFLOW_RECOVERY_FAILED_SUFFIX: &str = "; context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.";
 
 // Retry only the current request. Tool calls already emitted in this request
 // are not repeated. Partial assistant text is preserved and the model is told
@@ -375,7 +372,6 @@ pub(super) fn has_causal_provider_output(app: &AppHandle, event_start: usize) ->
 /// What the loop knows about the provider attempt being settled.
 pub(super) struct AttemptCtx {
     pub(super) event_start: usize,
-    pub(super) has_compactable: bool,
 }
 
 /// The phase and attempt counters a scheduled retry announces.
@@ -446,14 +442,24 @@ impl Runtime {
         {
             return self.settle_argument_repair(st, attempt).await;
         }
-        if !recovery.overflow_retry_used
+        let overflow = is_context_overflow_error(&error)
+            && !has_causal_provider_output(&self.app, event_start);
+        // Pi compacts for an overflow only when compaction is enabled; with it
+        // off the next request would be the rejected one again.
+        if overflow
+            && !recovery.overflow_retry_used
+            && st.config.context_compaction_enabled
+            && self.compaction_policy().enabled
             && self.compaction_handle.is_some()
-            && is_context_overflow_error(&error)
-            && !has_causal_provider_output(&self.app, event_start)
-            && attempt.has_compactable
+            && self.has_compactable_history(st.messages)
         {
-            return self.settle_context_overflow(st).await;
+            return self.settle_context_overflow(st);
         }
+        let error = if overflow && recovery.overflow_retry_used {
+            error.with_suffix(OVERFLOW_RECOVERY_FAILED_SUFFIX)
+        } else {
+            error
+        };
         if recovery.can_retry(recovery.provider_recoveries)
             && recoverable_provider_error(&error)
             && !request_emitted_tools(&self.app, event_start)
@@ -542,13 +548,6 @@ impl Runtime {
         if st.recovery.argument_repairs >= MAX_ARGUMENT_REPAIRS
             || st.turn + 1 >= st.config.max_turns
         {
-            let _ = self
-                .cancel_pending_background(
-                    &mut st.pending_background,
-                    &mut st.next_seq,
-                    "argument_repair_limit",
-                )
-                .await;
             return Err(ProviderError::InvalidResponse { message: format!(
                 "tool arguments remain invalid after {argument_repairs} repair retries or the configured turn limit; rejected batch was not executed; task remains pending: {note}",
                 argument_repairs = st.recovery.argument_repairs,
@@ -567,29 +566,15 @@ impl Runtime {
         Ok(ProviderAttempt::NextTurn)
     }
 
-    async fn settle_context_overflow(
+    /// One compact-and-retry per episode: the failed request left no assistant
+    /// message in the history, so the next request compacts it and is resent.
+    fn settle_context_overflow(
         &mut self,
         st: &mut LoopState<'_>,
     ) -> Result<ProviderAttempt, ProviderError> {
         st.recovery.overflow_retry_used = true;
         st.recovery.overflow_compaction_pending = true;
         st.next_seq = self.observed_next_seq(st.next_seq);
-        let has_prepared = self
-            .compaction_handle
-            .as_ref()
-            .is_some_and(|handle| handle.status() == crate::context::CompactionStatus::Ready);
-        if !has_prepared {
-            self.cancel_pending_background(
-                &mut st.pending_background,
-                &mut st.next_seq,
-                "context_overflow_retry",
-            )
-            .await?;
-            if let Some(handle) = &self.compaction_handle {
-                handle.invalidate();
-                let _ = handle.request_manual("");
-            }
-        }
         Ok(ProviderAttempt::Retry)
     }
 
@@ -608,12 +593,6 @@ impl Runtime {
         ) {
             Ok(delay) => delay,
             Err(blocked) => {
-                self.cancel_pending_background(
-                    &mut st.pending_background,
-                    &mut st.next_seq,
-                    "provider_retry_budget",
-                )
-                .await?;
                 if self
                     .wait_for_manual_retry(
                         error,
@@ -688,12 +667,6 @@ impl Runtime {
         st: &mut LoopState<'_>,
         attempt: &AttemptCtx,
     ) -> Result<ProviderAttempt, ProviderError> {
-        self.cancel_pending_background(
-            &mut st.pending_background,
-            &mut st.next_seq,
-            "provider_error",
-        )
-        .await?;
         let recovery_reason = terminal_recovery_reason(
             &error,
             &st.recovery,

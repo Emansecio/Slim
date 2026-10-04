@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use slim_core::events::{EventKind, SessionEvent};
-use slim_core::session::{branch, recover, SessionIndex, SessionWriter};
+use slim_core::session::{branch, recover, SessionWriter};
 
 fn temp_path(name: &str) -> PathBuf {
     let unique = format!(
@@ -39,8 +39,7 @@ fn branch_keeps_parent_identity_and_rebuildable_index() {
     assert_eq!(child.header.cutoff_seq, Some(1));
     assert_eq!(child.events.len(), 1);
 
-    let index = SessionIndex::rebuild(&child.events);
-    assert_eq!(index.last_seq, Some(1));
+    assert_eq!(child.events.last().map(|event| event.seq), Some(1));
 
     let _ = fs::remove_dir_all(path.parent().expect("parent"));
 }

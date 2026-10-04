@@ -31,6 +31,7 @@ fn http_spec(name: &str, url: &str) -> McpServerSpec {
         },
         enabled: true,
         timeout: Duration::from_secs(2),
+        options: Default::default(),
     }
 }
 
@@ -38,6 +39,15 @@ fn manager_with(spec: McpServerSpec) -> McpManager {
     let mut specs = BTreeMap::new();
     specs.insert(spec.name.clone(), spec);
     McpManager::new(specs, std::env::temp_dir(), ExecutableResolver::default())
+}
+
+#[test]
+fn status_target_excludes_http_url_credentials() {
+    let manager = manager_with(http_spec(
+        "private",
+        "https://user:fixture-password@example.com/mcp?token=fixture-token#fixture-secret",
+    ));
+    assert_eq!(manager.statuses()[0].target, "https://example.com/mcp");
 }
 
 /// A malformed configured URL is embedded verbatim in the connection error,
@@ -120,6 +130,7 @@ fn sec_mcp_credential_key_covers_common_secret_names() {
         },
         enabled: true,
         timeout: Duration::from_secs(2),
+        options: Default::default(),
     };
     let collected: Vec<String> = spec.transport.sensitive_values().cloned().collect();
     assert!(collected.iter().any(|value| value == "sk-fake-covered"));

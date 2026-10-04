@@ -194,7 +194,8 @@ fn decode_entries<'a>(
                 ProviderMessage::assistant(entry.content.clone(), entry.tool_calls.clone())
             }
             DurableEntryRole::Tool => {
-                if !entry.tool_calls.is_empty() || !entry.content_blocks.is_empty() {
+                // A tool result may carry content blocks (MCP image content).
+                if !entry.tool_calls.is_empty() {
                     return Err("invalid durable tool-result metadata");
                 }
                 let id = entry
@@ -262,6 +263,23 @@ mod tests {
         let serialized = serde_json::to_string(&entries(messages.clone())).unwrap();
         let restored: Vec<DurableEntry> = serde_json::from_str(&serialized).unwrap();
         assert_eq!(provider_messages_from_entries(&restored).unwrap(), messages);
+    }
+
+    #[test]
+    fn tool_results_keep_their_content_blocks_across_the_journal() {
+        let messages = vec![
+            ProviderMessage::user("look"),
+            ProviderMessage::assistant("", vec![call("a")]),
+            ProviderMessage::tool("read", "a", "[image image/png, 1 B]")
+                .with_content_blocks(vec![ProviderContentBlock::image("image/png", "AA==")]),
+        ];
+        let serialized = serde_json::to_string(&entries(messages.clone())).unwrap();
+        let restored: Vec<DurableEntry> = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(provider_messages_from_entries(&restored).unwrap(), messages);
+        // A tool result still cannot declare tool calls of its own.
+        let mut forged = entries(messages);
+        forged[2].tool_calls = vec![call("b")];
+        assert!(provider_messages_from_entries(&forged).is_err());
     }
 
     #[test]

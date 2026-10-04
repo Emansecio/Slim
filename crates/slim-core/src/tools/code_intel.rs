@@ -11,9 +11,9 @@ use super::execution::{
     CodeIntelContinuation, CodeIntelHeaderKind, CodeIntelPresentation, CodeIntelRecord,
 };
 use crate::codeintel::{
-    CodeIntelCompleteness, CodeIntelDiagnosticsQuery, CodeIntelMeta, CodeIntelOutcome,
-    CodeIntelPositionQuery, CodeIntelServerState, CodeIntelSymbolQuery, DEFAULT_CODE_INTEL_LIMIT,
-    MAX_CODE_INTEL_RESULTS,
+    sanitize_note_text, CodeIntelCompleteness, CodeIntelDiagnosticsQuery, CodeIntelMeta,
+    CodeIntelOutcome, CodeIntelPositionQuery, CodeIntelServerState, CodeIntelSymbolQuery,
+    DEFAULT_CODE_INTEL_LIMIT, MAX_CODE_INTEL_RESULTS,
 };
 
 #[derive(Clone, Debug)]
@@ -38,7 +38,7 @@ pub const CODE_INTEL_ACTIONS: &[&str] = &[
 pub fn code_intel_definition() -> Value {
     json!({
         "name": "code_intel",
-        "description": "Semantic Rust navigation and diagnostics; definition includes a bounded preview. Use search for literal text, not semantic references.",
+        "description": "Semantic Rust, JavaScript and TypeScript navigation and diagnostics; definition includes a bounded preview. Use search for literal text, not semantic references.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -47,6 +47,7 @@ pub fn code_intel_definition() -> Value {
                     "enum": CODE_INTEL_ACTIONS
                 },
                 "path": {"type": "string", "description": "Workspace-relative; symbol with path selects document outline."},
+                "server": {"type": "string", "minLength": 1, "description": "Optional profile for symbol/diagnostics; inferred from path. Select a server when a mixed workspace is ambiguous."},
                 "line": {"type": "integer", "minimum": 1, "description": "1-based line"},
                 "column": {"type": "integer", "minimum": 1, "description": "1-based character column."},
                 "symbol": {"type": "string", "description": "Symbol name for headers."},
@@ -60,13 +61,18 @@ pub fn code_intel_definition() -> Value {
             "oneOf": [
                 {
                     "properties": {"action": {"enum": ["definition", "references", "hover"]}},
-                    "required": ["path", "line", "column"]
+                    "required": ["path", "line", "column"],
+                    "not": {"required": ["server"]}
                 },
                 {
                     "properties": {"action": {"enum": ["symbol"]}},
                     "anyOf": [{"required": ["path"]}, {"required": ["query"]}]
                 },
-                {"properties": {"action": {"enum": ["diagnostics", "status"]}}}
+                {"properties": {"action": {"enum": ["diagnostics"]}}},
+                {
+                    "properties": {"action": {"enum": ["status"]}},
+                    "not": {"required": ["server"]}
+                }
             ],
             "additionalProperties": false
         }
@@ -79,6 +85,20 @@ fn required_str(args: &Value, name: &str) -> Result<String, String> {
         .map(str::to_owned)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("missing string argument: {name}"))
+}
+
+fn server_filter(args: &Value, action: &str) -> Result<Option<String>, String> {
+    let Some(value) = args.get("server") else {
+        return Ok(None);
+    };
+    if !matches!(action, "symbol" | "diagnostics") {
+        return Err("server is supported only for symbol and diagnostics".into());
+    }
+    value
+        .as_str()
+        .filter(|server| !server.trim().is_empty())
+        .map(|server| Some(server.to_owned()))
+        .ok_or_else(|| "server must be a nonempty string".into())
 }
 
 fn optional_u32(args: &Value, name: &str) -> Result<u32, String> {
@@ -177,6 +197,7 @@ fn prepared_optional_path(
 /// against cwd (the workspace root).
 pub fn parse_code_intel_request(cwd: &Path, args: &Value) -> Result<CodeIntelRequest, String> {
     let action = required_str(args, "action")?;
+    let server = server_filter(args, &action)?;
     match action.as_str() {
         "status" => Ok(CodeIntelRequest::Status {
             workspace: cwd.to_path_buf(),
@@ -231,6 +252,7 @@ pub fn parse_code_intel_request(cwd: &Path, args: &Value) -> Result<CodeIntelReq
             Ok(CodeIntelRequest::Symbols(CodeIntelSymbolQuery {
                 workspace: cwd.to_path_buf(),
                 path,
+                server,
                 query,
                 max_results: max_results(args),
                 offset: offset(args),
@@ -252,6 +274,7 @@ pub fn parse_code_intel_request(cwd: &Path, args: &Value) -> Result<CodeIntelReq
             Ok(CodeIntelRequest::Diagnostics(CodeIntelDiagnosticsQuery {
                 workspace: cwd.to_path_buf(),
                 path,
+                server,
                 include_info,
                 max_results: max_results(args),
                 cancellation: None,
@@ -271,6 +294,7 @@ pub(crate) fn parse_prepared_code_intel_request(
 ) -> Result<CodeIntelRequest, String> {
     let path = prepared_optional_path(args, resolved_path)?;
     let action = required_str(args, "action")?;
+    let server = server_filter(args, &action)?;
     let max_results = prepared_max_results(args)?;
     match action.as_str() {
         "status" => Ok(CodeIntelRequest::Status {
@@ -314,6 +338,7 @@ pub(crate) fn parse_prepared_code_intel_request(
             Ok(CodeIntelRequest::Symbols(CodeIntelSymbolQuery {
                 workspace: workspace.to_path_buf(),
                 path,
+                server,
                 query,
                 max_results,
                 offset: prepared_offset(args)?,
@@ -329,6 +354,7 @@ pub(crate) fn parse_prepared_code_intel_request(
             Ok(CodeIntelRequest::Diagnostics(CodeIntelDiagnosticsQuery {
                 workspace: workspace.to_path_buf(),
                 path,
+                server,
                 include_info,
                 max_results,
                 cancellation: None,
@@ -343,7 +369,7 @@ pub(crate) fn parse_prepared_code_intel_request(
 fn meta_line(meta: &CodeIntelMeta) -> String {
     let mut line = format!(
         "server: {} | state: {} | completeness: {}",
-        meta.server,
+        sanitize_note_text(&meta.server, 40),
         state_name(meta.state),
         completeness_name(meta.completeness)
     );
@@ -598,6 +624,8 @@ fn status_presentation(outcome: &CodeIntelOutcome, meta: String) -> CodeIntelPre
     }
     if let Some(servers) = outcome.payload.get("servers").and_then(Value::as_array) {
         for server in servers {
+            let id = server.get("server").and_then(Value::as_str).unwrap_or("?");
+            let id = sanitize_note_text(id, 40);
             let state = server.get("state").and_then(Value::as_str).unwrap_or("?");
             // Absolute paths carry machine-local segments (e.g. the user name);
             // the model only needs the leaf to tell servers apart.
@@ -611,7 +639,7 @@ fn status_presentation(outcome: &CodeIntelOutcome, meta: String) -> CodeIntelPre
                 .and_then(Value::as_str)
                 .map(path_leaf)
                 .unwrap_or("");
-            let mut row = format!("- {state} root={root} binary={binary}");
+            let mut row = format!("- {id}: {state} root={root} binary={binary}");
             if let Some(open) = server.get("open_documents").and_then(Value::as_u64) {
                 row.push_str(&format!(" open_documents={open}"));
             }
@@ -624,6 +652,11 @@ fn status_presentation(outcome: &CodeIntelOutcome, meta: String) -> CodeIntelPre
                 .unwrap_or(false)
             {
                 row.push_str(" binary_missing=true");
+            }
+            if let Some(reason) = server.get("reason").and_then(Value::as_str) {
+                if !reason.is_empty() {
+                    row.push_str(&format!(" reason={}", sanitize_note_text(reason, 200)));
+                }
             }
             records.push(CodeIntelRecord::line(row));
         }
@@ -1042,6 +1075,84 @@ mod tests {
     }
 
     #[test]
+    fn public_and_prepared_queries_preserve_optional_server() {
+        let dir = std::env::temp_dir().join(format!("slim-ci-server-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("workspace");
+        for action in ["symbol", "diagnostics"] {
+            for path in [None, Some("app.ts")] {
+                let mut value = json!({
+                    "action": action,
+                    "query": "target",
+                    "server": "typescript-language-server",
+                    "max_results": 20,
+                    "include_info": false,
+                });
+                if let Some(path) = path {
+                    value["path"] = json!(path);
+                }
+                let resolved = path.map(|path| dir.join(path));
+                for request in [
+                    parse_code_intel_request(&dir, &value).expect("public parser"),
+                    parse_prepared_code_intel_request(&dir, &value, resolved.as_deref())
+                        .expect("prepared parser"),
+                ] {
+                    let server = match request {
+                        CodeIntelRequest::Symbols(query) => query.server,
+                        CodeIntelRequest::Diagnostics(query) => query.server,
+                        other => panic!("wrong request: {other:?}"),
+                    };
+                    assert_eq!(server.as_deref(), Some("typescript-language-server"));
+                }
+                value.as_object_mut().unwrap().remove("server");
+                let request = parse_prepared_code_intel_request(&dir, &value, resolved.as_deref())
+                    .expect("server omission");
+                match request {
+                    CodeIntelRequest::Symbols(query) => assert!(query.server.is_none()),
+                    CodeIntelRequest::Diagnostics(query) => assert!(query.server.is_none()),
+                    other => panic!("wrong request: {other:?}"),
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn server_filter_rejects_invalid_values_and_other_actions() {
+        let workspace = Path::new("workspace");
+        for server in [
+            json!(null),
+            json!(0),
+            json!(true),
+            json!(""),
+            json!("  "),
+            json!([]),
+        ] {
+            for action in ["symbol", "diagnostics"] {
+                let value = json!({"action": action, "query": "target", "server": server,
+                    "max_results": 20, "include_info": false});
+                for result in [
+                    parse_code_intel_request(workspace, &value),
+                    parse_prepared_code_intel_request(workspace, &value, None),
+                ] {
+                    assert_eq!(result.unwrap_err(), "server must be a nonempty string");
+                }
+            }
+        }
+        for action in ["status", "definition", "references", "hover"] {
+            let value = json!({"action": action, "server": "rust-analyzer", "max_results": 20});
+            for result in [
+                parse_code_intel_request(workspace, &value),
+                parse_prepared_code_intel_request(workspace, &value, None),
+            ] {
+                assert_eq!(
+                    result.unwrap_err(),
+                    "server is supported only for symbol and diagnostics"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn prepared_path_absent_spellings_remain_equivalent() {
         let workspace = Path::new("workspace");
         for value in [
@@ -1150,6 +1261,29 @@ mod tests {
             "error should mention escapes, got: {msg}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ambiguity_error_preserves_server_choices_in_agent_text() {
+        let mut outcome = CodeIntelOutcome::unavailable(
+            "lsp",
+            "ambiguous language server (rust-analyzer, typescript-language-server); repeat the query with server",
+        );
+        outcome.payload["servers"] = json!(["rust-analyzer", "typescript-language-server"]);
+
+        for action in ["symbol", "diagnostics"] {
+            let presentation = presentation_for_code_intel(action, &outcome);
+            assert!(presentation.full.contains("ambiguous language server"));
+            assert!(presentation.full.contains("repeat the query with server"));
+            for server in outcome.payload["servers"].as_array().unwrap() {
+                assert!(
+                    presentation.full.contains(server.as_str().unwrap()),
+                    "{}",
+                    presentation.full
+                );
+            }
+            assert_eq!(presentation.full, render_code_intel(action, &outcome));
+        }
     }
 
     #[test]
@@ -1554,6 +1688,7 @@ mod tests {
         );
         assert!(text.contains("root=proj"), "{text}");
         assert!(text.contains("binary=rust-analyzer.exe"), "{text}");
+        assert!(text.contains("- rust-analyzer: ready"), "{text}");
     }
 
     #[test]
@@ -1562,6 +1697,32 @@ mod tests {
         let text = render_code_intel("status", &outcome);
         assert!(text.contains("state: unavailable"));
         assert!(text.contains("binary missing"));
+    }
+
+    #[test]
+    fn status_records_explain_missing_dependencies_with_bounded_sanitized_text() {
+        let mut outcome = CodeIntelOutcome::unavailable("lsp", "unused");
+        outcome.payload = json!({"servers": [
+            {"server": "typescript-language-server", "state": "unavailable", "binary_missing": true,
+                "reason": "Node.js executable is required to launch TypeScript Language Server"},
+            {"server": "rust-analyzer", "state": "unavailable", "binary_missing": true,
+                "root": "C:/Users/demo/private", "binary": "C:/Users/demo/private/server.exe",
+                "reason": "configured rust-analyzer path does not exist"},
+            {"server": format!("unknown\n\u{1b}\u{202e}{}", "x".repeat(100)), "state": "unavailable",
+                "reason": format!("invalid\n\u{1b}\u{202e}{}", "x".repeat(1000))}
+        ]});
+        let text = render_code_intel("status", &outcome);
+        assert!(text.contains("reason=Node.js executable is required"));
+        assert!(text.contains("reason=configured rust-analyzer path does not exist"));
+        assert!(!text.contains("C:/Users/demo/private"));
+        assert!(!text.contains('\u{1b}') && !text.contains('\u{202e}'));
+        let presentation = presentation_for_code_intel("status", &outcome);
+        assert_eq!(presentation.records.len(), 3);
+        let invalid = &presentation.records[2].text;
+        assert!(invalid.contains("unknown x"));
+        assert!(invalid.contains("reason=invalid x"));
+        assert!(invalid.len() < 300, "{invalid}");
+        assert_eq!(presentation.full, text);
     }
 
     #[test]

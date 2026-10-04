@@ -93,6 +93,13 @@ impl ManualRunJournal {
         &mut self.repo
     }
 
+    pub(crate) fn record_fact(&mut self, fact: DurableFact) -> io::Result<()> {
+        self.check()?;
+        let seq = self.repo.next_seq()?;
+        let result = self.repo.append(DurableRecord::Fact { seq, fact });
+        self.remember_failure(result)
+    }
+
     pub(crate) fn configure_output(&mut self, store: Option<ArtifactStore>, max_bytes: usize) {
         self.artifact_store = store;
         self.max_result_bytes = max_bytes;
@@ -143,6 +150,13 @@ impl ManualRunJournal {
     pub fn record_event(&mut self, event: &EventKind) -> io::Result<()> {
         self.check()?;
         match event {
+            EventKind::ShellJobChanged { job } => {
+                self.record_fact(DurableFact {
+                    namespace: "shell_job.v1".into(),
+                    key: job.id.clone(),
+                    value: serde_json::to_value(job).map_err(io::Error::other)?,
+                })?;
+            }
             EventKind::ToolStarted {
                 batch_id, call_id, ..
             } if self.batch_id.as_ref() == Some(batch_id) => {
@@ -320,6 +334,7 @@ impl ManualRunJournal {
             ProviderCallOutcome::Cancelled => "cancelled",
         };
         let code = telemetry.code.as_deref().and_then(normalized_provider_code);
+        let usage = telemetry.usage;
         let seq = self.repo.next_seq()?;
         let result = self.repo.append(DurableRecord::Fact {
             seq,
@@ -340,6 +355,10 @@ impl ManualRunJournal {
                     "http_status": telemetry.status,
                     "code": code,
                     "retry_after_ms": telemetry.retry_after_ms,
+                    "input_tokens": usage.map(|usage| usage.input_tokens),
+                    "output_tokens": usage.map(|usage| usage.output_tokens),
+                    "cache_read_tokens": usage.and_then(|usage| usage.cache_read_tokens),
+                    "cache_write_tokens": usage.and_then(|usage| usage.cache_write_tokens),
                 }),
             },
         });
@@ -349,6 +368,39 @@ impl ManualRunJournal {
             ))
         }))?;
         Ok(id)
+    }
+
+    /// Wall-clock duration of one executed tool batch. Each call's own
+    /// duration stays in its `tool.v1` fact; together they show how much of a
+    /// batch ran in parallel.
+    pub(crate) fn record_tool_batch(
+        &mut self,
+        batch_id: &str,
+        call_ids: &[&str],
+        wall_ms: u64,
+    ) -> io::Result<()> {
+        self.check()?;
+        // Observability-only, like `tool.v1`: skip the data sync. The next
+        // synced entry append flushes this line; replay never reads it.
+        let seq = self.repo.next_seq()?;
+        let result = self.repo.append_unsynced(DurableRecord::Fact {
+            seq,
+            fact: DurableFact {
+                namespace: "tool.batch.v1".into(),
+                key: batch_id.into(),
+                value: serde_json::json!({
+                    "batch_id": batch_id,
+                    "operation_id": &self.spec.operation_id,
+                    "attempt_id": &self.spec.attempt_id,
+                    "calls": call_ids.len(),
+                    "call_ids": call_ids,
+                    "wall_ms": wall_ms,
+                }),
+            },
+        });
+        self.remember_failure(result.map_err(|error| {
+            io::Error::other(format!("tool batch fact could not be persisted: {error}"))
+        }))
     }
 
     /// Records runtime validation separately from the completed HTTP call.
@@ -765,6 +817,7 @@ mod tests {
                 status: Some(429),
                 code: Some("header-secret".into()),
                 retry_after_ms: Some(2500),
+                usage: None,
             })
             .unwrap();
         journal
@@ -778,6 +831,12 @@ mod tests {
                 status: Some(200),
                 code: None,
                 retry_after_ms: None,
+                usage: Some(crate::provider::ProviderCallUsage {
+                    input_tokens: 1_200,
+                    output_tokens: 40,
+                    cache_read_tokens: Some(1_024),
+                    cache_write_tokens: Some(0),
+                }),
             })
             .unwrap();
         drop(journal);
@@ -806,10 +865,45 @@ mod tests {
         assert!(facts[0].value["first_semantic_ms"].is_null());
         assert_eq!(facts[1].value["headers_ms"], 2);
         assert_eq!(facts[1].value["first_semantic_ms"], 5);
+        // Per-call usage: absent when the provider reported none, cache split
+        // when it did.
+        assert!(facts[0].value["input_tokens"].is_null());
+        assert!(facts[0].value["cache_read_tokens"].is_null());
+        assert_eq!(facts[1].value["input_tokens"], 1_200);
+        assert_eq!(facts[1].value["output_tokens"], 40);
+        assert_eq!(facts[1].value["cache_read_tokens"], 1_024);
+        assert_eq!(facts[1].value["cache_write_tokens"], 0);
         let raw = fs::read_to_string(root.join("session.jsonl")).unwrap();
         assert!(!raw.contains("prompt-marker"));
         assert!(!raw.contains("body-marker"));
         assert!(!raw.contains("header-secret"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tool_batch_facts_record_wall_time_and_call_ids() {
+        let (root, mut journal) = fixture();
+        journal
+            .record_tool_batch("batch-1", &["call-a", "call-b"], 37)
+            .unwrap();
+        drop(journal);
+        let report = preflight_session(root.join("session.jsonl")).unwrap();
+        let fact = report
+            .records
+            .iter()
+            .find_map(|record| match record {
+                DurableRecord::Fact { fact, .. } if fact.namespace == "tool.batch.v1" => Some(fact),
+                _ => None,
+            })
+            .expect("batch fact");
+        assert_eq!(fact.key, "batch-1");
+        assert_eq!(fact.value["calls"], 2);
+        assert_eq!(
+            fact.value["call_ids"],
+            serde_json::json!(["call-a", "call-b"])
+        );
+        assert_eq!(fact.value["wall_ms"], 37);
+        assert_eq!(fact.value["attempt_id"], "attempt");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -826,6 +920,7 @@ mod tests {
             status: Some(200),
             code: None,
             retry_after_ms: None,
+            usage: None,
         };
         let first = journal.record_provider_call(&telemetry).unwrap();
         let later = journal.record_provider_call(&telemetry).unwrap();

@@ -44,6 +44,9 @@ struct MockConfig {
     /// Skips a publication identical to the previous one for that document,
     /// as rust-analyzer does when diagnostics did not change.
     skip_unchanged: bool,
+    /// Publishes document-derived diagnostics without `version`, as the
+    /// TypeScript Language Server does.
+    omit_diagnostic_version: bool,
     document_symbol_nested: bool,
     semantic_from_document: bool,
 }
@@ -518,6 +521,10 @@ impl MockConfig {
                 .and_then(|value| value.get("skipUnchanged"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            omit_diagnostic_version: mock
+                .and_then(|value| value.get("omitDiagnosticVersion"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             document_symbol_nested: mock
                 .and_then(|value| value.get("documentSymbolNested"))
                 .and_then(Value::as_bool)
@@ -685,11 +692,17 @@ fn publish_document_errors<W: Write>(
     if !config.publish_delay.is_zero() {
         thread::sleep(config.publish_delay);
     }
+    let mut publication = json!({ "uri": uri, "version": version, "diagnostics": diagnostics });
+    if config.omit_diagnostic_version {
+        if let Some(fields) = publication.as_object_mut() {
+            fields.remove("version");
+        }
+    }
     notify(
         writer,
         logger,
         "textDocument/publishDiagnostics",
-        json!({ "uri": uri, "version": version, "diagnostics": diagnostics }),
+        publication,
     )
 }
 

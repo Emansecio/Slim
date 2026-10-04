@@ -4,8 +4,9 @@
 > inventário de wiring atual. O headless integrado cobre providers SSE, tools
 > nativas, modos, auth, compaction, usage, artifacts e anti-loop. `slim --tui`
 > agora compartilha provider/loop/tools, com composer, streaming, usage e
-> cancelamento; cache normal, sessões resume/branch, Skills, MCP, child agents
-> reais e Todo/Plan/Goal end-to-end permanecem pendentes. Consulte o [status atual](README.md).
+> cancelamento; cache normal, sessões resume/branch, Skills, MCP *(superado: MCP
+> já está integrado, ver [referência](reference/CLI-AND-RUNTIME.md#mcp))*, child
+> agents reais e Todo/Plan/Goal end-to-end permanecem pendentes. Consulte o [status atual](README.md).
 
 > Navegação: [Índice](README.md) · [Checkpoint do grill](DECISOES-GRILL-PRE-IMPLEMENTACAO.md) · [Pesquisa](INSIGHTS-MINI-SWE-AGENT-GROK-BUILD.md) · [Design TUI](DESIGN-SLIM-TUI.md) · [Viabilidade TUI](VALIDACAO-VIABILIDADE-RATATUI-GROK-BUILD.md)  
 >
@@ -201,8 +202,9 @@ modelo, não executa hooks e não abre conexões MCP.
 2. Limpar estado efêmero do ciclo: interrupção, mutation revision, riscos,
    verification, self-review e retry budget.
 3. Rotear tools de alta confiança pela intenção do prompt.
-4. Juntar compactação preditiva pendente.
-5. Aplicar compactação hard/presend se o wire estimado não couber.
+4. Avaliar o gatilho de compactação: contexto estimado acima de
+   `janela - reserve_tokens`, pedido manual ou overflow.
+5. Compactar (método do Pi, em primeiro plano) quando o gatilho disparar.
 6. Compor contexto dinâmico e aplicar extensions `before_agent_start`.
 7. Executar somente o loop Solo na v1.
 8. Persistir mensagens e eventos relevantes.
@@ -325,15 +327,14 @@ implementação não pode expor tipos particulares de um SDK no core.
 
 Os mecanismos listados abaixo são o inventário de paridade e pesquisa. Na v1,
 o contrato efetivo é: budget dinâmico de output, reserva projetada, compactação
-manual/pre-send/overflow, prompt cache nativo e artefatos por handle. Mid-turn,
+única do Pi (limite, manual, overflow), prompt cache nativo e artefatos por handle. Mid-turn,
 live/proactive, memória global e recall BM25 não são implementados.
 
 O contexto não é reduzido por uma técnica única. O stack atual contém:
 
 - estimativa de tokens e ocupação wire;
 - reserva adaptativa de output;
-- compactação hard, soft preditiva, presend e recovery de overflow;
-- thresholds de compactação baseados em reserva projetada;
+- compactação única do Pi: gatilho `janela - reserve_tokens`, `/compact` e recovery de overflow;
 - supersede de reads/searches obsoletos;
 - elisão de argumentos grandes de mutações históricas;
 - head+tail de outputs grandes;
@@ -341,9 +342,7 @@ O contexto não é reduzido por uma técnica única. O stack atual contém:
 - BM25 do histórico compactado com `recall_history`;
 - cap de thinking antigo, protegendo turns recentes;
 - sumarização delta na segunda compactação em diante;
-- resumo estruturado JSON-primary e fallback para Markdown;
-- verificação e grounding determinístico de paths do resumo;
-- digests de símbolos para arquivos modificados;
+- resumo estruturado em Markdown (formato do Pi) com listas de arquivos lidos e modificados;
 - dedupe de read idêntico e delta quando o arquivo mudou;
 - seleção on-demand de tools e skills;
 - recall limitado a artefatos da sessão ativa;
@@ -357,7 +356,7 @@ O contexto não é reduzido por uma técnica única. O stack atual contém:
 
 | Camada | Disparo | LLM |
 |---|---|---|
-| reserva projetada/pre-send | contexto chega ao limite útil | sim |
+| limite (`janela - reserve_tokens`) | contexto estimado passa do limite | sim |
 | overflow recovery | provider devolve context overflow | sim, sem repetir tool |
 | mid-turn pressure | pressão entre tool rounds | não planejado |
 | live/proactive | resultados obsoletos ou piso configurado | não planejado |
@@ -445,7 +444,8 @@ Built-in extensions registram ainda:
 - `memory_append`;
 - `task`, `parallel` e `fanout`;
 - `message` dentro de subagentes com messaging habilitado;
-- `list_mcp_resources` e `read_mcp_resource` quando MCP anuncia resources;
+- `list_mcp_resources` e `read_mcp_resource` quando MCP anuncia resources (Pit;
+  no Slim, resources são ações do gateway `mcp`);
 - tools MCP prefixadas por servidor;
 - tools de extensions e do SDK.
 
@@ -693,15 +693,30 @@ discovery, validação, leitura e invocation.
 
 #### MCP
 
+> **Superado em 2026-10-02.** O contrato MCP vigente, verificado contra o
+> código, está em [CLI-AND-RUNTIME.md#mcp](reference/CLI-AND-RUNTIME.md#mcp). Divergências deste
+> mapa de origem, que fica como registro: **prompts MCP não são suportados**;
+> resources existem só como ações do gateway `mcp` (`resources`,
+> `resource_templates`, `uri`), não como tools `list_mcp_resources` /
+> `read_mcp_resource`; as conexões abrem em segundo plano (`lazy` é opt-in);
+> OAuth com registro dinâmico e PKCE, importador de configs de outros clientes,
+> busca BM25, exposição `direct`/`hidden` e o CLI `slim mcp` estão
+> implementados; SSE legado, sampling, elicitation e approval seguem fora.
+
 ##### Piso obrigatório da v1
 
 - transports `stdio` e Streamable HTTP;
 - JSON-RPC 2.0, initialize/initialized;
-- list/call de tools, list/read de resources e list/get de prompts;
+- list/call de tools, list/read de resources e list/get de prompts
+  *(superado: sem prompts; resources pelo gateway `mcp`)*;
 - prefixo estável por servidor;
 - configuração global e por projeto;
-- inicialização lazy, timeout e cancelamento;
+- inicialização lazy, timeout e cancelamento *(superado: conexão em segundo
+  plano; `lazy` é opt-in)*;
 - output/body caps;
+- CodeMode nativo para compor tools MCP e reduzir resultados estruturados;
+  descoberta, estado de sessão, budgets e cancelamento seguem a
+  [referência operacional](reference/CLI-AND-RUNTIME.md#codemode);
 - reconnect somente para a próxima call;
 - teardown completo de subprocessos;
 - uma conexão/subprocesso por server config no `AppRuntime`, compartilhada com
@@ -709,14 +724,15 @@ discovery, validação, leitura e invocation.
 - execução sem allow/deny ou approval.
 
 Ficam pós-v1: SSE legado, OAuth com dynamic registration/PKCE, importadores de
-config de terceiros e catalogação BM25 avançada.
+config de terceiros e catalogação BM25 avançada *(superado: OAuth, importador e
+BM25 estão implementados; SSE legado segue fora)*.
 
 ##### Paridade completa posterior
 
 MCP suporta:
 
 - transports `stdio`, Streamable HTTP e SSE legado;
-- JSON-RPC, initialize, tools, resources e prompts;
+- JSON-RPC, initialize, tools, resources e prompts *(superado: sem prompts)*;
 - OAuth 2.0 com discovery, registro dinâmico, PKCE, refresh e tokens persistidos;
 - cinco escopos de configuração, com precedência; trust decide somente se a
   configuração/código de projeto será carregada;
@@ -814,7 +830,8 @@ As opções de processo se dividem em:
 - skills, prompts e context files;
 - trust de projeto somente para carregar código/configuração executável;
 - dry-run, offline, export, list-models e verbose;
-- subcomandos MCP de list/get/add/remove/enable/disable.
+- subcomandos MCP de list/get/add/remove/enable/disable (Pit; no Slim, `slim mcp`
+  tem add/remove/enable/disable/list/login/logout/import/trust/untrust, sem `get`).
 
 O dispatcher interativo nativo cobre:
 
@@ -824,8 +841,8 @@ O dispatcher interativo nativo cobre:
 ```
 
 `/permission-mode`, `/permission-cycle`, `/fusion`, `/hindsight`, `/jobs` e
-`/memory` não existem no Slim. Skills e prompts MCP entram por seus comandos
-essenciais e mantêm diagnóstico de colisão.
+`/memory` não existem no Slim. Skills entram por seus comandos essenciais e
+mantêm diagnóstico de colisão; prompts MCP não existem no Slim.
 
 RPC persistente, package manager e SDK Node não são superfícies do produto
 atual. Não criar esses caminhos no `slim-cli`; a API oficial é o CLI headless
@@ -858,79 +875,171 @@ Gates atuais:
 O porte precisa de gates equivalentes em Rust e de uma suíte cross-language que
 alimente os dois binários com os mesmos fixtures.
 
-## 7. LSP — livestream slice 1 implementado
+## 7. LSP nativo — Rust, JavaScript e TypeScript
 
-Slice 1 (v1 pós-gate) implementado em 2026-08-28: crate `slim-lsp`, trait
-`CodeIntelligence` em `slim-core`, tool `code_intel` (6 ações read-only).
-Arquitetura real difere do planejamento original: a tool se chama `code_intel`
-e não `lsp`; o código é organizado em `crates/slim-lsp` com pool de processos
-LSP compartilhado (lease por sessão), codec de posição multi-encoding,
-e resultados compactos com metadados de confiabilidade.
+A integração usa `slim-lsp`, o trait `CodeIntelligence` em `slim-core`
+e a ferramenta `code_intel`, com seis ações de leitura. O host, o transporte
+stdio e o pool são nativos do Slim. **Não é preciso ativar nada, instalar plugin,
+passar flag ou escrever TOML para usar a integração.** Os dois perfis padrão são
+`rust-analyzer` e `typescript-language-server`; uma consulta semântica inicia
+automaticamente o servidor correspondente, quando suas dependências existem.
 
-A implementação atual cobre **rust-analyzer** apenas (primeiro vertical slice).
-Descoberta por Cargo.toml + PATH/lookup. Inicialização lazy, processo
-compartilhado por (workspace root, server id, config hash).
+Os servidores de linguagem continuam externos. Rust depende de rust-analyzer;
+JS/TS depende de Node.js, TypeScript Language Server e uma versão compatível
+do TypeScript clássico, com `lib/tsserver.js`. TypeScript nativo sem esse motor
+fica fora do contrato. O Slim não instala dependências nem altera o projeto.
+A descoberta JS/TS prefere um override explícito, depois o pacote instalado em
+`node_modules/typescript-language-server` na raiz do workspace e, por fim, PATH.
+No Windows, launchers npm são resolvidos pelos metadados do pacote e executados
+via Node com o entrypoint declarado.
+
+JS/TS cobre `.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.mts` e
+`.cts`, incluindo declarações como `.d.ts`. A raiz da instância JS/TS é o
+workspace autorizado canônico; o TypeScript escolhe os projetos e configs
+aninhados. Arquivos avulsos podem usar um projeto inferido. Rust conserva a
+descoberta por Cargo.toml. Ambos preservam a fronteira de caminhos e URIs do
+workspace, inclusive para resultados provenientes de imports.
+
+A configuração `[lsp]` é opcional e serve a overrides ou desativação explícita.
+Cada entrada de `[lsp.servers."<id>"]` aceita `enabled`, `path`, `args`,
+`initialization_options` e `settings`. Initialization options e settings são
+objetos separados; settings representa o mapa completo de seções, como
+`rust-analyzer`, `typescript` e `javascript`. Os campos omitidos preservam os
+defaults e a precedência das camadas existentes. Desabilitar somente
+rust-analyzer mantém o perfil JS/TS; a desativação global ou de ambos remove
+o manager.
+
+Sem override, JS/TS usa `hostInfo="slim"` e
+`tsserver.useSyntaxServer="never"` nas initialization options, para consultar
+o tsserver semântico. Um override substitui esse objeto inteiro.
 
 ### 7.1 Tool `code_intel`
 
+As ações continuam `symbol`, `definition`, `references`, `hover`,
+`diagnostics` e `status`. Posições humanas usam linha e coluna a partir de 1:
+
 ```json
-{
-  "action": "symbol|definition|references|hover|diagnostics|status",
-  "path": "src/main.rs",
-  "line": 12, "column": 3,  // human 1-based
-  "symbol": "execute_tool_call",
-  "query": "search term",
-  "include_info": false,
-  "max_results": 20
-}
+{"action":"definition","path":"src/main.ts","line":3,"column":22,"max_results":20}
 ```
 
-Toda resposta traz metadados: `server`, `state`, `completeness`, `document_version`,
-`stale`, `elapsed_ms`. Resultados são limitados e truncados por `max_results` (sem cursor ou offset),
-agrupados por arquivo, e cada linha de referência/símbolo inclui contexto de uma linha.
+Definition, references e hover inferem o servidor pela extensão do arquivo.
+Symbol com path consulta o outline; sem path exige query. Diagnostics aceita
+um arquivo ou consulta o conjunto de publicações conhecidas de um servidor.
+O filtro opcional `server` existe somente em symbol e diagnostics:
 
-#### Diagnósticos pós-edição (29/09/2026)
+```json
+{"action":"symbol","query":"parse","server":"typescript-language-server","max_results":20}
+```
 
-Sem chamar `code_intel`, o loop anexa ao próximo request uma mensagem curta com os
-**erros novos** dos arquivos que `write`/`patch` alteraram no lote
-(`CodeIntelligence::diagnostics_after_edits`, padrão "sem servidor"):
+Com path, um filtro incompatível é erro. Sem path, um único perfil aplicável
+é escolhido automaticamente; um workspace misto exige o filtro explícito e
+informa os IDs disponíveis. Cada consulta continua ligada a um servidor.
+O filtro seleciona a consulta; não é ativação nem configuração do usuário.
 
-- só com servidor **já quente**: nunca inicia processo; sem servidor, nada é dito;
-- vale apenas a publicação sem `stale` cuja versão é exatamente a do documento após o
-  `didChange`; publicação de versão anterior é descartada;
-- espera até 1,5 s (mais 200 ms de silêncio após a primeira publicação) e cancelamento
-  interrompe a espera. Servidor calado é **"não verificado"**, nunca "sem erros", e
-  isso é mencionado no máximo uma vez por execução;
-- regressão = erros de severidade *error* que não estavam na linha de base capturada
-  antes da primeira edição do lote (comparação por código e mensagem, sem posição;
-  a linha de base vira o estado relatado, então um erro mantido não se repete). Arquivo
-  aberto pela própria edição não tem linha de base e a mensagem avisa que os erros
-  podem ser anteriores;
-- limites: 8 erros (4 por arquivo), 160 caracteres por mensagem, 12 arquivos por lote;
-  edição limpa não gera mensagem;
-- o texto do diagnóstico vem do workspace: é achatado (sem quebras de linha,
-  controles nem bidi), passa por `redact_sensitive` e vem sob cabeçalho "dados não
-  confiáveis". Diagnósticos do editor não substituem build nem testes.
+Para símbolos de workspace JS/TS, o manager abre uma fonte do snapshot limitado,
+quando disponível: a mais próxima da raiz, com desempate por path. Isso carrega
+o projeto dessa fonte antes da consulta fria; `completeness=unknown` permanece,
+pois não comprova o carregamento de todos os projetos aninhados.
 
-Limites conhecidos: o rust-analyzer roda com `checkOnSave=false`, então só há
-diagnósticos nativos do arquivo editado; um chamador quebrado em **outro** arquivo não
-aparece (exigiria `cargo check`, que leva de segundos a minutos). Edições feitas por
-`shell` não sincronizam. A espera de 1,5 s pode ser paga integralmente se o servidor
-real não republicar diagnósticos inalterados (comportamento não medido aqui: o
-rust-analyzer não está instalado nesta máquina; a fixture usa o mock).
+Toda resposta traz `server`, `state`, `completeness`, `document_version`,
+`stale` e `elapsed_ms`. `max_results` limita os resultados. Referências e
+símbolos usam `offset` e `revision` para continuar páginas; uma revisão antiga
+é rejeitada após alteração do workspace ou da geração do servidor. Contexto e
+previews são limitados e respeitam a fronteira de paths.
+
+Status informa os IDs e as causas de indisponibilidade sem iniciar processos.
+**Configurado/disponível não significa em execução.** O catálogo conserva
+`code_intel` com um perfil ativo mesmo sem marcador ou binário, para permitir
+diagnóstico de dependências ausentes. A disponibilidade respeita os modos já
+existentes do runtime.
+
+#### Atualização do workspace e diagnósticos pós-edição (30/09/2026)
+
+Antes das consultas semânticas, cada instância reconcilia um snapshot limitado
+de stamps de seus fontes e inputs de projeto. Alterações feitas por editor ou
+shell são observadas nessa etapa. Notificações `workspace/didChangeWatchedFiles`
+precedem a consulta; documentos abertos alterados passam pela sincronização
+existente. Mudanças estruturais encerram a geração antiga, e a próxima consulta
+semântica adquire um servidor novo.
+
+Para Rust, os inputs continuam manifestos, Cargo.lock, rust-project.json e
+configuração .cargo. Para JS/TS, todo arquivo .json/.jsonc é conservadoramente
+um input estrutural, além dos lockfiles npm, Yarn, pnpm e Bun. Isso cobre configs
+com nomes arbitrários e extends sem implementar outro parser JSONC; também pode
+renovar o servidor por mudanças em JSON de dados. Criação e remoção de fontes
+invalidam publicações dependentes. Uma publicação fresca do arquivo já
+sincronizado por write/patch é preservada.
+
+A varredura tem limite de 32.768 entradas e ignora `.git`, `.slim` e
+`node_modules`. Rust ignora target; JS/TS também ignora target quando identificado
+como saída Cargo em workspace misto, mas conserva declarações em diretórios como
+dist/lib. A leitura roda no executor blocking do Tokio; não há watcher nem
+polling em idle. Falha de leitura ou excesso de entradas torna o frescor
+desconhecido. Stamps detectam mudanças usuais; não provam alteração cujo conteúdo
+mudou preservando os mesmos metadados.
+
+Depois de write/patch, o loop pode anexar **cobertura e erros novos** ao próximo
+request do provider, por `CodeIntelligence::diagnostics_after_edits`:
+
+- valida somente instâncias **já quentes**, sem iniciar processos. Arquivos sem
+  servidor ativo são não verificados; uma renovação estrutural nesta etapa
+  também não inicia a substituição;
+- só certifica publicação sem stale e com a versão exata do documento após a
+  edição. Publicação ausente, antiga ou sem versão exata não é arquivo limpo;
+- usa um prazo global de até **1,5 s para o lote inteiro**, incluindo refresh,
+  sincronização e até 200 ms de estabilização da publicação. As instâncias
+  Rust e JS/TS são atendidas concorrentemente, de modo que um servidor silencioso
+  não impeça aproveitar publicações frescas do outro;
+- valida até **12 arquivos únicos elegíveis**, em sua ordem original, somando
+  os dois perfis. Duplicatas, arquivos indisponíveis, linguagens não atendidas
+  e instâncias frias não consomem essa cota. O relatório preserva os motivos
+  dos arquivos restantes;
+- compara erros por código e mensagem com a linha de base capturada antes da
+  primeira edição do lote. Sem linha de base, informa que os erros podem ser
+  anteriores. Armazenamento truncado não constitui linha de base completa;
+- limita a nota a oito erros, quatro por arquivo e 160 caracteres por mensagem.
+  Lotes mistos identificam o servidor por arquivo quando necessário; nomes de
+  arquivos não verificados são limitados por motivo, com contagem dos demais;
+- achata conteúdo do workspace, remove controles/bidi, passa por
+  `redact_sensitive` e apresenta a nota como dados não confiáveis. Publicações
+  do editor não substituem build nem testes.
+
+No gate real, TypeScript Language Server publicou diagnósticos sem `version`,
+campo opcional do protocolo. A consulta explícita mostra esses resultados com
+`completeness=unknown` e conserva `diagnostic_version=null`; a versão local
+sincronizada não é atribuída à publicação. Pós-edição permanece `Unverified`,
+sem certificar arquivo limpo ou erros introduzidos. A nota informa
+`no verifiable diagnostics`, inclusive quando houve publicação sem versão.
+
+Diagnostics sem path consulta somente publicações conhecidas; não verifica
+recursivamente todos os arquivos do projeto. Rust conserva `checkOnSave=false`
+por padrão. A nota pós-edição acompanha alvos conhecidos de write/patch e só entra
+se houver próximo request e algo acionável (erros ou verificação tentada e não
+concluída; ver [CLI e runtime](reference/CLI-AND-RUNTIME.md)); alterações por shell são reconciliadas na próxima
+consulta semântica. Os gates reais Rust e JS/TS foram executados; versões,
+comandos, resultados e limites ficam em [release/README.md](../release/README.md).
 
 ### 7.2 Arquitetura
 
 ```text
 Modelo
   ↓
-code_intel (tool, 6 ações read-only)
+code_intel (6 ações de leitura)
   ↓
 CodeIntelligence trait (slim-core)
-  ├─ LspProcessPool (processo compartilhado por chave)
-  │  └─ LspServerInstance (handshake, encoding, doc store, diagnostics)
-  └─ fallback textual (busca via ripgrep, não implementado)
+  ↓
+LspCodeIntelligence (seleção de perfil, raiz, frescor e respostas)
+  ↓
+LspProcessPool (raiz + ID + comando/args/init/settings efetivos)
+  ↓
+LspServerInstance (capabilities, encoding, documentos e diagnósticos próprios)
 ```
+
+O pool compartilha processos somente quando a identidade efetiva coincide;
+aquisição normal e aquisição de instâncias quentes usam a mesma chave. O lease
+permanece durante toda a operação. O host reutiliza o transporte, DocumentStore
+e DiagnosticsStore existentes. Workspace folders e configuration são resolvidos
+a partir da raiz e dos settings da instância.
 
 ### 7.3 Componentes
 
@@ -938,11 +1047,12 @@ CodeIntelligence trait (slim-core)
 - `crates/slim-lsp/src/transport.rs` — framing Content-Length, JSON-RPC 2.0,
   timeouts, cancelamento, notificações
 - `crates/slim-lsp/src/document.rs` — DocumentStore (LRU, versões monotônicas)
-- `crates/slim-lsp/src/diagnostics.rs` — DiagnosticsStore bounded por URI
-- `crates/slim-lsp/src/discovery.rs` — descoberta de servidor + root marker
-- `crates/slim-lsp/src/instance.rs` — handshake initialize/initialized,
-  sync de documentos, dreno de notificações (publishDiagnostics, $/progress)
-- `crates/slim-lsp/src/pool.rs` — LspProcessPool com leases, idle shutdown
+- `crates/slim-lsp/src/diagnostics.rs` — DiagnosticsStore limitado por URI
+- `crates/slim-lsp/src/discovery.rs` — perfis, descoberta de servidor e raiz
+- `crates/slim-lsp/src/workspace.rs` — snapshots e inputs por perfil
+- `crates/slim-lsp/src/instance.rs` — handshake, settings/folders, sync de
+  documentos e notificações
+- `crates/slim-lsp/src/pool.rs` — identidade efetiva, leases, idle shutdown
   (15 min), circuit breaker com backoff exponencial
 - `crates/slim-lsp/src/manager.rs` — implementação de CodeIntelligence
 - `crates/slim-lsp/src/process.rs` — StdioPair, kill de árvore (taskkill /T /F),
@@ -960,11 +1070,9 @@ CodeIntelligence trait (slim-core)
 
 ### 7.5 Próximos slices
 
-- Slice 2: TypeScript + Python; post-write diagnostics;
-  singleflight; métricas
-- Slice 3: implementations, type definition, call hierarchy,
-  rename preview
-- Slice 4: aplicação transacional de rename, code actions seguras
+- Python como próximo perfil, após validar compatibilidade e utilidade JS/TS
+- Implementations, type definition, call hierarchy e rename preview
+- Aplicação transacional de rename e code actions seguras
 
 ### 7.6 Referência
 
@@ -1267,7 +1375,7 @@ quando todas estas capacidades funcionarem juntas:
 - sessão durável com resume e branch básico;
 - compaction automática/manual e budget de contexto;
 - pasta nativa de skills do Slim, com carregamento on-demand;
-- cliente MCP com tools, resources e prompts;
+- cliente MCP com tools, resources e prompts *(superado: sem prompts; resources pelo gateway `mcp`; ver [MCP](#mcp))*;
 - subagentes depth-1 com concorrência bounded e sessão própria;
 - tools básicas `read`, `edit`, `write`, `bash` e search;
 - runtime irrestrito conforme §1.1;
@@ -1309,8 +1417,8 @@ Cada fase abaixo é uma vertical slice com gate próprio.
 - channels text/json e dry-run;
 - wire schema compaction e tool discovery;
 - budget dinâmico de output e artefatos por handle;
-- compactação manual/pre-send com reserva projetada, 85% geral e 50% a partir
-  de janelas de 1M;
+- compactação manual (`/compact`) e automática pelo trigger Pi (tokens > janela
+  - `reserve_tokens`, default 16384), com retry único em overflow;
 - prompt cache nativo por provider;
 - token governor de root e subagentes;
 - nenhum shim Node ou memória global.
@@ -1321,7 +1429,8 @@ Cada fase abaixo é uma vertical slice com gate próprio.
 - carregar `SKILL.md` e recursos somente quando invocados;
 - manter scripts executáveis somente em `Auto`;
 - implementar MCP `stdio` e Streamable HTTP;
-- suportar initialize, tools, resources e prompts;
+- suportar initialize, tools, resources e prompts *(superado: sem prompts;
+  resources pelo gateway `mcp`)*;
 - compartilhar uma conexão por server config entre root e subagentes;
 - provar timeout, cancelamento, reconnect seguro e teardown de subprocessos.
 
@@ -1363,7 +1472,8 @@ Cada fase abaixo é uma vertical slice com gate próprio.
 
 - host compatível de extensions, plugins, packages e marketplace;
 - Fusion, coordinator, messaging lateral, worktrees e subagentes recursivos;
-- MCP OAuth somente se uma demanda futura exigir fluxo oficial.
+- MCP OAuth somente se uma demanda futura exigir fluxo oficial *(superado: OAuth
+  MCP está implementado; ver [CLI-AND-RUNTIME.md#mcp](reference/CLI-AND-RUNTIME.md#mcp))*.
 
 ### Não planejado — superfícies fora do Windows fullscreen
 
@@ -1444,8 +1554,8 @@ OAuth/auth.json oficial.
 
 - [ ] wire prefix não regride além da tolerância definida;
 - [ ] prompt prefix permanece estável entre turns equivalentes;
-- [ ] compactação manual/pre-send/overflow funciona com reserva projetada;
-- [ ] threshold geral de 85% e threshold de 50% para janelas a partir de 1M;
+- [ ] compactação manual/threshold/overflow (retry único) segue o trigger Pi
+  janela - `reserve_tokens`;
 - [ ] artefatos por handle recuperam output integral;
 - [ ] token governor soma root + subagentes sem duplicar.
 
@@ -1456,8 +1566,8 @@ OAuth/auth.json oficial.
 - [ ] roots de skills obedecem precedência e isolam colisões/skills inválidas;
 - [ ] startup injeta somente metadata; corpo/recursos entram on-demand;
 - [ ] `stdio` e Streamable HTTP suportam framing fragmentado;
-- [ ] tools, resources e prompts MCP passam fixtures;
-- [ ] MCP inicializa lazy e não repete uma call possivelmente side-effectful;
+- [ ] tools, resources e prompts MCP passam fixtures *(superado: sem prompts)*;
+- [ ] MCP inicializa lazy *(superado: segundo plano)* e não repete uma call possivelmente side-effectful;
 - [ ] root e children compartilham uma conexão por server config;
 - [ ] depth 1 e limite de slots/fila nunca são ultrapassados;
 - [ ] cada child possui sessão, usage, cancelamento e resultado final próprios;
@@ -1505,7 +1615,8 @@ A v1 está pronta quando:
 - as Fases 0–6 e a TUI M0–M3 estão verdes;
 - sessão, resume, branch básico e compaction funcionam no runtime Rust;
 - skills são descobertas nos roots canônicos e carregadas on-demand;
-- MCP `stdio`/Streamable HTTP entrega tools/resources/prompts e encerra limpo;
+- MCP `stdio`/Streamable HTTP entrega tools/resources/prompts e encerra limpo
+  *(superado: sem prompts)*;
 - subagentes depth-1 executam em slots bounded com child sessions duráveis;
 - TUI fullscreen exibe atividade do root, tools, MCP e children;
 - Todo/Plan/Goal, modos e fila de steering funcionam de ponta a ponta;
@@ -1629,7 +1740,7 @@ Fontes:
 | P0 | terminal tape | gravar bytes/input/resize e reproduzir no testkit |
 | P0 | unrestricted runtime | nenhuma permission, tool approval ou sandbox no core; risco aceito |
 | P0 | skills nativas | `.slim/skills` + roots compatíveis, metadata-first e body on-demand |
-| P0 | MCP mínimo | `stdio`/HTTP, tools/resources/prompts, lazy e compartilhado com children |
+| P0 | MCP mínimo | `stdio`/HTTP, tools/resources/prompts, lazy e compartilhado com children (superado: ver nota em [MCP](#mcp)) |
 | P0 | subagentes v1 | depth-1, slots bounded, child session, cancel/join/result |
 | P1 | context budget | derivar de capabilities reais, reservando output e cache invariants |
 | P1 | file index | background, cap, generation swap e top-N bounded |

@@ -9,9 +9,7 @@ use serde_json::json;
 use slim_cli::{
     spawn_tui_runtime, spawn_tui_runtime_with_resume, ProviderRequest, ProviderRunOptions,
 };
-use slim_core::context::{
-    AdaptiveTokenEstimator, CompactionHandle, CompactionPolicy, CompactionStrategy,
-};
+use slim_core::context::{AdaptiveTokenEstimator, CompactionHandle, CompactionPolicy};
 use slim_core::provider::{
     ProviderKind, ProviderMessage, ProviderToolCall, CODEX_BUNDLED_CONTEXT_WINDOW,
 };
@@ -20,11 +18,10 @@ use slim_core::session::{
     preflight_session, DurableEntry, DurableEntryRole, DurableOperation, DurableOperationKind,
     DurableRecord, DurableRepo, DurableSessionHeader, JsonlRepo, SessionWriter,
 };
-use slim_core::{
-    EventKind, OperatingMode, QuestionAnswer, SessionEvent, SessionEventReceiver,
-    SessionEventSender,
+use slim_core::{EventKind, OperatingMode, SessionEvent, SessionEventReceiver, SessionEventSender};
+use slim_tui::api::{
+    InteractionRequestId, ModelAlias, ReasoningEffort, UiChannels, UiCommand, UiEvent,
 };
-use slim_tui::api::{InteractionRequestId, ModelAlias, ReasoningEffort, UiCommand, UiEvent};
 use slim_tui::app::{AppState, FollowMode, ScrollAnchor};
 use slim_tui::block::{BlockKind, BlockLifecycle};
 use slim_tui::reducer::{reduce, Action, Effect};
@@ -1927,15 +1924,16 @@ fn ordinary_tui_reuses_compacted_history_on_the_next_prompt() {
     let address = listener.local_addr().expect("address");
     let (bodies_tx, bodies_rx) = mpsc::channel::<String>();
     let server = thread::spawn(move || {
-        for request_index in 0..2 {
+        for request_index in 0..4 {
             let (mut stream, _) = listener.accept().expect("accept");
             bodies_tx
                 .send(read_complete_http_request(&mut stream))
                 .expect("request body");
-            let answer = if request_index == 0 {
-                "first-answer-after-compaction"
-            } else {
-                "second-answer-without-recompaction"
+            let answer = match request_index {
+                0 => "## Goal\\nhistory-summary-fixture",
+                1 => "turn-prefix-summary-fixture",
+                2 => "first-answer-after-compaction",
+                _ => "second-answer-without-recompaction",
             };
             let events = format!(
                 "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{answer}\"}}}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
@@ -1954,10 +1952,14 @@ fn ordinary_tui_reuses_compacted_history_on_the_next_prompt() {
 
     let oversized_marker = format!("ORIGINAL-OVERSIZED-HISTORY-{}", "x".repeat(2_000_000));
     let options = ProviderRunOptions::default()
-        .with_context_window_tokens(32_000)
         .with_history(vec![
             ProviderMessage::user("small-root-instruction"),
             ProviderMessage::assistant(oversized_marker.clone(), Vec::new()),
+            ProviderMessage::user("tail-question"),
+            ProviderMessage::assistant(
+                format!("recent-tail {}", "tail ".repeat(24_000)),
+                Vec::new(),
+            ),
         ])
         .with_context_window_tokens(512_000)
         .with_max_output_tokens(128);
@@ -1968,18 +1970,35 @@ fn ordinary_tui_reuses_compacted_history_on_the_next_prompt() {
         .send(UiCommand::SendPrompt("first-prompt".into()))
         .expect("first prompt");
 
+    // The cut keeps the recent tail and summarizes what came before it: the
+    // history first (bounded to fit the window), then the turn prefix.
+    let history_summary_request = bodies_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("history summary request");
+    assert!(history_summary_request.contains("You are a context summarization assistant"));
+    assert!(history_summary_request.contains("ORIGINAL-OVERSIZED-HISTORY-"));
+    assert!(
+        history_summary_request.contains("[conversation bounded]"),
+        "a conversation larger than the window is bounded, never sent whole"
+    );
+    assert!(history_summary_request.len() < 1_900_000);
+    let prefix_summary_request = bodies_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("turn prefix summary request");
+    assert!(prefix_summary_request.contains("You are a context summarization assistant"));
+    assert!(prefix_summary_request.contains("[User]: tail-question"));
+
     let first_provider_request = bodies_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("first provider request");
     assert!(
-        !first_provider_request.contains("Summarize the prior agent transcript"),
-        "hard threshold without prepared must compact locally"
+        first_provider_request.contains("compacted into the following summary"),
+        "first turn must send the compacted history"
     );
-    assert!(
-        first_provider_request.contains("[Compacted context]"),
-        "first turn must send the local compacted history"
-    );
+    assert!(first_provider_request.contains("history-summary-fixture"));
+    assert!(first_provider_request.contains("turn-prefix-summary-fixture"));
     assert!(first_provider_request.contains("first-prompt"));
+    assert!(first_provider_request.contains("recent-tail"));
     assert!(
         !first_provider_request.contains(&oversized_marker),
         "first turn must not resend the original oversized history"
@@ -2007,7 +2026,7 @@ fn ordinary_tui_reuses_compacted_history_on_the_next_prompt() {
         .recv_timeout(Duration::from_secs(5))
         .expect("second turn provider request");
     assert!(
-        second_turn_first_request.contains("[Compacted context]"),
+        second_turn_first_request.contains("compacted into the following summary"),
         "second turn must reuse the compacted history: {second_turn_first_request}"
     );
     assert!(
@@ -2033,22 +2052,6 @@ const COMPACTION_FACTS: [&str; 6] = [
     "RECENT=file_729",
     "LATEST=answer_311",
 ];
-
-struct TuiCompactionMetrics {
-    before_tokens: u64,
-    after_tokens: u64,
-    summary_input_tokens: u64,
-    summary_output_tokens: u64,
-    facts_preserved: usize,
-    stable_prefix_tokens: u64,
-    next_request_ms: f64,
-    summary_ms: Option<f64>,
-    commits: usize,
-    committed_local: bool,
-    final_status: slim_core::context::CompactionStatus,
-    states: Vec<slim_core::context::CompactionStatus>,
-    summary_arrival_ms: Option<f64>,
-}
 
 fn compaction_corpus() -> Vec<ProviderMessage> {
     let mut history = vec![ProviderMessage::user(format!(
@@ -2085,6 +2088,8 @@ fn compaction_corpus() -> Vec<ProviderMessage> {
     history
 }
 
+/// A summary that names every fact its request showed, as a faithful
+/// summarizer would.
 fn fixture_summary(request: &str) -> String {
     let visible_facts = COMPACTION_FACTS
         .iter()
@@ -2092,9 +2097,7 @@ fn fixture_summary(request: &str) -> String {
         .copied()
         .collect::<Vec<_>>()
         .join("\n");
-    format!(
-        "## Goal\nContinue the task\n## Constraints\nRetain task facts\n## Progress\nHistory prepared\n## Blocked\nNone\n## Decisions\nUse recorded facts\n## Next steps\nContinue\n## Critical context\n{visible_facts}"
-    )
+    format!("## Goal\nContinue the task\n## Critical context\n{visible_facts}")
 }
 
 fn estimate_wire_tokens(request: &str) -> u64 {
@@ -2104,210 +2107,6 @@ fn estimate_wire_tokens(request: &str) -> u64 {
         "tui-bridge-fixture",
         body.chars().count() as u64,
     )
-}
-
-fn run_tui_compaction_corpus(background: bool) -> TuiCompactionMetrics {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.set_nonblocking(true).expect("nonblocking");
-    let address = listener.local_addr().expect("address");
-    let server = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut requests = Vec::new();
-        let mut normal_count = 0;
-        let mut first_writer = None;
-        let mut summary_latency = None;
-        let mut summary_text = None;
-        while normal_count < 2 {
-            let (mut stream, _) = loop {
-                match listener.accept() {
-                    Ok(pair) => break pair,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "compaction fixture timed out");
-                        thread::sleep(Duration::from_millis(2));
-                    }
-                    Err(error) => panic!("accept: {error}"),
-                }
-            };
-            stream.set_nonblocking(false).expect("blocking stream");
-            let request = read_complete_http_request(&mut stream);
-            let arrived = Instant::now();
-            if request.contains("You are a context compactor") {
-                assert!(request.contains(COMPACTION_FACTS[2]));
-                let summary_started = Instant::now();
-                thread::sleep(Duration::from_millis(20));
-                let summary = fixture_summary(&request);
-                let event = json!({"choices":[{"delta":{"content":summary}}]});
-                let body = format!(
-                    "data: {event}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
-                );
-                write_fixture_sse(&mut stream, &body);
-                summary_latency = Some(summary_started.elapsed().as_secs_f64() * 1_000.0);
-                summary_text = Some(summary);
-            } else if normal_count == 0 {
-                let content = "turn-padding ".repeat(7_000);
-                first_writer = Some(thread::spawn(move || {
-                    let event = json!({"choices":[{"delta":{
-                        "content":content,
-                        "tool_calls":[{"index":0,"id":"fixture-question","function":{
-                            "name":"ask_question","arguments":json!({
-                                "question":"Continue with the retained facts?",
-                                "options":[
-                                    {"label":"continue","description":"Use the stored context"},
-                                    {"label":"stop","description":"Stop this run"}
-                                ]
-                            }).to_string()
-                        }}]
-                    }}]});
-                    let body = format!(
-                        "data: {event}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
-                    );
-                    write_fixture_sse(&mut stream, &body);
-                }));
-                normal_count += 1;
-            } else {
-                write_fixture_sse(
-                    &mut stream,
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
-                );
-                normal_count += 1;
-            }
-            requests.push((request, arrived));
-        }
-        if let Some(writer) = first_writer {
-            writer.join().expect("first response");
-        }
-        (requests, summary_latency, summary_text)
-    });
-
-    let policy = CompactionPolicy {
-        background,
-        ..CompactionPolicy::default()
-    };
-    let handle = CompactionHandle::new(policy);
-    let options = ProviderRunOptions::default()
-        .with_history(compaction_corpus())
-        .with_context_window_tokens(115_000)
-        .with_max_output_tokens(2_048)
-        .with_compaction_handle(handle.clone());
-    let (runtime, channels) =
-        spawn_tui_runtime(request(format!("http://{address}")), options).expect("TUI bridge");
-    channels
-        .commands
-        .send(UiCommand::SendPrompt("Continue the task.".into()))
-        .expect("prompt");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut completed = false;
-    let mut states = Vec::new();
-    let mut answered = false;
-    while Instant::now() < deadline && !completed {
-        if let Ok(event) = channels
-            .events_data
-            .recv_timeout(Duration::from_millis(100))
-        {
-            match event {
-                UiEvent::RunCompleted { run_id: 1 } => completed = true,
-                UiEvent::RunFailed { message, .. } => panic!("TUI run failed: {message}"),
-                UiEvent::CompactionState { state, .. } => states.push(state),
-                UiEvent::QuestionRequired { request_id, .. } => {
-                    assert!(!answered);
-                    if background {
-                        // The background summary request starts once this tool call
-                        // arrives. Its completion is not observable from here (the
-                        // handle stays `Preparing` until the loop resumes), so give
-                        // the fixture time to answer it before resuming the loop.
-                        // Only the background run has a summary to wait for.
-                        thread::sleep(Duration::from_millis(120));
-                    }
-                    channels
-                        .commands
-                        .send(UiCommand::AnswerQuestion {
-                            request_id,
-                            answer: QuestionAnswer::option(0, "continue").expect("answer"),
-                        })
-                        .expect("answer question");
-                    answered = true;
-                }
-                _ => {}
-            }
-        }
-        while let Ok(event) = channels.events.try_recv() {
-            match event {
-                UiEvent::RunCompleted { run_id: 1 } => completed = true,
-                UiEvent::RunFailed { message, .. } => panic!("TUI run failed: {message}"),
-                UiEvent::CompactionState { state, .. } => states.push(state),
-                _ => {}
-            }
-        }
-    }
-    assert!(completed, "TUI compaction run must complete");
-    channels
-        .commands
-        .send(UiCommand::Shutdown)
-        .expect("shutdown");
-    drop(runtime);
-    let (requests, summary_ms, summary_text) = server.join().expect("server");
-    assert!(answered, "the fixture question must be answered");
-    let normal = requests
-        .iter()
-        .filter(|(request, _)| !request.contains("You are a context compactor"))
-        .collect::<Vec<_>>();
-    let summaries = requests
-        .iter()
-        .filter(|(request, _)| request.contains("You are a context compactor"))
-        .collect::<Vec<_>>();
-    assert_eq!(normal.len(), 2);
-    assert_eq!(summaries.len(), usize::from(background));
-    let first_body = normal[0].0.split_once("\r\n\r\n").unwrap().1;
-    let second_body = normal[1].0.split_once("\r\n\r\n").unwrap().1;
-    let first: serde_json::Value = serde_json::from_str(first_body).expect("first request JSON");
-    let second: serde_json::Value = serde_json::from_str(second_body).expect("second request JSON");
-    let stable_prefix_chars = first["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .zip(second["messages"].as_array().unwrap())
-        .take_while(|(before, after)| before == after)
-        .map(|(message, _)| message.to_string().chars().count() as u64)
-        .sum();
-    let commits = handle.take_commits();
-    let final_status = handle.status();
-    let committed_local = commits.first().is_some_and(|commit| {
-        commit
-            .summary
-            .contains("[local extract; not an LLM summary]")
-    });
-    TuiCompactionMetrics {
-        before_tokens: estimate_wire_tokens(normal[0].0.as_str()),
-        after_tokens: estimate_wire_tokens(normal[1].0.as_str()),
-        summary_input_tokens: summaries
-            .first()
-            .map_or(0, |(request, _)| estimate_wire_tokens(request)),
-        summary_output_tokens: summary_text.as_deref().map_or(0, |summary| {
-            AdaptiveTokenEstimator::default().estimate(
-                "openai-compatible",
-                "tui-bridge-fixture",
-                summary.chars().count() as u64,
-            )
-        }),
-        facts_preserved: COMPACTION_FACTS
-            .iter()
-            .filter(|fact| second_body.contains(**fact))
-            .count(),
-        stable_prefix_tokens: AdaptiveTokenEstimator::default().estimate(
-            "openai-compatible",
-            "tui-bridge-fixture",
-            stable_prefix_chars,
-        ),
-        next_request_ms: normal[1].1.duration_since(normal[0].1).as_secs_f64() * 1_000.0,
-        summary_ms,
-        commits: commits.len(),
-        committed_local,
-        final_status,
-        states,
-        summary_arrival_ms: summaries
-            .first()
-            .map(|(_, at)| at.duration_since(normal[0].1).as_secs_f64() * 1_000.0),
-    }
 }
 
 fn write_fixture_sse(stream: &mut std::net::TcpStream, body: &str) {
@@ -2323,84 +2122,19 @@ fn write_fixture_sse(stream: &mut std::net::TcpStream, body: &str) {
 }
 
 #[test]
-fn tui_prepares_and_applies_background_compaction_on_the_same_offline_corpus() {
-    let without = run_tui_compaction_corpus(false);
-    let with = run_tui_compaction_corpus(true);
-    eprintln!(
-        "SLIM_TUI_COMPACTION background=false before={} after={} summary_input={} summary_output={} facts={}/6 prefix={} next_ms={:.3} summary_ms={:?} summary_arrival_ms={:?} commits={} local={} status={:?} states={:?}",
-        without.before_tokens,
-        without.after_tokens,
-        without.summary_input_tokens,
-        without.summary_output_tokens,
-        without.facts_preserved,
-        without.stable_prefix_tokens,
-        without.next_request_ms,
-        without.summary_ms,
-        without.summary_arrival_ms,
-        without.commits,
-        without.committed_local,
-        without.final_status,
-        without.states
-    );
-    eprintln!(
-        "SLIM_TUI_COMPACTION background=true before={} after={} summary_input={} summary_output={} facts={}/6 prefix={} next_ms={:.3} summary_ms={:?} summary_arrival_ms={:?} commits={} local={} status={:?} states={:?}",
-        with.before_tokens,
-        with.after_tokens,
-        with.summary_input_tokens,
-        with.summary_output_tokens,
-        with.facts_preserved,
-        with.stable_prefix_tokens,
-        with.next_request_ms,
-        with.summary_ms,
-        with.summary_arrival_ms,
-        with.commits,
-        with.committed_local,
-        with.final_status,
-        with.states
-    );
-    assert_eq!(without.before_tokens, with.before_tokens);
-    assert_eq!(without.summary_input_tokens, 0);
-    assert_eq!(with.commits, 1, "prepared summary should be applied");
-    assert_eq!(
-        without.commits, 1,
-        "hard threshold should use local extract"
-    );
-    assert_eq!(with.facts_preserved, 6);
-    assert!(without.facts_preserved < with.facts_preserved);
-    assert!(without.after_tokens < without.before_tokens);
-    assert!(with.after_tokens < with.before_tokens);
-}
-
-struct HardCompactionMetrics {
-    trigger_tokens: u64,
-    after_tokens: u64,
-    summary_input_tokens: u64,
-    summary_output_tokens: u64,
-    facts_preserved: usize,
-    middle_preserved: bool,
-    request_latency_ms: f64,
-    summary_latency_ms: Option<f64>,
-    local_extract: bool,
-}
-
-fn run_hard_compaction_corpus(http_summary: bool) -> HardCompactionMetrics {
+fn tui_compacts_the_offline_corpus_with_the_model_summary_and_keeps_every_fact() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("address");
     let server = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut requests = Vec::new();
-        let mut summary_text = None;
-        let mut summary_latency_ms = None;
         loop {
             let (mut stream, _) = loop {
                 match listener.accept() {
                     Ok(pair) => break pair,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(
-                            Instant::now() < deadline,
-                            "hard compaction fixture timed out"
-                        );
+                        assert!(Instant::now() < deadline, "compaction fixture timed out");
                         thread::sleep(Duration::from_millis(2));
                     }
                     Err(error) => panic!("accept: {error}"),
@@ -2408,59 +2142,46 @@ fn run_hard_compaction_corpus(http_summary: bool) -> HardCompactionMetrics {
             };
             stream.set_nonblocking(false).expect("blocking stream");
             let request = read_complete_http_request(&mut stream);
-            let arrived = Instant::now();
-            let is_summary = request.contains("You are a context compactor");
+            let is_summary = request.contains("You are a context summarization assistant");
             if is_summary {
-                assert!(http_summary, "local hard must not request a summary");
-                assert!(request.contains(COMPACTION_FACTS[2]));
-                let summary_started = Instant::now();
-                thread::sleep(Duration::from_millis(20));
-                let summary = fixture_summary(&request);
-                let event = json!({"choices":[{"delta":{"content":summary}}]});
+                let event = json!({"choices":[{"delta":{"content":fixture_summary(&request)}}]});
                 let body = format!(
                     "data: {event}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
                 );
                 write_fixture_sse(&mut stream, &body);
-                summary_latency_ms = Some(summary_started.elapsed().as_secs_f64() * 1_000.0);
-                summary_text = Some(summary);
             } else {
                 write_fixture_sse(
                     &mut stream,
                     "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
                 );
             }
-            requests.push((request, arrived));
+            requests.push(request);
             if !is_summary {
                 break;
             }
         }
-        (requests, summary_text, summary_latency_ms)
+        requests
     });
 
-    let policy = CompactionPolicy {
-        background: false,
-        strategy: CompactionStrategy::Summary,
+    // A line low enough that the corpus (about 65k tokens) crosses it.
+    let handle = CompactionHandle::new(CompactionPolicy {
+        reserve_tokens: 55_000,
         ..CompactionPolicy::default()
-    };
-    let handle = CompactionHandle::new(policy);
-    if http_summary {
-        handle.request_manual("").expect("queue HTTP compaction");
-    }
+    });
     let options = ProviderRunOptions::default()
         .with_history(compaction_corpus())
-        .with_context_window_tokens(64_000)
+        .with_context_window_tokens(115_000)
         .with_max_output_tokens(2_048)
         .with_compaction_handle(handle.clone());
     let (runtime, channels) =
         spawn_tui_runtime(request(format!("http://{address}")), options).expect("TUI bridge");
-    let started = Instant::now();
     channels
         .commands
         .send(UiCommand::SendPrompt("Continue the task.".into()))
         .expect("prompt");
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut applied = None;
     let mut completed = false;
+    let mut applied = None;
     while Instant::now() < deadline && !completed {
         if let Ok(event) = channels
             .events_data
@@ -2471,9 +2192,11 @@ fn run_hard_compaction_corpus(http_summary: bool) -> HardCompactionMetrics {
                 UiEvent::RunFailed { message, .. } => panic!("TUI run failed: {message}"),
                 UiEvent::CompactionState {
                     state: slim_core::context::CompactionStatus::Applied,
+                    reason,
                     tokens_before,
+                    tokens_after,
                     ..
-                } => applied = Some(tokens_before),
+                } => applied = Some((reason, tokens_before, tokens_after)),
                 _ => {}
             }
         }
@@ -2481,88 +2204,631 @@ fn run_hard_compaction_corpus(http_summary: bool) -> HardCompactionMetrics {
             match event {
                 UiEvent::RunCompleted { run_id: 1 } => completed = true,
                 UiEvent::RunFailed { message, .. } => panic!("TUI run failed: {message}"),
+                UiEvent::CompactionState {
+                    state: slim_core::context::CompactionStatus::Applied,
+                    reason,
+                    tokens_before,
+                    tokens_after,
+                    ..
+                } => applied = Some((reason, tokens_before, tokens_after)),
                 _ => {}
             }
         }
     }
-    assert!(completed, "hard compaction run must complete");
+    assert!(completed, "TUI compaction run must complete");
     channels
         .commands
         .send(UiCommand::Shutdown)
         .expect("shutdown");
     drop(runtime);
-    let (requests, summary_text, summary_latency_ms) = server.join().expect("server");
-    assert_eq!(requests.len(), if http_summary { 2 } else { 1 });
-    let task_request = requests
-        .iter()
-        .find(|(request, _)| !request.contains("You are a context compactor"))
-        .expect("task request");
-    let summary_request = requests
-        .iter()
-        .find(|(request, _)| request.contains("You are a context compactor"));
+    let requests = server.join().expect("server");
+
+    // The cut falls inside the corpus' only turn: its prefix is summarized in
+    // one request, and the recent tail goes on verbatim.
+    assert_eq!(requests.len(), 2);
+    let summary_request = &requests[0];
+    let task_request = &requests[1];
+    assert!(summary_request.contains(COMPACTION_FACTS[0]));
+    assert!(summary_request.contains(COMPACTION_FACTS[2]));
+    for fact in COMPACTION_FACTS {
+        assert!(
+            task_request.contains(fact),
+            "{fact} is lost after compaction"
+        );
+    }
+    assert!(task_request.contains("compacted into the following summary"));
+    let uncompacted_tokens = AdaptiveTokenEstimator::default().estimate(
+        "openai-compatible",
+        "tui-bridge-fixture",
+        compaction_corpus()
+            .iter()
+            .map(|message| message.content.chars().count() as u64)
+            .sum(),
+    );
+    assert!(estimate_wire_tokens(task_request) < uncompacted_tokens / 2);
+
     let commits = handle.take_commits();
     assert_eq!(commits.len(), 1);
-    HardCompactionMetrics {
-        trigger_tokens: applied.expect("compaction applied event"),
-        after_tokens: estimate_wire_tokens(&task_request.0),
-        summary_input_tokens: summary_request
-            .map_or(0, |(request, _)| estimate_wire_tokens(request)),
-        summary_output_tokens: summary_text.as_deref().map_or(0, |summary| {
-            AdaptiveTokenEstimator::default().estimate(
-                "openai-compatible",
-                "tui-bridge-fixture",
-                summary.chars().count() as u64,
-            )
-        }),
-        facts_preserved: COMPACTION_FACTS
-            .iter()
-            .filter(|fact| task_request.0.contains(**fact))
-            .count(),
-        middle_preserved: task_request.0.contains(COMPACTION_FACTS[2]),
-        request_latency_ms: task_request.1.duration_since(started).as_secs_f64() * 1_000.0,
-        summary_latency_ms,
-        local_extract: commits[0]
-            .summary
-            .contains("[local extract; not an LLM summary]"),
-    }
+    assert!(!commits[0].summary.contains("local extract"));
+    assert!(commits[0].summary.contains(COMPACTION_FACTS[2]));
+    assert_eq!(
+        handle.status(),
+        slim_core::context::CompactionStatus::Applied
+    );
+    let (reason, tokens_before, tokens_after) = applied.expect("compaction applied event");
+    assert_eq!(reason, slim_core::context::CompactionReason::Threshold);
+    assert!(tokens_before > tokens_after);
 }
 
 #[test]
-fn hard_compaction_compares_local_extract_with_http_summary_on_same_corpus() {
-    let uncompacted_wire_tokens = run_tui_compaction_corpus(false).before_tokens;
-    let local = run_hard_compaction_corpus(false);
-    let http = run_hard_compaction_corpus(true);
-    eprintln!(
-        "SLIM_HARD_COMPACTION mode=local before_wire={} trigger_estimate={} after={} summary_input={} summary_output={} facts={}/6 request_ms={:.3} summary_ms={:?}",
-        uncompacted_wire_tokens,
-        local.trigger_tokens,
-        local.after_tokens,
-        local.summary_input_tokens,
-        local.summary_output_tokens,
-        local.facts_preserved,
-        local.request_latency_ms,
-        local.summary_latency_ms
+fn tui_compact_command_summarizes_an_idle_session_without_a_model_turn() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut requests = Vec::new();
+        loop {
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(pair) => break pair,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "compaction fixture timed out");
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).expect("blocking stream");
+            let request = read_complete_http_request(&mut stream);
+            let is_summary = request.contains("You are a context summarization assistant");
+            if is_summary {
+                let event = json!({"choices":[{"delta":{"content":fixture_summary(&request)}}]});
+                let body = format!(
+                    "data: {event}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+                );
+                write_fixture_sse(&mut stream, &body);
+            } else {
+                write_fixture_sse(
+                    &mut stream,
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                );
+            }
+            requests.push(request);
+            if !is_summary {
+                break;
+            }
+        }
+        requests
+    });
+
+    // The corpus (about 65k tokens) sits below the automatic threshold of this
+    // window: only the command compacts it.
+    let handle = CompactionHandle::new(CompactionPolicy::default());
+    let job_workspace = resume_path("compact-jobs").with_extension("workspace");
+    fs::create_dir_all(&job_workspace).unwrap();
+    let options = ProviderRunOptions::default()
+        .with_workspace_root(&job_workspace)
+        .with_history(compaction_corpus())
+        .with_context_window_tokens(115_000)
+        .with_max_output_tokens(2_048)
+        .with_compaction_handle(handle.clone());
+    let (runtime, channels) =
+        spawn_tui_runtime(request(format!("http://{address}")), options).expect("TUI bridge");
+    channels
+        .commands
+        .send(UiCommand::RunBackgroundShell { command: if cfg!(windows) { "Write-Output READY; while (!(Test-Path 'release-job')) { Start-Sleep -Milliseconds 20 }; Write-Output JOB-AFTER-COMPACT" } else { "printf READY; while [ ! -f release-job ]; do sleep 0.02; done; printf JOB-AFTER-COMPACT" }.into() }).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut started = false;
+    while Instant::now() < deadline && !started {
+        if let Ok(UiEvent::JobsChanged { jobs }) =
+            channels.events_data.recv_timeout(Duration::from_millis(50))
+        {
+            started = jobs.iter().any(|j| j.state == "running");
+        }
+        while channels.events.try_recv().is_ok() {}
+    }
+    assert!(started);
+    channels
+        .commands
+        .send(UiCommand::Compact {
+            instructions: "Keep the release checklist".into(),
+        })
+        .expect("compact");
+
+    let mut applied = None;
+    let mut block_shown = false;
+    let mut completed = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !completed {
+        let mut seen = Vec::new();
+        if let Ok(event) = channels
+            .events_data
+            .recv_timeout(Duration::from_millis(100))
+        {
+            seen.push(event);
+        }
+        while let Ok(event) = channels.events.try_recv() {
+            seen.push(event);
+        }
+        for event in seen {
+            match event {
+                UiEvent::RunCompleted { run_id: 1 } => completed = true,
+                UiEvent::RunFailed { message, .. } => panic!("compaction run failed: {message}"),
+                UiEvent::CompactionState {
+                    state: slim_core::context::CompactionStatus::Applied,
+                    reason,
+                    tokens_before,
+                    tokens_after,
+                    ..
+                } => applied = Some((reason, tokens_before, tokens_after)),
+                UiEvent::CompactionCompleted => block_shown = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(completed, "the idle compaction run must complete");
+    assert!(block_shown, "the completed compaction block is announced");
+    let (reason, tokens_before, tokens_after) = applied.expect("compaction applied event");
+    assert_eq!(reason, slim_core::context::CompactionReason::Manual);
+    assert!(tokens_before > tokens_after);
+    assert_eq!(handle.manual_instructions(), None, "the request was served");
+
+    channels.commands.send(UiCommand::JobsRefresh).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut alive = false;
+    while Instant::now() < deadline && !alive {
+        if let Ok(UiEvent::JobsChanged { jobs }) =
+            channels.events_data.recv_timeout(Duration::from_millis(50))
+        {
+            alive = jobs
+                .iter()
+                .any(|j| j.id == "shell-1" && j.state == "running");
+        }
+        while channels.events.try_recv().is_ok() {}
+    }
+    assert!(alive, "compaction must preserve the job ID");
+    fs::write(job_workspace.join("release-job"), "go").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut done = false;
+    while Instant::now() < deadline && !done {
+        if let Ok(UiEvent::Notification { message }) =
+            channels.events_data.recv_timeout(Duration::from_millis(50))
+        {
+            done = message.contains("shell-1") && message.contains("concluído");
+        }
+        while channels.events.try_recv().is_ok() {}
+    }
+    assert!(done);
+    // The live history is the compacted one: the next prompt carries the
+    // summary and none of the corpus it replaced.
+    channels
+        .commands
+        .send(UiCommand::SendPrompt("Continue the task.".into()))
+        .expect("prompt");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut finished = false;
+    while Instant::now() < deadline && !finished {
+        if let Ok(event) = channels
+            .events_data
+            .recv_timeout(Duration::from_millis(100))
+        {
+            finished = matches!(event, UiEvent::RunCompleted { run_id: 2 });
+        }
+        while let Ok(event) = channels.events.try_recv() {
+            finished |= matches!(event, UiEvent::RunCompleted { run_id: 2 });
+        }
+    }
+    assert!(finished, "the prompt after /compact must complete");
+    channels
+        .commands
+        .send(UiCommand::Shutdown)
+        .expect("shutdown");
+    drop(runtime);
+    let requests = server.join().expect("server");
+
+    // One summary request, then the prompt: the command ran no model turn.
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("Continue the task."));
+    assert!(requests[1].contains("JOB-AFTER-COMPACT"));
+    assert_eq!(requests[1].matches("[Shell job completion:").count(), 1);
+    fs::remove_dir_all(job_workspace).unwrap();
+    assert!(requests[1].contains("compacted into the following summary"));
+    let uncompacted_tokens = AdaptiveTokenEstimator::default().estimate(
+        "openai-compatible",
+        "tui-bridge-fixture",
+        compaction_corpus()
+            .iter()
+            .map(|message| message.content.chars().count() as u64)
+            .sum(),
     );
-    eprintln!(
-        "SLIM_HARD_COMPACTION mode=http before_wire={} trigger_estimate={} after={} summary_input={} summary_output={} facts={}/6 request_ms={:.3} summary_ms={:?}",
-        uncompacted_wire_tokens,
-        http.trigger_tokens,
-        http.after_tokens,
-        http.summary_input_tokens,
-        http.summary_output_tokens,
-        http.facts_preserved,
-        http.request_latency_ms,
-        http.summary_latency_ms
+    assert!(estimate_wire_tokens(&requests[1]) < uncompacted_tokens / 2);
+}
+
+#[test]
+fn tui_compact_command_reports_a_session_too_small_to_compact() {
+    let options = ProviderRunOptions::default()
+        .with_history(vec![
+            ProviderMessage::user("hello"),
+            ProviderMessage::assistant("hi", Vec::new()),
+        ])
+        .with_context_window_tokens(115_000)
+        .with_compaction_handle(CompactionHandle::new(CompactionPolicy::default()));
+    let (runtime, channels) =
+        spawn_tui_runtime(request("http://127.0.0.1:9".into()), options).expect("TUI bridge");
+    channels
+        .commands
+        .send(UiCommand::Compact {
+            instructions: String::new(),
+        })
+        .expect("compact");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut message = None;
+    while Instant::now() < deadline && message.is_none() {
+        let mut seen = Vec::new();
+        if let Ok(event) = channels
+            .events_data
+            .recv_timeout(Duration::from_millis(100))
+        {
+            seen.push(event);
+        }
+        while let Ok(event) = channels.events.try_recv() {
+            seen.push(event);
+        }
+        for event in seen {
+            match event {
+                UiEvent::Notification { message: text } if text.contains("compact") => {
+                    message = Some(text);
+                }
+                UiEvent::RunStarted { .. } => panic!("no run starts for nothing to compact"),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        message.as_deref(),
+        Some("Nothing to compact (session too small)")
     );
-    assert_eq!(local.trigger_tokens, http.trigger_tokens);
-    assert!(uncompacted_wire_tokens > local.after_tokens);
-    assert!(uncompacted_wire_tokens > http.after_tokens);
-    assert!(local.local_extract);
-    assert!(!http.local_extract);
-    assert_eq!(local.summary_input_tokens, 0);
-    assert!(http.summary_input_tokens > 0);
-    assert_eq!(http.facts_preserved, 6);
-    assert_eq!(local.facts_preserved, 5);
-    assert!(!local.middle_preserved);
-    assert!(http.middle_preserved);
+    channels
+        .commands
+        .send(UiCommand::Shutdown)
+        .expect("shutdown");
+    drop(runtime);
+}
+
+/// Feeds every UI event to `visit` until it returns true or the time is up.
+fn wait_for_ui_event(
+    channels: &UiChannels,
+    seconds: u64,
+    mut visit: impl FnMut(UiEvent) -> bool,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < deadline {
+        let mut seen = Vec::new();
+        if let Ok(event) = channels
+            .events_data
+            .recv_timeout(Duration::from_millis(100))
+        {
+            seen.push(event);
+        }
+        while let Ok(event) = channels.events.try_recv() {
+            seen.push(event);
+        }
+        for event in seen {
+            if visit(event) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A provider that answers summarization requests with a summary and counts
+/// every request it gets.
+fn spawn_summary_server() -> (
+    String,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = {
+        let (count, stop) = (count.clone(), stop.clone());
+        thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                };
+                stream.set_nonblocking(false).expect("blocking stream");
+                let request = read_complete_http_request(&mut stream);
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let content = if request.contains("You are a context summarization assistant") {
+                    fixture_summary(&request)
+                } else {
+                    "ordinary reply".to_owned()
+                };
+                let event = json!({"choices":[{"delta":{"content":content}}]});
+                let body = format!(
+                    "data: {event}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+                );
+                write_fixture_sse(&mut stream, &body);
+            }
+        })
+    };
+    (format!("http://{address}"), count, stop, handle)
+}
+
+#[test]
+fn tui_compact_command_refuses_a_second_compaction_with_nothing_new() {
+    let (endpoint, count, stop, server) = spawn_summary_server();
+    let handle = CompactionHandle::new(CompactionPolicy::default());
+    let options = ProviderRunOptions::default()
+        .with_history(compaction_corpus())
+        .with_context_window_tokens(115_000)
+        .with_max_output_tokens(2_048)
+        .with_compaction_handle(handle);
+    let (runtime, channels) = spawn_tui_runtime(request(endpoint), options).expect("TUI bridge");
+    channels
+        .commands
+        .send(UiCommand::Compact {
+            instructions: String::new(),
+        })
+        .expect("compact");
+    assert!(
+        wait_for_ui_event(&channels, 10, |event| {
+            assert!(!matches!(event, UiEvent::RunFailed { .. }), "{event:?}");
+            matches!(event, UiEvent::RunCompleted { run_id: 1 })
+        }),
+        "the first compaction completes"
+    );
+    let summary_requests = count.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(summary_requests >= 1);
+
+    // Nothing was appended since: Pi's "Already compacted", and no run.
+    channels
+        .commands
+        .send(UiCommand::Compact {
+            instructions: String::new(),
+        })
+        .expect("compact again");
+    let mut message = None;
+    assert!(wait_for_ui_event(&channels, 5, |event| match event {
+        UiEvent::Notification { message: text } if text.contains("ompact") => {
+            message = Some(text);
+            true
+        }
+        UiEvent::RunStarted { .. } => panic!("no run starts for an already compacted session"),
+        _ => false,
+    }));
+    assert_eq!(message.as_deref(), Some("Already compacted"));
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::SeqCst),
+        summary_requests
+    );
+    channels
+        .commands
+        .send(UiCommand::Shutdown)
+        .expect("shutdown");
+    drop(runtime);
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    server.join().expect("server");
+}
+
+#[test]
+fn tui_compact_command_works_with_automatic_compaction_disabled() {
+    let (endpoint, count, stop, server) = spawn_summary_server();
+    let handle = CompactionHandle::new(CompactionPolicy {
+        enabled: false,
+        ..CompactionPolicy::default()
+    });
+    let options = ProviderRunOptions::default()
+        .with_history(compaction_corpus())
+        .with_context_window_tokens(115_000)
+        .with_max_output_tokens(2_048)
+        .with_compaction_handle(handle);
+    let (runtime, channels) = spawn_tui_runtime(request(endpoint), options).expect("TUI bridge");
+    channels
+        .commands
+        .send(UiCommand::Compact {
+            instructions: String::new(),
+        })
+        .expect("compact");
+    let mut reason = None;
+    assert!(
+        wait_for_ui_event(&channels, 10, |event| match event {
+            UiEvent::RunFailed { message, .. } => panic!("manual compaction failed: {message}"),
+            UiEvent::Notification { message } if message.to_lowercase().contains("disabled") => {
+                panic!("manual compaction was refused: {message}")
+            }
+            UiEvent::CompactionState {
+                reason: applied, ..
+            } => {
+                reason = Some(applied);
+                false
+            }
+            UiEvent::RunCompleted { run_id: 1 } => true,
+            _ => false,
+        }),
+        "the manual compaction runs although [compaction] enabled = false"
+    );
+    assert_eq!(reason, Some(slim_core::context::CompactionReason::Manual));
+    assert!(count.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    channels
+        .commands
+        .send(UiCommand::Shutdown)
+        .expect("shutdown");
+    drop(runtime);
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    server.join().expect("server");
+}
+
+#[test]
+fn tui_force_aborted_idle_compaction_leaves_no_manual_request_queued() {
+    // A provider that takes the summary request and never answers it.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let _ = read_complete_http_request(&mut stream);
+        let _ = released.recv_timeout(Duration::from_secs(15));
+    });
+    let handle = CompactionHandle::new(CompactionPolicy::default());
+    let options = ProviderRunOptions::default()
+        .with_history(compaction_corpus())
+        .with_context_window_tokens(115_000)
+        .with_max_output_tokens(2_048)
+        .with_compaction_handle(handle.clone());
+    let (runtime, channels) =
+        spawn_tui_runtime(request(format!("http://{address}")), options).expect("TUI bridge");
+    channels
+        .commands
+        .send(UiCommand::Compact {
+            instructions: "Keep the checklist".into(),
+        })
+        .expect("compact");
+    // The summary request is in flight (the provider has read it).
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        handle.manual_instructions().as_deref(),
+        Some("Keep the checklist")
+    );
+    channels
+        .commands
+        .send(UiCommand::CancelRun)
+        .expect("cancel");
+    channels
+        .commands
+        .send(UiCommand::CancelRun)
+        .expect("force cancel");
+    assert!(
+        wait_for_ui_event(&channels, 10, |event| matches!(
+            event,
+            UiEvent::RunCancelled { run_id: 1 }
+        )),
+        "the aborted compaction ends as cancelled"
+    );
+    assert_eq!(
+        handle.manual_instructions(),
+        None,
+        "a cancelled /compact must not compact the next prompt"
+    );
+    channels
+        .commands
+        .send(UiCommand::Shutdown)
+        .expect("shutdown");
+    drop(runtime);
+    let _ = release.send(());
+    server.join().expect("server");
+}
+
+#[test]
+fn tui_reports_a_failed_automatic_compaction_as_a_notification() {
+    // Pi's line is crossed, the summary comes back empty, and the turn goes on
+    // with the history it has: the failure must reach the user, not only the
+    // activity label the next request replaces.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let (bodies_tx, bodies_rx) = mpsc::channel::<String>();
+    let server = thread::spawn(move || {
+        for request_index in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            bodies_tx
+                .send(read_complete_http_request(&mut stream))
+                .expect("request body");
+            let content = if request_index == 0 {
+                String::new()
+            } else {
+                "\"content\":\"answer-without-compaction\"".to_owned()
+            };
+            let events = format!(
+                "data: {{\"choices\":[{{\"delta\":{{{content}}},\"finish_reason\":\"stop\"}}]}}
+
+data: [DONE]
+
+"
+            );
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Content-Length: {}
+Connection: close
+
+{events}",
+                        events.len()
+                    )
+                    .as_bytes(),
+                )
+                .expect("response");
+        }
+    });
+
+    let options = ProviderRunOptions::default()
+        .with_history(vec![
+            ProviderMessage::user("small-root-instruction"),
+            ProviderMessage::assistant("old ".repeat(22_000), Vec::new()),
+            ProviderMessage::user("tail-question"),
+            ProviderMessage::assistant("recent ".repeat(12_000), Vec::new()),
+        ])
+        .with_context_window_tokens(60_000)
+        .with_max_output_tokens(128);
+    let (runtime, channels) =
+        spawn_tui_runtime(request(format!("http://{address}")), options).expect("bridge");
+    channels
+        .commands
+        .send(UiCommand::SendPrompt("first-prompt".into()))
+        .expect("prompt");
+
+    let summary_request = bodies_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("summary request");
+    assert!(summary_request.contains("You are a context summarization assistant"));
+    let turn_request = bodies_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the request goes out uncompacted");
+    assert!(!turn_request.contains("compacted into the following summary"));
+
+    let mut notice = None;
+    assert!(
+        wait_for_ui_event(&channels, 10, |event| match event {
+            UiEvent::Notification { message } if message.contains("Auto-compaction failed") => {
+                notice = Some(message);
+                false
+            }
+            UiEvent::RunFailed { message, .. } => panic!("the run must go on: {message}"),
+            UiEvent::RunCompleted { run_id: 1 } => true,
+            _ => false,
+        }),
+        "the run completes"
+    );
+    // The notification may trail the terminal event on the other lane.
+    if notice.is_none() {
+        wait_for_ui_event(&channels, 2, |event| match event {
+            UiEvent::Notification { message } if message.contains("Auto-compaction failed") => {
+                notice = Some(message);
+                true
+            }
+            _ => false,
+        });
+    }
+    let notice = notice.expect("a failed automatic compaction is reported to the user");
+    assert!(notice.contains("empty"), "{notice}");
+
+    channels
+        .commands
+        .send(UiCommand::Shutdown)
+        .expect("shutdown");
+    drop(runtime);
+    server.join().expect("server");
 }

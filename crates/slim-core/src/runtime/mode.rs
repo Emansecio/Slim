@@ -8,7 +8,7 @@ pub fn mode_name(mode: crate::OperatingMode) -> &'static str {
     }
 }
 
-/// Suffix on the latest user message. Durable JSONL stores the prompt only;
+/// Suffix on the run's anchor user message ([`ChannelFrame`]). Durable JSONL stores the prompt only;
 /// [`super::without_workspace_snapshot`] strips this with the workspace listing.
 pub(super) const CHANNEL_MARKER: &str = "\n\nHarness channel:";
 
@@ -61,6 +61,36 @@ impl WriteProjectionCache {
     }
 }
 
+/// Where a run puts the channel overlay, fixed when the run starts (and again
+/// when a compaction rewrites the history). The provider caches the request
+/// prefix: a stanza that followed the newest user message would move onto
+/// every message the loop injects (reviews, steers, notes, shell completions)
+/// and change the message it left.
+#[derive(Clone, Debug, Default)]
+pub(super) struct ChannelFrame {
+    /// The user message that carries the stanza: the one that started the run.
+    anchor: Option<usize>,
+    /// The MCP awareness block as it was when the frame was made; its status
+    /// labels change while servers connect.
+    mcp_servers: Option<String>,
+}
+
+impl ChannelFrame {
+    pub(super) fn new(messages: &[ProviderMessage], mcp_servers: Option<String>) -> Self {
+        Self {
+            anchor: messages.iter().rposition(|message| message.role == "user"),
+            mcp_servers,
+        }
+    }
+
+    /// The frame for `messages` that replace the history this one described.
+    /// The new prefix is cached from scratch anyway, so the MCP labels are
+    /// read again (`mcp_servers`) instead of staying as they were at the start.
+    pub(super) fn rebuilt_for(messages: &[ProviderMessage], mcp_servers: Option<String>) -> Self {
+        Self::new(messages, mcp_servers)
+    }
+}
+
 /// Facts that match advertised tools: `ask_question` only when Auto has a route.
 pub(super) struct ChannelOverlay<'a> {
     messages: &'a mut [ProviderMessage],
@@ -70,16 +100,32 @@ pub(super) struct ChannelOverlay<'a> {
 }
 
 impl<'a> ChannelOverlay<'a> {
+    #[cfg(test)]
     pub(super) fn apply(
         messages: &'a mut [ProviderMessage],
         mode: crate::OperatingMode,
         can_ask: bool,
         cache: Option<&mut WriteProjectionCache>,
     ) -> Self {
+        Self::apply_with_mcp(messages, mode, can_ask, cache, &ChannelFrame::default())
+    }
+
+    /// [`Self::apply`] at the frame's message, with its MCP server awareness
+    /// block (Auto only), which follows the stanza and is stripped with it.
+    /// Without a usable anchor the newest user message carries them.
+    pub(super) fn apply_with_mcp(
+        messages: &'a mut [ProviderMessage],
+        mode: crate::OperatingMode,
+        can_ask: bool,
+        cache: Option<&mut WriteProjectionCache>,
+        frame: &ChannelFrame,
+    ) -> Self {
+        let mcp_servers = frame.mcp_servers.as_deref();
         let original_arguments = project_completed_writes(messages, cache);
-        let applied = messages
-            .iter()
-            .rposition(|message| message.role == "user")
+        let applied = frame
+            .anchor
+            .filter(|index| messages.get(*index).is_some_and(|m| m.role == "user"))
+            .or_else(|| messages.iter().rposition(|message| message.role == "user"))
             .map(|index| {
                 let content = &mut messages[index].content;
                 if let Some(at) = content.find(CHANNEL_MARKER) {
@@ -87,6 +133,10 @@ impl<'a> ChannelOverlay<'a> {
                 }
                 let original_len = content.len();
                 content.push_str(channel_stanza(mode, can_ask));
+                if let Some(block) = mcp_servers.filter(|_| mode.allows_mutation()) {
+                    content.push_str("\n\n");
+                    content.push_str(block);
+                }
                 (index, original_len)
             });
         Self {
@@ -211,13 +261,24 @@ fn project_call(
     Some(projected)
 }
 
+/// Bytes of a call's arguments as the provider view sends them: a completed
+/// large `write` goes out as the short projection, everything else whole.
+pub(super) fn wire_argument_bytes(
+    messages: &[ProviderMessage],
+    index: usize,
+    call: &ProviderToolCall,
+) -> usize {
+    project_call(messages, index, call, None)
+        .map_or(call.arguments.len(), |projected| projected.len())
+}
+
 pub(super) fn channel_stanza(mode: crate::OperatingMode, can_ask: bool) -> &'static str {
     match (mode, can_ask) {
         (crate::OperatingMode::Auto, true) => {
-            "\n\nHarness channel: Auto, interactive. Use ask_question for unauthorized destructive/irreversible/external/production writes, secret exposure, new dependencies, scope expansion, and undiscoverable architecture/safety/data/behavior decisions. Do not reconfirm already authorized work. Shell runs PowerShell, not bash."
+            "\n\nHarness channel: Auto, interactive. Act on the request without asking. Use ask_question only before irreversible loss of data the request does not cover, production or external writes it does not cover, exposing secrets, or a material decision the request and code cannot settle. Shell runs PowerShell, not bash."
         }
         (crate::OperatingMode::Auto, false) => {
-            "\n\nHarness channel: Auto, unattended. No interactive pause (ask_question is not available). Refuse unauthorized destructive/irreversible/external/production writes, secret exposure, new dependencies or scope expansion rather than executing them. Continue authorized work without waiting. Shell runs PowerShell, not bash."
+            "\n\nHarness channel: Auto, unattended. No interactive pause (ask_question is not available). Take the most reasonable reading and finish the work. Skip only irreversible loss of data the request does not cover, production or external writes it does not cover, and exposing secrets; report what you skipped and why. Shell runs PowerShell, not bash."
         }
         (crate::OperatingMode::Plan, _) => {
             "\n\nHarness channel: Plan. Inspect and report only. Workspace mutations, shell, todo, skill and ask_question are not available."
@@ -481,6 +542,75 @@ mod tests {
         messages.pop();
         let overlay = super::ChannelOverlay::apply(&mut messages, OperatingMode::Auto, false, None);
         assert_eq!(overlay.view()[1].tool_calls[0].arguments, arguments);
+    }
+
+    #[test]
+    fn requests_of_one_run_serialize_the_earlier_messages_identically() {
+        use crate::provider::{
+            OpenAiCompatibleAdapter, ProviderAdapter, ProviderConfig, ProviderMessage,
+            ProviderToolCall,
+        };
+        let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+            "http://127.0.0.1:1",
+            "fixture",
+            "unused",
+        ))
+        .unwrap();
+        let call = ProviderToolCall {
+            id: "call-1".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"a.rs"}"#.into(),
+        };
+        let mut messages = vec![
+            ProviderMessage::user("implement"),
+            ProviderMessage::assistant("", vec![call]),
+            ProviderMessage::tool("read", "call-1", "fn main() {}"),
+        ];
+        let frame = super::ChannelFrame::new(&messages, Some("MCP servers (1)\n- fs".into()));
+        let serialized = |messages: &mut [ProviderMessage], frame: &super::ChannelFrame| {
+            let overlay = super::ChannelOverlay::apply_with_mcp(
+                messages,
+                OperatingMode::Auto,
+                false,
+                None,
+                frame,
+            );
+            let request = adapter
+                .build_messages_request_with_tools_checked(overlay.view(), &[])
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+            body["messages"].as_array().unwrap().clone()
+        };
+        let first = serialized(&mut messages, &frame);
+        assert!(first
+            .iter()
+            .any(|message| message.to_string().contains("Harness channel")));
+        // The loop injects user messages: a review, a steer, a note.
+        messages.push(ProviderMessage::assistant("step", Vec::new()));
+        messages.push(ProviderMessage::user("Review the todo list."));
+        messages.push(ProviderMessage::user("Diagnostics note."));
+        let second = serialized(&mut messages, &frame);
+        assert_eq!(second[..first.len()], first[..]);
+        let stanzas = second
+            .iter()
+            .filter(|message| message.to_string().contains("Harness channel"))
+            .count();
+        assert_eq!(stanzas, 1);
+        // Without a frame the newest user message carries it, which is what
+        // changed the earlier message on every injection.
+        let moved = serialized(&mut messages, &super::ChannelFrame::default());
+        assert_ne!(moved[..first.len()], first[..]);
+        // A compaction rewrites the history: the frame is rebuilt for it.
+        let rebuilt = super::ChannelFrame::rebuilt_for(
+            &messages[2..],
+            Some("MCP servers (1)\n- fs (ready)".into()),
+        );
+        assert_eq!(
+            rebuilt.mcp_servers.as_deref(),
+            Some("MCP servers (1)\n- fs (ready)")
+        );
+        assert_ne!(rebuilt.mcp_servers, frame.mcp_servers);
+        assert_eq!(rebuilt.anchor, Some(3));
     }
 
     #[test]

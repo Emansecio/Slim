@@ -13,88 +13,6 @@ use crate::markdown::LogicalLine;
 use crate::view_model::{Frame, ViewModel};
 use ratatui::style::Style;
 use ratatui::text::Line as RatatuiLine;
-use unicode_segmentation::UnicodeSegmentation;
-
-/// Retain a visual-row boundary rather than a sliding character suffix. Revisit
-/// the last few rows so an appended combining mark/ZWJ can complete a grapheme.
-/// Width changes rebuild once; appends only wrap the retained suffix and delta.
-#[derive(Default)]
-struct ThinkingPreview {
-    generation: u64,
-    source_len: usize,
-    restart: usize,
-    logical_column: usize,
-    hidden: bool,
-    rows: Vec<String>,
-}
-
-impl ThinkingPreview {
-    fn update(&mut self, text: &str, generation: u64, width: u16) {
-        if self.generation == generation && self.source_len == text.len() {
-            return;
-        }
-        if text.len() < self.source_len || !text.is_char_boundary(self.restart) {
-            *self = Self::default();
-        }
-        let prefix = " ".repeat(self.logical_column % 4);
-        let source = format!("{prefix}{}", &text[self.restart..]);
-        let raw_offsets: Vec<_> = source.char_indices().map(|(offset, _)| offset).collect();
-        let (safe, mapped) =
-            crate::markdown::sanitize_terminal_text_with_offsets(&source, &raw_offsets);
-        let safe = safe[prefix.len()..].trim_end();
-        let width = usize::from(width.max(1));
-        let mut rows = Vec::new();
-        // Start (offset, logical column) of each row, for restarting later.
-        let mut boundaries = Vec::new();
-        if !safe.is_empty() {
-            let mut line_start = 0usize;
-            let mut line_column = self.logical_column;
-            for line in safe.split('\n') {
-                // Row starts only move forward: accumulate the column from
-                // the previous start to keep the pass linear.
-                let mut previous_start = 0usize;
-                let mut column = line_column;
-                let (ranges, replaced) = crate::markdown::prose_line_ranges(line, width);
-                for range in ranges {
-                    column += line[previous_start..range.start]
-                        .graphemes(true)
-                        .map(unicode_width::UnicodeWidthStr::width)
-                        .sum::<usize>();
-                    previous_start = range.start;
-                    boundaries.push((line_start + range.start, column));
-                    rows.push(crate::markdown::prose_row_text(
-                        &line[range],
-                        width,
-                        replaced,
-                    ));
-                }
-                line_start += line.len() + 1;
-                line_column = 0;
-            }
-        }
-        // Only restart on a real raw boundary. A tab expansion can cross a row
-        // boundary; in that case retain the preceding row as well.
-        for &(offset, column) in boundaries.iter().take(rows.len().saturating_sub(2)).rev() {
-            if let Some(index) = mapped
-                .iter()
-                .position(|mapped| *mapped == offset + prefix.len())
-            {
-                let raw = raw_offsets[index].saturating_sub(prefix.len());
-                if raw > 0 {
-                    self.restart += raw;
-                    self.logical_column = column;
-                    self.hidden = true;
-                    break;
-                }
-            }
-        }
-        self.hidden |= rows.len() > 2;
-        self.rows = rows.into_iter().rev().take(2).collect();
-        self.rows.reverse();
-        self.source_len = text.len();
-        self.generation = generation;
-    }
-}
 
 #[derive(Debug)]
 pub struct EventCoalescer {
@@ -404,7 +322,6 @@ pub fn render(state: &AppState, width: u16, height: u16) -> Frame {
                 .iter()
                 .any(|item| item.status == crate::api::TodoItemStatus::InProgress),
         ),
-        state.working || state.activity.is_some(),
         !state.blocks().is_empty()
             && !crate::view_model::is_trivial_cwd(&state.cwd)
             && width >= 80
@@ -469,15 +386,11 @@ fn block_height(block: &Block, width: u16, cache: &mut WrapCache) -> usize {
                     BodyKind::Thinking,
                     width,
                     block.lifecycle != crate::block::BlockLifecycle::Streaming,
-                    || prose_row_count(text, thinking_body_width(width) as usize),
+                    || crate::thought::body_row_count(text, thinking_body_width(width)),
                 )
             }
-            _ if block.shows_thinking_preview() => {
-                1 + cache
-                    .thinking_preview(block, text, thinking_body_width(width))
-                    .0
-                    .len()
-            }
+            // Collapsed and streaming thoughts are one row: the newest words
+            // ride on the header.
             _ => 1,
         },
         // Tools/system/activity render as one summary row. Error and queued
@@ -543,37 +456,34 @@ pub struct ScrollMetrics {
     pub last_visible_foldable_anchor: Option<ScrollAnchor>,
 }
 
-fn grouped_member_rows(leader: &Block, member_count: usize) -> u64 {
-    if leader.fold == crate::block::FoldState::Expanded {
-        1u64.saturating_add(member_count as u64)
-    } else {
-        1
-    }
-}
-
+/// `collapsed_rows` lists members that keep a row of their own under a
+/// collapsed header (a group's failures), in display order.
 fn record_grouped_member_rows(
     block_rows: &mut HashMap<crate::api::BlockId, (u64, u64)>,
     prefix: u64,
-    leader: &Block,
     members: &[Block],
-    rows: u64,
-    member_is_tool: impl Fn(&Block) -> bool,
+    expanded: bool,
+    member_heights: &[u64],
+    collapsed_rows: &[usize],
 ) -> u64 {
-    let mut visible_index = 0usize;
-    for member in members {
-        let is_tool = member_is_tool(member);
-        let (member_prefix, member_rows) = if !is_tool {
-            (prefix, 0)
-        } else if visible_index == 0 {
+    let rows = if expanded {
+        1u64.saturating_add(member_heights.iter().sum())
+    } else {
+        1u64.saturating_add(collapsed_rows.len() as u64)
+    };
+    let mut next_prefix = prefix.saturating_add(1);
+    for (index, member) in members.iter().enumerate() {
+        let height = member_heights.get(index).copied().unwrap_or(0);
+        let (member_prefix, member_rows) = if index == 0 {
             (prefix, rows)
-        } else if leader.fold == crate::block::FoldState::Expanded {
-            (prefix.saturating_add(1 + visible_index as u64), 1)
+        } else if expanded {
+            (next_prefix, height)
+        } else if let Some(row) = collapsed_rows.iter().position(|member| *member == index) {
+            (prefix.saturating_add(1 + row as u64), 1)
         } else {
             (prefix, 1)
         };
-        if is_tool {
-            visible_index = visible_index.saturating_add(1);
-        }
+        next_prefix = next_prefix.saturating_add(height);
         block_rows
             .entry(member.id.clone())
             .or_insert((member_prefix, member_rows));
@@ -639,23 +549,41 @@ impl<'a> HeightIndex<'a> {
                     cache.present_now_ms,
                     cache.present_reduced_motion,
                 )
-            } else if crate::block::is_complete_tool(block) {
-                crate::block::consecutive_complete_tool_span(blocks, index)
+            } else if crate::block::is_settled_tool(block) {
+                crate::block::consecutive_settled_tool_span(blocks, index)
             } else {
                 None
             };
             if let Some((start, end)) = tool_span {
-                let tool_count = crate::block::complete_tool_count(blocks, start, end);
-                if tool_count > 1 && start == index {
-                    let rows = grouped_member_rows(block, tool_count);
+                if crate::block::is_tool_group(blocks, start, end) && start == index {
+                    let failure_rows: Vec<usize> = if block.group_expanded {
+                        Vec::new()
+                    } else {
+                        crate::block::group_failure_rows(&blocks[start..end])
+                            .into_iter()
+                            .map(|row| row.member)
+                            .collect()
+                    };
+                    let member_heights: Vec<u64> = if block.group_expanded {
+                        blocks[start..end]
+                            .iter()
+                            .map(|member| {
+                                (block_height(member, width, cache)
+                                    - usize::from(member.turn_boundary_before()))
+                                    as u64
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     let entry_prefix = prefix;
                     prefix = record_grouped_member_rows(
                         &mut block_rows,
                         prefix.saturating_add(gap),
-                        block,
                         &blocks[start..end],
-                        rows,
-                        crate::block::is_complete_tool,
+                        block.group_expanded,
+                        &member_heights,
+                        &failure_rows,
                     );
                     spans.push((entry_prefix, start, start, end));
                     index = end;
@@ -668,15 +596,26 @@ impl<'a> HeightIndex<'a> {
                 {
                     let tool_count = end.saturating_sub(start);
                     if tool_count > 1 && start == index {
-                        let rows = grouped_member_rows(block, tool_count);
+                        let member_heights: Vec<u64> = if block.group_expanded {
+                            blocks[start..end]
+                                .iter()
+                                .map(|member| {
+                                    (block_height(member, width, cache)
+                                        - usize::from(member.turn_boundary_before()))
+                                        as u64
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
                         let entry_prefix = prefix;
                         prefix = record_grouped_member_rows(
                             &mut block_rows,
                             prefix.saturating_add(gap),
-                            block,
                             &blocks[start..end],
-                            rows,
-                            crate::block::is_failed_tool,
+                            block.group_expanded,
+                            &member_heights,
+                            &[],
                         );
                         spans.push((entry_prefix, start, start, end));
                         index = end;
@@ -691,30 +630,26 @@ impl<'a> HeightIndex<'a> {
                     let count = end.saturating_sub(start);
                     if count > 1 && start == index {
                         let members = &blocks[start..end];
-                        let rows = if block.fold == crate::block::FoldState::Expanded {
-                            1u64.saturating_add(
-                                members
-                                    .iter()
-                                    .map(|member| {
-                                        cache.thinking_body_height(
-                                            member,
-                                            width,
-                                            &mut pending_heights,
-                                        ) as u64
-                                    })
-                                    .sum(),
-                            )
+                        let expanded = block.fold == crate::block::FoldState::Expanded;
+                        let member_heights: Vec<u64> = if expanded {
+                            members
+                                .iter()
+                                .map(|member| {
+                                    cache.thinking_body_height(member, width, &mut pending_heights)
+                                        as u64
+                                })
+                                .collect()
                         } else {
-                            1
+                            Vec::new()
                         };
                         let entry_prefix = prefix;
                         prefix = record_grouped_member_rows(
                             &mut block_rows,
                             prefix.saturating_add(gap),
-                            block,
                             members,
-                            rows,
-                            crate::block::is_complete_thinking,
+                            expanded,
+                            &member_heights,
+                            &[],
                         );
                         spans.push((entry_prefix, start, start, end));
                         index = end;
@@ -722,11 +657,40 @@ impl<'a> HeightIndex<'a> {
                     }
                 }
             }
+            if let Some((start, end)) = crate::block::consecutive_queued_user_span(blocks, index) {
+                let expanded = block.fold == crate::block::FoldState::Expanded;
+                let member_heights: Vec<u64> = if expanded {
+                    blocks[start..end]
+                        .iter()
+                        .map(|member| match member.kind() {
+                            BlockKind::QueuedUser(text) => crate::markdown::plain_row_count(
+                                text,
+                                width.saturating_sub(4).max(1),
+                            ) as u64,
+                            _ => 0,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let entry_prefix = prefix;
+                prefix = record_grouped_member_rows(
+                    &mut block_rows,
+                    prefix.saturating_add(gap),
+                    &blocks[start..end],
+                    expanded,
+                    &member_heights,
+                    &[],
+                );
+                spans.push((entry_prefix, start, start, end));
+                index = end;
+                continue;
+            }
             let key = (
                 block.cache_identity(),
                 block.content_generation(),
                 width,
-                u8::from(block.fold == crate::block::FoldState::Collapsed),
+                block.fold_tag(),
                 block.lifecycle_tag(),
             );
             let height = if let Some(height) = cache.heights.get(&key).copied() {
@@ -779,12 +743,22 @@ impl<'a> HeightIndex<'a> {
             return None;
         }
         let (index, skipped) = self.locate(row);
-        let leader = self.entry(index).1;
+        let (_, leader, members) = self.entry(index);
         // Offsets are relative to the block's content start, as in
         // `row_for_anchor`; a leading blank row resolves to that start.
         let leading = self
             .prefix_for_block(&leader.id)
             .map_or(0, |prefix| prefix.saturating_sub(self.memo.spans[index].0));
+        let leader_prefix = self.prefix_for_block(&leader.id)?;
+        for member in members.iter().skip(1).rev() {
+            let &(prefix, rows) = self.memo.block_rows.get(&member.id)?;
+            if prefix > leader_prefix && row >= prefix && row < prefix.saturating_add(rows) {
+                return Some(ScrollAnchor {
+                    block_id: member.id.clone(),
+                    row_offset: row.saturating_sub(prefix),
+                });
+            }
+        }
         Some(ScrollAnchor {
             block_id: leader.id.clone(),
             row_offset: skipped.saturating_sub(leading),
@@ -839,16 +813,49 @@ impl<'a> HeightIndex<'a> {
         let last_visible_foldable_anchor = has_visible_viewport
             .then(|| self.last_visible_foldable_anchor(viewport_start, viewport_end))
             .flatten();
+        let mut up_anchor = self.anchor_at_or_before(up);
+        // Upward moves step past a blank row that cannot be anchored, so a
+        // downward move whose anchor already resolves to the bottom must reach
+        // it too; `None` tells the reducer there is nothing left below.
+        let below_bottom = |anchor: Option<ScrollAnchor>| {
+            anchor.filter(|anchor| {
+                self.row_for_anchor(anchor)
+                    .is_none_or(|resolved| resolved < bottom_start)
+            })
+        };
+        let mut down_anchor = below_bottom(self.anchor_for_row(down));
+        let mut page_up_anchor = self.anchor_at_or_before(page_up);
+        let mut page_down_anchor = below_bottom(self.anchor_for_row(page_down));
+        if self.total_rows <= viewport_rows {
+            if let FollowMode::Pinned(anchor) = mode {
+                let anchors = self.fitted_fold_anchors();
+                if !anchors.is_empty() {
+                    let current = anchors.iter().rposition(|target| {
+                        target.block_id == anchor.block_id && target.row_offset <= anchor.row_offset
+                    });
+                    up_anchor = Some(
+                        anchors[current.map_or(anchors.len() - 1, |index| index.saturating_sub(1))]
+                            .clone(),
+                    );
+                    down_anchor = Some(
+                        anchors[current.map_or(0, |index| (index + 1).min(anchors.len() - 1))]
+                            .clone(),
+                    );
+                    page_up_anchor = anchors.first().cloned();
+                    page_down_anchor = anchors.last().cloned();
+                }
+            }
+        }
         ScrollMetrics {
             viewport_start,
             viewport_rows,
             total_rows: self.total_rows,
             bottom_start,
             top_anchor: self.anchor_for_row(viewport_start),
-            up_anchor: self.anchor_at_or_before(up),
-            down_anchor: self.anchor_for_row(down),
-            page_up_anchor: self.anchor_at_or_before(page_up),
-            page_down_anchor: self.anchor_for_row(page_down),
+            up_anchor,
+            down_anchor,
+            page_up_anchor,
+            page_down_anchor,
             last_visible_foldable_anchor,
         }
     }
@@ -866,6 +873,40 @@ impl<'a> HeightIndex<'a> {
             .min(self.memo.spans.len().saturating_sub(1));
         let skipped = row.saturating_sub(self.memo.spans[idx].0);
         (idx, skipped)
+    }
+
+    /// Focus targets come from the presented spans, including the tool hold.
+    /// Only a transcript that fits needs block navigation rather than scrolling.
+    fn fitted_fold_anchors(&self) -> Vec<ScrollAnchor> {
+        let mut anchors = Vec::new();
+        for &(_, leader, start, end) in &self.memo.spans {
+            let block = &self.blocks[leader];
+            let members = &self.blocks[start..end];
+            let foldable_tool = matches!(block.kind(), BlockKind::Tool(tool)
+                if members.len() > 1 || tool.content_handle.is_some() || tool.has_expanded_body());
+            if matches!(
+                block.kind(),
+                BlockKind::Thinking(_) | BlockKind::QueuedUser(_)
+            ) || foldable_tool
+            {
+                anchors.push(ScrollAnchor {
+                    block_id: block.id.clone(),
+                    row_offset: 0,
+                });
+                if matches!(block.kind(), BlockKind::Tool(_))
+                    && members.len() > 1
+                    && block.group_expanded
+                {
+                    anchors.extend(members.iter().enumerate().map(|(index, member)| {
+                        ScrollAnchor {
+                            block_id: member.id.clone(),
+                            row_offset: u64::from(index == 0),
+                        }
+                    }));
+                }
+            }
+        }
+        anchors
     }
 
     fn last_visible_foldable_anchor(
@@ -891,8 +932,12 @@ impl<'a> HeightIndex<'a> {
                 break;
             }
             let foldable_tool = matches!(block.kind(), BlockKind::Tool(state)
-                if members.len() > 1 || state.content_handle.is_some());
-            if matches!(block.kind(), BlockKind::Thinking(_)) || foldable_tool {
+                if members.len() > 1 || state.content_handle.is_some() || state.has_expanded_body());
+            if matches!(
+                block.kind(),
+                BlockKind::Thinking(_) | BlockKind::QueuedUser(_)
+            ) || foldable_tool
+            {
                 return Some(ScrollAnchor {
                     block_id: block.id.clone(),
                     row_offset: 0,
@@ -959,14 +1004,20 @@ fn inspector_memo_base_key(
     )
 }
 
+/// Block transition stamps found by one scan, valid while the content
+/// revision holds and the clock does not move back past `now_ms`.
+struct TransitionStamps {
+    content_rev: u64,
+    now_ms: u64,
+    stamps: Vec<u64>,
+}
+
 /// Bounded caches for the render pipeline (§12.3/§12.4): heights keyed by
 /// block generation, width and layout kind (folded/full/grouped body).
 /// Eviction only drops derivations.
 pub struct WrapCache {
     pub(crate) painted_selection: Option<crate::selection::PaintedSelection>,
     pub(crate) selection_scroll_anchor: Option<ScrollAnchor>,
-    thinking_previews: Vec<((u64, u16), ThinkingPreview)>,
-    finished_previews: WeightedCache<(u64, u64, u16), (Vec<String>, bool)>,
     /// Content hit regions from the last painted frame: transcript, inspector.
     pub(crate) selection_regions: [Option<ratatui::layout::Rect>; 2],
     heights: BoundedCache<HeightKey, usize>,
@@ -1018,6 +1069,15 @@ pub struct WrapCache {
     /// longer re-filters the static command list per frame.
     palette_memo: Option<(String, Arc<Vec<&'static str>>)>,
     streaming_blocks_memo: Option<(u64, bool)>,
+    /// Timestamps of block transitions that can still be inside their window.
+    transition_stamps_memo: Option<TransitionStamps>,
+    /// Paint-side edge of the modal backdrop entrance: whether a frame was
+    /// ever painted, whether the last one had a blocking modal, and the clock
+    /// at which the open modal first appeared (`None` when it was already
+    /// there on the first frame).
+    frame_painted: bool,
+    modal_was_open: bool,
+    modal_opened_ms: Option<u64>,
     /// Fully-rendered block lines (header + body + boundary) keyed by
     /// [`BlockLinesKey`]. Stable blocks paint into the frame buffer by
     /// reference; only changed or animated blocks re-materialize.
@@ -1084,55 +1144,6 @@ fn memoized<K: PartialEq, V>(slot: &mut Option<(K, V)>, key: K, produce: impl Fn
 }
 
 impl WrapCache {
-    pub(crate) fn thinking_preview(
-        &mut self,
-        block: &Block,
-        text: &str,
-        width: u16,
-    ) -> (Vec<String>, bool) {
-        let finished_key = (block.cache_identity(), block.content_generation(), width);
-        let stable = block.lifecycle != crate::block::BlockLifecycle::Streaming;
-        if stable {
-            if let Some(preview) = self.finished_previews.get(&finished_key) {
-                return preview.clone();
-            }
-        }
-        let key = (block.cache_identity(), width);
-        if !self
-            .thinking_previews
-            .iter()
-            .any(|(stored, _)| *stored == key)
-        {
-            if self.thinking_previews.len() == 4 {
-                self.thinking_previews.remove(0);
-            }
-            self.thinking_previews.push((
-                key,
-                ThinkingPreview {
-                    generation: u64::MAX,
-                    ..Default::default()
-                },
-            ));
-        }
-        let (_, preview) = self
-            .thinking_previews
-            .iter_mut()
-            .find(|(stored, _)| *stored == key)
-            .expect("preview inserted");
-        preview.update(text, block.content_generation(), width);
-        let result = (preview.rows.clone(), preview.hidden);
-        if stable {
-            let bytes = result
-                .0
-                .iter()
-                .map(|row| row.len() + std::mem::size_of::<String>())
-                .sum();
-            self.finished_previews
-                .insert(finished_key, result.clone(), bytes);
-        }
-        result
-    }
-
     /// Arms the tool-group hold for the next height build. Motion frames that
     /// share the same hold set reuse the index; only a settlement or a new
     /// completion changes the epoch.
@@ -1184,6 +1195,69 @@ impl WrapCache {
                 .iter()
                 .any(|block| block.lifecycle == crate::block::BlockLifecycle::Streaming)
         })
+    }
+
+    /// Records one painted frame's blocking-modal state and returns when the
+    /// open modal appeared. Only an open that follows a painted frame without
+    /// one is an entrance; a modal replacing another keeps its timestamp, and
+    /// a modal already open on the very first frame has none.
+    pub(crate) fn note_modal_frame(&mut self, modal_open: bool, now_ms: u64) -> Option<u64> {
+        if !modal_open {
+            self.modal_opened_ms = None;
+        } else if self.frame_painted && !self.modal_was_open {
+            self.modal_opened_ms = Some(now_ms);
+        }
+        self.modal_was_open = modal_open;
+        self.frame_painted = true;
+        self.modal_opened_ms
+    }
+
+    pub(crate) fn modal_opened_ms(&self) -> Option<u64> {
+        self.modal_opened_ms
+    }
+
+    /// Distinct `started_ms`/`ended_ms` stamps of `blocks` that are still
+    /// inside a `window_ms` transition at `now_ms`, in no particular order.
+    ///
+    /// The stamps are scanned once per content revision. A later `now_ms`
+    /// only narrows the window, so the stamps found at the scan time are a
+    /// superset of the live ones at any later time; callers apply the same
+    /// window test and get what a full scan would. A clock that moves back
+    /// rescans.
+    pub(crate) fn transition_stamps(
+        &mut self,
+        blocks: &[Block],
+        content_rev: u64,
+        now_ms: u64,
+        window_ms: u64,
+    ) -> &[u64] {
+        let live = |stamp: &u64| stamp.saturating_add(window_ms) > now_ms;
+        match &mut self.transition_stamps_memo {
+            Some(memo) if memo.content_rev == content_rev && memo.now_ms <= now_ms => {
+                memo.stamps.retain(live);
+                memo.now_ms = now_ms;
+            }
+            slot => {
+                let mut stamps: Vec<u64> = blocks
+                    .iter()
+                    .flat_map(|block| [block.started_ms, block.ended_ms])
+                    .flatten()
+                    .filter(live)
+                    .collect();
+                stamps.sort_unstable();
+                stamps.dedup();
+                *slot = Some(TransitionStamps {
+                    content_rev,
+                    now_ms,
+                    stamps,
+                });
+            }
+        }
+        &self
+            .transition_stamps_memo
+            .as_ref()
+            .expect("transition stamps populated")
+            .stamps
     }
 
     /// Markdown row count sharing the parse with the render pass: the
@@ -1482,8 +1556,8 @@ impl WrapCache {
         }
     }
 
-    // Tag 2 measures only a grouped thinking member's body. It must not alias
-    // standalone block heights (tags 0/1), which include headings/boundaries.
+    // Tag 3 measures only a grouped thinking member's body. It must not alias
+    // standalone fold tags (0/1/2), which include headings/boundaries.
     pub(crate) fn thinking_body_height(
         &mut self,
         block: &Block,
@@ -1494,7 +1568,7 @@ impl WrapCache {
             block.cache_identity(),
             block.content_generation(),
             width,
-            2,
+            3,
             block.lifecycle_tag(),
         );
         if let Some(height) = self.heights.get(&key) {
@@ -1502,7 +1576,9 @@ impl WrapCache {
         }
         self.height_misses = self.height_misses.saturating_add(1);
         let height = match block.kind() {
-            BlockKind::Thinking(text) => prose_row_count(text, thinking_body_width(width) as usize),
+            BlockKind::Thinking(text) => {
+                crate::thought::body_row_count(text, thinking_body_width(width))
+            }
             _ => 1,
         };
         pending.push((key, height));
@@ -1622,8 +1698,6 @@ impl Default for WrapCache {
         Self {
             painted_selection: None,
             selection_scroll_anchor: None,
-            thinking_previews: Vec::new(),
-            finished_previews: WeightedCache::new(256, 1024 * 1024),
             selection_regions: [None, None],
             heights: BoundedCache::new(16_384),
             height_misses: 0,
@@ -1642,6 +1716,10 @@ impl Default for WrapCache {
             model_rows_memo: None,
             palette_memo: None,
             streaming_blocks_memo: None,
+            transition_stamps_memo: None,
+            frame_painted: false,
+            modal_was_open: false,
+            modal_opened_ms: None,
             block_line_memos: WeightedCache::new(MAX_BLOCK_LINE_MEMOS, MAX_BLOCK_LINE_MEMO_BYTES),
             footer_memo: None,
             inspector_memo: None,
@@ -1657,123 +1735,6 @@ impl Default for WrapCache {
 mod height_cache_tests {
     use super::*;
     use crate::block::{Block, BlockKind, BlockLifecycle};
-
-    #[test]
-    fn thinking_preview_appends_match_full_wrap_without_a_moving_origin() {
-        for width in [1, 7, 19, 96] {
-            let mut cache = WrapCache::default();
-            let mut block = Block::new(
-                "preview",
-                BlockKind::Thinking(String::new()),
-                BlockLifecycle::Streaming,
-            );
-            for part in [
-                "prefix ",
-                "a".repeat(600).as_str(),
-                " 日",
-                "本語\n",
-                "👩",
-                "\u{200d}",
-                "💻",
-                "a",
-                "\u{301}",
-                "\tX\n",
-                "\u{1b}[",
-                "31mcolor\u{1b}[0m",
-                "z".repeat(400).as_str(),
-            ] {
-                block.append_text(part);
-                let BlockKind::Thinking(text) = block.kind() else {
-                    unreachable!()
-                };
-                let (actual, _) = cache.thinking_preview(&block, text, width);
-                let safe = crate::markdown::sanitize_terminal_text(text);
-                let expected = crate::markdown::render_prose(safe.trim_end(), width);
-                let start = expected.len().saturating_sub(2);
-                assert_eq!(actual, expected[start..], "width={width} part={part:?}");
-            }
-            let preview = &cache.thinking_previews.last().unwrap().1;
-            assert!(preview.restart > 600, "must retain a bounded visual suffix");
-            let BlockKind::Thinking(text) = block.kind() else {
-                unreachable!()
-            };
-            let resized = cache.thinking_preview(&block, text, 13).0;
-            let expected = crate::markdown::render_prose(text.trim_end(), 13);
-            assert_eq!(resized, expected[expected.len().saturating_sub(2)..]);
-        }
-    }
-
-    #[test]
-    fn finished_previews_survive_more_than_four_visible_blocks() {
-        let blocks: Vec<_> = (0..5)
-            .map(|id| {
-                Block::new(
-                    format!("preview-{id}"),
-                    BlockKind::Thinking("conteúdo estável 日本語 ".repeat(2_000)),
-                    BlockLifecycle::Complete,
-                )
-            })
-            .collect();
-        let mut cache = WrapCache::default();
-        for block in &blocks {
-            let BlockKind::Thinking(text) = block.kind() else {
-                unreachable!()
-            };
-            cache.thinking_preview(block, text, 76);
-        }
-        let retained: Vec<_> = cache
-            .thinking_previews
-            .iter()
-            .map(|(key, _)| *key)
-            .collect();
-        for block in &blocks {
-            let BlockKind::Thinking(text) = block.kind() else {
-                unreachable!()
-            };
-            let expected = crate::markdown::render_prose(text.trim_end(), 76);
-            assert_eq!(
-                cache.thinking_preview(block, text, 76).0,
-                expected[expected.len() - 2..]
-            );
-        }
-        assert_eq!(
-            retained,
-            cache
-                .thinking_previews
-                .iter()
-                .map(|(key, _)| *key)
-                .collect::<Vec<_>>(),
-            "warm finished previews must not evict/rebuild incremental slots"
-        );
-    }
-
-    #[test]
-    fn preview_stays_aligned_for_small_unicode_and_control_fragments() {
-        for width in [7, 53] {
-            let mut cache = WrapCache::default();
-            let mut block = Block::new(
-                "fragments",
-                BlockKind::Thinking(String::new()),
-                BlockLifecycle::Streaming,
-            );
-            let corpus = "abc 日本語 👩‍💻 a\u{301}\txyz\n\u{1b}[31mtexto\u{1b}[0m ".repeat(12);
-            for character in corpus.chars() {
-                block.append_text(&character.to_string());
-                let BlockKind::Thinking(text) = block.kind() else {
-                    unreachable!()
-                };
-                let safe = crate::markdown::sanitize_terminal_text(text);
-                let expected = crate::markdown::render_prose(safe.trim_end(), width);
-                let actual = cache.thinking_preview(&block, text, width).0;
-                assert_eq!(
-                    actual,
-                    expected[expected.len().saturating_sub(2)..],
-                    "width={width} at={}",
-                    text.len()
-                );
-            }
-        }
-    }
 
     #[test]
     fn grouped_thinking_heights_reuse_and_invalidate_per_member() {
@@ -1793,7 +1754,7 @@ mod height_cache_tests {
                 .iter()
                 .map(|block| match block.kind() {
                     BlockKind::Thinking(text) => {
-                        super::prose_row_count(text, super::thinking_body_width(width) as usize)
+                        crate::thought::body_row_count(text, super::thinking_body_width(width))
                             as u64
                     }
                     _ => unreachable!(),

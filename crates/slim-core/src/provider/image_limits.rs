@@ -140,6 +140,74 @@ fn webp_dimensions(mut bytes: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
+/// Largest side of a tool-result image sent inline. Anthropic lowers its
+/// limit from 8000 to 2000 pixels once a request carries more than 20
+/// images, and a rejected image stays in the history for every later request.
+pub(crate) const INLINE_IMAGE_MAX_DIMENSION: u32 = 2000;
+
+/// Decodes standard base64: padding is optional and ASCII whitespace is
+/// ignored. Any other character, data after padding, or a dangling sextet
+/// is `None`.
+pub(crate) fn decode_base64(encoded: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(encoded.len() / 4 * 3 + 3);
+    let mut accumulator = 0_u32;
+    let mut bits = 0_u32;
+    let mut padded = false;
+    for &byte in encoded.as_bytes() {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        if byte == b'=' {
+            padded = true;
+            continue;
+        }
+        if padded {
+            return None;
+        }
+        accumulator = (accumulator << 6) | u32::from(base64_value(byte)?);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((accumulator >> bits) as u8);
+            accumulator &= (1 << bits) - 1;
+        }
+    }
+    (bits < 6).then_some(out)
+}
+
+/// A tool-result image that every provider wire accepts, or why it cannot
+/// travel inline: a supported type, well-formed base64 within
+/// `max_base64_bytes`, readable dimensions, and a side of at most
+/// [`INLINE_IMAGE_MAX_DIMENSION`] pixels.
+pub(crate) fn inline_image(
+    media_type: &str,
+    base64: &str,
+    max_base64_bytes: usize,
+) -> Result<ProviderContentBlock, &'static str> {
+    let media_type = normalize_media_type(media_type).map_err(|_| "invalid media type")?;
+    if !matches!(
+        media_type.as_str(),
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    ) {
+        return Err("unsupported image type");
+    }
+    if base64.len() > max_base64_bytes {
+        return Err("image is too large to send inline");
+    }
+    let encoded = normalize_base64(base64).map_err(|_| "invalid base64")?;
+    let bytes = decode_base64(&encoded).ok_or("invalid base64")?;
+    let (width, height) = dimensions(&media_type, &bytes)
+        .filter(|(width, height)| *width > 0 && *height > 0)
+        .ok_or("image dimensions are unreadable")?;
+    if width > INLINE_IMAGE_MAX_DIMENSION || height > INLINE_IMAGE_MAX_DIMENSION {
+        return Err("image dimensions exceed the inline limit");
+    }
+    Ok(ProviderContentBlock::Image {
+        media_type,
+        data: encoded,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{encode_standard_base64, AnthropicAdapter, ProviderAdapter, ProviderConfig};
@@ -200,6 +268,58 @@ mod tests {
             None
         );
         assert_eq!(dimensions("image/png", b"not a png"), None);
+    }
+
+    #[test]
+    fn wrappers_around_the_anthropic_wire_do_not_take_tool_result_images() {
+        use super::super::{
+            CommandCodeAdapter, OpenCodeGoAdapter, COMMANDCODE_BASE_URL, OPENCODE_GO_BASE_URL,
+        };
+        // A gateway may front a model without vision: only the adapters
+        // that are the provider itself opt in.
+        assert!(
+            !CommandCodeAdapter::new(COMMANDCODE_BASE_URL, "claude-sonnet-4-6", "key", None)
+                .unwrap()
+                .accepts_tool_result_images()
+        );
+        assert!(
+            !OpenCodeGoAdapter::new(OPENCODE_GO_BASE_URL, "minimax-m3", "key", None)
+                .unwrap()
+                .accepts_tool_result_images()
+        );
+        assert!(
+            AnthropicAdapter::new(ProviderConfig::anthropic("http://x", "claude", "key"))
+                .unwrap()
+                .accepts_tool_result_images()
+        );
+    }
+
+    #[test]
+    fn inline_images_need_a_supported_type_readable_dimensions_and_a_small_size() {
+        let valid = encode_standard_base64(&png(640, 480));
+        let block = inline_image("IMAGE/PNG", &valid, 1024).expect("valid image");
+        assert_eq!(
+            block,
+            ProviderContentBlock::Image {
+                media_type: "image/png".into(),
+                data: valid.clone()
+            }
+        );
+        assert!(inline_image("image/png", &valid, 8).is_err(), "too large");
+        assert!(inline_image("image/svg+xml", &valid, 1024).is_err());
+        assert!(inline_image("image/png", "!!!!", 1024).is_err());
+        let wide = encode_standard_base64(&png(INLINE_IMAGE_MAX_DIMENSION + 1, 10));
+        assert_eq!(
+            inline_image("image/png", &wide, 1024),
+            Err("image dimensions exceed the inline limit")
+        );
+        let edge =
+            encode_standard_base64(&png(INLINE_IMAGE_MAX_DIMENSION, INLINE_IMAGE_MAX_DIMENSION));
+        assert!(inline_image("image/png", &edge, 1024).is_ok());
+        let unknown = encode_standard_base64(b"\x89PNG\r\n\x1a\n");
+        assert!(inline_image("image/png", &unknown, 1024).is_err());
+        let zero = encode_standard_base64(&png(0, 10));
+        assert!(inline_image("image/png", &zero, 1024).is_err());
     }
 
     #[test]

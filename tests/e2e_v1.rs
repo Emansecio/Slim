@@ -2,8 +2,12 @@ use std::fs;
 use std::sync::Arc;
 
 use slim_cli::{run_fake_headless, ExitCode, HeadlessRequest};
-use slim_core::context::{compact, ArtifactStore, ContextItem};
+use slim_core::context::{
+    apply_compaction, compaction_summary_message, prepare_compaction, ArtifactStore,
+    CompactionSettings, ContextUsage,
+};
 use slim_core::mcp::McpCatalog;
+use slim_core::provider::ProviderMessage;
 use slim_core::session::{branch, recover, SessionWriter};
 use slim_core::skills::{discover, read_body, SkillRoot};
 use slim_core::task::{Assurance, Goal, Plan, TodoStatus, TodoTracker};
@@ -51,17 +55,22 @@ fn fake_v1_flow_covers_headless_core_and_tui_contracts() {
     .expect("write");
     apply_exact_patch(&source, "needle changed", "needle final").expect("patch");
 
-    let compacted = compact(
-        &[
-            ContextItem::Text("transcript".into()),
-            ContextItem::Todo("todo".into()),
-            ContextItem::Plan("plan".into()),
-            ContextItem::Goal("goal".into()),
-            ContextItem::ToolPair("tool".into()),
-        ],
-        "summary",
-    );
-    assert_eq!(compacted.preserved.len(), 4);
+    let history = vec![
+        ProviderMessage::user("transcript"),
+        ProviderMessage::assistant("worked ".repeat(40), Vec::new()),
+        ProviderMessage::user("next step"),
+        ProviderMessage::assistant("done", Vec::new()),
+    ];
+    let settings = CompactionSettings {
+        keep_recent_tokens: 5,
+        ..CompactionSettings::default()
+    };
+    let plan =
+        prepare_compaction(&history, &settings, ContextUsage::default()).expect("compactable");
+    assert_eq!(plan.first_kept_index, 1);
+    let compacted = apply_compaction(&history, plan.first_kept_index, "summary");
+    assert_eq!(compacted[0], compaction_summary_message("summary"));
+    assert_eq!(&compacted[1..], &history[1..]);
     let artifacts = ArtifactStore::new(root.join("artifacts")).expect("artifacts");
     let handle = artifacts.put("output", b"full output").expect("artifact");
     assert_eq!(

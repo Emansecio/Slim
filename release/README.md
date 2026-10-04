@@ -1,60 +1,57 @@
 # Release do Slim
 
 Este arquivo registra somente o deploy vigente e o procedimento reproduzível.
-Deploys anteriores estão em [`history/2026-09.md`](history/2026-09.md).
+Deploys anteriores estão no [histórico](history/README.md).
 
-## Deploy local vigente — governador, jobs de shell e contabilidade de uso (2026-09-29)
+## Deploy vigente — Organização e polimento da TUI (02/10/2026)
 
-`.\refresh-slim.ps1 -Test` terminou com exit 0 e `OK: Slim slim 0.1.0`.
-Suíte do workspace inteiro: 2.415 aprovados, 0 falhas, 41 ignorados, 64 suítes
-(259 s de testes). Build release padrão: 427,29 s pelo wrapper, com um job Cargo.
-Executável no PATH: `C:\Users\Thiago Emanuel\bin\Slim.exe`, 19.953.152 bytes.
-SHA-256 do instalado e do `target/release/slim.exe` idênticos:
-`D25411F18E09422A1B0475F9C01CF03A6314C089067364A81EF0CDB9E7BEDB89`.
-Revisão do build: `a4d638691ca301ef56247616785d97d694e79db2-dirty`.
-`Get-Command Slim` confirmou essa cópia; `--version` terminou com exit 0.
+`.\refresh-slim.ps1` terminou com exit 0, build release padrão em 468,93 s,
+e `OK: Slim slim 0.1.0 implantado em C:\Users\Thiago Emanuel\bin\Slim.exe`.
+O comando `Slim` resolve esse executável e `--version` retornou `slim 0.1.0`, exit 0.
+Identidade verificada: 21.388.288 bytes, build de
+2026-10-02 18:54:36 -03:00 (America/Sao_Paulo).
+SHA-256 idêntico ao de `target/release/slim.exe`:
+`048B3AABA26E5509FC44138BFF2E04B0A0B93C2EEAAE716165A7C49363AC6739`.
+Revisão compilada: `848b325c65dc838d758a5b9066071e54fb8b8bf9-dirty`.
+O build inclui o checkout com suas alterações preexistentes.
 
-Segunda passada no `crates/slim-core/src/runtime/`, sobre `governor`, `loop_guard`,
-`shell_jobs`, `economy`, `usage`, `mode`, `workspace`, `capability_bridge` e
-`manual_retry`. Sem mudança de contrato público, exceto a contagem de
-`tool_calls_reused` (abaixo).
+- Grupos de ferramentas abrem os resumos; cada membro expande seus detalhes
+  individualmente, com paginação e âncoras estáveis. Thinking concluído entre
+  ferramentas permanece acessível dentro do grupo.
+- O único cabeçalho `● Slim` por turno foi mantido, com a ordem original da
+  resposta e das ferramentas.
+- Todo começa compacto, indica bloqueios e preserva a preferência manual de expansão.
+- Textos consecutivos na fila ficam recolhidos sob uma prévia expansível.
+  O contador continua no composer; edição, remoção e envio seguem a ordem da fila.
+- `/` e Ctrl+P usam as mesmas categorias e ordem, com títulos fora da seleção.
+  Comandos, skills e navegação foram verificados também em viewport estreito.
 
-- **Estrutura:** `governor.rs` virou `governor/{mod,compaction,evidence,observation,tests}.rs`;
-  `UsageTotals::from_events` (370 linhas) virou um `LedgerBuilder` com métodos por família de
-  evento; `observe_after`, `observe_evidence`, `compaction_snapshot`, `execute_managed_shell` e
-  `start` foram decompostos. Funções acima de 100 linhas no módulo: 9 para 1 (a que resta é
-  `initial_paths`, que contém a confinação de caminho e não foi tocada).
-- **Tamanho:** o módulo cresceu de 6.259 para 6.731 linhas (+7,5%): produção de 3.469 para
-  3.745 e testes de 2.790 para 2.986. Não houve redução de volume: helpers, tipos de fase e
-  guardas das correções custam mais do que a duplicação removida.
-- **Correções de comportamento**, cada uma com teste que falhava antes:
-  - a validação que termina depois de uma mutação não certifica mais o estado novo como
-    "verde" (a revisão gravada é a do início da chamada);
-  - `shell_jobs`: `elapsed_ms` é fixado na conclusão do job, não na entrega; a entrega segue
-    ordem numérica (`shell-2` antes de `shell-10`); um cancelamento já pedido impede o
-    comando de nascer (o executor de shell só conferia o token depois de criar o processo);
-  - no Windows, `write New.txt` e `write new.txt` de um arquivo ainda inexistente não entram
-    mais juntos no mesmo cluster de mutações paralelas (chave de agendamento sem distinção
-    de caixa; `path_identity` ficou intocado porque alguns chamadores usam o texto como caminho);
-  - `tool_calls_reused` passa a contar `ToolEvidenceReused` com `post_compaction:false` (antes
-    ficava sempre 0 no JSON e no texto do headless); o teste de contrato do fixture antigo
-    continua 0 porque aquele evento era `post_compaction:true` (reaquisição, não reuso);
-  - `normalize_output` só corta o sufixo ` | ms` quando há dígitos;
-  - `LoopGuard` guarda um hash do erro, não o texto inteiro, e usa um único slot para a
-    repetição imediata de shell/write/patch.
-- **Neutro:** `hash_fields` deixou de existir em duas cópias; a cadeia `preparation_us`, sem
-  leitor, foi removida; `CompactionSummary` acumula sobre `UsageBreakdown` em vez de um
-  `UsageTotals` inteiro; `Runtime::can_ask(mode)` substitui três cálculos do gate de
-  `ask_question`; `TempRoot` único de teste com limpeza automática; `Rig` de testes do governor.
-- **Testes:** `slim-core --lib` de 393 para 415; `contracts` de 59 para 61.
+Validação desta entrega:
 
-Não alterado por decisão: `path_identity` (texto e chave são usados juntos), o `status` de job
-concluído que repete a saída, limites de tempo em `shutdown`/`await` dos jobs, os limites sem
-aviso do governador (256 dependências observadas, 4.096 fingerprints), a oscilação A→B→A que
-conta como progresso, e a divergência entre as duas definições de "uso conhecido" (ledger contra
-acumulador de compactação; nenhum provider atual as separa).
+| Comando | Resultado |
+|---|---|
+| `.\test-slim.ps1 -Package slim-tui -Lib -TestTarget integration` | exit 0; 387 testes de biblioteca e 303 de integração aprovados |
+| `.\test-slim.ps1 -Package slim-tui -TestTarget properties,prompt_admission,tui_interaction_focus,pty_windows` | exit 0; 37 aprovados |
+| `.\test-slim.ps1 -Package slim-cli -TestTarget tui_bridge,session_continuation` | exit 0; 45 aprovados |
+| `cargo test --jobs 1 --timings -p slim-tui --test visual_snapshots -- --ignored --test-threads 1` | exit 0; 1 aprovado; snapshots do renderer de produção inspecionados offline |
+| `cargo clippy --jobs 1 -p slim-tui --all-targets -- -A clippy::bool_to_int_with_if -A clippy::manual_clamp` | exit 0, sem warnings; allowances preexistentes preservados |
 
-Não foram executados: console físico (ConPTY real) e sessão com provider real.
+Total: 773 testes focados aprovados, 0 falhas. `rustfmt --edition 2021
+--config skip_children=true --check` passou nos 16 arquivos tocados;
+`git diff --check` e os links relativos da documentação afetada foram verificados.
+Os testes cobriram paginação individual, diffs, Thinking entre ferramentas,
+âncoras de rolagem, hold de 249 ms, ordem da fila e seleção nos menus agrupados.
+A inspeção visual incluiu tarefas em 40×8, fila aberta/recolhida, detalhes de
+ferramentas, slash e paleta estreita.
+
+Limites: a suíte completa do workspace não foi repetida nesta entrega. A
+inspeção visual usou TestBackend e imagens offline das células dos snapshots;
+console físico e sessão com provider externo não foram exercitados.
+O alvo `pty_windows` verifica eventos de entrada e não comprova ConPTY real.
+
+Contrato visual: [DESIGN da TUI](../docs/DESIGN-SLIM-TUI.md).
+A validação e o deploy anteriores estão no [histórico de outubro](history/2026-10.md).
+Não houve commit, push, instalação de dependências ou alteração global de configuração.
 
 ## Build e deploy local
 

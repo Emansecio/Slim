@@ -41,8 +41,11 @@ pub(crate) const SKIP_DIR_NAMES: &[&str] = &[
     ".pi",
     ".venv",
 ];
+// `.gitignore` is honored only inside a git repository; `.ignore` anywhere.
 const SEARCH_SKIP_FOOTER: &str =
-    "[skipped: node_modules, target, dist, .git, .slim, .pi, .venv — use read/list/shell in those trees]";
+    "[skipped: node_modules, target, dist, .git, .slim, .pi, .venv, *.lock/*.map/*.min.js files and .ignore'd files, plus .gitignore'd files inside a git repository, are not searched in directory scans — use read/list/shell to reach them]";
+const CASE_VARIANT_NOTE_CHARS: usize = 80;
+const HIT_WINDOW_CONTEXT_BYTES: usize = 256;
 
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -99,6 +102,16 @@ pub(crate) struct SearchPatternCoverage {
     pub retained: usize,
     /// Matching lines observed but omitted by the retained-hit budget.
     pub omitted: usize,
+    /// Only for a pattern a complete scan never matched: a spelling that
+    /// differs in letter case and does occur.
+    pub case_variant: Option<CaseVariant>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CaseVariant {
+    pub path: PathBuf,
+    pub line: usize,
+    pub spelling: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -410,13 +423,14 @@ impl SearchService {
         }
 
         let canonical = root.to_path_buf();
-        let scan = search_with_walker(
+        let mut scan = search_with_walker(
             &canonical,
             &patterns,
             MAX_SEARCH_SNAPSHOT_HITS,
             context_lines,
             cancellation,
         )?;
+        note_case_variants(&canonical, &patterns, &mut scan, cancellation)?;
         Ok(self.cache_scan(canonical, patterns, options, scan))
     }
 
@@ -622,7 +636,9 @@ pub fn format_search_page(page: &SearchPage, display_root: &Path) -> String {
             last.saturating_add(1)
         ));
     }
-    append_skip_footer(&mut output);
+    if page.hits.is_empty() {
+        append_skip_footer(&mut output);
+    }
     output
 }
 
@@ -744,6 +760,8 @@ pub(crate) fn format_search_batch_page(page: &SearchBatchPage, display_root: &Pa
                 unsearched_notice(count)
             ),
         };
+        output.push_str(regex_note(&page.patterns[0]));
+        output.push_str(&case_variant_note(page.coverage.first(), display_root));
     }
     if let Some(cursor) = &page.next_cursor {
         let last = page.first.saturating_add(page.hits.len()).saturating_sub(1);
@@ -781,7 +799,7 @@ pub(crate) fn format_search_batch_page(page: &SearchBatchPage, display_root: &Pa
         }
         output.push_str(&format_search_io_notice(&page.io_failures));
     }
-    if let Some(coverage) = format_search_coverage(page) {
+    if let Some(coverage) = format_search_coverage(page, display_root) {
         if !output.is_empty() {
             output.push('\n');
         }
@@ -800,8 +818,41 @@ pub(crate) fn format_search_batch_page(page: &SearchBatchPage, display_root: &Pa
         notice.push(']');
         output.push_str(&notice);
     }
-    append_skip_footer(&mut output);
+    if page.total == 0 {
+        append_skip_footer(&mut output);
+    }
     output
+}
+
+/// Matching is literal, so a pattern written as a regular expression finds
+/// nothing and that absence proves nothing. A note for the not-found case
+/// only, never a rejection: the text may be meant literally.
+fn regex_note(pattern: &str) -> &'static str {
+    const REGEX_ONLY: &[&str] = &[".*", ".+", "\\w", "\\s", "\\d", "\\b", "\\.", "\\("];
+    let alternation = pattern.replace("||", "").contains('|');
+    if alternation
+        || pattern.starts_with('^')
+        || pattern.ends_with('$')
+        || REGEX_ONLY.iter().any(|token| pattern.contains(token))
+    {
+        " [note: search is literal, not regex, and this pattern looks like one; retry with plain text, one alternative per `patterns` entry]"
+    } else {
+        ""
+    }
+}
+
+/// Matching is case-sensitive, so a pattern with the wrong letter case finds
+/// nothing and that absence proves little. Names one spelling that does occur.
+fn case_variant_note(coverage: Option<&SearchPatternCoverage>, display_root: &Path) -> String {
+    let Some(variant) = coverage.and_then(|coverage| coverage.case_variant.as_ref()) else {
+        return String::new();
+    };
+    format!(
+        " [note: search is case-sensitive; `{}` occurs at {}:{} — retry with that spelling if it is what you meant]",
+        variant.spelling,
+        display_path(display_root, &variant.path).display(),
+        variant.line
+    )
 }
 
 fn unsearched_notice(count: usize) -> String {
@@ -811,7 +862,7 @@ fn unsearched_notice(count: usize) -> String {
     )
 }
 
-fn format_search_coverage(page: &SearchBatchPage) -> Option<String> {
+fn format_search_coverage(page: &SearchBatchPage, display_root: &Path) -> Option<String> {
     if page.patterns.len() <= 1 && !page.io_failures.has_failures() {
         return None;
     }
@@ -829,13 +880,17 @@ fn format_search_coverage(page: &SearchBatchPage) -> Option<String> {
             if page.scan_complete && !page.io_failures.has_failures() {
                 match page.unsearched_files {
                     0 => format!(
-                        "pattern {} `{pattern}`: not found after full scan",
-                        index + 1
+                        "pattern {} `{pattern}`: not found after full scan{}{}",
+                        index + 1,
+                        regex_note(pattern),
+                        case_variant_note(Some(&coverage), display_root)
                     ),
                     count => format!(
-                        "pattern {} `{pattern}`: not found in searched text ({})",
+                        "pattern {} `{pattern}`: not found in searched text ({}){}{}",
                         index + 1,
-                        unsearched_notice(count)
+                        unsearched_notice(count),
+                        regex_note(pattern),
+                        case_variant_note(Some(&coverage), display_root)
                     ),
                 }
             } else if page.io_failures.has_failures() {
@@ -989,7 +1044,7 @@ fn validate_search_options(opts: &SearchOptions) -> Result<(), ToolError> {
     Ok(())
 }
 
-fn validate_patterns(patterns: &[String]) -> Result<(), ToolError> {
+pub(super) fn validate_patterns(patterns: &[String]) -> Result<(), ToolError> {
     if patterns.is_empty() || patterns.len() > MAX_SEARCH_PATTERNS {
         return Err(ToolError::InvalidInput {
             message: format!("search patterns must contain 1..={MAX_SEARCH_PATTERNS} strings"),
@@ -998,6 +1053,16 @@ fn validate_patterns(patterns: &[String]) -> Result<(), ToolError> {
     if patterns.iter().any(String::is_empty) {
         return Err(ToolError::InvalidInput {
             message: "search query/patterns cannot contain an empty string".into(),
+        });
+    }
+    // Matching is per line: such a pattern can never match, and the scan would
+    // still report "no matches".
+    if patterns
+        .iter()
+        .any(|pattern| pattern.contains(['\n', '\r']))
+    {
+        return Err(ToolError::InvalidInput {
+            message: "search matches single lines, so a pattern cannot contain a line break (\\n or \\r); search one line of the text".into(),
         });
     }
     Ok(())
@@ -1054,13 +1119,7 @@ fn search_walk_error_path(error: &ignore::Error) -> Option<&Path> {
     }
 }
 
-fn search_with_walker(
-    root: &Path,
-    patterns: &[String],
-    hit_limit: usize,
-    context_lines: usize,
-    cancellation: Option<&CancellationToken>,
-) -> Result<SearchScan, ToolExecutionError> {
+fn walk_search_entries(root: &Path) -> impl Iterator<Item = Result<SearchWalkEntry, PathBuf>> + '_ {
     let mut walker = WalkBuilder::new(root);
     walker
         .git_ignore(true)
@@ -1074,17 +1133,25 @@ fn search_with_walker(
     walker.filter_entry(|entry| {
         !should_skip_entry(entry.path()) && !entry.file_type().is_some_and(|kind| kind.is_symlink())
     });
-
-    let entries = walker
+    walker
         .build()
-        .map(|entry| map_search_walk_entry(entry, root));
+        .map(|entry| map_search_walk_entry(entry, root))
+}
+
+fn search_with_walker(
+    root: &Path,
+    patterns: &[String],
+    hit_limit: usize,
+    context_lines: usize,
+    cancellation: Option<&CancellationToken>,
+) -> Result<SearchScan, ToolExecutionError> {
     search_with_entries(
         root,
         patterns,
         hit_limit,
         context_lines,
         cancellation,
-        entries,
+        walk_search_entries(root),
         open_search_file,
     )
 }
@@ -1156,7 +1223,7 @@ where
             }
         };
         let path = entry.path;
-        if entry.is_dir || should_skip_file(&path) {
+        if entry.is_dir || should_skip_file(&path, root) {
             continue;
         }
         if scanned_files >= MAX_SEARCH_SCAN_FILES {
@@ -1312,7 +1379,8 @@ where
             // the shared result budget. Covered patterns then use only slots
             // left after one slot per uncovered pattern is reserved.
             matched.sort_by_key(|&pattern_index| coverage[pattern_index].retained > 0);
-            for pattern_index in matched {
+            let mut hit_text = None;
+            for pattern_index in matched.iter().copied() {
                 let uncovered = coverage
                     .iter()
                     .filter(|pattern| pattern.retained == 0)
@@ -1337,7 +1405,9 @@ where
                     hit: SearchHit {
                         path: path.to_path_buf(),
                         line: line_number,
-                        text: bound_hit_text(line.to_owned()),
+                        text: hit_text
+                            .get_or_insert_with(|| bound_hit_text(line, patterns, &matched))
+                            .clone(),
                     },
                     pattern_index,
                     context: preceding
@@ -1370,6 +1440,223 @@ where
     })
 }
 
+/// Wall-clock allowance for the whole case-insensitive recheck. It exists to
+/// explain a miss; it must not turn a fast search into a slow one.
+const CASE_RECHECK_BUDGET: Duration = Duration::from_millis(250);
+/// Lines between looks at the clock and the cancellation token.
+const CASE_RECHECK_CHECK_INTERVAL: usize = 256;
+
+/// After a complete scan, looks once more, ignoring letter case, for the
+/// patterns that matched nothing. The recheck re-reads the same files under the
+/// same work budgets and a wall-clock budget; when it cannot finish inside them
+/// it adds nothing.
+fn note_case_variants(
+    root: &Path,
+    patterns: &[String],
+    scan: &mut SearchScan,
+    cancellation: Option<&CancellationToken>,
+) -> Result<(), ToolExecutionError> {
+    if !scan.scan_complete || scan.work_limited || scan.io_failures.has_failures() {
+        return Ok(());
+    }
+    let missing = scan
+        .coverage
+        .iter()
+        .enumerate()
+        .filter(|(_, coverage)| coverage.observed == 0)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    for (index, variant) in
+        find_case_variants(root, patterns, &missing, cancellation, CASE_RECHECK_BUDGET)?
+    {
+        scan.coverage[index].case_variant = Some(variant);
+    }
+    Ok(())
+}
+
+/// A pattern lowercased once, with its ASCII form when it has one: an ASCII
+/// pattern is matched on bytes, so a line that does not hold it costs one pass.
+struct CaseNeedle {
+    index: usize,
+    lowered: Vec<char>,
+    ascii: Option<Vec<u8>>,
+}
+
+impl CaseNeedle {
+    fn new(index: usize, pattern: &str) -> Self {
+        Self {
+            index,
+            lowered: pattern.chars().flat_map(char::to_lowercase).collect(),
+            ascii: pattern
+                .is_ascii()
+                .then(|| pattern.to_ascii_lowercase().into_bytes()),
+        }
+    }
+
+    /// The text of `line` that equals the pattern ignoring case.
+    fn find_in<'a>(&self, line: &'a str) -> Option<&'a str> {
+        match &self.ascii {
+            Some(ascii) => find_ascii_ignoring_case(line, ascii),
+            None => find_ignoring_case(line, &self.lowered),
+        }
+    }
+}
+
+fn find_case_variants(
+    root: &Path,
+    patterns: &[String],
+    missing: &[usize],
+    cancellation: Option<&CancellationToken>,
+    budget: Duration,
+) -> Result<Vec<(usize, CaseVariant)>, ToolExecutionError> {
+    let mut needles = missing
+        .iter()
+        .filter(|&&index| patterns[index].chars().any(char::is_alphabetic))
+        .map(|&index| CaseNeedle::new(index, &patterns[index]))
+        .collect::<Vec<_>>();
+    if needles.is_empty() {
+        return Ok(Vec::new());
+    }
+    let started = Instant::now();
+    let mut found = Vec::new();
+    let mut scanned_files = 0usize;
+    let mut scanned_bytes = 0u64;
+    let mut lines_until_check = 0usize;
+    let mut line_bytes = Vec::new();
+    for entry in walk_search_entries(root) {
+        check_cancelled(cancellation)?;
+        let Ok(entry) = entry else {
+            return Ok(Vec::new());
+        };
+        if entry.is_dir || should_skip_file(&entry.path, root) {
+            continue;
+        }
+        scanned_files = scanned_files.saturating_add(1);
+        if scanned_files > MAX_SEARCH_SCAN_FILES {
+            return Ok(Vec::new());
+        }
+        let Ok(file) = File::open(&entry.path) else {
+            return Ok(Vec::new());
+        };
+        let Ok(metadata) = file.metadata() else {
+            return Ok(Vec::new());
+        };
+        if metadata.len() > MAX_FILE_BYTES {
+            continue;
+        }
+        let mut reader = BufReader::new(file);
+        match reader.fill_buf() {
+            Ok(sample) if sample.contains(&0) => continue,
+            Ok(_) => {}
+            Err(_) => return Ok(Vec::new()),
+        }
+        let mut line_number = 0usize;
+        loop {
+            if lines_until_check == 0 {
+                check_cancelled(cancellation)?;
+                if started.elapsed() >= budget {
+                    return Ok(Vec::new());
+                }
+                lines_until_check = CASE_RECHECK_CHECK_INTERVAL;
+            }
+            lines_until_check -= 1;
+            line_bytes.clear();
+            match reader.read_until(b'\n', &mut line_bytes) {
+                Ok(0) => break,
+                Ok(read) => {
+                    scanned_bytes = scanned_bytes.saturating_add(read as u64);
+                    if scanned_bytes > MAX_SEARCH_SCAN_BYTES {
+                        return Ok(Vec::new());
+                    }
+                }
+                Err(_) => return Ok(Vec::new()),
+            }
+            line_number = line_number.saturating_add(1);
+            // Invalid UTF-8 ends the file, as in the scan itself.
+            let Ok(text) = std::str::from_utf8(&line_bytes) else {
+                break;
+            };
+            let line = strip_line_ending_str(text);
+            needles.retain(|needle| {
+                let Some(spelling) = needle
+                    .find_in(line)
+                    .filter(|found| *found != patterns[needle.index])
+                else {
+                    return true;
+                };
+                found.push((
+                    needle.index,
+                    CaseVariant {
+                        path: entry.path.clone(),
+                        line: line_number,
+                        spelling: spelling
+                            .chars()
+                            .take(CASE_VARIANT_NOTE_CHARS)
+                            .map(|character| {
+                                if character.is_control() {
+                                    '?'
+                                } else {
+                                    character
+                                }
+                            })
+                            .collect(),
+                    },
+                ));
+                false
+            });
+            if needles.is_empty() {
+                return Ok(found);
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// `needle` (ASCII, lowercase) in `line` ignoring ASCII case, on bytes. A match
+/// is all ASCII, so its ends are character boundaries.
+fn find_ascii_ignoring_case<'a>(line: &'a str, needle: &[u8]) -> Option<&'a str> {
+    let bytes = line.as_bytes();
+    let first = *needle.first()?;
+    let mut from = 0;
+    while from + needle.len() <= bytes.len() {
+        let offset = bytes[from..=bytes.len() - needle.len()]
+            .iter()
+            .position(|byte| byte.to_ascii_lowercase() == first)?;
+        let start = from + offset;
+        if bytes[start..start + needle.len()].eq_ignore_ascii_case(needle) {
+            return Some(&line[start..start + needle.len()]);
+        }
+        from = start + 1;
+    }
+    None
+}
+
+/// The text of `line` that equals `needle` (already lowercased) ignoring case.
+fn find_ignoring_case<'a>(line: &'a str, needle: &[char]) -> Option<&'a str> {
+    let first = *needle.first()?;
+    for (start, character) in line.char_indices() {
+        if character.to_lowercase().next() != Some(first) {
+            continue;
+        }
+        let mut matched = 0;
+        'candidate: for (offset, character) in line[start..].char_indices() {
+            for lowered in character.to_lowercase() {
+                if needle.get(matched) != Some(&lowered) {
+                    break 'candidate;
+                }
+                matched += 1;
+            }
+            if matched == needle.len() {
+                return Some(&line[start..start + offset + character.len_utf8()]);
+            }
+        }
+    }
+    None
+}
+
 /// Record only the portion of a read that fits inside the aggregate search
 /// work budget. Returning false tells the caller that the scan must stop
 /// without claiming that remaining patterns are absent.
@@ -1382,8 +1669,42 @@ fn record_search_bytes(evidence: &mut SearchEvidence, bytes: &[u8]) -> bool {
     keep == bytes.len()
 }
 
-pub(super) fn bound_hit_text(text: String) -> String {
-    bound_text(text, MAX_HIT_TEXT_BYTES)
+/// A hit line as the model sees it. A line over the limit is windowed around
+/// the earliest match of `matched`, so the match is always in view; what is cut
+/// is marked as truncated, and such text is not safe for patch.expected.
+fn bound_hit_text(line: &str, patterns: &[String], matched: &[usize]) -> String {
+    if line.len() <= MAX_HIT_TEXT_BYTES {
+        return line.to_owned();
+    }
+    let anchor = matched
+        .iter()
+        .filter_map(|&index| {
+            let pattern = patterns[index].as_str();
+            line.find(pattern).map(|start| start..start + pattern.len())
+        })
+        .min_by_key(|range| range.start)
+        .unwrap_or(0..0);
+    let mut start = anchor.start.saturating_sub(HIT_WINDOW_CONTEXT_BYTES);
+    while !line.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut end = anchor
+        .end
+        .saturating_add(HIT_WINDOW_CONTEXT_BYTES)
+        .min(line.len());
+    end = end.min(start + MAX_HIT_TEXT_BYTES - 2 * TRUNCATION_MARKER_RESERVE_BYTES);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut text = String::with_capacity(end - start + 2 * TRUNCATION_MARKER_RESERVE_BYTES);
+    if start > 0 {
+        text.push_str(&format!("[truncated {start} bytes] "));
+    }
+    text.push_str(&line[start..end]);
+    if end < line.len() {
+        text.push_str(&format!("\n[truncated {} bytes]", line.len() - end));
+    }
+    text
 }
 
 fn bound_text(text: String, limit: usize) -> String {
@@ -1416,7 +1737,12 @@ fn should_skip_entry(path: &Path) -> bool {
         .is_some_and(|name| SKIP_DIR_NAMES.contains(&name))
 }
 
-fn should_skip_file(path: &Path) -> bool {
+/// Generated and lock files are skipped in directory scans; a file named as
+/// the search root was asked for explicitly and is always searched.
+fn should_skip_file(path: &Path, root: &Path) -> bool {
+    if path == root {
+        return false;
+    }
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1969,7 +2295,6 @@ mod tests {
         for value in [
             serde_json::json!(-1),
             serde_json::json!(1.5),
-            serde_json::json!("1"),
             serde_json::json!(null),
             serde_json::json!(true),
         ] {
@@ -1981,6 +2306,14 @@ mod tests {
                 .success
             );
         }
+        // An integer-valued string is a number for admission.
+        assert!(
+            run(
+                "search",
+                serde_json::json!({"query":"needle", "context_lines":"1"})
+            )
+            .success
+        );
         assert!(
             !run(
                 "search",
@@ -2126,7 +2459,10 @@ mod tests {
         assert!(located.success, "{}", located.output);
         assert!(located.output.contains("[truncated "), "{}", located.output);
         let marker_start = located.output.find("\n1: ").expect("hit");
-        let rendered = located.output[marker_start + "\n1: ".len()..]
+        let after_prefix = &located.output[marker_start + "\n1: ".len()..];
+        // A window cut only before the match has its marker inline and no
+        // second line.
+        let rendered = after_prefix
             .split_once('\n')
             .map(|(head, rest)| {
                 if rest.starts_with("[truncated ") {
@@ -2135,7 +2471,7 @@ mod tests {
                     head.to_owned()
                 }
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| after_prefix.to_owned());
         assert!(rendered.contains("[truncated "), "{rendered}");
         let copied = run(
             "patch",
@@ -2274,6 +2610,30 @@ mod tests {
             )
             .expect("search");
         format_search_batch_page(&page, &canonical)
+    }
+
+    #[test]
+    fn absent_regex_looking_patterns_carry_a_literal_search_note() {
+        let root = temp_root("regex-note");
+        fs::create_dir_all(&root).expect("root");
+        fs::write(root.join("a.rs"), "fn handle_error() {}\nif a || b {}\n").expect("text");
+        for pattern in ["handle.*error", "fn \\w+", "foo|bar", "^fn x", "x {}$"] {
+            let single = formatted_search(&root, &[pattern]);
+            assert!(single.contains("search is literal, not regex"), "{single}");
+        }
+        for pattern in ["missing", "c || d", "v[0]", "a.b"] {
+            let single = formatted_search(&root, &[pattern]);
+            assert!(!single.contains("not regex"), "{single}");
+        }
+        // A hit carries no note, and the note names only the absent pattern.
+        assert!(!formatted_search(&root, &["a || b"]).contains("not regex"));
+        let multiple = formatted_search(&root, &["handle_error", "handle.*error"]);
+        assert_eq!(multiple.matches("not regex").count(), 1, "{multiple}");
+        assert!(
+            multiple.contains("`handle.*error`: not found after full scan [note:"),
+            "{multiple}"
+        );
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
     }
 
     #[test]
@@ -3090,6 +3450,210 @@ mod tests {
             .examples
             .iter()
             .any(|example| example == &expected_example));
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    #[test]
+    fn a_pattern_with_a_line_break_is_rejected_instead_of_never_matching() {
+        for pattern in ["one\ntwo", "one\r\ntwo", "one\rtwo"] {
+            let error = validate_patterns(&[pattern.to_owned()]).unwrap_err();
+            assert!(
+                matches!(&error, ToolError::InvalidInput { message }
+                    if message.contains("single lines") && message.contains("one line")),
+                "{error:?}"
+            );
+        }
+        assert!(validate_patterns(&["one two".to_owned()]).is_ok());
+    }
+
+    #[test]
+    fn an_explicit_file_root_is_searched_even_when_directory_scans_skip_its_kind() {
+        let root = temp_root("explicit-root-file");
+        fs::create_dir_all(&root).expect("root");
+        for name in ["Cargo.lock", "app.js.map", "app.min.js"] {
+            fs::write(root.join(name), "needle here\n").expect("fixture");
+        }
+        let directory = formatted_search(&root, &["needle"]);
+        assert!(
+            directory.contains("no matches after full scan"),
+            "{directory}"
+        );
+        for name in ["Cargo.lock", "app.js.map", "app.min.js"] {
+            let file = formatted_search(&root.join(name), &["needle"]);
+            assert!(file.contains("1: needle here"), "{name}: {file}");
+        }
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    #[test]
+    fn the_skip_footer_is_only_on_results_without_hits() {
+        let root = temp_root("skip-footer");
+        fs::create_dir_all(&root).expect("root");
+        fs::write(root.join("a.txt"), "needle\n").expect("fixture");
+        let hit = formatted_search(&root, &["needle"]);
+        assert!(!hit.contains("[skipped:"), "{hit}");
+        let miss = formatted_search(&root, &["absent"]);
+        assert!(miss.contains(".gitignore'd files"), "{miss}");
+        assert!(miss.contains("*.lock/*.map/*.min.js"), "{miss}");
+        let page = SearchPage {
+            hits: vec![SearchHit {
+                path: root.join("a.txt"),
+                line: 1,
+                text: "needle".into(),
+            }],
+            total_seen: 1,
+            truncated: false,
+        };
+        assert!(!format_search_page(&page, &root).contains("[skipped:"));
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    /// The footer names `.gitignore` only inside a git repository because that
+    /// is the only place the walker honors it.
+    #[test]
+    fn the_footer_claims_gitignore_only_where_the_walker_honors_it() {
+        let root = temp_root("footer-gitignore");
+        fs::create_dir_all(&root).expect("root");
+        fs::write(root.join(".gitignore"), "ignored.txt\n").expect("gitignore");
+        fs::write(root.join("ignored.txt"), "needle\n").expect("ignored");
+        fs::write(root.join("hidden-by-ignore.txt"), "needle\n").expect("ignore-file");
+        fs::write(root.join(".ignore"), "hidden-by-ignore.txt\n").expect("ignore");
+        // Not a repository: `.gitignore` is not honored, `.ignore` is.
+        let outside = formatted_search(&root, &["needle"]);
+        assert!(outside.contains("ignored.txt"), "{outside}");
+        assert!(!outside.contains("hidden-by-ignore.txt"), "{outside}");
+        fs::create_dir_all(root.join(".git")).expect("git");
+        let inside = formatted_search(&root, &["needle"]);
+        assert!(!inside.contains("ignored.txt"), "{inside}");
+        let miss = formatted_search(&root, &["absent"]);
+        assert!(
+            miss.contains(".ignore'd files, plus .gitignore'd files inside a git repository"),
+            "{miss}"
+        );
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    #[test]
+    fn a_miss_names_a_spelling_that_differs_only_in_case() {
+        let root = temp_root("case-variant");
+        fs::create_dir_all(&root).expect("root");
+        fs::write(root.join("a.rs"), "// intro\nstruct SearchService;\nação\n").expect("fixture");
+        let single = formatted_search(&root, &["searchservice"]);
+        assert!(
+            single.starts_with("[no matches after full scan]"),
+            "{single}"
+        );
+        assert!(
+            single.contains("`SearchService` occurs at a.rs:2"),
+            "{single}"
+        );
+        let unicode = formatted_search(&root, &["AÇÃO"]);
+        assert!(unicode.contains("`ação` occurs at a.rs:3"), "{unicode}");
+        // Per absent pattern, and nothing for a pattern that is truly absent
+        // or that has hits.
+        let multiple = formatted_search(&root, &["SEARCHSERVICE", "intro", "nothing"]);
+        assert_eq!(multiple.matches("case-sensitive").count(), 1, "{multiple}");
+        assert!(
+            multiple.contains("pattern 1 `SEARCHSERVICE`: not found after full scan [note:"),
+            "{multiple}"
+        );
+        assert!(!formatted_search(&root, &["nothing"]).contains("case-sensitive"));
+        assert!(!formatted_search(&root, &["12345"]).contains("case-sensitive"));
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    #[test]
+    fn the_case_recheck_adds_nothing_when_the_scan_was_not_complete() {
+        let root = temp_root("case-variant-incomplete");
+        fs::create_dir_all(&root).expect("root");
+        fs::write(root.join("a.txt"), "Needle\n").expect("fixture");
+        let patterns = vec!["needle".to_owned()];
+        let mut scan = search_with_walker(&root, &patterns, 10, 0, None).expect("scan");
+        scan.work_limited = true;
+        note_case_variants(&root, &patterns, &mut scan, None).expect("recheck");
+        assert!(scan.coverage[0].case_variant.is_none());
+        scan.work_limited = false;
+        note_case_variants(&root, &patterns, &mut scan, None).expect("recheck");
+        assert!(scan.coverage[0].case_variant.is_some());
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    #[test]
+    fn the_case_recheck_is_bounded_by_a_wall_clock_budget_and_by_cancellation() {
+        let root = temp_root("case-variant-budget");
+        fs::create_dir_all(&root).expect("root");
+        fs::write(root.join("a.txt"), "Needle\n").expect("fixture");
+        let patterns = vec!["needle".to_owned()];
+        let run = |budget, cancellation: Option<&CancellationToken>| {
+            find_case_variants(&root, &patterns, &[0], cancellation, budget)
+        };
+        assert_eq!(run(Duration::from_secs(10), None).unwrap().len(), 1);
+        // Out of time: nothing, not a partial answer.
+        assert!(run(Duration::ZERO, None).unwrap().is_empty());
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            run(Duration::from_secs(10), Some(&cancelled)),
+            Err(ToolExecutionError {
+                error: ToolError::Cancelled,
+                ..
+            })
+        ));
+        // Repetitive lines that nearly match cost about one pass, not a
+        // quadratic one.
+        fs::write(
+            root.join("a.txt"),
+            format!("{}\n", "aaaaaaaaab".repeat(200_000)),
+        )
+        .expect("long");
+        let nearly = vec!["aaaaaaaaac".to_owned()];
+        let started = Instant::now();
+        let none = find_case_variants(&root, &nearly, &[0], None, Duration::from_secs(30)).unwrap();
+        assert!(none.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    #[test]
+    fn ascii_and_unicode_case_matching_agree_and_return_the_spelling_found() {
+        for (line, pattern, expected) in [
+            (
+                "let SearchService = 1;",
+                "searchservice",
+                Some("SearchService"),
+            ),
+            ("xxNEEDLE", "needle", Some("NEEDLE")),
+            ("needl", "needle", None),
+            ("ação AÇÃO", "açÃo", Some("ação")),
+            ("é ÉÉ", "éé", Some("ÉÉ")),
+            ("aaab", "aaac", None),
+        ] {
+            let needle = CaseNeedle::new(0, pattern);
+            assert_eq!(needle.find_in(line), expected, "{line} / {pattern}");
+        }
+    }
+
+    #[test]
+    fn a_hit_on_a_very_long_line_is_windowed_around_the_match() {
+        let root = temp_root("long-line-window");
+        fs::create_dir_all(&root).expect("root");
+        let line = format!("{}needle{}", "a".repeat(20_000), "b".repeat(20_000));
+        fs::write(root.join("min.txt"), format!("{line}\nshort needle\n")).expect("fixture");
+        let output = formatted_search(&root, &["needle"]);
+        assert!(output.contains(&format!("{}needle{}", "a".repeat(256), "b".repeat(256))));
+        assert!(!output.contains(&"a".repeat(257)), "window must stay small");
+        assert!(output.contains("[truncated 19744 bytes] "), "{output}");
+        assert!(output.contains("\n[truncated 19744 bytes]\n"), "{output}");
+        assert!(output.contains("2: short needle"), "{output}");
+        assert!(output.len() < 2048, "{}", output.len());
+        // A line under the limit is never windowed.
+        let patterns = vec!["needle".to_owned()];
+        let short = "x".repeat(MAX_HIT_TEXT_BYTES - 6) + "needle";
+        assert_eq!(bound_hit_text(&short, &patterns, &[0]), short);
         let _ = fs::remove_dir_all(root.parent().expect("parent"));
     }
 }

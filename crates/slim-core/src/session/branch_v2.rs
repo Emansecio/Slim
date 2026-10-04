@@ -6,9 +6,9 @@ use super::resume::{preflight_session, PreflightStatus};
 use super::schema_v2::{DurableRecord, DurableSessionHeader};
 use super::SessionFormat;
 use crate::context::{
-    build_summary_prompt_with_checkpoint, compaction_prefix_fingerprint,
-    estimate_provider_message_tokens, select_compaction_history, CompactionPolicy,
-    CompactionReason,
+    apply_compaction, compaction_prefix_fingerprint, estimate_context_tokens,
+    fit_summary_for_persistence, prepare_compaction, CompactionPolicy, CompactionReason,
+    ContextUsage, SummaryRequest,
 };
 
 /// Metadata returned by the richer branch API. The path-returning
@@ -154,70 +154,83 @@ fn prepare_durable_branch(
 
 /// Prepare and summarize the confirmed prefix, then publish child and checkpoint
 /// together. A failed summary leaves the requested child id free for retry.
+///
+/// The summary is Pi's: `summarize` answers each [`SummaryRequest`] (the
+/// history summary and, when the cut splits a turn, the summary of that turn's
+/// prefix) with the model's text. An earlier checkpoint of the session
+/// is the starting point and its summary the previous summary.
 pub async fn create_durable_branch_compacted<F, Fut>(
     path: impl AsRef<Path>,
     child_id: &str,
     cutoff_seq: u64,
-    summarize: F,
+    mut summarize: F,
 ) -> io::Result<DurableBranch>
 where
-    F: FnOnce(String) -> Fut,
+    F: FnMut(SummaryRequest) -> Fut,
     Fut: std::future::Future<Output = io::Result<String>>,
 {
     let mut prepared = prepare_durable_branch(path, child_id, cutoff_seq)?;
-    let entries: Vec<_> = prepared
-        .records
-        .iter()
-        .filter_map(|record| match record {
-            DurableRecord::Entry { entry, .. } => Some(entry),
-            _ => None,
-        })
-        .collect();
-    let messages = super::provider_messages_from_records(prepared.records.iter())
+    // The history the model would see: the latest applied checkpoint's summary
+    // followed by what that checkpoint kept (the same rebuild resume uses, so
+    // the new checkpoint chains onto one that really applies).
+    let rebuilt = super::rebuild_provider_history(&prepared.records)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let entry_ids: Vec<_> = entries.iter().map(|entry| entry.entry_id.clone()).collect();
-    let mut policy = CompactionPolicy::default();
-    policy.keep_recent_tokens = policy.keep_recent_for_window(32_000);
-    let selection = select_compaction_history(&messages, &policy)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let previous = prepared.records.iter().rev().find_map(|record| {
-        if let DurableRecord::Compaction { checkpoint, .. } = record {
-            Some(checkpoint)
-        } else {
-            None
-        }
-    });
-    let summarized = selection.summarized_for_prompt();
-    let prompt = build_summary_prompt_with_checkpoint(
-        &summarized,
-        previous.map(|checkpoint| checkpoint.summary.as_str()),
-    );
+    let (history, history_ids) = (rebuilt.messages, rebuilt.entry_ids);
+    let policy = CompactionPolicy::default();
+    let preparation = prepare_compaction(&history, &policy.settings(), ContextUsage::default())
+        .ok_or_else(|| invalid_input("nothing to compact"))?;
+    let first_kept_entry_id = history_ids
+        .get(preparation.first_kept_index)
+        .cloned()
+        .flatten()
+        .ok_or_else(|| invalid_input("compaction kept no durable entry"))?;
+    let requests = preparation.summary_requests(None);
     let started = std::time::Instant::now();
-    let summary = summarize(prompt).await?;
-    if summary.trim().is_empty() || summary.len() > policy.summary_max_bytes {
+    let history_text = match requests.history {
+        Some(request) => Some(summarize(request).await?),
+        None => None,
+    };
+    let turn_prefix_text = match requests.turn_prefix {
+        Some(request) => Some(summarize(request).await?),
+        None => None,
+    };
+    let text = preparation
+        .assemble_summary(history_text.as_deref(), turn_prefix_text.as_deref())
+        .map_err(invalid_input)?;
+    if text.trim().is_empty() {
         return Err(invalid_input("branch compaction summary is invalid"));
     }
+    let fitted =
+        fit_summary_for_persistence(&text, &preparation.file_ops, policy.summary_max_bytes)
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
     let seq = prepared.branch.next_seq;
     let following_seq = seq
         .checked_add(1)
         .ok_or_else(|| invalid_input("branch checkpoint successor overflowed"))?;
-    let previous_checkpoint_id = previous.map(|checkpoint| checkpoint.checkpoint_id.clone());
+    let previous_checkpoint_id = rebuilt.applied_checkpoint_id;
+    let tokens_after = estimate_context_tokens(
+        &apply_compaction(&history, preparation.first_kept_index, &fitted.summary),
+        ContextUsage::default(),
+    )
+    .tokens;
     prepared.records.push(DurableRecord::Compaction {
         seq,
         checkpoint: super::schema_v2::CompactionCheckpoint {
             checkpoint_id: format!("compact-{child_id}-{seq}"),
-            summary,
-            first_kept_entry_id: entry_ids[selection.first_kept_index].clone(),
-            prefix_fingerprint: compaction_prefix_fingerprint(&selection.summarized),
+            summary: fitted.summary,
+            first_kept_entry_id,
+            prefix_fingerprint: compaction_prefix_fingerprint(
+                &history[..preparation.first_kept_index],
+            ),
             previous_checkpoint_id,
-            tokens_before: estimate_provider_message_tokens(&messages),
-            tokens_after: selection.recent_tokens,
+            tokens_before: preparation.tokens_before,
+            tokens_after,
             input_tokens: None,
             output_tokens: None,
             duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
             reason: CompactionReason::Branch,
-            read_files: Vec::new(),
-            modified_files: Vec::new(),
+            read_files: fitted.files.read_files,
+            modified_files: fitted.files.modified_files,
         },
     });
     drop(JsonlRepo::create_with_records(

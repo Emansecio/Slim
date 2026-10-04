@@ -220,6 +220,14 @@ fn tool_phrase(names: &[&str], completed: bool) -> String {
         n => parts.push(format!("Executando · {n} comandos")),
     }
     for (name, count) in others {
+        if name == "shell_job" {
+            parts.push(if count == 1 && !completed {
+                "Consultando job".into()
+            } else {
+                tally(count, "consulta de job", "consultas de job")
+            });
+            continue;
+        }
         let name = safe(name);
         if count == 1 {
             parts.push(name);
@@ -261,6 +269,7 @@ pub(crate) fn tool_title(name: &str, lifecycle: BlockLifecycle) -> String {
         "write" => ("Escrevendo", "Escreveu"),
         "shell" => ("Executando", "Executou"),
         "code_intel" => ("Analisando", "Analisou"),
+        "shell_job" => ("Consultando job", "Consultou job"),
         _ => return name.to_owned(),
     };
     if settled { verb.1 } else { verb.0 }.to_owned()
@@ -588,16 +597,11 @@ pub fn format_context(state: &AppState, compact: bool) -> String {
         }
     };
     let estimate = if state.context_exact { "" } else { "~" };
-    let compaction = match state.compaction_status {
-        slim_core::context::CompactionStatus::Preparing => " preparando",
-        slim_core::context::CompactionStatus::Ready => " pronto",
-        _ => "",
-    };
     if compact {
-        format!("ctx {estimate}{pct}%{compaction}")
+        format!("ctx {estimate}{pct}%")
     } else {
         format!(
-            "ctx {estimate}{pct}%{compaction} · {}/{}",
+            "ctx {estimate}{pct}% · {}/{}",
             format_token_count(state.context_tokens),
             format_token_count(state.context_window_tokens)
         )
@@ -624,9 +628,9 @@ pub(crate) fn footer_lines(
     let mode = mode_name(state.mode);
     let controls = if state.prompt_is_busy() {
         fit(vec![
-            "Esc cancelar preparação · Ctrl+C cancelar".into(),
             "Esc cancelar preparação".into(),
             "Esc cancelar".into(),
+            "Esc".into(),
         ])
     } else if state.working {
         let phase = if activity_visible {
@@ -634,14 +638,18 @@ pub(crate) fn footer_lines(
         } else {
             format!("{} · ", activity_label(state))
         };
+        // One way to stop is shown at a time: forcing only exists once a
+        // stop was asked for, so it is offered only then.
+        let stop = if state.cancellation.is_some() {
+            "Esc forçar"
+        } else {
+            "Esc parar"
+        };
         let base_variants = vec![
-            format!("{phase}Esc parar · Esc×2 forçar · Ctrl+C cancelar"),
-            format!("{phase}Esc parar · Ctrl+C cancelar"),
-            format!("{phase}Ctrl+C cancelar"),
-            format!("{phase}Ctrl+C"),
-            format!("{phase}^C"),
-            "Ctrl+C cancelar".into(),
-            "^C".into(),
+            format!("{phase}{stop}"),
+            format!("{phase}Esc"),
+            stop.into(),
+            "Esc".into(),
         ];
         if state.scroll.is_pinned() {
             let edge_variants = if state.scroll.unseen > 0 {
@@ -683,7 +691,13 @@ pub(crate) fn footer_lines(
         ])
     } else if !state.authenticated {
         fit(vec!["desconectado · /login".into(), "/login".into()])
-    } else if let Some(execution) = &state.last_execution {
+    } else if let Some(execution) = state
+        .last_execution
+        .as_ref()
+        .filter(|execution| execution_needs_attention(execution))
+    {
+        // A run that simply finished is closed by its receipt in the
+        // transcript; the footer only keeps an outcome that asks for action.
         let outcome = match execution.outcome {
             crate::app::RunOutcomeKind::Completed => "concluída",
             crate::app::RunOutcomeKind::Interrupted => "interrompida",
@@ -694,14 +708,14 @@ pub(crate) fn footer_lines(
         } else {
             format!("{}s", execution.duration_ms / 1_000)
         };
-        let pending = if execution.pending_count > 0 {
-            format!(" · {} pendente(s)", execution.pending_count)
-        } else {
-            String::new()
+        let pending = match execution.pending_count {
+            0 => String::new(),
+            1 => " · 1 pendente".to_owned(),
+            count => format!(" · {count} pendentes"),
         };
         let summary = format!("Execução {outcome} · {duration}{pending}");
         fit(vec![
-            format!("{summary} · Ctrl+J detalhes · F1 ajuda"),
+            format!("{summary} · Ctrl+J detalhes"),
             format!("{summary} · Ctrl+J"),
             summary,
             format!("{outcome} · {duration}{pending}"),
@@ -709,13 +723,10 @@ pub(crate) fn footer_lines(
         ])
     } else {
         fit(vec![
-            "F1 ajuda · / comandos · Shift+Tab · Ctrl+P · Ctrl+C sair".into(),
-            "F1 ajuda · / comandos · Ctrl+P · Ctrl+C sair".into(),
-            "F1 ajuda · Shift+Tab · Ctrl+P comandos".into(),
-            "/ comandos · Ctrl+P · Ctrl+C sair".into(),
-            "F1 ajuda · Ctrl+P comandos".into(),
-            "Ctrl+P comandos".into(),
-            "^P".into(),
+            "/ comandos · Shift+Tab modo · Ctrl+C sair".into(),
+            "/ comandos · Shift+Tab modo".into(),
+            "/ comandos".into(),
+            "/".into(),
         ])
     };
     let mode_line = if state.authenticated && !state.working && !state.scroll.is_pinned() {
@@ -723,19 +734,50 @@ pub(crate) fn footer_lines(
     } else {
         truncate_display_width(mode, width)
     };
+    let jobs = state.running_jobs();
+    let controls = if jobs > 0 {
+        let jobs = if jobs == 1 {
+            "1 job".to_owned()
+        } else {
+            format!("{jobs} jobs")
+        };
+        fit(vec![
+            format!("{controls} · {jobs} · /jobs"),
+            format!("{jobs} · /jobs · {controls}"),
+            format!(
+                "{jobs} · {}",
+                if (state.working || state.prompt_is_busy()) && state.scroll.is_pinned() {
+                    "Esc · End"
+                } else if state.working || state.prompt_is_busy() {
+                    "Esc parar"
+                } else if state.scroll.is_pinned() {
+                    "End recentes"
+                } else {
+                    "/jobs"
+                }
+            ),
+            controls,
+        ])
+    } else {
+        controls
+    };
     match rows {
         1 => {
             let mut line = if state.working
                 || state.scroll.is_pinned()
                 || !state.authenticated
-                || state.last_execution.is_some()
+                || state
+                    .last_execution
+                    .as_ref()
+                    .is_some_and(execution_needs_attention)
+                || jobs > 0
             {
                 controls
             } else {
                 fit(vec![
-                    format!("{mode} · Shift+Tab · F1/Ctrl+P"),
-                    format!("{mode} · Shift+Tab · Ctrl+P"),
-                    format!("{mode} · ^P"),
+                    format!("{mode} · Shift+Tab · / comandos"),
+                    format!("{mode} · / comandos"),
+                    format!("{mode} · /"),
                     mode.to_owned(),
                 ])
             };
@@ -768,6 +810,12 @@ pub(crate) fn footer_lines(
         }
         _ => vec![mode_line, model_metadata(state, width), controls],
     }
+}
+
+/// A finished run stays in the footer only when it did not simply complete
+/// or left tasks open.
+fn execution_needs_attention(execution: &crate::app::ExecutionSummary) -> bool {
+    execution.outcome != crate::app::RunOutcomeKind::Completed || execution.pending_count > 0
 }
 
 pub(crate) fn model_metadata(state: &AppState, width: usize) -> String {
@@ -822,6 +870,23 @@ mod minimal_footer_tests {
     }
 
     #[test]
+    fn job_control_reads_as_a_noun_not_as_an_internal_tool_name() {
+        assert_eq!(
+            completed_tool_phrase(&["shell", "shell", "shell_job", "shell_job"]),
+            "2 comandos, 2 consultas de job"
+        );
+        assert_eq!(completed_tool_phrase(&["shell_job"]), "1 consulta de job");
+        assert_eq!(
+            super::tool_activity_phrase(&["shell_job"]),
+            "Consultando job"
+        );
+        assert_eq!(
+            super::tool_title("shell_job", crate::block::BlockLifecycle::Complete),
+            "Consultou job"
+        );
+    }
+
+    #[test]
     fn settled_groups_are_a_tally_of_nouns_and_running_ones_keep_their_verbs() {
         assert_eq!(
             completed_tool_phrase(&["read", "search", "patch", "shell"]),
@@ -856,15 +921,41 @@ mod minimal_footer_tests {
         for rows in [1, 2, 3] {
             let lines = footer_lines(&state, 98, rows, false).join("\n");
             assert!(
-                lines.contains("Execução concluída · 3s · 2 pendente(s)"),
+                lines.contains("Execução concluída · 3s · 2 pendentes"),
                 "{lines}"
             );
             assert!(lines.contains("Ctrl+J"));
         }
+        // A run that simply completed is closed by its receipt.
+        if let Some(execution) = state.last_execution.as_mut() {
+            execution.pending_count = 0;
+        }
+        let idle = footer_lines(&state, 98, 2, false).join("\n");
+        assert!(!idle.contains("Execução concluída"), "{idle}");
+        assert!(idle.contains("/ comandos"), "{idle}");
         state.working = true;
         let active = footer_lines(&state, 98, 1, false).join("\n");
-        assert!(active.contains("Ctrl+C"));
+        assert!(active.contains("Esc parar"), "{active}");
         assert!(!active.contains("Execução concluída"));
+    }
+
+    #[test]
+    fn force_is_offered_only_after_a_stop_was_requested() {
+        let mut state = AppState::new();
+        state.authenticated = true;
+        state.working = true;
+        let running = footer_lines(&state, 98, 2, true).join("\n");
+        assert!(running.contains("Esc parar"), "{running}");
+        assert!(!running.contains("forçar"), "{running}");
+        assert!(!running.contains("Ctrl+C"), "{running}");
+        state.cancellation = Some(crate::app::CancellationState {
+            run_id: 1,
+            phase: crate::app::CancellationPhase::Requested,
+            requested_ms: 0,
+        });
+        let stopping = footer_lines(&state, 98, 2, true).join("\n");
+        assert!(stopping.contains("Esc forçar"), "{stopping}");
+        assert!(!stopping.contains("Esc parar"), "{stopping}");
     }
 
     #[test]
@@ -886,7 +977,7 @@ mod minimal_footer_tests {
         state.working = true;
         for rows in [1, 2, 3] {
             let lines = footer_lines(&state, 24, rows, false).join("\n");
-            assert!(lines.contains("^C") || lines.contains("Ctrl+C"), "{lines}");
+            assert!(lines.contains("Esc"), "{lines}");
         }
     }
 }

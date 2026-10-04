@@ -219,8 +219,6 @@ where
     }
 }
 
-pub type ManualDriver<'a, R, E> = ManualDrive<'a, R, E>;
-
 pub fn drive_manual<R, E>(
     repo: &mut R,
     executor: &mut E,

@@ -4,7 +4,7 @@ use std::path::Path;
 
 use super::write::{
     ensure_mutation_size, lock_mutations, patch_file_recovery_context, read_existing_file_observed,
-    replace_observed_file, resolved_public_path,
+    replace_observed_file, resolved_public_path, CURRENT_FILE_RECOVERY_BYTES, UTF8_BOM,
 };
 use super::{digest_bytes, DependencyObservation, FastStamp, ToolError, ToolExecutionError};
 
@@ -153,10 +153,13 @@ pub(crate) fn apply_exact_patches_with_content(
                 message
             };
             let context = if count == 0 {
-                format!(
-                    "{context}\n{}",
-                    patch_file_recovery_context(&observed.content)
-                )
+                let mut budget = RecoveryBudget::new();
+                let recovery = whitespace_blind_excerpt(&updated, &expected, &mut budget)
+                    .or_else(|| whitespace_insensitive_excerpt(&updated, &expected, &mut budget))
+                    .or_else(|| nearest_text_excerpt(&updated, &expected, &mut budget))
+                    .or_else(|| search_prefix_hint(&expected))
+                    .unwrap_or_else(|| patch_file_recovery_context(&observed.content));
+                format!("{context}\n{recovery}")
             } else {
                 context
             };
@@ -168,8 +171,18 @@ pub(crate) fn apply_exact_patches_with_content(
             failure.context = Some(if edits.len() == 1 {
                 context
             } else {
+                // Line numbers in `context` count the proposed content, which
+                // already holds the earlier edits of this call.
+                let applied = match edit_index {
+                    0 => String::new(),
+                    1 => " Line numbers below count the proposed content (edit 1 applied)."
+                        .to_owned(),
+                    later => format!(
+                        " Line numbers below count the proposed content (edits 1-{later} applied)."
+                    ),
+                };
                 format!(
-                    "Edit {} rejected in proposed content; no edits applied.\n{context}",
+                    "Edit {} rejected in proposed content; no edits applied.{applied}\n{context}",
                     edit_index + 1
                 )
             });
@@ -226,6 +239,11 @@ pub(crate) fn apply_exact_patches_with_content(
             start_line,
         );
         updated = updated.replacen(expected.as_ref(), replacement.as_ref(), 1);
+    }
+    // An edit that spelled the BOM must not drop it from the file.
+    if observed.content.starts_with(UTF8_BOM) && !updated.starts_with(UTF8_BOM) {
+        updated.insert(0, UTF8_BOM);
+        resolved_edits = None;
     }
     let (hunks, hunks_truncated) = diff.finish();
     if edits.len() > 1 {
@@ -460,6 +478,184 @@ fn unique_context_excerpt(text: &str, expected: &str, first_match: usize) -> Opt
         }
     }
     None
+}
+
+/// Recovery for an excerpt that matches nowhere exactly but whose words, line
+/// by line, equal those of exactly one run of lines: that run, verbatim.
+/// Indentation, tabs and trailing blanks are what excerpts most often get
+/// wrong, and the lines to copy are a far smaller answer than the whole file.
+fn whitespace_blind_excerpt(
+    text: &str,
+    expected: &str,
+    budget: &mut RecoveryBudget,
+) -> Option<String> {
+    let wanted = expected.trim().lines().collect::<Vec<_>>();
+    let lines = text.split_inclusive('\n').collect::<Vec<_>>();
+    if wanted.is_empty() || wanted.len() > lines.len() {
+        return None;
+    }
+    let mut found = None;
+    for start in 0..=lines.len() - wanted.len() {
+        let mut equal = true;
+        for (line, want) in lines[start..].iter().zip(&wanted) {
+            if !budget.spend(line.len().max(want.len()) + 1) {
+                return None;
+            }
+            if !line.split_whitespace().eq(want.split_whitespace()) {
+                equal = false;
+                break;
+            }
+        }
+        if equal {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(start);
+        }
+    }
+    let index = found?;
+    closest_text_note(&lines[index..index + wanted.len()], index)
+}
+
+/// Work the whole zero-match recovery chain may do, in bytes and lines
+/// compared. A huge file with a long near-match must not stall the call; when
+/// it runs out, the excerpt functions give up and the call falls back to the
+/// current file text.
+const RECOVERY_WORK_BUDGET: usize = 6_000_000;
+
+struct RecoveryBudget(usize);
+
+impl RecoveryBudget {
+    fn new() -> Self {
+        Self(RECOVERY_WORK_BUDGET)
+    }
+
+    /// False when `work` does not fit; the budget is then spent for good.
+    fn spend(&mut self, work: usize) -> bool {
+        match self.0.checked_sub(work) {
+            Some(left) => {
+                self.0 = left;
+                true
+            }
+            None => {
+                self.0 = 0;
+                false
+            }
+        }
+    }
+}
+
+fn closest_text_note(run: &[&str], first_index: usize) -> Option<String> {
+    let excerpt = run.concat();
+    let location = match run.len() {
+        1 => format!("line {}", first_index + 1),
+        count => format!("lines {}-{}", first_index + 1, first_index + count),
+    };
+    (excerpt.len() <= CURRENT_FILE_RECOVERY_BYTES).then(|| {
+        format!(
+            "Closest text is at {location} and differs from expected only in whitespace. Retry patch with it copied exactly; do not read again:\n{}",
+            excerpt.trim_end_matches(['\r', '\n'])
+        )
+    })
+}
+
+/// Like `whitespace_blind_excerpt`, but for an excerpt that starts or ends
+/// inside a line or breaks lines elsewhere: with all whitespace removed from
+/// both, it occurs exactly once. The whole lines it touches are returned.
+fn whitespace_insensitive_excerpt(
+    text: &str,
+    expected: &str,
+    budget: &mut RecoveryBudget,
+) -> Option<String> {
+    // Stripping both, then searching for the excerpt and for a second hit.
+    if !budget.spend(text.len().saturating_mul(2).saturating_add(expected.len())) {
+        return None;
+    }
+    let wanted = expected
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    if wanted.is_empty() {
+        return None;
+    }
+    let lines = text.split_inclusive('\n').collect::<Vec<_>>();
+    let mut stripped = String::with_capacity(text.len());
+    // Where each file line begins in the stripped text: a hit is located by
+    // line, which is all the answer needs.
+    let mut line_starts = Vec::with_capacity(lines.len());
+    for line in &lines {
+        line_starts.push(stripped.len());
+        stripped.extend(line.chars().filter(|character| !character.is_whitespace()));
+    }
+    let start = stripped.find(&wanted)?;
+    let after_first_char = start + stripped[start..].chars().next()?.len_utf8();
+    if stripped[after_first_char..].contains(&wanted) {
+        return None;
+    }
+    let end = start + wanted.len();
+    let first = line_starts.partition_point(|&line_start| line_start <= start) - 1;
+    let last = line_starts.partition_point(|&line_start| line_start < end) - 1;
+    closest_text_note(&lines[first..=last], first)
+}
+
+const NEAREST_TEXT_BEFORE_LINES: usize = 4;
+const NEAREST_TEXT_AFTER_LINES: usize = 5;
+const NEAREST_TEXT_ANCHOR_CANDIDATES: usize = 8;
+
+/// Last resort before dumping the file: the longest line of `expected` that
+/// occurs verbatim exactly once in the file locates where the excerpt was
+/// meant to be. Its surroundings are offered as the nearest text, not as the
+/// target.
+fn nearest_text_excerpt(text: &str, expected: &str, budget: &mut RecoveryBudget) -> Option<String> {
+    let mut candidates = expected
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.chars().filter(|c| c.is_alphanumeric()).count() >= 4)
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|line| std::cmp::Reverse(line.len()));
+    let anchor = candidates
+        .into_iter()
+        .take(NEAREST_TEXT_ANCHOR_CANDIDATES)
+        .find(|line| budget.spend(text.len()) && text.matches(line).count() == 1)?;
+    // Locating the anchor and its line, and splitting the lines.
+    if !budget.spend(text.len().saturating_mul(2)) {
+        return None;
+    }
+    let offset = text.find(anchor)?;
+    let lines = text.split_inclusive('\n').collect::<Vec<_>>();
+    let index = text[..offset].bytes().filter(|byte| *byte == b'\n').count();
+    let first = index.saturating_sub(NEAREST_TEXT_BEFORE_LINES);
+    let last = (index + NEAREST_TEXT_AFTER_LINES).min(lines.len().saturating_sub(1));
+    let excerpt = lines[first..=last].concat();
+    (excerpt.len() <= CURRENT_FILE_RECOVERY_BYTES).then(|| {
+        format!(
+            "Nearest text is around line {}, where one line of expected occurs exactly once (lines {}-{}); expected matched nowhere exactly, so this is not a guaranteed target. Retry patch with an excerpt copied exactly from it; do not read again:\n{}",
+            index + 1,
+            first + 1,
+            last + 1,
+            excerpt.trim_end_matches(['\r', '\n'])
+        )
+    })
+}
+
+/// Search output marks lines `N: ` (hit) or `N- ` (context); that marker is
+/// not file text, and copying it along is the commonest reason an excerpt
+/// matches nowhere.
+fn search_prefix_hint(expected: &str) -> Option<String> {
+    let has_prefix = |line: &str| {
+        let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+        let rest = &line[digits..];
+        digits > 0
+            && (rest == ":" || rest == "-" || rest.starts_with(": ") || rest.starts_with("- "))
+    };
+    let mut lines = expected
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .peekable();
+    lines.peek()?;
+    lines.all(has_prefix).then(|| {
+        "Every line of expected starts with a search marker (`N: ` or `N- `); those markers are not file text. Remove them, copy only the text after each, and retry patch.".to_owned()
+    })
 }
 
 fn contains_bare_lf(text: &str) -> bool {

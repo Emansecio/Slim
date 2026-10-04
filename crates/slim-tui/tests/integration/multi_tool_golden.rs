@@ -1,6 +1,8 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
-use slim_tui::api::{ToolBatchId, ToolCallId, UiEvent};
+use slim_tui::api::{
+    ContentHandle, ContentRequestId, PageCursor, ToolBatchId, ToolCallId, UiCommand, UiEvent,
+};
 use slim_tui::app::{AppState, FollowMode, ScrollAnchor};
 use slim_tui::block::{Block, BlockKind, BlockLifecycle, FoldState, ToolState};
 use slim_tui::reducer::{reduce, Action, Effect};
@@ -50,6 +52,313 @@ fn settle(state: &mut AppState) {
 }
 
 #[test]
+fn opening_group_keeps_materialized_member_details_closed() {
+    for lifecycle in [BlockLifecycle::Complete, BlockLifecycle::Failed] {
+        let mut state = AppState::new();
+        for (id, output) in [
+            ("first", "FIRST OUTPUT BODY"),
+            ("second", "SECOND OUTPUT BODY"),
+        ] {
+            state.append_block(Block::new(
+                id,
+                BlockKind::Tool(ToolState {
+                    name: "read".into(),
+                    call_id: call(id),
+                    materialized_output: output.into(),
+                    ..ToolState::default()
+                }),
+                lifecycle,
+            ));
+        }
+        let leader = state.blocks()[0].id.clone();
+        reduce(&mut state, Action::ToggleBlock(leader));
+        let expanded = render_terminal_text(&state, 80, 24);
+        assert!(!expanded.contains("OUTPUT BODY"), "{expanded}");
+        let mut cache = WrapCache::default();
+        let index = HeightIndex::build(state.blocks(), 80, &mut cache);
+        assert_eq!(index.total_rows, 3);
+    }
+}
+
+#[test]
+fn fitted_navigation_uses_the_rows_presented_during_the_tool_hold() {
+    let mut state = AppState::new();
+    state.clock.elapsed_ms = 500;
+    for (id, ended_ms) in [("first", 0), ("second", 500)] {
+        let mut block = Block::new(
+            id,
+            BlockKind::Tool(ToolState {
+                name: "read".into(),
+                content_handle: Some(ContentHandle(id.into())),
+                ..ToolState::default()
+            }),
+            BlockLifecycle::Complete,
+        );
+        block.ended_ms = Some(ended_ms);
+        state.append_block(block);
+    }
+    let ids: Vec<_> = state
+        .blocks()
+        .iter()
+        .map(|block| block.id.clone())
+        .collect();
+    state.scroll.mode = FollowMode::Pinned(ScrollAnchor {
+        block_id: ids[0].clone(),
+        row_offset: 0,
+    });
+    let mut cache = WrapCache::default();
+    let down = terminal_action(
+        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        &state,
+        (80, 24),
+        &mut cache,
+    )
+    .unwrap();
+    reduce(&mut state, down);
+    assert_eq!(state.selected_block_id(), Some(&ids[1]));
+    settle(&mut state);
+    let up = terminal_action(
+        Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        &state,
+        (80, 24),
+        &mut cache,
+    )
+    .unwrap();
+    reduce(&mut state, up);
+    assert_eq!(
+        state.scroll.mode,
+        FollowMode::Pinned(ScrollAnchor {
+            block_id: ids[0].clone(),
+            row_offset: 0
+        })
+    );
+}
+
+#[test]
+fn live_enter_hint_targets_the_queued_texts_after_a_tool_group() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::run_started(1));
+    complete(&mut state, "batch", "first", "read", "path=one", 1);
+    complete(&mut state, "batch", "second", "read", "path=two", 1);
+    settle(&mut state);
+    state.apply_event(UiEvent::QueuedUserAdded {
+        text: "queued preview\nQUEUED TEXT TAIL".into(),
+        position: 1,
+    });
+    let collapsed = render_terminal_text(&state, 80, 24);
+    assert!(collapsed.contains("Enter textos"), "{collapsed}");
+    assert!(!collapsed.contains("Enter detalhes"), "{collapsed}");
+    let mut cache = WrapCache::default();
+    let action = terminal_action(Event::Key(enter()), &state, (80, 24), &mut cache).unwrap();
+    reduce(&mut state, action);
+    assert!(render_terminal_text(&state, 80, 24).contains("QUEUED TEXT TAIL"));
+    assert_eq!(state.queue_len(), 1);
+}
+
+#[test]
+fn grouped_members_navigate_and_page_individually_with_stable_anchors() {
+    let mut state = AppState::new();
+    for id in ["first", "second"] {
+        state.append_block(Block::new(
+            id,
+            BlockKind::Tool(ToolState {
+                name: "read".into(),
+                call_id: call(id),
+                content_handle: Some(ContentHandle(id.into())),
+                ..ToolState::default()
+            }),
+            BlockLifecycle::Complete,
+        ));
+    }
+    let leader = state.blocks()[0].id.clone();
+    let second = state.blocks()[1].id.clone();
+    state.scroll.mode = FollowMode::Pinned(ScrollAnchor {
+        block_id: leader.clone(),
+        row_offset: 0,
+    });
+    reduce(&mut state, Action::Key(enter()));
+    let mut cache = WrapCache::default();
+    let down = terminal_action(
+        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        &state,
+        (80, 24),
+        &mut cache,
+    )
+    .unwrap();
+    reduce(&mut state, down);
+    assert_eq!(
+        state.scroll.mode,
+        FollowMode::Pinned(ScrollAnchor {
+            block_id: leader.clone(),
+            row_offset: 1
+        })
+    );
+    assert_eq!(
+        reduce(&mut state, Action::Key(enter())),
+        vec![
+            Effect::Send(UiCommand::RequestContentPage {
+                handle: ContentHandle("first".into()),
+                request_id: ContentRequestId(1),
+                cursor: None
+            }),
+            Effect::RequestRender,
+        ]
+    );
+    assert!(state.blocks()[0].group_expanded);
+    state.apply_event(UiEvent::ContentPageLoaded {
+        handle: ContentHandle("first".into()),
+        request_id: ContentRequestId(1),
+        cursor: None,
+        text: "page one\n".into(),
+        next_cursor: Some(PageCursor(9)),
+    });
+    assert_eq!(
+        reduce(&mut state, Action::Key(enter())),
+        vec![
+            Effect::Send(UiCommand::RequestContentPage {
+                handle: ContentHandle("first".into()),
+                request_id: ContentRequestId(2),
+                cursor: Some(PageCursor(9))
+            }),
+            Effect::RequestRender,
+        ]
+    );
+    state.apply_event(UiEvent::ContentPageLoaded {
+        handle: ContentHandle("first".into()),
+        request_id: ContentRequestId(2),
+        cursor: Some(PageCursor(9)),
+        text: "page two".into(),
+        next_cursor: None,
+    });
+    let down = terminal_action(
+        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        &state,
+        (80, 24),
+        &mut cache,
+    )
+    .unwrap();
+    reduce(&mut state, down);
+    assert_eq!(state.selected_block_id(), Some(&second));
+    assert_eq!(
+        reduce(&mut state, Action::Key(enter())),
+        vec![
+            Effect::Send(UiCommand::RequestContentPage {
+                handle: ContentHandle("second".into()),
+                request_id: ContentRequestId(3),
+                cursor: None
+            }),
+            Effect::RequestRender,
+        ]
+    );
+    state.apply_event(UiEvent::ContentPageLoaded {
+        handle: ContentHandle("second".into()),
+        request_id: ContentRequestId(3),
+        cursor: None,
+        text: "other result".into(),
+        next_cursor: None,
+    });
+    let index = HeightIndex::build(state.blocks(), 80, &mut cache);
+    assert_eq!(index.total_rows, 6);
+    for row in 0..index.total_rows {
+        assert_eq!(
+            index.row_for_anchor(&index.anchor_for_row(row).unwrap()),
+            Some(row)
+        );
+    }
+    for expected in ["page one", "page two", "other result"] {
+        assert!(render_terminal_text(&state, 80, 24).contains(expected));
+    }
+    state.scroll.mode = FollowMode::Pinned(ScrollAnchor {
+        block_id: leader,
+        row_offset: 0,
+    });
+    reduce(&mut state, Action::Key(enter()));
+    assert_eq!(
+        HeightIndex::build(state.blocks(), 80, &mut cache).total_rows,
+        1
+    );
+    reduce(&mut state, Action::Key(enter()));
+    assert_eq!(
+        HeightIndex::build(state.blocks(), 80, &mut cache).total_rows,
+        6
+    );
+}
+
+#[test]
+fn grouped_diffs_and_bridged_thinking_match_rendered_heights() {
+    let mut state = AppState::new();
+    state.append_block(Block::new(
+        "first",
+        BlockKind::Tool(ToolState {
+            name: "read".into(),
+            ..ToolState::default()
+        }),
+        BlockLifecycle::Complete,
+    ));
+    state.append_block(Block::new(
+        "thought",
+        BlockKind::Thinking("REASONING BODY\nsecond thought row".into()),
+        BlockLifecycle::Complete,
+    ));
+    state.append_block(Block::new(
+        "patch",
+        BlockKind::Tool(ToolState {
+            name: "patch".into(),
+            edit_diff: Some(slim_core::ToolEditDiff {
+                path: "src/lib.rs".into(),
+                hunks: vec![slim_core::ToolEditHunk {
+                    start_line: 1,
+                    removed: vec!["old".into()],
+                    added: vec!["new".into()],
+                }],
+                truncated: false,
+            }),
+            ..ToolState::default()
+        }),
+        BlockLifecycle::Complete,
+    ));
+    let ids: Vec<_> = state
+        .blocks()
+        .iter()
+        .map(|block| block.id.clone())
+        .collect();
+    reduce(&mut state, Action::ToggleBlock(ids[0].clone()));
+    assert!(!render_terminal_text(&state, 80, 24).contains("REASONING BODY"));
+    for id in &ids[1..] {
+        state.scroll.mode = FollowMode::Pinned(ScrollAnchor {
+            block_id: id.clone(),
+            row_offset: 0,
+        });
+        reduce(&mut state, Action::Key(enter()));
+    }
+    assert!(state.blocks()[0].group_expanded);
+    assert_eq!(state.blocks()[1].fold, FoldState::Expanded);
+    assert_eq!(state.blocks()[2].fold, FoldState::Expanded);
+    let mut cache = WrapCache::default();
+    for width in [40, 80, 120] {
+        let index = HeightIndex::build(state.blocks(), width, &mut cache);
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.total_rows, 9);
+        for row in 0..index.total_rows {
+            assert_eq!(
+                index.row_for_anchor(&index.anchor_for_row(row).unwrap()),
+                Some(row)
+            );
+        }
+        let text = render_terminal_text(&state, width, 30);
+        for expected in [
+            "REASONING BODY",
+            "second thought row",
+            "@@ src/lib.rs:1",
+            "- old",
+            "+ new",
+        ] {
+            assert!(text.contains(expected), "{expected}: {text}");
+        }
+    }
+}
+
+#[test]
 fn same_batch_groups_different_names_and_expands_in_provider_order() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::run_started(1));
@@ -78,7 +387,7 @@ fn same_batch_groups_different_names_and_expands_in_provider_order() {
         reduce(&mut state, Action::Key(enter())),
         vec![Effect::RequestRender]
     );
-    assert_eq!(state.blocks()[0].fold, FoldState::Expanded);
+    assert!(state.blocks()[0].group_expanded);
     let expanded = render_terminal_text(&state, 120, 30);
     assert!(
         expanded.contains("✓ 1 leitura, 1 comando · 12ms"),
@@ -88,15 +397,12 @@ fn same_batch_groups_different_names_and_expands_in_provider_order() {
         !expanded.contains("Enter detalhes"),
         "expanded header must not keep the collapse-competing hint\n{expanded}"
     );
-    let first = expanded.find("call-1").expect("first member");
-    let second = expanded.find("call-2").expect("second member");
+    let first = expanded.find("Leu one").expect("first member");
+    let second = expanded.find("Executou cmd=two").expect("second member");
     assert!(first < second, "provider order changed\n{expanded}");
-    for expected in ["Leu one", "Executou cmd=two"] {
-        assert!(
-            expanded.contains(expected),
-            "missing {expected}\n{expanded}"
-        );
-    }
+    // Call ids are internal identity, not something the reader acts on.
+    assert!(!expanded.contains("call-1"), "{expanded}");
+    assert!(!expanded.contains("call-2"), "{expanded}");
     let first_row = expanded
         .lines()
         .find(|line| line.contains("Leu one"))
@@ -112,7 +418,7 @@ fn same_batch_groups_different_names_and_expands_in_provider_order() {
     assert_eq!(index.row_for_anchor(&member_anchor), Some(2));
 
     reduce(&mut state, Action::Key(enter()));
-    assert_ne!(state.blocks()[0].fold, FoldState::Expanded);
+    assert!(!state.blocks()[0].group_expanded);
     let collapsed_again = render_terminal_text(&state, 120, 30);
     assert!(!collapsed_again.contains("call-1"));
 }
@@ -191,7 +497,7 @@ fn plain_enter_at_live_edge_activates_last_visible_tool_group() {
         "plain Enter must target the visible group, got {action:?}"
     );
     reduce(&mut state, action.expect("toggle action"));
-    assert_eq!(state.blocks()[0].fold, FoldState::Expanded);
+    assert!(state.blocks()[0].group_expanded);
 }
 
 #[test]
@@ -217,7 +523,7 @@ fn collapsed_thinking_does_not_split_complete_tool_groups() {
         "collapsed thought must not split adjacent tool groups\n{frame}"
     );
     assert_eq!(
-        frame.matches("Pensamento").count(),
+        frame.matches("Pensou").count(),
         0,
         "sandwiched collapsed thought is chrome, not a row\n{frame}"
     );
@@ -395,6 +701,86 @@ fn failed_and_cancelled_members_remain_individual_and_ordered() {
         frame.contains("later"),
         "cancelled tools keep their target\n{frame}"
     );
+}
+
+#[test]
+fn a_failure_joins_its_group_and_a_successful_retry_is_folded_into_its_row() {
+    let fail = |state: &mut AppState, call_id: &str, arguments: &str| {
+        state.apply_event(UiEvent::ToolStarted {
+            batch_id: batch(call_id),
+            call_id: call(call_id),
+            name: "shell".into(),
+            arguments_summary: arguments.into(),
+        });
+        state.apply_event(UiEvent::ToolProgress {
+            batch_id: batch(call_id),
+            call_id: call(call_id),
+            name: "shell".into(),
+            preview: "exit 101".into(),
+            content_handle: None,
+        });
+        state.apply_event(UiEvent::ToolEnded {
+            batch_id: batch(call_id),
+            call_id: call(call_id),
+            name: "shell".into(),
+            success: false,
+            duration_ms: 5,
+        });
+    };
+    let mut state = AppState::new();
+    complete(&mut state, "b-1", "edit", "patch", "path=src/lib.rs", 3);
+    fail(&mut state, "test-1", "command=cargo test");
+    fail(&mut state, "test-2", "command=cargo test");
+    fail(&mut state, "lint", "command=cargo clippy");
+    complete(
+        &mut state,
+        "b-4",
+        "test-3",
+        "shell",
+        "command=cargo test",
+        7,
+    );
+    settle(&mut state);
+
+    let frame = render_terminal_text(&state, 100, 24);
+    let rows = frame.lines().collect::<Vec<_>>();
+    let header = rows
+        .iter()
+        .position(|row| row.contains("✓ 1 edição, 4 comandos"))
+        .unwrap_or_else(|| panic!("one group for the whole streak\n{frame}"));
+    // Identical failures share a row; the retried call says it later passed;
+    // a failure nothing fixed stays plain.
+    assert!(
+        rows[header + 1].contains("✕ $ cargo test")
+            && rows[header + 1].contains("×2")
+            && rows[header + 1].contains("depois passou"),
+        "{frame}"
+    );
+    assert!(
+        rows[header + 2].contains("✕ $ cargo clippy")
+            && !rows[header + 2].contains("depois passou"),
+        "{frame}"
+    );
+    assert_eq!(frame.matches('✕').count(), 2, "{frame}");
+    assert!(!frame.contains("Executou"), "{frame}");
+
+    // Measured rows match what is drawn: header plus the two failure rows.
+    let mut cache = WrapCache::default();
+    let index = HeightIndex::build(state.blocks(), 99, &mut cache);
+    assert_eq!(index.len(), 1);
+    assert_eq!(index.total_rows, 3);
+
+    // Enter on the group opens every member in provider order.
+    let leader = state.blocks()[0].id.clone();
+    state.scroll.mode = FollowMode::Pinned(ScrollAnchor {
+        block_id: leader,
+        row_offset: 0,
+    });
+    reduce(&mut state, Action::Key(enter()));
+    assert!(state.blocks()[0].group_expanded);
+    let expanded = render_terminal_text(&state, 100, 24);
+    assert_eq!(expanded.matches("$ cargo test").count(), 3, "{expanded}");
+    assert!(!expanded.contains("depois passou"), "{expanded}");
 }
 
 #[test]

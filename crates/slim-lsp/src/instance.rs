@@ -136,7 +136,7 @@ pub struct ServerInstanceConfig {
     pub transport_options: TransportOptions,
     /// Sent as initializationOptions (server-specific).
     pub initialization_options: Value,
-    /// Value answered for workspace/configuration under spec.settings_section.
+    /// Complete section map for workspace/configuration and didChangeConfiguration.
     pub settings: Value,
     pub max_open_documents: usize,
 }
@@ -148,7 +148,7 @@ impl ServerInstanceConfig {
             spec,
             transport_options: TransportOptions::default(),
             initialization_options: json!({ "checkOnSave": false }),
-            settings: json!({ "checkOnSave": false }),
+            settings: json!({ "rust-analyzer": { "checkOnSave": false } }),
             max_open_documents: crate::document::DEFAULT_MAX_OPEN_DOCUMENTS,
         }
     }
@@ -201,6 +201,9 @@ struct InstanceState {
     diagnostics: DiagnosticsStore,
     /// Woken after every stored publication so post-edit waiters do not poll.
     diagnostics_changed: Arc<tokio::sync::Notify>,
+    /// The latest publication carried no document version (the TypeScript
+    /// Language Server never sends one), so post-edit checks cannot certify.
+    versionless_publications: bool,
     /// Errors known before the first unreported edit of a file. `None` inside
     /// means nothing certified was known (no fresh publication, truncated
     /// store, or the edit itself opened the document).
@@ -235,6 +238,7 @@ impl InstanceState {
                 crate::diagnostics::DEFAULT_MAX_DIAGNOSTIC_URIS,
             ),
             diagnostics_changed: Arc::new(tokio::sync::Notify::new()),
+            versionless_publications: false,
             baselines: std::collections::HashMap::new(),
         }
     }
@@ -274,6 +278,7 @@ pub struct LspServerInstance {
     document_sync: std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<Mutex<()>>>>,
     /// Only opening/closing and LRU eviction share this lifecycle barrier.
     document_lifecycle: Mutex<()>,
+    workspace_snapshot: Mutex<Option<crate::workspace::WorkspaceSnapshot>>,
     transport: LspTransport,
     config: ServerInstanceConfig,
     stderr_tail: Arc<Mutex<String>>,
@@ -342,10 +347,7 @@ impl LspServerInstance {
         stderr_tail: Arc<Mutex<String>>,
         config: ServerInstanceConfig,
     ) -> Result<Self, TransportError> {
-        let handler = server_request_handler(
-            config.settings.clone(),
-            config.spec.settings_section.clone(),
-        );
+        let handler = server_request_handler(config.settings.clone(), config.root.clone());
         let options = config.transport_options.clone();
         let (transport, notifications) = LspTransport::new(io, options, handler);
         let mut instance = Self {
@@ -353,6 +355,7 @@ impl LspServerInstance {
             state: Arc::new(Mutex::new(InstanceState::new(config.max_open_documents))),
             document_sync: std::sync::Mutex::new(std::collections::HashMap::new()),
             document_lifecycle: Mutex::new(()),
+            workspace_snapshot: Mutex::new(None),
             transport,
             config,
             stderr_tail,
@@ -419,15 +422,30 @@ impl LspServerInstance {
                 "initialized",
                 serde_json::to_value(InitializedParams {}).map_err(protocol)?,
             )
-            .await
+            .await?;
+        if self
+            .config
+            .settings
+            .as_object()
+            .is_some_and(|settings| !settings.is_empty())
+        {
+            self.transport
+                .notify(
+                    "workspace/didChangeConfiguration",
+                    json!({ "settings": self.config.settings }),
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     fn spawn_drain(&self, mut notifications: NotificationReceiver) -> tokio::task::JoinHandle<()> {
         let state = self.state.clone();
         let root = self.config.root.clone();
+        let server_id = self.config.spec.id.clone();
         tokio::spawn(async move {
             while let Some(notification) = notifications.recv().await {
-                Self::handle_notification(&state, &root, notification).await;
+                Self::handle_notification(&state, &root, &server_id, notification).await;
             }
         })
     }
@@ -435,6 +453,7 @@ impl LspServerInstance {
     async fn handle_notification(
         state: &Arc<Mutex<InstanceState>>,
         root: &Path,
+        server_id: &str,
         notification: ServerNotification,
     ) {
         match notification.method.as_str() {
@@ -459,13 +478,14 @@ impl LspServerInstance {
                     }) {
                         return;
                     }
+                    guard.versionless_publications = version.is_none();
                     guard
                         .diagnostics
                         .set(canonical_uri, version, params.diagnostics);
                     guard.diagnostics_changed.notify_waiters();
                 }
             }
-            "$/progress" => {
+            "$/progress" if server_id == "rust-analyzer" => {
                 if let Ok(params) = serde_json::from_value::<ProgressParams>(notification.params) {
                     // Real rust-analyzer reports work under string tokens such as
                     // "rustAnalyzer/Roots Scanned" (never the bare
@@ -777,6 +797,143 @@ impl LspServerInstance {
             .await
     }
 
+    /// Reuses the bounded refresh snapshot to choose one project-loading file.
+    /// The shallowest source wins; path order makes ties deterministic.
+    pub(crate) async fn workspace_source_anchors(&self, limit: usize) -> Vec<PathBuf> {
+        let snapshot = self.workspace_snapshot.lock().await;
+        let Some(snapshot) = snapshot.as_ref() else {
+            return Vec::new();
+        };
+        let mut anchors = snapshot
+            .keys()
+            .filter(|path| self.config.spec.language_id_for(path).is_some())
+            .collect::<Vec<_>>();
+        anchors.sort_by(|left, right| {
+            left.components()
+                .count()
+                .cmp(&right.components().count())
+                .then_with(|| left.cmp(right))
+        });
+        anchors.into_iter().take(limit).cloned().collect()
+    }
+
+    /// Refresh all relevant disk inputs before a semantic query, including
+    /// closed source files. Project changes retire this server generation.
+    pub(crate) async fn refresh_workspace(&self) -> Result<bool, TransportError> {
+        let mut previous = self.workspace_snapshot.lock().await;
+        let root = self.config.root.clone();
+        let server_id = self.config.spec.id.clone();
+        let current =
+            tokio::task::spawn_blocking(move || crate::workspace::snapshot(&root, &server_id))
+                .await
+                .map_err(|error| {
+                    TransportError::Protocol(format!("workspace refresh task failed: {error}"))
+                })??;
+        let Some(before) = previous.as_ref() else {
+            *previous = Some(current);
+            return Ok(false);
+        };
+        let mut changed = Vec::new();
+        for (path, stamp) in &current {
+            if before.get(path) != Some(stamp) {
+                changed.push((path, if before.contains_key(path) { 2 } else { 1 }));
+            }
+        }
+        changed.extend(
+            before
+                .keys()
+                .filter(|path| !current.contains_key(*path))
+                .map(|path| (path, 3)),
+        );
+        if changed.is_empty() {
+            return Ok(false);
+        }
+        if changed
+            .iter()
+            .any(|(path, _)| crate::workspace::project_input(path, &self.config.spec.id))
+        {
+            self.transport.invalidate();
+            return Ok(true);
+        }
+        // Ordered write/patch synchronization already updated these mirrors;
+        // do not invalidate a fresh publication a second time.
+        let synchronized = {
+            let state = self.state.lock().await;
+            changed
+                .iter()
+                .filter(|(path, _)| {
+                    state
+                        .documents
+                        .get(path)
+                        .is_some_and(|doc| doc.content.stamp_matches_path(path))
+                })
+                .map(|(path, _)| (*path).clone())
+                .collect::<std::collections::HashSet<_>>()
+        };
+        let mut transaction = SyncTransaction {
+            transport: &self.transport,
+            committed: false,
+        };
+        let events = changed
+            .iter()
+            .filter_map(|(path, kind)| {
+                file_uri(path).map(|uri| json!({ "uri": uri.as_str(), "type": kind }))
+            })
+            .collect::<Vec<_>>();
+        {
+            let mut state = self.state.lock().await;
+            let uris = state.diagnostics.uris().cloned().collect::<Vec<_>>();
+            for uri in uris {
+                let path = crate::path_policy::url_workspace_path(&self.config.root, &uri);
+                if path
+                    .as_ref()
+                    .is_some_and(|path| synchronized.contains(path))
+                {
+                    continue;
+                }
+                let version =
+                    path.and_then(|path| state.documents.get(&path).map(|doc| doc.version));
+                state.capture_baseline(&uri, version);
+                state.diagnostics.invalidate(&uri);
+            }
+            state.indexing_observed = false;
+        }
+        for events in events.chunks(128) {
+            self.transport
+                .notify(
+                    "workspace/didChangeWatchedFiles",
+                    json!({ "changes": events }),
+                )
+                .await?;
+        }
+        for (path, kind) in changed {
+            if !synchronized.contains(path) && self.document_is_open(path).await {
+                if kind == 3 {
+                    // The next acquisition gets an empty mirror and cache.
+                    self.transport.invalidate();
+                    return Ok(true);
+                }
+                let content =
+                    DocumentContent::read_capped(path, crate::manager::MAX_CONTEXT_READ_BYTES)
+                        .ok_or_else(|| {
+                            TransportError::Protocol(
+                                "changed document is unreadable or too large".into(),
+                            )
+                        })?;
+                self.sync_document_content(path, content)
+                    .await
+                    .ok_or_else(|| {
+                        TransportError::Protocol(
+                            "changed document could not be synchronized".into(),
+                        )
+                    })?;
+            }
+        }
+        *previous = Some(current);
+        transaction.committed = true;
+        Ok(true)
+    }
+
     pub async fn document_version_async(&self, path: &Path) -> Option<i64> {
         let path = crate::path_policy::existing_workspace_path(&self.config.root, path)?;
         let _document_sync = self.document_lock(&path).lock_owned().await;
@@ -835,21 +992,15 @@ impl LspServerInstance {
         })
     }
 
-    /// Waits for the server to validate the current version of an open
-    /// document, then returns the errors introduced since the last report (all
-    /// errors when no certified reference exists). Waits at most until
-    /// `deadline`; `None` means the document is not open, the connection is
-    /// gone or the caller cancelled.
-    ///
-    /// The server is the only source of truth: a publication counts only when
-    /// it is not stale and carries exactly the document's current version. A
-    /// server that stays silent yields `fresh: false`, never "no errors".
-    pub(crate) async fn edit_diagnostics(
+    /// Waits for an exact-version publication and its short settling period.
+    /// Does not consume the edit baseline. Silence returns false; a closed
+    /// connection, missing document or cancellation returns None.
+    pub(crate) async fn wait_for_diagnostics(
         &self,
         path: &Path,
         deadline: tokio::time::Instant,
         cancellation: Option<&CancellationToken>,
-    ) -> Option<EditDiagnosticsOutcome> {
+    ) -> Option<bool> {
         let path = crate::path_policy::existing_workspace_path(&self.config.root, path)?;
         let uri = file_uri(&path)?;
         let changed = self.state.lock().await.diagnostics_changed.clone();
@@ -861,6 +1012,9 @@ impl LspServerInstance {
         };
         tokio::pin!(cancelled);
         loop {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return None;
+            }
             // Register before reading state so a publication between the read
             // and the wait cannot be missed.
             let notified = changed.notified();
@@ -892,6 +1046,41 @@ impl LspServerInstance {
                 () = &mut cancelled => return None,
             }
         }
+        if self.transport.is_closed() || cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
+        let state = self.state.lock().await;
+        let document = state.documents.get(&path)?;
+        Some(
+            state
+                .diagnostics
+                .get(&uri)
+                .is_some_and(|stored| !stored.stale && stored.version == Some(document.version)),
+        )
+    }
+
+    /// Returns the errors introduced since the last report (all errors when
+    /// no certified baseline exists). A silent server never certifies a file.
+    pub(crate) async fn edit_diagnostics(
+        &self,
+        path: &Path,
+        deadline: tokio::time::Instant,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<EditDiagnosticsOutcome> {
+        // A versionless publication can never certify a document version, so
+        // waiting for one would only spend the deadline on the same outcome.
+        if self.state.lock().await.versionless_publications {
+            if self.transport.is_closed()
+                || cancellation.is_some_and(CancellationToken::is_cancelled)
+            {
+                return None;
+            }
+        } else {
+            self.wait_for_diagnostics(path, deadline, cancellation)
+                .await?;
+        }
+        let path = crate::path_policy::existing_workspace_path(&self.config.root, path)?;
+        let uri = file_uri(&path)?;
         let mut state = self.state.lock().await;
         let (version, content) = {
             let document = state.documents.get(&path)?;
@@ -901,7 +1090,12 @@ impl LspServerInstance {
         let stored = state
             .diagnostics
             .get(&uri)
-            .filter(|stored| !stored.stale && stored.version == Some(version))
+            .filter(|stored| {
+                !stored.stale
+                    && stored.version == Some(version)
+                    && !stored.truncated
+                    && content.stamp_matches_path(&path)
+            })
             .cloned();
         let Some(stored) = stored else {
             return Some(EditDiagnosticsOutcome {
@@ -1059,38 +1253,31 @@ impl LspServerInstance {
 /// assuming silent support (e.g. file-watching registrations).
 fn server_request_handler(
     settings: Value,
-    settings_section: String,
+    root: PathBuf,
 ) -> crate::transport::ServerRequestHandler {
+    let folders = file_uri(&root).map(|uri| json!([{
+        "uri": uri.as_str(),
+        "name": root.file_name().map(|name| name.to_string_lossy()).unwrap_or_else(|| "workspace".into()),
+    }]));
     Box::new(move |method, params| match method {
+        "workspace/workspaceFolders" => Ok(folders.clone().unwrap_or(Value::Null)),
         "workspace/configuration" => {
             let items = params
                 .and_then(|value| value.get("items"))
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            // One answer per requested item, positions aligned. A section
-            // asks for the *content* under that key: wrapping the settings
-            // in `{ settings_section: ... }` again would double-nest them and
-            // the server would silently drop the real values. Subsections of
-            // ours resolve to their subtree; unrelated sections get null.
+            // One answer per requested item, positions aligned. Settings are
+            // already a complete section map; nested sections resolve directly.
             Ok(Value::Array(
                 items
                     .iter()
                     .map(|item| match item.get("section").and_then(Value::as_str) {
-                        None | Some("") => {
-                            let mut row = serde_json::Map::new();
-                            row.insert(settings_section.clone(), settings.clone());
-                            Value::Object(row)
-                        }
-                        Some(section) if section == settings_section => settings.clone(),
+                        None | Some("") => settings.clone(),
                         Some(section) => section
-                            .strip_prefix(settings_section.as_str())
-                            .and_then(|rest| rest.strip_prefix('.'))
-                            .and_then(|rest| {
-                                rest.split('.')
-                                    .try_fold(&settings, |node, key| node.get(key))
-                                    .cloned()
-                            })
+                            .split('.')
+                            .try_fold(&settings, |node, key| node.get(key))
+                            .cloned()
                             .unwrap_or(Value::Null),
                     })
                     .collect(),
@@ -1132,7 +1319,7 @@ mod tests {
         let (transport, notifications) = LspTransport::new(
             Box::new(client),
             TransportOptions::default(),
-            server_request_handler(Value::Null, "test".into()),
+            server_request_handler(Value::Null, root.clone()),
         );
         let mut state = InstanceState::new(4);
         state.ready = true;
@@ -1145,6 +1332,7 @@ mod tests {
             state: Arc::new(Mutex::new(state)),
             document_sync: std::sync::Mutex::new(std::collections::HashMap::new()),
             document_lifecycle: Mutex::new(()),
+            workspace_snapshot: Mutex::new(None),
             transport,
             config: ServerInstanceConfig::for_rust_analyzer(
                 root,
@@ -1333,8 +1521,8 @@ mod tests {
     #[test]
     fn configuration_answers_per_requested_section() {
         let handler = server_request_handler(
-            json!({ "checkOnSave": false, "cargo": { "allTargets": true } }),
-            "rust-analyzer".into(),
+            json!({ "rust-analyzer": { "checkOnSave": false, "cargo": { "allTargets": true } } }),
+            std::env::temp_dir(),
         );
         let response = handler(
             "workspace/configuration",
@@ -1372,6 +1560,373 @@ mod tests {
         );
     }
 
+    #[test]
+    fn configuration_resolves_multiple_sections_and_workspace_folders() {
+        let root = std::env::temp_dir();
+        let settings = json!({
+            "typescript": { "preferences": { "quotePreference": "single" } },
+            "javascript": { "preferences": { "quotePreference": "double" } },
+        });
+        let handler = server_request_handler(settings.clone(), root.clone());
+        assert_eq!(
+            handler(
+                "workspace/configuration",
+                Some(&json!({ "items": [
+                { "section": "typescript.preferences" },
+                { "section": "javascript.preferences.quotePreference" },
+                { "section": "typescriptX" },
+                { "section": "typescript.missing" },
+                { "section": "" },
+            ] }))
+            )
+            .unwrap(),
+            json!([{ "quotePreference": "single" }, "double", null, null, settings])
+        );
+        let folders = handler("workspace/workspaceFolders", None).unwrap();
+        assert_eq!(folders[0]["uri"], file_uri(&root).unwrap().as_str());
+        assert_eq!(
+            folders[0]["name"],
+            root.file_name().unwrap().to_string_lossy().as_ref()
+        );
+    }
+
+    async fn read_test_message<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Value {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+        let mut length = None;
+        loop {
+            let mut line = String::new();
+            assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.strip_prefix("Content-Length: ") {
+                length = Some(value.trim().parse::<usize>().unwrap());
+            }
+        }
+        let mut body = vec![0; length.unwrap()];
+        reader.read_exact(&mut body).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn write_test_message<W: tokio::io::AsyncWrite + Unpin>(writer: &mut W, message: Value) {
+        use tokio::io::AsyncWriteExt;
+        let body = serde_json::to_vec(&message).unwrap();
+        writer
+            .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
+            .await
+            .unwrap();
+        writer.write_all(&body).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handshake_answers_folders_and_sends_settings_after_initialized() {
+        let root = std::env::temp_dir();
+        let settings = json!({ "typescript": { "preferences": { "quotePreference": "single" } } });
+        let initialization_options = json!({ "hostInfo": "slim" });
+        let expected_settings = settings.clone();
+        let expected_options = initialization_options.clone();
+        let expected_uri = file_uri(&root).unwrap().to_string();
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server);
+            let mut read = tokio::io::BufReader::new(read);
+            let initialize = read_test_message(&mut read).await;
+            assert_eq!(initialize["method"], "initialize");
+            assert_eq!(
+                initialize["params"]["initializationOptions"],
+                expected_options
+            );
+            write_test_message(
+                &mut write,
+                json!({
+                    "jsonrpc": "2.0", "id": "folders", "method": "workspace/workspaceFolders",
+                }),
+            )
+            .await;
+            let folders = read_test_message(&mut read).await;
+            assert_eq!(folders["id"], "folders");
+            assert_eq!(folders["result"][0]["uri"], expected_uri);
+            assert_eq!(folders["result"], initialize["params"]["workspaceFolders"]);
+            write_test_message(&mut write, json!({
+                "jsonrpc": "2.0", "id": "config", "method": "workspace/configuration",
+                "params": { "items": [{ "section": "typescript.preferences" }, { "section": "javascript" }] },
+            })).await;
+            let configuration = read_test_message(&mut read).await;
+            assert_eq!(
+                configuration["result"],
+                json!([{ "quotePreference": "single" }, null])
+            );
+            write_test_message(&mut write, json!({
+                "jsonrpc": "2.0", "id": initialize["id"], "result": { "capabilities": { "textDocumentSync": 2 } },
+            })).await;
+            assert_eq!(read_test_message(&mut read).await["method"], "initialized");
+            let changed = read_test_message(&mut read).await;
+            assert_eq!(changed["method"], "workspace/didChangeConfiguration");
+            assert_eq!(changed["params"]["settings"], expected_settings);
+        });
+        let mut config = ServerInstanceConfig::for_rust_analyzer(
+            root,
+            crate::discovery::rust_analyzer_spec("unused".into()),
+        );
+        config.spec.id = "typescript-language-server".into();
+        config.initialization_options = initialization_options;
+        config.settings = settings;
+        let instance = LspServerInstance::open(
+            Box::new(client),
+            Arc::new(Mutex::new(String::new())),
+            config,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(instance);
+    }
+
+    #[tokio::test]
+    async fn diagnostic_wait_requires_exact_version_and_keeps_the_edit_baseline() {
+        let (instance, _server, path) = sync_fixture(1024);
+        let uri = file_uri(&path).unwrap();
+        {
+            let mut state = instance.state.lock().await;
+            state.diagnostics.set(uri.clone(), None, Vec::new());
+            state.baselines.insert(uri.clone(), Some(Vec::new()));
+        }
+        assert_eq!(
+            instance
+                .wait_for_diagnostics(
+                    &path,
+                    tokio::time::Instant::now() + Duration::from_millis(20),
+                    None
+                )
+                .await,
+            Some(false)
+        );
+        let (fresh, ()) = tokio::join!(
+            instance.wait_for_diagnostics(
+                &path,
+                tokio::time::Instant::now() + Duration::from_millis(100),
+                None
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                LspServerInstance::handle_notification(
+                    &instance.state,
+                    &instance.config.root,
+                    "typescript-language-server",
+                    ServerNotification {
+                        method: "textDocument/publishDiagnostics".into(),
+                        params: json!({ "uri": uri.as_str(), "version": 1, "diagnostics": [] }),
+                    },
+                )
+                .await;
+            }
+        );
+        assert_eq!(fresh, Some(true));
+        assert!(instance.state.lock().await.baselines.contains_key(&uri));
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            instance
+                .wait_for_diagnostics(&path, tokio::time::Instant::now(), Some(&cancelled))
+                .await,
+            None
+        );
+        let root = instance.config.root.clone();
+        drop(instance);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    async fn stamped_sync_fixture() -> (LspServerInstance, tokio::io::DuplexStream, PathBuf) {
+        let (instance, server, path) = sync_fixture(1024);
+        let content =
+            DocumentContent::read_capped(&path, crate::manager::MAX_CONTEXT_READ_BYTES).unwrap();
+        assert!(content.stamp_matches_path(&path));
+        let update = instance.state.lock().await.documents.upsert_content(
+            path.clone(),
+            file_uri(&path).unwrap(),
+            "rust",
+            content,
+        );
+        assert!(matches!(update, DocumentUpdate::Unchanged { version: 1 }));
+        (instance, server, path)
+    }
+
+    fn diagnostic_error(message: &str) -> lsp_types::Diagnostic {
+        serde_json::from_value(json!({
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+            "severity": 1, "message": message,
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn truncated_publication_never_certifies_an_edit_or_replaces_its_baseline() {
+        let (instance, _server, path) = stamped_sync_fixture().await;
+        let uri = file_uri(&path).unwrap();
+        let before = vec![(None, "preexisting".to_owned())];
+        {
+            let mut state = instance.state.lock().await;
+            state.diagnostics = DiagnosticsStore::new(1, 4);
+            state.diagnostics.set(
+                uri.clone(),
+                Some(1),
+                vec![diagnostic_error("first"), diagnostic_error("second")],
+            );
+            state.baselines.insert(uri.clone(), Some(before.clone()));
+        }
+        let outcome = instance
+            .edit_diagnostics(&path, tokio::time::Instant::now(), None)
+            .await
+            .unwrap();
+        assert!(!outcome.fresh);
+        assert!(!outcome.baseline_known);
+        assert!(outcome.errors.is_empty());
+        assert_eq!(
+            instance
+                .state
+                .lock()
+                .await
+                .baselines
+                .get(&uri)
+                .cloned()
+                .unwrap(),
+            Some(before)
+        );
+        let partial = instance.diagnostics_snapshot(&uri, false).await.unwrap();
+        assert_eq!(partial.version, Some(1));
+        assert!(partial.truncated);
+        assert_eq!(partial.total, 2);
+        assert_eq!(
+            partial.items.len(),
+            1,
+            "partial information remains available to explicit diagnostics"
+        );
+
+        instance
+            .state
+            .lock()
+            .await
+            .diagnostics
+            .set(uri.clone(), Some(1), Vec::new());
+        let complete = instance
+            .edit_diagnostics(&path, tokio::time::Instant::now(), None)
+            .await
+            .unwrap();
+        assert!(
+            complete.fresh,
+            "a full exact-version publication still certifies a stamped mirror"
+        );
+        assert!(complete.baseline_known);
+        assert!(complete.errors.is_empty());
+        assert_eq!(
+            instance
+                .state
+                .lock()
+                .await
+                .baselines
+                .get(&uri)
+                .cloned()
+                .unwrap(),
+            Some(Vec::new())
+        );
+        let root = instance.config.root.clone();
+        drop(instance);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_change_during_diagnostic_settle_cannot_certify_the_older_mirror() {
+        let (instance, _server, path) = stamped_sync_fixture().await;
+        let uri = file_uri(&path).unwrap();
+        let before = vec![(None, "preexisting".to_owned())];
+        {
+            let mut state = instance.state.lock().await;
+            state.diagnostics.set(uri.clone(), Some(1), Vec::new());
+            state.baselines.insert(uri.clone(), Some(before.clone()));
+        }
+        let outcome = {
+            let verify = instance.edit_diagnostics(
+                &path,
+                tokio::time::Instant::now() + Duration::from_millis(50),
+                None,
+            );
+            tokio::pin!(verify);
+            // Poll verification into its settling wait before changing the disk.
+            tokio::select! {
+                biased;
+                _ = &mut verify => panic!("verification completed before its settling period"),
+                () = std::future::ready(()) => {}
+            }
+            std::fs::write(&path, "changed outside the mirror").unwrap();
+            verify.await.unwrap()
+        };
+        assert!(!outcome.fresh);
+        assert!(outcome.errors.is_empty());
+        assert_eq!(
+            instance
+                .state
+                .lock()
+                .await
+                .baselines
+                .get(&uri)
+                .cloned()
+                .unwrap(),
+            Some(before)
+        );
+
+        let content =
+            DocumentContent::read_capped(&path, crate::manager::MAX_CONTEXT_READ_BYTES).unwrap();
+        let version = {
+            let mut state = instance.state.lock().await;
+            state
+                .documents
+                .upsert_content(path.clone(), uri.clone(), "rust", content);
+            state.documents.get(&path).unwrap().version
+        };
+        assert_eq!(version, 2);
+        instance
+            .state
+            .lock()
+            .await
+            .diagnostics
+            .set(uri.clone(), Some(version), Vec::new());
+        let current = instance
+            .edit_diagnostics(&path, tokio::time::Instant::now(), None)
+            .await
+            .unwrap();
+        assert!(
+            current.fresh,
+            "the synchronized current disk version can be certified"
+        );
+        let root = instance.config.root.clone();
+        drop(instance);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn typescript_progress_never_certifies_rust_indexing() {
+        let state = Arc::new(Mutex::new(InstanceState::new(8)));
+        for token in [
+            json!(1),
+            json!("rustAnalyzer/Roots Scanned"),
+            json!("typescript/work"),
+        ] {
+            LspServerInstance::handle_notification(
+                &state,
+                Path::new("D:/demo"),
+                "typescript-language-server",
+                progress_notification(token, "begin"),
+            )
+            .await;
+        }
+        let state = state.lock().await;
+        assert!(!state.indexing_observed);
+        assert!(!state.indexing_active());
+    }
+
     #[tokio::test]
     async fn rust_analyzer_work_tokens_drive_indexing_flag() {
         let state = Arc::new(Mutex::new(InstanceState::new(8)));
@@ -1379,6 +1934,7 @@ mod tests {
         LspServerInstance::handle_notification(
             &state,
             root,
+            "rust-analyzer",
             progress_notification(serde_json::json!("rustAnalyzer/Roots Scanned"), "begin"),
         )
         .await;
@@ -1390,6 +1946,7 @@ mod tests {
         LspServerInstance::handle_notification(
             &state,
             root,
+            "rust-analyzer",
             progress_notification(serde_json::json!("rustAnalyzer/Roots Scanned"), "report"),
         )
         .await;
@@ -1397,6 +1954,7 @@ mod tests {
         LspServerInstance::handle_notification(
             &state,
             root,
+            "rust-analyzer",
             progress_notification(serde_json::json!("rustAnalyzer/Roots Scanned"), "end"),
         )
         .await;
@@ -1415,6 +1973,7 @@ mod tests {
             LspServerInstance::handle_notification(
                 &state,
                 root,
+                "rust-analyzer",
                 progress_notification(serde_json::json!(token), kind),
             )
             .await;
@@ -1431,6 +1990,7 @@ mod tests {
         LspServerInstance::handle_notification(
             &state,
             root,
+            "rust-analyzer",
             progress_notification(serde_json::json!("otherServer/work"), "begin"),
         )
         .await;

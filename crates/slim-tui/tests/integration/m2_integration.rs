@@ -127,15 +127,15 @@ fn tool_output_notification_preview_is_bounded() {
 
 #[test]
 fn layout_keeps_todo_composer_and_operational_rows_bounded() {
-    let regions = plan(100, 24, 2, false);
+    let regions = plan(100, 24, 2);
     assert_eq!(regions.todo.height, 2);
     assert_eq!(regions.todo_divider.height, 1);
     assert_eq!(regions.composer.height, 3);
     assert_eq!(regions.op_divider.height, 0);
     assert_eq!(regions.operational.height, 2);
     assert_eq!(regions.operational.y, regions.composer.y + 3);
-    assert_eq!(plan(100, 12, 0, false).operational.height, 2);
-    assert_eq!(plan(100, 11, 0, false).operational.height, 1);
+    assert_eq!(plan(100, 12, 0).operational.height, 2);
+    assert_eq!(plan(100, 11, 0).operational.height, 1);
     assert_eq!(visible_range(100, 98, 10), 98..100);
 }
 
@@ -479,11 +479,8 @@ fn context_percentage_is_stable_at_u64_boundaries() {
 
 #[test]
 fn tiny_terminal_returns_explicit_error_and_emergency_layout() {
-    assert_eq!(
-        plan_checked(39, 7, 2, false),
-        Err(LayoutError::TerminalTooSmall)
-    );
-    let emergency = plan(39, 7, 2, false);
+    assert_eq!(plan_checked(39, 7, 2), Err(LayoutError::TerminalTooSmall));
+    let emergency = plan(39, 7, 2);
     assert_eq!(emergency.composer.height, 1);
     assert_eq!(emergency.operational.height, 1);
 }

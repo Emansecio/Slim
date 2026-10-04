@@ -6,8 +6,8 @@ pub mod command_code_catalog;
 mod config;
 mod exit_codes;
 mod headless;
-mod jsonl;
 mod mcp;
+mod mcp_cli;
 pub mod oauth;
 pub mod opencode_go_catalog;
 pub mod opencode_zen_catalog;
@@ -23,14 +23,15 @@ pub use code_intel::install_code_intel;
 pub use config::Config;
 pub use exit_codes::ExitCode;
 pub use headless::{
-    load_local_images, render_provider_jsonl, render_provider_text, render_provider_verbose_text,
-    render_text, run_fake_headless, run_provider_headless, run_provider_headless_with_options,
-    run_provider_headless_with_resume, run_provider_headless_with_resume_and_options,
-    run_provider_headless_with_session, run_provider_headless_with_session_and_options,
-    HeadlessRequest, HeadlessResult, OutputFormat, ProviderHeadlessResult, ProviderRequest,
-    ProviderRunOptions, ToolJobOutputFact, ToolProcessFact, UsageCostSummary, MAX_IMAGE_BYTES,
+    load_local_images, render_jsonl, render_provider_jsonl, render_provider_text,
+    render_provider_verbose_text, render_text, run_fake_headless, run_provider_headless,
+    run_provider_headless_with_options, run_provider_headless_with_resume,
+    run_provider_headless_with_resume_and_options, run_provider_headless_with_session,
+    run_provider_headless_with_session_and_options, HeadlessRequest, HeadlessResult, OutputFormat,
+    ProviderHeadlessResult, ProviderRequest, ProviderRunOptions, ToolJobOutputFact,
+    ToolProcessFact, UsageCostSummary, MAX_IMAGE_BYTES,
 };
-pub use jsonl::render_jsonl;
+pub use mcp_cli::run_mcp_cli;
 pub use tui::{
     run_provider_tui_turn, run_tui, spawn_tui_runtime, spawn_tui_runtime_with_resume, TuiError,
     TuiRuntimeHandle,

@@ -16,7 +16,7 @@ use serde_json::json;
 use slim_core::context::CompactionHandle;
 use slim_core::mcp::{
     McpCancellation, McpCleanupStatus, McpConnection, McpError, McpInterruption, McpManager,
-    McpRequestOutcome, McpServerSpec, McpToolSummary, McpTransport,
+    McpProgress, McpProgressSink, McpRequestOutcome, McpServerSpec, McpToolSummary, McpTransport,
 };
 use slim_core::process::ExecutableResolver;
 use slim_core::runtime::{AgentLoopConfig, AgentLoopStop, CancellationToken};
@@ -291,7 +291,7 @@ fn cancellation_interrupts_an_idle_compaction_provider_request() {
         let mut request = [0_u8; 64 * 1024];
         let size = stream.read(&mut request).expect("request");
         let body = String::from_utf8_lossy(&request[..size]);
-        assert!(body.contains("You are a context compactor"));
+        assert!(body.contains("You are a context summarization assistant"));
         stream
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
@@ -335,7 +335,10 @@ fn cancellation_interrupts_an_idle_compaction_provider_request() {
     });
     let mut runtime = Runtime::new();
     runtime.set_cancellation_token(cancellation);
-    let handle = CompactionHandle::default();
+    let handle = CompactionHandle::new(slim_core::context::CompactionPolicy {
+        keep_recent_tokens: 1,
+        ..slim_core::context::CompactionPolicy::default()
+    });
     handle
         .request_manual("")
         .expect("queue summary so cancellation can interrupt the provider request");
@@ -384,6 +387,46 @@ fn cancellation_interrupts_an_idle_compaction_provider_request() {
         .events()
         .iter()
         .any(|event| matches!(event.kind, EventKind::CompactionCompleted)));
+}
+
+#[test]
+fn an_idle_compaction_cancelled_before_seeding_hands_the_history_back_unchanged() {
+    // Nothing listens: the token is already cancelled, so no request is made.
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        "http://127.0.0.1:9",
+        "fixture-model",
+        "fixture-key",
+    ))
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let mut runtime = Runtime::new();
+    runtime.set_cancellation_token(cancellation);
+    let handle = CompactionHandle::new(slim_core::context::CompactionPolicy::default());
+    handle.request_manual("").expect("queue summary");
+    runtime.set_compaction_handle(handle);
+    let messages = vec![
+        ProviderMessage::user("root instruction"),
+        ProviderMessage::assistant("prior transcript", Vec::new()),
+    ];
+    let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let result = tokio_runtime
+        .block_on(runtime.compact_messages(
+            &client,
+            &messages,
+            OperatingMode::Auto,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig::default(),
+        ))
+        .expect("cancellation is a loop result");
+    assert_eq!(result.stop, AgentLoopStop::Cancelled);
+    assert_eq!(
+        runtime.conversation(),
+        messages.as_slice(),
+        "a cancelled idle compaction must not leave the session with an empty history"
+    );
 }
 
 #[test]
@@ -666,6 +709,7 @@ fn cancellation_during_mcp_call_finishes_lifecycle_with_uncertain_output_and_con
         },
         enabled: true,
         timeout: Duration::from_secs(5),
+        options: Default::default(),
     };
     let manager = Arc::new(McpManager::new(
         std::collections::BTreeMap::from([(spec.name.clone(), spec.clone())]),
@@ -676,6 +720,7 @@ fn cancellation_during_mcp_call_finishes_lifecycle_with_uncertain_output_and_con
         spec,
         connection.clone() as Arc<dyn McpConnection>,
         vec![McpToolSummary {
+            output_schema: None,
             name: "ping".into(),
             description: Some("controlled cancellation fixture".into()),
             schema: json!({"type":"object"}),
@@ -765,6 +810,204 @@ fn cancellation_during_mcp_call_finishes_lifecycle_with_uncertain_output_and_con
     assert_eq!(
         result.next_seq,
         events.last().expect("event journal").seq + 1
+    );
+}
+
+/// Connection whose `tools/call` reports progress (the message embeds a
+/// secret and the burst is far faster than the throttle) before returning.
+struct ProgressMcpConnection {
+    saw_progress_token_request: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl McpConnection for ProgressMcpConnection {
+    async fn request(
+        &self,
+        method: &str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, McpError> {
+        Err(McpError::Protocol(format!("unexpected request: {method}")))
+    }
+
+    async fn request_with_progress(
+        &self,
+        method: &str,
+        _params: serde_json::Value,
+        _cancellation: McpCancellation,
+        progress: Option<McpProgressSink>,
+    ) -> McpRequestOutcome<serde_json::Value> {
+        assert_eq!(method, "tools/call");
+        let sink = progress.expect("tool calls always carry a progress sink");
+        self.saw_progress_token_request
+            .store(true, Ordering::Release);
+        for step in 1..=40u32 {
+            sink(McpProgress {
+                progress: f64::from(step),
+                total: Some(40.0),
+                message: Some(format!("syncing with tok-progress-secret step {step}")),
+            });
+        }
+        McpRequestOutcome::Completed(Ok(json!({
+            "content": [{"type": "text", "text": "synced"}],
+            "isError": false,
+        })))
+    }
+
+    async fn notify(&self, _method: &str, _params: serde_json::Value) {}
+
+    fn is_closed(&self) -> bool {
+        false
+    }
+}
+
+#[test]
+fn mcp_server_progress_becomes_bounded_redacted_tool_progress_events() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let mut stream = accept_with_deadline(&listener);
+        let mut request = [0_u8; 16 * 1024];
+        let size = stream.read(&mut request).expect("provider request");
+        assert!(size > 0, "provider request reached fixture");
+        let arguments = json!({"server": "fixture", "tool": "ping", "arguments": {}});
+        let call = json!({
+            "choices": [{
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "mcp-call-progress",
+                    "function": {"name": "mcp", "arguments": arguments.to_string()},
+                }]},
+                "finish_reason": "tool_calls",
+            }],
+        });
+        write_sse(
+            &mut stream,
+            &format!(
+                "data: {call}
+
+data: [DONE]
+
+"
+            ),
+        );
+    });
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-key",
+    ))
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+    let connection = Arc::new(ProgressMcpConnection {
+        saw_progress_token_request: AtomicBool::new(false),
+    });
+    let spec = McpServerSpec::new(
+        "fixture",
+        McpTransport::Stdio {
+            command: "controlled-test-connection".into(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+        },
+    );
+    let manager = Arc::new(McpManager::new(
+        std::collections::BTreeMap::from([(spec.name.clone(), spec.clone())]),
+        PathBuf::from("."),
+        ExecutableResolver::default(),
+    ));
+    manager.insert_connection(
+        spec,
+        connection.clone() as Arc<dyn McpConnection>,
+        vec![McpToolSummary {
+            output_schema: None,
+            name: "ping".into(),
+            description: None,
+            schema: json!({"type":"object"}),
+        }],
+    );
+
+    let mut runtime = Runtime::new();
+    runtime.register_sensitive_value("tok-progress-secret");
+    runtime.set_mcp_manager(Some(manager));
+    let (event_tx, event_rx) = SessionEventSender::bounded(256, CancellationToken::new());
+    runtime.app.set_event_sender(event_tx);
+    let result = tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "make one MCP call that reports progress",
+            OperatingMode::Auto,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig {
+                max_turns: 1,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .expect("loop result");
+    server.join().expect("provider fixture");
+
+    assert!(connection
+        .saw_progress_token_request
+        .load(Ordering::Acquire));
+    assert_eq!(result.tool_results.len(), 1);
+    assert!(
+        result.tool_results[0].success,
+        "{:?}",
+        result.tool_results[0]
+    );
+    assert_eq!(result.tool_results[0].output, "synced");
+
+    let mut kinds = Vec::new();
+    while let Ok(event) = event_rx.try_recv() {
+        kinds.push((event.seq, event.kind));
+    }
+    let started = kinds
+        .iter()
+        .find_map(|(seq, kind)| {
+            matches!(kind, EventKind::ToolStarted { call_id, .. } if call_id == "mcp-call-progress")
+                .then_some(*seq)
+        })
+        .expect("tool started");
+    let finished = kinds
+        .iter()
+        .find_map(|(seq, kind)| {
+            matches!(kind, EventKind::ToolFinished { call_id, .. } if call_id == "mcp-call-progress")
+                .then_some(*seq)
+        })
+        .expect("tool finished");
+    let previews: Vec<(u64, String)> = kinds
+        .iter()
+        .filter_map(|(seq, kind)| match kind {
+            EventKind::ToolProgress {
+                call_id,
+                name,
+                preview,
+                ..
+            } if call_id == "mcp-call-progress" => {
+                assert_eq!(name, "mcp");
+                Some((*seq, preview.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(!previews.is_empty(), "progress must surface: {kinds:?}");
+    assert!(
+        previews.len() <= 3,
+        "a 40-update burst is throttled, got {}",
+        previews.len()
+    );
+    for (seq, preview) in &previews {
+        assert!(
+            *seq > started && *seq < finished,
+            "{seq} outside {started}..{finished}"
+        );
+        assert!(!preview.contains("tok-progress-secret"), "{preview}");
+        assert!(preview.contains("[REDACTED]"), "{preview}");
+        assert!(preview.starts_with("progress "), "{preview}");
+    }
+    assert!(
+        previews.last().unwrap().1.starts_with("progress 40/40"),
+        "the completing update always passes: {previews:?}"
     );
 }
 
@@ -931,6 +1174,7 @@ fn cancellation_during_initialized_notification_reports_unconfirmed_cleanup_with
         },
         enabled: true,
         timeout: Duration::from_secs(5),
+        options: Default::default(),
     };
     let manager = Arc::new(McpManager::new(
         std::collections::BTreeMap::from([(spec.name.clone(), spec)]),

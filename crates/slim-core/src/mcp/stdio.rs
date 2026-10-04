@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 
+use crate::mcp::client::{parse_progress, ClientContext, McpProgress, McpProgressSink};
 use crate::mcp::spec::{
     McpCancellation, McpCleanupStatus, McpConnection, McpError, McpInterruption, McpRequestOutcome,
 };
@@ -18,9 +19,16 @@ use crate::process::ExecutableResolver;
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
 const OUTBOUND_QUEUE_CAPACITY: usize = 256;
-const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
+/// How long a cancellation waits for `notifications/cancelled` to reach the
+/// server's stdin before the transport is torn down regardless.
+const CANCEL_FLUSH_WAIT: Duration = Duration::from_millis(200);
+/// Pause after the notice is written so the server can read it before the
+/// transport is torn down; teardown kills the process right after.
+const CANCEL_READ_GRACE: Duration = Duration::from_millis(100);
 const CLOSE_WAIT_LIMIT: Duration = Duration::from_millis(900);
 const REAPER_WAIT_LIMIT: Duration = Duration::from_millis(800);
+/// How long a crashed server's stderr may take to reach the diagnostics.
+const DIAGNOSTIC_GRACE: Duration = Duration::from_millis(250);
 
 /// One framed stdout line: a protocol message or a non-JSON line. Real-world
 /// servers sometimes pollute stdout with log lines; those become `Noise`
@@ -86,6 +94,9 @@ type PendingMap = Arc<Mutex<HashMap<u64, Arc<RequestState>>>>;
 enum OutboundMessage {
     Request(RequestEnvelope),
     Notification(Value),
+    /// A message the sender waits to see written (cancellation notices that
+    /// must reach the server before the transport is closed).
+    Flushed(Value, tokio::sync::oneshot::Sender<()>),
 }
 
 struct RequestEnvelope {
@@ -100,9 +111,12 @@ struct RequestEnvelope {
 struct RequestState {
     phase: Mutex<RequestPhase>,
     notify: Notify,
-    deadline: Instant,
+    /// Moves forward on every progress notification of a progress-tracked
+    /// request, so a long-running tool call is not cut at its first timeout.
+    deadline: Mutex<Instant>,
     timeout: Duration,
     cancellation: McpCancellation,
+    progress: Option<McpProgressSink>,
 }
 
 enum RequestPhase {
@@ -127,10 +141,48 @@ impl RequestState {
         Self {
             phase: Mutex::new(RequestPhase::Queued),
             notify: Notify::new(),
-            deadline,
+            deadline: Mutex::new(deadline),
             timeout,
             cancellation,
+            progress: None,
         }
+    }
+
+    fn with_progress(mut self, progress: Option<McpProgressSink>) -> Self {
+        self.progress = progress;
+        self
+    }
+
+    fn deadline(&self) -> Instant {
+        *self
+            .deadline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A progress notification for this request: renews the timeout while the
+    /// request is in flight and hands the update to the sink.
+    fn on_progress(&self, progress: McpProgress) {
+        let Some(sink) = self.progress.as_ref() else {
+            return;
+        };
+        let in_flight = matches!(
+            *self
+                .phase
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            RequestPhase::Sending | RequestPhase::Awaiting
+        );
+        if !in_flight {
+            return;
+        }
+        *self
+            .deadline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now() + self.timeout;
+        // Wake the waiter so it re-reads the moved deadline.
+        self.notify.notify_one();
+        sink(progress);
     }
 
     fn admit_send(
@@ -191,7 +243,7 @@ impl RequestState {
         }
         *phase = if self.cancellation.is_cancelled() {
             RequestPhase::OutcomeUncertain(McpInterruption::Cancelled)
-        } else if Instant::now() >= self.deadline {
+        } else if Instant::now() >= self.deadline() {
             RequestPhase::OutcomeUncertain(McpInterruption::TimedOut(self.timeout))
         } else {
             RequestPhase::Completed(Some(result))
@@ -489,7 +541,7 @@ pub(crate) struct StdioConnection {
     outbound: mpsc::SyncSender<OutboundMessage>,
     close: Arc<CloseControl>,
     next_id: AtomicU64,
-    tools_stale: Arc<AtomicBool>,
+    context: Arc<ClientContext>,
     stderr_tail: Arc<Mutex<VecDeque<u8>>>,
     stdout_noise: Arc<Mutex<String>>,
     timeout: Duration,
@@ -503,6 +555,7 @@ impl StdioConnection {
         cwd: &Path,
         timeout: Duration,
         resolver: &ExecutableResolver,
+        context: Arc<ClientContext>,
     ) -> Result<Arc<Self>, McpError> {
         let program = resolver.resolve(command)?.ok_or_else(|| {
             McpError::Io(std::io::Error::new(
@@ -569,7 +622,6 @@ impl StdioConnection {
             cleanup_started_at: Mutex::new(None),
             cleanup_notify: Notify::new(),
         });
-        let tools_stale = Arc::new(AtomicBool::new(false));
         let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
         let stdout_noise = Arc::new(Mutex::new(String::new()));
         let start = Arc::new(Barrier::new(4));
@@ -579,7 +631,7 @@ impl StdioConnection {
             spawn_reader(
                 stdout,
                 Arc::clone(&close),
-                Arc::clone(&tools_stale),
+                Arc::clone(&context),
                 Arc::clone(&stdout_noise),
                 outbound_tx.clone(),
                 Arc::clone(&start),
@@ -596,7 +648,7 @@ impl StdioConnection {
             outbound: outbound_tx,
             close,
             next_id: AtomicU64::new(1),
-            tools_stale,
+            context,
             stderr_tail,
             stdout_noise,
             timeout,
@@ -635,16 +687,20 @@ impl StdioConnection {
     async fn request_inner(
         &self,
         method: &str,
-        params: Value,
+        mut params: Value,
         cancellation: McpCancellation,
+        progress: Option<McpProgressSink>,
     ) -> McpRequestOutcome<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let deadline = Instant::now() + self.timeout;
-        let state = Arc::new(RequestState::new(
-            deadline,
-            self.timeout,
-            cancellation.clone(),
-        ));
+        if progress.is_some() {
+            // The request id doubles as the progress token: it is unique per
+            // connection and lets the reader find the pending request.
+            attach_progress_token(&mut params, id);
+        }
+        let state = Arc::new(
+            RequestState::new(deadline, self.timeout, cancellation.clone()).with_progress(progress),
+        );
         {
             let mut pending = self
                 .close
@@ -708,14 +764,16 @@ impl StdioConnection {
             }
             if cancellation.is_cancelled() {
                 let outcome = self
-                    .interrupt_request(&state, id, McpInterruption::Cancelled)
+                    .interrupt_request(&state, id, method, McpInterruption::Cancelled)
                     .await;
                 drop(guard);
                 return outcome;
             }
+            // Progress notifications move the deadline forward.
+            let deadline = state.deadline();
             if Instant::now() >= deadline {
                 let outcome = self
-                    .interrupt_request(&state, id, McpInterruption::TimedOut(self.timeout))
+                    .interrupt_request(&state, id, method, McpInterruption::TimedOut(self.timeout))
                     .await;
                 drop(guard);
                 return outcome;
@@ -728,10 +786,45 @@ impl StdioConnection {
         }
     }
 
+    /// Best-effort `notifications/cancelled` for a request the server may
+    /// already be executing. It is written before the transport is closed so
+    /// a well-behaved server can stop the work; the wait is bounded because
+    /// the server may not be reading its stdin at all.
+    async fn send_cancelled(&self, id: u64, interruption: &McpInterruption) {
+        if self.close.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let reason = match interruption {
+            McpInterruption::Cancelled => "Request cancelled by client",
+            McpInterruption::TimedOut(_) => "Request timed out",
+            McpInterruption::ConnectionClosed => return,
+        };
+        let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": id, "reason": reason},
+        });
+        if self
+            .outbound
+            .try_send(OutboundMessage::Flushed(message, written_tx))
+            .is_err()
+        {
+            return;
+        }
+        if matches!(
+            tokio::time::timeout(CANCEL_FLUSH_WAIT, written_rx).await,
+            Ok(Ok(()))
+        ) {
+            tokio::time::sleep(CANCEL_READ_GRACE).await;
+        }
+    }
+
     async fn interrupt_request(
         &self,
         state: &Arc<RequestState>,
         id: u64,
+        method: &str,
         interruption: McpInterruption,
     ) -> McpRequestOutcome<Value> {
         match state.interrupt(interruption) {
@@ -745,6 +838,10 @@ impl StdioConnection {
             }
             InterruptedRequest::Uncertain(interruption) => {
                 remove_pending(&self.close.pending, id, state);
+                // The spec forbids cancelling `initialize`.
+                if method != "initialize" {
+                    self.send_cancelled(id, &interruption).await;
+                }
                 self.close.close_once();
                 McpRequestOutcome::OutcomeUncertain {
                     interruption,
@@ -761,7 +858,7 @@ impl StdioConnection {
 #[async_trait::async_trait]
 impl McpConnection for StdioConnection {
     async fn request(&self, method: &str, params: Value) -> Result<Value, McpError> {
-        self.request_inner(method, params, McpCancellation::new())
+        self.request_inner(method, params, McpCancellation::new(), None)
             .await
             .into_result()
     }
@@ -772,7 +869,18 @@ impl McpConnection for StdioConnection {
         params: Value,
         cancellation: McpCancellation,
     ) -> McpRequestOutcome<Value> {
-        self.request_inner(method, params, cancellation).await
+        self.request_inner(method, params, cancellation, None).await
+    }
+
+    async fn request_with_progress(
+        &self,
+        method: &str,
+        params: Value,
+        cancellation: McpCancellation,
+        progress: Option<McpProgressSink>,
+    ) -> McpRequestOutcome<Value> {
+        self.request_inner(method, params, cancellation, progress)
+            .await
     }
 
     async fn notify(&self, method: &str, params: Value) {
@@ -793,12 +901,27 @@ impl McpConnection for StdioConnection {
         self.close.wait_cleanup().await
     }
 
+    async fn closed_reason(&self) -> Option<McpError> {
+        // stderr is drained on its own thread: give it a moment to catch up
+        // with a process that has just exited (it is what explains a crash;
+        // stdout noise is a fallback and is already read in order).
+        let deadline = Instant::now() + DIAGNOSTIC_GRACE;
+        while self.stderr_tail_text().is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Some(self.closed_error())
+    }
+
     fn take_tools_stale(&self) -> bool {
-        self.tools_stale.swap(false, Ordering::Relaxed)
+        self.context.take_tools_stale()
     }
 
     fn mark_tools_stale(&self) {
-        self.tools_stale.store(true, Ordering::Relaxed);
+        self.context.mark_tools_stale();
+    }
+
+    fn take_resources_stale(&self) -> bool {
+        self.context.take_resources_stale()
     }
 }
 
@@ -830,6 +953,7 @@ fn spawn_writer(
             if close.closed.load(Ordering::Acquire) {
                 break;
             }
+            let mut written_ack = None;
             let (message, request) = match message {
                 OutboundMessage::Request(envelope) => {
                     let admitted = {
@@ -851,6 +975,10 @@ fn spawn_writer(
                     (envelope.message, Some(envelope.state))
                 }
                 OutboundMessage::Notification(message) => (message, None),
+                OutboundMessage::Flushed(message, ack) => {
+                    written_ack = Some(ack);
+                    (message, None)
+                }
             };
             let Ok(bytes) = serde_json::to_vec(&message) else {
                 close.close_once();
@@ -868,6 +996,9 @@ fn spawn_writer(
             if let Some(request) = request {
                 request.mark_awaiting();
             }
+            if let Some(ack) = written_ack {
+                let _ = ack.send(());
+            }
         }
         close.close_once();
     })
@@ -876,7 +1007,7 @@ fn spawn_writer(
 fn spawn_reader(
     mut stdout: impl Read + Send + 'static,
     close: Arc<CloseControl>,
-    tools_stale: Arc<AtomicBool>,
+    context: Arc<ClientContext>,
     stdout_noise: Arc<Mutex<String>>,
     outbound: mpsc::SyncSender<OutboundMessage>,
     start: Arc<Barrier>,
@@ -896,7 +1027,7 @@ fn spawn_reader(
             for line in framer.push(&chunk[..read]) {
                 match line {
                     FramedLine::Message(message) => {
-                        dispatch_inbound(message, &close.pending, &tools_stale, &outbound);
+                        dispatch_inbound(message, &close.pending, &context, &outbound);
                     }
                     FramedLine::Noise(noise) => {
                         *stdout_noise
@@ -910,22 +1041,35 @@ fn spawn_reader(
     })
 }
 
+/// Adds `_meta.progressToken` to request params, keeping any existing
+/// `_meta` members.
+fn attach_progress_token(params: &mut Value, token: u64) {
+    if params.is_null() {
+        *params = json!({});
+    }
+    let Some(params) = params.as_object_mut() else {
+        return;
+    };
+    let meta = params.entry("_meta").or_insert_with(|| json!({}));
+    if let Some(meta) = meta.as_object_mut() {
+        meta.insert("progressToken".to_owned(), json!(token));
+    }
+}
+
 fn dispatch_inbound(
     message: Value,
     pending: &PendingMap,
-    tools_stale: &Arc<AtomicBool>,
+    context: &Arc<ClientContext>,
     outbound: &mpsc::SyncSender<OutboundMessage>,
 ) {
     if let Some(id) = message.get("id") {
-        if message.get("method").is_some() {
-            // Server-to-client request: sampling, elicitation, roots, etc.
-            // v1 answers all of them with MethodNotFound so servers fail fast.
-            // `id` is echoed verbatim — JSON-RPC allows string ids too.
-            let _ = outbound.try_send(OutboundMessage::Notification(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {"code": JSONRPC_METHOD_NOT_FOUND, "message": "unsupported"},
-            })));
+        if let Some(method) = message.get("method") {
+            // Server-to-client request: `ping` and `roots/list` are served;
+            // sampling, elicitation, etc. get MethodNotFound so servers fail
+            // fast. `id` is echoed verbatim — JSON-RPC allows string ids too.
+            let _ = outbound.try_send(OutboundMessage::Notification(
+                context.answer_request(id, method.as_str().unwrap_or_default()),
+            ));
             return;
         }
         let Some(id) = id.as_u64() else {
@@ -958,9 +1102,24 @@ fn dispatch_inbound(
         }
         return;
     }
-    if message.get("method").and_then(Value::as_str) == Some("notifications/tools/list_changed") {
-        tools_stale.store(true, Ordering::Relaxed);
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        return;
+    };
+    let params = message.get("params").unwrap_or(&Value::Null);
+    if method == "notifications/progress" {
+        if let Some((token, progress)) = parse_progress(params) {
+            let state = pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&token)
+                .cloned();
+            if let Some(state) = state {
+                state.on_progress(progress);
+            }
+        }
+        return;
     }
+    context.on_notification(method, params);
 }
 
 fn spawn_stderr_reader(
@@ -1044,7 +1203,7 @@ mod tests {
             outbound,
             close,
             next_id: AtomicU64::new(1),
-            tools_stale: Arc::new(AtomicBool::new(false)),
+            context: ClientContext::detached(),
             stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
             stdout_noise: Arc::new(Mutex::new(String::new())),
             timeout,
@@ -1435,7 +1594,7 @@ mod tests {
         dispatch_inbound(
             json!({"jsonrpc":"2.0","id":7,"result":{"ok":true}}),
             &pending,
-            &Arc::new(AtomicBool::new(false)),
+            &ClientContext::detached(),
             &mpsc::sync_channel(1).0,
         );
         cancellation.cancel();
@@ -1468,7 +1627,7 @@ mod tests {
         dispatch_inbound(
             json!({"jsonrpc":"2.0","id":8,"result":{"late":true}}),
             &pending,
-            &Arc::new(AtomicBool::new(false)),
+            &ClientContext::detached(),
             &mpsc::sync_channel(1).0,
         );
 
@@ -1501,13 +1660,13 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(12, Arc::clone(&new_state));
-        let tools_stale = Arc::new(AtomicBool::new(false));
+        let context = ClientContext::detached();
         let (outbound, _receiver) = mpsc::sync_channel(1);
 
         dispatch_inbound(
             json!({"jsonrpc":"2.0","id":11,"result":{"old":true}}),
             &pending,
-            &tools_stale,
+            &context,
             &outbound,
         );
 
@@ -1527,7 +1686,7 @@ mod tests {
         dispatch_inbound(
             json!({"jsonrpc":"2.0","id":12,"result":{"new":true}}),
             &pending,
-            &tools_stale,
+            &context,
             &outbound,
         );
         assert!(matches!(
@@ -1744,7 +1903,12 @@ mod tests {
         let request_connection = Arc::clone(&connection);
         let request = tokio::spawn(async move {
             request_connection
-                .request_inner("tools/call", json!({"name":"ping"}), McpCancellation::new())
+                .request_inner(
+                    "tools/call",
+                    json!({"name":"ping"}),
+                    McpCancellation::new(),
+                    None,
+                )
                 .await
         });
         barrier.wait();
@@ -1815,7 +1979,7 @@ mod tests {
         let connection = connection(outbound, Arc::clone(&close), Duration::from_secs(5));
 
         let outcome = connection
-            .request_inner("tools/list", json!({}), McpCancellation::new())
+            .request_inner("tools/list", json!({}), McpCancellation::new(), None)
             .await;
 
         assert!(matches!(
@@ -1909,7 +2073,12 @@ mod tests {
         let request_connection = Arc::clone(&connection);
         let request = tokio::spawn(async move {
             request_connection
-                .request_inner("tools/call", json!({"name":"ping"}), McpCancellation::new())
+                .request_inner(
+                    "tools/call",
+                    json!({"name":"ping"}),
+                    McpCancellation::new(),
+                    None,
+                )
                 .await
         });
         let state = tokio::time::timeout(Duration::from_secs(2), async {
@@ -2007,5 +2176,120 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty());
         assert!(close.closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn progress_token_is_added_beside_existing_meta_and_to_empty_params() {
+        let mut params = json!({"name": "x", "_meta": {"trace": "t"}});
+        attach_progress_token(&mut params, 9);
+        assert_eq!(
+            params,
+            json!({"name": "x", "_meta": {"trace": "t", "progressToken": 9}})
+        );
+        let mut empty = Value::Null;
+        attach_progress_token(&mut empty, 3);
+        assert_eq!(empty, json!({"_meta": {"progressToken": 3}}));
+    }
+
+    #[test]
+    fn progress_renews_only_requests_in_flight_and_only_when_tracked() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let sink: McpProgressSink = Arc::new(move |update| {
+            sink_seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(update.progress);
+        });
+        let timeout = Duration::from_secs(10);
+        let cancellation = McpCancellation::new();
+        let initial = Instant::now() + Duration::from_millis(50);
+        let state = Arc::new(
+            RequestState::new(initial, timeout, cancellation.clone()).with_progress(Some(sink)),
+        );
+        let update = |progress: f64| McpProgress {
+            progress,
+            total: None,
+            message: None,
+        };
+
+        state.on_progress(update(1.0));
+        assert_eq!(state.deadline(), initial, "queued requests are not renewed");
+        assert!(seen.lock().unwrap().is_empty());
+
+        assert!(state.admit_send(initial, timeout, &cancellation, &AtomicBool::new(false)));
+        state.mark_awaiting();
+        state.on_progress(update(2.0));
+        assert!(state.deadline() > initial + Duration::from_secs(5));
+        assert_eq!(*seen.lock().unwrap(), [2.0]);
+
+        assert!(state.complete(Ok(json!({}))));
+        let renewed = state.deadline();
+        state.on_progress(update(3.0));
+        assert_eq!(state.deadline(), renewed, "finished requests stay finished");
+        assert_eq!(*seen.lock().unwrap(), [2.0]);
+
+        let untracked = request_state(timeout, McpCancellation::new());
+        assert!(untracked.admit_send(
+            Instant::now() + timeout,
+            timeout,
+            &untracked.cancellation,
+            &AtomicBool::new(false),
+        ));
+        let before = untracked.deadline();
+        untracked.on_progress(update(1.0));
+        assert_eq!(untracked.deadline(), before, "no token, no renewal");
+    }
+
+    #[tokio::test]
+    async fn cancellation_notice_is_written_before_close_and_skipped_when_closed() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let close = close_control(pending);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (outbound, receiver) = mpsc::sync_channel(4);
+        let barrier = Arc::new(Barrier::new(2));
+        let writer = spawn_writer(
+            RecordingWriter(Arc::clone(&bytes)),
+            receiver,
+            Arc::clone(&close),
+            Arc::clone(&barrier),
+        );
+        barrier.wait();
+        let connection = connection(outbound, Arc::clone(&close), Duration::from_secs(5));
+
+        connection
+            .send_cancelled(41, &McpInterruption::TimedOut(Duration::from_secs(5)))
+            .await;
+        let written = String::from_utf8(
+            bytes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+        .unwrap();
+        let message: Value = serde_json::from_str(written.trim()).expect("one JSON line");
+        assert_eq!(message["method"], "notifications/cancelled");
+        assert_eq!(message["params"]["requestId"], 41);
+        assert_eq!(message["params"]["reason"], "Request timed out");
+        assert!(message.get("id").is_none(), "a notification has no id");
+
+        // A closed transport gets nothing, and a connection-closed reason is
+        // not worth a notice.
+        let before = written.len();
+        connection
+            .send_cancelled(42, &McpInterruption::ConnectionClosed)
+            .await;
+        close.close_once();
+        connection
+            .send_cancelled(43, &McpInterruption::Cancelled)
+            .await;
+        writer.join().expect("writer exits once closed");
+        assert_eq!(
+            bytes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            before
+        );
     }
 }

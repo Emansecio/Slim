@@ -1,6 +1,5 @@
 use super::super::temp_root::TempRoot;
-use super::compaction::MAX_COMPACTION_SNAPSHOT_BYTES;
-use super::{CausalGovernor, GovernorObservation, ValidationResult};
+use super::{CausalGovernor, GovernorObservation};
 use crate::runtime::CancellationToken;
 use crate::tools::{
     PreparedToolInvocation, ToolExecutionOutcome, ToolExecutionReceipt, ToolRegistry, ToolResult,
@@ -145,22 +144,6 @@ fn has_boundary(observed: &[GovernorObservation]) -> bool {
     observed
         .iter()
         .any(|observation| matches!(observation, GovernorObservation::Boundary { .. }))
-}
-
-/// Exige (e proíbe) trechos no snapshot, mostrando-o inteiro na falha.
-fn assert_snapshot(snapshot: &str, contains: &[&str], absent: &[&str]) {
-    for needle in contains {
-        assert!(
-            snapshot.contains(needle),
-            "snapshot lacks {needle:?}:\n{snapshot}"
-        );
-    }
-    for needle in absent {
-        assert!(
-            !snapshot.contains(needle),
-            "snapshot must not contain {needle:?}:\n{snapshot}"
-        );
-    }
 }
 
 #[test]
@@ -428,15 +411,18 @@ fn validation_finishing_after_a_mutation_does_not_certify_the_new_state() {
         !rig.governor.validations_satisfied(),
         "a validation that started before the mutation tested the old state"
     );
-    assert_snapshot(
-        &rig.governor.compaction_snapshot(1),
-        &[
-            "call_id=\"late-validation\"",
-            "validation_revision=0",
-            "current=false",
-        ],
-        &[],
-    );
+    let validation = rig
+        .governor
+        .ledger
+        .validations
+        .values()
+        .next()
+        .expect("the late validation is recorded");
+    assert_eq!(validation.workspace_revision, 0);
+    assert!(!rig
+        .governor
+        .ledger
+        .is_current(validation.workspace_revision, validation.uncertainty_epoch));
 
     let revision = rig.registry.workspace_revision();
     rig.feed(
@@ -581,38 +567,6 @@ fn bounded_maps_replace_known_keys_and_refuse_new_ones_when_full() {
 }
 
 #[test]
-fn pending_failures_are_bounded_and_overflow_is_counted() {
-    let mut rig = Rig::new("failure-bound");
-    let failed = |rig: &mut Rig, index: usize| {
-        let prepared = rig.prep(
-            "read",
-            &serde_json::json!({"path": format!("missing-{index}.txt")}).to_string(),
-        );
-        let receipt = synthetic_receipt(0);
-        rig.feed(
-            &prepared,
-            &format!("call-{index}"),
-            &ToolResult::fail("read", "missing"),
-            &receipt,
-        );
-    };
-    for index in 0..300 {
-        failed(&mut rig, index);
-    }
-    assert_eq!(rig.governor.ledger.pending_failures.len(), 256);
-    assert_eq!(rig.governor.ledger.pending_failure_omitted, 44);
-    failed(&mut rig, 0);
-    assert_eq!(
-        rig.governor.ledger.pending_failure_omitted, 44,
-        "a known failure is replaced, not omitted"
-    );
-    assert!(rig
-        .governor
-        .compaction_snapshot(1)
-        .contains("omitted_observations failures="));
-}
-
-#[test]
 fn post_compaction_reacquisition_counts_the_same_stateful_call_once() {
     let mut rig = Rig::new("reacquisition");
     rig.put("state.txt", "stable\ntail\n");
@@ -700,26 +654,13 @@ fn validation_outcomes_require_each_failed_command_to_recover() {
 }
 
 #[test]
-fn compaction_snapshot_marks_validation_stale_after_mutation() {
+fn a_validation_goes_stale_after_a_mutation_and_survives_forgotten_evidence() {
     let mut rig = Rig::new("compaction-validation-stale");
     rig.put("changed.txt", "before");
     let prepared = rig.prep("shell", r#"{"command":"cargo","args":["check"]}"#);
     let green = shell_ok();
     rig.feed(&prepared, "validation-1", &green, &synthetic_receipt(0));
-
-    let fresh = rig.governor.compaction_snapshot(41);
-    assert_snapshot(
-        &fresh,
-        &[
-            "scope=compaction run_start_seq=41",
-            "call_id=\"validation-1\"",
-            "success=true",
-            "validation_revision=0",
-            "validation_epoch=0",
-            "current=true",
-        ],
-        &[],
-    );
+    assert!(rig.governor.validations_satisfied());
 
     let mutation = rig.prep(
         "write",
@@ -727,29 +668,14 @@ fn compaction_snapshot_marks_validation_stale_after_mutation() {
     );
     let (mutation_outcome, _) = rig.run(&mutation, "mutation-1");
     assert!(mutation_outcome.result.success);
-
-    let stale = rig.governor.compaction_snapshot(42);
-    let mutation_revision = format!("revision={}", mutation_outcome.receipt.revision_after);
-    assert_snapshot(
-        &stale,
-        &[
-            "call_id=\"validation-1\"",
-            "validation_revision=0",
-            "current=false",
-            "mutation path=",
-            "changed.txt",
-            &mutation_revision,
-        ],
-        &[],
+    assert!(
+        !rig.governor.validations_satisfied(),
+        "a validation of the old state does not certify the new one"
     );
 
+    // A compaction drops evidence, never what the validations established.
     rig.governor.forget_compacted_evidence();
-    let after_forget = rig.governor.compaction_snapshot(43);
-    assert_snapshot(
-        &after_forget,
-        &["success=true", "current=false", "changed.txt"],
-        &[],
-    );
+    assert!(!rig.governor.validations_satisfied());
 
     let revision = rig.registry.workspace_revision();
     rig.feed(
@@ -758,39 +684,19 @@ fn compaction_snapshot_marks_validation_stale_after_mutation() {
         &green,
         &synthetic_receipt(revision),
     );
-    let resolved = rig.governor.compaction_snapshot(44);
-    let validation_revision = format!("validation_revision={revision}");
-    assert_snapshot(
-        &resolved,
-        &[
-            "call_id=\"validation-2\"",
-            &validation_revision,
-            "current=true",
-        ],
-        &[],
-    );
+    assert!(rig.governor.validations_satisfied());
 }
 
 #[test]
-fn compaction_snapshot_keeps_failed_validation_until_exact_success() {
+fn a_failed_validation_stays_unresolved_until_the_same_command_succeeds() {
     let mut rig = Rig::new("compaction-validation-failure");
     let failed = rig.prep("shell", r#"{"command":"cargo","args":["check"]}"#);
     let failed_receipt = synthetic_receipt(0);
     rig.feed(&failed, "check-failed", &shell_failed(), &failed_receipt);
-    let initial = rig.governor.compaction_snapshot(50);
-    assert_snapshot(
-        &initial,
-        &["call_id=\"check-failed\"", "success=false", "current=true"],
-        &[],
-    );
+    assert!(!rig.governor.validations_satisfied());
 
     rig.governor.forget_compacted_evidence();
-    let retained = rig.governor.compaction_snapshot(51);
-    assert_snapshot(
-        &retained,
-        &["call_id=\"check-failed\"", "success=false"],
-        &[],
-    );
+    assert!(!rig.governor.validations_satisfied());
 
     let different = rig.prep("shell", r#"{"command":"cargo","args":["test"]}"#);
     let success_result = shell_ok();
@@ -800,140 +706,13 @@ fn compaction_snapshot_keeps_failed_validation_until_exact_success() {
         &success_result,
         &synthetic_receipt(0),
     );
-    let unresolved = rig.governor.compaction_snapshot(52);
-    assert_snapshot(
-        &unresolved,
-        &["call_id=\"check-failed\"", "success=false"],
-        &[],
+    assert!(
+        !rig.governor.validations_satisfied(),
+        "a different green command cannot resolve this command's failure"
     );
 
     rig.feed(&failed, "check-fixed", &success_result, &failed_receipt);
-    let resolved = rig.governor.compaction_snapshot(53);
-    assert_snapshot(
-        &resolved,
-        &["call_id=\"check-fixed\"", "success=true"],
-        &["call_id=\"check-failed\""],
-    );
     assert!(rig.governor.validations_satisfied());
-}
-
-#[test]
-fn compaction_snapshot_keeps_non_validation_failure_until_exact_success() {
-    let mut rig = Rig::new("compaction-failure");
-    rig.put("large-line.txt", oversized_line());
-    let prepared = rig.prep("read", r#"{"path":"large-line.txt","max_lines":1}"#);
-    let (failed, _) = rig.run(&prepared, "read-failed");
-    assert!(!failed.result.success);
-    assert_snapshot(
-        &rig.governor.compaction_snapshot(55),
-        &["failure tool=\"read\" call_id=\"read-failed\""],
-        &[],
-    );
-
-    rig.governor.forget_compacted_evidence();
-    assert_snapshot(
-        &rig.governor.compaction_snapshot(56),
-        &["pending=true"],
-        &[],
-    );
-
-    rig.put("large-line.txt", "small\n");
-    let (resolved, _) = rig.run(&prepared, "read-fixed");
-    assert!(resolved.result.success);
-    assert!(rig.governor.compaction_snapshot(57).is_empty());
-
-    // A rejected validation never reaches the validation ledger, so its
-    // failure must remain visible in the generic failure records.
-    let rejected = rig.prep("shell", r#"{"command":"cargo test","bogus":true}"#);
-    let (pending, _) = rig
-        .governor
-        .observe_before_identified(&rejected, "batch", "rejected-test");
-    assert!(pending.structural_rejection);
-    let outcome = rig.exec(&rejected);
-    rig.governor
-        .observe_after(pending, &outcome.result, &outcome.receipt);
-    assert_snapshot(
-        &rig.governor.compaction_snapshot(57),
-        &["failure tool=\"shell\" call_id=\"rejected-test\""],
-        &[],
-    );
-}
-
-#[test]
-fn compaction_snapshot_records_only_changed_mutation_paths() {
-    let mut rig = Rig::new("compaction-mutations");
-    rig.put("same.txt", "same");
-    rig.put("changed.txt", "before");
-
-    let unchanged = rig.prep(
-        "write",
-        r#"{"path":"same.txt","content":"same","expected":"same"}"#,
-    );
-    let (unchanged_outcome, _) = rig.run(&unchanged, "same");
-    assert!(unchanged_outcome.result.success);
-    assert!(unchanged_outcome
-        .receipt
-        .mutations
-        .iter()
-        .all(|mutation| !mutation.changed()));
-
-    let changed = rig.prep(
-        "write",
-        r#"{"path":"changed.txt","content":"after","expected":"before"}"#,
-    );
-    let (changed_outcome, _) = rig.run(&changed, "changed");
-    assert!(changed_outcome.result.success);
-    assert!(changed_outcome
-        .receipt
-        .mutations
-        .iter()
-        .any(|mutation| mutation.changed()));
-
-    let snapshot = rig.governor.compaction_snapshot(60);
-    assert_snapshot(&snapshot, &["changed.txt"], &["same.txt"]);
-}
-
-#[test]
-fn compaction_snapshot_is_deterministic_bounded_and_epoch_aware() {
-    let mut governor = CausalGovernor::default();
-    governor.ledger.workspace_revision = 7;
-    governor.ledger.validations.insert(
-        "validation-key".into(),
-        ValidationResult {
-            success: true,
-            tool_name: "tool\nname".into(),
-            call_id: "call\"id".into(),
-            workspace_revision: 7,
-            uncertainty_epoch: 0,
-        },
-    );
-    let fresh = governor.compaction_snapshot(70);
-    assert_snapshot(&fresh, &["tool\\nname", "call\\\"id", "current=true"], &[]);
-    assert_eq!(fresh, governor.compaction_snapshot(70));
-
-    governor.ledger.uncertainty_epoch = 1;
-    let stale = governor.compaction_snapshot(70);
-    assert_snapshot(&stale, &["uncertainty_epoch=1", "current=false"], &[]);
-
-    for index in 0..64 {
-        governor.ledger.validations.insert(
-            format!("{index:064x}"),
-            ValidationResult {
-                success: index % 2 == 0,
-                tool_name: "shell".into(),
-                call_id: format!("call-{index}"),
-                workspace_revision: 7,
-                uncertainty_epoch: 1,
-            },
-        );
-    }
-    let bounded = governor.compaction_snapshot(71);
-    assert!(bounded.len() <= MAX_COMPACTION_SNAPSHOT_BYTES);
-    assert_snapshot(
-        &bounded,
-        &["omitted_observations failures=0 validations="],
-        &[],
-    );
 }
 
 #[test]
@@ -1039,8 +818,10 @@ fn fused_validation_is_recorded_after_its_mutation_revision() {
     assert!(rig.governor.validations_satisfied());
     assert!(rig
         .governor
-        .compaction_snapshot(1)
-        .contains("validation_revision=1"));
+        .ledger
+        .validations
+        .values()
+        .any(|validation| validation.workspace_revision == 1));
 
     let mut cancelled = outcome;
     super::super::mark_cancelled_tool_outcome(&mut cancelled);
@@ -1079,8 +860,10 @@ fn fused_validation_is_recorded_after_its_mutation_revision() {
     assert!(!rig.governor.validations_satisfied());
     assert!(rig
         .governor
-        .compaction_snapshot(2)
-        .contains("validation_revision=2"));
+        .ledger
+        .validations
+        .values()
+        .any(|validation| validation.workspace_revision == 2));
 }
 
 #[test]

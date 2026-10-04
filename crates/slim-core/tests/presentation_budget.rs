@@ -176,3 +176,95 @@ fn four_medium_reads_fit_the_next_request_with_coherent_pages() {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+/// Crossing Pi's compaction line is not a reason to starve a result: the next
+/// turn's compaction keeps the newest tokens verbatim, so a batch that still
+/// fits the window is presented in full.
+#[test]
+fn a_batch_crossing_the_compaction_line_is_presented_in_full() {
+    let root = std::env::temp_dir().join(format!(
+        "slim-presentation-line-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let source = (0..400)
+        .map(|n| format!("ROW_{n:04}:{}\n", "x".repeat(90)))
+        .collect::<String>()
+        + "END_OK\n";
+    std::fs::write(root.join("big.txt"), &source).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut first, _) = request(&listener);
+        let call = json!({"index":0,"id":"read-0","function":{"name":"read","arguments":json!({"path":"big.txt"}).to_string()}});
+        respond(&mut first, json!({"tool_calls":[call]}), "tool_calls");
+        // Compaction may or may not fire on the next turn; either way the last
+        // model request carries the batch.
+        loop {
+            let (mut stream, wire) = request(&listener);
+            if wire.contains("You are a context summarization assistant") {
+                respond(&mut stream, json!({"content":"## Goal\nsummary"}), "stop");
+            } else {
+                respond(&mut stream, json!({"content":"done"}), "stop");
+                return wire;
+            }
+        }
+    });
+    let client = HttpProviderClient::new(
+        OpenAiCompatibleAdapter::new(ProviderConfig::openai(endpoint, "fixture", "fixture"))
+            .unwrap(),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let mut runtime = Runtime::with_artifact_store(root.join(".slim/artifacts")).unwrap();
+    // About 115 KB of history: the projected request sits above the
+    // compaction line (window 64_000 minus the 16_384 reserve) and below the
+    // window gate (a 1_000 token reserve).
+    let prompt = format!("Inspect big.txt. {}", "prior context line\n".repeat(6_000));
+    let outcome = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(runtime.run_agent_loop(
+            &client,
+            &prompt,
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig {
+                max_turns: 4,
+                context_window_tokens: 64_000,
+                context_reserve_tokens: 1_000,
+                ..AgentLoopConfig::default()
+            },
+        ))
+        .unwrap();
+    let wire = server.join().unwrap();
+    assert_eq!(outcome.stop, AgentLoopStop::ProviderCompleted);
+    assert!(
+        outcome.tool_results[0].output == source,
+        "raw output differs: {} vs {}",
+        outcome.tool_results[0].output.len(),
+        source.len()
+    );
+    let payload: Value = serde_json::from_str(&wire).unwrap();
+    let result = payload["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("the batch reaches the request");
+    // A result over the inline size keeps its artifact reference, which takes a
+    // few bytes of the allowance; a squeezed one would lose most of its rows.
+    let text = result["content"].as_str().unwrap();
+    let rows = text.lines().filter(|line| line.starts_with("ROW_")).count();
+    assert!(
+        rows >= 395,
+        "{rows} of 400 rows presented ({} bytes)",
+        text.len()
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}

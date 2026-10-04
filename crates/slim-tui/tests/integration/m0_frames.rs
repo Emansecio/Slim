@@ -126,7 +126,9 @@ fn signed_out_login_progress_and_success_are_projected_without_history_leaks() {
     assert!(footer
         .iter()
         .any(|line| line.contains("GPT-5.6 Sol (high)")));
-    assert!(footer.last().is_some_and(|line| line.contains("Ctrl+P")));
+    assert!(footer
+        .last()
+        .is_some_and(|line| line.contains("/ comandos")));
 }
 
 #[test]
@@ -180,4 +182,34 @@ fn compaction_completed_becomes_collapsed_system_block() {
     ));
     assert_eq!(state.blocks()[0].lifecycle, BlockLifecycle::Complete);
     assert_eq!(state.blocks()[0].fold, FoldState::Collapsed);
+}
+
+#[test]
+fn compaction_block_reports_tokens_before_and_after() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::CompactionState {
+        state: slim_core::context::CompactionStatus::Applied,
+        reason: slim_core::context::CompactionReason::Manual,
+        tokens_before: 123_400,
+        tokens_after: 8_200,
+        duration_ms: 1_500,
+    });
+    assert!(
+        state.blocks().is_empty(),
+        "the state event alone adds no block"
+    );
+    state.apply_event(UiEvent::CompactionCompleted);
+    assert_eq!(state.blocks().len(), 1);
+    assert!(matches!(
+        state.blocks()[0].kind(),
+        BlockKind::System(text) if text == "compactação concluída · 123k → 8.2k tokens"
+    ));
+    state.apply_event(UiEvent::CompactionCompleted);
+    assert!(
+        matches!(
+            state.blocks()[1].kind(),
+            BlockKind::System(text) if text == "compactação concluída"
+        ),
+        "the token counts belong to one completion only"
+    );
 }

@@ -1226,6 +1226,95 @@ fn every_session_command_is_answered_while_a_run_is_active() {
 }
 
 #[test]
+fn mcp_changes_are_refused_in_portuguese_while_a_run_is_active() {
+    let ws = Workspace::new("worker-active-mcp");
+    let provider = provider(1, true);
+    let mut harness = start(&ws, None, Some(&provider.endpoint));
+    let mark = harness.seen.len();
+    harness.send(UiCommand::SendPrompt("hold this run".into()));
+    provider
+        .bodies
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+
+    harness.send(UiCommand::McpEnable {
+        name: "web".into(),
+        enabled: true,
+    });
+    harness.send(UiCommand::McpTrust {
+        trust: true,
+        name: None,
+    });
+    harness.send(UiCommand::McpLogin {
+        name: "web".into(),
+        redirect_url: None,
+    });
+    harness.until("three refusals", |seen| {
+        seen[mark..]
+            .iter()
+            .filter(|event| {
+                matches!(event, UiEvent::Notification { message }
+                if message == "Aguarde ou cancele a execução antes de alterar servidores MCP")
+            })
+            .count()
+            == 3
+    });
+    assert!(
+        !harness.seen[mark..].iter().any(|event| matches!(event,
+            UiEvent::Notification { message } if message.contains("already active"))),
+        "the refusal is not the English catch-all"
+    );
+
+    provider.release_first.send(()).unwrap();
+    harness.until("the run to complete", |seen| {
+        seen[mark..]
+            .iter()
+            .any(|event| matches!(event, UiEvent::RunCompleted { .. }))
+    });
+    harness.wait_idle();
+}
+
+#[test]
+fn a_prompt_admitted_while_a_run_is_active_has_its_admission_resolved() {
+    use slim_tui::api::{PromptAdmission, PromptGeneration, PromptId, PromptOrigin};
+
+    let ws = Workspace::new("worker-active-prompt");
+    let provider = provider(1, true);
+    let mut harness = start(&ws, None, Some(&provider.endpoint));
+    let mark = harness.seen.len();
+    harness.send(UiCommand::SendPrompt("hold this run".into()));
+    provider
+        .bodies
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+
+    let admission = PromptAdmission {
+        id: PromptId(7),
+        generation: PromptGeneration(7),
+        origin: PromptOrigin::Direct,
+    };
+    harness.send(UiCommand::PreparePrompt {
+        prompt: "too early".into(),
+        admission,
+    });
+    harness.until("the admission to be refused", |seen| {
+        seen[mark..].iter().any(|event| {
+            matches!(event,
+            UiEvent::PromptPreparationFailed { admission: refused, message }
+                if *refused == admission && message.contains("Aguarde ou cancele a execução"))
+        })
+    });
+
+    provider.release_first.send(()).unwrap();
+    harness.until("the run to complete", |seen| {
+        seen[mark..]
+            .iter()
+            .any(|event| matches!(event, UiEvent::RunCompleted { .. }))
+    });
+    harness.wait_idle();
+}
+
+#[test]
 fn refusal_answers_carry_the_request_id_and_never_leave_a_list_hanging() {
     let (sink, control_rx, data_rx) = super::cancel_tests::sink_for_tests();
     let commands = [
@@ -1290,6 +1379,7 @@ fn refusal_answers_carry_the_request_id_and_never_leave_a_list_hanging() {
 fn a_run_finishing_delivery_still_answers_session_commands() {
     let (sink, control_rx, data_rx) = super::cancel_tests::sink_for_tests();
     let mut run = super::PendingRun {
+        jobs: None,
         run_id: 7,
         admission: None,
         result: None,
@@ -1305,8 +1395,14 @@ fn a_run_finishing_delivery_still_answers_session_commands() {
         UiCommand::ListSessions { request_id: 8 },
         UiCommand::RewindSession { first_seq: 1 },
     ] {
-        let shutdown =
-            super::dispatch_pending_command(&mut run, Some(command), &sink, &mut false, &None);
+        let shutdown = super::dispatch_pending_command(
+            &mut run,
+            Some(command),
+            &sink,
+            &mut false,
+            &None,
+            &Default::default(),
+        );
         assert!(!shutdown);
     }
     assert!(matches!(
@@ -1318,4 +1414,191 @@ fn a_run_finishing_delivery_still_answers_session_commands() {
         data_rx.try_recv().expect("rewind notice"),
         UiEvent::Notification { message } if message.starts_with("Aguarde a execução terminar")
     ));
+}
+
+#[test]
+fn a_run_finishing_delivery_refuses_mcp_changes_and_still_serves_a_waiting_sign_in() {
+    let (sink, _control_rx, data_rx) = super::cancel_tests::sink_for_tests();
+    let mut run = super::PendingRun {
+        jobs: None,
+        run_id: 7,
+        admission: None,
+        result: None,
+        projector: None,
+        delivery: Default::default(),
+        cancellation: slim_core::runtime::CancellationToken::new(),
+        durable: false,
+        cancel_requested: false,
+        content_store: Default::default(),
+        workspace_root: None,
+    };
+    let logins: super::mcp_login::McpLogins = Default::default();
+    let (cancelled, mut pasted) = super::mcp_login::register_for_tests(&logins, "web");
+    let mut dispatch = |command: UiCommand| {
+        assert!(!super::dispatch_pending_command(
+            &mut run,
+            Some(command),
+            &sink,
+            &mut false,
+            &None,
+            &logins,
+        ));
+    };
+    // Changes wait for the run: the user is told, in Portuguese.
+    for command in [
+        UiCommand::McpEnable {
+            name: "web".into(),
+            enabled: true,
+        },
+        UiCommand::McpTrust {
+            trust: true,
+            name: None,
+        },
+        UiCommand::McpLogin {
+            name: "web".into(),
+            redirect_url: None,
+        },
+    ] {
+        dispatch(command);
+        assert!(matches!(
+            data_rx.try_recv().expect("refusal notice"),
+            UiEvent::Notification { message }
+                if message == "Aguarde ou cancele a execução antes de alterar servidores MCP"
+        ));
+    }
+    // Finishing or dismissing a sign-in already waiting is not a change.
+    dispatch(UiCommand::McpLogin {
+        name: "web".into(),
+        redirect_url: Some("http://127.0.0.1:9/callback?code=1&state=2".into()),
+    });
+    assert_eq!(
+        pasted.try_recv().expect("pasted redirect delivered"),
+        "http://127.0.0.1:9/callback?code=1&state=2"
+    );
+    assert!(!*cancelled.borrow());
+    dispatch(UiCommand::McpLoginCancel { name: "web".into() });
+    assert!(*cancelled.borrow(), "the sign-in was cancelled");
+    assert!(data_rx.try_recv().is_err(), "no stray notices");
+}
+
+#[test]
+fn idle_background_completion_is_not_a_model_turn_and_next_prompt_carries_it_once() {
+    use slim_tui::api::{PromptAdmission, PromptGeneration, PromptId, PromptOrigin};
+    let ws = Workspace::new("job-next-prompt");
+    let provider = provider(1, false);
+    let mut harness = start(&ws, None, Some(&provider.endpoint));
+    let command = if cfg!(windows) {
+        "Write-Output 'READY'; while (!(Test-Path 'release-job')) { Start-Sleep -Milliseconds 20 }; Write-Output 'IDLE-DONE'"
+    } else {
+        "printf 'READY\n'; while [ ! -f release-job ]; do sleep 0.02; done; printf 'IDLE-DONE\n'"
+    };
+    harness.send(UiCommand::RunBackgroundShell {
+        command: command.into(),
+    });
+    harness.until("job start", |seen| {
+        seen.iter().any(
+            |e| matches!(e,UiEvent::JobsChanged{jobs} if jobs.iter().any(|j|j.state=="running")),
+        )
+    });
+    std::fs::write(ws.0.join("release-job"), "go").unwrap();
+    harness.until("idle job notification",|seen|seen.iter().any(|e|matches!(e,UiEvent::Notification{message} if message.contains("shell-1")&&message.contains("concluído"))));
+    assert!(
+        provider.bodies.try_recv().is_err(),
+        "idle completion must not call the provider"
+    );
+    harness.send(UiCommand::PreparePrompt {
+        admission: PromptAdmission {
+            id: PromptId(900),
+            generation: PromptGeneration(900),
+            origin: PromptOrigin::Direct,
+        },
+        prompt: "Use the background result".into(),
+    });
+    harness.until("prompt with completion", |seen| {
+        seen.iter()
+            .any(|e| matches!(e, UiEvent::PromptRunCompleted { .. }))
+    });
+    let body = provider
+        .bodies
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(body.matches("[Shell job completion:").count(), 1, "{body}");
+    assert!(body.contains("IDLE-DONE"), "{body}");
+    harness.wait_idle();
+    let id = jsonl_ids(&ws.sessions()).into_iter().next().unwrap();
+    let metadata = super::session_job_metadata(&preflight_session(ws.session_path(&id)).unwrap());
+    assert_eq!(metadata[0].state, "completed");
+}
+
+#[test]
+fn session_switch_stops_background_jobs_and_preserves_terminal_metadata() {
+    let ws = Workspace::new("jobs-switch");
+    let current = create_session(&ws, "tui-current", &["current"]);
+    create_session(&ws, "tui-next", &["next"]);
+    let mut harness = start(&ws, Some(&current), None);
+    let command = if cfg!(windows) {
+        "Write-Output 'READY'; while (!(Test-Path 'release-job')) { Start-Sleep -Milliseconds 20 }; Set-Content -LiteralPath escaped 'bad'"
+    } else {
+        "printf 'READY\n'; while [ ! -f release-job ]; do sleep 0.02; done; printf bad > escaped"
+    };
+    harness.send(UiCommand::RunBackgroundShell {
+        command: command.into(),
+    });
+    harness.until("job start", |seen| {
+        seen.iter().any(
+            |e| matches!(e,UiEvent::JobsChanged{jobs} if jobs.iter().any(|j|j.state=="running")),
+        )
+    });
+    let mark = harness.seen.len();
+    harness.send(UiCommand::ResumeSession {
+        id: "tui-next".into(),
+    });
+    harness.until("session switch", |seen| {
+        restored_after(seen, mark).is_some()
+    });
+    harness.wait_idle();
+    let metadata = super::session_job_metadata(&preflight_session(&current).unwrap());
+    assert_eq!(metadata[0].state, "cancelled");
+    std::fs::write(ws.0.join("release-job"), "go").unwrap();
+    assert!(!ws.0.join("escaped").exists());
+}
+
+#[test]
+fn job_metadata_refusal_happens_before_prompt_run_started() {
+    use slim_tui::api::{PromptAdmission, PromptGeneration, PromptId, PromptOrigin};
+    let ws = Workspace::new("job-refusal");
+    let current = create_session(&ws, "tui-current", &["current"]);
+    let provider = provider(1, false);
+    let mut harness = start(&ws, Some(&current), Some(&provider.endpoint));
+    let _held = JsonlRepo::open_no_repair(&current).unwrap();
+    harness.send(UiCommand::RunBackgroundShell {
+        command: if cfg!(windows) {
+            "Write-Output done"
+        } else {
+            "printf done"
+        }
+        .into(),
+    });
+    harness.until("job start", |seen| {
+        seen.iter()
+            .any(|e| matches!(e,UiEvent::JobsChanged{jobs} if !jobs.is_empty()))
+    });
+    let mark = harness.seen.len();
+    harness.send(UiCommand::PreparePrompt {
+        admission: PromptAdmission {
+            id: PromptId(800),
+            generation: PromptGeneration(800),
+            origin: PromptOrigin::Direct,
+        },
+        prompt: "new prompt".into(),
+    });
+    harness.until("metadata refusal",|seen|seen[mark..].iter().any(|e|matches!(e,UiEvent::PromptPreparationFailed{message,..} if message.contains("Metadados"))));
+    assert!(
+        !harness.seen[mark..]
+            .iter()
+            .any(|e| matches!(e, UiEvent::PromptRunStarted { .. })),
+        "{:?}",
+        &harness.seen[mark..]
+    );
+    assert!(provider.bodies.try_recv().is_err());
 }

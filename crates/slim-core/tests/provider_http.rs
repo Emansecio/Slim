@@ -539,7 +539,7 @@ fn provider_stream_reports_content_free_transport_phases() {
 }
 
 #[test]
-fn compaction_request_preserves_effort_and_bounds_existing_output() {
+fn compaction_request_preserves_effort_and_caps_the_output_limit() {
     let adapter = OpenAiCompatibleAdapter::new(
         ProviderConfig::openai("http://127.0.0.1:9", "fixture-model", "fixture-key")
             .with_reasoning_effort("high")
@@ -551,16 +551,78 @@ fn compaction_request_preserves_effort_and_bounds_existing_output() {
         .expect("compaction request");
     let body: Value = serde_json::from_str(&request.body).expect("json body");
     assert_eq!(body["reasoning_effort"], "high");
-    assert_eq!(body["max_tokens"], 2_048);
+    // The adapter's own limit stays: the cap belongs to the client, which
+    // knows the reserve the summary budget derives from.
+    assert_eq!(body["max_tokens"], 32_000);
     assert_eq!(
         body["messages"][0]["content"],
-        slim_core::context::COMPACTION_SYSTEM_PROMPT
+        slim_core::context::SUMMARIZATION_SYSTEM_PROMPT
     );
     assert_eq!(body["messages"][1]["role"], "user");
     assert_eq!(body["messages"][1]["content"], "summary input");
     assert!(!request
         .body
         .contains(slim_core::provider::NATIVE_SYSTEM_PROMPT));
+}
+
+#[test]
+fn the_client_caps_a_compaction_output_limit_and_raises_it_only_for_a_retry() {
+    let client = |max_output_tokens| {
+        HttpProviderClient::new(
+            OpenAiCompatibleAdapter::new(
+                ProviderConfig::openai("http://127.0.0.1:9", "fixture-model", "fixture-key")
+                    .with_max_output_tokens(max_output_tokens),
+            )
+            .expect("adapter"),
+            Duration::from_secs(2),
+        )
+        .expect("client")
+    };
+    let limit_of = |client: &HttpProviderClient<OpenAiCompatibleAdapter>, cap| {
+        let request = client
+            .prepare_compaction_messages(&[ProviderMessage::user("summary input")], cap)
+            .expect("compaction request");
+        let body: Value = serde_json::from_slice(request.body()).expect("json body");
+        body["max_tokens"].as_u64()
+    };
+    // The model's own limit is a ceiling of the summary budget...
+    assert_eq!(limit_of(&client(32_000), 13_107), Some(13_107));
+    // ...which does not raise the limit the model was configured with...
+    assert_eq!(limit_of(&client(4_096), 13_107), Some(4_096));
+    // ...and a zero budget (a zero reserve) leaves it alone.
+    assert_eq!(limit_of(&client(32_000), 0), Some(32_000));
+    // A retry of a summary that ran into its limit sets the higher limit.
+    let raised_limit_of = |client: &HttpProviderClient<OpenAiCompatibleAdapter>, limit| {
+        let request = client
+            .prepare_compaction_messages_raised(&[ProviderMessage::user("summary input")], limit)
+            .expect("compaction request");
+        let body: Value = serde_json::from_slice(request.body()).expect("json body");
+        body["max_tokens"].as_u64()
+    };
+    assert_eq!(raised_limit_of(&client(4_096), 8_192), Some(8_192));
+    assert_eq!(raised_limit_of(&client(32_000), 8_192), Some(32_000));
+
+    let codex = HttpProviderClient::new(
+        OpenAiCodexAdapter::new(ProviderConfig::openai_codex(
+            "https://example.invalid/backend-api",
+            "gpt-test",
+            "oauth-secret",
+            "account-id",
+        ))
+        .expect("adapter"),
+        Duration::from_secs(2),
+    )
+    .expect("client");
+    let request = codex
+        .prepare_compaction_messages(&[ProviderMessage::user("summary input")], 13_107)
+        .expect("compaction request");
+    let body: Value = serde_json::from_slice(request.body()).expect("json body");
+    assert!(body.get("max_output_tokens").is_none());
+    let raised = codex
+        .prepare_compaction_messages_raised(&[ProviderMessage::user("summary input")], 13_107)
+        .expect("raised compaction request");
+    let body: Value = serde_json::from_slice(raised.body()).expect("json body");
+    assert!(body.get("max_output_tokens").is_none());
 }
 
 #[test]
@@ -1400,6 +1462,72 @@ fn command_code_preserves_usage_received_before_stream_failure() {
         runtime.app.events().last().expect("completion").kind,
         EventKind::RequestCompleted { failed: true, .. }
     ));
+}
+
+#[test]
+fn provider_call_fact_records_per_request_usage_with_its_cache_split() {
+    use slim_core::session::{
+        preflight_session, DurableRecord, DurableSessionHeader, JsonlRepo, ManualRunJournal,
+        ManualRunSpec,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        read_http_request(&mut stream);
+        write_fixture_response(&mut stream,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":1200,\"completion_tokens\":40,\"prompt_tokens_details\":{\"cached_tokens\":1024}}}\n\ndata: [DONE]\n\n", 200);
+    });
+    let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+        format!("http://{address}"),
+        "fixture-model",
+        "fixture-secret",
+    ))
+    .expect("adapter");
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+    let path = std::env::temp_dir().join(format!(
+        "slim-provider-usage-{}-{}.jsonl",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let repo = JsonlRepo::create(
+        &path,
+        DurableSessionHeader::new("usage", "now", ".", None, None),
+    )
+    .expect("repo");
+    let journal = Arc::new(std::sync::Mutex::new(
+        ManualRunJournal::start(
+            repo,
+            ManualRunSpec::new("op", "attempt", "input", "final", "prompt-marker", 0),
+        )
+        .expect("journal"),
+    ));
+    let mut runtime = Runtime::new();
+    runtime.app.set_run_journal(journal.clone());
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(runtime.run_provider(&client, "prompt-marker", 1))
+        .expect("call succeeds");
+    server.join().expect("server");
+    drop(runtime);
+    drop(journal);
+    let report = preflight_session(&path).expect("valid session");
+    let call = report
+        .records
+        .iter()
+        .find_map(|record| match record {
+            DurableRecord::Fact { fact, .. } if fact.namespace == "provider.call.v1" => Some(fact),
+            _ => None,
+        })
+        .expect("provider call fact");
+    assert_eq!(call.value["input_tokens"], 1200);
+    assert_eq!(call.value["output_tokens"], 40);
+    assert_eq!(call.value["cache_read_tokens"], 1024);
+    assert_eq!(call.value["cache_write_tokens"], 0);
+    std::fs::remove_file(path).expect("cleanup");
 }
 
 #[test]

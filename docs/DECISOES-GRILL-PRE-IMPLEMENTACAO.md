@@ -330,7 +330,9 @@ read-only de scripts na v1.
   pausa headless de forma persistida.
 - Compactação usa reserva projetada, `/compact` manual, threshold geral de 85%
   e 50% para janelas a partir de 1M; o mesmo modelo gera o resumo e o JSONL
-  original permanece preservado.
+  original permanece preservado (substituído em 2026-10 pelo trigger Pi
+  janela - `reserve_tokens`; ver
+  [compactação de contexto](reference/CLI-AND-RUNTIME.md#compactação-de-contexto)).
 - API keys ficam em `auth.json` com ACL; refresh tokens OAuth ficam no
   Credential Manager; `config.toml` segue CLI > env > projeto > global.
 - Redaction remove valores conhecidos/headers de autenticação; retenção é sempre

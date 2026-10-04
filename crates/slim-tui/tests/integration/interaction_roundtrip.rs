@@ -70,8 +70,18 @@ fn question_options_support_selection_and_custom_answer_without_sending_a_prompt
         message: String::new(),
     });
     let done = render_terminal_text(&state, 40, 12);
-    assert!(done.contains("tui"), "{done}");
-    assert!(done.contains("· tui") || done.contains("  · tui"), "{done}");
+    // The record sits on the transcript grid: markers on column 2.
+    let rows = done.lines().collect::<Vec<_>>();
+    let question = rows
+        .iter()
+        .position(|row| row.starts_with("  ? Which crate should change?"))
+        .unwrap_or_else(|| {
+            panic!(
+                "question record
+{done}"
+            )
+        });
+    assert!(rows[question + 1].starts_with("  → tui"), "{done}");
     assert!(!done.contains("Outro"), "{done}");
 
     let mut custom = AppState::new();
@@ -350,7 +360,6 @@ fn question_overlay_wraps_on_words_and_does_not_use_approval_chrome() {
         persisted: false,
     });
     let frame = render_terminal_text(&state, 40, 12);
-    assert!(frame.contains("Pergunta"), "{frame}");
     assert!(frame.contains("download"), "{frame}");
     assert!(
         !frame.contains("downlo\n")
@@ -389,7 +398,6 @@ fn question_overlay_lists_options_with_selection_chrome() {
         persisted: false,
     });
     let frame = render_terminal_text(&state, 48, 16);
-    assert!(frame.contains("Pergunta"), "{frame}");
     assert!(frame.contains("Which crate should change?"), "{frame}");
     assert!(frame.contains(">   core"), "{frame}");
     assert!(frame.contains("Runtime and protocol"), "{frame}");
@@ -401,7 +409,7 @@ fn question_overlay_lists_options_with_selection_chrome() {
 }
 
 #[test]
-fn question_card_stays_contained_on_a_wide_terminal() {
+fn question_dropdown_rests_on_the_composer_at_its_width() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::QuestionRequired {
         request_id: request_id("question-card"),
@@ -419,16 +427,30 @@ fn question_card_stays_contained_on_a_wide_terminal() {
         persisted: false,
     });
     let frame = render_terminal_text(&state, 100, 24);
-    let title = frame
-        .lines()
-        .find(|line| line.contains("Pergunta"))
-        .expect("question title");
-    assert!(
-        title.starts_with(" ╭"),
-        "card must align with the one-cell composer inset\n{title}"
+    let rows = frame.lines().collect::<Vec<_>>();
+    let tops = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.contains('╭'))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let [dropdown, composer] = tops[..] else {
+        panic!(
+            "dropdown and composer borders
+{frame}"
+        )
+    };
+    assert_eq!(
+        rows[dropdown], rows[composer],
+        "dropdown must span the composer and carry no title
+{frame}"
     );
-    let border = title.chars().filter(|glyph| *glyph == '─').count();
-    assert!(border <= 72, "question card must stay contained\n{title}");
+    // question, spacer, two options and `Outro...`, then the composer.
+    assert_eq!(composer, dropdown + 6, "{frame}");
+    assert!(
+        rows[dropdown + 1].contains("Which crate should change?"),
+        "{frame}"
+    );
     assert!(frame.contains(">   core"), "{frame}");
     assert!(frame.contains("    tui"), "{frame}");
 }

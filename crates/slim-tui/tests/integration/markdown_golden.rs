@@ -544,7 +544,7 @@ fn agent_turn_opens_with_one_header_above_thinking_and_prose() {
     let thought = rendered
         .rows
         .iter()
-        .position(|row| row.contains("Pensamento"))
+        .position(|row| row.contains("Pensou"))
         .expect("thought");
     // The header owns the work that precedes the first prose of the turn.
     assert_eq!(header, prompt + 3, "{}", rendered.text());
@@ -564,8 +564,11 @@ fn agent_turn_opens_with_one_header_above_thinking_and_prose() {
 }
 
 fn role_header(row: &str) -> bool {
+    // The marker is the turn's state: done, interrupted or failed.
     let trimmed = row.trim();
-    trimmed == "● Slim" || trimmed.starts_with("● Slim ·")
+    ["●", "■", "✕"].iter().any(|marker| {
+        trimmed == format!("{marker} Slim") || trimmed.starts_with(&format!("{marker} Slim ·"))
+    })
 }
 
 #[test]
@@ -668,40 +671,59 @@ fn collapsed_thinking_is_single_muted_metadata_row() {
     });
     state.apply_event(UiEvent::ThinkingEnded);
     // The completed header settles into the reasoning hue after the brief
-    // confirmation emphasis; the retained preview keeps the same geometry.
+    // confirmation emphasis; the text stays behind Enter.
     state.clock.elapsed_ms = 249;
     let rendered = render_state(&state, 80);
     let text = rendered.text();
-    assert!(text.contains("Pensamento"), "{text}");
-    assert!(!text.contains("secret plan"), "{text}");
-    assert!(text.contains("… more"), "{text}");
-    assert!(text.contains("last line"), "{text}");
+    assert!(text.contains("▸ Pensou"), "{text}");
+    for hidden in ["secret plan", "more", "last line"] {
+        assert!(!text.contains(hidden), "{text}");
+    }
     assert_eq!(
-        rendered.word_style("Pensamento").0,
+        rendered.word_style("Pensou").0,
         Color::Rgb(0xA9, 0x9F, 0xD6)
     );
 }
 
 #[test]
-fn streaming_thinking_shows_only_the_latest_two_physical_rows() {
+fn streaming_thinking_shows_its_newest_finished_line_on_its_own_row() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::ThinkingStarted);
     state.apply_event(UiEvent::ThinkingDelta {
-        text: "first hidden line\nsecond live line\nfinal live line".into(),
+        text: "first hidden line\nsecond live line\nfinal line being written".into(),
     });
 
-    let streaming = render_state(&state, 48).text();
-    assert!(streaming.contains("Pensando"), "{streaming}");
-    assert!(!streaming.contains("first hidden line"), "{streaming}");
-    assert!(streaming.contains("… second live line"), "{streaming}");
-    assert!(streaming.contains("final live line"), "{streaming}");
+    let streaming = render_state(&state, 48);
+    let row = streaming
+        .rows
+        .iter()
+        .find(|row| row.contains("Pensando"))
+        .unwrap_or_else(|| panic!("{}", streaming.text()));
+    // One row: the label, then the newest finished line as a headline; the
+    // line still being written waits until it is finished.
+    assert!(
+        row.trim_end().ends_with("Pensando · Second live line"),
+        "{row}"
+    );
+    for hidden in ["first hidden", "being written"] {
+        assert!(!streaming.text().contains(hidden), "{}", streaming.text());
+    }
+    let position = streaming
+        .rows
+        .iter()
+        .position(|candidate| candidate == row)
+        .unwrap();
+    assert!(
+        streaming.rows[position + 1].trim().is_empty()
+            || streaming.rows[position + 1].contains('╭'),
+        "{}",
+        streaming.text()
+    );
 
     state.apply_event(UiEvent::ThinkingEnded);
     let complete = render_state(&state, 48).text();
-    assert!(complete.contains("Pensamento"), "{complete}");
-    assert!(!complete.contains("first hidden line"), "{complete}");
-    assert!(complete.contains("… second live line"), "{complete}");
-    assert!(complete.contains("final live line"), "{complete}");
+    assert!(complete.contains("Pensou"), "{complete}");
+    assert!(!complete.contains("live line"), "{complete}");
 }
 
 #[test]
@@ -711,9 +733,22 @@ fn user_marker_settles_without_changing_the_label_or_layout() {
         text: "mensagem".into(),
     });
     let recent = render_state(&state, 80);
-    assert_eq!(recent.word_style("●").0, Color::Rgb(0xBC, 0xB9, 0xAF));
-    assert!(recent.word_style("●").1.contains(Modifier::BOLD));
+    // The marker settles from a lifted tone back to its resting grey, one
+    // step per motion frame, without ever changing weight.
+    assert_eq!(recent.word_style("●").0, Color::Rgb(0xE1, 0xE0, 0xDB));
+    assert!(!recent.word_style("●").1.contains(Modifier::BOLD));
     assert!(!recent.word_style("Você").1.contains(Modifier::BOLD));
+    for (elapsed_ms, lifted) in [
+        (83, Color::Rgb(0xD0, 0xCE, 0xC7)),
+        (166, Color::Rgb(0xC4, 0xC1, 0xB9)),
+    ] {
+        state.clock.elapsed_ms = elapsed_ms;
+        let step = render_state(&state, 80);
+        assert_eq!(step.word_style("●").0, lifted, "{elapsed_ms} ms");
+        assert!(!step.word_style("●").1.contains(Modifier::BOLD));
+        assert_eq!(recent.rows, step.rows);
+    }
+    state.clock.elapsed_ms = 0;
     let reduced = render_state_with_caps(
         &state,
         80,

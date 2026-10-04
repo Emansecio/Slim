@@ -98,13 +98,6 @@ impl ArtifactStore {
         })
     }
 
-    pub(crate) fn discard_staged(staged: StagedArtifact) -> io::Result<()> {
-        match staged.temp_path {
-            Some(path) => fs::remove_file(path),
-            None => Ok(()),
-        }
-    }
-
     pub(crate) fn commit_staged(&self, staged: StagedArtifact) -> io::Result<ArtifactHandle> {
         let Some(temp_path) = staged.temp_path else {
             self.read(&staged.handle)?;
@@ -163,6 +156,31 @@ impl ArtifactStore {
             id,
             path,
             size: content.len() as u64,
+        }
+    }
+
+    /// Append-only redacted process log; cursor reads are owned by the job manager.
+    pub(crate) fn create_job_log(&self) -> io::Result<(fs::File, PathBuf)> {
+        fs::create_dir_all(&self.root)?;
+        loop {
+            let id = STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = self.root.join(format!(
+                "shell-job-{}-{}-{id}.log",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            let mut options = fs::OpenOptions::new();
+            options.create_new(true).read(true).write(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            match options.open(&path) {
+                Ok(file) => return Ok((file, path)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -374,28 +392,6 @@ mod tests {
             std::io::ErrorKind::InvalidData
         );
         assert_eq!(std::fs::read(&target).unwrap(), b"original");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn discarding_one_private_stage_cannot_remove_another_committed_artifact() {
-        let root = std::env::temp_dir().join(format!(
-            "slim-artifact-stage-race-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        let store = ArtifactStore::new(&root).unwrap();
-        let cancelled = store.stage("context-history", b"same transcript").unwrap();
-        let committed = store.stage("context-history", b"same transcript").unwrap();
-        let handle = store.commit_staged(committed).unwrap();
-
-        ArtifactStore::discard_staged(cancelled).unwrap();
-
-        assert_eq!(store.read(&handle).unwrap(), b"same transcript");
-        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 

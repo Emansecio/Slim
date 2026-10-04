@@ -766,37 +766,8 @@ pub(crate) fn create_secure_auth_file(_path: &Path) -> Result<File, AuthError> {
     Err(AuthError::UnsafePermissions)
 }
 
-const SENSITIVE_HEADER_NAMES: &[&str] = &[
-    "authorization",
-    "proxy-authorization",
-    "x-api-key",
-    "api-key",
-    "x-goog-api-key",
-    "cookie",
-    "set-cookie",
-    "x-auth-token",
-    "x-amz-security-token",
-];
-
 pub fn redact(input: &str) -> String {
-    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(input) {
-        redact_json_value(&mut value);
-        if let Ok(redacted) = serde_json::to_string(&value) {
-            return redacted;
-        }
-    }
-    let mut redacted = String::with_capacity(input.len());
-    for line in input.split_inclusive('\n') {
-        let (content, newline) = if let Some(content) = line.strip_suffix("\r\n") {
-            (content, "\r\n")
-        } else {
-            line.strip_suffix('\n')
-                .map_or((line, ""), |content| (content, "\n"))
-        };
-        redacted.push_str(&redact_header_line(content));
-        redacted.push_str(newline);
-    }
-    redacted
+    slim_core::redact_credentials(input)
 }
 
 /// `redact` plus literal secret values, longest first — the same discipline as
@@ -814,100 +785,73 @@ pub(crate) fn redact_with_secrets(input: &str, secrets: &[String]) -> String {
     text
 }
 
-fn redact_json_value(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(object) => {
-            for (name, value) in object {
-                if SENSITIVE_HEADER_NAMES
-                    .iter()
-                    .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
-                {
-                    *value = serde_json::Value::String("[REDACTED]".into());
-                } else {
-                    redact_json_value(value);
-                }
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                redact_json_value(value);
-            }
-        }
-        _ => {}
+/// Reads one owner-only JSON document stored beside the credentials (MCP
+/// trust decisions, MCP OAuth tokens). Same path and permission discipline as
+/// `auth.json`: symlinks and non-files are refused and the file's ACL is
+/// verified before its bytes are trusted. `Ok(None)` when it does not exist.
+pub(crate) fn read_secure_json(path: &Path) -> Result<Option<serde_json::Value>, AuthError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(AuthError::Read),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(AuthError::InvalidPath);
     }
+    let contents = secure_auth_file(path)?;
+    serde_json::from_slice(&contents)
+        .map(Some)
+        .map_err(|error| match error.classify() {
+            serde_json::error::Category::Data | serde_json::error::Category::Eof => {
+                AuthError::InvalidSchema
+            }
+            serde_json::error::Category::Syntax => AuthError::MalformedJson,
+            serde_json::error::Category::Io => AuthError::Read,
+        })
 }
 
-fn redact_header_line(line: &str) -> String {
-    let bytes = line.as_bytes();
-    let mut search_from = 0;
-    let mut matches = Vec::new();
-    while search_from < bytes.len() {
-        let Some((index, header_len, value_start)) =
-            find_sensitive_header(line, search_from, SENSITIVE_HEADER_NAMES)
-        else {
-            break;
-        };
-        matches.push((index, value_start));
-        search_from = index + header_len;
+/// Read-modify-write of a secure JSON document under the auth store lock,
+/// replacing it atomically through an owner-only temporary file.
+pub(crate) fn update_secure_json(
+    path: &Path,
+    update: impl FnOnce(Option<serde_json::Value>) -> Result<serde_json::Value, AuthError>,
+) -> Result<(), AuthError> {
+    if fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink() || metadata.is_dir())
+    {
+        return Err(AuthError::InvalidPath);
     }
-    if matches.is_empty() {
-        return line.to_owned();
+    let parent = path.parent().ok_or(AuthError::InvalidPath)?;
+    fs::create_dir_all(parent).map_err(|_| AuthError::Write)?;
+    if fs::symlink_metadata(parent)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
+    {
+        return Err(AuthError::InvalidPath);
     }
-
-    let mut result = String::with_capacity(line.len() + matches.len() * 4);
-    let mut cursor = 0;
-    for (index, (_, value_start)) in matches.iter().enumerate() {
-        let end = matches
-            .get(index + 1)
-            .map_or(line.len(), |(next_index, _)| *next_index);
-        result.push_str(&line[cursor..*value_start]);
-        result.push_str("[REDACTED]");
-        cursor = end;
+    let _guard = lock_auth_store(path)?;
+    let current = read_secure_json(path)?;
+    let document = update(current)?;
+    let bytes = serde_json::to_vec_pretty(&document).map_err(|_| AuthError::InvalidSchema)?;
+    if bytes.len() > MAX_AUTH_FILE_BYTES {
+        return Err(AuthError::InvalidSchema);
     }
-    result.push_str(&line[cursor..]);
+    let temporary = parent.join(format!(
+        ".secure-json-{}-{}.tmp",
+        std::process::id(),
+        AUTH_TEMP_NONCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file = create_secure_auth_file(&temporary)?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| AuthError::Write)?;
+        drop(file);
+        replace_auth_file(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
     result
-}
-
-fn find_sensitive_header(
-    line: &str,
-    search_from: usize,
-    header_names: &[&str],
-) -> Option<(usize, usize, usize)> {
-    let bytes = line.as_bytes();
-    let mut best = None;
-    for name in header_names {
-        let Some(offset) = find_ascii_case_insensitive(&line[search_from..], name) else {
-            continue;
-        };
-        let index = search_from + offset;
-        let boundary_before =
-            index == 0 || !bytes[index - 1].is_ascii_alphanumeric() && bytes[index - 1] != b'-';
-        if !boundary_before {
-            continue;
-        }
-        let mut cursor = index + name.len();
-        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if cursor >= bytes.len() || bytes[cursor] != b':' {
-            continue;
-        }
-        cursor += 1;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if best.is_none_or(|(best_index, _, _)| index < best_index) {
-            best = Some((index, name.len(), cursor));
-        }
-    }
-    best
-}
-
-fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 #[cfg(all(test, windows))]

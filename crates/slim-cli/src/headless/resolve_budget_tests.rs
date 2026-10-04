@@ -20,10 +20,10 @@ fn unknown_context_window_requires_explicit_metadata() {
     );
 }
 use super::{
-    command_code_context_window, command_code_zero_data_retention, execute_provider_turn,
-    resolve_max_mutating_tool_calls, resolve_max_output_tokens, resolve_max_read_tool_calls,
-    resolve_max_result_bytes, resolve_max_turns, resolve_timeout_secs, ProviderRequest,
-    ProviderRunOptions, DEFAULT_PROVIDER_TIMEOUT_SECS,
+    command_code_context_window, command_code_zero_data_retention, context_reserve_tokens,
+    execute_provider_turn, resolve_max_mutating_tool_calls, resolve_max_output_tokens,
+    resolve_max_read_tool_calls, resolve_max_result_bytes, resolve_max_turns, resolve_timeout_secs,
+    ProviderRequest, ProviderRunOptions, DEFAULT_PROVIDER_TIMEOUT_SECS,
 };
 use slim_core::runtime::AgentLoopConfig;
 use std::sync::{Mutex, OnceLock};
@@ -246,6 +246,37 @@ fn compatible_and_command_code_fall_back_to_default_max_output() {
             slim_core::provider::DEFAULT_MAX_OUTPUT_TOKENS
         );
     });
+}
+
+#[test]
+fn context_reserve_follows_the_output_limit_the_adapter_sends() {
+    use slim_core::provider::ProviderKind::{Anthropic, OpenAiCodex, OpenAiCompatible};
+    // Codex defaults to its catalog's 128k output but sends no limit: the
+    // reserve is compaction's own, not 128k of a 272k window.
+    with_env(&[("SLIM_MAX_OUTPUT_TOKENS", None)], || {
+        assert_eq!(
+            resolve_max_output_tokens(None, OpenAiCodex, "gpt-5.6-sol").expect("catalog"),
+            128_000
+        );
+    });
+    assert_eq!(
+        context_reserve_tokens(OpenAiCodex, 128_000, false, 16_384),
+        16_384
+    );
+    // A smaller default is never raised to the compaction reserve.
+    assert_eq!(
+        context_reserve_tokens(OpenAiCodex, 4_096, false, 16_384),
+        4_096
+    );
+    // An explicit limit keeps its meaning.
+    assert_eq!(
+        context_reserve_tokens(OpenAiCodex, 64_000, true, 16_384),
+        64_000
+    );
+    // Adapters that send `max_tokens` keep input + output inside the window.
+    for kind in [Anthropic, OpenAiCompatible] {
+        assert_eq!(context_reserve_tokens(kind, 32_000, false, 16_384), 32_000);
+    }
 }
 
 #[test]

@@ -15,8 +15,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use slim_core::mcp::{
-    McpCancellation, McpConnection, McpError, McpInterruption, McpManager, McpRequestOutcome,
-    McpServerSpec, McpServerStatus, McpToolSummary, McpTransport,
+    McpCancellation, McpConnection, McpError, McpExposure, McpInterruption, McpManager,
+    McpOAuthSpec, McpRequestOutcome, McpServerBlock, McpServerOptions, McpServerSpec,
+    McpServerStatus, McpToolSummary, McpTransport,
 };
 use slim_core::process::ExecutableResolver;
 
@@ -30,6 +31,7 @@ fn stdio_spec(name: &str) -> McpServerSpec {
         },
         enabled: true,
         timeout: Duration::from_millis(1_000),
+        options: Default::default(),
     }
 }
 
@@ -42,6 +44,7 @@ fn http_spec(name: &str) -> McpServerSpec {
         },
         enabled: true,
         timeout: Duration::from_millis(1_000),
+        options: Default::default(),
     }
 }
 
@@ -73,7 +76,9 @@ fn spawn_http_fixture(
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .expect("bound fixture read");
-        let request = read_http_request(&stream);
+        let Some(request) = read_http_request(&mut stream) else {
+            continue;
+        };
         let method = request["method"]
             .as_str()
             .expect("JSON-RPC method")
@@ -97,7 +102,7 @@ fn spawn_http_fixture(
         let result = match method.as_str() {
             "initialize" => json!({
                 "protocolVersion": "2025-11-25",
-                "capabilities": {},
+                "capabilities": {"tools": {}},
                 "serverInfo": {"name": "fixture", "version": "1"},
             }),
             "tools/list" => json!({
@@ -115,10 +120,20 @@ fn spawn_http_fixture(
     (url, method_rx, release_tx, worker)
 }
 
-fn read_http_request(stream: &TcpStream) -> Value {
+/// The next JSON-RPC POST. A `GET` (the client's server-to-client stream,
+/// which this fixture does not offer) is answered 405 and yields `None`.
+fn read_http_request(stream: &mut TcpStream) -> Option<Value> {
     let mut reader = BufReader::new(stream.try_clone().expect("clone fixture stream"));
     let mut line = String::new();
     reader.read_line(&mut line).expect("read request line");
+    if line.starts_with("GET ") {
+        stream
+            .write_all(
+                b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .expect("reject the GET stream");
+        return None;
+    }
     assert!(line.starts_with("POST "), "{line:?}");
     let mut content_length = 0usize;
     loop {
@@ -135,7 +150,7 @@ fn read_http_request(stream: &TcpStream) -> Value {
     }
     let mut body = vec![0; content_length];
     reader.read_exact(&mut body).expect("read JSON-RPC body");
-    serde_json::from_slice(&body).expect("parse JSON-RPC request")
+    Some(serde_json::from_slice(&body).expect("parse JSON-RPC request"))
 }
 
 fn write_http_response(stream: &mut TcpStream, body: &Value) {
@@ -155,6 +170,9 @@ struct FakeConnection {
     tools_stale: AtomicBool,
     fail_next_tools_list: AtomicBool,
     die_on_call: AtomicBool,
+    hold_refresh: AtomicBool,
+    refresh_started: tokio::sync::Notify,
+    refresh_release: tokio::sync::Notify,
 }
 
 impl FakeConnection {
@@ -165,6 +183,9 @@ impl FakeConnection {
             tools_stale: AtomicBool::new(false),
             fail_next_tools_list: AtomicBool::new(false),
             die_on_call: AtomicBool::new(false),
+            hold_refresh: AtomicBool::new(false),
+            refresh_started: tokio::sync::Notify::new(),
+            refresh_release: tokio::sync::Notify::new(),
         })
     }
 
@@ -188,6 +209,10 @@ impl McpConnection for FakeConnection {
         }
         match method {
             "tools/list" => {
+                if self.hold_refresh.load(Ordering::Relaxed) {
+                    self.refresh_started.notify_one();
+                    self.refresh_release.notified().await;
+                }
                 if self.fail_next_tools_list.swap(false, Ordering::Relaxed) {
                     return Err(McpError::Protocol("boom".into()));
                 }
@@ -226,10 +251,37 @@ impl McpConnection for FakeConnection {
 
 fn ready_tool(name: &str) -> McpToolSummary {
     McpToolSummary {
+        output_schema: None,
         name: name.into(),
         description: Some("fake tool".into()),
         schema: json!({"type": "object"}),
     }
+}
+
+#[tokio::test]
+async fn late_catalog_refresh_does_not_revive_a_disconnected_server() {
+    let manager = manager_with(vec![]);
+    let connection = FakeConnection::new();
+    connection.hold_refresh.store(true, Ordering::Relaxed);
+    connection.mark_tools_stale();
+    manager.insert_connection(http_spec("fs"), connection.clone(), vec![ready_tool("old")]);
+    let refreshing = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.list_tools("fs").await })
+    };
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        connection.refresh_started.notified(),
+    )
+    .await
+    .unwrap();
+    manager.disconnect("fs").await.unwrap();
+    connection.refresh_release.notify_one();
+    refreshing.await.unwrap().unwrap();
+    assert!(matches!(
+        manager.statuses()[0].status,
+        McpServerStatus::Disconnected
+    ));
 }
 
 #[test]
@@ -242,6 +294,23 @@ fn construction_is_lazy_and_list_servers_never_connects() {
     for info in manager.statuses() {
         assert!(matches!(info.status, McpServerStatus::Disconnected));
     }
+}
+
+#[tokio::test]
+async fn non_object_call_arguments_never_reach_the_transport() {
+    let manager = manager_with(vec![]);
+    let connection = FakeConnection::new();
+    manager.insert_connection(
+        http_spec("fs"),
+        connection.clone(),
+        vec![ready_tool("write")],
+    );
+    let error = manager
+        .call("fs", "write", json!([]))
+        .await
+        .expect_err("invalid arguments");
+    assert!(matches!(error, McpError::Protocol(_)));
+    assert!(connection.recorded().is_empty());
 }
 
 #[test]
@@ -345,6 +414,7 @@ fn http_tools_call_timeout_is_uncertain_and_disconnects_without_replay() {
         },
         enabled: true,
         timeout,
+        options: Default::default(),
     };
     let manager = manager_with(vec![spec]);
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
@@ -398,6 +468,7 @@ fn cancelling_http_initialized_notification_returns_before_timeout_without_tool_
         },
         enabled: true,
         timeout: Duration::from_secs(10),
+        options: Default::default(),
     };
     let manager = manager_with(vec![spec]);
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
@@ -538,6 +609,7 @@ fn describe_truncates_on_a_utf8_char_boundary() {
     // byte exactly at byte 16384 (MAX_DESCRIBE_BYTES).
     let content = format!("{}{}", "a".repeat(16_373), "世".repeat(64));
     let tool = McpToolSummary {
+        output_schema: None,
         name: "big".into(),
         description: None,
         schema: json!({"x": content}),
@@ -633,6 +705,16 @@ fn mcp_stdio_fixture() {
                     }
                     json!({
                         "content": [{"type": "text", "text": code}],
+                        "isError": false,
+                    })
+                } else if message["params"]["arguments"]["cwd"] == true {
+                    json!({
+                        "content": [{
+                            "type": "text",
+                            "text": std::env::current_dir()
+                                .expect("fixture cwd")
+                                .to_string_lossy(),
+                        }],
                         "isError": false,
                     })
                 } else {
@@ -793,6 +875,7 @@ fn cancellation_during_lazy_tools_list_disconnects_without_call_and_next_call_re
         },
         enabled: true,
         timeout: Duration::from_secs(10),
+        options: Default::default(),
     };
     let manager = Arc::new(McpManager::new(
         BTreeMap::from([(spec.name.clone(), spec)]),
@@ -900,6 +983,7 @@ fn cancellation_during_stdio_tool_call_closes_child_without_replaying_effect() {
         },
         enabled: true,
         timeout: Duration::from_secs(10),
+        options: Default::default(),
     };
     let manager = Arc::new(McpManager::new(
         BTreeMap::from([(spec.name.clone(), spec)]),
@@ -1029,6 +1113,7 @@ fn cancelled_stdio_batch_reaps_only_its_own_children_and_threads() {
                     },
                     enabled: true,
                     timeout: Duration::from_secs(10),
+                    options: Default::default(),
                 },
             )
         })
@@ -1168,6 +1253,7 @@ fn stdio_end_to_end_initialize_list_call_and_disconnect() {
         },
         enabled: true,
         timeout: Duration::from_secs(15),
+        options: Default::default(),
     };
     let manager = manager_with(vec![spec]);
     let runtime = tokio::runtime::Runtime::new().expect("tokio");
@@ -1192,4 +1278,200 @@ fn stdio_end_to_end_initialize_list_call_and_disconnect() {
     let info = manager.statuses().pop().expect("one server");
     assert!(matches!(info.status, McpServerStatus::Disconnected));
     drop(manager);
+}
+
+fn fixture_spec_in(options: McpServerOptions) -> McpServerSpec {
+    let exe = std::env::current_exe().expect("current exe");
+    McpServerSpec {
+        name: "fixture".into(),
+        transport: McpTransport::Stdio {
+            command: exe.to_string_lossy().into_owned(),
+            args: vec![
+                "--exact".into(),
+                "mcp_stdio_fixture".into(),
+                "--ignored".into(),
+            ],
+            env: BTreeMap::new(),
+        },
+        enabled: true,
+        timeout: Duration::from_secs(15),
+        options,
+    }
+}
+
+fn fixture_cwd(workspace: &std::path::Path, options: McpServerOptions) -> String {
+    let manager = Arc::new(McpManager::new(
+        BTreeMap::from([("fixture".to_owned(), fixture_spec_in(options))]),
+        workspace.to_path_buf(),
+        ExecutableResolver::default(),
+    ));
+    let runtime = tokio::runtime::Runtime::new().expect("tokio");
+    let reply = runtime
+        .block_on(manager.call("fixture", "ping", json!({"cwd": true})))
+        .expect("cwd call");
+    runtime
+        .block_on(manager.disconnect("fixture"))
+        .expect("disconnect");
+    reply["content"][0]["text"]
+        .as_str()
+        .expect("text")
+        .to_owned()
+}
+
+#[test]
+fn stdio_server_runs_in_its_configured_cwd_relative_to_the_workspace() {
+    let root = std::env::temp_dir().join(format!("slim-mcp-cwd-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("sub")).expect("sub dir");
+    let canonical = |path: &std::path::Path| fs::canonicalize(path).expect("canonical");
+
+    // Default: the workspace root.
+    let seen = fixture_cwd(&root, McpServerOptions::default());
+    assert_eq!(canonical(std::path::Path::new(&seen)), canonical(&root));
+
+    // Relative cwd resolves against the workspace root.
+    let seen = fixture_cwd(
+        &root,
+        McpServerOptions {
+            cwd: Some(PathBuf::from("sub")),
+            ..McpServerOptions::default()
+        },
+    );
+    assert_eq!(
+        canonical(std::path::Path::new(&seen)),
+        canonical(&root.join("sub"))
+    );
+
+    // Absolute cwd is used as given.
+    let seen = fixture_cwd(
+        &root,
+        McpServerOptions {
+            cwd: Some(root.join("sub")),
+            ..McpServerOptions::default()
+        },
+    );
+    assert_eq!(
+        canonical(std::path::Path::new(&seen)),
+        canonical(&root.join("sub"))
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn missing_cwd_fails_with_a_clear_blocked_error_and_never_spawns() {
+    let manager = manager_with(vec![McpServerSpec {
+        options: McpServerOptions {
+            cwd: Some(PathBuf::from("definitely-missing-subdir")),
+            ..McpServerOptions::default()
+        },
+        ..stdio_spec("s")
+    }]);
+    let runtime = tokio::runtime::Runtime::new().expect("tokio");
+    let error = runtime
+        .block_on(manager.test("s"))
+        .expect_err("missing cwd");
+    assert!(
+        matches!(&error, McpError::Blocked(message) if message.contains("cwd is not a directory")),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn blocked_servers_stay_listed_report_why_and_never_connect() {
+    let untrusted = McpServerSpec {
+        options: McpServerOptions {
+            block: Some(McpServerBlock::Untrusted),
+            description: Some("Project tools".into()),
+            exposure: McpExposure::Direct,
+            ..McpServerOptions::default()
+        },
+        ..stdio_spec("proj")
+    };
+    let invalid = McpServerSpec {
+        options: McpServerOptions {
+            block: Some(McpServerBlock::Invalid(
+                "env \"TOKEN\": environment variable X is not set".into(),
+            )),
+            ..McpServerOptions::default()
+        },
+        ..stdio_spec("bad")
+    };
+    let manager = manager_with(vec![untrusted, invalid]);
+    let infos = manager.statuses();
+    let proj = infos.iter().find(|info| info.name == "proj").expect("proj");
+    assert!(matches!(proj.status, McpServerStatus::Untrusted));
+    assert_eq!(proj.description.as_deref(), Some("Project tools"));
+    assert_eq!(proj.exposure, McpExposure::Direct);
+    let bad = infos.iter().find(|info| info.name == "bad").expect("bad");
+    assert!(
+        matches!(&bad.status, McpServerStatus::Failed { error } if error.contains("not set")),
+        "{:?}",
+        bad.status
+    );
+    assert!(manager.list_servers().contains("untrusted project server"));
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio");
+    let error = runtime
+        .block_on(manager.call("proj", "ping", json!({})))
+        .expect_err("blocked");
+    assert!(
+        matches!(&error, McpError::Blocked(message) if message.contains("not trusted")),
+        "{error:?}"
+    );
+    let error = runtime.block_on(manager.test("bad")).expect_err("blocked");
+    assert!(
+        matches!(&error, McpError::Blocked(message) if message.contains("misconfigured")),
+        "{error:?}"
+    );
+    // Lifecycle actions must not paper over the block.
+    runtime
+        .block_on(manager.disconnect("proj"))
+        .expect("disconnect");
+    runtime.block_on(manager.disconnect_all());
+    let infos = manager.statuses();
+    assert!(matches!(
+        infos.iter().find(|i| i.name == "proj").unwrap().status,
+        McpServerStatus::Untrusted
+    ));
+    assert!(matches!(
+        infos.iter().find(|i| i.name == "bad").unwrap().status,
+        McpServerStatus::Failed { .. }
+    ));
+}
+
+#[test]
+fn oauth_client_secret_is_a_sensitive_value_and_never_in_debug_output() {
+    let options = McpServerOptions {
+        oauth: Some(McpOAuthSpec {
+            client_id: Some("cid".into()),
+            client_secret: Some("super-secret-value".into()),
+            ..McpOAuthSpec::default()
+        }),
+        ..McpServerOptions::default()
+    };
+    let spec = McpServerSpec {
+        options: options.clone(),
+        ..http_spec("web")
+    };
+    let manager = manager_with(vec![spec]);
+    assert!(manager
+        .sensitive_values()
+        .contains(&"super-secret-value".to_owned()));
+    assert!(!format!("{options:?}").contains("super-secret-value"));
+}
+
+#[test]
+fn default_spec_uses_the_sixty_second_timeout_and_is_enabled() {
+    let spec = McpServerSpec::new(
+        "x",
+        McpTransport::Http {
+            url: "https://example.com/mcp".into(),
+            headers: BTreeMap::new(),
+        },
+    );
+    assert!(spec.enabled);
+    assert_eq!(spec.timeout, Duration::from_secs(60));
+    assert_eq!(spec.options, McpServerOptions::default());
+    assert_eq!(McpExposure::parse("direct"), Some(McpExposure::Direct));
+    assert_eq!(McpExposure::parse("codemode"), None);
 }

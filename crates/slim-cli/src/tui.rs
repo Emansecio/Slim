@@ -105,6 +105,27 @@ struct SelectedTuiSession {
     history: Vec<ProviderMessage>,
 }
 
+/// Toast for a job that ended: `shell-67 · concluído · 5s`. The exit code is
+/// only worth a word when it is not a clean 0.
+fn job_finished_notice(job: &slim_core::runtime::ShellJobInfo) -> String {
+    let state = match job.state.as_str() {
+        "completed" => "concluído",
+        "cancelled" => "cancelado",
+        "interrupted" => "interrompido",
+        _ => "falhou",
+    };
+    let mut parts = vec![job.id.clone(), state.to_owned()];
+    if let Some(code) = job.exit_code.filter(|code| *code != 0) {
+        parts.push(format!("exit {code}"));
+    }
+    parts.push(if job.elapsed_ms < 1_000 {
+        format!("{}ms", job.elapsed_ms)
+    } else {
+        format!("{}s", job.elapsed_ms / 1_000)
+    });
+    parts.join(" · ")
+}
+
 fn restored_todo_event(preflight: &SessionPreflight) -> Result<UiEvent, String> {
     let mut runtime = slim_core::runtime::Runtime::new();
     let cwd = preflight
@@ -451,6 +472,22 @@ fn announce_session_title(startup: &mut TuiStartup, sink: &EventSink) {
 /// next prompt appends to; then tells the TUI. Shared by `ResumePrevious`,
 /// `ResumeSession` and `RewindSession`. Returns false, changing nothing, when
 /// the transcript or task state to show cannot be built.
+fn session_job_metadata(preflight: &SessionPreflight) -> Vec<slim_core::runtime::ShellJobInfo> {
+    let mut jobs = std::collections::BTreeMap::new();
+    for record in &preflight.records {
+        if let slim_core::session::DurableRecord::Fact { fact, .. } = record {
+            if fact.namespace == "shell_job.v1" {
+                if let Ok(job) =
+                    serde_json::from_value::<slim_core::runtime::ShellJobInfo>(fact.value.clone())
+                {
+                    jobs.insert(job.id.clone(), job);
+                }
+            }
+        }
+    }
+    jobs.into_values().collect()
+}
+
 fn switch_session(
     startup: &mut TuiStartup,
     sink: &EventSink,
@@ -498,6 +535,27 @@ fn switch_session(
     {
         startup.options.compaction = Some(slim_core::context::CompactionHandle::new(policy));
     }
+    if let Some(jobs) = &startup.options.shell_jobs {
+        let count = jobs.running_count();
+        if count > 0 {
+            sink.send(UiEvent::Notification {
+                message: format!("Encerrando {count} job(s) antes de trocar a sessão"),
+            });
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(jobs.reset())
+            });
+        } else {
+            jobs.clear_finished();
+        }
+        let jobs = jobs.clone();
+        if let Err(message) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(persist_job_metadata(startup))
+        }) {
+            sink.send(UiEvent::Notification { message });
+            return false;
+        }
+        jobs.restore_lost(&session_job_metadata(&selected.preflight));
+    }
     startup.options.history = selected.history;
     startup.options.task_facts = crate::headless::session_task_facts(&selected.preflight);
     startup.options.artifact_ids = crate::headless::session_artifact_ids(&selected.preflight);
@@ -514,6 +572,9 @@ fn switch_session(
         messages,
         skill_names,
     });
+    if let Some(jobs) = &startup.options.shell_jobs {
+        sink.send(UiEvent::JobsChanged { jobs: jobs.list() });
+    }
     announce_session_title(startup, sink);
     let _ = sink.send(todo_event);
     if !skill_memo.warnings.is_empty() {
@@ -595,8 +656,15 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
         .or_else(|| (!parsed.positional.is_empty()).then(|| parsed.positional.join(" ")));
     let layered_config = crate::config::load_layered()
         .map_err(|error| TuiError::new(ExitCode::Internal, format!("config error: {error}")))?;
+    // load_layered reads the project slim.toml from the process directory;
+    // its LSP launch overrides follow the project MCP trust decision.
+    let lsp_trust = crate::code_intel::project_trust(
+        &layered_config.lsp,
+        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        parsed.trust_project,
+    );
     let application_code_intelligence =
-        crate::code_intel::build_code_intelligence(&layered_config.lsp);
+        crate::code_intel::build_code_intelligence(&layered_config.lsp, lsp_trust.trusted);
     let timeout = resolve_timeout_secs(layered_config.timeout_secs).map_err(|error| {
         TuiError::new(
             ExitCode::InputRequired,
@@ -606,22 +674,9 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
             },
         )
     })?;
-    let mut compaction_policy = layered_config
+    let compaction_policy = layered_config
         .compaction_policy()
         .map_err(|error| TuiError::new(ExitCode::Internal, format!("config error: {error}")))?;
-    if let Some(value) = std::env::var("SLIM_COMPACTOR")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
-        compaction_policy.strategy = slim_core::context::CompactionStrategy::parse(&value)
-            .map_err(|error| TuiError::new(ExitCode::InputRequired, error))?;
-    }
-    let jev_prune = if compaction_policy.strategy == slim_core::context::CompactionStrategy::Jev {
-        crate::config::jev_prune_config_from_env()
-            .map_err(|error| TuiError::new(ExitCode::InputRequired, error))?
-    } else {
-        None
-    };
     let endpoint_override = parsed
         .endpoint
         .or_else(|| std::env::var("SLIM_ENDPOINT").ok())
@@ -806,9 +861,11 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
     let mut options = ProviderRunOptions::default()
         .with_content_blocks(content_blocks)
         .with_compaction_handle(slim_core::context::CompactionHandle::new(compaction_policy));
-    if let Some(jev_prune) = jev_prune {
-        options = options.with_jev_prune(jev_prune);
-    }
+    options.shell_job_limits = layered_config.shell_jobs;
+    options
+        .shell_job_limits
+        .validate()
+        .map_err(|message| TuiError::new(ExitCode::InputRequired, message))?;
     if let Some(experiment_id) = parsed.experiment_id {
         options = options.with_experiment_id(experiment_id);
     }
@@ -836,6 +893,7 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
     if let Some(bytes) = layered_config.max_result_bytes {
         options = options.with_max_result_bytes(bytes);
     }
+    options.trust_project = parsed.trust_project;
     options.codex_fast = parsed
         .codex_fast
         .or(layered_config.codex_fast)
@@ -1408,6 +1466,12 @@ struct ActiveRun {
     interaction_responder: Option<InteractionResponder>,
     manual_retry: slim_core::runtime::ManualRetryHandle,
     workspace_root: Option<PathBuf>,
+    /// The compaction handle of an idle `/compact` run. Its manual request
+    /// belongs to that run: it is cleared however the run ends, a forced
+    /// abort and an early failure included, so it cannot compact a later
+    /// prompt by surprise. A normal run leaves the handle alone, since a
+    /// `/compact` queued during it is meant to survive.
+    idle_compaction: Option<slim_core::context::CompactionHandle>,
 }
 
 struct ActiveRunLaunch {
@@ -1416,7 +1480,209 @@ struct ActiveRunLaunch {
     skill_instructions: Option<SkillInstructions>,
 }
 
+#[derive(Clone)]
+struct JobCommandContext {
+    jobs: slim_core::runtime::ShellJobs,
+    mode: slim_core::OperatingMode,
+    cwd: PathBuf,
+    tools: slim_core::tools::ToolRegistry,
+    store: slim_core::context::ArtifactStore,
+    secrets: Vec<String>,
+}
+impl JobCommandContext {
+    fn from_startup(startup: &TuiStartup) -> Option<Self> {
+        let jobs = startup.options.shell_jobs.clone()?;
+        let cwd = startup.options.workspace_root.clone().unwrap_or_default();
+        let store = slim_core::context::ArtifactStore::new(
+            startup
+                .options
+                .artifact_root
+                .clone()
+                .unwrap_or_else(|| cwd.join(".slim/artifacts")),
+        )
+        .ok()?;
+        let tools = startup
+            .options
+            .tool_registry
+            .as_ref()
+            .map(|t| t.registry())
+            .unwrap_or_default();
+        let mut secrets = startup
+            .request
+            .as_ref()
+            .map(|r| vec![r.api_key.clone()])
+            .unwrap_or_default();
+        if let Some(mcp) = &startup.options.mcp {
+            secrets.extend(mcp.manager().sensitive_values());
+        }
+        Some(Self {
+            jobs,
+            mode: startup.mode,
+            cwd,
+            tools,
+            store,
+            secrets,
+        })
+    }
+    fn handle(&self, command: UiCommand, sink: &EventSink) -> Option<UiCommand> {
+        let result = match command {
+            UiCommand::JobsRefresh => {
+                sink.send(UiEvent::JobsChanged {
+                    jobs: self.jobs.list(),
+                });
+                return None;
+            }
+            UiCommand::JobOutput { id, offset, before } => {
+                let result = if let Some(before) = before {
+                    self.jobs.output_before(&id, before, 64 * 1024)
+                } else {
+                    self.jobs
+                        .output(&id, offset, offset.is_none().then_some(1000), 64 * 1024)
+                };
+                match result {
+                    Ok(output) => {
+                        sink.send(UiEvent::JobOutput {
+                            id,
+                            offset,
+                            before,
+                            output: Box::new(output),
+                        });
+                    }
+                    Err(message) => {
+                        sink.send(UiEvent::Notification { message });
+                    }
+                }
+                return None;
+            }
+            UiCommand::JobControl { id, interrupt } => {
+                if self.mode != slim_core::OperatingMode::Auto {
+                    Err("Controle de processos exige Auto (/mode auto)".into())
+                } else if interrupt {
+                    self.jobs.interrupt(&id)
+                } else {
+                    self.jobs.cancel(&id)
+                }
+            }
+            UiCommand::RunBackgroundShell { command } => {
+                if self.mode != slim_core::OperatingMode::Auto {
+                    Err("Comandos com !& exigem Auto (/mode auto)".into())
+                } else {
+                    self.jobs
+                        .start_user(
+                            self.tools.clone(),
+                            &self.cwd,
+                            &command,
+                            &self.secrets,
+                            self.store.clone(),
+                        )
+                        .map(|id| {
+                            sink.send(UiEvent::Notification {
+                                message: format!("{id} iniciado · /jobs"),
+                            });
+                        })
+                }
+            }
+            other => return Some(other),
+        };
+        if let Err(message) = result {
+            sink.send(UiEvent::Notification { message });
+        }
+        sink.send(UiEvent::JobsChanged {
+            jobs: self.jobs.list(),
+        });
+        None
+    }
+}
+async fn persist_job_metadata(startup: &mut TuiStartup) -> Result<(), String> {
+    let Some(jobs) = startup.options.shell_jobs.clone() else {
+        return Ok(());
+    };
+    let Some(path) = startup.resume_path.clone() else {
+        return Ok(());
+    };
+    let infos = jobs.take_metadata();
+    if infos.is_empty() {
+        return Ok(());
+    }
+    let retry_jobs = jobs.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let retry = infos.clone();
+        let result = (|| {
+            let mut repo = JsonlRepo::open_no_repair(path).map_err(|e| e.to_string())?;
+            let mut seq = repo.next_seq().map_err(|e| e.to_string())?;
+            let mut records = Vec::new();
+            for info in infos {
+                records.push(slim_core::session::DurableRecord::Fact {
+                    seq,
+                    fact: slim_core::session::DurableFact {
+                        namespace: "shell_job.v1".into(),
+                        key: info.id.clone(),
+                        value: serde_json::to_value(info).map_err(|e| e.to_string())?,
+                    },
+                });
+                seq = seq.checked_add(1).ok_or("session sequence exhausted")?;
+            }
+            slim_core::session::DurableRepo::append_batch(&mut repo, records)
+                .map_err(|e| e.to_string())
+        })();
+        if result.is_err() {
+            retry_jobs.return_metadata(retry);
+        }
+        result
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    match result {
+        Ok(()) => {
+            startup.resume_preflight = None;
+            Ok(())
+        }
+        Err(error) => Err(format!("Metadados de jobs ainda não gravados: {error}")),
+    }
+}
+async fn receive_tui_command(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<UiCommand>,
+    startup: &mut TuiStartup,
+    sink: &EventSink,
+    idle: bool,
+    persist_at: tokio::time::Instant,
+) -> Option<UiCommand> {
+    loop {
+        let command = tokio::select! {
+            command = rx.recv() => command?,
+            _ = tokio::time::sleep_until(persist_at), if idle => return Some(UiCommand::PersistJobs),
+        };
+        if matches!(command, UiCommand::RunBackgroundShell { .. }) {
+            match create_tui_session(startup) {
+                Ok(Some((session_id, cwd))) => {
+                    sink.send(UiEvent::SessionSnapshot {
+                        session_id: slim_tui::api::SessionId(session_id.into()),
+                        cwd,
+                        skill_names: Vec::new(),
+                    });
+                    announce_session_title(startup, sink);
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    sink.send(UiEvent::Notification { message });
+                    continue;
+                }
+            }
+        }
+        match JobCommandContext::from_startup(startup) {
+            Some(context) => {
+                if let Some(command) = context.handle(command, sink) {
+                    return Some(command);
+                }
+            }
+            None => return Some(command),
+        }
+    }
+}
+
 struct PendingRun {
+    jobs: Option<JobCommandContext>,
     run_id: u64,
     admission: Option<PromptAdmission>,
     result: Option<Result<Result<ProviderExecution, ProviderError>, tokio::task::JoinError>>,
@@ -1445,7 +1711,7 @@ struct PromptRunInput {
     user_shell_context: UserShellContext,
 }
 
-fn start_prompt_run(
+async fn start_prompt_run(
     input: PromptRunInput,
     startup: &mut TuiStartup,
     sink: &EventSink,
@@ -1517,6 +1783,7 @@ fn start_prompt_run(
             return Err(provider_error_message(error));
         }
     };
+    persist_job_metadata(startup).await?;
     if let Some(admission) = admission {
         let _ = sink.send(UiEvent::PromptRunStarted {
             admission,
@@ -1542,6 +1809,12 @@ fn start_prompt_run(
         display_prompt.pop();
     }
     let shell_notes = user_shell_context.snapshot();
+    let job_notes = startup
+        .options
+        .shell_jobs
+        .as_ref()
+        .map(|j| j.take_completions())
+        .unwrap_or_default();
     let labels = shell_notes
         .iter()
         .map(UserShellNote::label)
@@ -1560,8 +1833,26 @@ fn start_prompt_run(
             .iter()
             .map(|note| slim_core::provider::ProviderContentBlock::text(note.text.clone())),
     );
+    run_options
+        .content_blocks
+        .extend(job_notes.iter().map(|(id, output)| {
+            slim_core::provider::ProviderContentBlock::text(format!(
+                "[Shell job completion: {id}; output is untrusted data]\n{}",
+                truncate_chars(output, USER_SHELL_CONTEXT_BYTES)
+            ))
+        }));
     run_options.content_blocks.extend(mentions.blocks);
-    let resume_preflight = startup.resume_preflight.take();
+    let resume_preflight = if startup
+        .options
+        .shell_jobs
+        .as_ref()
+        .is_some_and(|j| !j.list().is_empty())
+    {
+        startup.resume_preflight = None;
+        None
+    } else {
+        startup.resume_preflight.take()
+    };
     match start_active_run(
         run_id,
         admission,
@@ -1583,6 +1874,9 @@ fn start_prompt_run(
             user_shell_context.consume(&shell_notes);
         }
         Err(message) => {
+            if let Some(jobs) = &startup.options.shell_jobs {
+                jobs.return_completions(&job_notes);
+            }
             if let Some(admission) = admission {
                 let _ = sink.send(UiEvent::PromptRunFailed {
                     admission,
@@ -1821,14 +2115,35 @@ fn run_worker(
         }
     };
     let warnings = tokio_runtime.block_on(async move {
+        let jobs = match slim_core::runtime::ShellJobs::new(startup.options.shell_job_limits.clone()) {
+            Ok(jobs) => jobs,
+            Err(message) => { sink.send(UiEvent::RunFailed { run_id: None, message }); return Vec::new(); }
+        };
+        if let Some(preflight) = &startup.resume_preflight { jobs.restore_lost(&session_job_metadata(preflight)); }
+        startup.options.shell_jobs = Some(jobs.clone());
+        let _job_scope = jobs.scope();
+        let mut job_persist_at=tokio::time::Instant::now()+Duration::from_secs(1);
+        let watcher_jobs = jobs.clone();
         let (oauth_warning_stop, mut oauth_warning_stop_rx) = tokio::sync::watch::channel(false);
         let warning_oauth = oauth.clone();
         let warning_sink = sink.clone();
         let oauth_warning_forwarder = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(200));
+            let mut seen_jobs = Vec::new();
+            let mut ticks = 0;
             loop {
                 tokio::select! {
                     _ = tick.tick() => {
+                        ticks += 1;
+                        if ticks % 5 == 0 {
+                            let snapshot = watcher_jobs.list();
+                            let mut signature = snapshot.clone();
+                            for job in &mut signature { if matches!(job.state.as_str(), "running" | "interrupting" | "cancelling") { job.elapsed_ms = 0; } }
+                            if signature != seen_jobs { seen_jobs = signature; warning_sink.send(UiEvent::JobsChanged { jobs: snapshot }); }
+                            for job in watcher_jobs.take_notifications() {
+                                warning_sink.send(UiEvent::Notification { message: job_finished_notice(&job) });
+                            }
+                        }
                         for message in warning_oauth.take_warnings() {
                             let _ = warning_sink.send(UiEvent::Notification { message });
                         }
@@ -1960,17 +2275,49 @@ fn run_worker(
         let zen_gen = Arc::new(AtomicU64::new(0));
         let cline_gen = Arc::new(AtomicU64::new(0));
         let command_code_gen = Arc::new(AtomicU64::new(0));
+        // Project LSP launch overrides held back by trust are announced once;
+        // the manager was built at startup, so trusting takes a restart.
+        if let Ok(layered) = crate::config::load_layered() {
+            let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let trust = crate::code_intel::project_trust(
+                &layered.lsp,
+                &workspace,
+                startup.options.trust_project,
+            );
+            if let Some(notice) = trust.notice {
+                let _ = sink.send(UiEvent::Notification {
+                    message: format!("{notice}; /mcp trust e reinicie o Slim para aplicar"),
+                });
+            }
+        }
         // Application-scoped MCP manager: built once from layered config,
         // never spawns a process until a server is actually exercised.
         if startup.options.mcp.is_none() {
-            let cwd = startup
-                .options
-                .workspace_root
-                .clone()
-                .unwrap_or_default();
-            if let Ok(layered) = crate::config::load_layered() {
-                if let Some(manager) = crate::mcp::build_mcp_manager(&layered.mcp, &cwd) {
-                    startup.options.mcp = Some(McpHandle::new(manager));
+            let cwd = mcp_workspace(&startup);
+            // Servers that cannot start (untrusted project, unresolved
+            // values) stay listed in /mcp and are announced once here;
+            // an unreadable config disables MCP loudly, never silently.
+            match crate::mcp::load_mcp(&cwd, startup.options.trust_project) {
+                Ok(load) => {
+                    if let Some(manager) = crate::mcp::build_mcp_manager(&load, &cwd) {
+                        // Enabled, trusted, non-lazy servers connect while the
+                        // session opens; nothing here waits for them. One
+                        // notice lists what failed, needs a login or waits
+                        // for trust once the connections settle.
+                        manager.start_background_connect();
+                        mcp_manage::spawn_startup_notice(
+                            manager.clone(),
+                            sink.clone(),
+                            load.denied,
+                            load.trust_error.is_some(),
+                        );
+                        startup.options.mcp = Some(McpHandle::new(manager));
+                    }
+                }
+                Err(error) => {
+                    let _ = sink.send(UiEvent::Notification {
+                        message: format!("mcp desativado: erro de configuração: {error}"),
+                    });
                 }
             }
         }
@@ -1986,11 +2333,12 @@ fn run_worker(
         let mcp_seen_revision = Arc::new(AtomicU64::new(0_u64));
         let mut mcp_watch_tick = tokio::time::interval(Duration::from_secs(1));
         let mcp_inflight = Arc::new(Mutex::new(HashSet::<String>::new()));
+        let mcp_logins: mcp_login::McpLogins = Arc::default();
         loop {
             if let Some(mut prompt_prep) = preparing.take() {
                 let wake = tokio::select! {
                     biased;
-                    command = async_rx.recv() => PromptPreparationEvent::Command(command),
+                    command = receive_tui_command(&mut async_rx, &mut startup, &sink, false, job_persist_at) => PromptPreparationEvent::Command(command),
                     result = &mut prompt_prep.task => PromptPreparationEvent::Finished(result),
                 };
                 match wake {
@@ -2131,7 +2479,7 @@ fn run_worker(
                             &mut next_run_id,
                             &mut active,
                             &mut skill_memo,
-                        ) {
+                        ).await {
                             let _ = sink.send(UiEvent::PromptPreparationFailed {
                                 admission: prompt_prep.admission,
                                 message,
@@ -2142,6 +2490,7 @@ fn run_worker(
                 continue;
             }
             if let Some(mut run) = pending.take() {
+                run.jobs = JobCommandContext::from_startup(&startup);
                 if let Some(projector) = run.projector.take() {
                     if projector.is_finished() {
                         let _ = projector.join();
@@ -2164,13 +2513,14 @@ fn run_worker(
                         // Cancel/Shutdown stays responsive while the provider
                         // task unwinds.
                         tokio::select! {
-                            command = async_rx.recv() => {
+                            command = receive_tui_command(&mut async_rx, &mut startup, &sink, false, job_persist_at) => {
                                 if dispatch_pending_command(
                                     &mut run,
                                     command,
                                     &sink,
                                     &mut mcp_watch,
                                     &mcp_manager,
+                                    &mcp_logins,
                                 ) {
                                     break;
                                 }
@@ -2188,19 +2538,21 @@ fn run_worker(
                     &sink,
                     &mut mcp_watch,
                     &mcp_manager,
+                    &mcp_logins,
                 ) {
                     PendingDeliveryStep::Complete => {}
                     PendingDeliveryStep::Pending => {
                         // Backpressure pacing plus command wake: a cancel no
                         // longer waits for the drain to finish first.
                         tokio::select! {
-                            command = async_rx.recv() => {
+                            command = receive_tui_command(&mut async_rx, &mut startup, &sink, false, job_persist_at) => {
                                 if dispatch_pending_command(
                                     &mut run,
                                     command,
                                     &sink,
                                     &mut mcp_watch,
                                     &mcp_manager,
+                                    &mcp_logins,
                                 ) {
                                     break;
                                 }
@@ -2218,7 +2570,7 @@ fn run_worker(
                 let wake = {
                     let current = login.as_mut().expect("checked");
                     tokio::select! {
-                        command = async_rx.recv() => LoginEvent::Command(command),
+                        command = receive_tui_command(&mut async_rx, &mut startup, &sink, false, job_persist_at) => LoginEvent::Command(command),
                         result = &mut current.task => LoginEvent::Finished(result),
                     }
                 };
@@ -2330,14 +2682,14 @@ fn run_worker(
                                 Instant::now().saturating_duration_since(armed_at),
                             );
                             tokio::select! {
-                                command = async_rx.recv() => ActiveEvent::Command(command),
+                                command = receive_tui_command(&mut async_rx, &mut startup, &sink, false, job_persist_at) => ActiveEvent::Command(command),
                                 result = &mut run.task => ActiveEvent::Finished(Box::new(result)),
                                 _ = tokio::time::sleep(grace) => ActiveEvent::CancelTimeout,
                                 _ = mcp_watch_tick.tick(), if mcp_watch => ActiveEvent::McpTick,
                             }
                         }
                         None => tokio::select! {
-                            command = async_rx.recv() => ActiveEvent::Command(command),
+                            command = receive_tui_command(&mut async_rx, &mut startup, &sink, false, job_persist_at) => ActiveEvent::Command(command),
                             result = &mut run.task => ActiveEvent::Finished(Box::new(result)),
                             _ = mcp_watch_tick.tick(), if mcp_watch => ActiveEvent::McpTick,
                         },
@@ -2420,7 +2772,12 @@ fn run_worker(
                         });
                     }
                     ActiveEvent::Command(Some(UiCommand::Compact { instructions })) => {
-                        request_manual_compaction(&startup.options, instructions, &sink);
+                        request_compaction_during_run(
+                            active.as_ref(),
+                            &startup.options,
+                            instructions,
+                            &sink,
+                        );
                     }
                     ActiveEvent::Command(Some(UiCommand::RequestContentPage {
                         handle,
@@ -2463,6 +2820,17 @@ fn run_worker(
                             });
                         }
                     }
+                    // A sign-in already waiting for the user can still be
+                    // finished or dismissed; starting one stays refused.
+                    ActiveEvent::Command(Some(UiCommand::McpLoginCancel { name })) => {
+                        mcp_login::cancel_login(&mcp_logins, &name);
+                    }
+                    ActiveEvent::Command(Some(UiCommand::McpLogin {
+                        name,
+                        redirect_url: Some(url),
+                    })) => {
+                        mcp_login::paste_redirect(&mcp_logins, &sink, &name, url);
+                    }
                     ActiveEvent::Command(Some(UiCommand::RunUserShell { request_id, .. })) => {
                         reject_user_shell(
                             &sink,
@@ -2477,9 +2845,23 @@ fn run_worker(
                             "Aguarde ou cancele a execução",
                         );
                     }
+                    // A prompt admitted while a run (an idle /compact starting
+                    // included) became active: resolve its admission so the UI
+                    // restores the draft instead of waiting for a preparation
+                    // that will never start.
+                    ActiveEvent::Command(Some(UiCommand::PreparePrompt { admission, .. })) => {
+                        let _ = sink.send(UiEvent::PromptPreparationFailed {
+                            admission,
+                            message: "Aguarde ou cancele a execução antes de enviar um prompt"
+                                .into(),
+                        });
+                    }
+                    ActiveEvent::Command(Some(command)) if mcp_manage::is_mutation(&command) => {
+                        mcp_manage::refuse_mutation(&sink);
+                    }
                     ActiveEvent::Command(Some(_)) => {
                         let _ = sink.send(UiEvent::Notification {
-                            message: "a run is already active".into(),
+                            message: "Já há uma execução ativa".into(),
                         });
                     }
                     ActiveEvent::McpTick => {
@@ -2500,6 +2882,11 @@ fn run_worker(
                         let esc_cancelled = last_esc_at.is_some();
                         last_esc_at = None;
                         if let Ok(Ok(execution)) = &*result {
+                            for message in &execution.warnings {
+                                let _ = sink.send(UiEvent::Notification {
+                                    message: message.clone(),
+                                });
+                            }
                             if execution.history.is_some() {
                                 startup.options.task_facts.clone_from(&execution.task_facts);
                             }
@@ -2523,8 +2910,12 @@ fn run_worker(
                         }
                         let durable = active.as_ref().is_some_and(|run| run.durable);
                         if let Some(run) = active.take() {
+                            if let Some(handle) = &run.idle_compaction {
+                                handle.clear_manual();
+                            }
                             ignored_prep_cancel = false;
                             pending = Some(PendingRun {
+                                jobs: JobCommandContext::from_startup(&startup),
                                 run_id: run.run_id,
                                 admission: run.admission,
                                 result: Some(*result),
@@ -2546,7 +2937,7 @@ fn run_worker(
                 // Status polling only runs while the /mcp overlay is open; a
                 // revision counter keeps identical snapshots off the UI lane.
                 tokio::select! {
-                    command = async_rx.recv() => command,
+                    command = receive_tui_command(&mut async_rx, &mut startup, &sink, true, job_persist_at) => command,
                     _ = mcp_watch_tick.tick() => {
                         if let Some(manager) = mcp_manager.as_ref() {
                             let revision = manager.revision();
@@ -2561,7 +2952,7 @@ fn run_worker(
                     }
                 }
             } else {
-                async_rx.recv().await
+                receive_tui_command(&mut async_rx, &mut startup, &sink, true, job_persist_at).await
             };
             let Some(command) = command else {
                 break;
@@ -3421,7 +3812,14 @@ fn run_worker(
                     let _ = sink.send(UiEvent::ModelChanged { model });
                     let _ = sink.send(UiEvent::EffortChanged { effort });
                 }
+                UiCommand::PersistJobs => { if let Err(message)=persist_job_metadata(&mut startup).await {sink.send(UiEvent::Notification{message});} job_persist_at=tokio::time::Instant::now()+Duration::from_secs(1); }
                 UiCommand::Logout => {
+                    if let Some(jobs) = &startup.options.shell_jobs {
+                        if jobs.running() { sink.send(UiEvent::Notification { message: format!("Encerrando {} job(s) antes do logout", jobs.running_count()) }); }
+                        jobs.reset().await;
+                        sink.send(UiEvent::JobsChanged { jobs: Vec::new() });
+                    }
+                    if let Err(message) = persist_job_metadata(&mut startup).await { sink.send(UiEvent::Notification { message }); }
                     if let Some((provider, _)) = startup.oauth_session.take() {
                         match oauth.logout(provider) {
                             Ok(()) => {
@@ -3685,7 +4083,7 @@ fn run_worker(
                     }
                     let _ = sink.send(UiEvent::UserMessageAdded { text: display_prompt });
                     let run_options = startup.options.clone();
-                    let resume_preflight = startup.resume_preflight.take();
+                    let resume_preflight = if startup.options.shell_jobs.as_ref().is_some_and(|j| !j.list().is_empty()) { startup.resume_preflight = None; None } else { startup.resume_preflight.take() };
                     match start_active_run(
                         run_id,
                         None,
@@ -3754,28 +4152,51 @@ fn run_worker(
                     }
                 }
                 UiCommand::Compact { instructions } => {
-                    let window = startup
-                        .options
-                        .context_window_tokens
-                        .unwrap_or(32_000);
-                    let mut policy = startup
-                        .options
-                        .compaction
+                    // Pi's /compact ignores `[compaction] enabled`, which gates
+                    // only the automatic triggers.
+                    let handle = startup.options.compaction.clone();
+                    let policy = handle
                         .as_ref()
                         .map(slim_core::context::CompactionHandle::policy)
                         .unwrap_or_default();
-                    policy.keep_recent_tokens = policy.keep_recent_for_window(window);
-                    if slim_core::context::select_compaction_history(
-                        &startup.options.history,
-                        &policy,
-                    )
-                    .is_err()
+                    let history = &startup.options.history;
+                    let usage = slim_core::context::ContextUsage {
+                        anchor: handle
+                            .as_ref()
+                            .and_then(|handle| handle.usage_anchor(None, history)),
+                        fixed_tokens: 0,
+                    };
+                    // Pi: a history that ends with the compaction is "Already
+                    // compacted". Slim puts the summary first, so that is a
+                    // history with nothing appended since the last compaction.
+                    let already_compacted = history.last().is_some_and(|message| {
+                        slim_core::context::compaction_summary_text(message).is_some()
+                    }) || handle
+                        .as_ref()
+                        .is_some_and(|handle| handle.is_already_compacted(history));
+                    if already_compacted
+                        || slim_core::context::prepare_compaction(history, &policy.settings(), usage)
+                            .is_none()
                     {
                         let _ = sink.send(UiEvent::Notification {
-                            message: "Nothing to compact yet".into(),
+                            message: if already_compacted {
+                                "Already compacted"
+                            } else {
+                                "Nothing to compact (session too small)"
+                            }
+                            .into(),
                         });
                     } else {
-                        request_manual_compaction(&startup.options, instructions, &sink);
+                        start_idle_compaction(
+                            instructions,
+                            &mut startup,
+                            &oauth,
+                            &sink,
+                            content_store.clone(),
+                            &mut next_run_id,
+                            &mut active,
+                        )
+                        .await;
                     }
                 }
                 UiCommand::AnswerInput { request_id, .. }
@@ -3868,26 +4289,8 @@ fn run_worker(
                 UiCommand::McpWatch { on } => {
                     mcp_watch = on;
                 }
-                UiCommand::McpRefresh => match crate::config::load_layered() {
-                    Ok(layered) => {
-                        match mcp_manager.as_ref() {
-                            Some(manager) => {
-                                manager.reconcile(crate::mcp::specs_from_config(&layered.mcp));
-                            }
-                            None => {
-                                let cwd = startup
-                                    .options
-                                    .workspace_root
-                                    .clone()
-                                    .unwrap_or_default();
-                                if let Some(manager) =
-                                    crate::mcp::build_mcp_manager(&layered.mcp, &cwd)
-                                {
-                                    startup.options.mcp = Some(McpHandle::new(manager.clone()));
-                                    mcp_manager = Some(manager);
-                                }
-                            }
-                        }
+                UiCommand::McpRefresh => match reload_mcp(&mut startup, &mut mcp_manager) {
+                    Ok(_) => {
                         mcp_seen_revision.store(
                             mcp_manager.as_ref().map_or(0, |manager| manager.revision()),
                             Ordering::Relaxed,
@@ -3901,7 +4304,7 @@ fn run_worker(
                     }
                     Err(error) => {
                         let _ = sink.send(UiEvent::Notification {
-                            message: format!("config: {error}"),
+                            message: format!("configuração: {error}"),
                         });
                     }
                 },
@@ -3913,10 +4316,13 @@ fn run_worker(
                         &sink,
                         name,
                         |manager, name| async move {
-                            manager
-                                .test(&name)
-                                .await
-                                .map(|count| format!("ok — {count} tool(s)"))
+                            let tools = manager.test(&name).await?;
+                            Ok(match mcp_manage::prime_resources(&manager, &name).await {
+                                Some(resources) => {
+                                    format!("ok — {tools} ferramenta(s), {resources} recurso(s)")
+                                }
+                                None => format!("ok — {tools} ferramenta(s)"),
+                            })
                         },
                     );
                 }
@@ -3928,7 +4334,9 @@ fn run_worker(
                         &sink,
                         name,
                         |manager, name| async move {
-                            manager.reconnect(&name).await.map(|()| "reconnected".to_owned())
+                            manager.reconnect(&name).await?;
+                            let _ = mcp_manage::prime_resources(&manager, &name).await;
+                            Ok("reconectado".to_owned())
                         },
                     );
                 }
@@ -3943,48 +4351,48 @@ fn run_worker(
                             manager
                                 .disconnect(&name)
                                 .await
-                                .map(|()| "disconnected".to_owned())
+                                .map(|()| "desconectado".to_owned())
                         },
                     );
                 }
                 UiCommand::McpRemove { name } => {
-                    match crate::config::remove_mcp_server(&name) {
+                    let workspace = mcp_workspace(&startup);
+                    match crate::config::remove_mcp_server(&workspace, &name) {
                         Ok(edited) => {
                             let mut still_defined = false;
-                            if let Some(manager) = mcp_manager.as_ref() {
+                            if mcp_manager.is_some() {
                                 // Reconcile against the reloaded config: the
                                 // server may survive in another layer, and a
                                 // blind remove would kill it anyway.
-                                still_defined = match crate::config::load_layered() {
-                                    Ok(layered) => {
-                                        manager.reconcile(crate::mcp::specs_from_config(
-                                            &layered.mcp,
-                                        ));
-                                        layered.mcp.servers.contains_key(&name)
-                                    }
+                                still_defined = match reload_mcp(&mut startup, &mut mcp_manager) {
+                                    Ok(load) => load.specs.contains_key(&name),
                                     Err(_) => {
-                                        manager.remove(&name);
+                                        if let Some(manager) = mcp_manager.as_ref() {
+                                            manager.remove(&name);
+                                        }
                                         false
                                     }
                                 };
-                                mcp_seen_revision
-                                    .store(manager.revision(), Ordering::Relaxed);
-                                let _ = sink.send(UiEvent::McpServersChanged {
-                                    servers: mcp_server_views(manager),
-                                });
+                                if let Some(manager) = mcp_manager.as_ref() {
+                                    mcp_seen_revision
+                                        .store(manager.revision(), Ordering::Relaxed);
+                                    let _ = sink.send(UiEvent::McpServersChanged {
+                                        servers: mcp_server_views(manager),
+                                    });
+                                }
                             }
                             let message = match edited {
                                 Some(path) => {
                                     if still_defined {
                                         format!(
-                                            "mcp {name} removed from {} (still defined in another layer)",
+                                            "mcp {name}: removido de {} (ainda definido em outra camada)",
                                             path.display()
                                         )
                                     } else {
-                                        format!("mcp {name} removed from {}", path.display())
+                                        format!("mcp {name}: removido de {}", path.display())
                                     }
                                 }
-                                None => format!("mcp {name} is not in slim.toml"),
+                                None => format!("mcp {name}: não está no slim.toml"),
                             };
                             let _ = sink.send(UiEvent::Notification { message });
                         }
@@ -4002,6 +4410,7 @@ fn run_worker(
                     url,
                     global,
                 } => {
+                    let workspace = mcp_workspace(&startup);
                     let file = crate::config::FileMcpServerConfig {
                         command,
                         args: if args.is_empty() { None } else { Some(args) },
@@ -4014,12 +4423,20 @@ fn run_worker(
                         url: file.url.clone(),
                         ..crate::config::McpServerConfig::default()
                     };
-                    let mut check = crate::config::McpConfig::default();
-                    check.servers.insert(name.clone(), server.clone());
+                    // Validate against the servers already configured so a
+                    // name that collides with another (- versus _) is refused
+                    // before it can make the whole config unloadable.
+                    let mut check = crate::config::McpConfig {
+                        servers: crate::config::load_layered_for(&workspace)
+                            .map(|layered| layered.mcp.servers)
+                            .unwrap_or_default(),
+                        ..crate::config::McpConfig::default()
+                    };
+                    check.servers.insert(name.clone(), server);
                     let path = if global {
                         crate::config::global_config_path()
                     } else {
-                        Some(PathBuf::from(crate::config::PROJECT_CONFIG_FILE))
+                        Some(crate::config::project_config_path(&workspace))
                     };
                     let result = check
                         .validate()
@@ -4034,39 +4451,30 @@ fn run_worker(
                     match result {
                         Ok(path) => {
                             // Reconcile from the merged config so the live
-                            // entry matches what the next load_layered sees
-                            // (other layers may contribute env/headers/etc).
-                            let cwd = startup
-                                .options
-                                .workspace_root
-                                .clone()
-                                .unwrap_or_default();
-                            let manager = match mcp_manager.as_ref() {
-                                Some(manager) => manager.clone(),
-                                None => {
-                                    let manager = Arc::new(McpManager::new(
-                                        std::collections::BTreeMap::new(),
-                                        cwd,
-                                        Default::default(),
-                                    ));
-                                    startup.options.mcp =
-                                        Some(McpHandle::new(manager.clone()));
-                                    mcp_manager = Some(manager.clone());
-                                    manager
+                            // entry matches what the next load sees (other
+                            // layers may contribute env/headers/etc).
+                            let mut notice = format!("mcp {name}: salvo em {}", path.display());
+                            match reload_mcp(&mut startup, &mut mcp_manager) {
+                                Ok(load) => {
+                                    if load.untrusted.contains(&name) {
+                                        notice.push_str(
+                                            " (projeto sem confiança: /mcp trust para iniciar)",
+                                        );
+                                    }
                                 }
-                            };
-                            if let Ok(layered) = crate::config::load_layered() {
-                                manager.reconcile(crate::mcp::specs_from_config(&layered.mcp));
-                            } else {
-                                manager.upsert(crate::mcp::server_spec(&name, &server));
+                                Err(error) => {
+                                    notice = format!(
+                                        "mcp {name}: salvo, mas recarregar a configuração falhou: {error}"
+                                    );
+                                }
                             }
-                            mcp_seen_revision.store(manager.revision(), Ordering::Relaxed);
-                            let _ = sink.send(UiEvent::McpServersChanged {
-                                servers: mcp_server_views(&manager),
-                            });
-                            let _ = sink.send(UiEvent::Notification {
-                                message: format!("mcp {name} saved to {}", path.display()),
-                            });
+                            if let Some(manager) = mcp_manager.as_ref() {
+                                mcp_seen_revision.store(manager.revision(), Ordering::Relaxed);
+                                let _ = sink.send(UiEvent::McpServersChanged {
+                                    servers: mcp_server_views(manager),
+                                });
+                            }
+                            let _ = sink.send(UiEvent::Notification { message: notice });
                         }
                         Err(error) => {
                             let _ = sink.send(UiEvent::Notification {
@@ -4074,6 +4482,49 @@ fn run_worker(
                             });
                         }
                     }
+                }
+                UiCommand::McpTrust { trust, name } => {
+                    mcp_manage::set_trust(
+                        &mut startup,
+                        &mut mcp_manager,
+                        &mcp_seen_revision,
+                        &sink,
+                        trust,
+                        name.as_deref(),
+                    );
+                }
+                UiCommand::McpEnable { name, enabled } => {
+                    mcp_manage::set_enabled(
+                        &mut startup,
+                        &mut mcp_manager,
+                        &mcp_seen_revision,
+                        &sink,
+                        &name,
+                        enabled,
+                    );
+                }
+                UiCommand::McpLoginCancel { name } => {
+                    mcp_login::cancel_login(&mcp_logins, &name);
+                }
+                UiCommand::McpLogin { name, redirect_url } => {
+                    mcp_login::start_login(
+                        &mcp_manager,
+                        &mcp_logins,
+                        &mcp_seen_revision,
+                        &sink,
+                        oauth.browser(),
+                        name,
+                        redirect_url,
+                    );
+                }
+                UiCommand::McpLogout { name } => {
+                    mcp_login::start_logout(
+                        &mcp_manager,
+                        &mcp_logins,
+                        &mcp_seen_revision,
+                        &sink,
+                        name,
+                    );
                 }
                 UiCommand::CancelRun => {
                     if let Some(run) = user_shell.as_ref() {
@@ -4106,6 +4557,9 @@ fn run_worker(
                     let _ = sink.send(UiEvent::Shutdown);
                     break;
                 }
+                UiCommand::JobsRefresh | UiCommand::JobOutput { .. } | UiCommand::JobControl { .. } | UiCommand::RunBackgroundShell { .. } => {
+                    sink.send(UiEvent::Notification { message: "Estado de jobs indisponível nesta sessão".into() });
+                }
                 UiCommand::RequestContentPage {
                     handle,
                     request_id,
@@ -4118,6 +4572,9 @@ fn run_worker(
                 ),
             }
         }
+        jobs.shutdown().await;
+        if let Err(message) = persist_job_metadata(&mut startup).await { sink.send(UiEvent::Notification { message }); }
+        mcp_login::cancel_all(&mcp_logins);
         if let Some(manager) = mcp_manager.as_ref() {
             manager.disconnect_all().await;
         }
@@ -4138,6 +4595,43 @@ fn redact_mcp_text(manager: &McpManager, input: &str) -> String {
     crate::auth::redact_with_secrets(input, &manager.sensitive_values())
 }
 
+/// Workspace root MCP configuration, trust and server working directories
+/// are anchored to.
+fn mcp_workspace(startup: &TuiStartup) -> PathBuf {
+    startup
+        .options
+        .workspace_root
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Reloads layered MCP config (project layer from the workspace, trust
+/// decision applied) into the live manager, creating it when the first server
+/// appears. Returns the load so callers can report what did not start.
+fn reload_mcp(
+    startup: &mut TuiStartup,
+    mcp_manager: &mut Option<Arc<McpManager>>,
+) -> Result<crate::mcp::McpLoad, String> {
+    let cwd = mcp_workspace(startup);
+    let load = crate::mcp::load_mcp(&cwd, startup.options.trust_project)?;
+    match mcp_manager.as_ref() {
+        Some(manager) => {
+            manager.reconcile(load.specs.clone());
+            manager.set_startup_wait(load.startup_wait);
+            // New or newly trusted servers connect like those at session start.
+            manager.start_background_connect();
+        }
+        None => {
+            if let Some(manager) = crate::mcp::build_mcp_manager(&load, &cwd) {
+                manager.start_background_connect();
+                startup.options.mcp = Some(McpHandle::new(manager.clone()));
+                *mcp_manager = Some(manager);
+            }
+        }
+    }
+    Ok(load)
+}
+
 /// Maps manager state to the UI view: target/error lines are bounded,
 /// redacted, and never carry header or env values.
 fn mcp_server_views(manager: &McpManager) -> Vec<McpServerView> {
@@ -4145,10 +4639,20 @@ fn mcp_server_views(manager: &McpManager) -> Vec<McpServerView> {
         .statuses()
         .into_iter()
         .map(|info| {
+            let counts = manager.cached_resource_counts(&info.name);
             let (status, tools, error) = match &info.status {
                 McpServerStatus::Disabled => (McpStatusView::Disabled, None, None),
                 McpServerStatus::Disconnected => (McpStatusView::Disconnected, None, None),
                 McpServerStatus::Connecting => (McpStatusView::Connecting, None, None),
+                McpServerStatus::Untrusted => (McpStatusView::Untrusted, None, None),
+                McpServerStatus::NeedsAuth { reason } => {
+                    let first = reason.lines().next().unwrap_or("");
+                    (
+                        McpStatusView::NeedsAuth,
+                        None,
+                        Some(redact_mcp_text(manager, first)),
+                    )
+                }
                 McpServerStatus::Ready { tools } => (McpStatusView::Ready, Some(tools.len()), None),
                 McpServerStatus::Failed { error } => {
                     let first = error.lines().next().unwrap_or("");
@@ -4170,6 +4674,9 @@ fn mcp_server_views(manager: &McpManager) -> Vec<McpServerView> {
                 target: info.target,
                 status,
                 tools,
+                resources: counts.resources,
+                resource_templates: counts.templates,
+                exposure: info.exposure.as_str(),
                 error,
             }
         })
@@ -4191,7 +4698,7 @@ fn spawn_mcp_op<F, Fut>(
 {
     let Some(manager) = mcp_manager.clone() else {
         let _ = sink.send(UiEvent::Notification {
-            message: "no MCP servers configured".into(),
+            message: "Nenhum servidor MCP configurado".into(),
         });
         return;
     };
@@ -4243,6 +4750,7 @@ fn advance_pending_delivery(
     sink: &EventSink,
     mcp_watch: &mut bool,
     mcp_manager: &Option<Arc<McpManager>>,
+    mcp_logins: &mcp_login::McpLogins,
 ) -> PendingDeliveryStep {
     let Some(event) = run.delivery.pop_front() else {
         return PendingDeliveryStep::Complete;
@@ -4252,7 +4760,7 @@ fn advance_pending_delivery(
         Ok(()) => PendingDeliveryStep::Pending,
         Err(mpsc::TrySendError::Full(event)) => {
             run.delivery.push_front(event);
-            if service_pending_command(run, commands, sink, mcp_watch, mcp_manager) {
+            if service_pending_command(run, commands, sink, mcp_watch, mcp_manager, mcp_logins) {
                 return PendingDeliveryStep::Shutdown;
             }
             if run.cancel_requested {
@@ -4283,7 +4791,15 @@ fn dispatch_pending_command(
     sink: &EventSink,
     mcp_watch: &mut bool,
     mcp_manager: &Option<Arc<McpManager>>,
+    mcp_logins: &mcp_login::McpLogins,
 ) -> bool {
+    let command = match (command, run.jobs.as_ref()) {
+        (Some(command), Some(context)) => match context.handle(command, sink) {
+            Some(command) => Some(command),
+            None => return false,
+        },
+        (command, _) => command,
+    };
     match command {
         Some(UiCommand::CancelPromptPreparation { admission })
             if run.admission == Some(admission) =>
@@ -4327,6 +4843,14 @@ fn dispatch_pending_command(
                 });
             }
         }
+        // A sign-in already waiting for the user can still be finished or
+        // dismissed while the run drains, as during the run.
+        Some(UiCommand::McpLoginCancel { name }) => mcp_login::cancel_login(mcp_logins, &name),
+        Some(UiCommand::McpLogin {
+            name,
+            redirect_url: Some(url),
+        }) => mcp_login::paste_redirect(mcp_logins, sink, &name, url),
+        Some(command) if mcp_manage::is_mutation(&command) => mcp_manage::refuse_mutation(sink),
         Some(command) if sessions::is_session_command(&command) => {
             sessions::refuse_session_command(sink, &command, "Aguarde a execução terminar");
         }
@@ -4346,11 +4870,14 @@ fn service_pending_command(
     sink: &EventSink,
     mcp_watch: &mut bool,
     mcp_manager: &Option<Arc<McpManager>>,
+    mcp_logins: &mcp_login::McpLogins,
 ) -> bool {
     match commands.try_recv() {
-        Ok(command) => dispatch_pending_command(run, Some(command), sink, mcp_watch, mcp_manager),
+        Ok(command) => {
+            dispatch_pending_command(run, Some(command), sink, mcp_watch, mcp_manager, mcp_logins)
+        }
         Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-            dispatch_pending_command(run, None, sink, mcp_watch, mcp_manager)
+            dispatch_pending_command(run, None, sink, mcp_watch, mcp_manager, mcp_logins)
         }
         Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
     }
@@ -5149,6 +5676,154 @@ fn request_manual_compaction(options: &ProviderRunOptions, instructions: String,
     let _ = sink.send(UiEvent::Notification { message });
 }
 
+/// `/compact` typed while a run is active. A normal run takes it at its next
+/// safe boundary. An idle compaction already read its instructions and clears
+/// the handle when it ends, so a request queued then would be acknowledged and
+/// silently dropped: it is refused instead.
+fn request_compaction_during_run(
+    active: Option<&ActiveRun>,
+    options: &ProviderRunOptions,
+    instructions: String,
+    sink: &EventSink,
+) {
+    if active.is_some_and(|run| run.idle_compaction.is_some()) {
+        let _ = sink.send(UiEvent::Notification {
+            message: "A compaction is already running".into(),
+        });
+    } else {
+        request_manual_compaction(options, instructions, sink);
+    }
+}
+
+/// `/compact` while the session is idle: the summary is produced right away as
+/// a run of its own (cancellable, durable, usage-recorded) that ends without a
+/// model turn. The compacted history comes back through the run's execution
+/// like any other run's.
+async fn start_idle_compaction(
+    instructions: String,
+    startup: &mut TuiStartup,
+    oauth: &OAuthService,
+    sink: &EventSink,
+    content_store: SharedContentStore,
+    next_run_id: &mut u64,
+    active: &mut Option<ActiveRun>,
+) {
+    let notify = |message: String| {
+        let _ = sink.send(UiEvent::Notification { message });
+    };
+    if startup.request.is_none() {
+        notify("No provider connected. Use /login.".into());
+        return;
+    }
+    if let Some((provider, credential)) = startup.oauth_session.take() {
+        let _ = sink.send(UiEvent::ActivityChanged {
+            label: "Checking authentication".into(),
+        });
+        let fresh = match oauth.fresh_credential(provider, credential.clone()).await {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                startup.oauth_session = Some((provider, credential));
+                notify(error.to_string());
+                return;
+            }
+        };
+        if let Some(message) = fresh.persistence_warning {
+            notify(message);
+        }
+        let credential = fresh.credential;
+        let request = oauth_request(
+            provider,
+            &credential,
+            startup.mode,
+            startup.endpoint_override.as_deref(),
+            startup.model_override.as_deref(),
+        );
+        startup.oauth_session = Some((provider, credential));
+        match request {
+            Ok(request) => startup.request = Some(request),
+            Err(error) => {
+                notify(error.to_string());
+                return;
+            }
+        }
+    }
+    let Some(request) = startup.request.clone() else {
+        return;
+    };
+    let Some(handle) = startup.options.compaction.clone() else {
+        notify("compaction is unavailable".into());
+        return;
+    };
+    if let Err(error) = handle.request_manual(instructions) {
+        notify(error.to_owned());
+        return;
+    }
+    let Some(run_id) = take_run_id(next_run_id) else {
+        handle.clear_manual();
+        let _ = sink.send(UiEvent::FatalError {
+            run_id: None,
+            message: "TUI run identity exhausted".into(),
+        });
+        return;
+    };
+    let (max_mutating, max_read, max_turns) = match (
+        resolve_max_mutating_tool_calls(&startup.options),
+        resolve_max_read_tool_calls(&startup.options),
+        resolve_max_turns(&startup.options),
+    ) {
+        (Ok(max_mutating), Ok(max_read), Ok(max_turns)) => (max_mutating, max_read, max_turns),
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+            handle.clear_manual();
+            let _ = sink.send(UiEvent::RunFailed {
+                run_id: None,
+                message: provider_error_message(error),
+            });
+            return;
+        }
+    };
+    let _ = sink.send(UiEvent::run_started_with_budget(
+        run_id,
+        max_mutating,
+        max_read,
+        max_turns,
+    ));
+    let mut options = startup.options.clone();
+    options.compact_only = true;
+    let resume_preflight = if startup
+        .options
+        .shell_jobs
+        .as_ref()
+        .is_some_and(|j| !j.list().is_empty())
+    {
+        startup.resume_preflight = None;
+        None
+    } else {
+        startup.resume_preflight.take()
+    };
+    match start_active_run(
+        run_id,
+        None,
+        ActiveRunLaunch {
+            request,
+            options,
+            skill_instructions: None,
+        },
+        startup.resume_path.clone(),
+        resume_preflight,
+        sink.clone(),
+        content_store,
+    ) {
+        Ok(run) => *active = Some(run),
+        Err(message) => {
+            handle.clear_manual();
+            let _ = sink.send(UiEvent::RunFailed {
+                run_id: Some(run_id),
+                message,
+            });
+        }
+    }
+}
+
 fn start_active_run(
     run_id: u64,
     admission: Option<PromptAdmission>,
@@ -5173,6 +5848,7 @@ fn start_active_run(
     // appear on the next prompt.
     let projector_skill_names = workspace_skill_names(&workspace_root, &mut String::new());
     let cancellation = CancellationToken::new();
+    let notice_sink = sink.clone();
     let (core_tx, core_rx) = SessionEventSender::bounded(1_024, cancellation.clone());
     let projector_cancellation = cancellation.clone();
     let projector_content_store = content_store.clone();
@@ -5194,12 +5870,30 @@ fn start_active_run(
         })
         .map_err(|error| format!("TUI projector thread: {error}"))?;
     options.cancellation = Some(cancellation.clone());
+    let idle_compaction = if options.compact_only {
+        options.compaction.clone()
+    } else {
+        None
+    };
     let manual_retry = slim_core::runtime::ManualRetryHandle::default();
     options.manual_retry = Some(manual_retry.clone());
     options.allow_plan_loop = true;
     let durable = resume_path.is_some();
     let (runtime_interaction_route, interaction_responder) = interaction_route();
+    let startup_manager = options.mcp.as_ref().map(|handle| handle.manager().clone());
+    let startup_cancellation = cancellation.clone();
     let task = tokio::spawn(async move {
+        // The first model request waits only for direct-exposure servers
+        // that are still connecting, and says so when it stops waiting.
+        if let Some(manager) = startup_manager {
+            if let Some(notice) =
+                crate::mcp::await_direct_startup(&manager, Some(&startup_cancellation)).await
+            {
+                let _ = notice_sink.send(UiEvent::Notification {
+                    message: format!("mcp: {notice}"),
+                });
+            }
+        }
         if let Some(preflight) = resume_preflight {
             run_provider_resume_with_preflight_events_interactive_async(
                 request,
@@ -5255,6 +5949,7 @@ fn start_active_run(
         interaction_responder: Some(interaction_responder),
         manual_retry,
         workspace_root: Some(workspace_root),
+        idle_compaction,
     })
 }
 
@@ -5291,7 +5986,12 @@ async fn abort_active_with_grace(
                 result
             }
         };
+        // An aborted task never reaches the core's own clearing.
+        if let Some(handle) = &run.idle_compaction {
+            handle.clear_manual();
+        }
         Some(PendingRun {
+            jobs: None,
             run_id: run.run_id,
             admission: run.admission,
             result: Some(result),
@@ -5460,6 +6160,10 @@ fn provider_error_message(error: ProviderError) -> String {
 
 mod sessions;
 
+mod mcp_login;
+
+mod mcp_manage;
+
 #[cfg(test)]
 mod local_session_tests;
 
@@ -5477,6 +6181,12 @@ mod mention_tests;
 
 #[cfg(test)]
 mod user_shell_tests;
+
+#[cfg(test)]
+mod mcp_trust_tests;
+
+#[cfg(test)]
+mod mcp_login_tests;
 
 #[cfg(test)]
 mod tests;

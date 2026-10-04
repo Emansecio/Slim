@@ -367,16 +367,21 @@ pub struct OpenCodeModelView {
 
 /// One configured MCP server as shown by `/mcp`. Status is pushed by the
 /// worker; `tools` is the cached tool count once a server is `Ready`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum McpStatusView {
     Disabled,
+    #[default]
     Disconnected,
     Connecting,
     Ready,
     Failed,
+    /// Defined by the project `slim.toml` of a workspace not yet trusted.
+    Untrusted,
+    /// The HTTP server needs OAuth sign-in (`/mcp login <server>`).
+    NeedsAuth,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct McpServerView {
     pub name: String,
     pub transport: &'static str,
@@ -384,6 +389,12 @@ pub struct McpServerView {
     pub target: String,
     pub status: McpStatusView,
     pub tools: Option<usize>,
+    /// Cached `resources/list` size; `None` until a listing was fetched.
+    pub resources: Option<usize>,
+    /// Cached `resources/templates/list` size; `None` until fetched.
+    pub resource_templates: Option<usize>,
+    /// `gateway`, `direct` or `hidden` (empty when the host does not say).
+    pub exposure: &'static str,
     pub error: Option<String>,
 }
 
@@ -717,9 +728,30 @@ pub enum UiEvent {
     Notification {
         message: String,
     },
+    JobsChanged {
+        jobs: Vec<slim_core::runtime::ShellJobInfo>,
+    },
+    JobOutput {
+        id: String,
+        offset: Option<u64>,
+        before: Option<u64>,
+        output: Box<slim_core::runtime::ShellJobOutput>,
+    },
     /// Fresh `/mcp` snapshot after any lifecycle change or poll tick.
     McpServersChanged {
         servers: Vec<McpServerView>,
+    },
+    /// A `/mcp login` sign-in is waiting for the user: show the full
+    /// authorization URL and the pasted-redirect field.
+    McpAuthorization {
+        name: String,
+        url: SensitiveText,
+        browser_opened: bool,
+    },
+    /// The sign-in for `name` is over (success, failure, timeout or
+    /// cancellation); the outcome arrives as a notification.
+    McpLoginEnded {
+        name: String,
     },
     /// Data-lane compaction checkpoint (§11.3): collapsed system block, not a toast.
     CompactionCompleted,
@@ -815,6 +847,7 @@ impl UiEvent {
     pub fn from_core(event: slim_core::SessionEvent) -> Option<Self> {
         let request_id = event.seq;
         match event.kind {
+            slim_core::EventKind::ShellJobChanged { .. } => None,
             slim_core::EventKind::SessionStarted { session_id } => Some(Self::SessionSnapshot {
                 session_id: SessionId(session_id.into()),
                 cwd: String::new(),
@@ -898,8 +931,7 @@ impl UiEvent {
                     slim_core::tools::summarize_tool_arguments_for(&name, &arguments);
                 // Edit size travels as one more summary segment; the tool
                 // row styles it (see `edit_stats_segment`).
-                if let Some((added, removed)) =
-                    slim_core::tools::edit_line_stats(&name, &arguments)
+                if let Some((added, removed)) = slim_core::tools::edit_line_stats(&name, &arguments)
                 {
                     arguments_summary.push_str(&format!(" · +{added} -{removed}"));
                 }
@@ -1047,31 +1079,7 @@ impl UiEvent {
                 }
             }
             slim_core::EventKind::CompactionCompleted => Some(Self::CompactionCompleted),
-            slim_core::EventKind::CompactionAttemptStarted { .. }
-            | slim_core::EventKind::CompactionAttemptCompleted { .. }
-            | slim_core::EventKind::CompactionAttemptCancelled { .. }
-            | slim_core::EventKind::CompactionUsageUnknown { .. }
-            | slim_core::EventKind::CompactionSkippedBelowBreakEven { .. } => None,
-            slim_core::EventKind::CompactionJevPruned {
-                pairs_dropped,
-                results_truncated,
-                estimated_saved_tokens,
-                ..
-            } => Some(Self::Notification {
-                message: format!(
-                    "Jev pruning completed: dropped {pairs_dropped} stale tool call(s), truncated {results_truncated} result(s), removed ~{estimated_saved_tokens} prompt tokens. The checkpoint is not applied yet."
-                ),
-            }),
-            slim_core::EventKind::CompactionJevFallback { detail, .. } => {
-                let detail = bounded_first_line(&detail, 200);
-                Some(Self::Notification {
-                    message: if detail.contains("cancelled") {
-                        format!("Jev pruning cancelled; the checkpoint was not applied. {detail}")
-                    } else {
-                        format!("Jev compaction unavailable; using LLM summary. {detail}")
-                    },
-                })
-            }
+            slim_core::EventKind::CompactionUsageUnknown { .. } => None,
             slim_core::EventKind::CompactionState {
                 state,
                 reason,
@@ -1284,6 +1292,21 @@ fn projected_interaction_id(value: &str) -> Option<InteractionRequestId> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UiCommand {
+    JobsRefresh,
+    /// Host idle timer; the controller serializes the durable job writer.
+    PersistJobs,
+    JobOutput {
+        id: String,
+        offset: Option<u64>,
+        before: Option<u64>,
+    },
+    JobControl {
+        id: String,
+        interrupt: bool,
+    },
+    RunBackgroundShell {
+        command: String,
+    },
     SendPrompt(String),
     /// Admission-aware prompt path used by the reducer. The legacy
     /// `SendPrompt` remains for existing programmatic bridge callers.
@@ -1379,6 +1402,14 @@ pub enum UiCommand {
         url: Option<String>,
         global: bool,
     },
+    /// Record the trust decision for the project's MCP servers
+    /// (`/mcp trust` = true, `/mcp untrust` = never) and reload them. The
+    /// decision covers the whole project; `name` (optional) must be a
+    /// configured server and is only echoed back.
+    McpTrust {
+        trust: bool,
+        name: Option<String>,
+    },
     /// Cheap status polling while the `/mcp` overlay is open.
     McpWatch {
         on: bool,
@@ -1426,6 +1457,27 @@ pub enum UiCommand {
     /// `UiEvent::WorkspaceFiles` carrying the same `request_id`.
     RequestWorkspaceFiles {
         request_id: u64,
+    },
+    /// `/mcp login <name>`: OAuth sign-in for an HTTP MCP server (opens the
+    /// browser, waits for the loopback callback). With `redirect_url`, hands
+    /// a pasted redirect URL to the sign-in already running for `name`.
+    McpLogin {
+        name: String,
+        redirect_url: Option<String>,
+    },
+    /// `/mcp logout <name>`: deletes the stored OAuth credentials.
+    McpLogout {
+        name: String,
+    },
+    /// Stops the sign-in running for `name` (the login panel was dismissed).
+    McpLoginCancel {
+        name: String,
+    },
+    /// `/mcp enable|disable <name>`: writes `enabled` into the config file
+    /// that defines the server and reloads it.
+    McpEnable {
+        name: String,
+        enabled: bool,
     },
 }
 
@@ -1684,6 +1736,8 @@ impl UiEvent {
             Self::RunStarted { .. }
                 | Self::PromptRunStarted { .. }
                 | Self::SessionRestored { .. }
+                | Self::JobsChanged { .. }
+                | Self::JobOutput { .. }
                 | Self::PromptRunCompleted { .. }
                 | Self::PromptRunStopped { .. }
                 | Self::PromptRunCancelled { .. }
@@ -1909,34 +1963,6 @@ mod tests {
         let projected = UiEvent::from_core(SessionEvent::new(4, EventKind::CompactionCompleted));
         assert_eq!(projected, Some(UiEvent::CompactionCompleted));
         assert!(!UiEvent::CompactionCompleted.is_control());
-    }
-
-    #[test]
-    fn jev_pruning_notification_does_not_claim_checkpoint_was_applied() {
-        let projected = UiEvent::from_core(SessionEvent::new(
-            4,
-            EventKind::CompactionJevPruned {
-                pairs_total: 2,
-                pairs_dropped: 1,
-                results_truncated: 1,
-                batches: 1,
-                batches_started: 1,
-                batches_completed: 1,
-                estimated_saved_tokens: 512,
-                input_tokens: Some(10),
-                output_tokens: Some(0),
-                usage_unknown: false,
-                backend: Some("typesafe".into()),
-                requested_model: Some("jev-1.13.0".into()),
-                model: Some("jev-1.13.0".into()),
-                duration_ms: 3,
-            },
-        ));
-        let Some(UiEvent::Notification { message }) = projected else {
-            panic!("Jev pruning must project a notification");
-        };
-        assert!(message.contains("not applied yet"));
-        assert!(!message.contains("compacted context"));
     }
 
     #[test]

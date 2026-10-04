@@ -135,10 +135,14 @@ fn repeated_search_patterns_use_a_self_contained_legend_on_each_page() {
                 ));
             }
         }
+        // No skipped-trees footer follows hits, so the last hit line ends the
+        // output without a newline.
+        expected.pop();
         assert!(result.output.starts_with(&expected), "{}", result.output);
         before.push_str(&result.output[expected.len()..]);
         assert!(result.output.len() < before.len());
-        assert!(result.output.ends_with("[skipped: node_modules, target, dist, .git, .slim, .pi, .venv — use read/list/shell in those trees]"));
+        // The skipped-trees footer is only for results without hits.
+        assert!(!result.output.contains("[skipped:"), "{}", result.output);
         println!(
             "search legend only page {}: before={} bytes after={} bytes",
             page + 1,
@@ -336,8 +340,23 @@ fn search_in_repo_with_dist_does_not_materialize_large_artifact() {
     );
     assert!(result.success);
     assert!(result.output.len() < 64 * 1024);
-    assert!(result.output.contains("skipped: node_modules, target"));
+    assert!(!result.output.contains("dist/bundle.js"));
     assert!(result.artifact.is_none());
+    // A miss is where the skipped trees matter: the footer says what was not
+    // searched.
+    let miss = registry.execute(
+        OperatingMode::ReadOnly,
+        &root,
+        "search",
+        r#"{"query":"absent-term","path":"."}"#,
+    );
+    assert!(miss.success);
+    assert!(miss.output.contains("skipped: node_modules, target"));
+    assert!(
+        miss.output.contains(".gitignore'd files"),
+        "{}",
+        miss.output
+    );
     let _ = fs::remove_dir_all(root.parent().expect("parent"));
 }
 

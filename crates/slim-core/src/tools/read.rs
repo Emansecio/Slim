@@ -14,6 +14,7 @@ pub const DEFAULT_MAX_READ_LINES: usize = 200;
 pub const MAX_READ_LINES_CAP: usize = 4096;
 const MAX_READ_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_READ_PAGE_BYTES: usize = 1024 * 1024;
+pub(super) const DIRECTORY_PATH_MESSAGE: &str = "path is a directory; use list to see its entries";
 const CHECKPOINT_INTERVAL_LINES: usize = 256;
 const MAX_CHECKPOINTS_PER_FILE: usize = 4096;
 /// One slot per recently touched file. Stays above the per-turn read cap (96)
@@ -130,14 +131,21 @@ impl ReadService {
             stamp,
         };
         if metadata.len() > MAX_READ_FILE_BYTES {
-            return Err(observed_read_error(
-                ToolError::InvalidInput {
-                    message: format!(
-                        "read file exceeds the {MAX_READ_FILE_BYTES}-byte safety limit"
-                    ),
-                },
-                &dependency,
-                0,
+            // search skips files over this size too, so it cannot help here.
+            return Err(with_context(
+                observed_read_error(
+                    ToolError::InvalidInput {
+                        message: format!(
+                            "read file exceeds the {MAX_READ_FILE_BYTES}-byte safety limit"
+                        ),
+                    },
+                    &dependency,
+                    0,
+                ),
+                format!(
+                    "Slice it with shell instead, for example `Get-Content -LiteralPath {path} -TotalCount 200`, `Get-Content -LiteralPath {path} -Tail 200` or `Select-String -LiteralPath {path} -Pattern <text>`.",
+                    path = powershell_literal(canonical)
+                ),
             ));
         }
         let requested_first = start_line.max(1);
@@ -174,10 +182,22 @@ impl ReadService {
         while current_line < requested_first {
             check_cancelled(cancellation)
                 .map_err(|error| observed_read_error(error, &dependency, bytes_read))?;
-            if read_utf8_line(&mut reader, &mut line, &dependency, &mut bytes_read)?.is_none() {
+            if read_utf8_line(
+                &mut reader,
+                &mut line,
+                &dependency,
+                &mut bytes_read,
+                current_line,
+            )?
+            .is_none()
+            {
                 self.merge_checkpoints(canonical, version, discovered);
                 return Ok(ReadPage {
-                    output: String::new(),
+                    output: if numbered {
+                        String::new()
+                    } else {
+                        empty_page_note(metadata.len(), requested_first, current_line - 1)
+                    },
                     first_line: requested_first,
                     records: Vec::new(),
                     next_offset: None,
@@ -208,7 +228,13 @@ impl ReadService {
         while returned < max_lines {
             check_cancelled(cancellation)
                 .map_err(|error| observed_read_error(error, &dependency, bytes_read))?;
-            let Some(line) = read_utf8_line(&mut reader, &mut line, &dependency, &mut bytes_read)?
+            let Some(line) = read_utf8_line(
+                &mut reader,
+                &mut line,
+                &dependency,
+                &mut bytes_read,
+                current_line,
+            )?
             else {
                 break;
             };
@@ -223,14 +249,25 @@ impl ReadService {
                 line.len()
             };
             if output.len().saturating_add(rendered_bytes) > MAX_READ_PAGE_BYTES {
-                return Err(observed_read_error(
-                    ToolError::InvalidInput {
-                        message: format!(
-                            "read page exceeds the {MAX_READ_PAGE_BYTES}-byte safety limit"
-                        ),
+                return Err(with_context(
+                    observed_read_error(
+                        ToolError::InvalidInput {
+                            message: format!(
+                                "read page exceeds the {MAX_READ_PAGE_BYTES}-byte safety limit"
+                            ),
+                        },
+                        &dependency,
+                        bytes_read,
+                    ),
+                    if returned == 0 {
+                        format!(
+                            "Line {current_line} alone is over the limit. Search for a distinctive substring of it (a hit on a long line is windowed around the match), or slice it with shell, for example `(Get-Content -LiteralPath {path})[{index}].Substring(0, 4000)`.",
+                            path = powershell_literal(canonical),
+                            index = current_line - 1
+                        )
+                    } else {
+                        "Pass a smaller max_lines to read fewer lines per page.".into()
                     },
-                    &dependency,
-                    bytes_read,
                 ));
             }
             if numbered {
@@ -292,14 +329,17 @@ impl ReadService {
                 last.saturating_add(1)
             );
             if output.len().saturating_add(footer.len()) > MAX_READ_PAGE_BYTES {
-                return Err(observed_read_error(
-                    ToolError::InvalidInput {
-                        message: format!(
-                            "read page exceeds the {MAX_READ_PAGE_BYTES}-byte safety limit"
-                        ),
-                    },
-                    &dependency,
-                    bytes_read,
+                return Err(with_context(
+                    observed_read_error(
+                        ToolError::InvalidInput {
+                            message: format!(
+                                "read page exceeds the {MAX_READ_PAGE_BYTES}-byte safety limit"
+                            ),
+                        },
+                        &dependency,
+                        bytes_read,
+                    ),
+                    "Pass a smaller max_lines to read fewer lines per page.".into(),
                 ));
             }
             output.push_str(&footer);
@@ -325,6 +365,9 @@ impl ReadService {
         }
 
         self.merge_checkpoints(canonical, version, discovered);
+        if returned == 0 && !numbered {
+            output = empty_page_note(metadata.len(), requested_first, current_line - 1);
+        }
         Ok(ReadPage {
             output,
             first_line: requested_first,
@@ -445,9 +488,68 @@ impl ReadService {
 
 fn directory_read_error() -> ToolExecutionError {
     ToolError::InvalidInput {
-        message: "path is a directory; use list to see its entries".into(),
+        message: DIRECTORY_PATH_MESSAGE.into(),
     }
     .into()
+}
+
+/// Empty output would be ambiguous: say whether the file is empty or the
+/// offset is past its last line.
+fn empty_page_note(file_len: u64, offset: usize, lines: usize) -> String {
+    if file_len == 0 {
+        "[empty file]".into()
+    } else {
+        format!(
+            "[offset {offset} is past the end; file has {lines} line{}]",
+            if lines == 1 { "" } else { "s" }
+        )
+    }
+}
+
+/// `path` as a PowerShell single-quoted literal: a quote inside it is doubled.
+fn powershell_literal(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "''"))
+}
+
+fn with_context(mut failure: ToolExecutionError, context: String) -> ToolExecutionError {
+    failure.context = Some(context);
+    failure
+}
+
+/// A file that is not UTF-8 text: what it is, how to read it, and how to
+/// replace it. `bytes` starts at line `first_line`; `valid_up_to` is the
+/// first invalid byte.
+pub(super) fn non_utf8_message(
+    path: &Path,
+    bytes: &[u8],
+    valid_up_to: usize,
+    first_line: usize,
+) -> String {
+    // UTF-32 LE begins with the UTF-16 LE mark: test the longer one first.
+    let (what, encoding) = if first_line == 1 && bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) {
+        ("a UTF-32 LE file (BOM detected)".to_owned(), "UTF32")
+    } else if first_line == 1 && bytes.starts_with(&[0xFF, 0xFE]) {
+        ("a UTF-16 LE file (BOM detected)".to_owned(), "Unicode")
+    } else if first_line == 1 && bytes.starts_with(&[0xFE, 0xFF]) {
+        (
+            "a UTF-16 BE file (BOM detected)".to_owned(),
+            "BigEndianUnicode",
+        )
+    } else {
+        let line = first_line + bytes[..valid_up_to].iter().filter(|b| **b == b'\n').count();
+        (
+            format!(
+                "not valid UTF-8 (invalid byte 0x{:02x} at line {line}); probably a legacy 8-bit encoding",
+                bytes.get(valid_up_to).copied().unwrap_or_default()
+            ),
+            "Default",
+        )
+    };
+    format!(
+        "{path} is {what}; read it with shell `Get-Content -LiteralPath {literal} -Encoding {encoding}`; to replace it with UTF-8 text, remove or rename it with shell, then create it with the write tool",
+        path = path.display(),
+        literal = powershell_literal(path)
+    )
 }
 
 fn read_path_error(path: &Path, error: io::Error) -> ToolExecutionError {
@@ -478,6 +580,7 @@ fn read_utf8_line<'a>(
     buffer: &'a mut Vec<u8>,
     dependency: &DependencyObservation,
     bytes_read: &mut u64,
+    line_number: usize,
 ) -> Result<Option<&'a str>, ToolExecutionError> {
     buffer.clear();
     let read = match reader.read_until(b'\n', buffer) {
@@ -494,7 +597,14 @@ fn read_utf8_line<'a>(
     }
     std::str::from_utf8(buffer).map(Some).map_err(|error| {
         observed_read_error(
-            io::Error::new(io::ErrorKind::InvalidData, error).into(),
+            ToolError::InvalidInput {
+                message: non_utf8_message(
+                    &dependency.path,
+                    buffer,
+                    error.valid_up_to(),
+                    line_number,
+                ),
+            },
             dependency,
             *bytes_read,
         )

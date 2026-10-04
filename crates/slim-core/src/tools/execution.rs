@@ -1,9 +1,10 @@
 use super::{
     code_intel::parse_prepared_code_intel_request, code_intel::CodeIntelRequest,
-    resolve_workspace_path_from_root, PresentationBudget, ToolCacheability, ToolDependencyScope,
-    ToolEffectClass, ToolError, ToolOperationalSpec, ToolPresentation, ToolReplayPolicy,
-    ToolResult, ToolVolatility, DEFAULT_MAX_ENTRIES, DEFAULT_MAX_HITS, MAX_ENTRIES_CAP,
-    MAX_HITS_CAP, MAX_MUTATING_FILE_BYTES, MAX_READ_LINES_CAP, MAX_SEARCH_PATTERNS,
+    resolve_workspace_path_from_root, workspace_relative_spelling, PresentationBudget,
+    ToolCacheability, ToolDependencyScope, ToolEffectClass, ToolError, ToolOperationalSpec,
+    ToolPresentation, ToolReplayPolicy, ToolResult, ToolVolatility, DEFAULT_MAX_ENTRIES,
+    DEFAULT_MAX_HITS, MAX_ENTRIES_CAP, MAX_HITS_CAP, MAX_MUTATING_FILE_BYTES, MAX_READ_LINES_CAP,
+    MAX_SEARCH_PATTERNS,
 };
 use crate::codeintel::DEFAULT_CODE_INTEL_LIMIT;
 use crate::OperatingMode;
@@ -13,6 +14,8 @@ use std::fmt::Write as _;
 use std::fs::{File, Metadata};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
+
+const MAX_SHELL_YIELD_MS: u64 = 10_000;
 
 #[derive(Clone, Debug)]
 pub(crate) enum ToolPresentationSource {
@@ -260,7 +263,7 @@ fn present_read_records(
     let mut text = render(low);
     if low == 0 {
         text.push_str(&format!(
-            "\n[line and continuation exceed presentation budget; no line delivered; pass \"offset\": {first} or request a narrower page; not safe for patch.expected]"
+            "\n[line and continuation exceed presentation budget; no line delivered; pass \"offset\": {first} or request a narrower page; a line this long is reached by searching for a distinctive substring of it, or by slicing it with shell; not safe for patch.expected]"
         ));
     }
     ToolPresentation {
@@ -943,6 +946,9 @@ fn materialize_defaults_and_paths(
     let object = arguments
         .as_object_mut()
         .ok_or_else(|| "tool arguments must be a JSON object".to_owned())?;
+    normalize_argument_aliases(tool_name, object, admission_notes)?;
+    decode_json_string_fields(tool_name, object, admission_notes);
+    coerce_integer_fields(tool_name, object, admission_notes);
     if tool_name == "patch" {
         if let Some(edits) = object.get_mut("edits").filter(|edits| edits.is_object()) {
             let edit = edits.take();
@@ -1043,6 +1049,7 @@ fn materialize_defaults_and_paths(
                 Value::from(super::DEFAULT_SHELL_TIMEOUT_MS),
             );
             insert_default(object, "yield_ms", Value::from(1000));
+            insert_default(object, "background", Value::from(false));
             if object.get("args").is_some_and(Value::is_null) {
                 object.remove("args");
             }
@@ -1068,7 +1075,13 @@ fn materialize_defaults_and_paths(
         if path.is_empty() {
             return Err("path must not be empty".to_owned());
         }
-        let normalized = resolve_workspace_path_from_root(cwd, path)?;
+        let spelled = workspace_relative_spelling(cwd, path);
+        if spelled.is_some() {
+            admission_notes.push(
+                "absolute path inside the workspace; used as a workspace-relative path".into(),
+            );
+        }
+        let normalized = resolve_workspace_path_from_root(cwd, spelled.as_deref().unwrap_or(path))?;
         target_paths.push(normalized.clone());
         object.insert("path".into(), Value::String(path_identity(&normalized)));
     }
@@ -1091,10 +1104,11 @@ fn native_argument_keys(tool_name: &str) -> Option<&'static [&'static str]> {
         ]),
         "write" => Some(&["path", "content", "expected", "then_run"]),
         "patch" => Some(&["path", "edits", "expected", "replacement", "then_run"]),
-        "shell" => Some(&["command", "args", "timeout_ms", "yield_ms"]),
+        "shell" => Some(&["command", "args", "timeout_ms", "yield_ms", "background"]),
         "code_intel" => Some(&[
             "action",
             "path",
+            "server",
             "line",
             "column",
             "symbol",
@@ -1118,7 +1132,10 @@ fn reject_unknown_native_fields(
         return Ok(());
     };
     if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(format!("{tool_name} has unknown argument `{key}`"));
+        return Err(format!(
+            "{tool_name} has unknown argument `{key}`; valid fields: {}",
+            allowed.join(", ")
+        ));
     }
     if tool_name == "patch" {
         if let Some(edits) = object.get("edits").and_then(Value::as_array) {
@@ -1130,12 +1147,128 @@ fn reject_unknown_native_fields(
                     .keys()
                     .find(|key| !matches!(key.as_str(), "expected" | "replacement"))
                 {
-                    return Err(format!("patch edit {index} has unknown argument `{key}`"));
+                    return Err(format!(
+                        "patch edit {index} has unknown argument `{key}`; valid fields: expected, replacement"
+                    ));
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Model spellings of a native argument that name an existing one. Each is
+/// admitted with a note; a value that contradicts the canonical field is not.
+fn normalize_argument_aliases(
+    tool_name: &str,
+    object: &mut serde_json::Map<String, Value>,
+    admission_notes: &mut Vec<String>,
+) -> Result<(), String> {
+    let Some(allowed) = native_argument_keys(tool_name) else {
+        return Ok(());
+    };
+    if allowed.contains(&"path") {
+        for alias in ["file_path", "filepath", "file"] {
+            rename_argument(object, alias, "path", admission_notes)?;
+        }
+    }
+    match tool_name {
+        "read" => rename_argument(object, "limit", "max_lines", admission_notes)?,
+        "search" => {
+            for alias in ["pattern", "regex"] {
+                rename_argument(object, alias, "query", admission_notes)?;
+            }
+        }
+        // A free-text label that never changes what runs.
+        "shell" => {
+            object.remove("description");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn rename_argument(
+    object: &mut serde_json::Map<String, Value>,
+    alias: &str,
+    canonical: &str,
+    admission_notes: &mut Vec<String>,
+) -> Result<(), String> {
+    // `null` is an absent value, as it is for the canonical field.
+    let Some(value) = object.remove(alias).filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    match object.get(canonical).filter(|existing| !existing.is_null()) {
+        None => {
+            object.insert(canonical.into(), value);
+        }
+        Some(existing) if *existing == value => {}
+        Some(_) => {
+            return Err(format!(
+                "`{alias}` conflicts with `{canonical}`; pass only `{canonical}`"
+            ));
+        }
+    }
+    admission_notes.push(format!("{alias} -> {canonical}"));
+    Ok(())
+}
+
+/// `edits` and `patterns` arrive JSON-encoded as a string often enough to
+/// decode that one layer, as `shell.args` does. Anything else is left for the
+/// ordinary type check to report.
+fn decode_json_string_fields(
+    tool_name: &str,
+    object: &mut serde_json::Map<String, Value>,
+    admission_notes: &mut Vec<String>,
+) {
+    let field = match tool_name {
+        "patch" => "edits",
+        "search" => "patterns",
+        _ => return,
+    };
+    let Some(Value::String(encoded)) = object.get(field) else {
+        return;
+    };
+    let Ok(decoded) = serde_json::from_str::<Value>(encoded) else {
+        return;
+    };
+    if decoded.is_array() || (field == "edits" && decoded.is_object()) {
+        object.insert(field.into(), decoded);
+        admission_notes.push(format!("{field} JSON string decoded once"));
+    }
+}
+
+/// Integer fields written as an integer-valued string (`"200"`) or float
+/// (`200.0`). Anything else keeps its type and fails the integer check.
+fn coerce_integer_fields(
+    tool_name: &str,
+    object: &mut serde_json::Map<String, Value>,
+    admission_notes: &mut Vec<String>,
+) {
+    let fields: &[&str] = match tool_name {
+        "read" => &["offset", "max_lines"],
+        "list" => &["offset", "max_entries"],
+        "search" => &["offset", "max_hits", "max_entries", "context_lines"],
+        "shell" => &["timeout_ms", "yield_ms"],
+        _ => return,
+    };
+    for field in fields {
+        let Some(value) = object.get_mut(*field) else {
+            continue;
+        };
+        let coerced = match value {
+            Value::String(text) => text.trim().parse::<u64>().ok(),
+            Value::Number(number) if number.as_u64().is_none() => number
+                .as_f64()
+                .filter(|float| float.fract() == 0.0 && (0.0..=9.0e15).contains(float))
+                .map(|float| float as u64),
+            _ => None,
+        };
+        if let Some(coerced) = coerced {
+            *value = Value::from(coerced);
+            admission_notes.push(format!("{field} coerced to integer {coerced}"));
+        }
+    }
 }
 
 fn normalize_search_limit_alias(
@@ -1145,19 +1278,23 @@ fn normalize_search_limit_alias(
     let Some(value) = object.get("max_entries") else {
         return Ok(());
     };
-    let limit = integer_value(Some(value), "max_entries")?;
-    if !(1..=MAX_HITS_CAP).contains(&limit) {
+    let requested = integer_value(Some(value), "max_entries")?;
+    if requested == 0 {
         return Err(format!("search max_entries must be 1..={MAX_HITS_CAP}"));
     }
+    let limit = requested.min(MAX_HITS_CAP);
     if let Some(value) = object.get("max_hits") {
-        if integer_value(Some(value), "max_hits")? != limit {
+        if integer_value(Some(value), "max_hits")?.min(MAX_HITS_CAP) != limit {
             return Err("search max_entries conflicts with max_hits".into());
         }
     } else {
         object.insert("max_hits".into(), Value::from(limit));
     }
     object.remove("max_entries");
-    admission_notes.push(format!("max_entries -> max_hits; limit {limit}"));
+    admission_notes.push(format!(
+        "max_entries -> max_hits; limit {limit}{}",
+        if limit == requested { "" } else { " (maximum)" }
+    ));
     Ok(())
 }
 
@@ -1258,12 +1395,13 @@ fn canonicalize_code_intel_arguments(
     const SYMBOL_KEYS: &[&str] = &[
         "action",
         "path",
+        "server",
         "query",
         "max_results",
         "offset",
         "revision",
     ];
-    const DIAGNOSTIC_KEYS: &[&str] = &["action", "path", "include_info", "max_results"];
+    const DIAGNOSTIC_KEYS: &[&str] = &["action", "path", "server", "include_info", "max_results"];
     let (allowed, effective_limit, offset, revision) = match request {
         CodeIntelRequest::Status { .. } => (STATUS_KEYS, None, None, None),
         CodeIntelRequest::Definition(query)
@@ -1367,12 +1505,21 @@ fn typed_arguments(
                 None
             };
             let offset = integer_argument(arguments, "offset")?;
-            if max_lines.is_some_and(|max_lines| max_lines == 0 || max_lines > MAX_READ_LINES_CAP) {
+            if max_lines == Some(0) {
                 return Err(format!("read max_lines must be 1..={MAX_READ_LINES_CAP}"));
             }
             if offset == 0 {
                 return Err("read offset must be at least 1".into());
             }
+            let max_lines = max_lines.map(|requested| {
+                clamp_limit(
+                    arguments,
+                    "max_lines",
+                    requested,
+                    MAX_READ_LINES_CAP,
+                    admission_notes,
+                )
+            });
             Ok(PreparedToolArguments::Read { offset, max_lines })
         }
         "list" => {
@@ -1381,9 +1528,16 @@ fn typed_arguments(
             if offset == 0 {
                 return Err("list offset must be at least 1".into());
             }
-            if max_entries == 0 || max_entries > MAX_ENTRIES_CAP {
+            if max_entries == 0 {
                 return Err(format!("list max_entries must be 1..={MAX_ENTRIES_CAP}"));
             }
+            let max_entries = clamp_limit(
+                arguments,
+                "max_entries",
+                max_entries,
+                MAX_ENTRIES_CAP,
+                admission_notes,
+            );
             Ok(PreparedToolArguments::List {
                 offset,
                 max_entries,
@@ -1409,14 +1563,22 @@ fn typed_arguments(
                     "search patterns must contain 1..={MAX_SEARCH_PATTERNS} strings"
                 ));
             }
+            super::search::validate_patterns(&patterns).map_err(super::tool_error_message)?;
             let offset = integer_argument(arguments, "offset")?;
             let max_hits = integer_argument(arguments, "max_hits")?;
             if offset == 0 {
                 return Err("search offset must be at least 1".into());
             }
-            if max_hits == 0 || max_hits > MAX_HITS_CAP {
+            if max_hits == 0 {
                 return Err(format!("search max_hits must be 1..={MAX_HITS_CAP}"));
             }
+            let max_hits = clamp_limit(
+                arguments,
+                "max_hits",
+                max_hits,
+                MAX_HITS_CAP,
+                admission_notes,
+            );
             let requested_context_lines = integer_argument(arguments, "context_lines")?;
             let context_lines = requested_context_lines.min(super::search::MAX_CONTEXT_LINES);
             if context_lines != requested_context_lines {
@@ -1523,11 +1685,20 @@ fn typed_arguments(
                     super::MAX_SHELL_TIMEOUT_MS
                 ));
             }
-            let yield_ms = u64_argument(arguments, "yield_ms")?;
-            if yield_ms > 10_000 {
-                return Err("shell yield_ms must be 0..=10000".into());
-            }
+            let background = arguments
+                .get("background")
+                .and_then(Value::as_bool)
+                .ok_or("shell background must be boolean")?;
             let command = nonempty_string_argument("command")?;
+            let mut requested_yield = u64_argument(arguments, "yield_ms")?;
+            if requested_yield > MAX_SHELL_YIELD_MS {
+                admission_notes.push(format!(
+                    "yield_ms {requested_yield} -> {MAX_SHELL_YIELD_MS}; maximum"
+                ));
+                requested_yield = MAX_SHELL_YIELD_MS;
+                arguments["yield_ms"] = Value::from(requested_yield);
+            }
+            let yield_ms = if background { 0 } else { requested_yield };
             // Decode exactly one JSON layer; never split a command line or
             // reinterpret the contents of an individual argument.
             if let Some(encoded) = arguments.get("args").and_then(Value::as_str) {
@@ -1558,7 +1729,25 @@ fn typed_arguments(
                         .collect::<Result<Vec<_>, String>>()
                 })
                 .transpose()?;
-            admit_shell_command(&command, args.is_some(), admission_notes)?;
+            let args = if args
+                .as_deref()
+                .is_some_and(|args| args_repeat_command_line(&command, args))
+            {
+                // A bare multi-word `command` can never name an executable;
+                // `args` that restate its words mean the model wrote the whole
+                // command line twice. Run the line instead of failing.
+                if let Some(object) = arguments.as_object_mut() {
+                    object.remove("args");
+                }
+                admission_notes.push(
+                    "shell args repeated the words of `command`; ran `command` as the full command line"
+                        .into(),
+                );
+                None
+            } else {
+                args
+            };
+            admit_shell_command(&command, args.as_deref(), admission_notes)?;
             Ok(PreparedToolArguments::Shell {
                 command,
                 args,
@@ -1577,6 +1766,23 @@ fn typed_arguments(
         }
         _ => Ok(PreparedToolArguments::External),
     }
+}
+
+/// An over-limit page size is served at the limit, with a note, as
+/// `context_lines` is; zero and non-integers still fail.
+fn clamp_limit(
+    arguments: &mut Value,
+    name: &str,
+    requested: usize,
+    maximum: usize,
+    admission_notes: &mut Vec<String>,
+) -> usize {
+    if requested <= maximum {
+        return requested;
+    }
+    admission_notes.push(format!("{name} {requested} -> {maximum}; maximum"));
+    arguments[name] = Value::from(maximum);
+    maximum
 }
 
 fn prepare_then_run(
@@ -1638,6 +1844,16 @@ fn prepare_then_run(
     Ok(Some(Box::new(prepared)))
 }
 
+/// `command` is several words led by a bare name (no path or quote) and
+/// `args` starts with that same name: the command line was sent as both.
+fn args_repeat_command_line(command: &str, args: &[String]) -> bool {
+    let mut words = command.split_whitespace();
+    let first = words.next().unwrap_or("");
+    !first.contains(['\\', '/', '"', '\''])
+        && words.next().is_some()
+        && args.first().is_some_and(|arg| arg == first)
+}
+
 /// Shell command admission for common model slips. A serialized tool-call
 /// payload in `command` is rejected outright; possible bash/PowerShell
 /// compatibility issues in the script form, a multi-word `command` with
@@ -1645,7 +1861,7 @@ fn prepare_then_run(
 /// admission notes attached to the call's output.
 fn admit_shell_command(
     command: &str,
-    has_args: bool,
+    args: Option<&[String]>,
     admission_notes: &mut Vec<String>,
 ) -> Result<(), String> {
     let trimmed = command.trim_start();
@@ -1662,7 +1878,7 @@ fn admit_shell_command(
             }
         }
     }
-    if has_args {
+    if let Some(args) = args {
         let mut words = command.split_whitespace();
         let first = words.next().unwrap_or("");
         let bare_name = !first.contains(['\\', '/', '"', '\'']);
@@ -1672,8 +1888,37 @@ fn admit_shell_command(
                     .into(),
             );
         }
+        // The script handed to PowerShell as `-Command <script>` is parsed by
+        // PowerShell exactly like a bare command line would be.
+        let program = Path::new(first.trim_matches(['"', '\'']))
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(program.as_str(), "powershell" | "pwsh") {
+            let script = args
+                .iter()
+                .position(|arg| matches!(arg.to_ascii_lowercase().as_str(), "-command" | "-c"))
+                .and_then(|index| args.get(index + 1));
+            if let Some(script) = script {
+                note_bash_syntax(script, admission_notes);
+            }
+        }
         return Ok(());
     }
+    note_bash_syntax(command, admission_notes);
+    if command.contains('\n') && has_inline_eval(command) {
+        admission_notes.push(
+            "possible quoting risk: this multiline script uses inline `-c`/`-e` eval; if parsing fails, consider a script file"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Flags tokens that are bash-only (or parse differently) in a PowerShell
+/// script. A note, never a rejection: the script may be intentional.
+fn note_bash_syntax(script: &str, admission_notes: &mut Vec<String>) {
     const BASH_ONLY: &[&str] = &[
         "<<",
         "head -",
@@ -1687,10 +1932,24 @@ fn admit_shell_command(
         "xargs",
         "/dev/null",
         "source ",
+        "rm -rf",
+        "rm -r",
+        "cp -r",
+        "touch ",
+        "curl -",
     ];
+    // A token counts where a command or argument can start, not inside a word
+    // (`tools -`, `--source `).
+    let starts_word = |token: &str| {
+        script.match_indices(token).any(|(index, _)| {
+            script[..index].chars().next_back().is_none_or(|before| {
+                before.is_whitespace() || matches!(before, ';' | '|' | '(' | '&' | '>' | '\'' | '"')
+            })
+        })
+    };
     let found = BASH_ONLY
         .iter()
-        .filter(|token| command.contains(**token))
+        .filter(|token| starts_word(token))
         .take(2)
         .map(|token| token.trim_end().to_owned())
         .collect::<Vec<_>>();
@@ -1700,13 +1959,6 @@ fn admit_shell_command(
             found.join("`, `")
         ));
     }
-    if command.contains('\n') && has_inline_eval(command) {
-        admission_notes.push(
-            "possible quoting risk: this multiline script uses inline `-c`/`-e` eval; if parsing fails, consider a script file"
-                .into(),
-        );
-    }
-    Ok(())
 }
 
 /// `python -c "..."`-style inline eval can carry a quoting risk when the
@@ -1847,7 +2099,7 @@ fn effective_spec(
             dependency_scope: ToolDependencyScope::Internal,
             replay_policy: ToolReplayPolicy::Never,
         }),
-        "skill" | "shell_job" => Some(ToolOperationalSpec {
+        "skill" | "shell_job" | "codemode" => Some(ToolOperationalSpec {
             effect_class: ToolEffectClass::PotentiallyVolatile,
             cacheability: ToolCacheability::None,
             volatility: ToolVolatility::Volatile,
@@ -2238,6 +2490,9 @@ mod tests {
         assert!(oversized.oversized_record);
         assert!(oversized.text.contains("\"offset\": 42"));
         assert!(oversized.text.contains("request a narrower page"));
+        assert!(oversized
+            .text
+            .contains("searching for a distinctive substring"));
     }
 
     #[test]
@@ -2432,13 +2687,7 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("max_entries -> max_hits")));
         }
-        for value in [
-            json!(0),
-            json!(-1),
-            json!(MAX_HITS_CAP + 1),
-            json!("2"),
-            json!(null),
-        ] {
+        for value in [json!(0), json!(-1), json!(null)] {
             assert!(prepare(
                 &root,
                 "search",
@@ -2446,6 +2695,22 @@ mod tests {
             )
             .error
             .is_some());
+        }
+        // Over the cap is clamped and a numeric string is a number (see the
+        // admission tests below); neither is an error any more.
+        let capped = prepare(
+            &root,
+            "search",
+            json!({"query":"needle", "max_hits":MAX_HITS_CAP}),
+        );
+        for value in [json!(MAX_HITS_CAP + 1), json!(MAX_HITS_CAP.to_string())] {
+            let alias = prepare(
+                &root,
+                "search",
+                json!({"query":"needle", "max_entries":value}),
+            );
+            assert!(alias.error.is_none(), "{:?}", alias.error);
+            assert_eq!(alias.canonical_fingerprint, capped.canonical_fingerprint);
         }
         assert!(prepare(
             &root,
@@ -2683,6 +2948,61 @@ mod tests {
     }
 
     #[test]
+    fn code_intel_server_survives_admission_and_separates_request_identity() {
+        let root = workspace("intel-server");
+        fs::write(root.join("app.ts"), "export const target = 1;\n").expect("fixture");
+        for action in ["symbol", "diagnostics"] {
+            for path in [None, Some("app.ts")] {
+                let mut args = json!({"action": action, "query": "target", "server": "typescript-language-server"});
+                if let Some(path) = path {
+                    args["path"] = json!(path);
+                }
+                let prepared = prepare(&root, "code_intel", args.clone());
+                assert!(prepared.error.is_none(), "{:?}", prepared.error);
+                let server = match &prepared.arguments {
+                    PreparedToolArguments::CodeIntel(CodeIntelRequest::Symbols(query)) => {
+                        assert_eq!(query.path.is_some(), path.is_some());
+                        query.server.as_deref()
+                    }
+                    PreparedToolArguments::CodeIntel(CodeIntelRequest::Diagnostics(query)) => {
+                        assert_eq!(query.path.is_some(), path.is_some());
+                        query.server.as_deref()
+                    }
+                    other => panic!("server filter lost before execution: {other:?}"),
+                };
+                assert_eq!(server, Some("typescript-language-server"));
+                args["server"] = json!("rust-analyzer");
+                let different = prepare(&root, "code_intel", args.clone());
+                assert!(different.error.is_none(), "{:?}", different.error);
+                assert_ne!(
+                    prepared.canonical_fingerprint,
+                    different.canonical_fingerprint
+                );
+                args.as_object_mut().unwrap().remove("server");
+                let inferred = prepare(&root, "code_intel", args);
+                assert!(inferred.error.is_none(), "{:?}", inferred.error);
+                assert_ne!(
+                    prepared.canonical_fingerprint,
+                    inferred.canonical_fingerprint
+                );
+            }
+        }
+        let status = crate::tools::ToolRegistry::default().prepare_invocation(
+            OperatingMode::Auto,
+            &root,
+            "code_intel",
+            r#"{"action":"status","server":"rust-analyzer"}"#,
+        );
+        assert!(status.structural_rejection);
+        assert_eq!(
+            status.error.as_deref(),
+            Some("server is supported only for symbol and diagnostics")
+        );
+        assert!(matches!(status.arguments, PreparedToolArguments::External));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn shell_double_encoded_args_preserve_identity_and_never_split_commands() {
         let root = workspace("shell-json-args");
         let values = vec!["check.py", "two words", "a;b", "$(literal)", ""];
@@ -2742,6 +3062,81 @@ mod tests {
     }
 
     #[test]
+    fn absolute_paths_inside_the_workspace_are_accepted_and_outside_stay_blocked() {
+        let root = workspace("absolute-path");
+        fs::write(root.join("inside.txt"), "x").unwrap();
+        let outside = workspace("absolute-path-outside");
+        fs::write(outside.join("secret.txt"), "x").unwrap();
+
+        let inside = root.join("inside.txt");
+        let call = prepare(&root, "read", json!({"path": inside.to_str().unwrap()}));
+        assert!(call.error.is_none(), "{:?}", call.error);
+        assert!(call
+            .admission_notes
+            .iter()
+            .any(|note| note.contains("absolute path inside the workspace")));
+        assert_eq!(
+            call.target_paths,
+            [fs::canonicalize(root.join("inside.txt")).unwrap()]
+        );
+
+        // A file that does not exist yet stays reachable for `write`.
+        let created = root.join("new").join("file.txt");
+        let call = prepare(
+            &root,
+            "write",
+            json!({"path": created.to_str().unwrap(), "content": "x"}),
+        );
+        assert!(call.error.is_none(), "{:?}", call.error);
+
+        for escape in [
+            outside.join("secret.txt").to_str().unwrap().to_owned(),
+            root.join("..")
+                .join("elsewhere.txt")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        ] {
+            let call = prepare(&root, "read", json!({"path": escape}));
+            assert!(call.error.is_some(), "{escape} must stay blocked");
+        }
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn powershell_command_scripts_are_checked_for_bash_syntax() {
+        let root = workspace("ps-script");
+        let heredoc = prepare(
+            &root,
+            "shell",
+            json!({
+                "command": "powershell",
+                "args": ["-NoProfile", "-Command", "python - <<'PY'\nprint(1)\nPY"]
+            }),
+        );
+        assert!(heredoc.error.is_none(), "{:?}", heredoc.error);
+        assert!(heredoc
+            .admission_notes
+            .iter()
+            .any(|note| note.contains("possible bash syntax")));
+        let clean = prepare(
+            &root,
+            "shell",
+            json!({
+                "command": "powershell",
+                "args": ["-NoProfile", "-Command", "Get-ChildItem -Force"]
+            }),
+        );
+        assert!(
+            clean.admission_notes.is_empty(),
+            "{:?}",
+            clean.admission_notes
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn shell_admission_guides_common_model_slips() {
         let root = workspace("shell-admission");
 
@@ -2767,6 +3162,23 @@ mod tests {
             .admission_notes
             .iter()
             .any(|note| note.contains("executable name alone")));
+        let repeated = prepare(
+            &root,
+            "shell",
+            json!({
+                "command":"Get-ChildItem -Path 'D:/x y' -Recurse",
+                "args":["Get-ChildItem", "-Path", "'D:/x y'", "-Recurse"]
+            }),
+        );
+        assert!(repeated.error.is_none(), "{:?}", repeated.error);
+        assert!(matches!(
+            &repeated.arguments,
+            PreparedToolArguments::Shell { args: None, .. }
+        ));
+        assert!(repeated
+            .admission_notes
+            .iter()
+            .any(|note| note.contains("repeated the words")));
         let program_path = prepare(
             &root,
             "shell",
@@ -2857,6 +3269,366 @@ mod tests {
         );
         assert!(eval_program_form.admission_notes.is_empty());
 
+        // Bash-only forms that PowerShell parses differently are named too.
+        for script in [
+            "rm -rf build",
+            "rm -r build",
+            "cp -r a b",
+            "touch x.txt",
+            "curl -s https://example.test",
+        ] {
+            let bash = prepare(&root, "shell", json!({"command": script}));
+            assert!(
+                bash.admission_notes
+                    .iter()
+                    .any(|note| note.contains("bash syntax")),
+                "{script}: {:?}",
+                bash.admission_notes
+            );
+        }
+        assert!(prepare(
+            &root,
+            "shell",
+            json!({"command":"Remove-Item -Recurse build"})
+        )
+        .admission_notes
+        .is_empty());
+        // Inside a word is not a command: `tools -`, `--source`.
+        for script in [
+            "Write-Output 'cargo run --bin tools -- x'",
+            "winget install --source winget",
+            "Get-Item xyz-ls -Force",
+            "Write-Output pre-touch x",
+        ] {
+            let call = prepare(&root, "shell", json!({"command": script}));
+            assert!(
+                call.admission_notes.is_empty(),
+                "{script}: {:?}",
+                call.admission_notes
+            );
+        }
+        // Where a command or argument starts, it still counts.
+        for script in [
+            "Get-Item x; ls -la",
+            "Get-Item x | head -5",
+            "(ls -la)",
+            "cmd & touch y",
+            "foo 2>/dev/null",
+            "Write-Output 'head -5'",
+        ] {
+            let call = prepare(&root, "shell", json!({"command": script}));
+            assert!(!call.admission_notes.is_empty(), "{script}");
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unknown_arguments_list_the_valid_fields_of_the_tool() {
+        let root = workspace("unknown-lists-fields");
+        fs::write(root.join("a.txt"), "one\n").expect("fixture");
+        for (tool, arguments, fields) in [
+            (
+                "read",
+                json!({"path":"a.txt", "extra":1}),
+                "path, offset, max_lines, lines",
+            ),
+            (
+                "write",
+                json!({"path":"a.txt", "content":"x", "extra":1}),
+                "path, content, expected, then_run",
+            ),
+            (
+                "shell",
+                json!({"command":"echo", "extra":1}),
+                "command, args, timeout_ms, yield_ms, background",
+            ),
+        ] {
+            let error = prepare(&root, tool, arguments).error.expect("rejected");
+            assert!(
+                error.contains("`extra`") && error.contains(&format!("valid fields: {fields}")),
+                "{error}"
+            );
+        }
+        let error = prepare(
+            &root,
+            "patch",
+            json!({"path":"a.txt", "edits":[{"expected":"one", "replacement":"two", "extra":1}]}),
+        )
+        .error
+        .expect("rejected");
+        assert!(
+            error.ends_with("valid fields: expected, replacement"),
+            "{error}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn common_argument_spellings_are_admitted_with_a_note() {
+        let root = workspace("argument-aliases");
+        fs::write(root.join("a.txt"), "one\n").expect("fixture");
+        let note = |call: &PreparedToolInvocation, text: &str| {
+            assert!(call.error.is_none(), "{:?}", call.error);
+            assert!(
+                call.admission_notes.iter().any(|note| note.contains(text)),
+                "{text}: {:?}",
+                call.admission_notes
+            );
+        };
+        let canonical = prepare(&root, "read", json!({"path":"a.txt", "max_lines":2}));
+        for path in ["file_path", "filepath", "file"] {
+            let call = prepare(&root, "read", json!({path:"a.txt", "max_lines":2}));
+            note(&call, &format!("{path} -> path"));
+            assert_eq!(call.canonical_fingerprint, canonical.canonical_fingerprint);
+        }
+        let limit = prepare(&root, "read", json!({"path":"a.txt", "limit":2}));
+        note(&limit, "limit -> max_lines");
+        assert_eq!(limit.canonical_fingerprint, canonical.canonical_fingerprint);
+        let query = prepare(&root, "search", json!({"query":"one"}));
+        for alias in ["pattern", "regex"] {
+            let call = prepare(&root, "search", json!({alias:"one"}));
+            note(&call, &format!("{alias} -> query"));
+            assert_eq!(call.canonical_fingerprint, query.canonical_fingerprint);
+        }
+        // A description on shell is a label: ignored, and not part of identity.
+        let plain = prepare(&root, "shell", json!({"command":"echo hi"}));
+        let described = prepare(
+            &root,
+            "shell",
+            json!({"command":"echo hi", "description":"say hi"}),
+        );
+        assert!(described.error.is_none(), "{:?}", described.error);
+        assert_eq!(described.canonical_fingerprint, plain.canonical_fingerprint);
+        // The same value spelled twice is fine; a contradiction is not.
+        let same = prepare(&root, "read", json!({"path":"a.txt", "file_path":"a.txt"}));
+        assert!(same.error.is_none(), "{:?}", same.error);
+        let contradiction = prepare(&root, "read", json!({"path":"a.txt", "file_path":"b.txt"}));
+        assert!(
+            contradiction
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("`file_path` conflicts with `path`")),
+            "{:?}",
+            contradiction.error
+        );
+        // `null` is an absent alias, as it is for the canonical field.
+        for (tool, arguments) in [
+            ("read", json!({"path":"a.txt", "file_path":null})),
+            (
+                "read",
+                json!({"path":"a.txt", "filepath":null, "file":null}),
+            ),
+            ("read", json!({"path":"a.txt", "limit":null})),
+            (
+                "search",
+                json!({"query":"one", "pattern":null, "regex":null}),
+            ),
+        ] {
+            let call = prepare(&root, tool, arguments.clone());
+            assert!(call.error.is_none(), "{arguments}: {:?}", call.error);
+            assert!(
+                call.admission_notes.is_empty(),
+                "{:?}",
+                call.admission_notes
+            );
+        }
+        let only_alias = prepare(&root, "read", json!({"path":null, "file_path":"a.txt"}));
+        assert!(only_alias.error.is_none(), "{:?}", only_alias.error);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn over_limit_sizes_are_clamped_with_a_note_but_timeout_stays_strict() {
+        let root = workspace("clamped-limits");
+        fs::write(root.join("a.txt"), "one\n").expect("fixture");
+        let clamped = |tool: &str, arguments: Value, text: &str| {
+            let call = prepare(&root, tool, arguments);
+            assert!(call.error.is_none(), "{tool}: {:?}", call.error);
+            assert!(
+                call.admission_notes.iter().any(|note| note.contains(text)),
+                "{text}: {:?}",
+                call.admission_notes
+            );
+            call
+        };
+        let read = clamped(
+            "read",
+            json!({"path":"a.txt", "max_lines":MAX_READ_LINES_CAP + 1}),
+            &format!(
+                "max_lines {} -> {MAX_READ_LINES_CAP}",
+                MAX_READ_LINES_CAP + 1
+            ),
+        );
+        assert!(matches!(
+            read.arguments,
+            PreparedToolArguments::Read { max_lines: Some(max), .. } if max == MAX_READ_LINES_CAP
+        ));
+        let at_cap = prepare(
+            &root,
+            "read",
+            json!({"path":"a.txt", "max_lines":MAX_READ_LINES_CAP}),
+        );
+        assert_eq!(read.canonical_fingerprint, at_cap.canonical_fingerprint);
+        let list = clamped(
+            "list",
+            json!({"path":".", "max_entries":MAX_ENTRIES_CAP + 1}),
+            "max_entries",
+        );
+        assert!(matches!(
+            list.arguments,
+            PreparedToolArguments::List { max_entries, .. } if max_entries == MAX_ENTRIES_CAP
+        ));
+        let search = clamped(
+            "search",
+            json!({"query":"one", "max_hits":MAX_HITS_CAP + 1}),
+            "max_hits",
+        );
+        assert!(matches!(
+            search.arguments,
+            PreparedToolArguments::Search { max_hits, .. } if max_hits == MAX_HITS_CAP
+        ));
+        let alias = clamped(
+            "search",
+            json!({"query":"one", "max_entries":MAX_HITS_CAP + 1}),
+            "max_entries -> max_hits",
+        );
+        assert_eq!(alias.canonical_fingerprint, search.canonical_fingerprint);
+        let shell = clamped(
+            "shell",
+            json!({"command":"echo", "yield_ms":60_000}),
+            "yield_ms 60000 -> 10000",
+        );
+        assert!(matches!(
+            shell.arguments,
+            PreparedToolArguments::Shell {
+                yield_ms: 10_000,
+                ..
+            }
+        ));
+        // Zero and an excessive timeout are still mistakes, not limits.
+        for (tool, arguments) in [
+            ("read", json!({"path":"a.txt", "max_lines":0})),
+            ("list", json!({"max_entries":0})),
+            ("search", json!({"query":"one", "max_hits":0})),
+            ("shell", json!({"command":"echo", "timeout_ms":u64::MAX})),
+        ] {
+            assert!(prepare(&root, tool, arguments).error.is_some(), "{tool}");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn integer_fields_accept_integer_valued_strings_and_floats() {
+        let root = workspace("integer-coercion");
+        fs::write(root.join("a.txt"), "one\n").expect("fixture");
+        let canonical = prepare(
+            &root,
+            "read",
+            json!({"path":"a.txt", "max_lines":200, "offset":2}),
+        );
+        for (lines, offset) in [
+            (json!("200"), json!(2)),
+            (json!(200.0), json!("2")),
+            (json!(" 200 "), json!(2.0)),
+        ] {
+            let call = prepare(
+                &root,
+                "read",
+                json!({"path":"a.txt", "max_lines":lines, "offset":offset}),
+            );
+            assert!(call.error.is_none(), "{:?}", call.error);
+            assert_eq!(call.canonical_fingerprint, canonical.canonical_fingerprint);
+            assert!(call
+                .admission_notes
+                .iter()
+                .any(|note| note.contains("coerced to integer")));
+        }
+        let shell = prepare(
+            &root,
+            "shell",
+            json!({"command":"echo", "timeout_ms":"30000", "yield_ms":"500"}),
+        );
+        assert!(matches!(
+            shell.arguments,
+            PreparedToolArguments::Shell {
+                timeout_ms: 30_000,
+                yield_ms: 500,
+                ..
+            }
+        ));
+        // Anything that is not a whole non-negative number keeps failing.
+        for value in [
+            json!("2.5"),
+            json!(2.5),
+            json!("abc"),
+            json!("-1"),
+            json!(-1.0),
+            json!(true),
+        ] {
+            let call = prepare(&root, "read", json!({"path":"a.txt", "max_lines":value}));
+            assert!(call.error.is_some(), "accepted {value}");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn edits_and_patterns_sent_as_a_json_string_are_decoded_once() {
+        let root = workspace("json-string-fields");
+        fs::write(root.join("a.txt"), "one\n").expect("fixture");
+        let edits = json!([{"expected":"one", "replacement":"two"}]);
+        let canonical = prepare(&root, "patch", json!({"path":"a.txt", "edits":edits}));
+        for encoded in [edits.to_string(), edits[0].to_string()] {
+            let call = prepare(&root, "patch", json!({"path":"a.txt", "edits":encoded}));
+            assert!(call.error.is_none(), "{:?}", call.error);
+            assert_eq!(call.canonical_fingerprint, canonical.canonical_fingerprint);
+            assert!(call
+                .admission_notes
+                .iter()
+                .any(|note| note.contains("edits JSON string decoded once")));
+        }
+        let search = prepare(&root, "search", json!({"patterns":["a", "b"]}));
+        let encoded = prepare(&root, "search", json!({"patterns":"[\"a\", \"b\"]"}));
+        assert!(encoded.error.is_none(), "{:?}", encoded.error);
+        assert_eq!(encoded.canonical_fingerprint, search.canonical_fingerprint);
+        // Not JSON, wrong JSON, or a second layer: the ordinary type errors.
+        for (tool, arguments) in [
+            ("search", json!({"patterns":"plain text"})),
+            ("search", json!({"patterns":"{\"a\":1}"})),
+            ("search", json!({"patterns":"\"[\\\"a\\\"]\""})),
+            ("patch", json!({"path":"a.txt", "edits":"not json"})),
+            ("patch", json!({"path":"a.txt", "edits":"3"})),
+        ] {
+            assert!(
+                prepare(&root, tool, arguments.clone()).error.is_some(),
+                "{arguments}"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_search_pattern_with_a_line_break_is_rejected_at_admission() {
+        let root = workspace("pattern-line-break");
+        for arguments in [
+            json!({"query":"one\ntwo"}),
+            json!({"patterns":["fine", "one\r\ntwo"]}),
+        ] {
+            let call = crate::tools::ToolRegistry::default().prepare_invocation(
+                OperatingMode::Auto,
+                &root,
+                "search",
+                &arguments.to_string(),
+            );
+            assert!(call.structural_rejection);
+            assert!(
+                call.error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("single lines")),
+                "{:?}",
+                call.error
+            );
+        }
         let _ = fs::remove_dir_all(root);
     }
 }

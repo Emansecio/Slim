@@ -12,20 +12,10 @@ pub(super) fn code_intel_action_name(request: &CodeIntelRequest) -> &'static str
 }
 
 /// Files the agent wrote or patched since the last post-edit diagnostics note,
-/// and whether the "unverified" caveat has still to be mentioned. Reset when a
-/// loop run starts.
+/// reset when a loop run starts.
+#[derive(Default)]
 pub(super) struct EditedFiles {
     paths: Vec<PathBuf>,
-    unverified_unmentioned: bool,
-}
-
-impl Default for EditedFiles {
-    fn default() -> Self {
-        Self {
-            paths: Vec::new(),
-            unverified_unmentioned: true,
-        }
-    }
 }
 
 impl EditedFiles {
@@ -219,8 +209,8 @@ impl Runtime {
     }
 
     /// Errors the language server sees in the files this batch wrote or
-    /// patched, as a short note for the next request. Silent when no server is
-    /// warm, when nothing was edited, or when the edits are clean.
+    /// patched, with explicit coverage in the next request. Silent when no
+    /// integration is installed, nothing was edited or the run was cancelled.
     pub(super) async fn post_edit_diagnostics_note(&mut self, cwd: &Path) -> Option<String> {
         let paths = std::mem::take(&mut self.edited.paths);
         if paths.is_empty() {
@@ -235,15 +225,7 @@ impl Runtime {
                 self.cancellation.clone(),
             )
             .await?;
-        let mention = self.edited.unverified_unmentioned;
-        if report
-            .files
-            .iter()
-            .any(|file| file.verification == crate::codeintel::EditVerification::Unverified)
-        {
-            self.edited.unverified_unmentioned = false;
-        }
-        crate::codeintel::render_edit_diagnostics(&report, mention)
+        crate::codeintel::render_edit_diagnostics(&report, true)
             .map(|note| self.redact_sensitive(&note))
     }
 }

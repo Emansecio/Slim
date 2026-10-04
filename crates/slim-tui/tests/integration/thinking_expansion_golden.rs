@@ -98,21 +98,13 @@ fn consecutive_collapsed_thoughts_render_as_one_row() {
     }
     let frame = render_at(&state, 80, 24);
     assert!(
-        frame.contains("Pensamento ×4"),
-        "prior completed thoughts must collapse\n{frame}"
+        frame.contains("Pensou ×5"),
+        "completed thoughts collapse as soon as they end\n{frame}"
     );
-    assert_eq!(
-        frame.matches("Pensamento").count(),
-        2,
-        "the last close frame keeps a preview row\n{frame}"
-    );
+    assert_eq!(frame.matches("Pensou").count(), 1, "{frame}");
     assert!(
-        frame.contains("scratch 4"),
-        "latest preview stays visible\n{frame}"
-    );
-    assert!(
-        !frame.contains("scratch 0"),
-        "released previews stay hidden\n{frame}"
+        !frame.contains("scratch"),
+        "the text stays behind Enter\n{frame}"
     );
 }
 
@@ -128,7 +120,7 @@ fn keyboard_expands_and_collapses_thinking_inline_at_normative_sizes() {
 
         let collapsed = render_at(&state, width, height);
         assert!(
-            collapsed.contains("> ▸ Pensamento"),
+            collapsed.contains("> ▸ Pensou"),
             "{width}x{height}\n{collapsed}"
         );
         assert!(collapsed.contains("Enter expandir"), "{collapsed}");
@@ -149,7 +141,7 @@ fn keyboard_expands_and_collapses_thinking_inline_at_normative_sizes() {
             Some(FoldState::Expanded)
         ));
         let expanded = render_at(&state, width, height);
-        assert!(expanded.contains("> ▾ Pensamento"), "{expanded}");
+        assert!(expanded.contains("> ▾ Pensou"), "{expanded}");
         assert!(expanded.contains("Enter recolher"), "{expanded}");
         assert!(expanded.contains("delta"), "{width}x{height}\n{expanded}");
         assert!(
@@ -181,7 +173,7 @@ fn keyboard_expands_and_collapses_thinking_inline_at_normative_sizes() {
 }
 
 #[test]
-fn completed_thinking_retains_preview_until_the_next_content_boundary() {
+fn completed_thinking_settles_to_its_header_at_once() {
     let mut state = AppState::new();
     state.authenticated = true;
     state.apply_event(UiEvent::run_started(1));
@@ -197,29 +189,16 @@ fn completed_thinking_retains_preview_until_the_next_content_boundary() {
         .find(|block| matches!(block.kind(), BlockKind::Thinking(_)))
         .expect("completed thinking block");
     assert_eq!(thinking.lifecycle, BlockLifecycle::Complete);
-    assert!(
-        thinking.preview_retained,
-        "the close frame keeps the latest preview"
-    );
-    let retained = render_at(&state, 48, 16);
-    assert!(retained.contains("… second live line"), "{retained}");
-    assert!(retained.contains("final live line"), "{retained}");
+    let settled = render_at(&state, 48, 16);
+    assert!(settled.contains("▸ Pensou"), "{settled}");
+    assert!(!settled.contains("live line"), "{settled}");
 
     state.apply_event(UiEvent::AssistantDelta {
         text: "final answer".into(),
     });
-    let thinking = state
-        .blocks()
-        .iter()
-        .find(|block| matches!(block.kind(), BlockKind::Thinking(_)))
-        .expect("thinking block after boundary");
-    assert!(
-        !thinking.preview_retained,
-        "next semantic content releases the preview"
-    );
-    let released = render_at(&state, 48, 16);
-    assert!(!released.contains("second live line"), "{released}");
-    assert!(!released.contains("final live line"), "{released}");
+    let answered = render_at(&state, 48, 16);
+    assert!(answered.contains("▸ Pensou"), "{answered}");
+    assert!(!answered.contains("live line"), "{answered}");
 }
 
 #[test]
@@ -310,7 +289,16 @@ fn hidden_scrollback_rows_never_create_a_thinking_selection() {
         )));
     }
     state.notifications = vec!["one".into(), "two".into(), "three".into()];
-    let scrollback_height = slim_tui::layout::plan(40, 8, 0, true).scrollback.height;
+    // A compact Todo row takes the row the three notices leave over.
+    state.apply_event(UiEvent::TodoChanged {
+        items: vec![slim_tui::api::TodoItemView {
+            reason: None,
+            id: Some(1),
+            title: "task".into(),
+            status: slim_tui::api::TodoItemStatus::Pending,
+        }],
+    });
+    let scrollback_height = slim_tui::layout::plan(40, 8, 1).scrollback.height;
     assert!(
         scrollback_height <= 3,
         "fixture must leave zero transcript rows"
@@ -412,6 +400,6 @@ fn auto_fold_thinking_hides_body_until_expanded() {
     assert!(state.append_block(block));
 
     let collapsed = render_at(&state, 80, 24);
-    assert!(collapsed.contains("Pensamento"), "{collapsed}");
+    assert!(collapsed.contains("Pensou"), "{collapsed}");
     assert!(!collapsed.contains("secret body"), "{collapsed}");
 }

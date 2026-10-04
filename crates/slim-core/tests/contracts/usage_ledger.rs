@@ -73,35 +73,6 @@ fn ledger_separates_request_cost_drivers_and_execution_outcomes() {
         ),
         SessionEvent::new(
             8,
-            EventKind::CompactionAttemptStarted {
-                provider: "anthropic".into(),
-                model: "claude-test".into(),
-                system_bytes: 1,
-                history_bytes: 2,
-                serialized_chars: 7,
-                request_bytes: 7,
-                estimated_input_tokens: 5,
-            },
-        ),
-        SessionEvent::new(
-            9,
-            EventKind::CompactionAttemptCompleted {
-                uncached_input_tokens: 5,
-                cache_write_tokens: 0,
-                cache_read_tokens: 0,
-                output_tokens: 2,
-                reasoning_tokens: 0,
-                time_to_first_byte_ms: 4,
-                time_to_first_semantic_ms: 6,
-                duration_ms: 10,
-                usage_known: true,
-                system_bytes: None,
-                history_bytes: None,
-                estimated_input_tokens: None,
-            },
-        ),
-        SessionEvent::new(
-            10,
             EventKind::ToolFinished {
                 batch_id: "batch".into(),
                 call_id: "call".into(),
@@ -111,16 +82,16 @@ fn ledger_separates_request_cost_drivers_and_execution_outcomes() {
             },
         ),
         SessionEvent::new(
-            11,
+            9,
             EventKind::ToolEvidenceReused {
                 original_bytes: 100,
                 emitted_bytes: 20,
                 post_compaction: true,
             },
         ),
-        SessionEvent::new(12, EventKind::ToolCallsSuppressed { count: 1 }),
+        SessionEvent::new(10, EventKind::ToolCallsSuppressed { count: 1 }),
         SessionEvent::new(
-            13,
+            11,
             EventKind::CausalAnomalyDetected {
                 batch_id: "batch".into(),
                 call_id: "call".into(),
@@ -134,11 +105,68 @@ fn ledger_separates_request_cost_drivers_and_execution_outcomes() {
                 action: CausalShadowAction::Observe,
             },
         ),
+        // The foreground compaction request that follows the tool turn.
+        SessionEvent::new(
+            12,
+            EventKind::ContextSnapshot {
+                request_kind: RequestKind::Compaction,
+                provider: "anthropic".into(),
+                model: "claude-test".into(),
+                system_bytes: 1,
+                tool_schema_bytes: 0,
+                history_bytes: 2,
+                tool_result_bytes: 0,
+                serialized_chars: 7,
+                estimated_tokens: 5,
+                context_window_tokens: 200_000,
+            },
+        ),
+        SessionEvent::new(
+            13,
+            EventKind::ProviderPhase {
+                phase: ProviderPhase::FirstByte,
+                elapsed_ms: 4,
+                detail: None,
+            },
+        ),
         SessionEvent::new(
             14,
+            EventKind::ProviderPhase {
+                phase: ProviderPhase::FirstSemantic,
+                elapsed_ms: 6,
+                detail: None,
+            },
+        ),
+        SessionEvent::new(
+            15,
+            EventKind::UsageBreakdown {
+                usage: UsageBreakdown {
+                    uncached_input_tokens: 5,
+                    output_tokens: 2,
+                    ..UsageBreakdown::default()
+                },
+            },
+        ),
+        SessionEvent::new(
+            16,
+            EventKind::Usage {
+                input_tokens: 5,
+                output_tokens: 2,
+            },
+        ),
+        SessionEvent::new(
+            17,
+            EventKind::RequestCompleted {
+                provider_latency_ms: 10,
+                cancelled: false,
+                failed: false,
+            },
+        ),
+        SessionEvent::new(
+            18,
             EventKind::CompactionState {
                 state: slim_core::context::CompactionStatus::Applied,
-                reason: slim_core::context::CompactionReason::SoftThreshold,
+                reason: slim_core::context::CompactionReason::Threshold,
                 tokens_before: 1_000,
                 tokens_after: 400,
                 duration_ms: 10,
@@ -218,54 +246,6 @@ fn only_in_context_evidence_reuse_counts_as_a_reused_tool_call() {
 }
 
 #[test]
-fn discarded_background_compaction_is_a_failed_attempt() {
-    let events = vec![
-        SessionEvent::new(
-            1,
-            EventKind::CompactionAttemptStarted {
-                provider: "anthropic".into(),
-                model: "claude-test".into(),
-                system_bytes: 1,
-                history_bytes: 2,
-                serialized_chars: 7,
-                request_bytes: 7,
-                estimated_input_tokens: 5,
-            },
-        ),
-        SessionEvent::new(
-            2,
-            EventKind::CompactionAttemptCompleted {
-                uncached_input_tokens: 5,
-                cache_write_tokens: 0,
-                cache_read_tokens: 0,
-                output_tokens: 2,
-                reasoning_tokens: 0,
-                time_to_first_byte_ms: 0,
-                time_to_first_semantic_ms: 0,
-                duration_ms: 10,
-                usage_known: true,
-                system_bytes: None,
-                history_bytes: None,
-                estimated_input_tokens: None,
-            },
-        ),
-        SessionEvent::new(
-            3,
-            EventKind::CompactionState {
-                state: slim_core::context::CompactionStatus::Discarded,
-                reason: slim_core::context::CompactionReason::SoftThreshold,
-                tokens_before: 1_000,
-                tokens_after: 0,
-                duration_ms: 10,
-            },
-        ),
-    ];
-
-    let ledger = UsageTotals::from_events(&events, false);
-    assert!(ledger.requests[0].failed);
-}
-
-#[test]
 fn local_response_cache_hit_is_known_zero_provider_usage() {
     let events = vec![
         SessionEvent::new(
@@ -302,170 +282,115 @@ fn local_response_cache_hit_is_known_zero_provider_usage() {
 }
 
 #[test]
-fn jev_usage_is_counted_in_compaction_totals() {
+fn compaction_input_overflow_marks_the_ledger() {
     let events = vec![
         SessionEvent::new(
             1,
-            EventKind::CompactionJevPruned {
-                pairs_total: 2,
-                pairs_dropped: 1,
-                results_truncated: 1,
-                batches: 1,
-                batches_started: 1,
-                batches_completed: 1,
-                usage_unknown: false,
-                estimated_saved_tokens: 500,
-                input_tokens: Some(321),
-                output_tokens: Some(12),
-                model: Some("jev-1.13.0".into()),
-                backend: Some("typesafe".into()),
-                requested_model: Some("jev-1.13.0".into()),
-                duration_ms: 45,
+            EventKind::ContextSnapshot {
+                request_kind: RequestKind::Compaction,
+                provider: "fixture".into(),
+                model: "fixture".into(),
+                system_bytes: 0,
+                tool_schema_bytes: 0,
+                history_bytes: 0,
+                tool_result_bytes: 0,
+                serialized_chars: 0,
+                estimated_tokens: 0,
+                context_window_tokens: u64::MAX,
             },
         ),
         SessionEvent::new(
             2,
-            EventKind::CompactionJevFallback {
-                detail: "transport failed".into(),
-                batches: 0,
-                batches_started: 1,
-                batches_completed: 0,
-                usage_unknown: true,
-                input_tokens: None,
-                output_tokens: None,
-                model: None,
-                backend: Some("typesafe".into()),
-                requested_model: Some("jev-1.13.0".into()),
-                duration_ms: 10,
+            EventKind::UsageBreakdown {
+                usage: UsageBreakdown {
+                    uncached_input_tokens: u64::MAX,
+                    cache_write_tokens: 1,
+                    ..UsageBreakdown::default()
+                },
+            },
+        ),
+        SessionEvent::new(
+            3,
+            EventKind::RequestCompleted {
+                provider_latency_ms: 0,
+                cancelled: false,
+                failed: false,
             },
         ),
     ];
 
     let ledger = UsageTotals::from_events(&events, false);
-    assert_eq!(ledger.jev_input_tokens, 321);
-    assert_eq!(ledger.jev_output_tokens, 12);
-    assert_eq!(ledger.jev_latency_ms, 55);
-    assert_eq!(ledger.compaction_input_tokens, 321);
-    assert_eq!(ledger.compaction_output_tokens, 12);
-    assert!(ledger.jev_usage_unknown);
-    assert!(ledger.usage_unknown);
-}
-
-#[test]
-fn confirmed_jev_usage_survives_unknown_marker_and_tracks_typesafe_price_bucket() {
-    let events = vec![SessionEvent::new(
-        1,
-        EventKind::CompactionJevPruned {
-            pairs_total: 1,
-            pairs_dropped: 1,
-            results_truncated: 0,
-            batches: 1,
-            batches_started: 1,
-            batches_completed: 1,
-            usage_unknown: true,
-            estimated_saved_tokens: 3,
-            input_tokens: Some(100),
-            output_tokens: Some(0),
-            model: Some("jev-1.13.0".into()),
-            backend: Some("typesafe".into()),
-            requested_model: Some("jev-1.13.0".into()),
-            duration_ms: 1,
-        },
-    )];
-
-    let ledger = UsageTotals::from_events(&events, false);
-    assert_eq!(ledger.jev_input_tokens, 100);
-    assert_eq!(ledger.jev_output_tokens, 0);
-    assert_eq!(ledger.jev_priced_input_tokens, 100);
-    assert_eq!(ledger.jev_failed_priced_input_tokens, 0);
-    assert!(ledger.jev_usage_unknown);
-    assert!(!ledger.jev_pricing_unknown);
-}
-
-#[test]
-fn vercel_jev_usage_is_confirmed_but_not_marked_as_typesafe_priced() {
-    let events = vec![SessionEvent::new(
-        1,
-        EventKind::CompactionJevPruned {
-            pairs_total: 1,
-            pairs_dropped: 0,
-            results_truncated: 0,
-            batches: 1,
-            batches_started: 1,
-            batches_completed: 1,
-            usage_unknown: false,
-            estimated_saved_tokens: 0,
-            input_tokens: Some(100),
-            output_tokens: Some(2),
-            model: Some("typesafe-ai/jev".into()),
-            backend: Some("vercel".into()),
-            requested_model: Some("typesafe-ai/jev".into()),
-            duration_ms: 1,
-        },
-    )];
-
-    let ledger = UsageTotals::from_events(&events, false);
-    assert_eq!(ledger.jev_input_tokens, 100);
-    assert_eq!(ledger.jev_priced_input_tokens, 0);
-    assert!(ledger.jev_pricing_unknown);
-    assert!(!ledger.jev_usage_unknown);
-}
-
-#[test]
-fn legacy_jev_events_deserialize_with_new_telemetry_defaults() {
-    let event: SessionEvent = serde_json::from_value(serde_json::json!({
-        "seq": 7,
-        "kind": {
-            "type": "CompactionJevPruned",
-            "pairs_total": 1,
-            "pairs_dropped": 1,
-            "results_truncated": 0,
-            "batches": 1,
-            "estimated_saved_tokens": 2,
-            "input_tokens": 10,
-            "output_tokens": 0,
-            "model": "jev-1.13.0",
-            "duration_ms": 3
-        }
-    }))
-    .expect("legacy Jev event");
-    assert!(matches!(
-        event.kind,
-        EventKind::CompactionJevPruned {
-            batches_started: 0,
-            batches_completed: 0,
-            usage_unknown: false,
-            backend: None,
-            requested_model: None,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn compaction_input_overflow_marks_the_ledger() {
-    let events = vec![SessionEvent::new(
-        1,
-        EventKind::CompactionAttemptCompleted {
-            uncached_input_tokens: u64::MAX,
-            cache_write_tokens: 1,
-            cache_read_tokens: 0,
-            output_tokens: 0,
-            reasoning_tokens: 0,
-            time_to_first_byte_ms: 0,
-            time_to_first_semantic_ms: 0,
-            duration_ms: 0,
-            usage_known: true,
-            system_bytes: None,
-            history_bytes: None,
-            estimated_input_tokens: None,
-        },
-    )];
-
-    let ledger = UsageTotals::from_events(&events, false);
 
     assert!(ledger.overflowed);
     assert_eq!(ledger.compaction_input_tokens, u64::MAX);
+}
+
+fn compaction_request_events(
+    first_seq: u64,
+    input: u64,
+    output: u64,
+    failed: bool,
+) -> Vec<SessionEvent> {
+    vec![
+        SessionEvent::new(
+            first_seq,
+            EventKind::ContextSnapshot {
+                request_kind: RequestKind::Compaction,
+                provider: "fixture".into(),
+                model: "fixture".into(),
+                system_bytes: 0,
+                tool_schema_bytes: 0,
+                history_bytes: 0,
+                tool_result_bytes: 0,
+                serialized_chars: 0,
+                estimated_tokens: input,
+                context_window_tokens: 1_000,
+            },
+        ),
+        SessionEvent::new(
+            first_seq + 1,
+            EventKind::UsageBreakdown {
+                usage: UsageBreakdown {
+                    uncached_input_tokens: input,
+                    output_tokens: output,
+                    ..UsageBreakdown::default()
+                },
+            },
+        ),
+        SessionEvent::new(
+            first_seq + 2,
+            EventKind::RequestCompleted {
+                provider_latency_ms: 1,
+                cancelled: false,
+                failed,
+            },
+        ),
+    ]
+}
+
+#[test]
+fn a_split_turn_compaction_counts_both_of_its_requests() {
+    let mut events = compaction_request_events(1, 100, 30, false);
+    events.extend(compaction_request_events(4, 40, 10, false));
+
+    let ledger = UsageTotals::from_events(&events, false);
+
+    assert_eq!(ledger.requests.len(), 2);
+    assert!(ledger
+        .requests
+        .iter()
+        .all(|request| request.request_kind == RequestKind::Compaction));
+    assert_eq!(ledger.compaction_input_tokens, 140);
+    assert_eq!(ledger.compaction_output_tokens, 40);
+    assert_eq!(ledger.provider_turns, 0);
+}
+
+#[test]
+fn a_failed_compaction_request_is_marked_failed_and_keeps_its_usage() {
+    let ledger = UsageTotals::from_events(&compaction_request_events(1, 100, 0, true), false);
+
+    assert!(ledger.requests[0].failed);
+    assert_eq!(ledger.compaction_input_tokens, 100);
 }
 
 #[test]

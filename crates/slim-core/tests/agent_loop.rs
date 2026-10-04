@@ -5,10 +5,7 @@ mod http_fixture;
 #[path = "../../../tests/support/temp_root.rs"]
 mod temp_root;
 
-use http_fixture::{
-    accept_within, bind_listener, read_http_request, write_sse, SSE_COMPACTION_SUMMARY,
-    SSE_FINAL_ANSWER,
-};
+use http_fixture::{accept_within, bind_listener, read_http_request, write_sse, SSE_FINAL_ANSWER};
 use temp_root::TempRoot;
 
 use std::io::{Read, Write};
@@ -20,7 +17,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use slim_core::context::{CompactionHandle, CompactionStatus};
+use slim_core::context::{
+    prepare_compaction, CompactionHandle, CompactionPolicy, CompactionReason, CompactionStatus,
+    ContextUsage, COMPACTION_SUMMARY_PREFIX, SUMMARIZATION_SYSTEM_PROMPT,
+    UPDATE_SUMMARIZATION_PROMPT,
+};
 use slim_core::provider::{
     AnthropicAdapter, HttpProviderClient, OpenAiCodexAdapter, OpenAiCompatibleAdapter,
     ProviderAdapter, ProviderConfig, ProviderError, ProviderMessage, ProviderToolCall,
@@ -33,6 +34,29 @@ use slim_core::{
     QuestionAnswer, Runtime, SessionEventSender,
 };
 
+/// Marks the summarization request on the wire: Pi's system prompt.
+const SUMMARIZER_MARKER: &str = "You are a context summarization assistant";
+
+/// Marks a request carrying a compaction summary in place of older history.
+const COMPACTED_MARKER: &str = "compacted into the following summary";
+
+/// A policy that compacts any history with something before its last turn.
+fn eager_policy() -> CompactionPolicy {
+    CompactionPolicy {
+        keep_recent_tokens: 1,
+        ..CompactionPolicy::default()
+    }
+}
+
+/// A live reasoning/tool continuation (the assistant message with its opaque
+/// state and the results that follow) is never summarized: the cut falls on
+/// that assistant message.
+fn assert_continuation_is_kept(history: &[ProviderMessage]) {
+    let plan = prepare_compaction(history, &eager_policy().settings(), ContextUsage::default())
+        .expect("the leading turn is compactable");
+    assert_eq!(plan.first_kept_index, 1);
+}
+
 /// Keeps recovery tests off the 500 ms production backoff; Retry-After still applies.
 fn test_loop_config() -> AgentLoopConfig {
     AgentLoopConfig {
@@ -44,6 +68,14 @@ fn test_loop_config() -> AgentLoopConfig {
 /// SSE body for one OpenAI chunk carrying `tool_calls`, closed by the `tool_calls` finish reason.
 fn sse_tool_calls(event: impl std::fmt::Display) -> String {
     format!("data: {event}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n")
+}
+
+/// SSE body of a plain-text answer that ends the turn.
+fn text_response(content: &str) -> String {
+    format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"choices": [{"delta": {"content": content}, "finish_reason": "stop"}]})
+    )
 }
 
 /// OpenAI-compatible client pointed at a local fixture server.
@@ -182,18 +214,6 @@ fn accept_request(listener: &TcpListener) -> (TcpStream, String) {
     (stream, request)
 }
 
-/// Deterministic replacement for a timing sleep in the fixtures below: the final
-/// answer ends the loop, which can abort a background summary whose request has
-/// not connected yet. Until that request is accepted, the final answer is held
-/// back. Returns the summary connection to serve on the next iteration, or
-/// `None` when the summary was already served.
-fn hold_final_answer_until_summary_connects(
-    listener: &TcpListener,
-    summary_seen: bool,
-) -> Option<TcpStream> {
-    (!summary_seen).then(|| accept_with_deadline(listener))
-}
-
 #[test]
 fn provider_catalog_refreshes_when_tool_work_changes_backend_availability() {
     let root = TempRoot::new("catalog-refresh");
@@ -328,7 +348,7 @@ fn deepseek_thinking_replays_exact_scoped_state_after_native_tools() {
     assert!(history.last().unwrap().chat_reasoning.is_some());
     assert!(!format!("{history:?}").contains("fixture-key"));
     assert!(!format!("{:?}", runtime.app.events()).contains("fixture-key"));
-    assert!(!slim_core::context::has_compactable_history(&history[..3]));
+    assert_continuation_is_kept(&history[..3]);
     for (endpoint, model, key) in [
         (endpoint.as_str(), "deepseek-v4-flash", "different-key"),
         (endpoint.as_str(), "deepseek-v4-pro", "fixture-key"),
@@ -839,7 +859,8 @@ fn superseded_read_output_is_elided_from_later_requests() {
     let root = TempRoot::new("elision");
     std::fs::write(
         root.join("fixture.txt"),
-        "original bytes that will be overwritten entirely\n".repeat(4),
+        // Large enough that eliding the read pays for the cache it rewrites.
+        "original bytes that will be overwritten entirely\n".repeat(40),
     )
     .expect("fixture");
     let (listener, address) = bind_listener();
@@ -2213,13 +2234,11 @@ fn codex_subscription_responses_execute_tool_and_send_function_output() {
     );
     assert!(!format!("{:?}", runtime.app.events()).contains("opaque-fixture-token"));
     assert!(
-        !slim_core::context::build_summary_prompt(runtime.conversation())
+        !slim_core::context::serialize_conversation(runtime.conversation())
             .contains("opaque-fixture-token")
     );
     assert!(!format!("{:?}", runtime.conversation()).contains("opaque-fixture-token"));
-    assert!(!slim_core::context::has_compactable_history(
-        &runtime.conversation()[..3]
-    ));
+    assert_continuation_is_kept(&runtime.conversation()[..3]);
     let same = client
         .adapter()
         .build_messages_request(runtime.conversation());
@@ -2521,7 +2540,7 @@ fn context_below_threshold_sends_only_the_normal_request() {
     let body = server.join().expect("server");
 
     assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
-    assert!(!body.contains("You are a context compactor"));
+    assert!(!body.contains(SUMMARIZER_MARKER));
     assert!(!runtime
         .app
         .events()
@@ -2618,7 +2637,7 @@ fn sole_prompt_above_threshold_but_within_window_is_sent_unchanged() {
     let sent = body["messages"][1]["content"].as_str().expect("prompt");
     assert_eq!(slim_core::without_workspace_snapshot(sent), prompt);
     assert!(sent.contains("Harness channel: Auto, unattended"));
-    assert!(!sent.contains("Summarize the prior agent transcript"));
+    assert!(!body.to_string().contains(SUMMARIZER_MARKER));
     assert!(!runtime
         .app
         .events()
@@ -2660,7 +2679,7 @@ fn sole_prompt_beyond_window_fails_without_a_provider_call() {
 }
 
 #[test]
-fn threshold_requests_summary_then_real_turn_with_same_provider_model() {
+fn a_manual_request_summarizes_the_history_then_the_real_turn_uses_the_same_provider_model() {
     let (listener, address) = bind_listener();
     let server = thread::spawn(move || {
         let mut requests = Vec::new();
@@ -2669,49 +2688,19 @@ fn threshold_requests_summary_then_real_turn_with_same_provider_model() {
             let mut request = [0_u8; 32 * 1024];
             let size = stream.read(&mut request).expect("request");
             requests.push(String::from_utf8_lossy(&request[..size]).into_owned());
-            stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-            ).expect("headers");
-            if index == 0 {
-                let event = json!({
-                    "choices": [{
-                        "delta": {
-                            "tool_calls": [{
-                                "index": 0,
-                                "id": "c",
-                                "function": {
-                                    "name": "read",
-                                    "arguments": json!({
-                                        "path": "missing-file.txt",
-                                        "max_lines": 10
-                                    }).to_string()
-                                }
-                            }]
-                        }
-                    }]
-                });
-                stream
-                    .write_all(format!("data: {event}\n\n").as_bytes())
-                    .expect("summary");
-                stream
-                    .write_all(
-                        b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
-                    )
-                    .expect("tool finish");
-            } else if index == 1 {
-                stream
-                    .write_all(
-                        b"data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\nsummary from fixture\\n## Constraints\\nNone\\n## Progress\\nDone\\n## Blocked\\nNone\\n## Decisions\\nKeep context\\n## Next steps\\nContinue\\n## Critical context\\nFixture\"}}]}\n\n",
-                    )
-                    .expect("summary");
-            } else {
-                stream
-                    .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n")
-                    .expect("answer");
-            }
-            stream.write_all(
-                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
-            ).expect("response");
+            let body = match index {
+                0 => sse_tool_calls(json!({"choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "c",
+                    "function": {
+                        "name": "read",
+                        "arguments": json!({"path": "missing-file.txt", "max_lines": 10}).to_string()
+                    }
+                }]}}]})),
+                1 => text_response("## Goal\nsummary from fixture\n## Progress\nDone"),
+                _ => text_response("done"),
+            };
+            write_sse(&mut stream, &body);
         }
         requests
     });
@@ -2729,9 +2718,9 @@ fn threshold_requests_summary_then_real_turn_with_same_provider_model() {
     );
     let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
     let mut runtime = Runtime::new();
-    let handle = CompactionHandle::default();
+    let handle = CompactionHandle::new(eager_policy());
     handle.request_manual("").expect("queue summary protocol");
-    runtime.set_compaction_handle(handle);
+    runtime.set_compaction_handle(handle.clone());
     let result = tokio_runtime
         .block_on(runtime.run_agent_loop(
             &client,
@@ -2762,53 +2751,41 @@ fn threshold_requests_summary_then_real_turn_with_same_provider_model() {
         .expect("first user");
     assert_eq!(slim_core::without_workspace_snapshot(first_user), "start");
     assert!(first_user.contains("Harness channel: Auto, unattended"));
+
+    // The summary call: Pi's system prompt over the serialized turn prefix.
     assert_eq!(
         bodies[1]["messages"][0]["content"],
-        slim_core::context::COMPACTION_SYSTEM_PROMPT
+        SUMMARIZATION_SYSTEM_PROMPT
     );
-    assert!(bodies[1]["messages"][1]["content"]
+    let summary_prompt = bodies[1]["messages"][1]["content"]
         .as_str()
-        .expect("summary transcript")
-        .contains("user: start"));
-    assert!(!bodies[1]["messages"][1]["content"]
-        .as_str()
-        .expect("summary transcript")
-        .contains("Summarize the prior agent transcript"));
-    let resumed_user = bodies[2]["messages"][1]["content"]
-        .as_str()
-        .expect("resumed user");
-    assert_eq!(slim_core::without_workspace_snapshot(resumed_user), "start");
+        .expect("summary prompt");
+    assert!(summary_prompt.contains("# Conversation\n[User]: start"));
+    assert_eq!(bodies[1]["messages"].as_array().expect("messages").len(), 2);
+    // Half the default reserve (8192) is above the 4096 the model is configured
+    // with: the summary budget never raises that limit.
+    assert_eq!(bodies[1]["max_tokens"], bodies[0]["max_tokens"]);
+
+    // The real turn: the summary replaces the user message it summarized, and
+    // the tool exchange the cut kept follows it.
+    let resumed = bodies[2]["messages"].as_array().expect("messages");
+    assert_eq!(resumed.len(), 4, "system, summary, tool call, tool result");
+    let summary_message = resumed[1]["content"].as_str().expect("summary message");
+    assert!(summary_message.starts_with(COMPACTION_SUMMARY_PREFIX));
+    assert!(summary_message.contains("summary from fixture"));
     assert!(
         serde_json::to_string(&bodies[2])
             .expect("third request")
             .contains("Harness channel: Auto, unattended"),
         "compacted follow-up must keep the unattended channel"
     );
-    assert!(bodies[2]["messages"][2]["content"]
-        .as_str()
-        .expect("compacted context")
-        .contains("[Compacted context]"));
-    // With the native system prompt the compacted request is: system,
-    // literal root, compacted context, assistant tool call, tool result.
-    assert_eq!(bodies[2]["messages"].as_array().expect("messages").len(), 5);
-    assert_eq!(bodies[2]["messages"][3]["tool_calls"][0]["id"], "c");
-    assert_eq!(bodies[2]["messages"][4]["role"], "tool");
-    assert_eq!(bodies[2]["messages"][4]["name"], "read");
+    assert_eq!(resumed[2]["tool_calls"][0]["id"], "c");
+    assert_eq!(resumed[3]["role"], "tool");
+    assert_eq!(resumed[3]["name"], "read");
     assert!(bodies.iter().all(|body| body["model"] == "fixture-model"));
-    assert!(runtime
-        .app
-        .events()
-        .iter()
-        .any(|event| matches!(event.kind, EventKind::CompactionCompleted)));
-    let compaction_position = runtime
-        .app
-        .events()
-        .iter()
-        .position(|event| matches!(event.kind, EventKind::CompactionCompleted))
-        .expect("compaction event");
-    let compacting_position = runtime
-        .app
-        .events()
+
+    let events = runtime.app.events();
+    let compacting_position = events
         .iter()
         .position(|event| {
             matches!(
@@ -2820,10 +2797,12 @@ fn threshold_requests_summary_then_real_turn_with_same_provider_model() {
             )
         })
         .expect("compacting phase");
+    let compaction_position = events
+        .iter()
+        .position(|event| matches!(event.kind, EventKind::CompactionCompleted))
+        .expect("compaction event");
     assert!(compacting_position < compaction_position);
-    let snapshots = runtime
-        .app
-        .events()
+    let snapshots = events
         .iter()
         .enumerate()
         .filter_map(|(index, event)| {
@@ -2839,491 +2818,8 @@ fn threshold_requests_summary_then_real_turn_with_same_provider_model() {
         snapshots.iter().any(|index| *index > compaction_position),
         "main snapshot follows compaction"
     );
+    assert_eq!(handle.take_commits()[0].reason, CompactionReason::Manual);
     assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
-}
-
-#[test]
-fn jev_strategy_prunes_stale_evidence_before_the_summary_request() {
-    struct DropJudge;
-
-    #[async_trait::async_trait]
-    impl slim_core::context::JevJudge for DropJudge {
-        async fn judge(
-            &self,
-            _state: &serde_json::Value,
-            questions: &[(String, String)],
-        ) -> Result<slim_core::context::JevJudgment, String> {
-            // Every candidate is judged stale.
-            Ok(slim_core::context::JevJudgment::probabilities(vec![
-                0.02;
-                questions.len()
-            ]))
-        }
-    }
-
-    let root = TempRoot::new("jev-prune");
-    let big_file = root.join("big.txt");
-    std::fs::write(&big_file, "y".repeat(20_000)).expect("big file");
-    let big_path = big_file.to_string_lossy().replace('\\', "/");
-    let big_path_for_history = big_path.clone();
-
-    let (listener, address) = bind_listener();
-    let server = thread::spawn(move || {
-        let mut requests = Vec::new();
-        for index in 0..3 {
-            let mut stream = accept_with_deadline(&listener);
-            let mut request = [0_u8; 64 * 1024];
-            let size = stream.read(&mut request).expect("request");
-            requests.push(String::from_utf8_lossy(&request[..size]).into_owned());
-            stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-            ).expect("headers");
-            match index {
-                1 => {
-                    let event = json!({
-                        "choices": [{
-                            "delta": {
-                                "tool_calls": [{
-                                    "index": 0,
-                                    "id": "c",
-                                    "function": {
-                                        "name": "read",
-                                        "arguments": json!({
-                                            "path": big_path,
-                                            "max_lines": 10
-                                        }).to_string()
-                                    }
-                                }]
-                            }
-                        }]
-                    });
-                    stream
-                        .write_all(format!("data: {event}\n\n").as_bytes())
-                        .expect("tool call");
-                    stream
-                        .write_all(
-                            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
-                        )
-                        .expect("tool finish");
-                }
-                0 => {
-                    stream
-                        .write_all(
-                        b"data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\nsummary from fixture\\n## Constraints\\nNone\\n## Progress\\nDone\\n## Blocked\\nNone\\n## Decisions\\nKeep context\\n## Next steps\\nContinue\\n## Critical context\\nFixture\"}}]}\n\n",
-                        )
-                        .expect("summary");
-                    stream
-                        .write_all(
-b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
-                        )
-                        .expect("summary end");
-                }
-                _ => {
-                    stream
-                        .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n")
-                        .expect("answer");
-                    stream
-                        .write_all(
-                            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
-                        )
-                        .expect("response");
-                }
-            }
-        }
-        requests
-    });
-
-    let client = fixture_client(format!("http://{address}"), Duration::from_secs(2));
-    let tools = Runtime::new().advertised_tool_definitions(OperatingMode::Auto);
-    let fixed_tokens = slim_core::context::estimate_text_tokens_from_chars(
-        client
-            .adapter()
-            .build_messages_request_with_tools_checked(&[], &tools)
-            .expect("fixed request")
-            .body
-            .chars()
-            .count() as u64,
-    );
-    let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
-    // Seed two older tool pairs: the newest group is always protected as the
-    // recent suffix, so the older pair is the one the summarized prefix holds.
-    let mut history = vec![ProviderMessage::user("start")];
-    let mut first_assistant = ProviderMessage::user("");
-    first_assistant.role = "assistant".into();
-    first_assistant.content = "read the big file".into();
-    first_assistant.tool_calls = vec![ProviderToolCall {
-        id: "old1".into(),
-        name: "read".into(),
-        arguments: json!({ "path": big_path_for_history, "max_lines": 10 }).to_string(),
-    }];
-    history.push(first_assistant);
-    history.push(ProviderMessage::tool("read", "old1", "z".repeat(8_000)));
-    history.push(ProviderMessage::user("continue"));
-    let mut second_assistant = ProviderMessage::user("");
-    second_assistant.role = "assistant".into();
-    second_assistant.content = "read it again".into();
-    second_assistant.tool_calls = vec![ProviderToolCall {
-        id: "old2".into(),
-        name: "read".into(),
-        arguments: json!({ "path": big_path_for_history, "max_lines": 10 }).to_string(),
-    }];
-    history.push(second_assistant);
-    history.push(ProviderMessage::tool("read", "old2", "w".repeat(8_000)));
-    let mut runtime = Runtime::new();
-    let mut policy = slim_core::context::CompactionPolicy {
-        keep_recent_tokens: 1_000,
-        ..slim_core::context::CompactionPolicy::default()
-    };
-    policy.strategy = slim_core::context::CompactionStrategy::Jev;
-    let handle = CompactionHandle::new(policy);
-    handle.request_manual("").expect("queue summary protocol");
-    runtime.set_compaction_handle(handle);
-    runtime.set_jev_judge(Some(std::sync::Arc::new(DropJudge)));
-    let result = tokio_runtime
-        .block_on(runtime.run_agent_loop_with_messages(
-            &client,
-            &history,
-            OperatingMode::Auto,
-            std::env::temp_dir(),
-            1,
-            AgentLoopConfig {
-                context_window_tokens: fixed_tokens + 40_000,
-                context_reserve_tokens: 120,
-                ..test_loop_config()
-            },
-        ))
-        .expect("loop");
-    let requests = server.join().expect("server");
-    drop(root);
-    let pruned = runtime
-        .app
-        .events()
-        .iter()
-        .find_map(|event| match &event.kind {
-            EventKind::CompactionJevPruned {
-                pairs_dropped,
-                batches,
-                ..
-            } => Some((*pairs_dropped, *batches)),
-            _ => None,
-        })
-        .expect("jev pruning event");
-    assert!(pruned.0 >= 1, "at least one pair dropped");
-    assert!(pruned.1 >= 1, "at least one batch judged");
-    assert!(
-        !runtime
-            .app
-            .events()
-            .iter()
-            .any(|event| matches!(event.kind, EventKind::CompactionJevFallback { .. })),
-        "no fallback when pruning succeeds"
-    );
-    let summary_body = requests
-        .iter()
-        .find(|request| request.contains("You are a context compactor"))
-        .map(|request| request.split("\r\n\r\n").nth(1).unwrap_or("").to_string())
-        .expect("compaction request");
-    assert!(
-        summary_body.contains("jev-compaction"),
-        "summary transcript must show the prune note"
-    );
-    let bodies = requests
-        .iter()
-        .map(|request| {
-            let body = request.split("\r\n\r\n").nth(1).expect("body");
-            serde_json::from_str::<Value>(body).expect("json")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(bodies.len(), 3);
-    assert_eq!(bodies[2]["messages"][0]["role"], "system");
-    assert!(bodies[2]["messages"][2]["content"]
-        .as_str()
-        .expect("compacted context")
-        .contains("[Compacted context]"));
-    assert!(bodies.iter().all(|body| body["model"] == "fixture-model"));
-    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
-    assert!(runtime
-        .app
-        .events()
-        .iter()
-        .any(|event| matches!(event.kind, EventKind::CompactionCompleted)));
-}
-
-#[test]
-fn jev_failure_falls_back_to_the_llm_summary() {
-    struct FailingJudge;
-
-    #[async_trait::async_trait]
-    impl slim_core::context::JevJudge for FailingJudge {
-        async fn judge(
-            &self,
-            _state: &serde_json::Value,
-            _questions: &[(String, String)],
-        ) -> Result<slim_core::context::JevJudgment, String> {
-            Err("connection refused".into())
-        }
-    }
-
-    let (listener, address) = bind_listener();
-    let server = thread::spawn(move || {
-        let mut requests = Vec::new();
-        for index in 0..3 {
-            let mut stream = accept_with_deadline(&listener);
-            let mut request = [0_u8; 64 * 1024];
-            let size = stream.read(&mut request).expect("request");
-            requests.push(String::from_utf8_lossy(&request[..size]).into_owned());
-            stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-            ).expect("headers");
-            match index {
-                1 => {
-                    let event = json!({
-                        "choices": [{
-                            "delta": {
-                                "tool_calls": [{
-                                    "index": 0,
-                                    "id": "c",
-                                    "function": {
-                                        "name": "read",
-                                        "arguments": json!({
-                                            "path": "missing-file.txt",
-                                            "max_lines": 10
-                                        }).to_string()
-                                    }
-                                }]
-                            }
-                        }]
-                    });
-                    stream
-                        .write_all(format!("data: {event}\n\n").as_bytes())
-                        .expect("tool call");
-                    stream
-                        .write_all(
-                            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
-                        )
-                        .expect("tool finish");
-                }
-                0 => {
-                    stream
-                        .write_all(
-                        b"data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\nsummary from fixture\\n## Constraints\\nNone\\n## Progress\\nDone\\n## Blocked\\nNone\\n## Decisions\\nKeep context\\n## Next steps\\nContinue\\n## Critical context\\nFixture\"}}]}\n\n",
-                        )
-                        .expect("summary");
-                    stream
-                        .write_all(
-b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
-                        )
-                        .expect("summary end");
-                }
-                _ => {
-                    stream
-                        .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n")
-                        .expect("answer");
-                    stream
-                        .write_all(
-                            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
-                        )
-                        .expect("response");
-                }
-            }
-        }
-        requests
-    });
-
-    let client = fixture_client(format!("http://{address}"), Duration::from_secs(2));
-    let tools = Runtime::new().advertised_tool_definitions(OperatingMode::Auto);
-    let fixed_tokens = slim_core::context::estimate_text_tokens_from_chars(
-        client
-            .adapter()
-            .build_messages_request_with_tools_checked(&[], &tools)
-            .expect("fixed request")
-            .body
-            .chars()
-            .count() as u64,
-    );
-    let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
-    // Two older tool pairs: the newest is protected, so the older one is what
-    // the summarized prefix holds. The judge fails, so that prefix must reach
-    // the LLM summary untouched.
-    let mut history = vec![ProviderMessage::user("start")];
-    let mut first_assistant = ProviderMessage::user("");
-    first_assistant.role = "assistant".into();
-    first_assistant.content = "read the older file".into();
-    first_assistant.tool_calls = vec![ProviderToolCall {
-        id: "old1".into(),
-        name: "read".into(),
-        arguments: json!({ "path": "older.rs", "max_lines": 10 }).to_string(),
-    }];
-    history.push(first_assistant);
-    history.push(ProviderMessage::tool(
-        "read",
-        "old1",
-        format!("RAW_FALLBACK_MARKER{}", "z".repeat(8_000)),
-    ));
-    history.push(ProviderMessage::user("continue"));
-    let mut second_assistant = ProviderMessage::user("");
-    second_assistant.role = "assistant".into();
-    second_assistant.content = "read it again".into();
-    second_assistant.tool_calls = vec![ProviderToolCall {
-        id: "old2".into(),
-        name: "read".into(),
-        arguments: json!({ "path": "older.rs", "max_lines": 10 }).to_string(),
-    }];
-    history.push(second_assistant);
-    history.push(ProviderMessage::tool("read", "old2", "w".repeat(8_000)));
-    let mut runtime = Runtime::new();
-    let mut policy = slim_core::context::CompactionPolicy {
-        keep_recent_tokens: 1_000,
-        ..slim_core::context::CompactionPolicy::default()
-    };
-    policy.strategy = slim_core::context::CompactionStrategy::Jev;
-    let handle = CompactionHandle::new(policy);
-    handle.request_manual("").expect("queue summary protocol");
-    runtime.set_compaction_handle(handle);
-    runtime.set_jev_judge(Some(std::sync::Arc::new(FailingJudge)));
-    let result = tokio_runtime
-        .block_on(runtime.run_agent_loop_with_messages(
-            &client,
-            &history,
-            OperatingMode::Auto,
-            std::env::temp_dir(),
-            1,
-            AgentLoopConfig {
-                context_window_tokens: fixed_tokens + 40_000,
-                context_reserve_tokens: 120,
-                ..test_loop_config()
-            },
-        ))
-        .expect("loop");
-    let requests = server.join().expect("server");
-    let fallback = runtime
-        .app
-        .events()
-        .iter()
-        .find_map(|event| match &event.kind {
-            EventKind::CompactionJevFallback { detail, .. } => Some(detail.clone()),
-            _ => None,
-        })
-        .expect("jev fallback event");
-    assert!(
-        fallback.contains("connection refused"),
-        "redacted reason carried: {fallback}"
-    );
-    assert!(
-        !runtime
-            .app
-            .events()
-            .iter()
-            .any(|event| matches!(event.kind, EventKind::CompactionJevPruned { .. })),
-        "no pruning event when the judge fails"
-    );
-    let summary_body = requests
-        .iter()
-        .find(|request| request.contains("You are a context compactor"))
-        .map(|request| request.split("\r\n\r\n").nth(1).unwrap_or("").to_string())
-        .expect("compaction request");
-    assert!(
-        !summary_body.contains("jev-compaction"),
-        "fallback summarizes the untouched prefix"
-    );
-    assert!(
-        summary_body.contains("RAW_FALLBACK_MARKER") || summary_body.contains("older.rs"),
-        "raw tool evidence stays in the summary transcript"
-    );
-    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
-    assert!(runtime
-        .app
-        .events()
-        .iter()
-        .any(|event| matches!(event.kind, EventKind::CompactionCompleted)));
-}
-
-#[test]
-fn foreground_cancellation_interrupts_slow_jev_without_committing_checkpoint() {
-    struct BlockingJudge {
-        started: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
-    }
-
-    #[async_trait]
-    impl slim_core::context::JevJudge for BlockingJudge {
-        async fn judge(
-            &self,
-            _state: &Value,
-            _questions: &[(String, String)],
-        ) -> Result<slim_core::context::JevJudgment, String> {
-            if let Some(started) = self.started.lock().unwrap().take() {
-                started.send(()).unwrap();
-            }
-            std::future::pending().await
-        }
-    }
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let client = jev_openai_client(listener.local_addr().unwrap());
-    let history = jev_tool_pair_history();
-    let handle = CompactionHandle::new(slim_core::context::CompactionPolicy {
-        keep_recent_tokens: 1_000,
-        strategy: slim_core::context::CompactionStrategy::Jev,
-        ..slim_core::context::CompactionPolicy::default()
-    });
-    handle.request_manual("").unwrap();
-    let cancellation = CancellationToken::new();
-    let cancel = cancellation.clone();
-    let (started, judge_started) = std::sync::mpsc::channel();
-    let watcher = thread::spawn(move || {
-        judge_started
-            .recv_timeout(Duration::from_secs(2))
-            .expect("Jev started");
-        cancel.cancel();
-    });
-    let mut runtime = Runtime::new();
-    runtime.set_compaction_handle(handle);
-    runtime.set_jev_judge(Some(Arc::new(BlockingJudge {
-        started: std::sync::Mutex::new(Some(started)),
-    })));
-    runtime.set_cancellation_token(cancellation);
-
-    let started_at = Instant::now();
-    let result = run_loop_with_messages(
-        &mut runtime,
-        &client,
-        &history,
-        OperatingMode::Auto,
-        std::env::temp_dir(),
-        1,
-        test_loop_config(),
-    )
-    .expect("cancellation is a normal stop");
-    watcher.join().unwrap();
-    drop(listener);
-
-    assert_eq!(result.stop, AgentLoopStop::Cancelled);
-    assert!(started_at.elapsed() < Duration::from_secs(1));
-    assert_eq!(runtime.conversation(), history.as_slice());
-    assert!(!runtime
-        .app
-        .events()
-        .iter()
-        .any(|event| matches!(event.kind, EventKind::CompactionCompleted)));
-    let fallback = runtime
-        .app
-        .events()
-        .iter()
-        .find_map(|event| match &event.kind {
-            EventKind::CompactionJevFallback {
-                batches_started,
-                batches_completed,
-                usage_unknown,
-                detail,
-                ..
-            } => Some((*batches_started, *batches_completed, *usage_unknown, detail)),
-            _ => None,
-        })
-        .expect("cancelled Jev outcome");
-    assert_eq!(fallback.0, 1);
-    assert_eq!(fallback.1, 0);
-    assert!(fallback.2);
-    assert!(fallback.3.contains("cancelled"));
 }
 
 #[test]
@@ -3397,7 +2893,7 @@ fn economy_projection_keeps_written_bytes_and_reconciles_todo_in_normal_turn() {
             write_sse(&mut stream, &format!("data: {event}\n\ndata: [DONE]\n\n"));
         }
     });
-    let client = jev_openai_client(address);
+    let client = openai_fixture_client(address);
     let mut runtime = Runtime::with_artifact_store(root.join("artifacts")).unwrap();
     runtime.set_read_presentation_bytes(24 * 1024).unwrap();
     assert!(runtime.set_read_presentation_bytes(0).is_err());
@@ -3435,861 +2931,10 @@ fn economy_projection_keeps_written_bytes_and_reconciles_todo_in_normal_turn() {
     );
 }
 
-fn sse_read_call_body(call_id: &str) -> String {
-    let tool_call = json!({
-        "choices": [{
-            "delta": {
-                "tool_calls": [{
-                    "index": 0,
-                    "id": call_id,
-                    "function": {
-                        "name": "read",
-                        "arguments": json!({
-                            "path": "missing-file.txt",
-                            "max_lines": 1
-                        }).to_string()
-                    }
-                }]
-            }
-        }]
-    });
-    sse_tool_calls(&tool_call)
-}
-
-fn jev_openai_client(address: std::net::SocketAddr) -> HttpProviderClient<OpenAiCompatibleAdapter> {
+fn openai_fixture_client(
+    address: std::net::SocketAddr,
+) -> HttpProviderClient<OpenAiCompatibleAdapter> {
     fixture_client(format!("http://{address}"), Duration::from_secs(5))
-}
-
-fn soft_only_context_window_tokens(
-    client: &HttpProviderClient<OpenAiCompatibleAdapter>,
-    messages: &[ProviderMessage],
-) -> u64 {
-    let tools = Runtime::new().advertised_tool_definitions(OperatingMode::Auto);
-    let request = client
-        .adapter()
-        .build_messages_request_with_tools_checked(messages, &tools)
-        .expect("request builds");
-    let estimated = slim_core::context::AdaptiveTokenEstimator::default().estimate(
-        "openai-compatible",
-        client.adapter().model(),
-        request.body.chars().count() as u64,
-    );
-    let window = estimated.saturating_mul(100).div_ceil(70);
-    let policy = slim_core::context::CompactionPolicy::default();
-    assert!(
-        policy.is_over_soft(estimated, window),
-        "exact estimate {estimated} must clear the soft threshold of window {window}"
-    );
-    assert!(
-        !policy.is_over_hard(estimated, window, 0),
-        "exact estimate {estimated} must stay under the hard threshold of window {window}"
-    );
-    window
-}
-
-fn jev_tool_pair_history() -> Vec<ProviderMessage> {
-    let read_args = json!({ "path": "older.rs", "max_lines": 10 }).to_string();
-    let mut first = ProviderMessage::assistant("read the older file", Vec::new());
-    first.tool_calls = vec![ProviderToolCall {
-        id: "old1".into(),
-        name: "read".into(),
-        arguments: read_args.clone(),
-    }];
-    let mut second = ProviderMessage::assistant("read it again", Vec::new());
-    second.tool_calls = vec![ProviderToolCall {
-        id: "old2".into(),
-        name: "read".into(),
-        arguments: read_args,
-    }];
-    vec![
-        ProviderMessage::user("start"),
-        ProviderMessage::assistant("old context ".repeat(20_000), Vec::new()),
-        first,
-        ProviderMessage::tool("read", "old1", "z".repeat(8_000)),
-        ProviderMessage::user("continue"),
-        second,
-        ProviderMessage::tool("read", "old2", "w".repeat(8_000)),
-    ]
-}
-
-struct CountingJevJudge {
-    calls: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-#[async_trait]
-impl slim_core::context::JevJudge for CountingJevJudge {
-    fn metadata(&self) -> slim_core::context::JevJudgeMetadata {
-        slim_core::context::JevJudgeMetadata {
-            backend: Some("typesafe".into()),
-            requested_model: Some(slim_core::context::DEFAULT_JEV_MODEL.into()),
-        }
-    }
-
-    async fn judge(
-        &self,
-        _state: &Value,
-        questions: &[(String, String)],
-    ) -> Result<slim_core::context::JevJudgment, String> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(slim_core::context::JevJudgment::probabilities(vec![
-            0.0;
-            questions.len()
-        ]))
-    }
-}
-
-#[test]
-fn uneconomic_jev_prepass_still_runs_the_background_summary() {
-    let (listener, address) = bind_listener();
-    let server = thread::spawn(move || {
-        let mut summary_seen = false;
-        let mut pending = None;
-        for index in 0..3 {
-            let mut stream = pending
-                .take()
-                .unwrap_or_else(|| accept_with_deadline(&listener));
-            let request = read_http_request(&mut stream);
-            let body = if request.contains("You are a context compactor") {
-                summary_seen = true;
-                SSE_COMPACTION_SUMMARY.to_owned()
-            } else if index == 0 {
-                sse_read_call_body("economic-read")
-            } else {
-                pending = hold_final_answer_until_summary_connects(&listener, summary_seen);
-                SSE_FINAL_ANSWER.to_owned()
-            };
-            write_sse(&mut stream, &body);
-        }
-        summary_seen
-    });
-
-    let client = jev_openai_client(address);
-    let history = jev_tool_pair_history();
-    let window = soft_only_context_window_tokens(&client, &history);
-    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut runtime = jev_runtime(Arc::new(CountingJevJudge {
-        calls: calls.clone(),
-    }));
-    runtime.set_compaction_input_cost_micros_per_million(Some(1));
-    let result = run_loop_to_completion(&mut runtime, &client, &history, window, 3);
-    assert!(server.join().expect("server"), "summary request was sent");
-    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-    assert!(runtime
-        .app
-        .events()
-        .iter()
-        .any(|event| matches!(event.kind, EventKind::CompactionAttemptCompleted { .. })));
-}
-
-fn jev_runtime(judge: Arc<dyn slim_core::context::JevJudge>) -> Runtime {
-    let mut runtime = Runtime::new();
-    runtime.set_compaction_handle(CompactionHandle::new(
-        slim_core::context::CompactionPolicy {
-            keep_recent_tokens: 1_000,
-            strategy: slim_core::context::CompactionStrategy::Jev,
-            ..slim_core::context::CompactionPolicy::default()
-        },
-    ));
-    runtime.set_background_compaction_enabled(true);
-    runtime.set_jev_judge(Some(judge));
-    runtime
-}
-
-fn run_loop_to_completion(
-    runtime: &mut Runtime,
-    client: &HttpProviderClient<OpenAiCompatibleAdapter>,
-    messages: &[ProviderMessage],
-    window_tokens: u64,
-    max_turns: usize,
-) -> slim_core::runtime::AgentLoopResult {
-    run_loop_with_messages(
-        runtime,
-        client,
-        messages,
-        OperatingMode::Auto,
-        std::env::temp_dir(),
-        1,
-        AgentLoopConfig {
-            max_turns,
-            context_window_tokens: window_tokens,
-            context_reserve_tokens: 0,
-            ..test_loop_config()
-        },
-    )
-    .expect("loop")
-}
-
-#[test]
-fn jev_is_not_called_for_a_final_answer_turn() {
-    let (listener, address) = bind_listener();
-    let server = thread::spawn(move || {
-        let (mut stream, request) = accept_request(&listener);
-        write_sse(&mut stream, SSE_FINAL_ANSWER);
-        request
-    });
-
-    let client = jev_openai_client(address);
-    let messages = vec![
-        ProviderMessage::user("literal root"),
-        ProviderMessage::assistant("old context ".repeat(20_000), Vec::new()),
-        ProviderMessage::user("recent request"),
-    ];
-    let window = soft_only_context_window_tokens(&client, &messages);
-    let judge_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut runtime = jev_runtime(Arc::new(CountingJevJudge {
-        calls: judge_calls.clone(),
-    }));
-    let result = run_loop_to_completion(&mut runtime, &client, &messages, window, 3);
-    server.join().expect("server");
-
-    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
-    assert_eq!(judge_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-    assert!(!runtime.app.events().iter().any(|event| matches!(
-        event.kind,
-        EventKind::CompactionJevPruned { .. } | EventKind::CompactionJevFallback { .. }
-    )));
-}
-
-#[test]
-fn jev_eligibility_does_not_charge_pruning_tokens_to_summary_break_even() {
-    fn run_once(messages: &[ProviderMessage], jev: bool) -> (u64, u64, u64, u64, u64, usize) {
-        let (listener, address) = bind_listener();
-        let server = thread::spawn(move || {
-            for index in 0..2 {
-                let (mut stream, request) = accept_request(&listener);
-                assert!(!request.contains("You are a context compactor"));
-                let body = if index == 0 {
-                    sse_read_call_body("jev-gate-read")
-                } else {
-                    SSE_FINAL_ANSWER.to_owned()
-                };
-                write_sse(&mut stream, &body);
-            }
-        });
-
-        let client = jev_openai_client(address);
-        let context_window_tokens = soft_only_context_window_tokens(&client, messages);
-        let judge_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut runtime = Runtime::new();
-        runtime.set_compaction_handle(CompactionHandle::new(
-            slim_core::context::CompactionPolicy {
-                keep_recent_tokens: 1_000,
-                strategy: if jev {
-                    slim_core::context::CompactionStrategy::Jev
-                } else {
-                    slim_core::context::CompactionStrategy::Summary
-                },
-                ..slim_core::context::CompactionPolicy::default()
-            },
-        ));
-        runtime.set_background_compaction_enabled(true);
-        if jev {
-            runtime.set_jev_judge(Some(Arc::new(CountingJevJudge {
-                calls: judge_calls.clone(),
-            })));
-        }
-        let result =
-            run_loop_to_completion(&mut runtime, &client, messages, context_window_tokens, 2);
-        server.join().expect("server");
-        assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
-
-        let used_tokens = runtime
-            .app
-            .events()
-            .iter()
-            .find_map(|event| match &event.kind {
-                EventKind::ContextSnapshot {
-                    estimated_tokens, ..
-                } => Some(*estimated_tokens),
-                _ => None,
-            })
-            .expect("context snapshot");
-        let (savings, cost, future_turns) = runtime
-            .app
-            .events()
-            .iter()
-            .find_map(|event| match &event.kind {
-                EventKind::CompactionSkippedBelowBreakEven {
-                    projected_savings_tokens,
-                    estimated_cost_tokens,
-                    future_turns,
-                    ..
-                } => Some((
-                    *projected_savings_tokens,
-                    *estimated_cost_tokens,
-                    u64::from(*future_turns),
-                )),
-                _ => None,
-            })
-            .expect("below-break-even event");
-        (
-            savings,
-            cost,
-            future_turns,
-            used_tokens,
-            context_window_tokens,
-            judge_calls.load(std::sync::atomic::Ordering::SeqCst),
-        )
-    }
-
-    let read_args = json!({ "path": "older.rs", "max_lines": 10 }).to_string();
-    let mut assistant = ProviderMessage::assistant("read earlier", Vec::new());
-    assistant.tool_calls = vec![ProviderToolCall {
-        id: "old1".into(),
-        name: "read".into(),
-        arguments: read_args.clone(),
-    }];
-    let mut recent = ProviderMessage::assistant("read the big file", Vec::new());
-    recent.tool_calls = vec![ProviderToolCall {
-        id: "new1".into(),
-        name: "read".into(),
-        arguments: read_args,
-    }];
-    let messages = vec![
-        ProviderMessage::user("literal root"),
-        assistant,
-        ProviderMessage::tool("read", "old1", "z".repeat(4_000)),
-        ProviderMessage::user("continue"),
-        recent,
-        ProviderMessage::tool("read", "new1", "w".repeat(200_000)),
-    ];
-
-    let (savings_summary, cost_summary, future_turns, used_tokens, window_tokens, _) =
-        run_once(&messages, false);
-    let (savings_jev, cost_jev, _, _, _, jev_calls) = run_once(&messages, true);
-
-    assert_eq!(jev_calls, 0);
-    assert_eq!(savings_jev, savings_summary, "savings ignore the strategy");
-
-    let mut capped_policy = slim_core::context::CompactionPolicy {
-        keep_recent_tokens: 1_000,
-        ..slim_core::context::CompactionPolicy::default()
-    };
-    capped_policy.keep_recent_tokens = capped_policy.keep_recent_for_window(window_tokens);
-    let selection = slim_core::context::select_compaction_history(&messages, &capped_policy)
-        .expect("selection");
-    let history_tokens = slim_core::context::estimate_provider_message_tokens(&messages);
-    let fixed_request_tokens = used_tokens.saturating_sub(history_tokens);
-    assert!(fixed_request_tokens > 0, "request has fixed overhead");
-    let mut retained: Vec<ProviderMessage> = selection
-        .summarized
-        .iter()
-        .filter(|message| matches!(message.role.as_str(), "system" | "developer"))
-        .cloned()
-        .collect();
-    retained.push(ProviderMessage::user(selection.root_instruction.clone()));
-    retained.extend(selection.pinned.iter().cloned());
-    retained.extend(selection.kept.iter().cloned());
-    let projected_after = fixed_request_tokens
-        .saturating_add(slim_core::context::estimate_provider_message_tokens(
-            &retained,
-        ))
-        .saturating_add(2_048);
-    assert_eq!(
-        savings_summary,
-        used_tokens
-            .saturating_sub(projected_after)
-            .saturating_mul(future_turns),
-        "fixed provider/tool-schema overhead is not counted as savings"
-    );
-
-    let expected_jev = slim_core::context::estimate_prune_input_tokens(
-        &selection,
-        None,
-        &selection.summarized_for_prompt(),
-    );
-    assert!(matches!(
-        expected_jev,
-        slim_core::context::JevInputEstimate::Eligible(tokens) if tokens > 0
-    ));
-    assert_eq!(
-        cost_jev, cost_summary,
-        "summary break-even is independent from optional Jev spend"
-    );
-}
-
-#[test]
-fn over_limit_jev_candidates_still_allow_background_summary() {
-    let (listener, address) = bind_listener();
-    let server = thread::spawn(move || {
-        let mut summary_body = String::new();
-        let mut turn_requests = 0;
-        let mut pending = None;
-        for _ in 0..3 {
-            let mut stream = pending
-                .take()
-                .unwrap_or_else(|| accept_with_deadline(&listener));
-            let request = read_http_request(&mut stream);
-            let body = if request.contains("You are a context compactor") {
-                summary_body = request;
-                SSE_COMPACTION_SUMMARY.to_owned()
-            } else {
-                turn_requests += 1;
-                if turn_requests == 1 {
-                    sse_read_call_body("over-limit-read")
-                } else {
-                    pending = hold_final_answer_until_summary_connects(
-                        &listener,
-                        !summary_body.is_empty(),
-                    );
-                    SSE_FINAL_ANSWER.to_owned()
-                }
-            };
-            write_sse(&mut stream, &body);
-        }
-        summary_body
-    });
-
-    let client = jev_openai_client(address);
-    let mut history = vec![ProviderMessage::user("root")];
-    for index in 0..257 {
-        let id = format!("old-{index}");
-        let mut assistant = ProviderMessage::assistant("inspect", Vec::new());
-        assistant.tool_calls = vec![ProviderToolCall {
-            id: id.clone(),
-            name: "read".into(),
-            arguments: json!({"path": format!("old-{index}.rs")}).to_string(),
-        }];
-        history.push(assistant);
-        history.push(ProviderMessage::tool("read", id, "x".repeat(2_000)));
-    }
-    history.push(ProviderMessage::user("continue"));
-    let mut recent = ProviderMessage::assistant("read recent", Vec::new());
-    recent.tool_calls = vec![ProviderToolCall {
-        id: "recent".into(),
-        name: "read".into(),
-        arguments: json!({"path":"recent.rs"}).to_string(),
-    }];
-    history.push(recent);
-    history.push(ProviderMessage::tool("read", "recent", "w".repeat(200_000)));
-
-    let window = soft_only_context_window_tokens(&client, &history);
-    let judge_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut runtime = jev_runtime(Arc::new(CountingJevJudge {
-        calls: judge_calls.clone(),
-    }));
-    let result = run_loop_to_completion(&mut runtime, &client, &history, window, 3);
-    let summary_body = server.join().expect("server");
-
-    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
-    assert_eq!(judge_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-    assert!(summary_body.contains("You are a context compactor"));
-    assert!(!summary_body.contains("jev-compaction"));
-    assert!(runtime
-        .app
-        .events()
-        .iter()
-        .any(|event| matches!(event.kind, EventKind::CompactionAttemptCompleted { .. })));
-}
-
-#[test]
-fn jev_runs_once_inside_the_settled_background_task() {
-    struct DropJudge {
-        calls: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl slim_core::context::JevJudge for DropJudge {
-        async fn judge(
-            &self,
-            _state: &Value,
-            questions: &[(String, String)],
-        ) -> Result<slim_core::context::JevJudgment, String> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(slim_core::context::JevJudgment {
-                probabilities: vec![0.0; questions.len()],
-                input_tokens: Some(321),
-                output_tokens: Some(12),
-                model: Some("jev-1.13.0".into()),
-            })
-        }
-    }
-
-    let (listener, address) = bind_listener();
-    let server = thread::spawn(move || {
-        let mut summary_body = String::new();
-        let mut turn_requests = 0;
-        let mut pending = None;
-        for _ in 0..3 {
-            let mut stream = pending
-                .take()
-                .unwrap_or_else(|| accept_with_deadline(&listener));
-            let request = read_http_request(&mut stream);
-            let body = if request.contains("You are a context compactor") {
-                summary_body = request;
-                SSE_COMPACTION_SUMMARY.to_owned()
-            } else {
-                turn_requests += 1;
-                if turn_requests == 1 {
-                    sse_read_call_body("bg-read-call")
-                } else {
-                    pending = hold_final_answer_until_summary_connects(
-                        &listener,
-                        !summary_body.is_empty(),
-                    );
-                    SSE_FINAL_ANSWER.to_owned()
-                }
-            };
-            write_sse(&mut stream, &body);
-        }
-        summary_body
-    });
-
-    let client = jev_openai_client(address);
-    let history = jev_tool_pair_history();
-    let window = soft_only_context_window_tokens(&client, &history);
-    let judge_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut runtime = jev_runtime(Arc::new(DropJudge {
-        calls: judge_calls.clone(),
-    }));
-    let result = run_loop_to_completion(&mut runtime, &client, &history, window, 3);
-    let summary_body = server.join().expect("server");
-
-    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
-    assert_eq!(judge_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    let events = runtime.app.events();
-    let jev_index = events
-        .iter()
-        .position(|event| matches!(event.kind, EventKind::CompactionJevPruned { .. }))
-        .expect("jev pruning event emitted when the task settles");
-    match &events[jev_index].kind {
-        EventKind::CompactionJevPruned {
-            pairs_dropped,
-            batches,
-            input_tokens,
-            output_tokens,
-            model,
-            ..
-        } => {
-            assert_eq!(*batches, 1);
-            assert!(*pairs_dropped >= 1);
-            assert_eq!(*input_tokens, Some(321));
-            assert_eq!(*output_tokens, Some(12));
-            assert_eq!(model.as_deref(), Some("jev-1.13.0"));
-        }
-        _ => unreachable!(),
-    }
-    let completed_index = events
-        .iter()
-        .position(|event| matches!(event.kind, EventKind::CompactionAttemptCompleted { .. }))
-        .expect("summary attempt completed");
-    assert!(
-        jev_index < completed_index,
-        "the Jev outcome is emitted before the summary attempt result"
-    );
-    let spawned_estimate = events
-        .iter()
-        .find_map(|event| match &event.kind {
-            EventKind::CompactionAttemptStarted {
-                estimated_input_tokens,
-                ..
-            } => Some(*estimated_input_tokens),
-            _ => None,
-        })
-        .expect("attempt started");
-    let settled_estimate = events
-        .iter()
-        .find_map(|event| match &event.kind {
-            EventKind::CompactionAttemptCompleted {
-                estimated_input_tokens,
-                ..
-            } => *estimated_input_tokens,
-            _ => None,
-        })
-        .expect("settled estimate");
-    assert!(
-        settled_estimate < spawned_estimate,
-        "settled telemetry reports the rebuilt pruned request"
-    );
-    let rebuilt = slim_core::runtime::UsageTotals::from_events(events, false);
-    let settled_request = rebuilt
-        .requests
-        .iter()
-        .find(|request| request.request_kind == slim_core::RequestKind::Compaction)
-        .expect("reconstructed compaction request");
-    assert_eq!(settled_request.estimated_input_tokens, settled_estimate);
-    let observed_request = result
-        .usage
-        .requests
-        .iter()
-        .find(|request| request.request_kind == slim_core::RequestKind::Compaction)
-        .expect("observed compaction request");
-    assert_eq!(observed_request.estimated_input_tokens, settled_estimate);
-    assert!(
-        summary_body.contains("jev-compaction"),
-        "the pruned request reaches the summary model"
-    );
-}
-
-#[test]
-fn jev_latency_does_not_block_the_main_tool_turn() {
-    struct SlowJudge {
-        calls: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl slim_core::context::JevJudge for SlowJudge {
-        async fn judge(
-            &self,
-            _state: &Value,
-            questions: &[(String, String)],
-        ) -> Result<slim_core::context::JevJudgment, String> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(1_500)).await;
-            Ok(slim_core::context::JevJudgment::probabilities(vec![
-                0.0;
-                questions.len()
-            ]))
-        }
-    }
-
-    let (listener, address) = bind_listener();
-    let server = thread::spawn(move || {
-        for index in 0..2 {
-            let (mut stream, request) = accept_request(&listener);
-            assert!(!request.contains("You are a context compactor"));
-            let body = if index == 0 {
-                sse_read_call_body("latency-read-call")
-            } else {
-                SSE_FINAL_ANSWER.to_owned()
-            };
-            write_sse(&mut stream, &body);
-        }
-    });
-
-    let client = jev_openai_client(address);
-    let history = jev_tool_pair_history();
-    let window = soft_only_context_window_tokens(&client, &history);
-    let judge_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut runtime = jev_runtime(Arc::new(SlowJudge {
-        calls: judge_calls.clone(),
-    }));
-    let started = Instant::now();
-    let result = run_loop_to_completion(&mut runtime, &client, &history, window, 3);
-    let elapsed = started.elapsed();
-    server.join().expect("server");
-
-    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
-    assert_eq!(judge_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert!(
-        elapsed < Duration::from_millis(1_000),
-        "loop took {elapsed:?}"
-    );
-    let cancelled = runtime
-        .app
-        .events()
-        .iter()
-        .find_map(|event| match &event.kind {
-            EventKind::CompactionJevFallback {
-                batches_started,
-                batches_completed,
-                usage_unknown,
-                detail,
-                ..
-            } if detail.contains("cancelled") => {
-                Some((*batches_started, *batches_completed, *usage_unknown))
-            }
-            _ => None,
-        })
-        .expect("background Jev cancellation is harvested");
-    assert_eq!(cancelled, (1, 0, true));
-}
-
-#[test]
-fn jev_failure_in_background_falls_back_to_unpruned_summary() {
-    struct FailingJudge {
-        calls: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl slim_core::context::JevJudge for FailingJudge {
-        async fn judge(
-            &self,
-            _state: &Value,
-            _questions: &[(String, String)],
-        ) -> Result<slim_core::context::JevJudgment, String> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err("connection refused".into())
-        }
-    }
-
-    let (listener, address) = bind_listener();
-    let server = thread::spawn(move || {
-        let mut summary_body = String::new();
-        let mut turn_requests = 0;
-        let mut pending = None;
-        for _ in 0..3 {
-            let mut stream = pending
-                .take()
-                .unwrap_or_else(|| accept_with_deadline(&listener));
-            let request = read_http_request(&mut stream);
-            let body = if request.contains("You are a context compactor") {
-                summary_body = request;
-                SSE_COMPACTION_SUMMARY.to_owned()
-            } else {
-                turn_requests += 1;
-                if turn_requests == 1 {
-                    sse_read_call_body("bg-fallback-read")
-                } else {
-                    pending = hold_final_answer_until_summary_connects(
-                        &listener,
-                        !summary_body.is_empty(),
-                    );
-                    SSE_FINAL_ANSWER.to_owned()
-                }
-            };
-            write_sse(&mut stream, &body);
-        }
-        summary_body
-    });
-
-    let client = jev_openai_client(address);
-    let mut history = jev_tool_pair_history();
-    history[3] = ProviderMessage::tool(
-        "read",
-        "old1",
-        format!("RAW_FALLBACK_MARKER{}", "z".repeat(8_000)),
-    );
-    let window = soft_only_context_window_tokens(&client, &history);
-    let judge_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut runtime = jev_runtime(Arc::new(FailingJudge {
-        calls: judge_calls.clone(),
-    }));
-    let result = run_loop_to_completion(&mut runtime, &client, &history, window, 3);
-    let summary_body = server.join().expect("server");
-
-    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
-    assert_eq!(judge_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    let detail = runtime
-        .app
-        .events()
-        .iter()
-        .find_map(|event| match &event.kind {
-            EventKind::CompactionJevFallback { detail, .. } => Some(detail.clone()),
-            _ => None,
-        })
-        .expect("jev fallback event");
-    assert!(detail.contains("connection refused"), "{detail}");
-    assert!(!runtime
-        .app
-        .events()
-        .iter()
-        .any(|event| matches!(event.kind, EventKind::CompactionJevPruned { .. })));
-    assert!(
-        !summary_body.contains("jev-compaction"),
-        "the fallback request keeps the untouched source prefix"
-    );
-    assert!(
-        summary_body.contains("RAW_FALLBACK_MARKER") || summary_body.contains("older.rs"),
-        "raw tool evidence stays in the summary transcript"
-    );
-}
-
-#[test]
-fn jev_outcome_is_metered_when_the_summary_attempt_is_aborted() {
-    struct StatsJudge;
-
-    #[async_trait]
-    impl slim_core::context::JevJudge for StatsJudge {
-        async fn judge(
-            &self,
-            _state: &Value,
-            questions: &[(String, String)],
-        ) -> Result<slim_core::context::JevJudgment, String> {
-            Ok(slim_core::context::JevJudgment {
-                probabilities: vec![0.0; questions.len()],
-                input_tokens: Some(321),
-                output_tokens: Some(12),
-                model: Some("jev-1.13.0".into()),
-            })
-        }
-    }
-
-    let (listener, address) = bind_listener();
-    let (release_summary, summary_release) = std::sync::mpsc::channel();
-    let server = thread::spawn(move || {
-        let mut summary_release = Some(summary_release);
-        let mut summary_handlers = Vec::new();
-        let mut saw_summary = false;
-        let mut turn_requests = 0;
-        let mut pending = None;
-        for _ in 0..3 {
-            let mut stream = pending
-                .take()
-                .unwrap_or_else(|| accept_with_deadline(&listener));
-            let request = read_http_request(&mut stream);
-            if request.contains("You are a context compactor") {
-                saw_summary = true;
-                let release = summary_release.take().expect("one summary request");
-                summary_handlers.push(thread::spawn(move || {
-                    release.recv().expect("release background summary");
-                    let body = SSE_COMPACTION_SUMMARY;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(response.as_bytes());
-                }));
-            } else {
-                turn_requests += 1;
-                if turn_requests == 1 {
-                    write_sse(&mut stream, &sse_read_call_body("aborted-jev-read"));
-                } else {
-                    pending = hold_final_answer_until_summary_connects(&listener, saw_summary);
-                    write_sse(&mut stream, SSE_FINAL_ANSWER);
-                }
-            }
-        }
-        assert!(saw_summary);
-        for handler in summary_handlers {
-            handler.join().expect("summary handler");
-        }
-    });
-
-    let client = jev_openai_client(address);
-    let history = jev_tool_pair_history();
-    let window = soft_only_context_window_tokens(&client, &history);
-    let mut runtime = jev_runtime(Arc::new(StatsJudge));
-    let result = run_loop_to_completion(&mut runtime, &client, &history, window, 3);
-    release_summary.send(()).expect("release summary");
-    server.join().expect("server");
-
-    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
-    let jev_events: Vec<_> = runtime
-        .app
-        .events()
-        .iter()
-        .filter(|event| {
-            matches!(
-                event.kind,
-                EventKind::CompactionJevPruned { .. } | EventKind::CompactionJevFallback { .. }
-            )
-        })
-        .collect();
-    assert_eq!(jev_events.len(), 1, "exactly one Jev outcome event");
-    match &jev_events[0].kind {
-        EventKind::CompactionJevPruned {
-            input_tokens,
-            output_tokens,
-            model,
-            ..
-        } => {
-            assert_eq!(*input_tokens, Some(321));
-            assert_eq!(*output_tokens, Some(12));
-            assert_eq!(model.as_deref(), Some("jev-1.13.0"));
-        }
-        other => panic!("expected pruned event, got {other:?}"),
-    }
-    assert!(runtime
-        .app
-        .events()
-        .iter()
-        .any(|event| matches!(event.kind, EventKind::CompactionAttemptCancelled { .. })));
-    let totals = slim_core::runtime::UsageTotals::from_events(runtime.app.events(), false);
-    assert_eq!(totals.jev_input_tokens, 321);
-    assert_eq!(totals.jev_output_tokens, 12);
 }
 
 #[test]
@@ -4312,7 +2957,6 @@ fn post_compaction_reacquisition_emits_one_event_per_call() {
 
     let (listener, address) = bind_listener();
     let handle = CompactionHandle::new(slim_core::context::CompactionPolicy {
-        strategy: slim_core::context::CompactionStrategy::Summary,
         keep_recent_tokens: 1,
         ..slim_core::context::CompactionPolicy::default()
     });
@@ -4344,7 +2988,7 @@ fn post_compaction_reacquisition_emits_one_event_per_call() {
             });
             sse_tool_calls(&call)
         };
-        for turn in 0..6 {
+        for turn in 0..7 {
             let (mut stream, request) = accept_request(&listener);
             let body = match turn {
                 0 => tool_call("read-1", &state_args),
@@ -4354,14 +2998,14 @@ fn post_compaction_reacquisition_emits_one_event_per_call() {
                         .expect("manual compaction request");
                     tool_call("read-other", &other_args)
                 }
-                2 => {
-                    assert!(request.contains("You are a context compactor"));
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\nreacquire\\n## Constraints\\nNone\\n## Progress\\nDone\\n## Blocked\\nNone\\n## Decisions\\nKeep\\n## Next steps\\nGo\\n## Critical context\\nFixture\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_owned()
+                // The cut splits the turn that began at the latest user message:
+                // one request for the history before it, one for its prefix.
+                2 | 3 => {
+                    assert!(request.contains(SUMMARIZER_MARKER));
+                    text_response("## Goal\nreacquire")
                 }
-                3 | 4 => tool_call(&format!("read-{turn}"), &state_args),
-                _ => {
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_owned()
-                }
+                4 | 5 => tool_call(&format!("read-{turn}"), &state_args),
+                _ => text_response("done"),
             };
             write_sse(&mut stream, &body);
         }
@@ -4414,142 +3058,52 @@ fn post_compaction_reacquisition_emits_one_event_per_call() {
 }
 
 #[test]
-fn manual_compaction_retains_native_execution_facts_without_model_summary() {
-    let root = TempRoot::new("native-facts-compaction");
-    let mutation_path = std::fs::canonicalize(&root)
-        .expect("canonical workspace")
-        .join("written.txt")
-        .to_string_lossy()
-        .replace('\\', "/");
+fn manual_compaction_stores_the_model_summary_with_file_lists_and_no_runtime_facts() {
+    let root = TempRoot::new("compaction-file-lists");
+    std::fs::write(root.join("seen.txt"), "seen\n").expect("fixture");
+    std::fs::write(root.join("kept.txt"), "kept\n").expect("fixture");
 
     let (listener, address) = bind_listener();
-    let handle = CompactionHandle::default();
+    let handle = CompactionHandle::new(eager_policy());
     let server_handle = handle.clone();
-    let server_mutation_path = mutation_path.clone();
     let server = thread::spawn(move || {
+        let calls = |calls: Vec<(&str, &str, Value)>| {
+            let calls = calls
+                .into_iter()
+                .enumerate()
+                .map(|(index, (id, name, arguments))| {
+                    json!({"index": index, "id": id, "function": {"name": name, "arguments": arguments.to_string()}})
+                })
+                .collect::<Vec<_>>();
+            sse_tool_calls(json!({"choices": [{"delta": {"tool_calls": calls}}]}))
+        };
         let mut requests = Vec::new();
         for turn in 0..4 {
             let (mut stream, request) = accept_request(&listener);
-            let wire: Value =
-                serde_json::from_str(request.split_once("\r\n\r\n").expect("request body").1)
-                    .expect("request JSON");
-
-            let body = if turn == 0 {
-                let calls = json!({
-                    "choices": [{
-                        "delta": {
-                            "tool_calls": [
-                                {"index": 0, "id": "write-fact", "function": {"name": "write", "arguments": json!({"path": "written.txt", "content": "native fact\n"}).to_string()}},
-                                {"index": 1, "id": "validation-fact", "function": {"name": "shell", "arguments": json!({"command": "cargo", "args": ["check", "--offline"]}).to_string()}},
-                                {"index": 2, "id": "failure-fact", "function": {"name": "read", "arguments": json!({"path": "missing.txt"}).to_string()}}
-                            ]
-                        }
-                    }]
-                });
-                let terminal = json!({
-                    "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
-                });
-                server_handle
-                    .request_manual("")
-                    .expect("manual compaction request");
-                format!("data: {calls}\n\ndata: {terminal}\n\ndata: [DONE]\n\n")
-            } else if turn == 1 {
-                assert_eq!(
-                    wire["messages"][0]["content"],
-                    slim_core::context::COMPACTION_SYSTEM_PROMPT,
-                    "the next iteration must consume the shared manual compaction request"
-                );
-                let summary = "## Goal\nRecord the requested change.\n## Constraints\nUse the existing workspace.\n## Progress\nThe transcript was compacted.\n## Blocked\nNone.\n## Decisions\nKeep going.\n## Next steps\nReturn the final result.\n## Critical context\nNo additional context.";
-                assert!(!summary.contains("execution_facts"));
-                assert!(!summary.contains("write-fact"));
-                let event = json!({
-                    "choices": [{"delta": {"content": summary}, "finish_reason": "stop"}]
-                });
-                format!("data: {event}\n\ndata: [DONE]\n\n")
-            } else if turn == 2 {
-                assert_ne!(
-                    wire["messages"][0]["content"],
-                    slim_core::context::COMPACTION_SYSTEM_PROMPT,
-                    "third request must be the resumed model turn"
-                );
-                let messages = wire["messages"].as_array().expect("messages");
-                let compacted = messages
-                    .iter()
-                    .find_map(|message| {
-                        (message["role"] == "user"
-                            && message["content"].as_str().is_some_and(|content| {
-                                content.starts_with("[Compacted context]\n")
-                            }))
-                        .then(|| message["content"].as_str().expect("compacted context"))
-                    })
-                    .expect("compacted context");
-                assert!(compacted.contains("[Runtime facts at compaction;"));
-                assert!(compacted.contains("execution_facts scope=compaction run_start_seq=1"));
-                assert!(compacted.contains(&format!(
-                    "mutation path=\"{server_mutation_path}\" revision=1"
-                )));
-                assert!(compacted.contains("failure "));
-                assert!(compacted.contains("call_id=\"failure-fact\""));
-                assert!(compacted.contains("pending=true"));
-                assert!(compacted.contains("validation "));
-                assert!(compacted.contains("call_id=\"validation-fact\""));
-                assert!(compacted.contains("success=false"));
-                assert!(compacted.contains("validation_revision=1"));
-                let read_path = compacted
-                    .split_once("[Prior visible transcript: use read on ")
-                    .and_then(|(_, suffix)| suffix.split_once(" with offset=1"))
-                    .map(|(path, _)| {
-                        serde_json::from_str::<String>(path).expect("quoted recovery path")
-                    })
-                    .expect("recovery read pointer");
-                assert!(
-                    !Path::new(&read_path).is_absolute(),
-                    "recovery pointer must stay workspace-relative: {read_path}"
-                );
-                assert!(
-                    read_path.starts_with("artifacts/context-history-"),
-                    "recovery pointer must target the indexed archive: {read_path}"
-                );
-                let call = json!({
-                    "choices": [{
-                        "delta": {
-                            "tool_calls": [{
-                                "index": 0,
-                                "id": "recovery-read",
-                                "function": {
-                                    "name": "read",
-                                    "arguments": json!({
-                                        "path": read_path,
-                                        "offset": 1,
-                                        "max_lines": 20
-                                    }).to_string()
-                                }
-                            }]
-                        }
-                    }]
-                });
-                let terminal = json!({
-                    "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
-                });
-                format!("data: {call}\n\ndata: {terminal}\n\ndata: [DONE]\n\n")
-            } else {
-                let messages = wire["messages"].as_array().expect("messages");
-                let read_result = messages
-                    .iter()
-                    .find(|message| {
-                        message["role"] == "tool" && message["tool_call_id"] == "recovery-read"
-                    })
-                    .expect("recovery read result");
-                assert!(
-                    read_result["content"]
-                        .as_str()
-                        .is_some_and(|content| content.contains("[Recovery transcript index]")),
-                    "native read should return the indexed archive"
-                );
-                let event = json!({
-                    "choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]
-                });
-                format!("data: {event}\n\ndata: [DONE]\n\n")
+            let body = match turn {
+                0 => calls(vec![
+                    (
+                        "write-1",
+                        "write",
+                        json!({"path": "written.txt", "content": "native fact\n"}),
+                    ),
+                    ("read-1", "read", json!({"path": "seen.txt"})),
+                ]),
+                1 => {
+                    server_handle
+                        .request_manual("")
+                        .expect("manual compaction request");
+                    calls(vec![("read-2", "read", json!({"path": "kept.txt"}))])
+                }
+                2 => {
+                    assert!(request.contains(SUMMARIZER_MARKER));
+                    text_response("## Goal\nRecord the requested change.")
+                }
+                _ => {
+                    assert!(request.contains(COMPACTED_MARKER));
+                    assert!(request.contains("Record the requested change."));
+                    text_response("done")
+                }
             };
             write_sse(&mut stream, &body);
             requests.push(request);
@@ -4558,7 +3112,7 @@ fn manual_compaction_retains_native_execution_facts_without_model_summary() {
     });
 
     let client = fixture_client(format!("http://{address}"), Duration::from_secs(3));
-    let mut runtime = Runtime::with_artifact_store(root.join("artifacts")).expect("artifacts");
+    let mut runtime = Runtime::new();
     runtime.set_compaction_handle(handle.clone());
     let result = run_loop(
         &mut runtime,
@@ -4581,478 +3135,38 @@ fn manual_compaction_retains_native_execution_facts_without_model_summary() {
         std::fs::read_to_string(root.join("written.txt")).expect("written file"),
         "native fact\n"
     );
-    assert_eq!(result.tool_results.len(), 4);
-    assert_eq!(
-        result
-            .tool_results
-            .iter()
-            .map(|result| (result.name.as_str(), result.success))
-            .collect::<Vec<_>>(),
-        [
-            ("write", true),
-            ("shell", false),
-            ("read", false),
-            ("read", true),
-        ]
-    );
 
     let commits = handle.take_commits();
     assert_eq!(commits.len(), 1);
-    let checkpoint = &commits[0].summary;
-    assert!(checkpoint.contains("execution_facts scope=compaction run_start_seq=1"));
-    assert!(checkpoint.contains(&format!("mutation path=\"{mutation_path}\" revision=1")));
-    assert!(checkpoint.contains("call_id=\"failure-fact\""));
-    assert!(checkpoint.contains("call_id=\"validation-fact\""));
-    assert!(checkpoint.contains("success=false"));
-    assert!(checkpoint.contains("[Prior visible transcript: use read on "));
-
-    let archive = std::fs::read_dir(root.join("artifacts"))
-        .expect("archive directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("context-history-"))
-        })
-        .expect("indexed context-history archive");
-    let archive_text = std::fs::read_to_string(archive).expect("archive text");
-    assert!(archive_text.starts_with("[Recovery transcript index]\n"));
-    assert!(archive_text.contains("\"kind\":\"user_message\""));
-}
-
-#[test]
-fn soft_threshold_final_response_does_not_start_background_compaction() {
-    let (listener, address) = bind_listener();
-    let server = thread::spawn(move || {
-        let (mut stream, request) = accept_request(&listener);
-        let body = SSE_FINAL_ANSWER;
-        write_sse(&mut stream, body);
-        request
-    });
-
-    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
-    let tools = Runtime::new().advertised_tool_definitions(OperatingMode::Auto);
-    let fixed_tokens = slim_core::context::estimate_text_tokens_from_chars(
-        client
-            .adapter()
-            .build_messages_request_with_tools_checked(&[], &tools)
-            .expect("fixed request")
-            .body
-            .chars()
-            .count() as u64,
-    );
-    let messages = vec![
-        ProviderMessage::user("literal root"),
-        ProviderMessage::assistant("old context ".repeat(20_000), Vec::new()),
-        ProviderMessage::user("recent request"),
-    ];
-    let used = slim_core::context::estimate_provider_message_tokens(&messages) + fixed_tokens;
-    let handle = CompactionHandle::default();
-    let mut runtime = Runtime::new();
-    runtime.set_compaction_handle(handle.clone());
-    runtime.set_background_compaction_enabled(true);
-    let result = run_loop_with_messages(
-        &mut runtime,
-        &client,
-        &messages,
-        OperatingMode::Auto,
-        std::env::temp_dir(),
-        1,
-        AgentLoopConfig {
-            max_turns: 3,
-            context_window_tokens: used.saturating_mul(100).div_ceil(80),
-            context_reserve_tokens: 0,
-            ..test_loop_config()
-        },
-    )
-    .expect("loop");
-    let request = server.join().expect("server");
-
-    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
-    assert_eq!(handle.status(), CompactionStatus::Idle);
-    assert!(!request.contains("You are a context compactor"));
-    assert!(!runtime
-        .app
-        .events()
-        .iter()
-        .any(|event| matches!(event.kind, EventKind::CompactionAttemptStarted { .. })));
-}
-
-#[test]
-fn fast_main_tool_turn_does_not_wait_for_slow_background_summary() {
-    let (listener, address) = bind_listener();
-    let (release_summary, summary_release) = std::sync::mpsc::channel();
-    let server = thread::spawn(move || {
-        let mut summary_handlers = Vec::new();
-        let mut summary_release = Some(summary_release);
-        let mut saw_initial = false;
-        let mut saw_summary = false;
-        let mut saw_final = false;
-        for _ in 0..3 {
-            let (mut stream, request) = accept_request(&listener);
-            if request.contains("You are a context compactor") {
-                saw_summary = true;
-                let summary_release = summary_release
-                    .take()
-                    .expect("only one background summary request is expected");
-                summary_handlers.push(thread::spawn(move || {
-                    summary_release.recv().expect("release background summary");
-                    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"slow summary\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":19,\"completion_tokens\":4}}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(response.as_bytes());
-                }));
-            } else if request.contains("\"role\":\"tool\"") {
-                saw_final = true;
-                let body = SSE_FINAL_ANSWER;
-                write_sse(&mut stream, body);
-            } else {
-                saw_initial = true;
-                let tool_call = json!({
-                    "choices": [{
-                        "delta": {
-                            "tool_calls": [{
-                                "index": 0,
-                                "id": "fast-read-call",
-                                "function": {
-                                    "name": "read",
-                                    "arguments": json!({
-                                        "path": "missing-file.txt",
-                                        "max_lines": 1
-                                    }).to_string()
-                                }
-                            }]
-                        }
-                    }]
-                });
-                let body = sse_tool_calls(&tool_call);
-                write_sse(&mut stream, &body);
-            }
-        }
-        assert!(saw_initial && saw_summary && saw_final);
-        for handler in summary_handlers {
-            handler.join().expect("summary handler");
-        }
-    });
-
-    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
-    let tools = Runtime::new().advertised_tool_definitions(OperatingMode::Auto);
-    let fixed_tokens = slim_core::context::estimate_text_tokens_from_chars(
-        client
-            .adapter()
-            .build_messages_request_with_tools_checked(
-                &[slim_core::provider::ProviderMessage::user("slim")],
-                &tools,
-            )
-            .expect("fixed request")
-            .body
-            .chars()
-            .count() as u64,
-    );
-    let initial = vec![
-        ProviderMessage::user("literal root"),
-        ProviderMessage::assistant("old context ".repeat(20_000), Vec::new()),
-        ProviderMessage::user("recent request"),
-    ];
-    let used = slim_core::context::estimate_provider_message_tokens(&initial) + fixed_tokens;
-    let context_window_tokens = used.saturating_mul(100).div_ceil(80);
-    let config = AgentLoopConfig {
-        max_turns: 3,
-        context_window_tokens,
-        context_reserve_tokens: 0,
-        ..test_loop_config()
-    };
-    let handle = CompactionHandle::default();
-    let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
-    let mut runtime = Runtime::new();
-    runtime.set_compaction_handle(handle.clone());
-    runtime.set_background_compaction_enabled(true);
-    let started = Instant::now();
-    let result = tokio_runtime
-        .block_on(runtime.run_agent_loop_with_messages(
-            &client,
-            &initial,
-            OperatingMode::Auto,
-            std::env::temp_dir(),
-            1,
-            config,
-        ))
-        .expect("fast main/tool loop");
-    let elapsed = started.elapsed();
-    eprintln!(
-        "SLIM_LATENCY background_blocked=causal main_tool_turn_us={}",
-        elapsed.as_micros()
-    );
-    release_summary
-        .send(())
-        .expect("release background summary");
-    server.join().expect("server");
-
-    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
-    assert_eq!(handle.status(), CompactionStatus::Discarded);
+    let commit = &commits[0];
+    assert_eq!(commit.reason, CompactionReason::Manual);
+    // The cut splits the turn: no history of its own, so the turn's prefix
+    // summary stands under Pi's placeholder.
     assert!(
-        elapsed < Duration::from_millis(1_000),
-        "loop took {elapsed:?}"
+        commit
+            .summary
+            .starts_with("No prior history.\n\n---\n\n**Turn Context (split turn):**"),
+        "{:?}",
+        commit.summary
     );
-    assert!(runtime
-        .app
-        .events()
-        .iter()
-        .any(|event| matches!(event.kind, EventKind::ToolStarted { .. })));
-    assert!(runtime
-        .app
-        .events()
-        .iter()
-        .any(|event| matches!(event.kind, EventKind::AssistantEnded { .. })));
-    assert!(runtime
-        .app
-        .events()
-        .iter()
-        .any(|event| matches!(event.kind, EventKind::CompactionAttemptStarted { .. })));
-    assert!(runtime
-        .app
-        .events()
-        .iter()
-        .any(|event| matches!(event.kind, EventKind::CompactionAttemptCancelled { .. })));
-    assert!(runtime
-        .app
-        .events()
-        .iter()
-        .any(|event| matches!(event.kind, EventKind::CompactionUsageUnknown { .. })));
-    let rebuilt = slim_core::runtime::UsageTotals::from_events(runtime.app.events(), false);
-    assert_eq!(result.usage, rebuilt);
-    assert_eq!(
-        rebuilt
-            .requests
-            .iter()
-            .find(|request| request.cancelled)
-            .expect("cancelled compaction request")
-            .estimation_error_tokens,
-        0
-    );
-}
-
-#[test]
-fn tool_call_below_break_even_skips_background_compaction() {
-    let (listener, address) = bind_listener();
-    let server = thread::spawn(move || {
-        let mut requests = Vec::new();
-        for _ in 0..2 {
-            let (mut stream, request) = accept_request(&listener);
-            assert!(!request.contains("You are a context compactor"));
-            let body = if request.contains("\"role\":\"tool\"") {
-                SSE_FINAL_ANSWER.to_owned()
-            } else {
-                let tool_call = json!({
-                    "choices": [{
-                        "delta": {
-                            "tool_calls": [{
-                                "index": 0,
-                                "id": "break-even-read-call",
-                                "function": {
-                                    "name": "read",
-                                    "arguments": json!({
-                                        "path": "missing-file.txt",
-                                        "max_lines": 1
-                                    }).to_string()
-                                }
-                            }]
-                        }
-                    }]
-                });
-                sse_tool_calls(&tool_call)
-            };
-            write_sse(&mut stream, &body);
-            requests.push(request);
-        }
-        requests
-    });
-
-    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
-    let tools = Runtime::new().advertised_tool_definitions(OperatingMode::Auto);
-    let fixed_tokens = slim_core::context::estimate_text_tokens_from_chars(
-        client
-            .adapter()
-            .build_messages_request_with_tools_checked(
-                &[slim_core::provider::ProviderMessage::user("slim")],
-                &tools,
-            )
-            .expect("fixed request")
-            .body
-            .chars()
-            .count() as u64,
-    );
-    let messages = vec![
-        ProviderMessage::user("literal root"),
-        ProviderMessage::assistant("old context ".repeat(20_000), Vec::new()),
-        ProviderMessage::user("recent request"),
-    ];
-    let used = slim_core::context::estimate_provider_message_tokens(&messages) + fixed_tokens;
-    let mut runtime = Runtime::new();
-    let handle = CompactionHandle::default();
-    runtime.set_compaction_handle(handle.clone());
-    runtime.set_background_compaction_enabled(true);
-    let result = run_loop_with_messages(
-        &mut runtime,
-        &client,
-        &messages,
-        OperatingMode::Auto,
-        std::env::temp_dir(),
-        1,
-        AgentLoopConfig {
-            max_turns: 2,
-            context_window_tokens: used.saturating_mul(100).div_ceil(80),
-            context_reserve_tokens: 0,
-            ..test_loop_config()
-        },
-    )
-    .expect("loop");
-    let requests = server.join().expect("server");
-
-    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
-    assert_eq!(handle.status(), CompactionStatus::Idle);
-    assert_eq!(requests.len(), 2);
-    assert!(!runtime
-        .app
-        .events()
-        .iter()
-        .any(|event| matches!(event.kind, EventKind::CompactionAttemptStarted { .. })));
-    assert!(runtime.app.events().iter().any(|event| matches!(
-        event.kind,
-        EventKind::CompactionSkippedBelowBreakEven {
-            future_turns: 1,
-            ..
-        }
-    )));
-}
-
-#[test]
-fn completed_background_summary_is_reused_before_overflow_retry() {
-    let (listener, address) = bind_listener();
-    let server = thread::spawn(move || {
-        let mut saw_initial = false;
-        let mut saw_summary = false;
-        let mut saw_overflow = false;
-        let mut saw_retry = false;
-        for _ in 0..4 {
-            let (mut stream, request) = accept_request(&listener);
-            let (status, body) = if request.contains("You are a context compactor") {
-                saw_summary = true;
-                (
-                    "200 OK",
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\noverflow prepared\\n## Constraints\\nNone\\n## Progress\\nPrepared\\n## Blocked\\nNone\\n## Decisions\\nReuse summary\\n## Next steps\\nRetry\\n## Critical context\\nOverflow\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":29,\"completion_tokens\":6}}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_owned(),
-                )
-            } else if request.contains("[Compacted context]") {
-                saw_retry = true;
-                assert!(request.contains("overflow prepared"));
-                (
-                    "200 OK",
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_owned(),
-                )
-            } else if request.contains("\"role\":\"tool\"") {
-                saw_overflow = true;
-                thread::sleep(Duration::from_millis(100));
-                (
-                    "400 Bad Request",
-                    "maximum context length exceeded".to_owned(),
-                )
-            } else {
-                saw_initial = true;
-                let tool_call = json!({
-                    "choices": [{
-                        "delta": {
-                            "tool_calls": [{
-                                "index": 0,
-                                "id": "overflow-read-call",
-                                "function": {
-                                    "name": "read",
-                                    "arguments": json!({
-                                        "path": "missing-file.txt",
-                                        "max_lines": 1
-                                    }).to_string()
-                                }
-                            }]
-                        }
-                    }]
-                });
-                (
-                    "200 OK",
-                    format!(
-                        // Calibrate below the soft threshold, so a fast summary
-                        // cannot be applied before the request that must overflow.
-                        "data: {tool_call}\n\ndata: {{\"usage\":{{\"prompt_tokens\":10000,\"completion_tokens\":1}}}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
-                    ),
-                )
-            };
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).expect("response");
-        }
-        assert!(saw_initial && saw_summary && saw_overflow && saw_retry);
-    });
-
-    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
-    let tools = Runtime::new().advertised_tool_definitions(OperatingMode::Auto);
-    let fixed_tokens = slim_core::context::estimate_text_tokens_from_chars(
-        client
-            .adapter()
-            .build_messages_request_with_tools_checked(&[], &tools)
-            .expect("fixed request")
-            .body
-            .chars()
-            .count() as u64,
-    );
-    let messages = vec![
-        ProviderMessage::user("literal root"),
-        ProviderMessage::assistant("old context ".repeat(20_000), Vec::new()),
-        ProviderMessage::user("recent request"),
-    ];
-    let used = slim_core::context::estimate_provider_message_tokens(&messages) + fixed_tokens;
-    let mut runtime = Runtime::new();
-    let handle = CompactionHandle::default();
-    runtime.set_compaction_handle(handle.clone());
-    runtime.set_background_compaction_enabled(true);
-    let result = run_loop_with_messages(
-        &mut runtime,
-        &client,
-        &messages,
-        OperatingMode::Auto,
-        std::env::temp_dir(),
-        1,
-        AgentLoopConfig {
-            max_turns: 3,
-            context_window_tokens: used.saturating_mul(100).div_ceil(80),
-            context_reserve_tokens: 0,
-            ..test_loop_config()
-        },
-    )
-    .expect("overflow retry");
-    server.join().expect("server");
-
-    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
-    assert_eq!(handle.status(), CompactionStatus::Applied);
-    assert_eq!(result.usage.compaction_input_tokens, 29);
-    assert_eq!(result.usage.compaction_output_tokens, 6);
-    assert!(runtime.app.events().iter().any(|event| matches!(
-        event.kind,
-        EventKind::CompactionAttemptCompleted {
-            uncached_input_tokens: 29,
-            output_tokens: 6,
-            usage_known: true,
-            ..
-        }
-    )));
-    assert!(runtime
-        .conversation()
-        .iter()
-        .any(|message| message.content.contains("recovered")));
+    assert!(commit.summary.contains("Record the requested change."));
+    // Pi's file lists, from the calls the compaction summarized.
+    assert!(commit.summary.contains(
+        "<read-files>\nseen.txt\n</read-files>\n\n<modified-files>\nwritten.txt\n</modified-files>"
+    ));
+    assert_eq!(commit.read_files, ["seen.txt"]);
+    assert_eq!(commit.modified_files, ["written.txt"]);
+    // The stored summary carries nothing else: no runtime facts, no manifest
+    // of calls, no pointer to an archived transcript.
+    for removed in [
+        "execution_facts",
+        "Runtime facts",
+        "Prior tool calls",
+        "Prior visible transcript",
+        "[Compacted context]",
+    ] {
+        assert!(!commit.summary.contains(removed), "{removed}");
+    }
 }
 
 #[test]
@@ -5369,166 +3483,50 @@ fn default_max_turns_is_one_hundred_twenty_eight() {
 }
 
 #[test]
-fn hard_threshold_without_prepared_compacts_locally_without_summary_post() {
+fn crossing_the_pi_threshold_summarizes_with_the_model_before_the_turn() {
     let (listener, address) = bind_listener();
     let server = thread::spawn(move || {
-        let (mut stream, request) = accept_request(&listener);
+        let (mut summary, summary_request) = accept_request(&listener);
+        assert!(summary_request.contains(SUMMARIZER_MARKER));
         assert!(
-            !request.contains("You are a context compactor"),
-            "hard threshold without prepared must not wait for a summary POST"
+            summary_request.contains("[User]: literal root"),
+            "the turn the cut splits is summarized from its prefix"
         );
-        assert!(request.contains("[Compacted context]"));
-        assert!(request.contains("local extract"));
-        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-        write_sse(&mut stream, body);
+        write_sse(&mut summary, &text_response("## Goal\nthe literal task"));
+
+        let (mut turn, turn_request) = accept_request(&listener);
+        assert!(turn_request.contains(COMPACTED_MARKER));
+        assert!(turn_request.contains("the literal task"));
+        assert!(
+            !turn_request.contains("local extract"),
+            "the summary is the model's, never a local extract"
+        );
+        write_sse(&mut turn, &text_response("answer"));
     });
 
     let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
-    let tools = Runtime::new().advertised_tool_definitions(OperatingMode::Auto);
-    let fixed_tokens = slim_core::context::estimate_text_tokens_from_chars(
-        client
-            .adapter()
-            .build_messages_request_with_tools_checked(&[], &tools)
-            .expect("fixed request")
-            .body
-            .chars()
-            .count() as u64,
-    );
     let initial = vec![
         ProviderMessage::user("literal root"),
         ProviderMessage::assistant("old context ".repeat(20_000), Vec::new()),
         ProviderMessage::user("recent request"),
     ];
-    let used = slim_core::context::estimate_provider_message_tokens(&initial) + fixed_tokens;
-    let context_window_tokens = used.saturating_mul(100).div_ceil(90);
-    let config = AgentLoopConfig {
-        max_turns: 1,
-        context_window_tokens,
-        context_reserve_tokens: 0,
-        ..test_loop_config()
-    };
-    let handle = CompactionHandle::default();
-    let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
-    let artifact_root = TempRoot::new("context-recovery");
-    let mut runtime = Runtime::with_artifact_store(&artifact_root).expect("store");
-    runtime.set_compaction_handle(handle.clone());
-    runtime.set_background_compaction_enabled(false);
-    let result = tokio_runtime
-        .block_on(runtime.run_agent_loop_with_messages(
-            &client,
-            &initial,
-            OperatingMode::Auto,
-            std::env::temp_dir(),
-            1,
-            config,
-        ))
-        .expect("loop");
-    server.join().expect("server");
-
-    let artifacts = std::fs::read_dir(&artifact_root)
-        .expect("artifacts")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("entries");
-    assert_eq!(artifacts.len(), 1);
-    let transcript_path = artifacts[0].path();
-    let restored = std::fs::read_to_string(&transcript_path).expect("full transcript");
-    assert!(restored.contains(&initial[1].content));
-    let workspace = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp dir");
-    let read_path = std::fs::canonicalize(&transcript_path)
-        .expect("canonical transcript")
-        .strip_prefix(workspace)
-        .expect("transcript under workspace")
-        .to_string_lossy()
-        .replace('\\', "/");
-    let read_pointer = serde_json::to_string(&read_path).expect("quoted transcript path");
-    assert!(runtime
-        .conversation()
-        .iter()
-        .any(|message| message.content.contains(&format!(
-            "[Prior visible transcript: use read on {read_pointer} with offset=1"
-        ))));
-    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
-    assert_eq!(handle.status(), CompactionStatus::Applied);
-    assert!(runtime
-        .app
-        .events()
-        .iter()
-        .any(|event| matches!(event.kind, EventKind::CompactionCompleted)));
-}
-#[test]
-fn discarded_background_summary_still_counts_observed_usage() {
-    let (listener, address) = bind_listener();
-    let server = thread::spawn(move || {
-        let mut initial = accept_with_deadline(&listener);
-        let initial_request = read_http_request(&mut initial);
-        assert!(!initial_request.contains("You are a context compactor"));
-        let tool_call = json!({
-            "choices": [{
-                "delta": {
-                    "tool_calls": [{
-                        "index": 0,
-                        "id": "discarded-read-call",
-                        "function": {
-                            "name": "read",
-                            "arguments": json!({
-                                "path": "missing-file.txt",
-                                "max_lines": 1
-                            }).to_string()
-                        }
-                    }]
-                }
-            }]
-        });
-        let initial_body = sse_tool_calls(&tool_call);
-        write_sse(&mut initial, &initial_body);
-
-        let mut final_stream = None;
-        for _ in 0..2 {
-            let (mut stream, request) = accept_request(&listener);
-            if request.contains("You are a context compactor") {
-                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"incomplete\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":2}}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n";
-                write_sse(&mut stream, body);
-            } else {
-                assert!(request.contains("\"role\":\"tool\""));
-                final_stream = Some(stream);
-            }
-        }
-
-        let mut final_stream = final_stream.expect("final request");
-        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"normal\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-        write_sse(&mut final_stream, body);
+    let handle = CompactionHandle::new(CompactionPolicy {
+        // About 60k tokens of history against a line of 60k (100k - 40k): over it.
+        reserve_tokens: 40_000,
+        ..CompactionPolicy::default()
     });
-    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
-    let tools = Runtime::new().advertised_tool_definitions(OperatingMode::Auto);
-    let fixed_tokens = slim_core::context::estimate_text_tokens_from_chars(
-        client
-            .adapter()
-            .build_messages_request_with_tools_checked(&[], &tools)
-            .expect("fixed request")
-            .body
-            .chars()
-            .count() as u64,
-    );
-    let messages = vec![
-        ProviderMessage::user("root"),
-        ProviderMessage::assistant("old context ".repeat(20_000), Vec::new()),
-        ProviderMessage::user("recent"),
-    ];
-    let used = slim_core::context::estimate_provider_message_tokens(&messages) + fixed_tokens;
-    let handle = CompactionHandle::default();
     let mut runtime = Runtime::new();
     runtime.set_compaction_handle(handle.clone());
-    runtime.set_background_compaction_enabled(true);
     let result = run_loop_with_messages(
         &mut runtime,
         &client,
-        &messages,
+        &initial,
         OperatingMode::Auto,
         std::env::temp_dir(),
         1,
         AgentLoopConfig {
-            max_turns: 3,
-            context_window_tokens: used.saturating_mul(100).div_ceil(80),
+            max_turns: 1,
+            context_window_tokens: 100_000,
             context_reserve_tokens: 0,
             ..test_loop_config()
         },
@@ -5537,18 +3535,1460 @@ fn discarded_background_summary_still_counts_observed_usage() {
     server.join().expect("server");
 
     assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
-    assert_eq!(handle.status(), CompactionStatus::Discarded);
-    assert_eq!(result.usage.compaction_input_tokens, 11);
-    assert_eq!(result.usage.compaction_output_tokens, 2);
+    assert_eq!(handle.status(), CompactionStatus::Applied);
+    let commits = handle.take_commits();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].reason, CompactionReason::Threshold);
+    assert_eq!(commits[0].first_kept_index, 1);
+    assert!(
+        commits[0].tokens_before > 60_000,
+        "{}",
+        commits[0].tokens_before
+    );
     assert!(runtime.app.events().iter().any(|event| matches!(
         event.kind,
-        EventKind::CompactionAttemptCompleted {
-            uncached_input_tokens: 11,
-            output_tokens: 2,
-            usage_known: true,
+        EventKind::CompactionState {
+            state: CompactionStatus::Applied,
+            reason: CompactionReason::Threshold,
             ..
         }
     )));
+    let ledger = slim_core::runtime::UsageTotals::from_events(runtime.app.events(), false);
+    assert_eq!(
+        ledger
+            .requests
+            .iter()
+            .filter(|request| request.request_kind == slim_core::RequestKind::Compaction)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_context_under_the_pi_threshold_is_never_compacted() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut stream, request) = accept_request(&listener);
+        assert!(!request.contains(SUMMARIZER_MARKER));
+        assert!(!request.contains(COMPACTED_MARKER));
+        write_sse(&mut stream, &text_response("answer"));
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let initial = vec![
+        ProviderMessage::user("literal root"),
+        ProviderMessage::assistant("old context ".repeat(20_000), Vec::new()),
+        ProviderMessage::user("recent request"),
+    ];
+    let handle = CompactionHandle::default();
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    let result = run_loop_with_messages(
+        &mut runtime,
+        &client,
+        &initial,
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            max_turns: 1,
+            // The default reserve leaves a line above the ~60k-token history.
+            context_window_tokens: 128_000,
+            context_reserve_tokens: 0,
+            ..test_loop_config()
+        },
+    )
+    .expect("loop");
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(handle.status(), CompactionStatus::Idle);
+    assert!(handle.take_commits().is_empty());
+}
+
+/// A user turn whose text is about `chars` characters.
+fn bulky_message(chars: usize) -> ProviderMessage {
+    ProviderMessage::assistant("word ".repeat(chars / 5), Vec::new())
+}
+
+/// The history of the gate tests: a large middle between a root and a recent
+/// request, so an eager policy has a long prefix to summarize.
+fn gate_history(chars: usize) -> Vec<ProviderMessage> {
+    vec![
+        ProviderMessage::user("literal root"),
+        bulky_message(chars),
+        ProviderMessage::user("recent request"),
+    ]
+}
+
+#[test]
+fn a_request_over_the_context_gate_compacts_instead_of_failing_without_trying() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut summary, summary_request) = accept_request(&listener);
+        assert!(summary_request.contains(SUMMARIZER_MARKER));
+        write_sse(&mut summary, &text_response("## Goal\ngate"));
+        let (mut turn, turn_request) = accept_request(&listener);
+        assert!(turn_request.contains(COMPACTED_MARKER));
+        write_sse(&mut turn, &text_response("answer"));
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(eager_policy());
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    // About 65k tokens by Pi's estimate (under its 83_616 line), but about 74k
+    // by the request estimate, and the gate keeps 32k for the output: 106k.
+    let result = run_loop_with_messages(
+        &mut runtime,
+        &client,
+        &gate_history(260_000),
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            max_turns: 1,
+            context_window_tokens: 100_000,
+            context_reserve_tokens: 32_000,
+            ..test_loop_config()
+        },
+    )
+    .expect("the gate compacts first");
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    let commits = handle.take_commits();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].reason, CompactionReason::Threshold);
+    assert!(
+        commits[0].tokens_before < 83_616,
+        "Pi's own line was not crossed: {}",
+        commits[0].tokens_before
+    );
+}
+
+#[test]
+fn a_raised_output_limit_moves_the_gate_and_compacts_before_the_next_request() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        // Turn one fits: the gate still keeps no room for the output.
+        let (mut first, first_request) = accept_request(&listener);
+        assert!(!first_request.contains(SUMMARIZER_MARKER));
+        write_sse(
+            &mut first,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
+        );
+        // The recovery raises the output limit to 16_384, which the gate now
+        // keeps free: the history no longer fits, and compacts.
+        let (mut summary, summary_request) = accept_request(&listener);
+        assert!(summary_request.contains(SUMMARIZER_MARKER));
+        write_sse(&mut summary, &text_response("## Goal\nraised"));
+        let (mut turn, turn_request) = accept_request(&listener);
+        assert!(turn_request.contains(COMPACTED_MARKER));
+        assert!(turn_request.contains("\"max_tokens\":16384"));
+        write_sse(&mut turn, &text_response("answer"));
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(eager_policy());
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    let result = run_loop_with_messages(
+        &mut runtime,
+        &client,
+        &gate_history(296_000),
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            max_turns: 4,
+            context_window_tokens: 100_000,
+            context_reserve_tokens: 0,
+            ..test_loop_config()
+        },
+    )
+    .expect("the raised gate compacts");
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    let commits = handle.take_commits();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].reason, CompactionReason::Threshold);
+    assert!(
+        commits[0].tokens_before < 83_616,
+        "Pi's own line was not crossed: {}",
+        commits[0].tokens_before
+    );
+}
+
+#[test]
+fn the_usage_of_the_last_response_anchors_the_first_request_of_the_next_run() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        // Run one: a tool turn that reports 80k tokens (under the 83_616 line),
+        // then the answer.
+        let (mut first, _) = accept_request(&listener);
+        write_sse(&mut first, &read_call_with_usage("heavy", 80_000));
+        let (mut second, second_request) = accept_request(&listener);
+        assert!(!second_request.contains(SUMMARIZER_MARKER));
+        write_sse(&mut second, &text_response("first answer"));
+        // Run two: little is estimated, but the last response said 80k tokens
+        // and what came after it adds up past the line.
+        let (mut summary, summary_request) = accept_request(&listener);
+        assert!(summary_request.contains(SUMMARIZER_MARKER));
+        write_sse(&mut summary, &text_response("## Goal\ncarried"));
+        let (mut turn, turn_request) = accept_request(&listener);
+        assert!(turn_request.contains(COMPACTED_MARKER));
+        write_sse(&mut turn, &text_response("second answer"));
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(eager_policy());
+    let config = || AgentLoopConfig {
+        max_turns: 3,
+        // The default reserve puts the line at 83_616 tokens.
+        context_window_tokens: 100_000,
+        context_reserve_tokens: 0,
+        ..test_loop_config()
+    };
+    let mut first = Runtime::new();
+    first.set_compaction_handle(handle.clone());
+    run_loop(
+        &mut first,
+        &client,
+        "start",
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        config(),
+    )
+    .expect("first run");
+    assert!(handle.take_commits().is_empty());
+
+    let mut history = first.conversation().to_vec();
+    history.push(ProviderMessage::user(format!(
+        "next task {}",
+        "word ".repeat(6_000)
+    )));
+    let mut second = Runtime::new();
+    second.set_compaction_handle(handle.clone());
+    run_loop_with_messages(
+        &mut second,
+        &client,
+        &history,
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        config(),
+    )
+    .expect("second run");
+    server.join().expect("server");
+
+    let commits = handle.take_commits();
+    assert_eq!(commits.len(), 1);
+    assert!(
+        commits[0].tokens_before >= 80_010,
+        "the carried usage anchors the estimate: {}",
+        commits[0].tokens_before
+    );
+}
+
+#[test]
+fn a_changed_history_drops_the_carried_usage_anchor() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut first, _) = accept_request(&listener);
+        write_sse(&mut first, &read_call_with_usage("heavy", 80_000));
+        let (mut second, _) = accept_request(&listener);
+        write_sse(&mut second, &text_response("first answer"));
+        // The second run's history is not the one the usage described.
+        let (mut turn, turn_request) = accept_request(&listener);
+        assert!(!turn_request.contains(SUMMARIZER_MARKER));
+        assert!(!turn_request.contains(COMPACTED_MARKER));
+        write_sse(&mut turn, &text_response("second answer"));
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(eager_policy());
+    let config = || AgentLoopConfig {
+        max_turns: 3,
+        context_window_tokens: 100_000,
+        context_reserve_tokens: 0,
+        ..test_loop_config()
+    };
+    let mut first = Runtime::new();
+    first.set_compaction_handle(handle.clone());
+    run_loop(
+        &mut first,
+        &client,
+        "start",
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        config(),
+    )
+    .expect("first run");
+
+    let mut history = first.conversation().to_vec();
+    history[1] = ProviderMessage::assistant("a different response", Vec::new());
+    history.push(ProviderMessage::user(format!(
+        "next task {}",
+        "word ".repeat(6_000)
+    )));
+    let mut second = Runtime::new();
+    second.set_compaction_handle(handle.clone());
+    run_loop_with_messages(
+        &mut second,
+        &client,
+        &history,
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        config(),
+    )
+    .expect("second run");
+    server.join().expect("server");
+    assert!(handle.take_commits().is_empty());
+}
+
+/// One manual `/compact` of `history` through `compact_messages`.
+fn compact_history(
+    runtime: &mut Runtime,
+    client: &HttpProviderClient<OpenAiCompatibleAdapter>,
+    history: &[ProviderMessage],
+    config: AgentLoopConfig,
+) -> Result<AgentLoopResult, ProviderError> {
+    tokio::runtime::Runtime::new()
+        .expect("tokio")
+        .block_on(runtime.compact_messages(
+            client,
+            history,
+            OperatingMode::Auto,
+            std::env::temp_dir(),
+            1,
+            config,
+        ))
+}
+
+#[test]
+fn compacting_again_without_anything_new_is_refused_as_already_compacted() {
+    let (listener, address) = bind_listener();
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server = {
+        let requests = requests.clone();
+        thread::spawn(move || {
+            let (mut summary, summary_request) = accept_request(&listener);
+            assert!(summary_request.contains(SUMMARIZER_MARKER));
+            requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            write_sse(&mut summary, &text_response("## Goal\nonce"));
+            // A second summary request would be a defect: wait for one.
+            thread::sleep(Duration::from_millis(400));
+            if listener.accept().is_ok() {
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        })
+    };
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(eager_policy());
+    let config = || AgentLoopConfig {
+        context_window_tokens: 100_000,
+        context_reserve_tokens: 0,
+        ..test_loop_config()
+    };
+    let history = vec![
+        ProviderMessage::user("one"),
+        ProviderMessage::assistant("two ".repeat(200), Vec::new()),
+        ProviderMessage::user("three"),
+        ProviderMessage::assistant("four", Vec::new()),
+        ProviderMessage::user("five"),
+    ];
+
+    let mut first = Runtime::new();
+    first.set_compaction_handle(handle.clone());
+    handle.request_manual("").expect("request");
+    let result = compact_history(&mut first, &client, &history, config()).expect("first");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    let compacted = first.conversation().to_vec();
+    assert!(compacted.len() < history.len());
+    assert!(handle.is_already_compacted(&compacted));
+    assert_eq!(handle.take_commits().len(), 1);
+
+    // Nothing was appended: the second request does nothing at all.
+    let mut second = Runtime::new();
+    second.set_compaction_handle(handle.clone());
+    handle.request_manual("").expect("request");
+    compact_history(&mut second, &client, &compacted, config()).expect("second");
+    server.join().expect("server");
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(handle.take_commits().is_empty());
+    assert_eq!(second.conversation(), compacted);
+    assert_eq!(handle.manual_instructions(), None);
+
+    // Something appended: compacting is possible again.
+    let mut grown = compacted;
+    grown.push(ProviderMessage::user("six"));
+    assert!(!handle.is_already_compacted(&grown));
+}
+
+#[test]
+fn an_idle_compaction_summarizes_the_history_a_run_would_send() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut summary, summary_request) = accept_request(&listener);
+        assert!(summary_request.contains(SUMMARIZER_MARKER));
+        write_sse(&mut summary, &text_response("## Goal\nelided"));
+        summary_request
+    });
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(eager_policy());
+    handle.request_manual("").expect("request");
+    let call = |id: &str, name: &str, arguments: Value| ProviderToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: arguments.to_string(),
+    };
+    let history = vec![
+        ProviderMessage::user("start"),
+        ProviderMessage::assistant(
+            "",
+            vec![call("read-0", "read", json!({"path": "src/a.rs"}))],
+        ),
+        ProviderMessage::tool("read", "read-0", "STALE-FILE-CONTENT ".repeat(40)),
+        ProviderMessage::assistant(
+            "",
+            vec![call(
+                "write-1",
+                "write",
+                json!({"path": "src/a.rs", "content": "new\n"}),
+            )],
+        ),
+        ProviderMessage::tool("write", "write-1", "written src/a.rs (4 bytes)".to_owned()),
+        ProviderMessage::user("next"),
+        ProviderMessage::assistant("done", Vec::new()),
+        ProviderMessage::user("last"),
+    ];
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    let result = compact_history(
+        &mut runtime,
+        &client,
+        &history,
+        AgentLoopConfig {
+            context_window_tokens: 100_000,
+            context_reserve_tokens: 0,
+            ..test_loop_config()
+        },
+    )
+    .expect("idle compaction");
+    let summary_request = server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(handle.take_commits().len(), 1);
+    assert!(
+        summary_request.contains("superseded read output elided"),
+        "the summarizer sees the pointer a run's model sees"
+    );
+    assert!(
+        !summary_request.contains("STALE-FILE-CONTENT"),
+        "the overwritten file contents are not summarized as evidence"
+    );
+}
+
+#[test]
+fn manual_compaction_ignores_the_automatic_switch_and_the_loop_switch_disables_it() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut summary, summary_request) = accept_request(&listener);
+        assert!(summary_request.contains(SUMMARIZER_MARKER));
+        write_sse(
+            &mut summary,
+            &text_response("## Goal\nmanual while disabled"),
+        );
+    });
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(CompactionPolicy {
+        enabled: false,
+        ..eager_policy()
+    });
+    let history = gate_history(4_000);
+
+    // [compaction] enabled = false gates the automatic triggers only.
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    handle.request_manual("focus").expect("request");
+    let result = compact_history(
+        &mut runtime,
+        &client,
+        &history,
+        AgentLoopConfig {
+            context_window_tokens: 100_000,
+            context_reserve_tokens: 0,
+            ..test_loop_config()
+        },
+    )
+    .expect("manual compaction");
+    server.join().expect("server");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    let commits = handle.take_commits();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].reason, CompactionReason::Manual);
+
+    // The loop-level switch is a different matter: no compaction at all.
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(CompactionHandle::default());
+    let error = compact_history(
+        &mut runtime,
+        &client,
+        &history,
+        AgentLoopConfig {
+            context_compaction_enabled: false,
+            ..test_loop_config()
+        },
+    )
+    .expect_err("disabled for the loop");
+    assert!(
+        matches!(&error, ProviderError::InvalidResponse { message } if message == "compaction is disabled"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_context_over_the_threshold_is_not_compacted_when_automatic_compaction_is_off() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut stream, request) = accept_request(&listener);
+        assert!(!request.contains(SUMMARIZER_MARKER));
+        write_sse(&mut stream, &text_response("answer"));
+    });
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(CompactionPolicy {
+        enabled: false,
+        ..eager_policy()
+    });
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    let result = run_loop_with_messages(
+        &mut runtime,
+        &client,
+        &gate_history(260_000),
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            max_turns: 1,
+            context_window_tokens: 100_000,
+            context_reserve_tokens: 10_000,
+            ..test_loop_config()
+        },
+    )
+    .expect("sent unchanged");
+    server.join().expect("server");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert!(handle.take_commits().is_empty());
+}
+
+#[test]
+fn a_summary_prompt_too_large_for_the_window_is_bounded_head_and_tail() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut summary, summary_request) = accept_request(&listener);
+        assert!(summary_request.contains(SUMMARIZER_MARKER));
+        assert!(summary_request.contains("[conversation bounded]"));
+        // 20k tokens at the default 3.5 characters per token.
+        assert!(
+            summary_request.len() < 75_000,
+            "the bounded prompt fits the window: {}",
+            summary_request.len()
+        );
+        write_sse(&mut summary, &text_response("## Goal\nbounded"));
+        let (mut turn, turn_request) = accept_request(&listener);
+        assert!(turn_request.contains(COMPACTED_MARKER));
+        write_sse(&mut turn, &text_response("answer"));
+    });
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(CompactionPolicy {
+        reserve_tokens: 1_000,
+        ..eager_policy()
+    });
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    let result = run_loop_with_messages(
+        &mut runtime,
+        &client,
+        &gate_history(200_000),
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            max_turns: 1,
+            context_window_tokens: 20_000,
+            context_reserve_tokens: 0,
+            ..test_loop_config()
+        },
+    )
+    .expect("bounded summary");
+    server.join().expect("server");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(handle.take_commits().len(), 1);
+}
+
+#[test]
+fn a_window_smaller_than_the_summary_prompt_fails_the_compaction_without_a_request() {
+    let (listener, address) = bind_listener();
+    listener.set_nonblocking(true).expect("listener");
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(2));
+    let handle = CompactionHandle::new(eager_policy());
+    handle.request_manual("").expect("request");
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    // Pi's summarization instructions alone are bigger than this window.
+    let error = compact_history(
+        &mut runtime,
+        &client,
+        &gate_history(2_000),
+        AgentLoopConfig {
+            context_window_tokens: 100,
+            context_reserve_tokens: 0,
+            ..test_loop_config()
+        },
+    )
+    .expect_err("the fixed prompt does not fit");
+    assert!(
+        matches!(&error, ProviderError::InvalidResponse { message }
+            if message == "compaction request still exceeds context window"),
+        "{error:?}"
+    );
+    assert!(
+        listener.accept().is_err(),
+        "no request was sent for a prompt that cannot fit"
+    );
+    assert!(handle.take_commits().is_empty());
+    assert_eq!(
+        handle.manual_instructions(),
+        None,
+        "the failed request is not left queued"
+    );
+}
+
+#[test]
+fn overflow_with_compaction_disabled_is_surfaced_after_one_request() {
+    let (listener, address) = bind_listener();
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server = {
+        let requests = requests.clone();
+        thread::spawn(move || {
+            let (mut stream, _) = accept_request(&listener);
+            requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = "prompt is too long: 213462 tokens > 200000 maximum";
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .expect("overflow response");
+            // The same request again would be a defect: wait for one.
+            thread::sleep(Duration::from_millis(400));
+            if listener.accept().is_ok() {
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        })
+    };
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(CompactionHandle::new(CompactionPolicy {
+        enabled: false,
+        ..eager_policy()
+    }));
+    let error = run_loop_with_messages(
+        &mut runtime,
+        &client,
+        &gate_history(400),
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            max_turns: 1,
+            context_window_tokens: 64_000,
+            context_reserve_tokens: 0,
+            ..test_loop_config()
+        },
+    )
+    .expect_err("the overflow is surfaced");
+    server.join().expect("server");
+
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let ProviderError::Http { message, .. } = &error else {
+        panic!("{error:?}");
+    };
+    assert!(message.contains("prompt is too long"), "{message}");
+    assert!(!message.contains("compact-and-retry"), "{message}");
+}
+
+#[test]
+fn a_response_reporting_more_than_the_window_compacts_before_the_next_request() {
+    // Pi's silent overflow: the provider accepted the request and said it used
+    // more than the whole window. The anchored estimate is over the line, so the
+    // next request compacts without a failed attempt in between.
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut first, _) = accept_request(&listener);
+        write_sse(&mut first, &read_call_with_usage("silent", 130_000));
+        let (mut summary, summary_request) = accept_request(&listener);
+        assert!(summary_request.contains(SUMMARIZER_MARKER));
+        write_sse(&mut summary, &text_response("## Goal\nsilent overflow"));
+        let (mut turn, turn_request) = accept_request(&listener);
+        assert!(turn_request.contains(COMPACTED_MARKER));
+        write_sse(&mut turn, &text_response("done"));
+    });
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(eager_policy());
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    let result = run_loop(
+        &mut runtime,
+        &client,
+        "start",
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            max_turns: 3,
+            context_window_tokens: 128_000,
+            context_reserve_tokens: 0,
+            ..test_loop_config()
+        },
+    )
+    .expect("loop");
+    server.join().expect("server");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(handle.take_commits().len(), 1);
+}
+
+/// SSE body of a tool call to `read` that also reports the request's usage.
+fn read_call_with_usage(id: &str, prompt_tokens: u64) -> String {
+    let call = json!({"choices": [{"delta": {"tool_calls": [{
+        "index": 0,
+        "id": id,
+        "function": {
+            "name": "read",
+            "arguments": json!({"path": "missing-file.txt", "max_lines": 10}).to_string()
+        }
+    }]}}]});
+    let usage =
+        json!({"choices": [], "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 10}});
+    format!(
+        "data: {call}\n\ndata: {usage}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+    )
+}
+
+#[test]
+fn provider_usage_anchors_the_threshold_beyond_what_the_estimate_sees() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut first, _) = accept_request(&listener);
+        // A tiny history, but the provider says the request used 90k tokens.
+        write_sse(&mut first, &read_call_with_usage("heavy", 90_000));
+
+        let (mut summary, summary_request) = accept_request(&listener);
+        assert!(summary_request.contains(SUMMARIZER_MARKER));
+        write_sse(&mut summary, &text_response("## Goal\nanchored"));
+
+        let (mut turn, turn_request) = accept_request(&listener);
+        assert!(turn_request.contains(COMPACTED_MARKER));
+        write_sse(&mut turn, &text_response("done"));
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(eager_policy());
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    let result = run_loop(
+        &mut runtime,
+        &client,
+        "start",
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            max_turns: 3,
+            // The default reserve puts the line at 83_616 tokens.
+            context_window_tokens: 100_000,
+            context_reserve_tokens: 0,
+            ..test_loop_config()
+        },
+    )
+    .expect("loop");
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    let commits = handle.take_commits();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].reason, CompactionReason::Threshold);
+    // The usage of the last response (input and output) plus what followed it.
+    assert!(
+        commits[0].tokens_before >= 90_010,
+        "{}",
+        commits[0].tokens_before
+    );
+}
+
+/// The JSON body of a captured request.
+fn request_body(request: &str) -> Value {
+    serde_json::from_str(request.split_once("\r\n\r\n").expect("body").1).expect("json body")
+}
+
+#[test]
+fn a_failed_compaction_at_pis_line_is_reported_and_the_request_goes_out() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut first, _) = accept_request(&listener);
+        // 90k of a 100k window: over Pi's line (83_616), well within the window.
+        write_sse(&mut first, &read_call_with_usage("heavy", 90_000));
+
+        let (mut summary, summary_request) = accept_request(&listener);
+        assert!(summary_request.contains(SUMMARIZER_MARKER));
+        write_sse(&mut summary, &text_response(""));
+
+        let (mut turn, turn_request) = accept_request(&listener);
+        assert!(!turn_request.contains(SUMMARIZER_MARKER));
+        assert!(!turn_request.contains(COMPACTED_MARKER));
+        write_sse(&mut turn, &text_response("done"));
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(eager_policy());
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    let result = run_loop(
+        &mut runtime,
+        &client,
+        "start",
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            max_turns: 3,
+            context_window_tokens: 100_000,
+            context_reserve_tokens: 0,
+            ..test_loop_config()
+        },
+    )
+    .expect("a failed automatic compaction does not end the run");
+    // Exactly one summary attempt: the next one waits for a response.
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert!(handle.take_commits().is_empty());
+    assert!(runtime
+        .app
+        .events()
+        .iter()
+        .any(|event| event.kind.auto_compaction_failure().is_some()));
+    assert!(!runtime
+        .app
+        .events()
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::CompactionCompleted)));
+}
+
+#[test]
+fn a_failed_compaction_the_request_needs_still_ends_the_run() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut first, _) = accept_request(&listener);
+        write_sse(&mut first, &read_call_with_usage("read-1", 1));
+        let (mut summary, _) = accept_request(&listener);
+        write_sse(&mut summary, &text_response(""));
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(eager_policy());
+    handle.request_manual("").expect("queue summary");
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle);
+    let error = run_loop(
+        &mut runtime,
+        &client,
+        "start",
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            max_turns: 3,
+            ..test_loop_config()
+        },
+    )
+    .expect_err("a requested compaction that fails is an error");
+    server.join().expect("server");
+    assert!(
+        matches!(&error, ProviderError::InvalidResponse { message } if message.contains("empty")),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_cancelled_compaction_does_not_leave_its_manual_request_queued() {
+    let (listener, address) = bind_listener();
+    let cancellation = CancellationToken::new();
+    let server_cancel = cancellation.clone();
+    let server = thread::spawn(move || {
+        let (mut first, _) = accept_request(&listener);
+        write_sse(&mut first, &read_call_with_usage("read-1", 1));
+        // The user cancels while the requested summary is being produced.
+        let (_summary, summary_request) = accept_request(&listener);
+        assert!(summary_request.contains(SUMMARIZER_MARKER));
+        server_cancel.cancel();
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(eager_policy());
+    // Queued while nothing could be compacted yet: it waits for the boundary.
+    handle.request_manual("focus").expect("queue summary");
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    runtime.set_cancellation_token(cancellation);
+    let result = run_loop(
+        &mut runtime,
+        &client,
+        "start",
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            max_turns: 3,
+            ..test_loop_config()
+        },
+    )
+    .expect("cancelled loop");
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::Cancelled);
+    assert!(handle.take_commits().is_empty());
+    assert_eq!(
+        handle.manual_instructions(),
+        None,
+        "the next run must not repeat the compaction the user cancelled"
+    );
+}
+
+#[test]
+fn a_summary_that_hits_its_output_limit_is_retried_once_with_a_higher_limit() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut first, _) = accept_request(&listener);
+        write_sse(&mut first, &read_call_with_usage("read-1", 1));
+
+        let (mut summary, summary_request) = accept_request(&listener);
+        assert!(summary_request.contains(SUMMARIZER_MARKER));
+        let first_limit = request_body(&summary_request)["max_tokens"]
+            .as_u64()
+            .expect("limit");
+        write_sse(
+            &mut summary,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\ncut sh\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
+        );
+
+        let (mut retry, retry_request) = accept_request(&listener);
+        assert!(retry_request.contains(SUMMARIZER_MARKER));
+        let retry_limit = request_body(&retry_request)["max_tokens"]
+            .as_u64()
+            .expect("limit");
+        write_sse(&mut retry, &text_response("## Goal\nfull summary"));
+
+        let (mut turn, turn_request) = accept_request(&listener);
+        assert!(turn_request.contains(COMPACTED_MARKER));
+        write_sse(&mut turn, &text_response("done"));
+        (first_limit, retry_limit)
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(eager_policy());
+    handle.request_manual("").expect("queue summary");
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    let result = run_loop(
+        &mut runtime,
+        &client,
+        "start",
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            max_turns: 3,
+            ..test_loop_config()
+        },
+    )
+    .expect("the retried summary compacts");
+    let (first_limit, retry_limit) = server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(first_limit, 4_096, "the configured per-turn limit");
+    assert_eq!(retry_limit, 8_192, "doubled, within 0.8 of the reserve");
+    let commits = handle.take_commits();
+    assert_eq!(commits.len(), 1);
+    assert!(commits[0].summary.contains("full summary"));
+    let ledger = slim_core::runtime::UsageTotals::from_events(runtime.app.events(), false);
+    let compaction_requests = ledger
+        .requests
+        .iter()
+        .filter(|request| request.request_kind == slim_core::RequestKind::Compaction)
+        .count();
+    assert_eq!(compaction_requests, 2, "both calls are recorded");
+}
+
+#[test]
+fn a_summary_truncated_at_the_reserve_cap_names_the_reserve_not_the_output_limit() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut first, _) = accept_request(&listener);
+        write_sse(&mut first, &read_call_with_usage("read-1", 1));
+
+        // The request here is a split turn's prefix: 50% of a 2_000-token
+        // reserve, below the configured output limit. The retry cannot raise
+        // it, so there is no second summary request.
+        let (mut summary, summary_request) = accept_request(&listener);
+        assert!(summary_request.contains(SUMMARIZER_MARKER));
+        assert_eq!(request_body(&summary_request)["max_tokens"], 1_000);
+        write_sse(
+            &mut summary,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\ncut sh\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
+        );
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(CompactionPolicy {
+        reserve_tokens: 2_000,
+        ..eager_policy()
+    });
+    handle.request_manual("").expect("queue summary");
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle);
+    let error = run_loop(
+        &mut runtime,
+        &client,
+        "start",
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            max_turns: 3,
+            ..test_loop_config()
+        },
+    )
+    .expect_err("a summary cut at the cap fails the requested compaction");
+    server.join().expect("server");
+
+    let ProviderError::InvalidResponse { message } = &error else {
+        panic!("{error:?}");
+    };
+    assert!(message.contains("compaction.reserve_tokens"), "{message}");
+    assert!(!message.contains("max_output_tokens"), "{message}");
+}
+
+#[test]
+fn eliding_a_superseded_read_in_the_loop_drops_the_usage_anchor() {
+    let root = TempRoot::new("anchor-elision");
+    std::fs::write(
+        root.join("fixture.txt"),
+        "a line of a file the model will overwrite\n".repeat(400),
+    )
+    .expect("fixture");
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let call = |id: &str, name: &str, arguments: Value, prompt_tokens: u64| {
+            let event = json!({"choices": [{"delta": {"tool_calls": [{
+                "index": 0, "id": id,
+                "function": {"name": name, "arguments": arguments.to_string()}
+            }]}}]});
+            let usage = json!({"choices": [], "usage": {
+                "prompt_tokens": prompt_tokens, "completion_tokens": 10
+            }});
+            format!(
+                "data: {event}\n\ndata: {usage}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+            )
+        };
+        let (mut read, _) = accept_request(&listener);
+        write_sse(
+            &mut read,
+            &call("read-0", "read", json!({"path": "fixture.txt"}), 100_000),
+        );
+        // The line is 111_616 tokens: this response lands just under it with
+        // the full read output counted, and the write that follows supersedes
+        // that output.
+        let (mut write, _) = accept_request(&listener);
+        write_sse(
+            &mut write,
+            &call(
+                "write-1",
+                "write",
+                json!({"path": "fixture.txt", "content": "replaced\n"}),
+                111_606,
+            ),
+        );
+        let (mut turn, turn_request) = accept_request(&listener);
+        assert!(
+            !turn_request.contains(SUMMARIZER_MARKER),
+            "the read output was elided, so the context is below the line"
+        );
+        write_sse(&mut turn, &text_response("done"));
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(eager_policy());
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    let result = run_loop(
+        &mut runtime,
+        &client,
+        "Replace the fixture",
+        OperatingMode::Auto,
+        &root,
+        1,
+        AgentLoopConfig {
+            max_turns: 4,
+            context_window_tokens: 128_000,
+            context_reserve_tokens: 0,
+            ..test_loop_config()
+        },
+    )
+    .expect("loop");
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert!(handle.take_commits().is_empty());
+    assert!(runtime
+        .app
+        .events()
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::ToolEvidenceElided { .. })));
+}
+
+#[test]
+fn a_window_that_stays_over_the_threshold_compacts_once_until_a_response_arrives() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut first, _) = accept_request(&listener);
+        write_sse(&mut first, &read_call_with_usage("read-1", 1));
+
+        let (mut summary, summary_request) = accept_request(&listener);
+        assert!(summary_request.contains(SUMMARIZER_MARKER));
+        write_sse(&mut summary, &text_response("## Goal\ncompacted once"));
+
+        // The compacted request fails transiently and is sent again: it is
+        // still over the threshold, but no response came in between.
+        let (mut failing, failing_request) = accept_request(&listener);
+        assert!(failing_request.contains(COMPACTED_MARKER));
+        let body = "temporarily unavailable";
+        failing
+            .write_all(
+                format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .expect("transient failure");
+
+        let (mut retry, retry_request) = accept_request(&listener);
+        assert!(!retry_request.contains(SUMMARIZER_MARKER));
+        assert!(retry_request.contains(COMPACTED_MARKER));
+        write_sse(&mut retry, &text_response("done"));
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(CompactionPolicy {
+        // A line of one token: every request is over it.
+        reserve_tokens: 63_999,
+        ..eager_policy()
+    });
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    let result = run_loop(
+        &mut runtime,
+        &client,
+        "start",
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            max_turns: 3,
+            context_window_tokens: 64_000,
+            context_reserve_tokens: 0,
+            ..test_loop_config()
+        },
+    )
+    .expect("loop");
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(handle.take_commits().len(), 1);
+}
+
+#[test]
+fn a_response_releases_the_anti_loop_wait_so_a_run_compacts_again() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut first, first_request) = accept_request(&listener);
+        assert!(!first_request.contains(SUMMARIZER_MARKER));
+        write_sse(&mut first, &read_call_with_usage("read-1", 90_000));
+
+        let (mut summary, summary_request) = accept_request(&listener);
+        assert!(summary_request.contains(SUMMARIZER_MARKER));
+        write_sse(&mut summary, &text_response("## Goal\nfirst compaction"));
+
+        // A real response (a tool call that is over the line again) comes in
+        // after the compaction: the next request may compact once more.
+        let (mut turn, turn_request) = accept_request(&listener);
+        assert!(!turn_request.contains(SUMMARIZER_MARKER));
+        assert!(turn_request.contains(COMPACTED_MARKER));
+        write_sse(&mut turn, &read_call_with_usage("read-2", 90_000));
+
+        let (mut summary, summary_request) = accept_request(&listener);
+        assert!(summary_request.contains(SUMMARIZER_MARKER));
+        // The second summary updates the first one (Pi's iterative prompt)
+        // instead of starting from scratch.
+        let prompt = request_body(&summary_request)["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let previous = prompt
+            .split_once("<previous-summary>")
+            .and_then(|(_, rest)| rest.split_once("</previous-summary>"))
+            .map(|(previous, _)| previous)
+            .unwrap_or_else(|| panic!("no previous summary: {prompt}"));
+        assert!(previous.contains("first compaction"), "{prompt}");
+        assert!(prompt.contains(UPDATE_SUMMARIZATION_PROMPT), "{prompt}");
+        write_sse(&mut summary, &text_response("## Goal\nsecond compaction"));
+
+        let (mut turn, turn_request) = accept_request(&listener);
+        assert!(!turn_request.contains(SUMMARIZER_MARKER));
+        assert!(turn_request.contains("second compaction"));
+        write_sse(&mut turn, &text_response("done"));
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(eager_policy());
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    let result = run_loop(
+        &mut runtime,
+        &client,
+        "start",
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            max_turns: 5,
+            context_window_tokens: 100_000,
+            context_reserve_tokens: 0,
+            ..test_loop_config()
+        },
+    )
+    .expect("loop");
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    let commits = handle.take_commits();
+    assert_eq!(commits.len(), 2);
+    assert!(commits
+        .iter()
+        .all(|commit| commit.reason == CompactionReason::Threshold));
+}
+
+#[test]
+fn a_summary_over_the_persistence_limit_fails_the_compaction_and_keeps_the_history() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut first, _) = accept_request(&listener);
+        write_sse(&mut first, &read_call_with_usage("read-1", 1));
+        let (mut summary, _) = accept_request(&listener);
+        write_sse(&mut summary, &text_response(&"long summary ".repeat(40)));
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(CompactionPolicy {
+        summary_max_bytes: 100,
+        ..eager_policy()
+    });
+    handle.request_manual("").expect("queue summary protocol");
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    let error = run_loop(
+        &mut runtime,
+        &client,
+        "start",
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            max_turns: 3,
+            ..test_loop_config()
+        },
+    )
+    .expect_err("a summary that cannot be stored must fail");
+    server.join().expect("server");
+
+    assert!(
+        matches!(&error, ProviderError::InvalidResponse { message }
+            if message.contains("persistence limit")),
+        "{error:?}"
+    );
+    assert!(handle.take_commits().is_empty());
+    assert_eq!(handle.manual_instructions(), None);
+    // The conversation is the one the loop had: the summary replaced nothing.
+    assert!(runtime
+        .conversation()
+        .iter()
+        .all(|message| !message.content.contains(COMPACTED_MARKER)));
+    assert!(!runtime
+        .app
+        .events()
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::CompactionCompleted)));
+}
+
+#[test]
+fn a_summary_is_redacted_before_it_is_stored_or_shown_to_the_model() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut first, _) = accept_request(&listener);
+        write_sse(&mut first, &read_call_with_usage("read-1", 1));
+        let (mut summary, _) = accept_request(&listener);
+        write_sse(
+            &mut summary,
+            &text_response("## Goal\nuse the key hunter2-secret-value for the deploy"),
+        );
+        let (mut turn, turn_request) = accept_request(&listener);
+        assert!(turn_request.contains(COMPACTED_MARKER));
+        assert!(!turn_request.contains("hunter2-secret-value"));
+        write_sse(&mut turn, &text_response("done"));
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let handle = CompactionHandle::new(eager_policy());
+    handle.request_manual("").expect("queue summary protocol");
+    let mut runtime = Runtime::new();
+    runtime.register_sensitive_value("hunter2-secret-value");
+    runtime.set_compaction_handle(handle.clone());
+    let result = run_loop(
+        &mut runtime,
+        &client,
+        "start",
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            max_turns: 3,
+            ..test_loop_config()
+        },
+    )
+    .expect("loop");
+    server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    let commits = handle.take_commits();
+    assert_eq!(commits.len(), 1);
+    assert!(!commits[0].summary.contains("hunter2-secret-value"));
+    assert!(commits[0].summary.contains("[REDACTED]"));
+}
+
+#[test]
+fn a_split_turn_runs_two_summary_calls_and_a_transient_failure_retries_only_the_failed_one() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        let (mut history, request) = accept_request(&listener);
+        assert!(request.contains(SUMMARIZER_MARKER));
+        write_sse(&mut history, &text_response("## Goal\nhistory summary"));
+        requests.push(request);
+
+        let (mut failing, request) = accept_request(&listener);
+        assert!(request.contains(SUMMARIZER_MARKER));
+        let body = "temporarily unavailable";
+        failing
+            .write_all(
+                format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .expect("transient failure");
+        requests.push(request);
+
+        let (mut prefix, request) = accept_request(&listener);
+        write_sse(&mut prefix, &text_response("turn prefix summary"));
+        requests.push(request);
+
+        let (mut turn, request) = accept_request(&listener);
+        assert!(request.contains(COMPACTED_MARKER));
+        assert!(request.contains("history summary"));
+        assert!(request.contains("turn prefix summary"));
+        write_sse(&mut turn, &text_response("done"));
+        requests
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    // A reserve of 2000 tokens: the summary budgets are 80% and 50% of it.
+    let handle = CompactionHandle::new(CompactionPolicy {
+        reserve_tokens: 2_000,
+        ..eager_policy()
+    });
+    handle.request_manual("").expect("queue summary protocol");
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    let messages = vec![
+        ProviderMessage::user("first task"),
+        ProviderMessage::assistant("first answer", Vec::new()),
+        ProviderMessage::user("second task"),
+        ProviderMessage::assistant("second answer", Vec::new()),
+    ];
+    let result = run_loop_with_messages(
+        &mut runtime,
+        &client,
+        &messages,
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        test_loop_config(),
+    )
+    .expect("loop");
+    let requests = server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    let body = |request: &String| {
+        serde_json::from_str::<Value>(request.split("\r\n\r\n").nth(1).expect("body"))
+            .expect("json")
+    };
+    let (history, failing, retried) = (body(&requests[0]), body(&requests[1]), body(&requests[2]));
+    // The cut splits the turn that began at "second task".
+    let history_prompt = history["messages"][1]["content"].as_str().expect("prompt");
+    assert!(history_prompt.contains("[User]: first task"));
+    assert!(!history_prompt.contains("second task"));
+    let prefix_prompt = failing["messages"][1]["content"].as_str().expect("prompt");
+    assert!(prefix_prompt.contains("# Conversation\n[User]: second task"));
+    // Each call has its own share of the reserve; only the failed one is resent.
+    assert_eq!(history["max_tokens"], 1_600);
+    assert_eq!(failing["max_tokens"], 1_000);
+    assert_eq!(failing, retried);
+    assert_eq!(handle.take_commits().len(), 1);
+    // Both calls are recorded requests of the compaction.
+    let ledger = slim_core::runtime::UsageTotals::from_events(runtime.app.events(), false);
+    let compaction_requests = ledger
+        .requests
+        .iter()
+        .filter(|request| request.request_kind == slim_core::RequestKind::Compaction)
+        .count();
+    assert_eq!(
+        compaction_requests, 3,
+        "history, failed prefix, retried prefix"
+    );
 }
 
 #[test]
@@ -5557,7 +4997,7 @@ fn context_overflow_compacts_and_retries_once_without_consuming_turn_budget() {
     let server = thread::spawn(move || {
         let mut first = accept_with_deadline(&listener);
         let first_request = read_http_request(&mut first);
-        assert!(!first_request.contains("You are a context compactor"));
+        assert!(!first_request.contains(SUMMARIZER_MARKER));
         let error_body = "maximum context length exceeded";
         first
             .write_all(
@@ -5572,13 +5012,13 @@ fn context_overflow_compacts_and_retries_once_without_consuming_turn_budget() {
 
         let mut summary = accept_with_deadline(&listener);
         let summary_request = read_http_request(&mut summary);
-        assert!(summary_request.contains("You are a context compactor"));
-        let summary_body = "data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\noverflow summary\\n## Constraints\\nNone\\n## Progress\\nRecovered\\n## Blocked\\nNone\\n## Decisions\\nCompact\\n## Next steps\\nRetry\\n## Critical context\\nOverflow\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        assert!(summary_request.contains(SUMMARIZER_MARKER));
+        let summary_body = "data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\noverflow summary\\n## Constraints & Preferences\\nNone\\n## Progress\\n### Done\\nRecovered\\n### In Progress\\n(none)\\n### Blocked\\nNone\\n## Key Decisions\\nCompact\\n## Next Steps\\nRetry\\n## Critical Context\\nOverflow\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         write_sse(&mut summary, summary_body);
 
         let mut retry = accept_with_deadline(&listener);
         let retry_request = read_http_request(&mut retry);
-        assert!(retry_request.contains("[Compacted context]"));
+        assert!(retry_request.contains(COMPACTED_MARKER));
         assert!(retry_request.contains("overflow summary"));
         let retry_body = "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         write_sse(&mut retry, retry_body);
@@ -5586,7 +5026,7 @@ fn context_overflow_compacts_and_retries_once_without_consuming_turn_budget() {
 
     let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
     let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
-    let handle = CompactionHandle::default();
+    let handle = CompactionHandle::new(eager_policy());
     let mut runtime = Runtime::new();
     runtime.set_compaction_handle(handle.clone());
     let messages = vec![
@@ -5615,7 +5055,6 @@ fn context_overflow_compacts_and_retries_once_without_consuming_turn_budget() {
     assert_eq!(result.turns, 1);
     assert_eq!(result.usage.retry_count, 1);
     assert_eq!(handle.status(), CompactionStatus::Applied);
-    assert_eq!(handle.generation(), 1);
     assert!(runtime
         .conversation()
         .iter()
@@ -5623,17 +5062,75 @@ fn context_overflow_compacts_and_retries_once_without_consuming_turn_budget() {
 }
 
 #[test]
+fn an_overflow_that_survives_its_compact_and_retry_fails_with_pis_text() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let overflow = |stream: &mut TcpStream| {
+            let body = "prompt is too long: 213462 tokens > 200000 maximum";
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .expect("overflow response");
+        };
+        let mut first = accept_with_deadline(&listener);
+        read_http_request(&mut first);
+        overflow(&mut first);
+
+        let mut summary = accept_with_deadline(&listener);
+        assert!(read_http_request(&mut summary).contains(SUMMARIZER_MARKER));
+        write_sse(&mut summary, &text_response("## Goal\nstill too long"));
+
+        // The compacted request overflows too: no second compaction.
+        let mut retry = accept_with_deadline(&listener);
+        assert!(read_http_request(&mut retry).contains(COMPACTED_MARKER));
+        overflow(&mut retry);
+    });
+
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(CompactionHandle::new(eager_policy()));
+    let messages = vec![
+        ProviderMessage::user("literal root"),
+        ProviderMessage::assistant("old context", Vec::new()),
+        ProviderMessage::user("recent request"),
+    ];
+    let error = run_loop_with_messages(
+        &mut runtime,
+        &client,
+        &messages,
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            max_turns: 1,
+            context_window_tokens: 64_000,
+            context_reserve_tokens: 0,
+            ..test_loop_config()
+        },
+    )
+    .expect_err("one compact-and-retry per episode");
+    server.join().expect("server");
+
+    assert!(
+        matches!(&error, ProviderError::Http { message, .. }
+            if message.contains("context overflow recovery failed after one compact-and-retry attempt")),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn manual_compaction_after_an_overflow_recovery_is_labelled_manual() {
     let (listener, address) = bind_listener();
-    let handle = CompactionHandle::new(slim_core::context::CompactionPolicy {
-        strategy: slim_core::context::CompactionStrategy::Summary,
-        keep_recent_tokens: 1,
-        ..slim_core::context::CompactionPolicy::default()
-    });
+    let handle = CompactionHandle::new(eager_policy());
     let server_handle = handle.clone();
     let server = thread::spawn(move || {
         let summary = |goal: &str| {
-            format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"## Goal\\n{goal}\\n## Constraints\\nNone\\n## Progress\\nRecovered\\n## Blocked\\nNone\\n## Decisions\\nCompact\\n## Next steps\\nRetry\\n## Critical context\\nFixture\"}}}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n")
+            format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"## Goal\\n{goal}\\n## Constraints & Preferences\\nNone\\n## Progress\\n### Done\\nRecovered\\n### In Progress\\n(none)\\n### Blocked\\nNone\\n## Key Decisions\\nCompact\\n## Next Steps\\nRetry\\n## Critical Context\\nFixture\"}}}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n")
         };
         let read_call = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"read-after-overflow\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"missing-file.txt\\\",\\\"max_lines\\\":10}\"}}]}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n".to_owned();
         let done = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_owned();
@@ -5649,7 +5146,7 @@ fn manual_compaction_after_an_overflow_recovery_is_labelled_manual() {
                     )
                 }
                 1 | 3 => {
-                    assert!(request.contains("You are a context compactor"));
+                    assert!(request.contains(SUMMARIZER_MARKER));
                     let body = summary(if turn == 1 { "overflow" } else { "manual" });
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -5728,12 +5225,11 @@ fn overflow_recovery_renews_after_progress() {
     std::fs::write(root.join("source.txt"), "new evidence").unwrap();
     let (listener, address) = bind_listener();
     let handle = CompactionHandle::new(slim_core::context::CompactionPolicy {
-        strategy: slim_core::context::CompactionStrategy::Summary,
         keep_recent_tokens: 1,
         ..slim_core::context::CompactionPolicy::default()
     });
     let server = thread::spawn(move || {
-        let summary = "data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\noverflow\\n## Constraints\\nNone\\n## Progress\\nRecovered\\n## Blocked\\nNone\\n## Decisions\\nCompact\\n## Next steps\\nRetry\\n## Critical context\\nFixture\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let summary = "data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\noverflow\\n## Constraints & Preferences\\nNone\\n## Progress\\n### Done\\nRecovered\\n### In Progress\\n(none)\\n### Blocked\\nNone\\n## Key Decisions\\nCompact\\n## Next Steps\\nRetry\\n## Critical Context\\nFixture\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         let read_call = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"read-source\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"source.txt\\\"}\"}}]}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
         let done = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         let overflow = "maximum context length exceeded";
@@ -5746,7 +5242,7 @@ fn overflow_recovery_renews_after_progress() {
                 ),
                 _ => {
                     assert_eq!(
-                        request.contains("You are a context compactor"),
+                        request.contains(SUMMARIZER_MARKER),
                         matches!(turn, 1 | 4),
                         "request {turn}"
                     );
@@ -5866,7 +5362,7 @@ fn truncated_summary_publishes_usage_but_never_compacts() {
     );
     let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
     let mut runtime = Runtime::new();
-    let handle = CompactionHandle::default();
+    let handle = CompactionHandle::new(eager_policy());
     handle.request_manual("").expect("queue summary protocol");
     runtime.set_compaction_handle(handle);
     let error = tokio_runtime
@@ -5906,6 +5402,9 @@ fn truncated_summary_publishes_usage_but_never_compacts() {
     assert!(ledger.requests.iter().any(|request| {
         request.request_kind == slim_core::RequestKind::Compaction && request.failed
     }));
+    // The truncated summary was still paid for.
+    assert_eq!(ledger.compaction_input_tokens, 5);
+    assert_eq!(ledger.compaction_output_tokens, 2);
 }
 
 #[test]
@@ -5969,7 +5468,7 @@ fn tool_call_summary_is_rejected_without_replacing_the_transcript() {
     );
     let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
     let mut runtime = Runtime::new();
-    let handle = CompactionHandle::default();
+    let handle = CompactionHandle::new(eager_policy());
     handle.request_manual("").expect("queue summary protocol");
     runtime.set_compaction_handle(handle);
     let error = tokio_runtime
@@ -6242,7 +5741,7 @@ fn post_compaction_identical_reread_reuses_retained_full_output() {
             } else if index == 1 {
                 stream
                     .write_all(
-                        b"data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\nsummary\\n## Constraints\\nNone\\n## Progress\\nDone\\n## Blocked\\nNone\\n## Decisions\\nKeep\\n## Next steps\\nContinue\\n## Critical context\\nFixture\"}}]}\n\n",
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\nsummary\\n## Constraints & Preferences\\nNone\\n## Progress\\n### Done\\nDone\\n### In Progress\\n(none)\\n### Blocked\\nNone\\n## Key Decisions\\nKeep\\n## Next Steps\\nContinue\\n## Critical Context\\nFixture\"}}]}\n\n",
                     )
                     .expect("summary");
                 stream
@@ -6274,7 +5773,12 @@ fn post_compaction_identical_reread_reuses_retained_full_output() {
     );
     let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
     let mut runtime = Runtime::new();
-    let handle = CompactionHandle::default();
+    // A small reserve keeps the threshold below the tiny window's own line: only
+    // the manual request compacts.
+    let handle = CompactionHandle::new(CompactionPolicy {
+        reserve_tokens: 100,
+        ..eager_policy()
+    });
     handle.request_manual("").expect("queue summary protocol");
     runtime.set_compaction_handle(handle);
     let result = tokio_runtime
@@ -8600,8 +8104,8 @@ fn foreground_compaction_recovers_transient_failure_and_preserves_original_on_pe
         ProviderMessage::user("continue"),
     ];
     for status in [503, 401] {
-        let (client, done, server) = recovery_fixture(vec![(status, "temporary failure".into()), (200, text("## Goal\noriginal task\n## Constraints\nNone\n## Progress\nprior evidence\n## Blocked\nNone\n## Decisions\nKeep evidence\n## Next steps\nContinue\n## Critical context\nFixture")), (200, text("done"))]);
-        let handle = CompactionHandle::default();
+        let (client, done, server) = recovery_fixture(vec![(status, "temporary failure".into()), (200, text("## Goal\noriginal task\n## Constraints & Preferences\nNone\n## Progress\n### Done\nprior evidence\n### In Progress\n(none)\n### Blocked\nNone\n## Key Decisions\nKeep evidence\n## Next Steps\nContinue\n## Critical Context\nFixture")), (200, text("done"))]);
+        let handle = CompactionHandle::new(eager_policy());
         handle.request_manual("").unwrap();
         let mut runtime = Runtime::new();
         runtime.set_compaction_handle(handle);
@@ -8656,7 +8160,7 @@ fn foreground_compaction_backoff_is_cancellable_and_does_not_replace_history() {
         ProviderMessage::assistant("prior evidence", Vec::new()),
         ProviderMessage::user("continue"),
     ];
-    let handle = CompactionHandle::default();
+    let handle = CompactionHandle::new(eager_policy());
     handle.request_manual("").unwrap();
     let cancellation = CancellationToken::new();
     let (sender, receiver) = SessionEventSender::bounded(64, cancellation.clone());
@@ -8704,7 +8208,7 @@ fn foreground_compaction_stops_after_two_retries_without_replacing_history() {
         ProviderMessage::assistant("prior evidence", Vec::new()),
         ProviderMessage::user("continue"),
     ];
-    let handle = CompactionHandle::default();
+    let handle = CompactionHandle::new(eager_policy());
     handle.request_manual("").unwrap();
     let mut runtime = Runtime::new();
     runtime.set_compaction_handle(handle);
@@ -8865,6 +8369,7 @@ fn mcp_call_in_readonly_mode_is_rejected_by_the_gate() {
                 },
                 enabled: true,
                 timeout: Duration::from_millis(1_000),
+                options: Default::default(),
             },
         )]),
         std::env::temp_dir(),
@@ -9138,6 +8643,7 @@ fn edit_report(
         server: "rust-analyzer".into(),
         files: vec![slim_core::codeintel::EditFileDiagnostics {
             path: "src/result.rs".into(),
+            server: None,
             verification,
             errors,
         }],
@@ -9216,7 +8722,7 @@ fn hostile_diagnostic_text_is_flattened_before_it_reaches_the_model() {
 }
 
 #[test]
-fn clean_edits_and_cold_servers_add_no_note() {
+fn clean_or_unchecked_edits_and_absent_backends_add_no_note() {
     let mut clean = edit_report(slim_core::codeintel::EditVerification::Verified, "");
     clean.files[0].errors.clear();
     let (requests, calls) = run_edit_loop(
@@ -9225,7 +8731,26 @@ fn clean_edits_and_cold_servers_add_no_note() {
         Some(clean),
     );
     assert_eq!(calls, 1);
-    assert!(!requests[1].contains("Post-edit diagnostics"));
+    assert!(
+        !requests[1].contains("Post-edit diagnostics"),
+        "{}",
+        requests[1]
+    );
+
+    // A markdown edit is not served by any language server: no message.
+    let mut unserved = edit_report(slim_core::codeintel::EditVerification::Unsupported, "");
+    unserved.files[0].errors.clear();
+    let (requests, calls) = run_edit_loop(
+        "post-edit-unserved",
+        &[("notes.md", "saved once")],
+        Some(unserved),
+    );
+    assert_eq!(calls, 1);
+    assert!(
+        !requests[1].contains("Post-edit diagnostics"),
+        "{}",
+        requests[1]
+    );
 
     let (requests, calls) = run_edit_loop("post-edit-cold", &[("result.txt", "saved once")], None);
     assert_eq!(calls, 1);
@@ -9233,7 +8758,7 @@ fn clean_edits_and_cold_servers_add_no_note() {
 }
 
 #[test]
-fn an_unverified_file_is_mentioned_once_per_run() {
+fn each_edit_batch_reports_its_unverified_files() {
     let report = edit_report(slim_core::codeintel::EditVerification::Unverified, "");
     let (requests, calls) = run_edit_loop(
         "post-edit-unverified",
@@ -9244,16 +8769,16 @@ fn an_unverified_file_is_mentioned_once_per_run() {
     assert_eq!(calls, 2);
     assert_eq!(
         requests[1]
-            .matches("Not verified (no answer in time)")
+            .matches("Not verified (no verifiable diagnostics)")
             .count(),
         1
     );
-    // The third request replays the first note but the second batch adds none.
+    // The third request replays the first note and includes the second batch.
     assert_eq!(
         requests[2]
-            .matches("Not verified (no answer in time)")
+            .matches("Not verified (no verifiable diagnostics)")
             .count(),
-        1
+        2
     );
 }
 
@@ -9289,4 +8814,204 @@ fn turns_without_edits_never_ask_the_server() {
     result.expect("loop completes");
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert!(!requests[1].contains("Post-edit diagnostics"));
+}
+
+#[test]
+fn session_shell_job_survives_two_model_runs_and_idle_completion_is_once_only() {
+    let root = TempRoot::new("session-shell");
+    let (listener, address) = bind_listener();
+    let command = if cfg!(windows) {
+        "Write-Output 'READY'; while (!(Test-Path -LiteralPath 'release-job')) { Start-Sleep -Milliseconds 20 }; Write-Output 'IDLE-DONE'"
+    } else {
+        "printf 'READY\n'; while [ ! -f release-job ]; do sleep 0.02; done; printf 'IDLE-DONE\n'"
+    };
+    let server = thread::spawn(move || {
+        for index in 0..4 {
+            let (mut stream, request) = accept_request(&listener);
+            let body = match index {
+                0 => sse_tool_calls(
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"launch","function":{"name":"shell","arguments":json!({"command":command,"background":true,"timeout_ms":30000}).to_string()}}]}}]}),
+                ),
+                1 => {
+                    assert!(request.contains("job_id=shell-1"));
+                    text_response("First prompt done")
+                }
+                2 => sse_tool_calls(
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"status","function":{"name":"shell_job","arguments":json!({"job_id":"shell-1","action":"status"}).to_string()}}]}}]}),
+                ),
+                _ => {
+                    assert!(request.contains("state=running"));
+                    text_response("Second prompt done")
+                }
+            };
+            write_sse(&mut stream, &body);
+        }
+    });
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(10));
+    let jobs = slim_core::runtime::ShellJobs::default();
+    let executor = tokio::runtime::Runtime::new().unwrap();
+    executor.block_on(async {
+        let _scope = jobs.scope();
+        let mut first = Runtime::new();
+        first.set_session_shell_jobs(jobs.clone());
+        let result = first
+            .run_agent_loop(
+                &client,
+                "first",
+                OperatingMode::Auto,
+                &root,
+                1,
+                test_loop_config(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+        assert!(jobs.running());
+        let mut second = Runtime::new();
+        second.set_session_shell_jobs(jobs.clone());
+        second
+            .run_agent_loop(
+                &client,
+                "second",
+                OperatingMode::Auto,
+                &root,
+                1,
+                test_loop_config(),
+            )
+            .await
+            .unwrap();
+        assert!(jobs.running());
+        assert_eq!(jobs.list()[0].id, "shell-1");
+        std::fs::write(root.join("release-job"), "go").unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while jobs.running() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let notes = jobs.take_completions();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].1.contains("IDLE-DONE"));
+        assert!(jobs.take_completions().is_empty());
+        jobs.reset().await;
+        assert!(jobs.list().is_empty());
+    });
+    server.join().unwrap();
+}
+
+/// An OpenAI-compatible adapter on a local fixture that, like a first-party
+/// wire, lets the closing request keep the tools and forbid calls.
+struct ClosingToolsAdapter(OpenAiCompatibleAdapter);
+
+impl ProviderAdapter for ClosingToolsAdapter {
+    fn kind(&self) -> slim_core::provider::ProviderKind {
+        self.0.kind()
+    }
+
+    fn model(&self) -> &str {
+        self.0.model()
+    }
+
+    fn closing_tool_choice(&self) -> Option<Value> {
+        Some(json!("none"))
+    }
+
+    fn request_envelope_upper_bound_chars(&self) -> Option<u64> {
+        self.0.request_envelope_upper_bound_chars()
+    }
+
+    fn build_request(&self, prompt: &str) -> slim_core::provider::HttpRequest {
+        self.0.build_request(prompt)
+    }
+
+    fn build_messages_request_with_tools(
+        &self,
+        messages: &[ProviderMessage],
+        tools: &[Value],
+    ) -> slim_core::provider::HttpRequest {
+        self.0.build_messages_request_with_tools(messages, tools)
+    }
+
+    fn parse_event(
+        &self,
+        value: &Value,
+    ) -> Result<Vec<slim_core::provider::ProviderEvent>, ProviderError> {
+        self.0.parse_event(value)
+    }
+}
+
+#[test]
+fn a_closing_request_that_keeps_the_tools_is_sent_as_the_turns_are() {
+    let root = TempRoot::new("closing-overlay");
+    let content = "generated content\n".repeat(400);
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut stream, first) = accept_request(&listener);
+        let first: Value = serde_json::from_str(first.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let call = json!({"tool_calls": [{"index": 0, "id": "write-1", "function": {
+            "name": "write",
+            "arguments": json!({"path": "out.txt", "content": content}).to_string()
+        }}]});
+        write_sse(
+            &mut stream,
+            &sse_tool_calls(json!({"choices": [{"delta": call}]})),
+        );
+        let (mut stream, closing) = accept_request(&listener);
+        let closing: Value =
+            serde_json::from_str(closing.split_once("\r\n\r\n").unwrap().1).unwrap();
+        write_sse(&mut stream, &text_response("Closing answer."));
+        (first, closing)
+    });
+    let adapter = ClosingToolsAdapter(
+        OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+            format!("http://{address}"),
+            "fixture-model",
+            "fixture-key",
+        ))
+        .expect("adapter"),
+    );
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(2)).expect("client");
+    let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let mut runtime = Runtime::new();
+    let result = tokio_runtime
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "write the file",
+            OperatingMode::Auto,
+            &root,
+            1,
+            AgentLoopConfig {
+                max_turns: 1,
+                ..test_loop_config()
+            },
+        ))
+        .expect("loop");
+    let (first, closing) = server.join().expect("server");
+    assert_eq!(result.stop, AgentLoopStop::TurnLimit);
+    assert!(runtime.finalization_error().is_none());
+
+    assert_eq!(closing["tool_choice"], "none");
+    assert_eq!(closing["tools"], first["tools"]);
+    let messages = closing["messages"].as_array().expect("messages");
+    let first_messages = first["messages"].as_array().expect("messages");
+    // The prompt carries the channel stanza exactly as the turn sent it...
+    assert!(messages[1]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Harness channel"));
+    assert_eq!(messages[..first_messages.len()], first_messages[..]);
+    // ...and the completed write goes out as its projection.
+    let arguments = messages
+        .iter()
+        .flat_map(|message| message["tool_calls"].as_array().into_iter().flatten())
+        .find(|call| call["function"]["name"] == "write")
+        .expect("write call")["function"]["arguments"]
+        .as_str()
+        .unwrap();
+    assert!(arguments.contains("successful write content elided"));
+    assert!(messages.last().unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .contains("Budget exhausted"));
 }

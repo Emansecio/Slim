@@ -19,11 +19,16 @@ impl TodoCadence {
             .any(|item| matches!(item.status.as_str(), "pending" | "in_progress"))
     }
 
+    /// Whether the batch just run earns a reminder. The first list rides the
+    /// turn its creation already needs; after that a list the model just
+    /// changed needs no nudge, and a reminder is spent only on one left
+    /// unchanged for four batches.
     pub(super) fn after_batch(&mut self, items: &[crate::TodoChangedItem]) -> bool {
         if self.snapshot != items {
+            let created = self.snapshot.is_empty();
             self.snapshot = items.to_vec();
             self.unchanged_batches = 0;
-            if Self::unfinished(items) && self.reminders < 2 {
+            if created && Self::unfinished(items) && self.reminders < 2 {
                 self.reminders += 1;
                 return true;
             }

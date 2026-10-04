@@ -9,7 +9,7 @@ use slim_core::codeintel::{
     CodeIntelSymbolQuery, CodeIntelligence,
 };
 use slim_core::runtime::CancellationToken;
-use slim_lsp::discovery::ServerSpec;
+use slim_lsp::discovery::{rust_analyzer_spec, ServerOptions, ServerSpec, RUST_ANALYZER};
 use slim_lsp::pool::{PoolConfig, ProcessFactory, SpawnedServer, StdioProcessFactory};
 use slim_lsp::{LspCodeIntelligence, LspManagerConfig, LspProcessPool, TransportOptions};
 
@@ -66,6 +66,20 @@ fn mock_spec(args: Vec<String>) -> ServerSpec {
     }
 }
 
+fn mock_servers(config: Value) -> std::collections::BTreeMap<String, ServerOptions> {
+    [(
+        RUST_ANALYZER.into(),
+        ServerOptions {
+            path: Some(PathBuf::from(mock_binary())),
+            initialization_options: Some(config.clone()),
+            settings: Some(json!({"rust-analyzer": config})),
+            ..Default::default()
+        },
+    )]
+    .into_iter()
+    .collect()
+}
+
 fn transport_options() -> TransportOptions {
     TransportOptions {
         request_timeout: Duration::from_secs(3),
@@ -118,21 +132,30 @@ fn manager_with_mock(
     root: &Path,
     server_config: Value,
 ) -> (Arc<LspProcessPool>, Arc<LspCodeIntelligence>) {
+    manager_with_mock_args(root, server_config, Vec::new())
+}
+
+fn manager_with_mock_args(
+    root: &Path,
+    server_config: Value,
+    args: Vec<String>,
+) -> (Arc<LspProcessPool>, Arc<LspCodeIntelligence>) {
     let pool = LspProcessPool::new(PoolConfig {
         idle_shutdown: None,
         circuit_window: Duration::from_millis(10),
         max_servers: 2,
         factory: Arc::new(StdioProcessFactory),
     });
+    let mut servers = mock_servers(server_config);
+    servers.get_mut(RUST_ANALYZER).expect("mock profile").args = Some(args);
     let manager = LspCodeIntelligence::new(
         pool.clone(),
         LspManagerConfig {
             idle_shutdown: None,
             max_servers: 2,
             request_timeout: Duration::from_secs(3),
-            server_config,
+            servers,
             max_open_documents: 8,
-            server_path: Some(PathBuf::from(mock_binary())),
         },
     );
     assert!(root.join("Cargo.toml").is_file());
@@ -193,6 +216,7 @@ async fn real_subprocess_startup_failure_retains_bounded_stderr() {
                 std::fs::canonicalize(dir.path()).expect("root"),
                 mock_spec(vec![diagnostic]),
                 &json!({}),
+                &json!({"rust-analyzer": {}}),
                 transport_options(),
                 8,
             )
@@ -237,6 +261,7 @@ async fn real_subprocess_observes_dedup_and_lru_did_close() {
             dir.path().to_path_buf(),
             spec,
             &json!({}),
+            &json!({"rust-analyzer": {}}),
             transport_options(),
             1,
         )
@@ -324,9 +349,16 @@ async fn same_pool_key_initializes_once_and_counts_every_lease() {
         let root = dir.path().to_path_buf();
         let spec = spec.clone();
         tasks.push(tokio::spawn(async move {
-            pool.acquire(root, spec, &json!({}), transport_options(), 8)
-                .await
-                .expect("singleflight acquire")
+            pool.acquire(
+                root,
+                spec,
+                &json!({}),
+                &json!({"rust-analyzer": {}}),
+                transport_options(),
+                8,
+            )
+            .await
+            .expect("singleflight acquire")
         }));
     }
     let mut leases = Vec::new();
@@ -367,8 +399,15 @@ async fn aborting_startup_leader_does_not_strand_followers_or_shutdown() {
         let spec = spec.clone();
         let root = dir.path().to_path_buf();
         tokio::spawn(async move {
-            pool.acquire(root, spec, &json!({}), transport_options(), 8)
-                .await
+            pool.acquire(
+                root,
+                spec,
+                &json!({}),
+                &json!({"rust-analyzer": {}}),
+                transport_options(),
+                8,
+            )
+            .await
         })
     };
     wait_for_client_method(&log, "initialize").await;
@@ -377,6 +416,7 @@ async fn aborting_startup_leader_does_not_strand_followers_or_shutdown() {
     // The follower joins while initialize is still gated; the gate opens
     // shortly after it starts waiting.
     let no_settings = json!({});
+    let settings = json!({"rust-analyzer": no_settings});
     let (follower, ()) = tokio::join!(
         tokio::time::timeout(
             Duration::from_secs(2),
@@ -384,6 +424,7 @@ async fn aborting_startup_leader_does_not_strand_followers_or_shutdown() {
                 dir.path().to_path_buf(),
                 spec,
                 &no_settings,
+                &settings,
                 transport_options(),
                 8,
             ),
@@ -432,8 +473,15 @@ async fn close_all_waits_for_inflight_initialize_and_prevents_reinsert() {
         let root = dir.path().to_path_buf();
         let spec = spec.clone();
         tokio::spawn(async move {
-            pool.acquire(root, spec, &json!({}), transport_options(), 8)
-                .await
+            pool.acquire(
+                root,
+                spec,
+                &json!({}),
+                &json!({"rust-analyzer": {}}),
+                transport_options(),
+                8,
+            )
+            .await
         })
     };
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -469,6 +517,7 @@ async fn close_all_waits_for_inflight_initialize_and_prevents_reinsert() {
             dir.path().to_path_buf(),
             spec,
             &json!({}),
+            &json!({"rust-analyzer": {}}),
             transport_options(),
             8,
         )
@@ -511,8 +560,15 @@ async fn different_pool_keys_initialize_concurrently() {
         let spec = gated_spec(&left_log, &left_gate);
         let root = first.path().to_path_buf();
         tokio::spawn(async move {
-            pool.acquire(root, spec, &json!({}), transport_options(), 8)
-                .await
+            pool.acquire(
+                root,
+                spec,
+                &json!({}),
+                &json!({"rust-analyzer": {}}),
+                transport_options(),
+                8,
+            )
+            .await
         })
     };
     let right = {
@@ -520,8 +576,15 @@ async fn different_pool_keys_initialize_concurrently() {
         let spec = gated_spec(&right_log, &right_gate);
         let root = second.path().to_path_buf();
         tokio::spawn(async move {
-            pool.acquire(root, spec, &json!({}), transport_options(), 8)
-                .await
+            pool.acquire(
+                root,
+                spec,
+                &json!({}),
+                &json!({"rust-analyzer": {}}),
+                transport_options(),
+                8,
+            )
+            .await
         })
     };
     wait_for_client_method(&left_log, "initialize").await;
@@ -557,14 +620,13 @@ async fn manager_keeps_lease_for_the_entire_slow_query() {
             idle_shutdown: Some(Duration::ZERO),
             max_servers: 1,
             request_timeout: Duration::from_secs(3),
-            server_config: json!({
+            servers: mock_servers(json!({
                 "mock": {
                     "logPath": log.to_string_lossy(),
                     "requestGate": request_gate.to_string_lossy()
                 }
-            }),
+            })),
             max_open_documents: 8,
-            server_path: Some(PathBuf::from(mock_binary())),
         },
     );
     let query = CodeIntelPositionQuery {
@@ -612,6 +674,7 @@ async fn zero_idle_shutdown_sends_exit_and_reaps_the_server() {
             dir.path().to_path_buf(),
             mock_spec(vec!["--log".into(), log.to_string_lossy().into_owned()]),
             &json!({}),
+            &json!({"rust-analyzer": {}}),
             transport_options(),
             8,
         )
@@ -756,7 +819,12 @@ async fn post_write_notifications_are_ordered_and_versions_are_monotonic() {
 
     let canonical_root = std::fs::canonicalize(workspace.path()).expect("canonical root");
     let warm = pool
-        .acquire_warm(&canonical_root, "rust-analyzer", &server_config)
+        .acquire_warm(
+            &canonical_root,
+            &rust_analyzer_spec(mock_binary()),
+            &server_config,
+            &json!({"rust-analyzer": server_config}),
+        )
         .await
         .expect("warm server lease");
     warm.instance()
@@ -816,6 +884,7 @@ async fn dead_server_is_evicted_and_restarted_on_next_acquire() {
             dir.path().to_path_buf(),
             spec.clone(),
             &json!({}),
+            &json!({"rust-analyzer": {}}),
             transport_options(),
             8,
         )
@@ -837,6 +906,7 @@ async fn dead_server_is_evicted_and_restarted_on_next_acquire() {
             dir.path().to_path_buf(),
             spec,
             &json!({}),
+            &json!({"rust-analyzer": {}}),
             transport_options(),
             8,
         )
@@ -864,6 +934,7 @@ async fn nested_document_symbols_carry_file_and_position() {
     let outcome = manager
         .symbols(&CodeIntelSymbolQuery {
             workspace: workspace.path().to_path_buf(),
+            server: None,
             path: Some(source),
             query: None,
             max_results: 20,
@@ -910,7 +981,12 @@ async fn queries_during_indexing_report_partial_completeness() {
     // completeness. Until then, `unknown` is the honest answer.
     let canonical = std::fs::canonicalize(workspace.path()).expect("canonical root");
     let warm = pool
-        .acquire_warm(&canonical, "rust-analyzer", &server_config)
+        .acquire_warm(
+            &canonical,
+            &rust_analyzer_spec(mock_binary()),
+            &server_config,
+            &json!({"rust-analyzer": server_config}),
+        )
         .await
         .expect("warm server lease");
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -972,6 +1048,7 @@ async fn off_runtime_final_drop_arms_idle_on_next_acquire() {
             first.path().to_path_buf(),
             spec.clone(),
             &json!({}),
+            &json!({"rust-analyzer": {}}),
             transport_options(),
             8,
         )
@@ -991,6 +1068,7 @@ async fn off_runtime_final_drop_arms_idle_on_next_acquire() {
             second.path().to_path_buf(),
             spec,
             &json!({}),
+            &json!({"rust-analyzer": {}}),
             transport_options(),
             8,
         )
@@ -1026,6 +1104,7 @@ async fn idle_servers_do_not_consume_process_slots() {
             first.path().to_path_buf(),
             spec.clone(),
             &json!({}),
+            &json!({"rust-analyzer": {}}),
             transport_options(),
             8,
         )
@@ -1039,6 +1118,7 @@ async fn idle_servers_do_not_consume_process_slots() {
             second.path().to_path_buf(),
             spec,
             &json!({}),
+            &json!({"rust-analyzer": {}}),
             transport_options(),
             8,
         )
@@ -1072,6 +1152,7 @@ async fn spawned_server_starts_with_workspace_as_working_directory() {
             dir.path().to_path_buf(),
             mock_spec(vec!["--log".into(), log.to_string_lossy().into_owned()]),
             &json!({}),
+            &json!({"rust-analyzer": {}}),
             transport_options(),
             8,
         )
@@ -1099,6 +1180,17 @@ async fn spawned_server_starts_with_workspace_as_working_directory() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_before_first_query_reports_starting() {
+    let workspace = TestDir::new("starting-status");
+    write_workspace(workspace.path());
+    let (pool, manager) = manager_with_mock(workspace.path(), json!({}));
+    let outcome = manager.status(workspace.path()).await;
+    assert_eq!(outcome.meta.state, CodeIntelServerState::Starting);
+    assert_eq!(pool.running_servers().await, 0);
+    pool.close_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn status_after_shutdown_reports_stopped() {
     let workspace = TestDir::new("stopped-status");
     write_workspace(workspace.path());
@@ -1117,7 +1209,7 @@ async fn status_after_shutdown_reports_stopped() {
 }
 
 #[test]
-fn workspace_support_tracks_project_markers_without_starting_a_server() {
+fn enabled_workspace_support_is_independent_of_markers_and_binary_presence() {
     let workspace = TestDir::new("catalog-availability");
     let factory = Arc::new(CountingFactory::default());
     let pool = LspProcessPool::new(PoolConfig {
@@ -1127,15 +1219,23 @@ fn workspace_support_tracks_project_markers_without_starting_a_server() {
     let manager = LspCodeIntelligence::new(
         pool,
         LspManagerConfig {
-            server_path: Some(PathBuf::from(mock_binary())),
+            servers: [(
+                RUST_ANALYZER.into(),
+                ServerOptions {
+                    path: Some(workspace.path().join("missing-server")),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
             ..LspManagerConfig::default()
         },
     );
-    assert!(!manager.supports_workspace(workspace.path()));
+    assert!(manager.supports_workspace(workspace.path()));
     write_workspace(workspace.path());
     assert!(manager.supports_workspace(workspace.path()));
     std::fs::remove_file(workspace.path().join("Cargo.toml")).expect("remove own marker");
-    assert!(!manager.supports_workspace(workspace.path()));
+    assert!(manager.supports_workspace(workspace.path()));
     assert_eq!(factory.spawns.load(Ordering::Acquire), 0);
 }
 
@@ -1155,6 +1255,7 @@ async fn older_diagnostics_cannot_replace_current_document_version() {
             workspace.path().to_path_buf(),
             spec,
             &json!({}),
+            &json!({"rust-analyzer": {}}),
             transport_options(),
             8,
         )
@@ -1221,6 +1322,7 @@ async fn older_diagnostics_cannot_replace_current_document_version() {
 fn diagnostics_query(workspace: &Path, path: Option<PathBuf>) -> CodeIntelDiagnosticsQuery {
     CodeIntelDiagnosticsQuery {
         workspace: workspace.to_path_buf(),
+        server: None,
         path,
         include_info: false,
         max_results: 20,
@@ -1243,8 +1345,7 @@ async fn cached_queries_refresh_document_lru_without_reopening() {
         pool.clone(),
         LspManagerConfig {
             max_open_documents: 2,
-            server_path: Some(PathBuf::from(mock_binary())),
-            server_config: json!({ "mock": { "logPath": log } }),
+            servers: mock_servers(json!({ "mock": { "logPath": log } })),
             ..Default::default()
         },
     );
@@ -1295,6 +1396,7 @@ async fn symbol_result_limits_are_explicit() {
     for path in [Some(source), None] {
         let mut query = CodeIntelSymbolQuery {
             workspace: workspace.path().into(),
+            server: None,
             path,
             query: Some("main".into()),
             max_results: 1,
@@ -1415,6 +1517,7 @@ async fn measure_symbol_pipeline_sizes() {
         );
         let query = CodeIntelSymbolQuery {
             workspace: workspace.path().to_path_buf(),
+            server: None,
             query: Some("target".into()),
             max_results: 100,
             ..Default::default()
@@ -1572,6 +1675,7 @@ async fn measure_document_symbol_pipeline_sizes() {
         );
         let query = CodeIntelSymbolQuery {
             workspace: workspace.path().to_path_buf(),
+            server: None,
             path: Some(source),
             query: Some("target".into()),
             max_results: 100,
@@ -1662,6 +1766,7 @@ async fn symbol_detail_keeps_stale_metadata_after_external_write() {
     );
     let query = CodeIntelSymbolQuery {
         workspace: workspace.path().into(),
+        server: None,
         path: Some(source.clone()),
         max_results: 20,
         ..Default::default()
@@ -1689,7 +1794,12 @@ async fn diagnostic_result_limits_and_storage_cuts_are_explicit() {
     manager.diagnostics(&query).await;
     let root = std::fs::canonicalize(workspace.path()).unwrap();
     let lease = pool
-        .acquire_warm(&root, "rust-analyzer", &json!({}))
+        .acquire_warm(
+            &root,
+            &rust_analyzer_spec(mock_binary()),
+            &json!({}),
+            &json!({"rust-analyzer": {}}),
+        )
         .await
         .unwrap();
     let uri = url::Url::from_file_path(std::fs::canonicalize(&source).unwrap()).unwrap();
@@ -1786,6 +1896,7 @@ async fn null_symbol_responses_are_successful_empty_results() {
         let result = manager
             .symbols(&CodeIntelSymbolQuery {
                 workspace: workspace.path().to_path_buf(),
+                server: None,
                 path,
                 query: Some("main".into()),
                 max_results: 20,
@@ -1860,7 +1971,12 @@ async fn diagnostics_distinguish_missing_publication_from_empty_publication() {
     assert_eq!(missing.payload["files"][0]["received"], false);
     let root = std::fs::canonicalize(workspace.path()).unwrap();
     let lease = pool
-        .acquire_warm(&root, "rust-analyzer", &json!({}))
+        .acquire_warm(
+            &root,
+            &rust_analyzer_spec(mock_binary()),
+            &json!({}),
+            &json!({"rust-analyzer": {}}),
+        )
         .await
         .unwrap();
     let uri = url::Url::from_file_path(std::fs::canonicalize(&source).unwrap()).unwrap();
@@ -1925,7 +2041,12 @@ async fn diagnostics_without_version_become_stale_after_write() {
     manager.diagnostics(&query).await;
     let root = std::fs::canonicalize(workspace.path()).unwrap();
     let lease = pool
-        .acquire_warm(&root, "rust-analyzer", &json!({}))
+        .acquire_warm(
+            &root,
+            &rust_analyzer_spec(mock_binary()),
+            &json!({}),
+            &json!({"rust-analyzer": {}}),
+        )
         .await
         .unwrap();
     let uri = url::Url::from_file_path(std::fs::canonicalize(&source).unwrap()).unwrap();
@@ -2135,18 +2256,25 @@ async fn manager_cancellation_during_shared_initialize_is_prompt() {
     let root = std::fs::canonicalize(dir.path()).unwrap();
     let log = dir.path().join("init.jsonl");
     let init_gate = gate(dir.path(), "initialize");
-    let (pool, manager) = manager_with_mock(dir.path(), json!({}));
+    let spec = mock_spec(vec![
+        "--log".into(),
+        log.to_string_lossy().into_owned(),
+        "--initialize-gate".into(),
+        init_gate.to_string_lossy().into_owned(),
+    ]);
+    let (pool, manager) = manager_with_mock_args(dir.path(), json!({}), spec.args.clone());
     let leader = {
         let pool = pool.clone();
-        let spec = mock_spec(vec![
-            "--log".into(),
-            log.to_string_lossy().into_owned(),
-            "--initialize-gate".into(),
-            init_gate.to_string_lossy().into_owned(),
-        ]);
         tokio::spawn(async move {
-            pool.acquire(root, spec, &json!({}), transport_options(), 8)
-                .await
+            pool.acquire(
+                root,
+                spec,
+                &json!({}),
+                &json!({"rust-analyzer": {}}),
+                transport_options(),
+                8,
+            )
+            .await
         })
     };
     wait_for_client_method(&log, "initialize").await;
@@ -2176,6 +2304,14 @@ async fn manager_cancellation_during_shared_initialize_is_prompt() {
     assert!(!lease.instance().is_closed());
     drop(lease);
     pool.close_all().await;
+    assert_eq!(
+        read_client_methods(&log)
+            .iter()
+            .filter(|message| message["method"] == "initialize")
+            .count(),
+        1,
+        "consumers with the same effective command, args and settings must share startup"
+    );
 }
 
 #[derive(Default)]
@@ -2271,9 +2407,8 @@ fn cold_start_manager(
             idle_shutdown: None,
             max_servers: 1,
             request_timeout: Duration::from_secs(3),
-            server_config,
+            servers: mock_servers(server_config),
             max_open_documents: 8,
-            server_path: Some(PathBuf::from(mock_binary())),
         },
     );
     assert!(root.join("Cargo.toml").is_file());
@@ -2357,6 +2492,7 @@ async fn run_prewarm_unused_sample(first_need_delay: Duration) -> u128 {
                 root,
                 mock_spec(Vec::new()),
                 &server_config,
+                &json!({"rust-analyzer": server_config}),
                 transport_options(),
                 8,
             )
@@ -2484,6 +2620,7 @@ async fn run_prewarm_cold_sample(first_need_delay: Duration) -> ColdStartSample 
                     root,
                     mock_spec(Vec::new()),
                     &server_config,
+                    &json!({"rust-analyzer": server_config}),
                     transport_options(),
                     8,
                 )
@@ -2757,7 +2894,12 @@ async fn references_continuation_rejects_stale_revision() {
         .expect("fresh page carries a revision token");
     let root = std::fs::canonicalize(workspace.path()).unwrap();
     let lease = pool
-        .acquire_warm(&root, "rust-analyzer", &json!({}))
+        .acquire_warm(
+            &root,
+            &rust_analyzer_spec(mock_binary()),
+            &json!({}),
+            &json!({"rust-analyzer": {}}),
+        )
         .await
         .expect("warm lease");
     assert!(
@@ -2804,6 +2946,7 @@ async fn document_symbol_query_ranks_matches_before_the_window() {
     );
     let mut query = CodeIntelSymbolQuery {
         workspace: workspace.path().to_path_buf(),
+        server: None,
         path: Some(source),
         query: Some("target_late".into()),
         max_results: 1,

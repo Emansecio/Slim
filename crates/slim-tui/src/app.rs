@@ -379,13 +379,80 @@ pub struct ModelOverlay {
     pub selection_lost: bool,
 }
 
-/// `/mcp` overlay: flat server list with an inline remove confirmation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JobsOverlay {
+    pub selected: usize,
+    pub detail: bool,
+    pub output: String,
+    pub page_start: u64,
+    pub next_offset: u64,
+    pub truncated: bool,
+    pub requested: (Option<u64>, Option<u64>),
+    pub scroll: InspectorScroll,
+}
+impl Default for JobsOverlay {
+    fn default() -> Self {
+        Self {
+            selected: 0,
+            detail: false,
+            output: String::new(),
+            page_start: 0,
+            next_offset: 0,
+            truncated: false,
+            requested: (None, None),
+            scroll: InspectorScroll::FromEnd(0),
+        }
+    }
+}
+
+/// Destructive `/mcp` action armed on a server; `y`/`Enter` confirms, any
+/// other key cancels.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum McpConfirm {
+    /// Remove the server from its config file.
+    Remove(String),
+    /// Delete the server's stored OAuth credentials.
+    Logout(String),
+}
+
+impl McpConfirm {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Remove(name) | Self::Logout(name) => name,
+        }
+    }
+}
+
+/// Sign-in panel of an HTTP MCP server: the authorization URL to open and the
+/// field for a redirect URL pasted from a browser on another machine.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpSignIn {
+    pub name: String,
+    pub url: crate::api::SensitiveText,
+    pub browser_opened: bool,
+    /// Pasted redirect URL (carries the authorization code: never printed in
+    /// `Debug`).
+    pub input: crate::api::SensitiveText,
+}
+
+/// Longest pasted redirect URL the sign-in field takes.
+pub const MCP_SIGNIN_INPUT_MAX_CHARS: usize = 4_096;
+
+/// `/mcp` overlay: server list with inline confirmations, a notice row for
+/// the host's latest message (toasts are hidden while it is open) and, on top
+/// of the list, the sign-in panel.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct McpOverlay {
     pub selected: usize,
     pub viewport_start: usize,
-    /// Server name armed for removal; `y`/`Enter` confirms, `n`/`Esc` cancels.
-    pub confirm_remove: Option<String>,
+    /// Armed destructive action.
+    pub confirm: Option<McpConfirm>,
+    /// Last host notification seen while the overlay was open.
+    pub notice: Option<String>,
+    pub signin: Option<McpSignIn>,
+    /// The overlay exists only to carry the sign-in panel (`/mcp login` typed
+    /// with the manager closed): it closes when the sign-in ends.
+    pub signin_only: bool,
 }
 
 /// A single flattened row in the grouped overlay.
@@ -854,6 +921,9 @@ pub struct AppState {
     /// the skill list without re-scanning it.
     skills_revision: u64,
     pub mcp_overlay: Option<McpOverlay>,
+    pub jobs_overlay: Option<JobsOverlay>,
+    pub jobs: Vec<slim_core::runtime::ShellJobInfo>,
+    pub job_exit_confirm: Option<UiCommand>,
     pub mcp_servers: Vec<crate::api::McpServerView>,
     /// Bumped on every `McpServersChanged` so render memos key on it.
     pub mcp_revision: u64,
@@ -912,7 +982,8 @@ pub struct AppState {
     pub context_tokens: u64,
     pub context_window_tokens: u64,
     pub context_exact: bool,
-    pub compaction_status: slim_core::context::CompactionStatus,
+    /// Tokens before and after the compaction whose completion block is next.
+    compaction_tokens: Option<(u64, u64)>,
     context_run_id: Option<u64>,
     context_request_id: Option<u64>,
     pub stream_output_chars: u64,
@@ -1032,6 +1103,9 @@ impl Default for AppState {
             skill_names: Vec::new(),
             skills_revision: 0,
             mcp_overlay: None,
+            jobs_overlay: None,
+            jobs: Vec::new(),
+            job_exit_confirm: None,
             mcp_servers: Vec::new(),
             mcp_revision: 0,
             effort_overlay: None,
@@ -1073,7 +1147,7 @@ impl Default for AppState {
             context_tokens: 0,
             context_window_tokens: 0,
             context_exact: false,
-            compaction_status: slim_core::context::CompactionStatus::Idle,
+            compaction_tokens: None,
             context_run_id: None,
             context_request_id: None,
             stream_output_chars: 0,
@@ -1341,6 +1415,9 @@ impl AppState {
         skill_names: Vec<String>,
     ) {
         self.session_id = Some(session_id);
+        self.jobs.clear();
+        self.jobs_overlay = None;
+        self.job_exit_confirm = None;
         self.session_picker = None;
         self.session_title = None;
         self.set_workspace(cwd, skill_names);
@@ -1396,7 +1473,7 @@ impl AppState {
         self.context_tokens = 0;
         self.context_window_tokens = 0;
         self.context_exact = false;
-        self.compaction_status = slim_core::context::CompactionStatus::Idle;
+        self.compaction_tokens = None;
         self.context_run_id = None;
         self.context_request_id = None;
         self.stream_output_chars = 0;
@@ -1746,13 +1823,14 @@ impl AppState {
             BlockKind::Thinking(_) => true,
             BlockKind::Tool(tool) => {
                 tool.content_handle.is_some()
-                    || crate::block::consecutive_complete_tool_span(&self.blocks, index)
-                        .is_some_and(|(start, end)| {
-                            crate::block::complete_tool_count(&self.blocks, start, end) > 1
-                        })
+                    || tool.has_expanded_body()
+                    || crate::block::consecutive_settled_tool_span(&self.blocks, index).is_some_and(
+                        |(start, end)| crate::block::is_tool_group(&self.blocks, start, end),
+                    )
                     || crate::block::consecutive_identical_failed_tool_span(&self.blocks, index)
                         .is_some_and(|(start, end)| end.saturating_sub(start) > 1)
             }
+            BlockKind::QueuedUser(_) => true,
             _ => false,
         };
         foldable.then_some(&block.id)
@@ -1786,6 +1864,21 @@ impl AppState {
             return (false, None);
         };
         if matches!(self.blocks[index].kind(), BlockKind::Thinking(_)) {
+            let tool_group = self.blocks[..index]
+                .iter()
+                .rposition(crate::block::is_settled_tool)
+                .and_then(|tool_index| {
+                    crate::block::consecutive_settled_tool_span(&self.blocks, tool_index)
+                })
+                .filter(|(start, end)| {
+                    *start < index
+                        && index < *end
+                        && crate::block::is_tool_group(&self.blocks, *start, *end)
+                });
+            if let Some((start, _)) = tool_group {
+                self.blocks[start].group_expanded = true;
+                return (self.toggle_block(id), None);
+            }
             let target = crate::block::consecutive_complete_thinking_span(&self.blocks, index)
                 .filter(|(start, end)| end.saturating_sub(*start) > 1)
                 .map(|(start, _)| self.blocks[start].id.clone())
@@ -1793,30 +1886,49 @@ impl AppState {
             return (self.toggle_block(&target), None);
         }
 
-        let BlockKind::Tool(tool) = self.blocks[index].kind() else {
-            return (false, None);
-        };
-        let grouped = crate::block::consecutive_complete_tool_span(&self.blocks, index)
-            .filter(|(start, end)| {
-                crate::block::complete_tool_count(&self.blocks, *start, *end) > 1
-            })
-            .or_else(|| {
-                crate::block::consecutive_identical_failed_tool_span(&self.blocks, index)
-                    .filter(|(start, end)| end.saturating_sub(*start) > 1)
-            });
-        if let Some((start, _end)) = grouped {
-            let leader_id = self.blocks[start].id.clone();
-            self.blocks[start].fold = match self.blocks[start].fold {
-                FoldState::Expanded => FoldState::Collapsed,
-                FoldState::Auto | FoldState::Collapsed => FoldState::Expanded,
+        if let Some((start, _)) = crate::block::consecutive_queued_user_span(&self.blocks, index) {
+            let leader = &mut self.blocks[start];
+            leader.fold = if leader.fold == FoldState::Expanded {
+                FoldState::Collapsed
+            } else {
+                FoldState::Expanded
             };
             if let FollowMode::Pinned(anchor) = &mut self.scroll.mode {
-                anchor.block_id = leader_id;
+                anchor.block_id = leader.id.clone();
                 anchor.row_offset = 0;
             }
             self.revisions.fold += 1;
             return (true, None);
         }
+
+        if !matches!(self.blocks[index].kind(), BlockKind::Tool(_)) {
+            return (false, None);
+        }
+        let grouped = crate::block::consecutive_settled_tool_span(&self.blocks, index)
+            .filter(|(start, end)| crate::block::is_tool_group(&self.blocks, *start, *end))
+            .or_else(|| {
+                crate::block::consecutive_identical_failed_tool_span(&self.blocks, index)
+                    .filter(|(start, end)| end.saturating_sub(*start) > 1)
+            });
+        if let Some((start, _end)) = grouped {
+            let member_selected = self.blocks[start].group_expanded
+                && (start != index
+                    || matches!(&self.scroll.mode, FollowMode::Pinned(anchor)
+                        if &anchor.block_id == id && anchor.row_offset > 0));
+            if !member_selected {
+                let leader_id = self.blocks[start].id.clone();
+                self.blocks[start].group_expanded = !self.blocks[start].group_expanded;
+                if let FollowMode::Pinned(anchor) = &mut self.scroll.mode {
+                    anchor.block_id = leader_id;
+                    anchor.row_offset = 0;
+                }
+                self.revisions.fold += 1;
+                return (true, None);
+            }
+        }
+        let BlockKind::Tool(tool) = self.blocks[index].kind() else {
+            unreachable!("tool checked above");
+        };
         let was_expanded = self.blocks[index].fold == FoldState::Expanded;
         let has_materialized_output = !tool.materialized_output.is_empty();
         let pending = tool.pending_page.is_some();
@@ -2015,29 +2127,6 @@ impl AppState {
             self.transition_activity(ActivityPhase::QueuedTool(name));
         } else if self.working {
             self.transition_activity(ActivityPhase::AwaitingProvider);
-        }
-    }
-
-    /// Hides completed thinking previews at the next visual boundary while
-    /// preserving a block the user selected. Expanded blocks remain visible
-    /// through their fold state even after this retention flag is cleared.
-    fn release_thinking_previews(&mut self) {
-        let selected_id = self.selected_block_id().cloned();
-        let screen_selection_active = self.selection.is_some();
-        let mut changed = false;
-        for block in &mut self.blocks {
-            if !matches!(block.kind(), BlockKind::Thinking(_))
-                || !block.preview_retained
-                || screen_selection_active
-                || selected_id.as_ref() == Some(&block.id)
-            {
-                continue;
-            }
-            block.preview_retained = false;
-            changed = true;
-        }
-        if changed {
-            self.revisions.content += 1;
         }
     }
 
@@ -2773,8 +2862,50 @@ impl AppState {
         true
     }
 
+    pub fn running_jobs(&self) -> usize {
+        self.jobs
+            .iter()
+            .filter(|j| matches!(j.state.as_str(), "running" | "interrupting" | "cancelling"))
+            .count()
+    }
+
     fn apply_event_inner(&mut self, event: UiEvent) {
         match event {
+            UiEvent::JobsChanged { jobs } => {
+                let selected = self
+                    .jobs_overlay
+                    .as_ref()
+                    .and_then(|o| self.jobs.get(o.selected))
+                    .map(|j| j.id.clone());
+                self.jobs = jobs;
+                if let Some(overlay) = &mut self.jobs_overlay {
+                    let found = selected.and_then(|id| self.jobs.iter().position(|j| j.id == id));
+                    if found.is_none() {
+                        *overlay = JobsOverlay::default();
+                    }
+                    overlay.selected = found.unwrap_or(0).min(self.jobs.len().saturating_sub(1));
+                }
+                self.revisions.status += 1;
+            }
+            UiEvent::JobOutput {
+                id,
+                offset,
+                before,
+                output,
+            } => {
+                if let Some(overlay) = &mut self.jobs_overlay {
+                    if overlay.detail
+                        && overlay.requested == (offset, before)
+                        && self.jobs.get(overlay.selected).is_some_and(|j| j.id == id)
+                    {
+                        overlay.output = output.text;
+                        overlay.page_start = output.start_offset;
+                        overlay.next_offset = output.next_offset;
+                        overlay.truncated = output.next_offset < output.output_bytes;
+                        self.revisions.status += 1;
+                    }
+                }
+            }
             UiEvent::SessionSnapshot {
                 session_id,
                 cwd,
@@ -2920,7 +3051,6 @@ impl AppState {
                 } else {
                     // A genuine new run is an output boundary even if an
                     // upstream terminal was lost.
-                    self.release_thinking_previews();
                     self.terminalize_streaming(BlockLifecycle::Cancelled);
                     self.terminal_tail = None;
                     self.thinking_open = false;
@@ -2978,7 +3108,6 @@ impl AppState {
                     let explicitly_cancelled = self
                         .cancellation
                         .is_some_and(|cancellation| cancellation.run_id == run_id);
-                    self.release_thinking_previews();
                     self.terminalize_streaming(BlockLifecycle::Complete);
                     self.latest_run_assistant = None;
                     self.close_request_usage(true);
@@ -3015,7 +3144,6 @@ impl AppState {
                     let explicitly_cancelled = self
                         .cancellation
                         .is_some_and(|cancellation| cancellation.run_id == run_id);
-                    self.release_thinking_previews();
                     self.terminalize_streaming(BlockLifecycle::Cancelled);
                     self.terminalize_latest_assistant(BlockLifecycle::Cancelled);
                     self.close_request_usage(false);
@@ -3054,7 +3182,6 @@ impl AppState {
                     self.working = false;
                     self.thinking_open = false;
                     self.activity = None;
-                    self.release_thinking_previews();
                     self.terminalize_streaming(BlockLifecycle::Cancelled);
                     self.terminalize_latest_assistant(BlockLifecycle::Cancelled);
                     self.close_request_usage(false);
@@ -3080,7 +3207,6 @@ impl AppState {
                         self.cancellation
                             .is_some_and(|cancellation| cancellation.run_id == run_id)
                     });
-                    self.release_thinking_previews();
                     self.terminalize_streaming(BlockLifecycle::Failed);
                     self.terminalize_latest_assistant(BlockLifecycle::Failed);
                     self.close_request_usage(false);
@@ -3148,7 +3274,6 @@ impl AppState {
                 let terminal_tail = self.terminal_tail_lifecycle();
                 if terminal_tail.is_none() {
                     if !text.is_empty() {
-                        self.release_thinking_previews();
                         self.last_provider_content_ms = Some(self.clock.elapsed_ms);
                         self.retry = None;
                     }
@@ -3212,7 +3337,6 @@ impl AppState {
             }
             UiEvent::ThinkingStarted => {
                 if self.terminal_tail.is_none() {
-                    self.release_thinking_previews();
                     self.thinking_open = true;
                     self.transition_activity(ActivityPhase::Thinking);
                     let started_ms = self
@@ -3266,7 +3390,6 @@ impl AppState {
                 }
                 if terminal_tail.is_none() {
                     if !text.is_empty() {
-                        self.release_thinking_previews();
                         self.last_provider_content_ms = Some(self.clock.elapsed_ms);
                         self.retry = None;
                     }
@@ -3332,7 +3455,6 @@ impl AppState {
                 }) {
                     block.lifecycle = BlockLifecycle::Complete;
                     block.ended_ms = Some(self.clock.elapsed_ms);
-                    block.preview_retained = true;
                 }
                 self.blocks.retain(|block| {
                     if let BlockKind::Thinking(text) = block.kind() {
@@ -3451,9 +3573,13 @@ impl AppState {
                                 .selected
                                 .min(self.mcp_servers.len().saturating_sub(1))
                         });
-                    if let Some(name) = overlay.confirm_remove.as_ref() {
-                        if !self.mcp_servers.iter().any(|server| &server.name == name) {
-                            overlay.confirm_remove = None;
+                    if let Some(confirm) = overlay.confirm.as_ref() {
+                        if !self
+                            .mcp_servers
+                            .iter()
+                            .any(|server| server.name == confirm.name())
+                        {
+                            overlay.confirm = None;
                         }
                     }
                 }
@@ -3517,9 +3643,6 @@ impl AppState {
                 name,
                 arguments_summary,
             } => {
-                if self.terminal_tail.is_none() {
-                    self.release_thinking_previews();
-                }
                 self.admitted_tool_calls
                     .retain(|(active_batch, active_call, _)| {
                         active_batch != &batch_id || active_call != &call_id
@@ -3893,11 +4016,7 @@ impl AppState {
                     self.todo_focused = false;
                     self.todo_title_offset = 0;
                 }
-                if let Some(preference) = self.todo_dock_user_preference {
-                    self.todo_dock_open = preference;
-                } else {
-                    self.todo_dock_open = self.pending_todo_count() > 0;
-                }
+                self.todo_dock_open = self.todo_dock_user_preference.unwrap_or(false);
                 self.revisions.status += 1;
             }
             UiEvent::SessionTitleChanged { title } => {
@@ -4034,26 +4153,80 @@ impl AppState {
                 if message.starts_with("Connected:") {
                     self.dismiss_no_provider_notifications();
                 }
+                // Toasts are hidden while /mcp is open: its notice row is the
+                // only place the host's answer to an action can be read.
+                if let Some(overlay) = self.mcp_overlay.as_mut() {
+                    overlay.notice = Some(message.clone());
+                }
                 self.push_notification(message);
                 self.revisions.status += 1;
             }
+            UiEvent::McpAuthorization {
+                name,
+                url,
+                browser_opened,
+            } => {
+                // Same keyboard rules as the /mcp command: search owns keys
+                // before overlays do.
+                self.search = None;
+                let overlay = self.mcp_overlay.get_or_insert_with(|| McpOverlay {
+                    signin_only: true,
+                    ..McpOverlay::default()
+                });
+                overlay.confirm = None;
+                overlay.notice = None;
+                overlay.signin = Some(McpSignIn {
+                    name,
+                    url,
+                    browser_opened,
+                    input: crate::api::SensitiveText::default(),
+                });
+                self.revisions.status += 1;
+                self.revisions.focus += 1;
+            }
+            UiEvent::McpLoginEnded { name } => {
+                let mut close = false;
+                if let Some(overlay) = self.mcp_overlay.as_mut() {
+                    if overlay
+                        .signin
+                        .as_ref()
+                        .is_some_and(|signin| signin.name == name)
+                    {
+                        overlay.signin = None;
+                        close = overlay.signin_only;
+                    }
+                }
+                if close {
+                    self.mcp_overlay = None;
+                }
+                self.revisions.status += 1;
+                self.revisions.focus += 1;
+            }
             UiEvent::CompactionCompleted => {
-                self.compaction_status = slim_core::context::CompactionStatus::Idle;
+                let text = match self.compaction_tokens.take() {
+                    Some((before, after)) => format!(
+                        "compactação concluída · {} → {} tokens",
+                        crate::view_model::format_token_count(before),
+                        crate::view_model::format_token_count(after)
+                    ),
+                    None => "compactação concluída".to_owned(),
+                };
                 let id = self.fresh_id("compaction");
-                let mut block = Block::new(
-                    id,
-                    BlockKind::System("compactação concluída".into()),
-                    BlockLifecycle::Complete,
-                );
+                let mut block = Block::new(id, BlockKind::System(text), BlockLifecycle::Complete);
                 block.fold = FoldState::Collapsed;
                 self.blocks.push(block);
                 self.note_new_content();
                 self.revisions.content += 1;
             }
-            UiEvent::CompactionState { state, .. } => {
-                self.compaction_status = state;
-                self.revisions.status += 1;
+            UiEvent::CompactionState {
+                state: slim_core::context::CompactionStatus::Applied,
+                tokens_before,
+                tokens_after,
+                ..
+            } => {
+                self.compaction_tokens = Some((tokens_before, tokens_after));
             }
+            UiEvent::CompactionState { .. } => {}
             UiEvent::FatalError { run_id, message } => {
                 let terminal_run_id = run_id.or(self.active_run_id);
                 let explicitly_cancelled = terminal_run_id.is_some_and(|run_id| {
@@ -4063,7 +4236,6 @@ impl AppState {
                 let accepted = terminal_run_id
                     .is_none_or(|run_id| self.accept_terminal(run_id, BlockLifecycle::Failed));
                 if accepted {
-                    self.release_thinking_previews();
                     self.terminalize_streaming(BlockLifecycle::Failed);
                     self.terminalize_latest_assistant(BlockLifecycle::Failed);
                     self.close_request_usage(false);

@@ -50,6 +50,13 @@ fn read_http_request(stream: &mut TcpStream) -> Option<Value> {
         }
     }
     let text = String::from_utf8_lossy(&headers);
+    if text.starts_with("GET ") {
+        // The client's server-to-client stream: this fixture offers none.
+        stream
+            .write_all(b"HTTP/1.1 405 Method Not Allowed\r\ncontent-length: 0\r\n\r\n")
+            .ok()?;
+        return read_http_request(stream);
+    }
     let length = text.lines().find_map(|line| {
         let (name, value) = line.split_once(':')?;
         if name.eq_ignore_ascii_case("content-length") {
@@ -135,6 +142,7 @@ fn manager(url: &str) -> McpManager {
         },
         enabled: true,
         timeout: Duration::from_secs(5),
+        options: Default::default(),
     };
     McpManager::new(
         BTreeMap::from([(spec.name.clone(), spec)]),
@@ -160,7 +168,7 @@ fn healthy(request: &Value) -> Reply {
             request,
             json!({
                 "protocolVersion": "2025-11-25",
-                "capabilities": {},
+                "capabilities": {"tools": {}},
                 "serverInfo": {"name": "adv", "version": "0"},
             }),
         ),
@@ -185,6 +193,86 @@ async fn healthy_json_responses_complete_initialize_and_tools_list() {
         .collect();
     assert!(methods.contains(&"initialize".to_owned()));
     assert!(methods.contains(&"tools/list".to_owned()));
+}
+
+#[tokio::test]
+async fn rejected_initialized_notification_stops_both_connection_paths() {
+    for cancellable in [false, true] {
+        let fixture = spawn_fixture(|request| {
+            if request["method"] == "notifications/initialized" {
+                // 501 is the one 5xx that connect retries never repeat, so the
+                // rejection stops the connect after a single attempt.
+                Reply::Raw(b"HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            } else {
+                healthy(request)
+            }
+        });
+        let manager = manager(&fixture.url);
+        let result = if cancellable {
+            manager
+                .list_tools_cancellable("adv", Default::default())
+                .await
+                .into_result()
+        } else {
+            manager.list_tools("adv").await
+        };
+        assert!(
+            matches!(
+                result,
+                Err(slim_core::mcp::McpError::Server { code: 501, .. })
+            ),
+            "{result:?}"
+        );
+        let methods: Vec<_> = fixture
+            .requests
+            .try_iter()
+            .map(|request| request["method"].clone())
+            .collect();
+        assert_eq!(
+            methods,
+            vec![json!("initialize"), json!("notifications/initialized")]
+        );
+    }
+}
+
+#[tokio::test]
+async fn invalid_utf8_in_sse_is_rejected_without_replacing_data() {
+    let fixture = spawn_fixture(|request| {
+        if request["method"] == "initialize" {
+            Reply::Raw(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"text\":\"\xff\"}}\n\n")
+        } else {
+            healthy(request)
+        }
+    });
+    let error = manager(&fixture.url)
+        .test("adv")
+        .await
+        .expect_err("invalid SSE bytes must fail");
+    assert!(matches!(error, slim_core::mcp::McpError::Protocol(_)));
+    assert!(error.to_string().contains("UTF-8"), "{error}");
+}
+
+#[tokio::test]
+async fn large_sse_lines_preserve_unicode_across_http_chunks() {
+    let text = "ação🐾".repeat(16 * 1024);
+    let expected = text.clone();
+    let fixture = spawn_fixture(move |request| {
+        if request["method"] == "tools/call" {
+            let response = json!({"jsonrpc":"2.0", "id":request["id"],
+                "result":{"structuredContent":{"text":text}, "content":[]}});
+            Reply::Sse(format!(
+                "{}data: {response}\n\n",
+                ": keepalive\r\n".repeat(4096)
+            ))
+        } else {
+            healthy(request)
+        }
+    });
+    let result = manager(&fixture.url)
+        .call("adv", "unicode", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(result["structuredContent"]["text"], expected);
 }
 
 /// BUG: an initialize response carrying `"error": null` plus a valid result
@@ -443,7 +531,7 @@ async fn tools_list_without_tools_array_is_rejected() {
         |request| match request.get("method").and_then(Value::as_str) {
             Some("initialize") => result_reply(
                 request,
-                json!({"protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": {"name": "adv", "version": "0"}}),
+                json!({"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "adv", "version": "0"}}),
             ),
             Some("tools/list") => result_reply(request, json!({})),
             _ => Reply::Accepted,
@@ -474,5 +562,100 @@ async fn error_object_response_becomes_server_error() {
     assert!(
         error.to_string().contains("-32000"),
         "expected server error code, got: {error}"
+    );
+}
+
+fn tool_page(request: &Value, names: &[&str], next_cursor: Option<&str>) -> Reply {
+    let tools: Vec<Value> = names
+        .iter()
+        .map(|name| json!({"name": name, "inputSchema": {"type": "object"}}))
+        .collect();
+    let mut page = json!({"tools": tools});
+    if let Some(cursor) = next_cursor {
+        page["nextCursor"] = json!(cursor);
+    }
+    result_reply(request, page)
+}
+
+fn tools_list_requests(fixture: &Fixture) -> Vec<Value> {
+    fixture
+        .requests
+        .try_iter()
+        .filter(|request| request["method"] == "tools/list")
+        .collect()
+}
+
+#[tokio::test]
+async fn empty_next_cursor_ends_tools_pagination() {
+    let fixture = spawn_fixture(|request| {
+        if request["method"] == "tools/list" {
+            tool_page(request, &["a", "b"], Some(""))
+        } else {
+            healthy(request)
+        }
+    });
+    let manager = manager(&fixture.url);
+    let tools = manager.list_tools("adv").await.expect("connect");
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    assert_eq!(tools_list_requests(&fixture).len(), 1);
+}
+
+#[tokio::test]
+async fn repeated_next_cursor_stops_pagination_and_keeps_the_tools_received() {
+    let fixture = spawn_fixture(|request| {
+        if request["method"] != "tools/list" {
+            return healthy(request);
+        }
+        match request["params"].get("cursor").and_then(Value::as_str) {
+            None => tool_page(request, &["a"], Some("c1")),
+            Some(_) => tool_page(request, &["b"], Some("c1")),
+        }
+    });
+    let manager = manager(&fixture.url);
+    let tools = manager.list_tools("adv").await.expect("connect");
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    assert_eq!(tools_list_requests(&fixture).len(), 2);
+}
+
+#[tokio::test]
+async fn a_dropped_initialized_notification_is_retried_like_any_transient_failure() {
+    let resets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&resets);
+    let fixture = spawn_fixture(move |request| {
+        if request["method"] == "notifications/initialized"
+            && counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+        {
+            // Closes the socket without answering: a network-level failure.
+            Reply::Raw(b"")
+        } else {
+            healthy(request)
+        }
+    });
+    let manager = manager(&fixture.url);
+    assert_eq!(manager.test("adv").await.expect("retried connect"), 0);
+    let methods: Vec<_> = fixture
+        .requests
+        .try_iter()
+        .map(|request| request["method"].clone())
+        .collect();
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|method| **method == json!("initialize"))
+            .count(),
+        2,
+        "{methods:?}"
     );
 }

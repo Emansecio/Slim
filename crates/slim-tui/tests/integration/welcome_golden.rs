@@ -140,7 +140,7 @@ fn welcome_keeps_path_and_leaves_shortcuts_to_the_footer() {
     );
     let footer = lines.iter().rev().take(2).copied().collect::<Vec<_>>();
     assert!(
-        footer.iter().any(|line| line.contains("Ctrl+P")),
+        footer.iter().any(|line| line.contains("/ comandos")),
         "footer still owns commands\n{frame}"
     );
 }

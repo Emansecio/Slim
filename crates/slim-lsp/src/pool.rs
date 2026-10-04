@@ -187,6 +187,31 @@ pub struct PoolKey {
     pub config_hash: u64,
 }
 
+impl PoolKey {
+    /// One effective identity shared by normal and warm-only acquisition.
+    pub fn new(
+        root: &Path,
+        spec: &ServerSpec,
+        initialization_options: &Value,
+        settings: &Value,
+    ) -> Self {
+        let command = Path::new(&spec.command)
+            .canonicalize()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| spec.command.clone());
+        Self {
+            root: root.to_path_buf(),
+            server_id: spec.id.clone(),
+            config_hash: config_hash(&serde_json::json!({
+                "command": command,
+                "args": spec.args,
+                "initialization_options": initialization_options,
+                "settings": settings,
+            })),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct PoolConfig {
     /// Time a zero-lease server stays alive before shutdown. None keeps it
@@ -383,15 +408,12 @@ impl LspProcessPool {
         self: &Arc<Self>,
         root: PathBuf,
         spec: ServerSpec,
-        config_payload: &Value,
+        initialization_options: &Value,
+        settings: &Value,
         transport_options: crate::transport::TransportOptions,
         max_open_documents: usize,
     ) -> Result<Lease, PoolError> {
-        let key = PoolKey {
-            root: root.clone(),
-            server_id: spec.id.clone(),
-            config_hash: config_hash(config_payload),
-        };
+        let key = PoolKey::new(&root, &spec, initialization_options, settings);
 
         self.drain_orphaned_releases().await;
         loop {
@@ -504,13 +526,15 @@ impl LspProcessPool {
             // its JoinHandle detaches startup; its eventual Lease is dropped
             // normally, while other consumers still observe the shared flight.
             let this = self.clone();
-            let config_payload = config_payload.clone();
+            let initialization_options = initialization_options.clone();
+            let settings = settings.clone();
             return tokio::spawn(async move {
                 let started = this
                     .start_server(
                         root.clone(),
                         spec.clone(),
-                        &config_payload,
+                        &initialization_options,
+                        &settings,
                         transport_options.clone(),
                         max_open_documents,
                     )
@@ -605,7 +629,8 @@ impl LspProcessPool {
         &self,
         root: PathBuf,
         spec: ServerSpec,
-        config_payload: &Value,
+        initialization_options: &Value,
+        settings: &Value,
         transport_options: crate::transport::TransportOptions,
         max_open_documents: usize,
     ) -> Result<(Arc<LspServerInstance>, Option<ServerProcess>), String> {
@@ -621,8 +646,8 @@ impl LspProcessPool {
             root,
             spec,
             transport_options,
-            initialization_options: config_payload.clone(),
-            settings: config_payload.clone(),
+            initialization_options: initialization_options.clone(),
+            settings: settings.clone(),
             max_open_documents,
         };
         match LspServerInstance::open(io, stderr_tail.clone(), instance_config).await {
@@ -683,14 +708,11 @@ impl LspProcessPool {
     pub async fn acquire_warm(
         self: &Arc<Self>,
         root: &std::path::Path,
-        server_id: &str,
-        config_payload: &Value,
+        spec: &ServerSpec,
+        initialization_options: &Value,
+        settings: &Value,
     ) -> Option<Lease> {
-        let key = PoolKey {
-            root: root.to_path_buf(),
-            server_id: server_id.to_owned(),
-            config_hash: config_hash(config_payload),
-        };
+        let key = PoolKey::new(root, spec, initialization_options, settings);
         self.drain_orphaned_releases().await;
         let mut state = self.state.lock().await;
         if state.closed {
@@ -748,6 +770,16 @@ impl LspProcessPool {
             || !Arc::ptr_eq(&entry.leases, leases)
             || entry.leases.load(Ordering::Acquire) != 0
         {
+            return;
+        }
+        if entry.instance.is_closed() {
+            // A retired generation (e.g. a project input changed) serves no
+            // caller; stop its process now instead of at idle or next acquire.
+            let expected = entry.instance.clone();
+            drop(state);
+            let pool = self.clone();
+            let key = key.clone();
+            tokio::spawn(async move { pool.shutdown_if_idle(&key, &expected).await });
             return;
         }
         let Some(idle) = self.config.idle_shutdown else {
@@ -861,4 +893,52 @@ fn decrement_atomic_once(counter: &AtomicUsize) -> Option<usize> {
 fn backoff(window: Duration, failures: u32) -> Duration {
     let multiplier = 2u32.saturating_pow(failures.saturating_sub(1).min(5));
     window.saturating_mul(multiplier)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn equivalent_executable_paths_share_the_same_pool_identity() {
+        let executable = std::env::current_exe().unwrap();
+        let canonical = executable.canonicalize().unwrap();
+        let alias = executable
+            .parent()
+            .unwrap()
+            .join(".")
+            .join(executable.file_name().unwrap());
+        let canonical_spec =
+            crate::discovery::rust_analyzer_spec(canonical.to_string_lossy().into_owned());
+        let alias_spec = crate::discovery::rust_analyzer_spec(alias.to_string_lossy().into_owned());
+        assert_ne!(canonical_spec.command, alias_spec.command);
+        assert_eq!(
+            PoolKey::new(
+                Path::new("/workspace"),
+                &canonical_spec,
+                &json!({}),
+                &json!({})
+            ),
+            PoolKey::new(Path::new("/workspace"), &alias_spec, &json!({}), &json!({})),
+        );
+    }
+
+    #[test]
+    fn pool_identity_includes_command_args_initialization_and_settings() {
+        let root = Path::new("/workspace");
+        let spec = crate::discovery::rust_analyzer_spec("/bin/rust-analyzer".into());
+        let init = json!({"checkOnSave": false});
+        let settings = json!({"rust-analyzer": {"checkOnSave": false}});
+        let key = PoolKey::new(root, &spec, &init, &settings);
+        assert_eq!(key, PoolKey::new(root, &spec, &init, &settings));
+        let mut changed = spec.clone();
+        changed.command = "/other/rust-analyzer".into();
+        assert_ne!(key, PoolKey::new(root, &changed, &init, &settings));
+        changed = spec.clone();
+        changed.args.push("--other".into());
+        assert_ne!(key, PoolKey::new(root, &changed, &init, &settings));
+        assert_ne!(key, PoolKey::new(root, &spec, &json!({}), &settings));
+        assert_ne!(key, PoolKey::new(root, &spec, &init, &json!({})));
+    }
 }

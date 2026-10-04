@@ -289,14 +289,23 @@ fn compaction_checkpoint_is_additive_to_schema_v2_and_round_trips() {
             input_tokens: Some(1_000),
             output_tokens: Some(300),
             duration_ms: 25,
-            reason: CompactionReason::HardThreshold,
+            reason: CompactionReason::Threshold,
             read_files: vec!["D:\\Slim\\README.md".into()],
             modified_files: vec!["D:\\Slim\\crates\\slim-core\\src\\lib.rs".into()],
         },
     };
     let value = serde_json::to_value(&record).expect("serialize checkpoint");
     assert_eq!(value["type"], "compaction");
-    assert_eq!(value["checkpoint"]["reason"], "hard_threshold");
+    assert_eq!(value["checkpoint"]["reason"], "threshold");
+    // Checkpoints written before the Pi port name their threshold differently.
+    for legacy in ["soft_threshold", "hard_threshold"] {
+        let mut older = value.clone();
+        older["checkpoint"]["reason"] = legacy.into();
+        assert_eq!(
+            serde_json::from_value::<DurableRecord>(older).expect("legacy checkpoint"),
+            record
+        );
+    }
     assert_eq!(
         serde_json::from_value::<DurableRecord>(value).expect("deserialize checkpoint"),
         record

@@ -8,6 +8,8 @@ mod search;
 mod shell;
 mod write;
 
+pub(crate) use shell::normalize_shell_text;
+
 use crate::context::{ArtifactHandle, ArtifactStore};
 use crate::process::{
     ExecutableResolver, ProcessExecutionFacts, ProcessOutputBudget, ProcessRunner,
@@ -374,7 +376,8 @@ pub struct ToolRegistry {
     specs: &'static [ToolSpec],
     services: Arc<ToolServices>,
     artifact_store: Option<ArtifactStore>,
-    sensitive_values: Arc<[String]>,
+    pub(crate) sensitive_values: Arc<[String]>,
+    pub(crate) process_observer: Option<crate::process::ProcessObserver>,
 }
 
 #[derive(Clone, Debug)]
@@ -489,6 +492,9 @@ pub struct ToolResult {
     pub success: bool,
     pub output: String,
     pub artifact: Option<ArtifactHandle>,
+    /// Media the model sees next to `output` (MCP image content). Only
+    /// provider wires that accept images in tool results receive it.
+    pub media: Vec<crate::provider::ProviderContentBlock>,
 }
 
 impl ToolResult {
@@ -498,6 +504,7 @@ impl ToolResult {
             success,
             output: output.into(),
             artifact: None,
+            media: Vec::new(),
         }
     }
 
@@ -669,6 +676,7 @@ impl Default for ToolRegistry {
             ))),
             artifact_store: None,
             sensitive_values: Arc::from([]),
+            process_observer: None,
         }
     }
 }
@@ -689,6 +697,10 @@ fn mode_definitions_base(mode: OperatingMode) -> Arc<[Value]> {
 }
 
 impl ToolRegistry {
+    pub(crate) fn job_artifacts(&self) -> Option<ArtifactStore> {
+        self.artifact_store.clone()
+    }
+
     pub(crate) fn configure_artifacts(
         &mut self,
         store: Option<ArtifactStore>,
@@ -917,6 +929,7 @@ impl ToolRegistry {
                         success: shell.success,
                         output: shell.output,
                         artifact: shell.artifact,
+                        media: Vec::new(),
                     },
                 )));
             }
@@ -944,6 +957,7 @@ impl ToolRegistry {
                     success: executed.success,
                     output: executed.output,
                     artifact: executed.artifact,
+                    media: Vec::new(),
                 },
                 executed.dependencies,
                 executed.mutations,
@@ -961,6 +975,34 @@ impl ToolRegistry {
                 if let Some(context) = failure.context {
                     output.push('\n');
                     output.push_str(&context);
+                }
+                // A file tool aimed at a file that is not there: the name
+                // often exists in another directory. Only that failure: a
+                // write that creates a file (no `expected`) or one that failed
+                // for another reason (size, encoding) is not a wrong directory.
+                let names_existing_file = match &prepared.arguments {
+                    PreparedToolArguments::Read { .. } | PreparedToolArguments::Patch { .. } => {
+                        true
+                    }
+                    PreparedToolArguments::Write { expected, .. } => expected.is_some(),
+                    _ => false,
+                };
+                let same_name = prepared
+                    .target_paths
+                    .first()
+                    .filter(|path| {
+                        names_existing_file && !path.exists() && output.contains("does not exist")
+                    })
+                    .and_then(|path| {
+                        crate::workspace_files::same_name_files_note(
+                            &prepared.canonical_workspace,
+                            path,
+                            cancellation,
+                        )
+                    });
+                if let Some(note) = same_name {
+                    output.push('\n');
+                    output.push_str(&note);
                 }
                 (
                     ToolResult::fail(prepared.name.clone(), output),
@@ -1180,14 +1222,8 @@ impl ToolRegistry {
             display_root: prepared.canonical_workspace.clone(),
         });
         let page_len = page.entries.len();
-        let mut output = page
-            .entries
-            .iter()
-            .map(|entry| {
-                search::display_path(&prepared.canonical_workspace, entry)
-                    .display()
-                    .to_string()
-            })
+        let mut output = (0..page_len)
+            .map(|index| page.label(index, &prepared.canonical_workspace))
             .collect::<Vec<_>>()
             .join("\n");
         if let Some(cursor) = page.next_cursor {
@@ -1468,27 +1504,41 @@ impl ToolRegistry {
             },
             std::time::Duration::from_millis(*timeout_ms),
             cancellation,
-            ProcessOutputBudget::per_stream(if self.artifact_store.is_some() {
+            ProcessOutputBudget::per_stream(if let Some(observer) = &self.process_observer {
+                observer.capture_bytes
+            } else if self.artifact_store.is_some() {
                 SHELL_LOG_CAPTURE_CAP_BYTES
             } else {
                 SHELL_STREAM_CAP_BYTES
             }),
-            |progress| {
-                let line = if progress.last_line.is_empty() {
-                    "no output yet"
-                } else {
-                    &progress.last_line
-                };
-                on_progress(ToolExecutionProgress {
-                    preview: format!(
-                        "{line} · out {} B · err {} B",
-                        progress.stdout_bytes, progress.stderr_bytes
-                    ),
-                });
-            },
+            (
+                |progress| {
+                    let line = if progress.last_line.is_empty() {
+                        "no output yet"
+                    } else {
+                        &progress.last_line
+                    };
+                    on_progress(ToolExecutionProgress {
+                        preview: format!(
+                            "{line} · out {} B · err {} B",
+                            progress.stdout_bytes, progress.stderr_bytes
+                        ),
+                    });
+                },
+                self.process_observer.clone(),
+            ),
         )?;
-        let success = result.output.status.success() && !result.timed_out && !result.cancelled;
-        let mut stdout = cap_shell_stream(&result.output.stdout, result.stdout_discarded_bytes);
+        let success = !result.interrupted
+            && result.output.status.success()
+            && !result.timed_out
+            && !result.cancelled;
+        let safe_output = self
+            .process_observer
+            .as_ref()
+            .map(|observer| (observer.redacted_output)());
+        let mut stdout = safe_output.clone().unwrap_or_else(|| {
+            clean_shell_stream(&result.output.stdout, result.stdout_discarded_bytes)
+        });
         // The stderr label must start its own line even when stdout does not
         // end with a newline.
         if !stdout.is_empty() && !stdout.ends_with('\n') {
@@ -1501,19 +1551,45 @@ impl ToolRegistry {
                 result.timed_out,
                 result.cancelled,
             ),
-            cap_shell_stream(&result.output.stderr, result.stderr_discarded_bytes),
+            if safe_output.is_some() {
+                String::new()
+            } else {
+                clean_shell_stream(&result.output.stderr, result.stderr_discarded_bytes)
+            },
         );
+        if result.interrupted {
+            output.push_str(if result.interrupt_escalated {
+                "\ninterrupt=forced"
+            } else {
+                "\ninterrupt=graceful"
+            });
+        }
         if result.capture_may_be_incomplete {
             output.push_str("\n[note: pipe capture may be incomplete after interruption]");
+        }
+        if args.is_none()
+            && shell::script_shell_is_windows_powershell(&self.services.process_runner)
+        {
+            if let Some(note) = windows_powershell_syntax_note(
+                !result.output.status.success(),
+                &result.output.stdout,
+                &result.output.stderr,
+            ) {
+                output.push_str(note);
+            }
+        }
+        if result.timed_out {
+            output.push_str(
+                "\n[note: the command hit its timeout_ms and was stopped; for long work run it \
+                 with background=true and follow it with shell_job, or raise timeout_ms]",
+            );
         }
         if result.output.status.code().is_some_and(|code| code != 0)
             && !result.timed_out
             && !result.cancelled
-            && result
-                .output
-                .stderr
-                .iter()
-                .all(|byte| byte.is_ascii_whitespace())
+            && normalize_shell_text(&String::from_utf8_lossy(&result.output.stderr))
+                .chars()
+                .all(|character| character.is_ascii_whitespace())
         {
             output.push_str(
                 "\n[note: nonzero exit with empty stderr — empty stderr does not imply success; \
@@ -1551,7 +1627,18 @@ impl ToolRegistry {
                         result.stderr_discarded_bytes,
                     ),
                 );
-                let redacted = crate::runtime::redact_values(&self.sensitive_values, &log);
+                let redacted = safe_output
+                    .map(|safe| {
+                        format!(
+                            "{}\n[redacted preview; use shell_job output for full log]\n{safe}",
+                            format_shell_status_header(
+                                result.output.status.code(),
+                                result.timed_out,
+                                result.cancelled
+                            )
+                        )
+                    })
+                    .unwrap_or_else(|| crate::runtime::redact_values(&self.sensitive_values, &log));
                 match store.put("shell-log", redacted.as_bytes()) {
                     Ok(handle) => Some(handle),
                     Err(error) => {
@@ -1573,6 +1660,45 @@ impl ToolRegistry {
         executed.artifact = artifact;
         Ok(executed)
     }
+}
+
+/// Windows PowerShell rejects the whole script at parse time, before the
+/// UTF-8 setup runs, so its own message arrives localized and mis-encoded. The
+/// error id and category are neither. Models write PowerShell 7 syntax here;
+/// one note covers every parse error, the statement-separator one in detail.
+/// Only for a script that itself failed to parse: the process failed, nothing
+/// reached stdout, and the first error record on stderr is the top-level
+/// parser's (`ParserError: (:) [], ParentContainsErrorRecordException`). A parse
+/// error that a running script printed (`Invoke-Expression` reports
+/// `ParserError: (:) [Invoke-Expression], ParseException`) is not that record.
+/// Known limit: a nested `powershell` whose own script fails to parse prints
+/// the same record and is not told apart.
+fn windows_powershell_syntax_note(
+    failed: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Option<&'static str> {
+    if !failed || !stdout.iter().all(u8::is_ascii_whitespace) {
+        return None;
+    }
+    let stderr = normalize_shell_text(&String::from_utf8_lossy(stderr));
+    let first_record = stderr
+        .lines()
+        .map(str::trim_start)
+        .find(|line| line.starts_with("+ CategoryInfo"))?;
+    if !first_record.contains(": ParserError: (:) [], ParentContainsErrorRecordException") {
+        return None;
+    }
+    Some(
+        if stderr.contains("FullyQualifiedErrorId : InvalidEndOfLine") {
+            "\n[note: nothing ran — Windows PowerShell 5.1 has no `&&`/`||`; \
+             write `a; if ($?) { b }` for `a && b` and `a; if (-not $?) { b }` for `a || b`. \
+             `??`, `?.` and `?:` are unavailable too]"
+        } else {
+            "\n[note: this host is Windows PowerShell 5.1; PowerShell 7 syntax \
+             (`&&`, `||`, `??`, `?.`, `?:`) is unavailable]"
+        },
+    )
 }
 
 fn prepared_path(prepared: &PreparedToolInvocation) -> Result<PathBuf, ToolError> {
@@ -1658,7 +1784,81 @@ fn utf8_edges<'a>(head: &'a [u8], tail: &'a [u8]) -> (&'a [u8], &'a [u8], usize)
     (head, tail, omitted)
 }
 
+const CLEANED_BASIS: &str = " after terminal cleanup";
+
+/// One stream as placed into model context: terminal noise is removed first
+/// so it does not consume the cap. Clean text takes the exact byte path of
+/// `cap_shell_stream`; otherwise the cap applies to the cleaned text, and the
+/// truncation marker says its byte counts refer to that cleaned text
+/// (`previously_discarded_bytes` still counts raw capture-limit bytes).
+///
+/// After a capture-limit discard `raw` is the capture head joined to the
+/// capture tail, with the real gap at the midpoint: the halves are cleaned
+/// separately so nothing (an unterminated escape, a repeat run, a partial
+/// character) crosses the gap, and the marker stays where the gap is.
+fn clean_shell_stream(raw: &[u8], previously_discarded_bytes: usize) -> String {
+    if previously_discarded_bytes == 0 {
+        let text = String::from_utf8_lossy(raw);
+        let cleaned = normalize_shell_text(&text);
+        if cleaned == text {
+            return cap_shell_stream(raw, 0);
+        }
+        return cap_shell_bytes(cleaned.as_bytes(), 0, CLEANED_BASIS);
+    }
+    let (head, tail) = raw.split_at(raw.len().div_ceil(2));
+    let (head, tail, boundary_bytes) = utf8_edges(head, tail);
+    let (head, tail) = (String::from_utf8_lossy(head), String::from_utf8_lossy(tail));
+    let (cleaned_head, cleaned_tail) = (normalize_shell_text(&head), normalize_shell_text(&tail));
+    if cleaned_head == head && cleaned_tail == tail {
+        return cap_shell_stream(raw, previously_discarded_bytes);
+    }
+    cap_shell_gap(
+        &cleaned_head,
+        &cleaned_tail,
+        previously_discarded_bytes.saturating_add(boundary_bytes),
+    )
+}
+
+/// Caps a cleaned capture head and tail to `SHELL_STREAM_CAP_BYTES` in total,
+/// trimming at the gap (end of head, start of tail) and reporting the gap's
+/// `omitted_bytes` plus what the trim removed.
+fn cap_shell_gap(head: &str, tail: &str, omitted_bytes: usize) -> String {
+    let head_share = SHELL_STREAM_CAP_BYTES.div_ceil(2);
+    let tail_share = SHELL_STREAM_CAP_BYTES - head_share;
+    let head_limit = if tail.len() < tail_share {
+        SHELL_STREAM_CAP_BYTES - tail.len()
+    } else {
+        head_share
+    };
+    let tail_limit = if head.len() < head_share {
+        SHELL_STREAM_CAP_BYTES - head.len()
+    } else {
+        tail_share
+    };
+    let mut head_end = head.len().min(head_limit);
+    while !head.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = tail.len() - tail.len().min(tail_limit);
+    while !tail.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let omitted = omitted_bytes
+        .saturating_add(head.len() - head_end)
+        .saturating_add(tail_start);
+    format!(
+        "{}\n[truncated {omitted} bytes; kept first {head_end} and last {} bytes of this stream{CLEANED_BASIS}]\n{}",
+        &head[..head_end],
+        tail.len() - tail_start,
+        &tail[tail_start..],
+    )
+}
+
 fn cap_shell_stream(raw: &[u8], previously_discarded_bytes: usize) -> String {
+    cap_shell_bytes(raw, previously_discarded_bytes, "")
+}
+
+fn cap_shell_bytes(raw: &[u8], previously_discarded_bytes: usize, basis: &str) -> String {
     if raw.len() <= SHELL_STREAM_CAP_BYTES && previously_discarded_bytes == 0 {
         return String::from_utf8_lossy(raw).into_owned();
     }
@@ -1671,7 +1871,7 @@ fn cap_shell_stream(raw: &[u8], previously_discarded_bytes: usize) -> String {
         .saturating_add(raw.len() - retained_bytes)
         .saturating_add(boundary_bytes);
     format!(
-        "{}\n[truncated {discarded_bytes} bytes; kept first {} and last {} bytes of this stream]\n{}",
+        "{}\n[truncated {discarded_bytes} bytes; kept first {} and last {} bytes of this stream{basis}]\n{}",
         String::from_utf8_lossy(head),
         head.len(),
         tail.len(),
@@ -1747,8 +1947,8 @@ fn tool_definition(name: &str) -> Value {
             json!(["path"]),
         ),
         "shell" => (
-            "Run in workspace. Without args (or null), command is PowerShell script; with args (even []), an executable with literal arguments. .bat/.cmd keep their interpreter. For native checks, prefer command + args. In scripts, capture $LASTEXITCODE immediately after the native command, before filtering or printing, and explicitly exit with that saved code. Inspect workspace metadata before Git. Exit status alone does not validate the task. Use file tools for edits. In the agent loop, returns a job after yield_ms; continue independent work. Completion is delivered automatically; use shell_job for status/cancel, not sleep/process polling. Jobs end on run cancellation; do not detach child processes. Avoid concurrent edits to files used by a running job.",
-            json!({"command": {"type": "string"}, "args": {"type": ["array", "null"], "items": {"type": "string"}}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_MS, "default": DEFAULT_SHELL_TIMEOUT_MS}, "yield_ms": {"type": "integer", "minimum": 0, "maximum": 10000, "default": 1000}}),
+            "Run in workspace. Without args (or null), command is PowerShell script; with args (even []), an executable with literal arguments. .bat/.cmd keep their interpreter. For native checks, prefer command + args. In scripts, capture $LASTEXITCODE immediately after the native command, before filtering or printing, and explicitly exit with that saved code. Inspect workspace metadata before Git. Exit status alone does not validate the task. Use file tools for edits. In the agent loop, returns a job after yield_ms; continue independent work. Completion is delivered automatically; use shell_job to list, inspect, read output, wait, interrupt or cancel; do not poll. background=true yields immediately. TUI jobs survive responses within the session; headless waits. Run cancellation stops jobs launched by that run; do not detach child processes. Avoid concurrent edits to files used by a running job.",
+            json!({"command": {"type": "string"}, "args": {"type": ["array", "null"], "items": {"type": "string"}}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_MS, "default": DEFAULT_SHELL_TIMEOUT_MS}, "yield_ms": {"type": "integer", "minimum": 0, "maximum": 10000, "default": 1000}, "background": {"type": "boolean", "default": false}}),
             json!(["command"]),
         ),
         _ => ("Slim tool", json!({}), json!([])),
@@ -1832,6 +2032,46 @@ pub(crate) fn resolve_workspace_path_from_root(root: &Path, path: &str) -> Resul
         }
         Err(error) => Err(format!("path cannot be resolved: {error}")),
     }
+}
+
+/// Spells an absolute path that lies inside `root` as a workspace-relative
+/// one. Only the spelling changes: the result must still pass
+/// [`resolve_workspace_path_from_root`], which owns containment. `None` when
+/// the path is relative, outside the workspace, or cannot be placed.
+pub(crate) fn workspace_relative_spelling(root: &Path, path: &str) -> Option<String> {
+    let raw = Path::new(path);
+    if !raw.is_absolute() {
+        return None;
+    }
+    let relative = match raw.strip_prefix(root) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => {
+            // Canonicalize the deepest existing ancestor (so `C:\x` and
+            // `\\?\C:\x` agree) and keep the not-yet-existing tail, which a
+            // `write` may legitimately name.
+            let mut ancestor = raw;
+            let mut tail = Vec::<OsString>::new();
+            loop {
+                match fs::canonicalize(ancestor) {
+                    Ok(resolved) => {
+                        let mut relative = resolved.strip_prefix(root).ok()?.to_path_buf();
+                        relative.extend(tail.iter().rev());
+                        break relative;
+                    }
+                    Err(_) => {
+                        tail.push(ancestor.file_name()?.to_os_string());
+                        ancestor = ancestor.parent()?;
+                    }
+                }
+            }
+        }
+    };
+    let spelled = relative.to_str()?;
+    Some(if spelled.is_empty() {
+        ".".into()
+    } else {
+        spelled.into()
+    })
 }
 
 fn resolve_missing_workspace_path(root: &Path, candidate: &Path) -> Result<PathBuf, String> {
@@ -2051,6 +2291,150 @@ mod timeout_bound_tests {
         let captured = b"AAA\xc3\xa9BBB";
         let log = super::captured_shell_stream_text(captured, 10);
         assert_eq!(log, "AAA\n[12 bytes omitted by capture limit]\nBBB");
+    }
+
+    #[test]
+    fn clean_shell_stream_keeps_clean_text_on_the_exact_cap_path() {
+        let raw = format!("{}\n", "ok line".repeat(2000));
+        assert_eq!(
+            super::clean_shell_stream(raw.as_bytes(), 5),
+            super::cap_shell_stream(raw.as_bytes(), 5)
+        );
+        assert_eq!(super::clean_shell_stream(b"fine\n", 0), "fine\n");
+    }
+
+    #[test]
+    fn terminal_noise_no_longer_pushes_an_error_line_out_of_the_cap() {
+        // The error sits between repeated lines and ANSI-colored progress
+        // frames, all far larger than the cap.
+        let noise = "downloading crate foo v1.0.0\n".repeat(600);
+        let mut progress = String::new();
+        for step in 0..400 {
+            progress.push_str(&format!("\u{1b}[32m{step:>3}%\u{1b}[0m\r"));
+        }
+        let raw = format!(
+            "{noise}{progress}\nerror[E0308]: mismatched types\n{noise}{progress}\nfinished\n"
+        );
+        assert!(raw.len() > 3 * super::SHELL_STREAM_CAP_BYTES);
+        let old = super::cap_shell_stream(raw.as_bytes(), 0);
+        assert!(!old.contains("mismatched types"), "{old}");
+
+        let cleaned = super::clean_shell_stream(raw.as_bytes(), 0);
+        assert!(!cleaned.contains("[truncated"), "{cleaned}");
+        assert!(cleaned.contains("error[E0308]: mismatched types\n"));
+        assert_eq!(cleaned.matches("399%\n").count(), 2, "{cleaned}");
+        assert!(!cleaned.contains("398%"));
+        assert_eq!(
+            cleaned
+                .matches("[previous line repeated 599 more times]")
+                .count(),
+            2
+        );
+        assert!(cleaned.ends_with("finished\n"));
+        assert!(!cleaned.contains('\u{1b}') && !cleaned.contains('\r'));
+    }
+
+    /// Capture head and tail as `process.rs` joins them: equal halves, the
+    /// real gap at the midpoint.
+    fn joined_capture(head: &[u8], tail: &[u8]) -> Vec<u8> {
+        assert_eq!(head.len(), tail.len());
+        [head, tail].concat()
+    }
+
+    #[test]
+    fn cleaned_capture_gap_keeps_the_marker_at_the_gap_and_repeat_runs_apart() {
+        let line = "downloading crate foo v1.0.0\n";
+        let raw = line.repeat(100);
+        let (head, tail) = raw.as_bytes().split_at(raw.len() / 2);
+        let out = super::clean_shell_stream(&joined_capture(head, tail), 5_000_000);
+        let half = format!("{line}[previous line repeated 49 more times]\n");
+        assert_eq!(
+            out,
+            format!(
+                "{half}\n[truncated 5000000 bytes; kept first {0} and last {0} bytes of this stream after terminal cleanup]\n{half}",
+                half.len()
+            )
+        );
+    }
+
+    #[test]
+    fn cleaned_capture_gap_does_not_let_head_escapes_or_split_chars_leak_across() {
+        // Head ends in an unterminated OSC; the tail's first line must survive.
+        let head = b"first\n\x1b]0;unterminated title".to_vec();
+        let mut tail = b"next line\n".to_vec();
+        tail.resize(head.len(), b'.');
+        let out = super::clean_shell_stream(&joined_capture(&head, &tail), 777);
+        assert_eq!(
+            out,
+            format!(
+                "first\n\n[truncated 777 bytes; kept first 6 and last {0} bytes of this stream after terminal cleanup]\n{1}",
+                tail.len(),
+                String::from_utf8(tail).unwrap()
+            )
+        );
+
+        // `é` split by the gap: both partial bytes are dropped and counted.
+        let out =
+            super::clean_shell_stream(&joined_capture(b"\x1b[31mred\xc3", b"\xa9blue!!!!"), 100);
+        assert_eq!(
+            out,
+            "red\n[truncated 102 bytes; kept first 3 and last 8 bytes of this stream after terminal cleanup]\nblue!!!!"
+        );
+    }
+
+    #[test]
+    fn cleaned_capture_gap_trims_at_the_gap_when_halves_exceed_the_cap() {
+        let half = |label: &str| {
+            let mut text = String::from("\u{1b}[0m");
+            let mut index = 0;
+            while text.len() < 6000 {
+                text.push_str(&format!("{label} {index}\n"));
+                index += 1;
+            }
+            text
+        };
+        let (head, tail) = (half("head"), half("tail"));
+        let size = head.len().max(tail.len());
+        let head = format!("{head}{}", "h".repeat(size - head.len()));
+        let tail = format!("{tail}{}", "t".repeat(size - tail.len()));
+        let (cleaned_head, cleaned_tail) = (
+            super::normalize_shell_text(&head),
+            super::normalize_shell_text(&tail),
+        );
+        let out = super::clean_shell_stream(&joined_capture(head.as_bytes(), tail.as_bytes()), 42);
+        let share = super::SHELL_STREAM_CAP_BYTES / 2;
+        let (kept_head, kept_tail) = out.split_once("\n[truncated ").expect("marker");
+        assert_eq!(kept_head, &cleaned_head[..share]);
+        let (marker, kept_tail) = kept_tail.split_once("]\n").expect("marker end");
+        assert_eq!(kept_tail, &cleaned_tail[cleaned_tail.len() - share..]);
+        let omitted = 42 + (cleaned_head.len() - share) + (cleaned_tail.len() - share);
+        assert_eq!(
+            marker,
+            format!(
+                "{omitted} bytes; kept first {share} and last {share} bytes of this stream after terminal cleanup"
+            )
+        );
+    }
+
+    #[test]
+    fn cleaned_truncation_marker_counts_cleaned_bytes() {
+        let mut raw = String::from("\u{1b}[1m");
+        for index in 0..2000 {
+            raw.push_str(&format!("line {index}\r\n"));
+        }
+        let cleaned = super::normalize_shell_text(&raw);
+        let capped = super::clean_shell_stream(raw.as_bytes(), 0);
+        let cap = super::SHELL_STREAM_CAP_BYTES;
+        assert!(cleaned.len() > cap && raw.len() > cleaned.len());
+        assert!(
+            capped.contains(&format!(
+                "[truncated {} bytes; kept first {} and last {} bytes of this stream after terminal cleanup]",
+                cleaned.len() - cap,
+                cap / 2,
+                cap / 2
+            )),
+            "{capped}"
+        );
     }
 
     #[test]

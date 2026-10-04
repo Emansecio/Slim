@@ -15,8 +15,11 @@ use ratatui::buffer::Cell;
 use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
 use slim_core::{EventKind, OperatingMode, SessionEvent};
-use slim_tui::api::{LoginProvider, SessionId, UiEvent};
-use slim_tui::app::{AppState, FrameClock};
+use slim_tui::api::{
+    ContentHandle, LoginProvider, SessionId, TodoItemStatus, TodoItemView, ToolBatchId, ToolCallId,
+    UiCommand, UiEvent,
+};
+use slim_tui::app::{AppState, FollowMode, FrameClock, ScrollAnchor};
 use slim_tui::block::{Block, BlockKind, BlockLifecycle};
 use slim_tui::reducer::{reduce, Action};
 use slim_tui::render::WrapCache;
@@ -239,11 +242,29 @@ fn scenes() -> Vec<(&'static str, AppState, u16, u16)> {
 
     let mut palette = session(false);
     key(&mut palette, KeyCode::Char('p'), KeyModifiers::CONTROL);
+    let mut palette_narrow = session(false);
+    key(
+        &mut palette_narrow,
+        KeyCode::Char('p'),
+        KeyModifiers::CONTROL,
+    );
+    key(&mut palette_narrow, KeyCode::End, KeyModifiers::NONE);
     let mut slash = session(false);
     key(&mut slash, KeyCode::Char('/'), KeyModifiers::NONE);
     key(&mut slash, KeyCode::Char('m'), KeyModifiers::NONE);
     let mut model = session(false);
     key(&mut model, KeyCode::Char('l'), KeyModifiers::CONTROL);
+    let mut model_narrow = session(false);
+    key(&mut model_narrow, KeyCode::Char('l'), KeyModifiers::CONTROL);
+    let mut model_search = session(false);
+    key(&mut model_search, KeyCode::Char('l'), KeyModifiers::CONTROL);
+    for character in "lu".chars() {
+        key(
+            &mut model_search,
+            KeyCode::Char(character),
+            KeyModifiers::NONE,
+        );
+    }
     let mut read_only = session(false);
     read_only.mode = OperatingMode::ReadOnly;
     let mut plan = session(false);
@@ -382,7 +403,170 @@ fn scenes() -> Vec<(&'static str, AppState, u16, u16)> {
         duration_ms: 2_300,
     });
 
+    let mut jobs = session(false);
+    jobs.jobs = vec![
+        slim_core::runtime::ShellJobInfo {
+            id: "shell-1".into(),
+            command: "cargo test --workspace".into(),
+            origin: "user".into(),
+            state: "running".into(),
+            elapsed_ms: 1200,
+            exit_code: None,
+            output_bytes: 512,
+        },
+        slim_core::runtime::ShellJobInfo {
+            id: "shell-2".into(),
+            command: "echo concluído".into(),
+            origin: "model".into(),
+            state: "completed".into(),
+            elapsed_ms: 2400,
+            exit_code: Some(0),
+            output_bytes: 24,
+        },
+    ];
+    jobs.jobs_overlay = Some(slim_tui::app::JobsOverlay::default());
+    let mut completed = jobs.clone();
+    let overlay = completed.jobs_overlay.as_mut().unwrap();
+    overlay.selected = 1;
+    overlay.detail = true;
+    overlay.output = "    progresso  100%\nconcluído\nexit 0".into();
+    let mut warning = jobs.clone();
+    warning.job_exit_confirm = Some(slim_tui::api::UiCommand::Shutdown);
+
+    let mut todo = connected();
+    todo.apply_event(UiEvent::UserMessageAdded {
+        text: "Revise e organize a TUI.".into(),
+    });
+    todo.apply_event(UiEvent::run_started(1));
+    let mut queue = todo.clone();
+    todo.apply_event(UiEvent::TodoChanged {
+        items: vec![
+            TodoItemView {
+                id: Some(1),
+                title: "Revisar a navegação e os detalhes das ferramentas agrupadas".into(),
+                status: TodoItemStatus::InProgress,
+                reason: None,
+            },
+            TodoItemView {
+                id: Some(2),
+                title: "Validar a publicação".into(),
+                status: TodoItemStatus::Blocked,
+                reason: Some("aguardando os testes".into()),
+            },
+        ],
+    });
+    for (index, text) in [
+        "Depois, confira os atalhos de navegação.\nPreserve o rascunho ao trocar o foco.",
+        "Compare o layout em 40 e 80 colunas antes de publicar o binário.",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        queue.apply_event(UiEvent::QueuedUserAdded {
+            text: text.into(),
+            position: index + 1,
+        });
+    }
+    let mut queue_expanded = queue.clone();
+    let queue_leader = queue_expanded
+        .blocks()
+        .iter()
+        .find(|block| matches!(block.kind(), BlockKind::QueuedUser(_)))
+        .expect("queued draft")
+        .id
+        .clone();
+    reduce(&mut queue_expanded, Action::ToggleBlock(queue_leader));
+
+    let mut group = connected();
+    group.apply_event(UiEvent::UserMessageAdded {
+        text: "Corrija o parser de CRLF e mostre a alteração.".into(),
+    });
+    group.apply_event(UiEvent::run_started(1));
+    tool(
+        &mut group,
+        "detail-read",
+        "read",
+        r#"{"path":"src/parser.rs"}"#,
+        "src/parser.rs · 3 linhas",
+        true,
+    );
+    group.apply_event(UiEvent::ToolProgress {
+        batch_id: ToolBatchId("batch-detail-read".into()),
+        call_id: ToolCallId("call-detail-read".into()),
+        name: "read".into(),
+        preview: "src/parser.rs · 3 linhas".into(),
+        content_handle: Some(ContentHandle("parser-output".into())),
+    });
+    group.apply_event(UiEvent::ThinkingStarted);
+    group.apply_event(UiEvent::ThinkingDelta {
+        text: "O split conserva o CR. lines() elimina o separador inteiro e mantém a ordem das linhas.".into(),
+    });
+    group.apply_event(UiEvent::ThinkingEnded);
+    tool(
+        &mut group,
+        "detail-patch",
+        "patch",
+        r#"{"path":"src/parser.rs"}"#,
+        "patched src/parser.rs:2",
+        true,
+    );
+    group.apply_event(UiEvent::ToolDiff {
+        batch_id: ToolBatchId("batch-detail-patch".into()),
+        call_id: ToolCallId("call-detail-patch".into()),
+        diff: slim_core::ToolEditDiff {
+            path: "src/parser.rs".into(),
+            hunks: vec![slim_core::ToolEditHunk {
+                start_line: 2,
+                removed: vec!["    text.split('\\n')".into()],
+                added: vec!["    text.lines()".into()],
+            }],
+            truncated: false,
+        },
+    });
+    group.apply_event(UiEvent::RunCompleted { run_id: 1 });
+    group.clock.elapsed_ms += 1_000;
+    let group_ids: Vec<_> = group
+        .blocks()
+        .iter()
+        .filter(|block| matches!(block.kind(), BlockKind::Tool(_) | BlockKind::Thinking(_)))
+        .map(|block| block.id.clone())
+        .collect();
+    reduce(&mut group, Action::ToggleBlock(group_ids[0].clone()));
+    group.scroll.mode = FollowMode::Pinned(ScrollAnchor {
+        block_id: group_ids[0].clone(),
+        row_offset: 1,
+    });
+    let (_, command) = group.activate_block(&group_ids[0]);
+    let Some(UiCommand::RequestContentPage {
+        handle,
+        request_id,
+        cursor,
+    }) = command
+    else {
+        panic!("expanded member must request its output");
+    };
+    group.apply_event(UiEvent::ContentPageLoaded {
+        handle,
+        request_id,
+        cursor,
+        text: "fn lines(text: &str) -> impl Iterator<Item = &str> {\n    text.split('\\n')\n}"
+            .into(),
+        next_cursor: None,
+    });
+    for id in &group_ids[1..] {
+        reduce(&mut group, Action::ToggleBlock(id.clone()));
+    }
+    group.scroll.mode = FollowMode::Top;
     vec![
+        ("todo-compact-narrow", todo.clone(), 40, 8),
+        ("todo-compact-80", todo, 80, 24),
+        ("queue-collapsed", queue, 80, 24),
+        ("queue-expanded", queue_expanded, 80, 24),
+        ("tool-group-details", group, 80, 30),
+        ("jobs-list", jobs.clone(), 80, 24),
+        ("jobs-list-narrow", jobs, 40, 8),
+        ("jobs-completed-output", completed, 80, 24),
+        ("jobs-exit-warning", warning, 40, 8),
         ("welcome", connected(), 120, 30),
         ("session-running", session(true), 120, 44),
         ("session-done-80", session(false), 80, 40),
@@ -394,8 +578,11 @@ fn scenes() -> Vec<(&'static str, AppState, u16, u16)> {
         ("mode-read-only", read_only, 80, 24),
         ("mode-plan", plan, 80, 24),
         ("palette", palette, 120, 40),
+        ("palette-narrow", palette_narrow, 44, 20),
         ("slash", slash, 120, 40),
         ("model", model, 120, 40),
+        ("model-narrow", model_narrow, 80, 24),
+        ("model-search", model_search, 120, 40),
         ("mention", mention, 120, 40),
         ("resume", resume, 120, 40),
         ("rewind", rewind, 120, 40),

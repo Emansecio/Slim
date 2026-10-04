@@ -81,9 +81,41 @@ impl SessionEvent {
     }
 }
 
+impl EventKind {
+    /// The event that reports a failed automatic compaction: the run goes on
+    /// with the history it has. The detail is the live activity label, and
+    /// [`EventKind::auto_compaction_failure`] lets an interface keep it.
+    pub fn auto_compaction_failed(reason: &str) -> Self {
+        Self::ProviderPhase {
+            phase: ProviderPhase::Compacting,
+            elapsed_ms: 0,
+            detail: Some(format!("{AUTO_COMPACTION_FAILED_PREFIX}{reason}")),
+        }
+    }
+
+    /// The message of a failed automatic compaction, when this event is one.
+    pub fn auto_compaction_failure(&self) -> Option<&str> {
+        match self {
+            Self::ProviderPhase {
+                phase: ProviderPhase::Compacting,
+                detail: Some(detail),
+                ..
+            } if detail.starts_with(AUTO_COMPACTION_FAILED_PREFIX) => Some(detail),
+            _ => None,
+        }
+    }
+}
+
+/// Start of the `ProviderPhase::Compacting` detail that reports a failed
+/// automatic compaction.
+const AUTO_COMPACTION_FAILED_PREFIX: &str = "Auto-compaction failed: ";
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type")]
 pub enum EventKind {
+    ShellJobChanged {
+        job: crate::runtime::ShellJobInfo,
+    },
     SessionStarted {
         session_id: String,
     },
@@ -291,83 +323,11 @@ pub enum EventKind {
         size: u64,
     },
     CompactionCompleted,
-    CompactionAttemptStarted {
-        #[serde(default)]
-        provider: String,
-        #[serde(default)]
-        model: String,
-        #[serde(default)]
-        system_bytes: u64,
-        #[serde(default)]
-        history_bytes: u64,
-        #[serde(default)]
-        serialized_chars: u64,
-        #[serde(default)]
-        request_bytes: u64,
-        #[serde(default)]
-        estimated_input_tokens: u64,
-    },
-    CompactionAttemptCompleted {
-        #[serde(default, alias = "input_tokens")]
-        uncached_input_tokens: u64,
-        #[serde(default)]
-        cache_write_tokens: u64,
-        #[serde(default)]
-        cache_read_tokens: u64,
-        #[serde(default)]
-        output_tokens: u64,
-        #[serde(default)]
-        reasoning_tokens: u64,
-        #[serde(default)]
-        time_to_first_byte_ms: u64,
-        #[serde(default)]
-        time_to_first_semantic_ms: u64,
-        #[serde(default)]
-        duration_ms: u64,
-        #[serde(default)]
-        usage_known: bool,
-        #[serde(default)]
-        system_bytes: Option<u64>,
-        #[serde(default)]
-        history_bytes: Option<u64>,
-        #[serde(default)]
-        estimated_input_tokens: Option<u64>,
-    },
-    CompactionAttemptCancelled {
-        #[serde(default)]
-        request_bytes: u64,
-        #[serde(default)]
-        estimated_input_tokens: u64,
-        #[serde(default)]
-        time_to_first_byte_ms: u64,
-        #[serde(default)]
-        time_to_first_semantic_ms: u64,
-        #[serde(default)]
-        duration_ms: u64,
-        #[serde(default)]
-        send_started: bool,
-        #[serde(default)]
-        headers_received: bool,
-        #[serde(default)]
-        first_byte_received: bool,
-        #[serde(default)]
-        first_token_received: bool,
-    },
     CompactionUsageUnknown {
         #[serde(default)]
         estimated_input_tokens: u64,
         #[serde(default)]
         reason: String,
-    },
-    CompactionSkippedBelowBreakEven {
-        #[serde(default)]
-        projected_savings_tokens: u64,
-        #[serde(default)]
-        estimated_cost_tokens: u64,
-        #[serde(default)]
-        safety_margin_tokens: u64,
-        #[serde(default)]
-        future_turns: u8,
     },
     CompactionState {
         state: crate::context::CompactionStatus,
@@ -376,71 +336,6 @@ pub enum EventKind {
         tokens_before: u64,
         #[serde(default)]
         tokens_after: u64,
-        #[serde(default)]
-        duration_ms: u64,
-    },
-    CompactionJevPruned {
-        #[serde(default)]
-        pairs_total: u64,
-        #[serde(default)]
-        pairs_dropped: u64,
-        #[serde(default)]
-        results_truncated: u64,
-        #[serde(default)]
-        batches: u64,
-        /// Number of Jev requests that entered the bounded batch loop. Kept
-        /// separate from the legacy `batches` field so partially completed
-        /// or cancelled pruning remains observable.
-        #[serde(default)]
-        batches_started: u64,
-        #[serde(default)]
-        batches_completed: u64,
-        /// True when at least one usage component was unavailable. Confirmed
-        /// components are still retained by the usage ledger.
-        #[serde(default)]
-        usage_unknown: bool,
-        #[serde(default)]
-        estimated_saved_tokens: u64,
-        #[serde(default)]
-        input_tokens: Option<u64>,
-        #[serde(default)]
-        output_tokens: Option<u64>,
-        #[serde(default)]
-        model: Option<String>,
-        /// Jev endpoint identity. `model` is the resolved model returned by
-        /// the provider; this field records the requested model and backend
-        /// for pricing/audit decisions.
-        #[serde(default)]
-        backend: Option<String>,
-        #[serde(default)]
-        requested_model: Option<String>,
-        #[serde(default)]
-        duration_ms: u64,
-    },
-    /// Jev pruning was selected but could not complete. The ordinary failure
-    /// path uses the LLM summary; cancellation stops the compaction instead.
-    /// `detail` carries a bounded, redacted reason.
-    CompactionJevFallback {
-        #[serde(default)]
-        detail: String,
-        #[serde(default)]
-        batches: u64,
-        #[serde(default)]
-        batches_started: u64,
-        #[serde(default)]
-        batches_completed: u64,
-        #[serde(default)]
-        usage_unknown: bool,
-        #[serde(default)]
-        input_tokens: Option<u64>,
-        #[serde(default)]
-        output_tokens: Option<u64>,
-        #[serde(default)]
-        model: Option<String>,
-        #[serde(default)]
-        backend: Option<String>,
-        #[serde(default)]
-        requested_model: Option<String>,
         #[serde(default)]
         duration_ms: u64,
     },

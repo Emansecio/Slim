@@ -224,7 +224,7 @@ fn compaction_checkpoint_bounds_fail_before_state_mutation() {
         input_tokens: None,
         output_tokens: None,
         duration_ms: 0,
-        reason: CompactionReason::HardThreshold,
+        reason: CompactionReason::Threshold,
         read_files: vec![],
         modified_files: vec![],
     };

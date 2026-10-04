@@ -12,6 +12,15 @@ pub(super) struct BatchRecord<'a> {
     pub(super) event_start: usize,
 }
 
+/// What recording a batch concluded.
+pub(super) struct BatchOutcome {
+    /// A repeated failed call must stop the run.
+    pub(super) repeated_failure: bool,
+    /// Earlier tool outputs were elided, so a usage figure recorded before
+    /// the batch no longer describes the history.
+    pub(super) elided: bool,
+}
+
 /// What every phase of one batch reads; borrowed for the whole batch.
 struct BatchCtx<'a> {
     mode: crate::OperatingMode,
@@ -229,16 +238,14 @@ fn evidence_alias_outcome(
 
 impl Runtime {
     /// Appends one tool message per executed call, reports reused evidence
-    /// and folds each outcome into the loop guard. Returns whether a repeated
-    /// failed call must stop the run.
+    /// and folds each outcome into the loop guard.
     pub(super) async fn record_batch_results(
         &mut self,
         batch: BatchRecord<'_>,
         guard: &mut LoopGuard,
-        pending_background: &mut Option<PendingBackgroundCompaction>,
         messages: &mut Vec<ProviderMessage>,
         next_seq: &mut u64,
-    ) -> Result<bool, ProviderError> {
+    ) -> Result<BatchOutcome, ProviderError> {
         let BatchRecord {
             calls,
             results,
@@ -267,6 +274,7 @@ impl Runtime {
                     && tool_output_already_in_context(messages, &tool_name, text)
             };
             let duplicate_in_active_context = result.success
+                && result.media.is_empty()
                 && (already_in_context(&full_output)
                     || (full_output != result.output && already_in_context(&result.output)));
             let full_output_bytes = if full_output == pointer {
@@ -290,34 +298,31 @@ impl Runtime {
                 full_output
             };
             if duplicate_in_active_context {
-                self.push_or_cancel_background(
-                    pending_background,
+                push_runtime_event(
+                    &mut self.app,
                     next_seq,
                     crate::EventKind::ToolEvidenceReused {
                         original_bytes: full_output_bytes,
                         emitted_bytes: output.len() as u64,
                         post_compaction: false,
                     },
-                    "tool_evidence_reused",
-                )
-                .await?;
+                )?;
             }
             if reacquisitions.remove(&call.id) && !duplicate_in_active_context {
-                self.push_or_cancel_background(
-                    pending_background,
+                push_runtime_event(
+                    &mut self.app,
                     next_seq,
                     crate::EventKind::ToolEvidenceReused {
                         original_bytes: 0,
                         emitted_bytes: 0,
                         post_compaction: true,
                     },
-                    "tool_evidence_reused",
-                )
-                .await?;
+                )?;
             }
             self.append_conversation_message(
                 messages,
-                ProviderMessage::tool(tool_name, self.redact_sensitive(&call.id), output),
+                ProviderMessage::tool(tool_name, self.redact_sensitive(&call.id), output)
+                    .with_content_blocks(result.media.clone()),
             )?;
             // A volatile operation may change state even when it fails.
             // Use the existing causal boundary instead of treating its exit
@@ -366,9 +371,11 @@ impl Runtime {
             };
             repeated_failure_in_batch |= repeated_failure;
         }
+        let mut elided = false;
         if mutation_succeeded {
-            let elision = elide_superseded_tool_outputs(messages);
+            let elision = elide_superseded_tool_outputs_if_it_pays(messages);
             if elision.elided > 0 {
+                elided = true;
                 push_runtime_event(
                     &mut self.app,
                     next_seq,
@@ -380,7 +387,10 @@ impl Runtime {
                 )?;
             }
         }
-        Ok(repeated_failure_in_batch)
+        Ok(BatchOutcome {
+            repeated_failure: repeated_failure_in_batch,
+            elided,
+        })
     }
 
     pub(super) async fn prepare_provider_tool_invocations(
@@ -446,9 +456,18 @@ impl Runtime {
         let previous = self.cancellation.clone();
         let cancellation = previous.clone().unwrap_or_default();
         self.cancellation = Some(cancellation.clone());
-        let result = self
+        let started = std::time::Instant::now();
+        let mut result = self
             .execute_provider_tool_batch_inner(mode, cwd, batch_id, calls, next_seq, governor)
             .await;
+        if result.is_ok() && !calls.is_empty() {
+            let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if let Err(error) =
+                super::events::persist_tool_batch(&self.app.run_journal, batch_id, calls, wall_ms)
+            {
+                result = Err(error);
+            }
+        }
         if result.is_err() || cancellation.is_cancelled() {
             cancellation.cancel();
             cancellation.wait_for_native_work().await;
@@ -1023,8 +1042,12 @@ impl Runtime {
                 self.execute_code_intel(invocation, prepared, next_seq)
                     .await?,
             )
-        } else if invocation.name == "mcp" {
+        } else if invocation.name == "mcp"
+            || super::native_mcp_direct::is_direct_mcp_call(invocation.name)
+        {
             Some(self.execute_mcp(mode, invocation, next_seq).await?)
+        } else if invocation.name == "codemode" {
+            Some(self.execute_codemode(mode, invocation, next_seq).await?)
         } else {
             let (outcome, following) = self
                 .execute_tool_call_async(invocation, prepared, next_seq)

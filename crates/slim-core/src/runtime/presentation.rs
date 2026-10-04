@@ -65,7 +65,10 @@ impl Runtime {
 
     /// Chooses how much of each result of one tool batch enters the request:
     /// the largest common scale of the per-call targets whose projected
-    /// request still fits the window (and stays under the hard threshold).
+    /// request still fits the window. A batch that crosses the compaction
+    /// line is not squeezed to stay under it: the next turn's compaction
+    /// keeps the newest `keep_recent_tokens` verbatim, so the batch survives
+    /// and starving it would only lose data.
     pub(super) fn plan_tool_presentations<A: ProviderAdapter>(
         &self,
         ctx: &LoopCtx<'_, A>,
@@ -74,21 +77,14 @@ impl Runtime {
         batch: &PresentationBatch<'_>,
     ) -> Vec<ToolPresentation> {
         let config = st.config;
-        let compaction_policy = self.compaction_policy();
-        // The loop treats the hard threshold as inclusive (`>=`). Keep the
-        // projected request strictly below the same configured line so a
-        // newly completed tool batch does not immediately trigger a second
-        // compaction that would add summary overhead to the batch.
-        let hard_threshold = (config.context_compaction_enabled && compaction_policy.enabled)
-            .then(|| compaction_policy.hard_threshold_tokens(config.context_window_tokens));
         let plan = self.presentation_plan(batch, st.messages, &config, ctx.cwd);
         let fit = RequestFit {
             client: ctx.client,
             tools,
             mode: ctx.mode,
-            hard_threshold,
             reserve_tokens: config.context_reserve_tokens,
             window_tokens: config.context_window_tokens,
+            channel: &st.channel,
         };
         largest_fitting_scale(
             |scale| self.present_batch(&plan, scale),
@@ -97,7 +93,7 @@ impl Runtime {
     }
 
     /// The scale-independent facts of a batch, computed once.
-    fn presentation_plan<'a>(
+    pub(super) fn presentation_plan<'a>(
         &'a self,
         batch: &PresentationBatch<'a>,
         base_messages: &'a [ProviderMessage],
@@ -114,7 +110,7 @@ impl Runtime {
                     .get(&(batch.id.to_owned(), call.id.clone()))
             })
             .collect::<Vec<_>>();
-        let targets = results
+        let targets: Vec<usize> = results
             .iter()
             .zip(&sources)
             .map(|(result, source)| {
@@ -135,11 +131,42 @@ impl Runtime {
             .iter()
             .map(|call| self.redact_sensitive(&call.name))
             .collect::<Vec<_>>();
+        let duplicates: Vec<String> = names.iter().map(|name| duplicate_pointer(name)).collect();
+        // What each result needs of the batch cap: a result already in context
+        // (or repeated inside the batch) collapses to its pointer in
+        // `present_call`, so it needs no more than that.
+        let needs: Vec<usize> = (0..count)
+            .map(|index| {
+                let result = &results[index];
+                let repeated = result.success
+                    && result.media.is_empty()
+                    && duplicates[index].len() < result.output.len()
+                    && (tool_output_already_in_context(
+                        base_messages,
+                        &names[index],
+                        &result.output,
+                    ) || results[..index].iter().zip(&names).any(|(earlier, name)| {
+                        earlier.success
+                            && earlier.media.is_empty()
+                            && *name == names[index]
+                            && earlier.output == result.output
+                    }));
+                if repeated {
+                    duplicates[index].len()
+                } else {
+                    targets[index]
+                }
+            })
+            .collect();
+        let batch_cap = AgentLoopConfig::DEFAULT_MAX_BATCH_RESULT_BYTES
+            .max(config.max_result_bytes)
+            .max(self.read_presentation_bytes);
         PresentationPlan {
+            batch_limits: batch_limits(&needs, batch_cap),
             base_messages,
             calls,
             results,
-            duplicates: names.iter().map(|name| duplicate_pointer(name)).collect(),
+            duplicates,
             ids: calls
                 .iter()
                 .map(|call| self.redact_sensitive(&call.id))
@@ -155,7 +182,11 @@ impl Runtime {
     }
 
     /// Every call of the batch presented at `scale` per mille of its target.
-    fn present_batch(&self, plan: &PresentationPlan<'_>, scale: usize) -> Vec<ToolPresentation> {
+    pub(super) fn present_batch(
+        &self,
+        plan: &PresentationPlan<'_>,
+        scale: usize,
+    ) -> Vec<ToolPresentation> {
         // Duplicate detection must see the same context the assembly loop
         // will: base history plus this batch's already chosen tool
         // messages. Otherwise a repeated result inside one batch is
@@ -197,11 +228,14 @@ impl Runtime {
         // pointer. Account for that before allocating page space,
         // otherwise a tight budget can hide the duplicate behind
         // a zero-record projection and defeat evidence reuse.
-        if result.success && already_in_context(&result.output) {
+        if result.success && result.media.is_empty() && already_in_context(&result.output) {
             return ToolPresentation::complete(duplicate.clone());
         }
         let suffix = plan.suffixes[index].as_ref();
-        let allowance = plan.targets[index].saturating_mul(scale).div_ceil(1000);
+        let allowance = plan.targets[index]
+            .saturating_mul(scale)
+            .div_ceil(1000)
+            .min(plan.batch_limits[index]);
         let body_budget = allowance.saturating_sub(suffix.map_or(0, String::len));
         let mut presentation = plan.sources[index]
             .map(|source| {
@@ -218,6 +252,11 @@ impl Runtime {
                     },
                 )
             });
+        // A cut result is never longer than the result it cuts: the notice a
+        // small result would gain costs more than the result is worth.
+        if !presentation.complete && presentation.text.len() >= result.output.len() {
+            presentation = ToolPresentation::complete(result.output.clone());
+        }
         if let Some(suffix) = suffix {
             if presentation.text.len().saturating_add(suffix.len()) <= allowance {
                 presentation.text.push_str(suffix);
@@ -234,7 +273,7 @@ impl Runtime {
         // already verbatim in context (e.g. an identical
         // truncation); mirror it so the budgeted size matches
         // the emitted one.
-        if result.success && already_in_context(&presentation.text) {
+        if result.success && result.media.is_empty() && already_in_context(&presentation.text) {
             ToolPresentation::complete(duplicate.clone())
         } else {
             presentation
@@ -242,7 +281,7 @@ impl Runtime {
     }
 
     /// Whether the request with these presentations appended stays inside
-    /// the window and under the hard threshold.
+    /// the window.
     fn request_fits<A: ProviderAdapter>(
         &self,
         fit: &RequestFit<'_, A>,
@@ -251,12 +290,17 @@ impl Runtime {
     ) -> bool {
         let client = fit.client;
         let mut candidate = plan.base_messages.to_vec();
-        for ((name, id), presentation) in plan.names.iter().zip(&plan.ids).zip(presentations) {
-            candidate.push(ProviderMessage::tool(
-                name.clone(),
-                id.clone(),
-                presentation.text.clone(),
-            ));
+        for (((name, id), presentation), result) in plan
+            .names
+            .iter()
+            .zip(&plan.ids)
+            .zip(presentations)
+            .zip(plan.results)
+        {
+            candidate.push(
+                ProviderMessage::tool(name.clone(), id.clone(), presentation.text.clone())
+                    .with_content_blocks(result.media.clone()),
+            );
         }
         // The loop's preflight uses the conservative structural estimate
         // before preparing the wire request, and that estimate never
@@ -264,7 +308,7 @@ impl Runtime {
         // request envelope the structural estimate alone is the decision
         // input — the exact path the loop already takes — so transport
         // metadata is only built for adapters without the bound.
-        let overlay = self.overlay_channel(&mut candidate, fit.mode);
+        let overlay = self.overlay_channel(&mut candidate, fit.mode, fit.channel);
         let structural_chars =
             estimate_unprepared_request_chars(client.adapter(), overlay.view(), fit.tools, None);
         drop(overlay);
@@ -275,23 +319,25 @@ impl Runtime {
                 chars,
             ),
             None => {
-                let Ok(request) =
-                    self.prepare_loop_request(client, &mut candidate, fit.tools, fit.mode)
-                else {
+                let Ok(request) = self.prepare_loop_request(
+                    client,
+                    &mut candidate,
+                    fit.tools,
+                    fit.mode,
+                    fit.channel,
+                ) else {
                     return false;
                 };
                 self.token_estimator.estimate(
                     crate::provider::provider_kind_name(client.adapter().kind()),
                     client.adapter().model(),
-                    request.serialized_chars,
+                    request
+                        .serialized_chars
+                        .saturating_sub(image_payload_discount_chars(&candidate)),
                 )
             }
         };
-        let under_hard_threshold = fit
-            .hard_threshold
-            .is_none_or(|threshold| budget_estimated < threshold);
-        under_hard_threshold
-            && budget_estimated.saturating_add(fit.reserve_tokens) <= fit.window_tokens
+        budget_estimated.saturating_add(fit.reserve_tokens) <= fit.window_tokens
     }
 }
 
@@ -304,7 +350,10 @@ pub(super) struct PresentationBatch<'a> {
 
 /// The per-call facts of a batch that do not depend on the presentation
 /// scale; the names and ids are redacted.
-struct PresentationPlan<'a> {
+pub(super) struct PresentationPlan<'a> {
+    /// The most of its target each result may present so that the batch stays
+    /// within its shared budget (`usize::MAX`: no limit).
+    batch_limits: Vec<usize>,
     base_messages: &'a [ProviderMessage],
     calls: &'a [ProviderToolCall],
     results: &'a [ToolResult],
@@ -316,14 +365,44 @@ struct PresentationPlan<'a> {
     sources: Vec<Option<&'a ToolPresentationSource>>,
 }
 
+/// How much of its need each result of one batch may present so that the batch
+/// stays within `cap` bytes. A result no larger than an equal share of the cap
+/// is never reduced; the larger ones share what is left in proportion to their
+/// needs.
+fn batch_limits(needs: &[usize], cap: usize) -> Vec<usize> {
+    let total = needs
+        .iter()
+        .fold(0_usize, |sum, need| sum.saturating_add(*need));
+    if total <= cap {
+        return vec![usize::MAX; needs.len()];
+    }
+    let share = cap / needs.len().max(1);
+    let large: usize = needs
+        .iter()
+        .filter(|need| **need > share)
+        .fold(0_usize, |sum, need| sum.saturating_add(*need));
+    let remaining = cap.saturating_sub(total - large);
+    needs
+        .iter()
+        .map(|need| {
+            if *need <= share {
+                usize::MAX
+            } else {
+                usize::try_from(*need as u128 * remaining as u128 / large as u128)
+                    .unwrap_or(usize::MAX)
+            }
+        })
+        .collect()
+}
+
 /// The request envelope a presented batch must fit.
 struct RequestFit<'a, A: ProviderAdapter> {
     client: &'a HttpProviderClient<A>,
     tools: &'a [Value],
     mode: crate::OperatingMode,
-    hard_threshold: Option<u64>,
     reserve_tokens: u64,
     window_tokens: u64,
+    channel: &'a mode::ChannelFrame,
 }
 
 /// The value built at the largest scale (per mille, 0..=999) that still

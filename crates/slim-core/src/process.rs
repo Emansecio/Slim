@@ -3,6 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -280,6 +281,8 @@ pub struct ProcessRunOutput {
     pub capture_may_be_incomplete: bool,
     pub stdout_discarded_bytes: usize,
     pub stderr_discarded_bytes: usize,
+    pub interrupted: bool,
+    pub interrupt_escalated: bool,
 }
 
 /// Facts observed while running one process. These describe process
@@ -334,6 +337,25 @@ pub struct ProcessProgress {
     pub last_line: String,
 }
 
+/// Optional managed-job hooks; pipe readers serialize chunks in arrival order.
+type ProcessOutputCallback = dyn Fn(usize, &[u8], bool) + Send + Sync;
+
+#[derive(Clone)]
+pub(crate) struct ProcessObserver {
+    pub output: Arc<ProcessOutputCallback>,
+    pub redacted_output: Arc<dyn Fn() -> String + Send + Sync>,
+    pub interrupt: Arc<AtomicBool>,
+    pub grace: Duration,
+    pub capture_bytes: usize,
+}
+impl std::fmt::Debug for ProcessObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessObserver")
+            .field("grace", &self.grace)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ProcessRunner {
     resolver: ExecutableResolver,
@@ -364,6 +386,15 @@ impl ProcessRunner {
         request: ProcessRequest,
         mut on_progress: impl FnMut(ProcessProgress),
     ) -> io::Result<ProcessRunOutput> {
+        self.run_observed(request, &mut on_progress, None)
+    }
+
+    pub(crate) fn run_observed(
+        &self,
+        request: ProcessRequest,
+        mut on_progress: impl FnMut(ProcessProgress),
+        observer: Option<ProcessObserver>,
+    ) -> io::Result<ProcessRunOutput> {
         #[cfg(all(test, windows))]
         performance::mark("runner_enter");
         let program = self.resolver.resolve(&request.program)?.ok_or_else(|| {
@@ -392,20 +423,25 @@ impl ProcessRunner {
             command.process_group(0);
         }
         #[cfg(windows)]
-        let (mut child, job) = windows_job::Job::spawn(&mut command)?;
+        let (mut child, job) = windows_job::Job::spawn_managed(&mut command, observer.is_some())?;
         #[cfg(not(windows))]
         let mut child = command.spawn()?;
         #[cfg(all(test, windows))]
         performance::mark("spawn_complete");
         #[cfg(unix)]
         let pid = child.id();
+        #[cfg(unix)]
+        let _tree = UnixTree(pid);
         let stdout = child.stdout.take().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "process stdout pipe unavailable")
         })?;
         let stderr = child.stderr.take().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "process stderr pipe unavailable")
         })?;
-        let progress = Arc::new(Mutex::new(PipeProgress::default()));
+        let progress = Arc::new(Mutex::new(PipeProgress {
+            observer: observer.clone(),
+            ..PipeProgress::default()
+        }));
         let stop_reading = CancellationToken::new();
         let stdout_reader = spawn_pipe_reader(
             stdout,
@@ -427,6 +463,8 @@ impl ProcessRunner {
         let mut next_progress = Duration::from_secs(1);
         let mut timed_out = false;
         let mut cancelled = false;
+        let mut interrupt_started = None;
+        let mut interrupt_escalated = false;
         let mut capture_may_be_incomplete = false;
         let status = (|| -> io::Result<ExitStatus> {
             let mut status = None;
@@ -457,7 +495,28 @@ impl ProcessRunner {
                     .as_ref()
                     .is_some_and(CancellationToken::is_cancelled);
                 timed_out = !cancelled && started.elapsed() >= request.timeout;
-                if cancelled || timed_out {
+                if interrupt_started.is_none()
+                    && observer
+                        .as_ref()
+                        .is_some_and(|o| o.interrupt.load(Ordering::Relaxed))
+                {
+                    interrupt_started = Some(Instant::now());
+                    #[cfg(windows)]
+                    let sent = job.interrupt(child.id());
+                    #[cfg(unix)]
+                    let sent = if unsafe { libc::kill(-(pid as i32), libc::SIGINT) } == 0 {
+                        Ok(())
+                    } else {
+                        Err(io::Error::last_os_error())
+                    };
+                    if sent.is_err() {
+                        interrupt_escalated = true;
+                    }
+                }
+                interrupt_escalated |= interrupt_started
+                    .is_some_and(|at| at.elapsed() >= observer.as_ref().unwrap().grace);
+                if cancelled || timed_out || interrupt_escalated {
+                    interrupt_escalated |= interrupt_started.is_some();
                     capture_may_be_incomplete =
                         !stdout_reader.is_finished() || !stderr_reader.is_finished();
                     #[cfg(windows)]
@@ -517,7 +576,7 @@ impl ProcessRunner {
         #[cfg(all(test, windows))]
         performance::mark("readers_joined");
         let status = status.map_err(|error| {
-            let error = process_error_with_output(error, &stdout, &stderr);
+            let error = process_error_with_output(error, &stdout, &stderr, observer.as_ref());
             if capture_may_be_incomplete {
                 io::Error::new(
                     error.kind(),
@@ -540,6 +599,8 @@ impl ProcessRunner {
             capture_may_be_incomplete,
             stdout_discarded_bytes: stdout.discarded_bytes,
             stderr_discarded_bytes: stderr.discarded_bytes,
+            interrupted: interrupt_started.is_some(),
+            interrupt_escalated,
         };
         #[cfg(all(test, windows))]
         performance::mark("result_ready");
@@ -551,6 +612,18 @@ impl ProcessRunner {
         #[cfg(all(test, windows))]
         performance::mark("handles_closed");
         Ok(result)
+    }
+}
+
+#[cfg(unix)]
+struct UnixTree(u32);
+#[cfg(unix)]
+impl Drop for UnixTree {
+    fn drop(&mut self) {
+        // SAFETY: only the group created for this child is targeted.
+        unsafe {
+            libc::kill(-(self.0 as i32), libc::SIGKILL);
+        }
     }
 }
 
@@ -592,7 +665,17 @@ fn process_error_with_output(
     error: io::Error,
     stdout: &io::Result<PipeCapture>,
     stderr: &io::Result<PipeCapture>,
+    observer: Option<&ProcessObserver>,
 ) -> io::Error {
+    if let Some(observer) = observer {
+        return io::Error::new(
+            error.kind(),
+            format!(
+                "{error}\nredacted output:\n{}",
+                (observer.redacted_output)()
+            ),
+        );
+    }
     let describe = |capture: &io::Result<PipeCapture>| match capture {
         Ok(capture) => format!(
             "{}{}",
@@ -716,6 +799,7 @@ struct PipeProgress {
     stdout_bytes: usize,
     stderr_bytes: usize,
     last_line: String,
+    observer: Option<ProcessObserver>,
 }
 
 impl PipeProgress {
@@ -812,6 +896,16 @@ fn read_pipe(
         let mut progress = progress
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(observer) = &progress.observer {
+            (observer.output)(
+                match kind {
+                    PipeKind::Stdout => 0,
+                    PipeKind::Stderr => 1,
+                },
+                &chunk[..read],
+                false,
+            );
+        }
         match kind {
             PipeKind::Stdout => progress.stdout_bytes = progress.stdout_bytes.saturating_add(read),
             PipeKind::Stderr => progress.stderr_bytes = progress.stderr_bytes.saturating_add(read),
@@ -822,6 +916,19 @@ fn read_pipe(
             .find(|line| !line.trim().is_empty())
         {
             progress.last_line = bound_last_line(line);
+        }
+    }
+    {
+        let progress = progress.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(observer) = &progress.observer {
+            (observer.output)(
+                match kind {
+                    PipeKind::Stdout => 0,
+                    PipeKind::Stderr => 1,
+                },
+                &[],
+                true,
+            );
         }
     }
     let discarded_bytes = total_bytes.saturating_sub(head.len().saturating_add(tail.len()));
@@ -916,6 +1023,29 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn managed_interruption_error_never_includes_raw_cut_output() {
+        let observer = ProcessObserver {
+            output: Arc::new(|_, _, _| {}),
+            redacted_output: Arc::new(|| "[REDACTED]".into()),
+            interrupt: Arc::new(AtomicBool::new(false)),
+            grace: Duration::from_millis(50),
+            capture_bytes: 512,
+        };
+        let capture = Ok(PipeCapture {
+            bytes: b"raw-secret-fragment".to_vec(),
+            discarded_bytes: 99,
+        });
+        let error = process_error_with_output(
+            io::Error::other("termination unconfirmed"),
+            &capture,
+            &capture,
+            Some(&observer),
+        )
+        .to_string();
+        assert!(!error.contains("raw-secret"));
+        assert!(error.contains("termination unconfirmed") && error.contains("[REDACTED]"));
+    }
+    #[test]
     fn interruption_error_preserves_captured_output_and_limits() {
         let stdout = Ok(PipeCapture {
             bytes: b"partial stdout".to_vec(),
@@ -929,6 +1059,7 @@ mod tests {
             io::Error::new(io::ErrorKind::TimedOut, "termination unconfirmed"),
             &stdout,
             &stderr,
+            None,
         );
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         let message = error.to_string();
@@ -947,6 +1078,7 @@ mod tests {
                 discarded_bytes: 0,
             }),
             &Err(io::Error::other("broken reader")),
+            None,
         );
         let message = error.to_string();
         assert!(message.contains("completed effect receipt"));

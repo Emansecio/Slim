@@ -5,14 +5,13 @@
 //!   of the history and hands it back on every exit path.
 //! - A tool batch runs in phases: snapshot reads in parallel, then in call
 //!   order independent file mutations as parallel waves and every other call
-//!   alone. Serial barriers (shell, skill, MCP) fail closed: no later read runs
+//!   alone. Serial barriers (shell, skill, MCP, CodeMode) fail closed: no later read runs
 //!   ahead of a pending barrier.
 //! - `sensitive_values` has no empty entries and is sorted by decreasing length.
 //!   Streamed text and tool outputs are redacted before they reach the events,
 //!   the governor or the history; a tool call whose arguments carry a secret is
 //!   rejected, not redacted.
 //! - Cancellation is acknowledged only after native (blocking) work has stopped.
-//! - A background compaction task never outlives its handle: dropping it aborts.
 //!
 //! Modules:
 //! - `agent_loop`: the turn loop and its phases; `config`: loop config and results.
@@ -26,25 +25,23 @@
 //!   structural request size.
 //! - `recovery`: provider error policy, retry and stop-reason classification;
 //!   `manual_retry`: the user-triggered retry handle.
-//! - `compaction_foreground`, `compaction_background`, `compaction_types`, `economy`:
-//!   compaction before a request, in the background, shared types and pricing.
+//! - `compaction_foreground`, `compaction_types`, `overflow`: Pi's compaction run
+//!   before a request, its shared types, and context-overflow detection by text.
 //! - `governor`: causal progress ledger; `loop_guard`: repeated failed-call detector.
 //! - `native_*`: runtime-executed tools (artifact, ask, code_intel, mcp, skill, todo);
 //!   `shell_jobs`: run-scoped background shell jobs.
+//! - `codemode`: MCP composition and durable values; `codemode::engine`: isolated JS worker.
 //! - `cancellation`: token and native-work barrier; `capability_bridge`: durable
 //!   task state; `usage`: token accounting; `workspace`: initial path snapshot;
-//!   `mode`: mode names, write projections and the harness channel; `app_handle`:
-//!   `RuntimeHandle` alias.
+//!   `mode`: mode names, write projections and the harness channel.
 
 mod agent_loop;
-mod app_handle;
 mod cancellation;
 mod capability_bridge;
-mod compaction_background;
+mod codemode;
 mod compaction_foreground;
 mod compaction_types;
 mod config;
-mod economy;
 mod events;
 mod governor;
 mod history_elision;
@@ -55,8 +52,10 @@ mod native_artifact;
 mod native_ask;
 mod native_code_intel;
 mod native_mcp;
+mod native_mcp_direct;
 mod native_skill;
 mod native_todo;
+mod overflow;
 #[cfg(test)]
 mod performance;
 mod presentation;
@@ -76,19 +75,12 @@ mod workspace;
 #[cfg(test)]
 use agent_loop::runtime_goal_assurance;
 pub use cancellation::CancellationToken;
-use compaction_background::run_background_compaction;
-use compaction_foreground::{compaction_policy_for_window, jev_prepass_can_pay};
-use compaction_types::{
-    BackgroundCompactionObservers, BackgroundCompactionPlan, BackgroundCompactionResult,
-    CompactionAttemptProgress, CompactionOutcome, CompactionSummary, CompactionTrigger,
-    JevAttemptOutcome, LocalCompactionCommit, PendingBackgroundCompaction,
-};
+use compaction_types::{CompactionOutcome, CompactionSummary, CompactionTrigger};
 use config::ProviderTurnResult;
 pub use config::{AgentLoopConfig, AgentLoopResult, AgentLoopStop};
-pub use economy::CompactionPricing;
 use events::{
-    assistant_text_since, checked_next_seq, completed_provider_turns, drain_tool_started_notices,
-    duration_millis, elapsed_micros, elapsed_millis, journal_error, push_runtime_event,
+    assistant_text_since, checked_next_seq, drain_tool_started_notices, duration_millis,
+    elapsed_micros, elapsed_millis, journal_error, push_runtime_event,
     push_runtime_transient_event, push_tool_result_facts, push_tool_started_notice,
     replace_admission_prefix, tool_calls_since, usage_since,
 };
@@ -96,8 +88,8 @@ pub(crate) use events::{persist_provider_call, persist_provider_validation_failu
 #[cfg(test)]
 use history_elision::ElisionStats;
 use history_elision::{
-    duplicate_pointer, elide_superseded_tool_outputs, tool_output_already_in_context,
-    truncate_result,
+    duplicate_pointer, elide_superseded_tool_outputs, elide_superseded_tool_outputs_if_it_pays,
+    tool_output_already_in_context, truncate_result,
 };
 use native_artifact::artifact_read_definition;
 use native_code_intel::{prepared_code_intel_request, run_code_intel_request, EditedFiles};
@@ -120,7 +112,9 @@ use recovery::{
 use recovery::{is_context_overflow_error, provider_recovery_backoff, MAX_PROVIDER_RECOVERY_WAIT};
 pub(crate) use redaction::redact_values;
 use redaction::{redact_task_value, SensitiveValues};
-use request_estimate::{estimate_unprepared_request_chars, messages_are_text_only};
+use request_estimate::{
+    estimate_unprepared_request_chars, image_payload_discount_chars, messages_are_text_only,
+};
 #[cfg(test)]
 use stream_normalizer::sensitive_tool_arguments;
 pub(crate) use stream_normalizer::{
@@ -143,12 +137,10 @@ pub use workspace::without_workspace_snapshot;
 
 use crate::codeintel::CodeIntelligence;
 use crate::context::{
-    apply_compaction_selection, build_bounded_summary_prompt_with_checkpoint,
-    build_bounded_summary_prompt_with_checkpoint_and_instructions, compaction_prefix_fingerprint,
-    estimate_provider_message_tokens, has_compactable_history, local_emergency_summary,
-    select_compaction_history, AdaptiveTokenEstimator, ArtifactStore, CompactionCommit,
-    CompactionHandle, CompactionPolicy, CompactionReason, CompactionSelection, ContextBudget,
-    PreparedCompaction, COMPACTION_SYSTEM_PROMPT,
+    apply_compaction, canonical_prefix_fingerprint, estimate_context_tokens,
+    estimate_system_and_tools_tokens, fit_summary_for_persistence, prepare_compaction,
+    should_compact, usable_anchor, AdaptiveTokenEstimator, ArtifactStore, CompactionCommit,
+    CompactionHandle, CompactionPolicy, CompactionReason, ContextBudget, ContextUsage, UsageAnchor,
 };
 use crate::interaction::{
     ask_question_definition, AskQuestion, InteractionRequestId, InteractionRoute,
@@ -158,8 +150,7 @@ use crate::model::AppHandle;
 use crate::provider::{
     is_transient_http_status, HttpProviderClient, PreparedProviderRequest, ProviderAdapter,
     ProviderCallTelemetry, ProviderError, ProviderEvent, ProviderKind, ProviderMessage,
-    ProviderPhase, ProviderRequestComponents, ProviderToolCall, COMPACTION_MAX_OUTPUT_TOKENS,
-    STREAM_ENDED_EARLY_MESSAGE,
+    ProviderPhase, ProviderRequestComponents, ProviderToolCall, STREAM_ENDED_EARLY_MESSAGE,
 };
 use crate::session::{
     AuthorizationGrant, CapabilityCatalog, CapabilityLedgerError, DurableFact, DurableRecord,
@@ -183,16 +174,18 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 use tokio::sync::Notify;
 
-pub use app_handle::RuntimeHandle;
 pub use capability_bridge::RuntimeCapabilityBridge;
 pub use loop_guard::LoopGuard;
 pub use manual_retry::ManualRetryHandle;
 pub use mode::mode_name;
+pub use shell_jobs::{ShellJobInfo, ShellJobLimits, ShellJobOutput, ShellJobScope, ShellJobs};
 
 pub struct Runtime {
     pub app: AppHandle,
     tools: ToolRegistry,
     shell_jobs: shell_jobs::ShellJobs,
+    session_shell_jobs: bool,
+    shell_job_run_start: u64,
     artifact_store: Option<ArtifactStore>,
     restored_artifact_ids: std::collections::HashSet<String>,
     conversation: Vec<ProviderMessage>,
@@ -206,16 +199,12 @@ pub struct Runtime {
     capability_bridge: Option<RuntimeCapabilityBridge<MemoryRepo>>,
     compaction_handle: Option<CompactionHandle>,
     manual_retry: Option<ManualRetryHandle>,
-    jev_judge: Option<std::sync::Arc<dyn crate::context::JevJudge>>,
-    jev_economy: economy::JevEconomy,
-    compaction_input_cost_micros_per_million: Option<u64>,
-    compaction_pricing: Option<CompactionPricing>,
     read_presentation_bytes: usize,
     write_projection_cache: Mutex<mode::WriteProjectionCache>,
-    background_compaction_enabled: bool,
     code_intel: Option<Arc<dyn CodeIntelligence>>,
     edited: EditedFiles,
     mcp: Option<Arc<McpManager>>,
+    codemode: codemode::CodeMode,
     token_estimator: AdaptiveTokenEstimator,
     /// Skill discovery memoized for one loop run (`Runtime` is per-turn).
     /// `None` inside means discovery failed; callers fall back to direct
@@ -255,6 +244,8 @@ impl Runtime {
             app: AppHandle::fake(),
             tools: ToolRegistry::default(),
             shell_jobs: shell_jobs::ShellJobs::default(),
+            session_shell_jobs: false,
+            shell_job_run_start: 0,
             artifact_store: None,
             restored_artifact_ids: std::collections::HashSet::new(),
             conversation: Vec::new(),
@@ -268,16 +259,12 @@ impl Runtime {
             capability_bridge: None,
             compaction_handle: None,
             manual_retry: None,
-            jev_judge: None,
-            jev_economy: economy::JevEconomy::default(),
-            compaction_input_cost_micros_per_million: None,
-            compaction_pricing: None,
             read_presentation_bytes: 64 * 1024,
             write_projection_cache: Mutex::new(mode::WriteProjectionCache::default()),
-            background_compaction_enabled: false,
             code_intel: None,
             edited: EditedFiles::default(),
             mcp: None,
+            codemode: codemode::CodeMode::default(),
             token_estimator: AdaptiveTokenEstimator::default(),
             skill_discovery_cache: None,
             presentation_sources: std::collections::HashMap::new(),
@@ -293,6 +280,15 @@ impl Runtime {
     /// IDs come from artifact.v1 facts in the resumed durable session.
     pub fn restore_artifact_ids(&mut self, ids: &[String]) {
         self.restored_artifact_ids = ids.iter().cloned().collect();
+    }
+
+    pub fn set_session_shell_jobs(&mut self, jobs: ShellJobs) {
+        self.shell_jobs = jobs;
+        self.session_shell_jobs = true;
+    }
+    pub fn set_shell_job_limits(&mut self, limits: ShellJobLimits) -> Result<(), String> {
+        self.shell_jobs = ShellJobs::new(limits)?;
+        Ok(())
     }
 
     pub fn set_tool_registry(&mut self, tools: ToolRegistry) {
@@ -322,22 +318,6 @@ impl Runtime {
             .as_ref()
             .map(CompactionHandle::policy)
             .unwrap_or_default()
-    }
-
-    /// Attach the Jev judge used when the active compaction policy selects the
-    /// Jev pruning strategy. `None` leaves every run on the LLM summary path
-    /// without any TypeSafe call.
-    pub fn set_jev_judge(&mut self, judge: Option<std::sync::Arc<dyn crate::context::JevJudge>>) {
-        self.jev_economy = economy::JevEconomy::default();
-        self.jev_judge = judge;
-    }
-
-    pub fn set_compaction_input_cost_micros_per_million(&mut self, price: Option<u64>) {
-        self.compaction_input_cost_micros_per_million = price;
-    }
-
-    pub fn set_compaction_pricing(&mut self, pricing: Option<CompactionPricing>) {
-        self.compaction_pricing = pricing;
     }
 
     /// Presentation only: internal read, digest and write preconditions are unchanged.
@@ -444,10 +424,6 @@ impl Runtime {
         appended
     }
 
-    pub fn set_background_compaction_enabled(&mut self, enabled: bool) {
-        self.background_compaction_enabled = enabled;
-    }
-
     pub fn capture_turn_transcript(&mut self) {
         self.turn_transcript = Some(Vec::new());
     }
@@ -505,7 +481,7 @@ impl Runtime {
         &self.conversation
     }
 
-    fn tool_definition_set(
+    fn base_tool_definition_set(
         &self,
         mode: crate::OperatingMode,
         code_intel_enabled: bool,
@@ -559,6 +535,7 @@ impl Runtime {
             }
             if key.mcp_enabled {
                 tools.push(mcp_tool_definition());
+                tools.push(codemode::definition());
             }
         }
         let definitions: Arc<[Value]> = tools.into();

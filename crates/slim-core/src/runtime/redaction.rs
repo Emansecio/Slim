@@ -47,6 +47,18 @@ impl Runtime {
         }
     }
 
+    /// Registers the secrets the MCP manager holds now. OAuth tokens signed in
+    /// or refreshed after the run started (before an MCP request is sent) are
+    /// unknown to the snapshot taken at run start.
+    pub(super) fn refresh_mcp_secrets(&mut self) {
+        let Some(manager) = self.mcp.clone() else {
+            return;
+        };
+        for value in manager.sensitive_values() {
+            self.register_sensitive_value(value);
+        }
+    }
+
     /// Replaces every exact registered sensitive value in `input`.
     pub fn redact_sensitive(&self, input: &str) -> String {
         redact_values(&self.sensitive_values.0, input)
@@ -87,6 +99,9 @@ impl Runtime {
             return message;
         }
         message.content = self.redact_sensitive(&message.content);
+        message.recorded_content = message
+            .recorded_content
+            .map(|recorded| Arc::from(self.redact_sensitive(&recorded)));
         message.name = message.name.map(|value| self.redact_sensitive(&value));
         message.tool_call_id = message
             .tool_call_id

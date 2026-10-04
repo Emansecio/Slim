@@ -165,7 +165,7 @@ fn text_overlays_place_cursor_in_their_filter_field() {
         ..ModelOverlay::default()
     });
     let model = render(&state, 80, 20);
-    assert!(model.text.contains("Filtro: …") || model.text.contains("Filtro: 界"));
+    assert!(model.text.contains("Modelo · …") || model.text.contains("Modelo · 界"));
     assert!(model.cursor.x < 80 && model.cursor.y < 20);
     assert_cursor_visible(&model);
 }

@@ -507,7 +507,8 @@ milestone correspondente passou seu gate.
   conteúdo. Shell ativo mantém comando bounded, limite e snapshot de saída 1 Hz
   visíveis, enquanto tools concluídas continuam compactas por padrão.
   Hardening de latência (2026-08-29, G346–G354): compaction background lenta
-  deixa de ser aguardada obrigatoriamente pelo turno principal; batches formados
+  deixa de ser aguardada obrigatoriamente pelo turno principal (removido em
+  2026-10: compaction é única, Pi, sem background); batches formados
   apenas por `read`/`list`/`search`/`code_intel` executam com concorrência bounded
   4 e materializam resultados na ordem do provider, enquanto tools mutantes ou
   mistas permanecem seriais. O default operacional de output volta a 4.096 e o
@@ -524,9 +525,8 @@ milestone correspondente passou seu gate.
   OAuth devolve a credencial em memória se restam mais de 30s e refresca em
   background abaixo de 10min; só espera o HTTP de refresh se o token já
   expirou ou resta ≤30s. Path ao vivo não anexa `ProviderCache` (sem hash
-  canónico no POST). Hard threshold sem `PreparedCompaction` compacta local
-  (extract bounded, sem POST de summary); `/compact` manual e overflow
-  causal continuam no summary HTTP. Tool results no wire do próximo turno
+  canónico no POST). (O hard threshold com extract local, sem POST de
+  summary, foi removido em 2026-10.) Tool results no wire do próximo turno
   capam em 16 KiB (artifact handle acima disso). Projector em lane cheia
   espera `lane_space` (teto 50ms) em vez de `sleep(1ms)`. Gzip não entra no
   SSE. Gateways OpenCode Go/ClinePass/Command Code permanecem hops extras.
@@ -576,7 +576,10 @@ milestone correspondente passou seu gate.
   background. Os seis providers compartilham o pool HTTP do processo, com
   timeout separado de connect/idle/wall. A ActivityRail distingue compaction,
   conexão, headers, primeiro byte, primeiro evento semântico e preparação de
-  tool sem argumentos. Summary usa reasoning low e output máximo de 2.048.
+  tool sem argumentos. (O summary com reasoning low e teto de 2.048 tokens foi
+  removido em 2026-10: o summary preserva o esforço de reasoning da sessão e o
+  teto de saída é min(0,8 × reserve_tokens, limite de saída da request); ver
+  docs/reference/CLI-AND-RUNTIME.md.)
   Usage OpenCode Go (2026-08-26, G298): o wire Chat Completions pode publicar
   snapshots cumulativos terminais; o transporte mantém o máximo observado por
   componente e entrega um único total após o stream. Outros providers seguem
@@ -615,19 +618,14 @@ milestone correspondente passou seu gate.
   entrada e saída separadamente; fila de prompts tem teto 8; composer mantém
   contagem incremental e coalesce de texto para latência constante em drafts
   longos. Esses contratos são provider-agnostic e não alteram protocolo de rede;
-  Compactação Parity+ (2026-08-26, limiar G319 2026-08-27, reserva 2026-09-10):
-  política compartilhada aplica soft 60% e hard 85% em janelas abaixo de 1M,
-  soft 30% e hard 50% em janelas maiores, medidos sobre o uso da conversa (o
-  mesmo `ctx` do rodapé). `max_output` só antecipa compactação quando
-  uso+reserva excede a janela; não entra no percentual. Mantém 20k tokens
-  recentes sem separar pares assistant/tool e preserva a instrução raiz
-  literalmente. A TUI prepara
-  summary validada em background, mostra `preparing`/`ready` no contexto e
-  expõe `/compact [instruções]`; o hard boundary reutiliza somente checkpoint
-  com provider/modelo e fingerprint compatíveis. Sem prepared no hard, o loop
-  aplica extract local bounded e envia o pedido do utilizador sem esperar
-  summary HTTP. Overflow causalmente seguro compacta (HTTP) e repete uma
-  única vez. Manual `/compact` continua no summary HTTP.
+  Compactação (2026-10, substitui a Parity+ de 2026-08): há um único método, o
+  padrão do Pi portado em Rust. Dispara quando o contexto passa
+  `janela - reserve_tokens` (default 16384), mantém 20k tokens recentes
+  (`keep_recent_tokens`) e produz um único summary pelo modelo mais as listas
+  de arquivos lidos/modificados. Não há compactação em background, estados
+  `preparing`/`ready` nem extract local; `/compact [instruções]` compacta na
+  hora quando a sessão está ociosa e overflow compacta e repete uma única vez
+  (detalhes em `docs/reference/CLI-AND-RUNTIME.md`, "Compactação de contexto").
   Checkpoints schema v2 encadeiam resumo, anchor, fingerprint, usage, duração e
   inventários bounded; recovery inválido recua para o histórico integral. A
   configuração `[compaction]` é mesclada campo a campo. O mecanismo usa o mesmo
@@ -750,6 +748,113 @@ real, com degradação explícita e testes golden (G340–G341).
   arquivos ou testes unitários isolados não basta.
 
 ### 1.2 Direção visual revisada
+
+**Revisão de 04/10/2026 (leitura do pensamento):** a row de um pensamento em
+streaming deixa de rastejar a cada token e passa a dizer do que ele trata. Vale
+para qualquer provedor; não há chamada, timer nem altura nova.
+
+- **Manchete no lugar da cauda.** Depois do relógio, a row mostra o título mais
+  recente (`**Título**` dos resumos do OpenAI Responses, ou um cabeçalho
+  Markdown); sem título, a frase concluída mais recente, sem aberturas vazias
+  (`Okay,`, `So`, `Certo,`, `Então`), com inicial maiúscula e sem ponto final.
+  Frases com menos de três palavras e código cercado nunca viram manchete. A
+  manchete só muda quando outra fica pronta. Ela é reta, em `secondary_text`,
+  e cortada numa palavra com `…`. Só os últimos 4 KiB do pensamento são lidos.
+- **Cauda só enquanto nada terminou.** Sem frase concluída, a row mostra as
+  palavras mais novas como antes (itálico, um passo atrás do violeta), agora
+  cortadas numa palavra inteira. O brilho de chegada fica nessa cauda e no
+  corpo expandido; uma row com manchete não brilha, porque não tem borda de
+  escrita.
+- **Varredura contínua.** O pico de `Pensando`, do nome `Slim` e o brilho de
+  chegada têm posição e intensidade contínuas: em truecolor cada célula recebe o
+  tom exato entre o repouso e o pico, e a luz desliza entre os ticks de 83 ms em
+  vez de saltar uma célula. A borda suaviza (smoothstep sobre o halo de duas
+  células). Em 256 cores, ANSI16 e sem cor continuam os quatro degraus, com o
+  pico em negrito onde os tons não se distinguem. O ritmo da passagem não muda.
+- **Corpo expandido legível.** Os marcadores `**` somem do corpo; linhas de
+  título ficam retas e em negrito no violeta do raciocínio, o resto continua em
+  itálico. Código cercado fica intacto. A medição de altura usa a mesma regra.
+- **Partes do resumo separadas.** O adaptador Codex abre um parágrafo
+  (`\n\n`) em cada parte de resumo depois da primeira, para que o título de uma
+  parte não grude na última frase da anterior.
+
+O spinner continua azul, como todo indicador vivo. Concluído, o cabeçalho segue
+`▸ Pensou · 2.0s`, sem prévia retida. Esta revisão substitui, na revisão de
+28/09/2026 sobre o pensamento em streaming, a cauda como único conteúdo da row e
+a varredura descrita apenas em quatro passos.
+
+**Revisão de 03/10/2026 (organização, minimalismo e agrupamento):** a mesma
+informação aparecia em dois ou três lugares. Cada dado passa a ter uma fonte só,
+e o que é do mesmo assunto fica junto.
+
+- **Estado da execução no rodapé.** A ActivityRail deixa de ser uma row própria
+  acima do composer: seu conteúdo (indicador, fase ou `execução Ns`, idade sem
+  progresso, orçamentos perto do limite) é a última row do rodapé, seguido dos
+  controles que couberem. O controle vence a fase quando falta largura. A row
+  liberada vai para o transcript.
+- **Um jeito de parar por vez.** Em execução o rodapé mostra `Esc parar`;
+  depois do primeiro Esc, `Esc forçar`. `Ctrl+C` continua cancelando, mas sai do
+  rodapé. A preparação de prompt mostra `Esc cancelar preparação`.
+- **Execução concluída fica no recibo.** O rodapé só mantém o desfecho quando
+  ele pede ação (interrompida, falhou ou tarefas pendentes). Ocioso, mostra
+  `/ comandos · Shift+Tab modo · Ctrl+C sair`.
+- **Placeholder sem atalhos.** `Próxima tarefa…` ocioso e
+  `Próxima mensagem (vai para a fila)…` em execução.
+- **Fila.** A contagem fica na row do transcript (`2 na fila · …`); a borda do
+  composer mantém só o que pede ação (`fila pausada · /queue resume`,
+  `Enter enfileira`).
+- **Todo compacto sem divisória.** A divisória só separa o dock expandido;
+  plurais corretos (`1 bloqueada`, `2 bloqueadas`).
+- **Rows de ferramenta.** Um comando lê como ele mesmo: `✓ $ cargo test`,
+  `✓ ! cargo test` para o shell do usuário, sem `Executou`/`Executando`. O
+  membro expandido não mostra o `ToolCallId` nem prévia que só repete o alvo.
+- **Falhas entram no grupo.** Chamadas concluídas consecutivas agrupam mesmo
+  quando alguma falhou, desde que haja ao menos um sucesso. O grupo recolhido
+  mantém uma row por falha, um passo para dentro, com `×N` para repetições
+  idênticas. Quando a mesma chamada passa depois no grupo, a row encolhe para
+  `✕ $ cargo test · exit 101 · depois passou`, com o `✕` recuado. Falhas sem
+  sucesso no trecho continuam com a row própria ou de falhas idênticas.
+- **Pensamento em uma row.** Em streaming, `⠋ Pensando · 3s · …últimas
+  palavras`: a cauda vai na mesma row, em itálico um passo atrás do violeta,
+  cortada pela esquerda, e o brilho de chegada ilumina o fim dessa row (a
+  revisão de 04/10/2026 põe a manchete do pensamento no lugar da cauda).
+  Concluído, `▸ Pensou · 2.0s` (`Pensou ×N` quando agrupado), sem prévia retida:
+  pensamentos consecutivos agrupam assim que terminam. O texto completo continua
+  em Enter.
+- **Detalhes com abas.** Alterações, Atividade, Sessão e Diagnósticos são abas
+  de um painel só; `←→` alternam, e Ctrl+D/J/R/G abrem direto na sua aba. Painel
+  estreito mostra só a aba aberta e a posição (`Diagnósticos 4/4 ←→`). `/jobs`
+  continua uma overlay própria, por ter controles de processo.
+- **Overlays filtráveis.** Comandos, Modelo, Retomar e Voltar levam o filtro no
+  título (`Comandos · api`, `digite para filtrar` quando vazio), sem row
+  própria.
+- **Seletor de modelos.** Título `Modelo`. Cada provedor é um cabeçalho de
+  seção com régua e a contagem de modelos do grupo (`▾ OpenAI Codex ──── 4`);
+  os modelos ficam um passo para dentro, com `●` no ativo. A coluna da direita
+  diz uma coisa só: na linha focada, o esforço como medidor sobre os níveis
+  que o modelo oferece (`▰▰▰▱ High`, ASCII `###-` sem cor); no modelo ativo,
+  o esforço em uso; numa busca, o provedor de cada resultado. Uma régua separa
+  a lista do detalhe: nome, `id · provedor`, e depois `contexto 256k · saída
+  32k · imagens · velocidade Normal · só nesta sessão`. Sobre um cabeçalho, o
+  detalhe descreve o grupo (`OpenCode Go · 25 modelos`, `Enter expande o
+  grupo`). A posição conta só modelos (`1/4`). A linha `Atual:` saiu.
+- **Jobs.** Sem `exit=`: o estado diz o desfecho e o código só aparece quando
+  não é zero (`falhou · exit 2`). A overlay da lista e a confirmação ocupam só
+  as rows necessárias; `1 job`.
+- **Paleta.** Grupos por assunto: ajuda; conversa (`/resume`, `/rename`,
+  `/rewind`, `/compact`); execução (`/model`, `/model --default`, `/mode`,
+  `/image`, `/queue`, `/retry`); conta e integrações (`/login`, `/logout`,
+  `/mcp`); detalhes (`/diff`, `/activity`, `/session`, `/diagnostics`, `/jobs`).
+
+Correção de comportamento descoberta na revisão: um `↑` vindo do live edge pula
+a row em branco que não pode ser âncora, e o `↓` seguinte parava uma row antes
+do fundo. Agora uma descida cuja âncora já resolve no fundo volta ao live edge.
+
+Esta revisão substitui as prescrições conflitantes de §11.4, §11.4.1, §14.1,
+§14.4, §14.5, §15.1, §15.2.1, §15.4, §17.2 e §21, e as revisões anteriores
+deste capítulo sobre ActivityRail, cauda de duas rows do pensamento, prévia
+retida e falhas sempre em row própria. Os registros históricos de §1.1 e §30
+continuam descrevendo o passado.
 
 **Revisão de 28/09/2026 (pensamento em streaming):** o cabeçalho e o resumo de
 um pensamento em curso ganham quatro cuidados, todos só de estilo. Nada muda de
@@ -878,6 +983,23 @@ separados por uma row só com a régua. Antes o parser emitia uma régua isolada
 uma row vazia e o texto sem régua. Esta revisão substitui as prescrições
 conflitantes de §15.2.1 e §21.4, do refinamento de agrupamento de 12/09/2026 e
 da revisão de 26/09/2026 sobre a row de respiro do primeiro trecho.
+
+**Revisão de 02/10/2026 (agrupamento e detalhes progressivos):** permanece um
+único dono `● Slim` por turno. Ferramentas agrupam apenas trechos consecutivos;
+prosa e chamadas preservam a ordem do transcript. Abrir o grupo revela os
+membros, sem abrir nem buscar seus outputs. `↑↓` navegam pelas linhas e Enter
+no membro abre seu conteúdo ou solicita a próxima página; Enter no cabeçalho
+recolhe o grupo. Pensamentos concluídos entre chamadas ficam acessíveis na
+expansão. Alturas e âncoras medem todas as linhas efetivamente apresentadas,
+incluindo outputs, diffs e pensamentos abertos.
+
+O Todo começa compacto; atualizações preservam a preferência manual. Seu resumo
+mantém a contagem de bloqueios antes do título da tarefa ativa. Textos de fila
+consecutivos ficam sob uma linha recolhível, com acesso ao texto integral por
+Enter; a contagem e a pausa continuam no composer. Os blocos, o FIFO, os comandos
+de edição/remoção e o journal não mudam. `/` e Ctrl+P compartilham categorias e
+ordem de navegação; cabeçalhos não selecionáveis contam para a janela visível.
+Prefixos, habilidades e o comportamento de Tab/Enter permanecem preservados.
 
 **Revisão de 27/09/2026 (menus e seleção de modelo):** a navegação usa azul
 frio (`accent`/`border_focus = #8AADD4`) e seleção textual azul-cinza
@@ -1698,12 +1820,13 @@ visível (`interaction route unavailable`); a TUI nunca simula sucesso local.
   correlacionado pelo request ID.
 - se existirem vários requests pendentes, a interação captura o mais recente;
   requests anteriores permanecem visíveis e correlacionáveis.
-- `ActivityChanged` cobre tool, MCP e subagente. Não existe Jobs manager na TUI;
-  atividade transitória é o único inspector operacional da v1.
+- `ActivityChanged` cobre tool, MCP e subagente. `/jobs` inspeciona processos
+  da sessão conforme §15.7.1; atividade transitória mantém seu papel no turno.
 - reasoning aparece como `ThinkingBlock` recolhido por padrão; expandir é uma
   ação visual e não altera o contexto enviado ao provider.
-- mensagens aguardando execução viram `QueuedUserBlock` visível no fim do
-  transcript, em ordem FIFO, com estado `queued` até serem consumidas
+- mensagens aguardando execução viram `QueuedUserBlock` no transcript, em ordem
+  FIFO, com estado `queued` até serem consumidas; trechos consecutivos têm
+  apresentação recolhível, sem mover blocos através de saídas do agente
   (implementado em G244, 2026-08-25: Enter/Alt+Enter durante run enfileira;
   a fronteira de turno drena um prompt por vez via `PreparePrompt` com
   `PromptOrigin::Queued`).
@@ -1720,12 +1843,13 @@ persistida, a fila continua apenas em memória.
 Jobs shell no loop Auto devolvem o controle após `yield_ms` (1 s por padrão).
 O resultado inicial com `job_id`/`running` indica lançamento; a conclusão do
 processo é enviada depois ao modelo e registrada em `ToolProcessFinished`.
-O bloco da chamada original permanece ativo até a saída final `ToolJobOutput`
-e seu único `ToolFinished`; a saída final substitui o status inicial no inspetor.
-O agente pode inspecionar/cancelar via `shell_job`. Enquanto não há trabalho
-independente, o status indica espera por jobs e o runtime aguarda sem polling
-pelo modelo. Esc/cancelamento global encerra também os jobs ativos, aguardando
-seus workers. Limites e detalhes: [contrato do shell](reference/CLI-AND-RUNTIME.md).
+Na mesma execução, a saída final `ToolJobOutput` e o único `ToolFinished`
+atualizam o bloco da chamada. Entre execuções, `/jobs` mostra o estado terminal
+e a saída; a nota de conclusão mantém o ID sem associar fatos a chamadas novas.
+O agente usa `shell_job` para list/status/output/wait/interrupt/cancel, sem polling.
+Na TUI o fim da resposta libera o composer; conclusões ociosas entram como
+notas do harness no próximo prompt. Headless mantém espera ao final. Esc
+cancela jobs iniciados pelo run cancelado; a sessão encerra todos ao sair/trocar. Limites e detalhes: [contrato do shell](reference/CLI-AND-RUNTIME.md).
 
 ### 7.4.1 Seleção de Astra e velocidade Codex
 
@@ -2180,8 +2304,9 @@ Cada tool call mostra:
 
 - glyph de lifecycle;
 - verbo da tool: gerúndio em execução ou cancelada, passado ao concluir ou
-  falhar (`Lendo`/`Leu`, `Editando`/`Editou`, `Executando`/`Executou`…);
-  demais tools e blocos restaurados mantêm o nome;
+  falhar (`Lendo`/`Leu`, `Editando`/`Editou`…); um comando dispensa o verbo e
+  lê como ele mesmo (`$ comando`, `! comando` para o shell do usuário); demais
+  tools e blocos restaurados mantêm o nome;
 - alvo resumido seguro logo após o verbo, sem o prefixo `chave=`: caminho,
   `$ comando` no shell, padrão entre aspas na busca;
 - tamanho da edição do `patch` como `+N -M` (linhas alteradas por edit,
@@ -2236,14 +2361,18 @@ duração e `ContentHandle` individual. A projeção agregada não concatena out
 e não altera replay, telemetria ou contabilidade.
 
 Ao expandir, o header permanece e os membros aparecem em ordem original com
-`ToolCallId`, nome, argumentos seguros, duração e preview. A expansão não busca
+nome, argumentos seguros, duração e preview; o `ToolCallId` é identidade
+interna e não aparece, nem a prévia que só repete o alvo. A expansão não busca
 outputs automaticamente; cada `ContentHandle` continua pertencendo ao membro.
+Enter no membro abre os detalhes e solicita páginas pelo contrato individual
+existente. O estado do cabeçalho é independente do estado desses detalhes.
 
 Regras normativas:
 
-- o grupo termina quando aparece um bloco que não é tool concluída com sucesso
-  (thinking, assistant, user, failed ou cancelled); `ToolBatchId` distinto
-  **não** quebra o grupo;
+- o grupo termina em prosa, prompt ou cancelamento; uma failure não o quebra
+  quando o trecho tem ao menos um sucesso. Pensamentos concluídos entre tools
+  são pontes e aparecem nos detalhes do grupo, onde podem ser abertos.
+  `ToolBatchId` distinto **não** quebra o grupo;
 - argumento/target não aparece na row agregada; fica nos detalhes;
 - o header usa resumo verbal (`Read 3 files`, `Ran shell`, `Edited`), não
   `N tools · name ×N`; se a largura não comportar, degrada para
@@ -2253,11 +2382,16 @@ Regras normativas:
 - uma call que acaba de concluir com sucesso permanece na própria row por 249 ms,
   a mesma janela da ênfase, e só então entra no grupo; reduced motion agrega no
   mesmo frame. `Enter` continua no grupo lógico, mesmo durante essa janela;
-- failed e cancelled sempre ocupam row própria com razão curta; um alvo
-  reconhecido (caminho, comando, padrão) pode aparecer ajustado à largura, com
-  prioridade menor que a razão; segmentos `key=value` desconhecidos e telemetria
-  (`out `, `err `) não entram na row colapsada; comando/target completos ficam
-  na expansão; nunca somem numa contagem;
+- uma failure dentro do grupo nunca some numa contagem: o grupo recolhido
+  mantém uma row por failure, um passo para dentro do header, com a razão curta
+  e `×N` para repetições idênticas consecutivas; quando a mesma chamada (nome e
+  argumentos) conclui com sucesso depois no grupo, a row encolhe para alvo,
+  primeira razão e `depois passou`, com o `✕` recuado. Failures sem sucesso no
+  trecho e cancelled ocupam row própria com razão curta; um alvo reconhecido
+  (caminho, comando, padrão) pode aparecer ajustado à largura, com prioridade
+  menor que a razão; segmentos `key=value` desconhecidos e telemetria (`out `,
+  `err `) não entram na row colapsada; comando/target completos ficam na
+  expansão;
 - a row concluída recolhida omite `exit 0` e o recibo textual de
   `patch`/`write`, já expressos pelo `✓` e por `+N -M`; a expansão conserva o
   resultado integral;
@@ -2265,8 +2399,8 @@ Regras normativas:
   do próprio batch sem atravessar failure/cancel;
 - o glyph ocupa a coluna da rail; o texto da tool começa no mesmo eixo das
   mensagens;
-- `Enter` expande o grupo inline, sem overlay e sem scroll aninhado; `Enter`
-  novamente recolhe;
+- `Enter` no cabeçalho expande/recolhe o grupo inline, sem overlay e sem scroll
+  aninhado; no membro, abre/recolhe seus detalhes ou solicita a próxima página;
 - em live edge, `Enter` simples com composer vazio ativa diretamente o último
   bloco recolhível visível; não exige um `Up` preparatório e não muda o scroll;
 - a expansão é completa e pode crescer verticalmente porque só ocorre por ação
@@ -2471,13 +2605,11 @@ vai a `Top`; `End` volta a `LiveEdge` sem prompt preso.
   SLIM · cwd
   Conversa na coluna de leitura                 Inspector?
   Todo compacto, quando existir
-  ○ Atividade atual · elapsed
   ╭──────────────────────────────────────────╮
   │> draft                                   │
   ╰──────────────────────────────────────────╯
-  Auto · Shift+Tab mode
-  model (effort) · ctx ~42%
-  / commands · Ctrl+P · Ctrl+C exit
+  Auto · model (effort) · ctx ~42%
+  ⠋ Atividade atual · elapsed · Esc parar     (ocioso: / comandos · Shift+Tab modo)
 ```
 
 O workspace ocupa toda a largura disponível do terminal. Conversa, composer,
@@ -2496,8 +2628,9 @@ histórico longo preserva o page-fill e a âncora de leitura existentes.
 largura >=80 e altura >=12. Cwd trivial, welcome e emergência não gastam essa
 row. Contexto fica no footer; nenhuma rail repete contadores ou estado READY.
 
-`ActivityRail` ocupa zero ou uma row acima do composer e abaixo do Todo. Mostra
-fase e elapsed reais; near-limit continua warning. O indicador é o spinner
+A ActivityRail não ocupa row própria (revisão de 03/10/2026): é a última row
+do rodapé enquanto há execução ou atividade, seguida dos controles que couberem.
+Mostra fase e elapsed reais; near-limit continua warning. O indicador é o spinner
 braille de dez quadros, um por tick de 83 ms (§1.2, revisão de 28/09/2026).
 Com o cabeçalho Thinking visível, quem anima é a célula desse cabeçalho, nunca
 os dois. Tools no transcript mantêm marcadores estáticos e mostram o relógio de
@@ -2525,14 +2658,15 @@ composer. Não é sidebar, drawer nem overlay.
 | Condição | Altura do dock | Conteúdo |
 |---|---:|---|
 | sem Todo ativo | 0 rows | dock ausente |
-| Todo ativo, estado compacto | 1 row | progresso + item ativo |
+| Todo ativo, compacto por padrão | 1 row | progresso + bloqueios + item ativo |
 | Todos concluídos/cancelados | 1 row | resumo recolhido; Ctrl+T expande |
 | terminal com altura `<10` | 1 row | progresso + item ativo truncado |
 | estado expandido | até 6 rows | resumo, lista navegável e rodapé de navegação/atualização |
 
 Regras:
 
-- mesma posição em qualquer largura;
+- mesma posição em qualquer largura; começa compacto, e atualizações mantêm
+  a escolha manual de expansão/recolhimento;
 - expandir faz reflow do scrollback; nunca cobre conteúdo;
 - items não fazem wrap no modo compacto; usam ellipsis;
 - `Ctrl+T` alterna compacto/expandido;
@@ -2569,11 +2703,10 @@ Prioridade quando a altura diminui dentro do mínimo suportado (`40×8`):
 
 1. preservar ao menos uma row editável do composer e a operational bar mínima;
 2. reduzir rows de metadata; ocultar SessionRail;
-3. ocultar ActivityRail e mover estado ativo para a operational bar;
-4. remover divider do Todo;
-5. reduzir Todo dock de duas para uma row, depois ocultá-lo;
-6. entregar todo espaço restante ao scrollback;
-7. overlays aplicam scroll interno.
+3. remover divider do Todo expandido (o compacto não tem);
+4. reduzir Todo dock de duas para uma row, depois ocultá-lo;
+5. entregar todo espaço restante ao scrollback;
+6. overlays aplicam scroll interno.
 
 Em altura `>=16`, o composer cresce sem animação até cinco rows de conteúdo
 (sete com borda). Entre `8–15`, preserva uma row de conteúdo no box de três
@@ -2587,7 +2720,7 @@ layout. O planner valida invariantes e retorna layout de emergência explícito.
 
 Para terminal menor que 40×8:
 
-- esconder SessionRail, inspector e ActivityRail;
+- esconder SessionRail e inspector; a atividade segue na row do rodapé;
 - manter Todo ativo em uma linha truncada;
 - uma linha de operational bar mínima;
 - uma linha de composer sem box;
@@ -2604,8 +2737,11 @@ esquerda. O estado comum usa duas rows (modo+modelo/esforço/contexto, controles
 quando a altura permite; alturas menores oferecem uma row priorizando
 fase/cancelamento, login ou live edge. Informação adicional deve justificar
 qualquer altura extra. O planner reduz metadata antes de sacrificar a edição.
-Durante execução os atalhos passam a Esc stop / Esc×2 force / Ctrl+C cancel;
-pinned conserva unseen / End latest também durante o run. O valor ativo usa
+Durante execução a última row é a da atividade seguida de `Esc parar`, e
+depois do primeiro Esc, `Esc forçar`; `Ctrl+C` continua cancelando sem ocupar o
+rodapé. Pinned conserva unseen / End latest também durante o run. Ocioso, o
+rodapé mostra `/ comandos · Shift+Tab modo · Ctrl+C sair`; o desfecho da última
+execução só aparece quando pede ação (interrompida, falhou ou com pendências). O valor ativo usa
 accent, enquanto descrições e atalhos usam texto secundário.
 
 O nome do modelo é abreviado por células/graphemes, preservando esforço e
@@ -2625,7 +2761,7 @@ e stderr/stdout de shell sem sucesso; o output integral permanece nos detalhes. 
 byte-stable; `--verbose --jsonl` é inválido.
 
 ```text
-^C stop                                      ctx ~42% · ↑0 ↓0
+⠋ Pensando · 8s · Esc parar
 ```
 
 `SLIM` aparece no empty state, não como branding permanente no footer. O footer
@@ -2644,9 +2780,14 @@ Responsabilidades:
 - fornecer seleção/copy/search.
 - renderizar input/approval como bloco inline: pergunta/summary, opções ou hint
   `Y approve · N reject`, estado persisted/ephemeral e ack aceito/rejeitado;
-- `ask_question` pendente: cartão contido (máx. 72 colunas, alinhado ao composer) acima do
-  composer, título `Question`, opções `[x]`/`[ ]`; `1`–`5` selecionam sem
-  aparecer no chrome. Após ack, bloco compacto no transcript.
+- `ask_question` pendente: dropdown apoiado na borda superior do composer, na
+  largura dele e sem título (mesma silhueta dos popups `/` e `@`); o texto
+  quebra em até 72 colunas e o hint de teclas fica no rótulo do composer;
+  `1`–`5` selecionam sem aparecer no chrome. Ao digitar resposta livre, o foco
+  permanece em `Outro...`. Após ack, registro de duas linhas na grade do
+  transcript: `  ? pergunta` e `  → resposta` (marcadores na coluna 2).
+  A opção com foco mantém `>` e fundo neutro de seleção nas linhas de label
+  e descrição, sem animação adicional nem dependência exclusiva de cor.
 
 Não interpreta `AgentEvent`; recebe blocks já materializados.
 
@@ -2681,12 +2822,13 @@ o `row_offset` dentro da nova altura.
   coluna 4, como o corpo do prompt. H1 permanece em `assistant_accent`. Medição
   (`leading_rows`), materialização, caches e projeção textual derivam o
   cabeçalho da mesma função sobre os vizinhos;
-- thinking colapsado ocupa uma row em `reasoning_accent` (`▸ Pensamento`) quando completo;
-  `▾` indica expandido; seleção mostra `Enter expand`/`Enter collapse` se couber.
-  em streaming, `{spinner} Thinking` é seguido pela cauda atualizada de até
-  duas rows físicas dos 256 grafemas finais do reasoning, com `…` quando o
-  início ficou oculto; preview e corpo usam inset de quatro células. O corpo
-  completo só aparece com `fold == Expanded`;
+- thinking ocupa uma row: concluído, `▸ Pensou · 2.0s` em `reasoning_accent`
+  (`Pensou ×N` agrupado); `▾` indica expandido; seleção mostra
+  `Enter expandir`/`Enter recolher` se couber. Em streaming,
+  `{spinner} Pensando · Ns · …` leva na mesma row as palavras mais recentes,
+  com espaços dobrados, cortadas pela esquerda com `…`, em itálico
+  `reasoning_dim`, até 96 células. O corpo completo, com inset de quatro
+  células, só aparece com `fold == Expanded`;
   `FoldState::Auto` conta
   como colapsado; bloco omitido se reasoning vazio;
 - tools colapsados ocupam uma row: glyph de lifecycle discreto, resumo verbal
@@ -2840,7 +2982,8 @@ Uma chamada ainda em escrita reporta `Preparing tool · <nome> · <tamanho>`; a
 rail troca só o tamanho quando a ferramenta é a mesma (sem novo `started_ms` nem
 entrada no timeline) e o rodapé usa o mesmo rótulo quando a rail está oculta.
 
-`ActivityRail` materializa a fase transitória corrente: Thinking, Responding,
+`ActivityRail` (desde 03/10/2026, a última row do rodapé) materializa a fase
+transitória corrente: Thinking, Responding,
 resumo verbal das tools em voo, awaiting input, elapsed e cancelamento no
 footer. HTTP de conexão (`Connecting`, headers, first byte) e `AwaitingProvider`
 aparecem como `Thinking` — o agente continua no turno, não “reconecta” aos
@@ -2858,8 +3001,8 @@ deixa de ser acionável; `ActivityBlock` fica reservado a histórico persistido:
 
 Tools em voo usam um resumo quieto (`Reading · 3 calls`, `Running command`,
 `Reading, Searching`); o nome cru da ferramenta não ocupa a rail.
-Sem ActivityRail, a operational bar conserva a fase abreviada e o cancelamento,
-priorizando-os sobre o contexto numérico.
+Na row do rodapé, o controle de parada vence a fase quando falta largura: a
+fase é cortada com `…` antes de o controle sumir.
 
 Em largura ≥72, `turn`/`reads`/`edits` só entram quando o uso atinge 80% do
 limite e couberem integralmente; nesse caso o contador usa warning. A fase
@@ -2966,7 +3109,7 @@ pub struct OverlayEntry {
 Stack visual e focus order são iguais. Overlay não-capturante não recebe tecla,
 mas pode receber hit test quando explicitamente permitido.
 
-`SessionPicker` (`/resume`, `/rewind`): modal centrado com linha de filtro,
+`SessionPicker` (`/resume`, `/rewind`): modal centrado com o filtro no título,
 lista, linha de detalhe e rodapé `n/total`. Altura definida pela lista sem
 filtro, para que digitar não redimensione o painel. Enter age, Esc fecha; o
 filtro captura texto e colagem. O painel de `/rewind` avisa que só a conversa
@@ -2974,6 +3117,187 @@ volta.
 
 Máximo de 16 overlays simultâneos. Ao atingir o limite, rejeitar o novo overlay,
 registrar diagnóstico e manter o stack existente.
+
+#### 15.7.1 Jobs de shell da sessão
+
+`/jobs` abre um modal neutro no padrão `/mcp`, disponível também durante uma
+execução/preparação. Lista cada ID, comando abreviado, origem (modelo/usuário),
+estado textual, duração e exit code; vazio mostra `Nenhum job nesta sessão`.
+↑/↓ e Home/End selecionam; Enter abre a saída redigida. O detalhe usa rolagem
+independente (↑/↓, PageUp/PageDown, Home/End), segue o final com End e pagina
+por cursor quando a saída excede a janela de 64 KiB. `i` interrompe com sinal
+gracioso e escala após o prazo; `x` cancela a árvore; `c` copia somente o ID.
+Esc volta à lista/fecha o modal, restaurando o composer e o draft intactos.
+Mouse e paste ficam capturados; nenhum conteúdo executável é interpretado.
+
+O rodapé exibe `N jobs · /jobs` quando houver jobs vivos, sem aumentar altura
+e sem retirar controles críticos. Apenas mudanças semânticas provocam evento;
+lista/detalhe vivos atualizam no máximo uma vez por segundo, sem spinner extra.
+Cor é complementar ao estado textual; terminais estreitos truncam comandos e
+mantêm ID/estado, modal adapta-se à área disponível, inclusive sem cor.
+Conclusão notifica ID, exit code e duração, sem iniciar turno do modelo.
+
+`!& COMANDO` inicia um job Auto, aparece na lista e libera o composer. `!`
+continua foreground. Jobs sobrevivem entre prompts e compactações da sessão
+no mesmo processo. Ao sair, trocar/retomar sessão ou `/logout`, um modal avisa
+quantos jobs serão encerrados: Enter prossegue, Esc mantém a sessão. O host
+encerra e aguarda workers também em desconexão/erro; o Job Object mantém a
+proteção de órfãos no Windows. Reinício não preserva processos: metadata
+retomada mostra `perdido` para um job antes ativo, com ID sem processo vivo.
+
+#### 15.7.2 Servidores MCP (`/mcp`)
+
+`/mcp` abre o gerenciador de servidores MCP: um modal neutro no mesmo padrão de
+`/jobs` e `/model` (centrado, largura de 90% do terminal entre 40 e 96 células,
+altura definida pelo conteúdo, `backdrop` atrás, composer e draft intactos).
+Também abre durante uma execução ou preparação: a leitura (lista, estados,
+snapshots) continua viva, e toda ação que altera estado é recusada pelo host com
+um aviso, sem entrar na fila de prompts (concluir ou dispensar um login já
+aguardando o usuário continua possível). Enquanto o modal está aberto os toasts
+ficam ocultos; o último aviso do host aparece numa **linha de aviso** dentro do
+modal (uma row acima do rodapé, truncada, cor `secondary_text`) e some na próxima
+ação. O host empurra um snapshot por mudança semântica e, com o modal aberto, no
+máximo um por segundo; não há spinner nem tick de animação (§21.4: motion nunca
+altera largura ou posição de texto).
+
+**Estados.** Cada servidor está em exatamente um estado. O rótulo textual está
+sempre presente; a cor é complementar e sem cor o significado vem do glifo e do
+rótulo (§21.4).
+
+| Estado | Glifo | Rótulo | Cor | Linha de ajuda (abaixo do alvo) | Ação principal |
+|---|---|---|---|---|---|
+| pronto | `●` | `pronto` | `success` | — | `Enter` testa |
+| conectando | `◌` | `conectando` | `warning` | — | aguardar |
+| desconectado | `◌` | `desconectado` | `muted` | — | `Enter` conecta |
+| falhou | `✕` | `falhou` | `error` | primeira linha do erro, redigida, até 160 caracteres | `r` reconecta |
+| desativado | `○` | `desativado` | `muted` | `desativado no slim.toml · a ativa` | `a` ativa |
+| sem confiança | `!` | `projeto sem confiança` | `warning` | `definido pelo slim.toml do projeto · t confia no projeto (ou /mcp trust)` | `t` confia |
+| requer login | `!` | `requer login` | `warning` | motivo redigido (1ª linha) + `l entra (ou /mcp login NOME)` | `l` entra |
+
+`sem confiança` é o servidor definido (ou alterado) pelo `slim.toml` de um
+workspace ainda não confiável: nada dele roda nem é lido enquanto durar. `requer
+login` é o servidor HTTP com OAuth sem credencial válida (ou com escopo novo
+pedido): nunca abre navegador sozinho. O fallback ASCII de §21.4 **não** está
+implementado no overlay: ele usa só os glifos Unicode da tabela (`●`, `◌`, `○`,
+`✕`, `!`) e o rótulo textual carrega o significado sozinho.
+
+**Conteúdo de cada servidor.** Até quatro tipos de row, separadas do próximo
+servidor por uma row vazia, com o marcador `>` na linha selecionada (texto em
+`focus_text`):
+
+1. título: `> ● nome · transporte · estado` (transporte `stdio` ou `http`);
+2. métricas, só as conhecidas, separadas por ` · `: `N ferramentas` (servidor
+   pronto), `N recursos` e `N modelos` (listagens já em cache; nunca dispara
+   uma listagem só para exibir contagem; `Enter` e `r` a preenchem quando o
+   servidor declara recursos) e `exposição gateway|direct|hidden` (sempre);
+3. alvo: linha de comando ou URL sem credenciais, em `muted`, quebrado por
+   palavras na largura do modal; nunca contém valores de `env` ou `headers`;
+4. ajuda/erro do estado, na cor do estado, quebrado por palavras.
+
+Texto vindo do servidor ou do ambiente passa por sanitização de terminal e pela
+redação dos segredos registrados antes de chegar à UI.
+
+**Ações e teclas.** Teclas simples, sem Ctrl/Alt (um Ctrl/Alt+tecla nunca dispara
+ação por baixo do modal):
+
+| Tecla | Ação | Vale para |
+|---|---|---|
+| `↑` `↓` `Home` `End` | selecionar | sempre |
+| `Enter` | testar: conecta e conta ferramentas | qualquer servidor |
+| `r` | reconectar | qualquer servidor |
+| `x` | desconectar | qualquer servidor |
+| `a` | ativar (se desativado) ou desativar | qualquer servidor |
+| `l` | entrar (OAuth): abre o painel de login | transporte `http` |
+| `o` | sair (apaga credenciais armazenadas), com confirmação | transporte `http` |
+| `t` | confiar no projeto e recarregar | estado `sem confiança` |
+| `d` `Delete` | remover do `slim.toml`, com confirmação | qualquer servidor |
+| `R` | recarregar a configuração | sempre |
+| `Esc` | fechar (para o watch de status) | sempre |
+
+Confirmações (`d`, `o`) trocam o rodapé por `remover NOME? y/Enter confirma ·
+n/Esc cancela` (ou `sair de NOME? …`); qualquer outra tecla cancela, e `Esc` só
+cancela a confirmação. O rodapé mostra `n/total` e apenas as ações aplicáveis ao
+servidor selecionado (`l`/`o` só em HTTP, `t` só em `sem confiança`, `a` troca
+entre `ativar` e `desativar`); ele quebra por palavras e nunca perde a tecla de
+fechar. `Enter testar` é sempre a primeira ação listada. Lista vazia mostra
+`nenhum servidor configurado — /mcp add <nome> <comando>`.
+
+`a` e `/mcp enable|disable` gravam `enabled` na **camada que define o servidor**
+(o `slim.toml` do projeto quando ele define o servidor, senão o global),
+preservando o resto da entrada (merge, não substituição); o arquivo é
+reserializado, então as demais tabelas e valores ficam, mas comentários, ordem
+das chaves e formatação se perdem. Um
+servidor de projeto só desativado não exige confiança. O aviso do resultado
+nomeia o arquivo alterado e o servidor volta a conectar (ou é desconectado) no
+mesmo reload.
+
+**Subcomandos.** Todos aceitam argumentos entre aspas no estilo shell (aspas
+simples literais; aspas duplas agrupam e a barra invertida só escapa aspas
+duplas, para sobreviver a caminhos Windows):
+
+- `/mcp enable|disable <nome>`;
+- `/mcp login <nome> [url-de-redirecionamento]` e `/mcp logout <nome>`;
+- `/mcp trust [nome]` e `/mcp untrust [nome]`: a decisão vale para o projeto
+  inteiro (chave: caminho canônico do workspace); o nome é opcional, o host o
+  valida contra os servidores configurados (nome desconhecido não altera nada)
+  e o repete no aviso; `untrust` grava "nunca" e silencia o aviso de início;
+- `/mcp reconnect|disconnect|remove <nome>`, `/mcp reload` e `/mcp add …`
+  (sem mudança).
+
+Nome ausente mostra `Uso: /mcp …` como aviso e mantém o draft. Subcomandos que
+alteram estado são despachados mesmo durante uma execução (nunca viram prompt
+na fila) e o host recusa os que não podem rodar ali.
+
+**Painel de login OAuth.** Quando um sign-in começa — por `l` ou por `/mcp login
+<nome>`, com o gerenciador aberto ou não — abre um modal de entrada sobre a
+lista (se o gerenciador estava fechado, ele fecha sozinho quando o sign-in
+termina). Título ` Entrar em NOME `. Conteúdo, de cima para baixo:
+
+1. instrução: `Aprove o acesso no navegador que acabou de abrir. Se ele não
+   abriu, abra esta URL:` (ou só a segunda frase quando o navegador não pôde ser
+   aberto);
+2. a **URL de autorização completa**, em `link_accent`, quebrada por células (a
+   URL não tem espaços), sem truncar silenciosamente: se não couber na altura
+   disponível a última row termina em `…`; `Ctrl+Y` copia sempre a URL inteira
+   e exata (a exibição é sanitizada, a cópia não);
+3. `Navegador em outra máquina? Cole a URL para onde ele redirecionou:` e o
+   campo de uma linha com caret, que mostra o final do texto quando excede a
+   largura e aceita digitação, colagem e `Ctrl+V` (limite 4096 caracteres);
+4. a linha de aviso (por exemplo, URL inválida ou erro ao entrar);
+5. rodapé `Enter enviar · Ctrl+Y copiar URL · Esc cancelar`.
+
+`Enter` com o campo preenchido entrega a URL ao sign-in em andamento (o mesmo
+caminho de `/mcp login <nome> <url>`) e limpa o campo; o painel só fecha quando
+o host informa o fim do sign-in (sucesso, falha, tempo de 5 minutos esgotado ou
+cancelamento), que também notifica o resultado. `Esc` e `Ctrl+C` cancelam o
+sign-in e fecham o painel. Mouse e paste ficam capturados pelo painel; a URL e o
+texto colado nunca são interpretados como comando.
+
+**Avisos.**
+
+- Aviso de início: no máximo **um** por sessão, depois que as conexões em
+  segundo plano assentam (ou 15 s após o início, sem listar quem ainda conecta),
+  e só se houver algo a dizer. Forma: `MCP · falhou: a, b · requer login: c ·
+  projeto sem confiança: d. Use /mcp` (grupos vazios são omitidos, no máximo
+  cinco nomes por grupo e `+N`, nomes sanitizados). O estado "nunca confiar"
+  não gera aviso. Config ilegível continua num aviso próprio (`mcp desativado:
+  erro de configuração: …`).
+- Avisos de ação (resultado de enable/disable/login/logout/trust/remove etc.):
+  uma frase em português, com segredos redigidos, no toast ou, com o modal
+  aberto, na linha de aviso (o resumo de testar/reconectar/desconectar é limitado
+  a 160 caracteres).
+
+**Degradação.** Terminal estreito: título truncado com `…`, alvo e ajuda quebram
+por palavras, o modal nunca passa de largura menos duas células. Altura curta: a
+lista rola por servidor mantendo o selecionado visível e o rodapé sempre
+presente; abaixo de 12 rows só o servidor selecionado e o rodapé. Sem cor e com
+reduced motion o conteúdo e o layout são idênticos.
+
+**Testes.** Reducer (teclas, subcomandos com aspas, confirmações, painel de
+login, seleção por nome entre snapshots), render com `TestBackend` (cada estado,
+métricas, rodapé contextual, URL longa quebrada, caret, larguras 40/80, sem
+cor) e worker real da TUI (enable/disable gravando no arquivo definidor, login
+com a URL no painel e fim do sign-in, trust/untrust, aviso de início único).
 
 ### 15.8 Toasts
 
@@ -3120,6 +3444,7 @@ por terminal.
 | activity inspector | Ctrl+J |
 | session tree | Ctrl+R |
 | diagnostics | Ctrl+G |
+| trocar de aba no painel Detalhes (Alterações, Atividade, Sessão, Diagnósticos) | ← / → com o painel aberto |
 | search scrollback | Ctrl+F |
 | filtrar busca (todos/erros/tools) | Tab com a busca aberta |
 | copiar texto original do bloco selecionado/última resposta, sem quebras visuais | Ctrl+Y |
@@ -3135,6 +3460,9 @@ por terminal.
 | prompt anterior/seguinte | ↑ / ↓ com composer vazio no live edge |
 | completar `` | `@` + Tab ou Enter |
 | rodar comando do usuário (só Auto) | `!comando` |
+| iniciar comando em segundo plano (só Auto) | `!& comando` |
+| inspecionar/controlar jobs da sessão | `/jobs` |
+| gerenciar servidores MCP (estados, login OAuth, confiança, ativar) | `/mcp` (§15.7.2) |
 | retomar / renomear / voltar turno | /resume, /rename TÍTULO, /rewind |
 | expand/collapse block | Enter sobre bloco focado |
 | responder input pendente | digitar no composer e Enter |
@@ -3433,7 +3761,8 @@ Componentes não podem inferir semântica a partir do RGB resolvido; usam tokens
 - user prompt usa cabeçalho `● Você` e corpo sobre `user_prompt_bg`, em
   largura total; o agente mantém um único cabeçalho `● Slim` por turno, no
   mesmo canal, com todo texto na coluna 4;
-- SessionRail e ActivityRail têm uma row cada; OperationalBar tem uma a três rows;
+- SessionRail tem uma row; a atividade é a última row da OperationalBar, que tem
+  uma a três rows;
   SessionRail é conversacional e adaptativa, nunca aparece no welcome/emergência;
 - composer tem uma a cinco rows de conteúdo conforme draft/altura e uma row no
   modo de emergência;
@@ -3441,6 +3770,11 @@ Componentes não podem inferir semântica a partir do RGB resolvido; usam tokens
   indentação de quatro células;
 - output textual de tool expandida usa `secondary_text`; resumo concluído usa
   `muted`. Não há mudança de paginação, retenção ou quantidade de linhas;
+  O diff aplicado expandido usa a classificação dos hunks para colorir e
+  preencher o fundo de adições/remoções, preservando `+`/`-`, indentação,
+  wrap e texto copiado; a indentação externa permanece neutra.
+  No TODO expandido, o resumo usa texto secundário fora de foco; a tarefa
+  selecionada recebe fundo neutro. Expansão manual e alturas são preservadas.
 - uma row vazia depois do user band; thinking e tools são adjacentes; o
   cabeçalho `● Slim` fica direto sob essa row e abre o turno; uma row separa
   prosa do assistente de tools/thinking nos dois sentidos; exatamente uma row

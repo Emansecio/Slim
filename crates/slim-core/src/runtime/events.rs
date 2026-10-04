@@ -132,6 +132,23 @@ pub(crate) fn persist_provider_call(
         .map_err(journal_error)
 }
 
+pub(crate) fn persist_tool_batch(
+    journal: &Option<Arc<Mutex<crate::session::ManualRunJournal>>>,
+    batch_id: &str,
+    calls: &[crate::provider::ProviderToolCall],
+    wall_ms: u64,
+) -> Result<(), ProviderError> {
+    let Some(journal) = journal else {
+        return Ok(());
+    };
+    let call_ids: Vec<&str> = calls.iter().map(|call| call.id.as_str()).collect();
+    journal
+        .lock()
+        .map_err(|_| journal_error("durable run lock poisoned"))?
+        .record_tool_batch(batch_id, &call_ids, wall_ms)
+        .map_err(journal_error)
+}
+
 pub(crate) fn persist_provider_validation_failure(
     journal: &Option<Arc<Mutex<crate::session::ManualRunJournal>>>,
     provider_call_id: Option<&str>,
@@ -169,39 +186,6 @@ pub(super) fn checked_next_seq(seq: u64) -> Result<u64, ProviderError> {
 
 pub(super) fn usage_since(app: &AppHandle, start: usize) -> UsageTotals {
     UsageTotals::from_events(app.events().get(start..).unwrap_or_default(), false)
-}
-
-/// Provider turns of `events` that finished without failure or cancellation:
-/// what `usage_since(app, 0)` reports as such requests, without rebuilding
-/// the ledger. A request stays open until the next context snapshot, and
-/// only its `RequestCompleted` sets its outcome.
-pub(super) fn completed_provider_turns(events: &[crate::SessionEvent]) -> usize {
-    let mut count = 0;
-    let mut open: Option<(crate::RequestKind, bool)> = None;
-    for event in events {
-        match &event.kind {
-            crate::EventKind::ContextSnapshot { request_kind, .. } => {
-                if let Some((crate::RequestKind::ProviderTurn, true)) =
-                    open.replace((*request_kind, true))
-                {
-                    count += 1;
-                }
-            }
-            crate::EventKind::RequestCompleted {
-                cancelled, failed, ..
-            } => {
-                if let Some((_, succeeded)) = &mut open {
-                    *succeeded = !*cancelled && !*failed;
-                }
-            }
-            _ => {}
-        }
-    }
-    count
-        + usize::from(matches!(
-            open,
-            Some((crate::RequestKind::ProviderTurn, true))
-        ))
 }
 
 pub(super) fn duration_millis(duration: std::time::Duration) -> u64 {

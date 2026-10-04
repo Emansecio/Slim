@@ -39,15 +39,25 @@ pub fn summary(state: &AppState) -> String {
         });
     }
     if blocked > 0 {
-        label.push_str(&format!(" · {blocked} bloqueada(s)"));
+        label.push_str(&format!(
+            " · {}",
+            count_label(blocked, "bloqueada", "bloqueadas")
+        ));
     }
     if cancelled > 0 {
-        label.push_str(&format!(" · {cancelled} cancelada(s)"));
+        label.push_str(&format!(
+            " · {}",
+            count_label(cancelled, "cancelada", "canceladas")
+        ));
     }
     label
 }
 
-/// Compact mode reserves room for the active title even on a narrow terminal.
+fn count_label(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
+/// Compact mode keeps blockers before the active title that may be truncated.
 pub fn compact_summary(state: &AppState) -> String {
     if state.todo_focused {
         if let Some(item) = state.todo_items.get(state.todo_selected) {
@@ -80,7 +90,20 @@ pub fn compact_summary(state: &AppState) -> String {
         .find(|item| item.status == TodoItemStatus::InProgress)
     {
         let phase = if state.working { "em curso" } else { "parada" };
-        format!("TODO {done}/{total} · {phase} · {}", title(&active.title))
+        let blocked = state
+            .todo_items
+            .iter()
+            .filter(|item| item.status == TodoItemStatus::Blocked)
+            .count();
+        let mut label = format!("TODO {done}/{total}");
+        if blocked > 0 {
+            label.push_str(&format!(
+                " · {}",
+                count_label(blocked, "bloqueada", "bloqueadas")
+            ));
+        }
+        label.push_str(&format!(" · {phase} · {}", title(&active.title)));
+        label
     } else {
         summary(state)
     }
@@ -187,6 +210,8 @@ mod tests {
                 .collect(),
         });
         state.composer.insert_text("preservar rascunho");
+        assert!(!state.todo_dock_open);
+        key(&mut state, KeyCode::Char('t'), KeyModifiers::CONTROL);
         let before = draw(&state, 80, 24);
         assert!(before.contains("+5 fora da vista"));
         assert!(before.contains('…'));
@@ -220,11 +245,42 @@ mod tests {
         state.apply_event(UiEvent::TodoChanged {
             items: vec![blocked],
         });
+        key(&mut state, KeyCode::Char('t'), KeyModifiers::CONTROL);
         assert!(draw(&state, 80, 24).contains("Motivo: aguardando aprovação"));
         state.apply_event(UiEvent::TodoChanged {
             items: vec![item(1, TodoItemStatus::Cancelled)],
         });
-        assert_eq!(summary(&state), "TODO encerrado · 1 cancelada(s)");
+        assert_eq!(summary(&state), "TODO encerrado · 1 cancelada");
+    }
+
+    #[test]
+    fn compact_todo_keeps_blocked_count_before_the_active_title_on_narrow_screens() {
+        let mut state = AppState::new();
+        state.authenticated = true;
+        state.apply_event(UiEvent::TodoChanged {
+            items: vec![
+                item(1, TodoItemStatus::InProgress),
+                item(2, TodoItemStatus::Blocked),
+                item(3, TodoItemStatus::Completed),
+            ],
+        });
+        assert!(!state.todo_dock_open);
+        for working in [false, true] {
+            state.working = working;
+            let phase = if working { "em curso" } else { "parada" };
+            assert!(compact_summary(&state)
+                .starts_with(&format!("TODO 1/3 · 1 bloqueada · {phase} · Tarefa 1")));
+            for (width, height) in [(40, 8), (80, 24)] {
+                let frame = draw(&state, width, height);
+                let row = frame
+                    .lines()
+                    .find(|row| row.trim_start().starts_with("TODO"))
+                    .unwrap_or_else(|| panic!("missing Todo at {width}x{height}\n{frame}"));
+                assert!(row.contains("1 bloqueada ·"), "{row}");
+                assert!(row.trim_end().ends_with('…'), "{row}");
+                assert!(!frame.contains("Tarefa 2"), "{frame}");
+            }
+        }
     }
 
     #[test]
@@ -261,7 +317,7 @@ mod tests {
                 item(10, TodoItemStatus::Completed),
             ],
         });
-        assert_eq!(summary(&state), "TODO 1/1 concluídas · 1 cancelada(s)");
+        assert_eq!(summary(&state), "TODO 1/1 concluídas · 1 cancelada");
         assert!(!state.todo_dock_open);
     }
 }

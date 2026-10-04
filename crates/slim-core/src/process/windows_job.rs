@@ -31,6 +31,13 @@ thread_local! {
 
 impl Job {
     pub(crate) fn spawn(command: &mut Command) -> io::Result<(Child, Self)> {
+        Self::spawn_managed(command, false)
+    }
+
+    pub(crate) fn spawn_managed(
+        command: &mut Command,
+        interruptible: bool,
+    ) -> io::Result<(Child, Self)> {
         #[cfg(test)]
         super::performance::mark("job_begin");
         // SAFETY: unnamed job, default security, owned exactly once below.
@@ -57,7 +64,14 @@ impl Job {
         #[cfg(test)]
         super::performance::mark("job_configured");
         let mut child = command
-            .creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW)
+            .creation_flags(
+                CREATE_SUSPENDED
+                    | if interruptible {
+                        0x00000200 /* CREATE_NEW_PROCESS_GROUP */
+                    } else {
+                        CREATE_NO_WINDOW
+                    },
+            )
             .spawn()?;
         #[cfg(test)]
         super::performance::mark("process_created");
@@ -80,6 +94,19 @@ impl Job {
             return Err(error);
         }
         Ok((child, job))
+    }
+
+    pub(crate) fn interrupt(&self, pid: u32) -> io::Result<()> {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
+        }
+        // CTRL_BREAK targets only the child's process group in our inherited console.
+        // Without a console Windows refuses; the runner reports forced escalation.
+        if unsafe { GenerateConsoleCtrlEvent(1, pid) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     pub(crate) fn terminate(&self) -> io::Result<()> {

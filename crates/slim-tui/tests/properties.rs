@@ -205,18 +205,15 @@ proptest! {
         width in 0u16..121,
         height in 0u16..40,
         todo in 0u16..7,
-        working in any::<bool>(),
         show_session_rail in any::<bool>(),
     ) {
         let regions = slim_tui::layout::plan_with_session_rail(
             width,
             height,
             todo,
-            working,
             show_session_rail,
         );
         let total = regions.session_rail.height
-            + regions.activity_rail.height
             + regions.scrollback.height
             + regions.todo.height
             + regions.todo_divider.height

@@ -1,165 +1,130 @@
+//! Foreground compaction: Pi's default compaction run before a request.
+//!
+//! The summary comes from the session's own model in one call over the
+//! history before the cut and, when the cut splits a turn, a second call over
+//! that turn's prefix (`crate::context::pi_compaction`). Each call is a
+//! recorded `RequestKind::Compaction` request and each is covered by the
+//! bounded retry of recoverable provider errors.
+
 use super::agent_loop::{LoopCtx, LoopState};
+use super::compaction_types::is_truncated_summary;
 use super::*;
+use crate::context::{CompactionPreparation, SummaryRequest, SummaryRequests};
 
-/// Jev's input cost is inflated by 5/4 before comparing it with the savings.
-pub(super) const JEV_COST_MARGIN: (u128, u128) = (5, 4);
-
-/// `None` means the price of one side is unknown. Only TypeSafe's default Jev
-/// model has a published static rate; custom models and Vercel stay unpriced.
-pub(super) fn jev_prepass_can_pay(
-    jev_input_tokens: u64,
-    max_summary_input_savings_tokens: u64,
-    summary_input_micros_per_million: Option<u64>,
-    judge: &crate::context::JevJudgeMetadata,
-) -> Option<bool> {
-    if judge.backend.as_deref() != Some("typesafe")
-        || judge.requested_model.as_deref() != Some(crate::context::DEFAULT_JEV_MODEL)
-    {
-        return None;
-    }
-    let summary_price = u128::from(summary_input_micros_per_million?);
-    let (margin_numerator, margin_denominator) = JEV_COST_MARGIN;
-    Some(
-        u128::from(max_summary_input_savings_tokens).saturating_mul(summary_price)
-            > (u128::from(jev_input_tokens)
-                * u128::from(crate::context::TYPESAFE_JEV_INPUT_MICROS_PER_MILLION))
-                * margin_numerator
-                / margin_denominator,
-    )
+/// What a summarization call returned.
+struct SummaryAnswer {
+    text: String,
+    usage: crate::UsageBreakdown,
 }
 
-pub(super) fn compaction_policy_for_window(
-    mut policy: CompactionPolicy,
-    context_window_tokens: u64,
-) -> CompactionPolicy {
-    policy.keep_recent_tokens = policy.keep_recent_for_window(context_window_tokens);
-    policy
+/// The answers of a compaction's calls.
+#[derive(Default)]
+struct SummaryAnswers {
+    history: Option<String>,
+    turn_prefix: Option<String>,
+    usage: crate::UsageBreakdown,
+}
+
+/// A summarization request prepared for the wire.
+struct PreparedSummaryCall {
+    request: PreparedProviderRequest,
+    estimated_tokens: u64,
+}
+
+/// The output limit a summary retries with after running into `sent`: twice
+/// as much, within the request's own cap, half the window and the model's
+/// ceiling. `None` when that is no more than was sent.
+fn raised_summary_limit(
+    sent: u64,
+    cap: u64,
+    window: u64,
+    model_ceiling: Option<u64>,
+) -> Option<u64> {
+    let raised = sent
+        .saturating_mul(2)
+        .min(cap)
+        .min(window / 2)
+        .min(model_ceiling.unwrap_or(u64::MAX));
+    (raised > sent).then_some(raised)
+}
+
+/// Everything `finalize_compaction` needs besides the loop state.
+struct CompactionResultInputs {
+    reason: CompactionReason,
+    preparation: CompactionPreparation,
+    answers: SummaryAnswers,
+    started: Instant,
 }
 
 impl Runtime {
-    /// Compacts the history before this turn's request: applies a prepared
-    /// summary, runs a manual/overflow summary with bounded retries, or falls
-    /// back to the local emergency summary over the hard threshold.
+    /// Whether `messages` are exactly what the last compaction left, with
+    /// nothing appended since (Pi's "Already compacted").
+    pub(super) fn is_already_compacted(&self, messages: &[ProviderMessage]) -> bool {
+        self.compaction_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_already_compacted(messages))
+    }
+
+    /// Whether a compaction of `messages` would replace anything.
+    pub(super) fn has_compactable_history(&self, messages: &[ProviderMessage]) -> bool {
+        !self.is_already_compacted(messages)
+            && prepare_compaction(
+                messages,
+                &self.compaction_policy().settings(),
+                ContextUsage::default(),
+            )
+            .is_some()
+    }
+
+    /// The context estimate the trigger and the compaction share: the last
+    /// response's provider usage plus an estimate of what followed it. Before
+    /// any response (or after a compaction) everything is estimated, with the
+    /// system prompt and tool schemas included; those are only counted when
+    /// no anchor is usable, because an anchored usage already includes them.
+    pub(super) fn context_usage<A: ProviderAdapter>(
+        &self,
+        adapter: &A,
+        st: &LoopState<'_>,
+        tools: &[Value],
+    ) -> ContextUsage {
+        let anchor = st.usage_anchor;
+        let fixed_tokens = if usable_anchor(st.messages, anchor).is_some() {
+            0
+        } else {
+            Self::fixed_context_tokens(adapter, tools)
+        };
+        ContextUsage {
+            anchor,
+            fixed_tokens,
+        }
+    }
+
+    /// Estimate of the system prompt and tool schemas.
+    fn fixed_context_tokens<A: ProviderAdapter>(adapter: &A, tools: &[Value]) -> u64 {
+        estimate_system_and_tools_tokens(
+            adapter.system_prompt_for_budget().unwrap_or_default(),
+            tools,
+        )
+    }
+
+    /// Compacts the history before this turn's request. Nothing to compact is
+    /// not an error: the turn goes on with the history it has, and a manual
+    /// request stays queued until there is something to compact.
     pub(super) async fn compact_for_turn<A: ProviderAdapter + Send + Sync + 'static>(
         &mut self,
         ctx: &LoopCtx<'_, A>,
         st: &mut LoopState<'_>,
         tools: &[Value],
         trigger: CompactionTrigger,
-        compaction_policy: &CompactionPolicy,
     ) -> Result<CompactionOutcome, ProviderError> {
-        let provider_identity = format!(
-            "{:?}:{}",
-            ctx.client.adapter().wire_kind(),
-            ctx.client.adapter().model()
-        );
-        let mut prepared = self
-            .compaction_handle
-            .as_ref()
-            .and_then(|handle| handle.take_prepared(st.messages, &provider_identity));
-        if prepared.is_none() && st.pending_background.is_some() {
-            self.cancel_pending_background(
-                &mut st.pending_background,
-                &mut st.next_seq,
-                "foreground_compaction_required",
-            )
-            .await?;
-            prepared = self
-                .compaction_handle
-                .as_ref()
-                .and_then(|handle| handle.take_prepared(st.messages, &provider_identity));
+        let policy = self.compaction_policy();
+        if self.is_already_compacted(st.messages) {
+            return Ok(CompactionOutcome::Skipped);
         }
-        if let Some(prepared) = prepared {
-            self.apply_prepared_compaction(ctx, st, tools, trigger, prepared)
-                .await
-        } else if trigger.manual {
-            self.run_manual_compaction(ctx, st, tools, trigger).await
-        } else if trigger.over_hard {
-            self.run_emergency_compaction(ctx, st, tools, trigger, compaction_policy)
-                .await
-        } else {
-            Ok(CompactionOutcome::Skipped)
-        }
-    }
-
-    /// Redacts and archives `summary`; `None` means cancellation won.
-    async fn archive_for_turn<A: ProviderAdapter>(
-        &self,
-        ctx: &LoopCtx<'_, A>,
-        st: &LoopState<'_>,
-        selection: &CompactionSelection,
-        summary: &str,
-    ) -> Result<Option<String>, ProviderError> {
-        let summary = self.redact_sensitive(summary);
-        match self
-            .archive_compaction_summary(
-                selection,
-                summary,
-                &st.governor.compaction_snapshot(ctx.run_start_seq),
-                ctx.initial_messages,
-                ctx.cwd,
-            )
-            .await
-        {
-            Err(ProviderError::Cancelled) => Ok(None),
-            result => result.map(Some),
-        }
-    }
-
-    /// Applies the summary a background compaction prepared.
-    async fn apply_prepared_compaction<A: ProviderAdapter>(
-        &mut self,
-        ctx: &LoopCtx<'_, A>,
-        st: &mut LoopState<'_>,
-        tools: &[Value],
-        trigger: CompactionTrigger,
-        prepared: PreparedCompaction,
-    ) -> Result<CompactionOutcome, ProviderError> {
-        let messages: &[ProviderMessage] = st.messages;
-        let selection = CompactionSelection {
-            root_instruction: messages
-                .iter()
-                .find(|message| message.role == "user")
-                .map(|message| message.content.clone())
-                .unwrap_or_default(),
-            summarized: messages[..prepared.first_kept_index].to_vec(),
-            pinned: prepared.pinned.clone(),
-            kept: messages[prepared.first_kept_index..].to_vec(),
-            first_kept_index: prepared.first_kept_index,
-            recent_tokens: estimate_provider_message_tokens(&messages[prepared.first_kept_index..])
-                .saturating_add(estimate_provider_message_tokens(&prepared.pinned)),
-        };
-        let Some(summary) = self
-            .archive_for_turn(ctx, st, &selection, &prepared.summary)
-            .await?
+        let Some(preparation) = prepare_compaction(st.messages, &policy.settings(), trigger.usage)
         else {
-            return Ok(CompactionOutcome::Cancelled);
+            return Ok(CompactionOutcome::Skipped);
         };
-        self.finish_local_compaction(
-            ctx,
-            st,
-            &selection,
-            summary,
-            LocalCompactionCommit {
-                prefix_fingerprint: prepared.prefix_fingerprint,
-                input_tokens: prepared.input_tokens,
-                output_tokens: prepared.output_tokens,
-                duration_ms: prepared.duration_ms,
-                tokens_before: trigger.preflight_tokens,
-            },
-            tools,
-        )
-    }
-
-    /// A manual or overflow summary from the provider, retried a bounded
-    /// number of times on recoverable errors.
-    async fn run_manual_compaction<A: ProviderAdapter>(
-        &mut self,
-        ctx: &LoopCtx<'_, A>,
-        st: &mut LoopState<'_>,
-        tools: &[Value],
-        trigger: CompactionTrigger,
-    ) -> Result<CompactionOutcome, ProviderError> {
         push_runtime_event(
             &mut self.app,
             &mut st.next_seq,
@@ -169,32 +134,113 @@ impl Runtime {
                 detail: None,
             },
         )?;
-        let mut compaction_attempts = 0_u32;
-        let compact_result = loop {
-            compaction_attempts += 1;
-            let result = self
-                .compact_before_send(
-                    ctx.client,
-                    CompactionInputs {
-                        messages: st.messages,
-                        initial_messages: ctx.initial_messages,
-                        cwd: ctx.cwd,
-                        facts: &st.governor.compaction_snapshot(ctx.run_start_seq),
-                        tools,
-                        mode: ctx.mode,
-                        tokens_before: trigger.preflight_tokens,
-                        window: st.config.context_window_tokens,
-                        reserve: st.config.context_reserve_tokens,
-                        reason: if trigger.overflow {
-                            CompactionReason::Overflow
-                        } else {
-                            CompactionReason::Manual
-                        },
+        let started = Instant::now();
+        let instructions = self
+            .compaction_handle
+            .as_ref()
+            .and_then(CompactionHandle::manual_instructions)
+            .filter(|text| !text.trim().is_empty());
+        let requests = preparation.summary_requests(instructions.as_deref());
+        let answers = self.run_summary_calls(ctx, st, requests).await;
+        let result = if self.is_cancelled() {
+            Ok(CompactionOutcome::Cancelled)
+        } else {
+            answers.and_then(|answers| {
+                self.finalize_compaction(
+                    ctx,
+                    st,
+                    tools,
+                    &policy,
+                    CompactionResultInputs {
+                        reason: trigger.reason,
+                        preparation,
+                        answers,
+                        started,
                     },
-                    st.next_seq,
+                )
+            })
+        };
+        // A failed or cancelled compaction does not leave its manual request
+        // queued: it would run again on the next prompt.
+        if result.is_err() || matches!(result, Ok(CompactionOutcome::Cancelled)) {
+            if let Some(handle) = &self.compaction_handle {
+                handle.clear_manual();
+            }
+        }
+        if matches!(result, Ok(CompactionOutcome::Cancelled)) {
+            st.next_seq = self.observed_next_seq(st.next_seq);
+        }
+        result
+    }
+
+    /// The history summary, then the summary of a split turn's prefix.
+    async fn run_summary_calls<A: ProviderAdapter>(
+        &mut self,
+        ctx: &LoopCtx<'_, A>,
+        st: &mut LoopState<'_>,
+        requests: SummaryRequests,
+    ) -> Result<SummaryAnswers, ProviderError> {
+        let mut answers = SummaryAnswers::default();
+        if let Some(request) = &requests.history {
+            let answer = self.summarize_with_retry(ctx, st, request).await?;
+            answers.usage.absorb(answer.usage);
+            answers.history = Some(answer.text);
+        }
+        if let Some(request) = &requests.turn_prefix {
+            let answer = self.summarize_with_retry(ctx, st, request).await?;
+            answers.usage.absorb(answer.usage);
+            answers.turn_prefix = Some(answer.text);
+        }
+        Ok(answers)
+    }
+
+    /// One summarization call, retried a bounded number of times on
+    /// recoverable provider errors, and once with a higher output limit when
+    /// the summary ran into the limit it was sent with.
+    async fn summarize_with_retry<A: ProviderAdapter>(
+        &mut self,
+        ctx: &LoopCtx<'_, A>,
+        st: &mut LoopState<'_>,
+        request: &SummaryRequest,
+    ) -> Result<SummaryAnswer, ProviderError> {
+        let mut attempts = 0_u32;
+        let mut raised_limit = None;
+        loop {
+            attempts += 1;
+            let mut sent_limit = None;
+            let result = self
+                .summarize_once(
+                    ctx.client,
+                    request,
+                    (
+                        st.config.context_window_tokens,
+                        st.config.context_reserve_tokens,
+                    ),
+                    raised_limit,
+                    (&mut st.next_seq, &mut sent_limit),
                 )
                 .await;
             match result {
+                Err(error)
+                    if raised_limit.is_none()
+                        && is_truncated_summary(&error)
+                        && !self.is_cancelled() =>
+                {
+                    // The configured output limit is per turn, not the
+                    // summary's budget: Pi sizes the summary by the reserve.
+                    let Some(raised) = sent_limit.and_then(|sent| {
+                        raised_summary_limit(
+                            sent,
+                            request.max_output_tokens,
+                            st.config.context_window_tokens,
+                            ctx.client.known_max_output_tokens(),
+                        )
+                    }) else {
+                        return Err(error);
+                    };
+                    st.next_seq = self.observed_next_seq(st.next_seq);
+                    raised_limit = Some(raised);
+                }
                 Err(error)
                     if st.recovery.can_retry(st.recovery.compaction_recoveries)
                         && recoverable_provider_error(&error)
@@ -209,10 +255,10 @@ impl Runtime {
                     ) {
                         Ok(delay) => delay,
                         Err(blocked) => {
-                            break Err(annotate_provider_recovery_error(
+                            return Err(annotate_provider_recovery_error(
                                 blocked,
                                 "compaction",
-                                compaction_attempts,
+                                attempts,
                                 st.recovery.automatic_recoveries,
                                 st.recovery.compaction_recoveries,
                                 "retry wait budget exhausted",
@@ -234,14 +280,14 @@ impl Runtime {
                         },
                     )?;
                     if self.sleep_or_cancel(delay).await {
-                        break Err(ProviderError::Cancelled);
+                        return Err(ProviderError::Cancelled);
                     }
                 }
                 Err(error) if recoverable_provider_error(&error) => {
-                    break Err(annotate_provider_recovery_error(
+                    return Err(annotate_provider_recovery_error(
                         error,
                         "compaction",
-                        compaction_attempts,
+                        attempts,
                         st.recovery.automatic_recoveries,
                         st.recovery.compaction_recoveries,
                         if st.recovery.automatic_recoveries >= MAX_AUTOMATIC_RECOVERIES {
@@ -251,312 +297,41 @@ impl Runtime {
                         },
                     ));
                 }
-                result => break result,
-            }
-        };
-        if compact_result.is_err() {
-            if let Some(handle) = &self.compaction_handle {
-                handle.invalidate();
-                handle.clear_manual();
+                result => return result,
             }
         }
-        if self.is_cancelled() {
-            st.next_seq = self.observed_next_seq(st.next_seq);
-            return Ok(CompactionOutcome::Cancelled);
-        }
-        let applied = compact_result?;
-        *st.messages = applied.messages;
-        st.next_seq = applied.next_seq;
-        st.recovery.compaction_recoveries = 0;
-        st.governor.forget_compacted_evidence();
-        Ok(CompactionOutcome::Applied(Box::new(applied.request)))
     }
 
-    /// Over the hard threshold with nothing prepared: a local summary.
-    async fn run_emergency_compaction<A: ProviderAdapter>(
-        &mut self,
-        ctx: &LoopCtx<'_, A>,
-        st: &mut LoopState<'_>,
-        tools: &[Value],
-        trigger: CompactionTrigger,
-        compaction_policy: &CompactionPolicy,
-    ) -> Result<CompactionOutcome, ProviderError> {
-        let selection = select_compaction_history(
-            st.messages,
-            &compaction_policy_for_window(
-                compaction_policy.clone(),
-                st.config.context_window_tokens,
-            ),
-        )
-        .map_err(|message| ProviderError::InvalidResponse {
-            message: message.into(),
-        })?;
-        let Some(summary) = self
-            .archive_for_turn(ctx, st, &selection, &local_emergency_summary(&selection))
-            .await?
-        else {
-            return Ok(CompactionOutcome::Cancelled);
-        };
-        self.finish_local_compaction(
-            ctx,
-            st,
-            &selection,
-            summary,
-            LocalCompactionCommit {
-                prefix_fingerprint: compaction_prefix_fingerprint(&selection.summarized),
-                input_tokens: 0,
-                output_tokens: 0,
-                duration_ms: 0,
-                tokens_before: trigger.preflight_tokens,
-            },
-            tools,
-        )
-    }
-
-    /// Applies a local hard-threshold compaction: swaps the history, rebuilds
-    /// the request, records the commit and announces the result.
-    pub(super) fn finish_local_compaction<A: ProviderAdapter>(
-        &mut self,
-        ctx: &LoopCtx<'_, A>,
-        st: &mut LoopState<'_>,
-        selection: &CompactionSelection,
-        summary: String,
-        commit: LocalCompactionCommit,
-        tools: &[Value],
-    ) -> Result<CompactionOutcome, ProviderError> {
-        *st.messages = apply_compaction_selection(st.messages, selection, summary.clone())
-            .map_err(|message| ProviderError::InvalidResponse {
-                message: message.into(),
-            })?;
-        let mut request = self.prepare_loop_request(ctx.client, st.messages, tools, ctx.mode)?;
-        let tokens_after =
-            self.token_estimator
-                .estimate(ctx.provider, ctx.model, request.serialized_chars);
-        request.estimated_tokens = tokens_after;
-        if let Some(handle) = &self.compaction_handle {
-            handle.commit_detailed(crate::context::CompactionCommit {
-                summary,
-                prefix_fingerprint: commit.prefix_fingerprint,
-                first_kept_index: selection.first_kept_index,
-                tokens_before: commit.tokens_before,
-                tokens_after,
-                input_tokens: commit.input_tokens,
-                output_tokens: commit.output_tokens,
-                duration_ms: commit.duration_ms,
-                reason: crate::context::CompactionReason::HardThreshold,
-                generation: 0,
-            });
-        }
-        push_runtime_event(
-            &mut self.app,
-            &mut st.next_seq,
-            crate::EventKind::CompactionState {
-                state: crate::context::CompactionStatus::Applied,
-                reason: crate::context::CompactionReason::HardThreshold,
-                tokens_before: commit.tokens_before,
-                tokens_after,
-                duration_ms: commit.duration_ms,
-            },
-        )?;
-        push_runtime_event(
-            &mut self.app,
-            &mut st.next_seq,
-            crate::EventKind::CompactionCompleted,
-        )?;
-        st.governor.forget_compacted_evidence();
-        Ok(CompactionOutcome::Applied(Box::new(request)))
-    }
-
-    pub(super) fn calibrate_latest_request(&mut self, calibration_eligible: bool) {
-        if !calibration_eligible {
-            return;
-        }
-        let events = self.app.events();
-        let Some((start, provider, model, serialized_chars)) = events
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, event)| match &event.kind {
-                crate::EventKind::ContextSnapshot {
-                    provider,
-                    model,
-                    serialized_chars,
-                    ..
-                } => Some((index, provider.as_str(), model.as_str(), *serialized_chars)),
-                _ => None,
-            })
-        else {
-            return;
-        };
-        let ledger = UsageTotals::from_events(&events[start..], false);
-        let Some(request) = ledger
-            .requests
-            .first()
-            .filter(|request| request.usable_for_calibration())
-        else {
-            return;
-        };
-        self.token_estimator.observe(
-            provider,
-            model,
-            serialized_chars,
-            request.total_input_tokens(),
-        );
-    }
-
-    pub(super) async fn archive_compaction_summary(
-        &self,
-        selection: &CompactionSelection,
-        summary: String,
-        execution_facts: &str,
-        initial_messages: &[ProviderMessage],
-        cwd: &Path,
-    ) -> Result<String, ProviderError> {
-        let max_bytes = self.compaction_policy().summary_max_bytes;
-        self.ensure_not_cancelled()?;
-        let summary = self.redact_sensitive(&summary);
-        crate::context::validate_checkpoint_content(&summary, usize::MAX).map_err(|message| {
-            ProviderError::InvalidResponse {
-                message: format!("compaction checkpoint rejected before archival: {message}"),
-            }
-        })?;
-        let mut retained = String::new();
-        if !execution_facts.is_empty() {
-            retained.push_str("[Runtime facts at compaction; subsequent actions may invalidate them. Prior-run facts remain historical, not proof of current state.]\n");
-            retained.push_str(&self.redact_sensitive(execution_facts));
-        }
-        let mut manifest = self.redact_sensitive(&crate::context::tool_call_manifest_with_limit(
-            &selection.summarized,
-            usize::MAX,
-        ));
-        let mut preflight = retained.clone();
-        if self.artifact_store.is_some() {
-            append_block(
-                &mut preflight,
-                "[Prior visible transcript archive reference pending.]",
-            );
-        }
-        let mut with_manifest = preflight.clone();
-        append_block(&mut with_manifest, &manifest);
-        if crate::context::fit_checkpoint_content(&summary, &with_manifest, max_bytes).is_err() {
-            manifest.clear();
-        }
-        crate::context::fit_checkpoint_content(&summary, &preflight, max_bytes).map_err(
-            |message| ProviderError::InvalidResponse {
-                message: format!(
-                    "compaction checkpoint cannot retain operational metadata: {message}"
-                ),
-            },
-        )?;
-        let mut artifact_write = None;
-        if let Some(store) = self.artifact_store.clone() {
-            let recovered = restore_superseded_outputs(
-                initial_messages,
-                self.app.events(),
-                &selection.summarized,
-            );
-            let transcript = crate::context::recovery_transcript(&self.redact_messages(&recovered));
-            append_block(
-                &mut retained,
-                &transcript_reference(&store, &transcript, cwd),
-            );
-            artifact_write = Some((store, transcript));
-        }
-        let final_checkpoint =
-            self.fit_final_checkpoint(&summary, &retained, &manifest, max_bytes)?;
-        self.ensure_not_cancelled()?;
-        if let Some((store, transcript)) = artifact_write {
-            commit_context_artifact(store, transcript, self.cancellation.clone()).await?;
-        }
-        Ok(final_checkpoint)
-    }
-
-    /// The checkpoint text with the operational metadata that fits: the
-    /// manifest is dropped, not the retained facts, when both cannot fit.
-    fn fit_final_checkpoint(
-        &self,
-        summary: &str,
-        retained: &str,
-        manifest: &str,
-        max_bytes: usize,
-    ) -> Result<String, ProviderError> {
-        let mut retained_with_manifest = retained.to_owned();
-        append_block(&mut retained_with_manifest, manifest);
-        let retained_with_manifest = self.redact_sensitive(&retained_with_manifest);
-        match crate::context::fit_checkpoint_content(summary, &retained_with_manifest, max_bytes) {
-            Ok(checkpoint) => Ok(checkpoint),
-            Err(_) if !manifest.is_empty() => {
-                let retained = self.redact_sensitive(retained);
-                crate::context::fit_checkpoint_content(summary, &retained, max_bytes).map_err(
-                    |message| ProviderError::InvalidResponse {
-                        message: format!("final compaction checkpoint rejected: {message}"),
-                    },
-                )
-            }
-            Err(message) => Err(ProviderError::InvalidResponse {
-                message: format!("final compaction checkpoint rejected: {message}"),
-            }),
-        }
-    }
-
-    /// Summarizes the compacted prefix with the provider, archives the result
-    /// and applies it. Every request event of the summary is recorded.
-    pub(super) async fn compact_before_send<A: ProviderAdapter>(
+    /// Sends one summarization request and records every request event.
+    /// `limits` is the context window and the reserve for the output;
+    /// `raised_limit` sends the call with that output limit instead of the
+    /// capped one. `sequence` is the next event sequence and where the output
+    /// limit the request was sent with is reported.
+    async fn summarize_once<A: ProviderAdapter>(
         &mut self,
         client: &HttpProviderClient<A>,
-        inputs: CompactionInputs<'_>,
-        mut next_seq: u64,
-    ) -> Result<CompactionApplied, ProviderError> {
-        let handle = self.compaction_handle.clone();
-        let policy = self.compaction_policy();
-        let capped_policy = compaction_policy_for_window(policy.clone(), inputs.window);
-        let selection =
-            select_compaction_history(inputs.messages, &capped_policy).map_err(|message| {
-                ProviderError::InvalidResponse {
-                    message: message.into(),
-                }
-            })?;
-        let previous_summary = handle.as_ref().and_then(CompactionHandle::previous_summary);
-        let manual_instructions = handle
-            .as_ref()
-            .and_then(CompactionHandle::manual_instructions);
-        let mut summarized = selection.summarized_for_prompt();
-        if policy.strategy == crate::context::CompactionStrategy::Jev {
-            self.run_jev_prepass(
-                &selection,
-                manual_instructions.as_deref(),
-                &mut summarized,
-                &mut next_seq,
-            )
-            .await?;
-        }
-        let summary_request = self.prepare_summary_request(
-            client,
-            &inputs,
-            &summarized,
-            previous_summary.as_deref(),
-            manual_instructions.as_deref(),
-            &mut next_seq,
-        )?;
+        request: &SummaryRequest,
+        limits: (u64, u64),
+        raised_limit: Option<u64>,
+        (next_seq, sent_limit): (&mut u64, &mut Option<u64>),
+    ) -> Result<SummaryAnswer, ProviderError> {
+        let call = self.prepare_summary_call(client, request, limits, raised_limit, next_seq)?;
+        *sent_limit = call.request.output_token_limit();
         let started = Instant::now();
         let cancellation = CancellationToken::cancelled_or_pending(self.cancellation.clone());
         let mut collected = CompactionSummary::default();
         let provider_call_journal = self.app.run_journal.clone();
         let stream_result = client
             .stream_prepared_cancellable_observed(
-                summary_request.request,
+                call.request,
                 cancellation,
                 |event| collected.push(event),
                 |telemetry| persist_provider_call(&provider_call_journal, telemetry).map(|_| ()),
             )
             .await;
-        self.record_compaction_stream(
-            &mut collected,
-            summary_request.estimated_tokens,
-            &mut next_seq,
-        )?;
+        self.record_compaction_stream(&mut collected, call.estimated_tokens, next_seq)?;
         let validation_result = if stream_result.is_ok() {
-            collected.validate(policy.summary_max_bytes)
+            collected.validate()
         } else {
             Ok(())
         };
@@ -564,156 +339,118 @@ impl Runtime {
         let request_cancelled = matches!(&stream_result, Err(ProviderError::Cancelled));
         push_runtime_event(
             &mut self.app,
-            &mut next_seq,
+            next_seq,
             crate::EventKind::RequestCompleted {
                 provider_latency_ms: elapsed_millis(started),
                 cancelled: request_cancelled,
                 failed: request_failed,
             },
         )?;
-        self.calibrate_latest_request(summary_request.text_only);
+        // A summarization request is a single text message.
+        self.calibrate_latest_request(true);
         if let Err(error) = stream_result {
             return Err(self.redact_provider_error(error));
         }
         validation_result?;
-        self.finalize_compaction(client, &inputs, &selection, &collected, started, next_seq)
-            .await
+        Ok(SummaryAnswer {
+            text: collected.text,
+            usage: collected.usage,
+        })
     }
 
-    /// Jev pruning strategy: judge and drop stale tool calls/results
-    /// verbatim, then let the same LLM summarize the smaller prefix. Any
-    /// failure or insufficient reduction falls back to the unchanged
-    /// prefix, never to a silently empty summary.
-    async fn run_jev_prepass(
-        &mut self,
-        selection: &CompactionSelection,
-        manual_instructions: Option<&str>,
-        summarized: &mut [ProviderMessage],
-        next_seq: &mut u64,
-    ) -> Result<(), ProviderError> {
-        let jev_plan = crate::context::jev_prune::PreparedPrune::new(
-            selection,
-            manual_instructions,
-            summarized,
-        );
-        let jev_cannot_pay =
-            !self.jev_plan_can_pay(&jev_plan, estimate_provider_message_tokens(summarized));
-        match &self.jev_judge {
-            Some(judge) if jev_cannot_pay => {
-                let metadata = judge.metadata();
-                push_runtime_event(
-                    &mut self.app,
-                    next_seq,
-                    jev_fallback_event(
-                        "estimated summary savings cannot pay for Jev pre-pass with margin".into(),
-                        jev_unattempted_stats(metadata.backend, metadata.requested_model),
-                    ),
-                )
-            }
-            Some(judge) => {
-                match crate::context::jev_prune::prune_prepared(
-                    &**judge,
-                    jev_plan,
-                    summarized,
-                    self.cancellation.as_ref(),
-                )
-                .await
-                {
-                    Ok(stats) => {
-                        self.jev_economy.observe(&stats);
-                        push_runtime_event(
-                            &mut self.app,
-                            next_seq,
-                            crate::EventKind::CompactionJevPruned {
-                                pairs_total: stats.pairs_total as u64,
-                                pairs_dropped: stats.pairs_dropped as u64,
-                                results_truncated: stats.results_truncated as u64,
-                                batches: stats.batches as u64,
-                                batches_started: stats.batches_started as u64,
-                                batches_completed: stats.batches_completed as u64,
-                                estimated_saved_tokens: stats.estimated_saved_tokens,
-                                input_tokens: stats.input_tokens,
-                                output_tokens: stats.output_tokens,
-                                usage_unknown: stats.usage_unknown,
-                                backend: stats.backend,
-                                requested_model: stats.requested_model,
-                                model: stats.model,
-                                duration_ms: stats.duration_ms,
-                            },
-                        )
-                    }
-                    Err(failure) => {
-                        let cancelled =
-                            matches!(failure.error, crate::context::JevPruneError::Cancelled);
-                        let detail = self.redact_sensitive(&failure.to_string());
-                        let stats = *failure.stats;
-                        self.jev_economy.observe(&stats);
-                        push_runtime_event(
-                            &mut self.app,
-                            next_seq,
-                            jev_fallback_event(detail, stats),
-                        )?;
-                        if cancelled {
-                            return Err(ProviderError::Cancelled);
-                        }
-                        Ok(())
-                    }
-                }
-            }
-            None => push_runtime_event(
-                &mut self.app,
-                next_seq,
-                jev_fallback_event(
-                    "no Jev credential configured (set TYPESAFE_API_KEY or AI_GATEWAY_API_KEY)"
-                        .into(),
-                    jev_unattempted_stats(None, None),
-                ),
-            ),
-        }
-    }
-
-    /// The summary request for the (possibly pruned) prefix, rejected when it
-    /// cannot fit the window with the reserve; its context snapshot is
-    /// recorded.
-    fn prepare_summary_request<A: ProviderAdapter>(
+    /// The wire request of a summarization call, with its context snapshot
+    /// recorded. A conversation too large for the window (with the room the
+    /// output needs) is bounded to its head and tail; Pi has no such guard.
+    /// Fails only when even the fixed parts of the prompt do not fit.
+    fn prepare_summary_call<A: ProviderAdapter>(
         &mut self,
         client: &HttpProviderClient<A>,
-        inputs: &CompactionInputs<'_>,
-        summarized: &[ProviderMessage],
-        previous_summary: Option<&str>,
-        manual_instructions: Option<&str>,
+        request: &SummaryRequest,
+        (window, reserve): (u64, u64),
+        raised_limit: Option<u64>,
         next_seq: &mut u64,
-    ) -> Result<SummaryRequest, ProviderError> {
-        let summary_prompt = build_bounded_summary_prompt_with_checkpoint_and_instructions(
-            summarized,
-            previous_summary,
-            manual_instructions,
-            inputs.window,
-            inputs.reserve,
-        )
-        .map_err(|message| ProviderError::InvalidResponse {
-            message: message.into(),
-        })?;
-        let summary_messages = vec![ProviderMessage::user(summary_prompt)];
+    ) -> Result<PreparedSummaryCall, ProviderError> {
         let provider = crate::provider::provider_kind_name(client.adapter().kind());
         let model = client.adapter().model();
-        let mut request = client.prepare_compaction_messages(&summary_messages)?;
-        let serialized_chars = request.serialized_chars;
-        let estimated_tokens = self
-            .token_estimator
-            .estimate(provider, model, serialized_chars);
-        request.estimated_tokens = estimated_tokens;
-        if estimated_tokens.saturating_add(inputs.reserve) > inputs.window {
-            return Err(ProviderError::InvalidResponse {
-                message: "compaction request still exceeds context window".into(),
-            });
+        let output_room = raised_limit.unwrap_or_else(|| request.max_output_tokens.min(reserve));
+        let prepare = |request: &SummaryRequest| -> Result<(PreparedProviderRequest, u64), _> {
+            let messages = request.messages();
+            let prepared = match raised_limit {
+                Some(limit) => client.prepare_compaction_messages_raised(&messages, limit)?,
+                None => client.prepare_compaction_messages(&messages, request.max_output_tokens)?,
+            };
+            let tokens = self
+                .token_estimator
+                .estimate(provider, model, prepared.serialized_chars);
+            Ok::<_, ProviderError>((prepared, tokens))
+        };
+        let fits = |tokens: u64| tokens.saturating_add(output_room) <= window;
+
+        let (mut prepared, mut estimated_tokens) = prepare(request)?;
+        if !fits(estimated_tokens) {
+            // A path taken at most once per compaction, so it avoids building
+            // wire requests per step: the serialized size is close to linear
+            // in the prompt length, which the full and the smallest request
+            // pin down. The length found on that model is confirmed by one
+            // real request and shrunk a little when the model was optimistic.
+            let fixed = request.prompt.len() - request.conversation_bytes();
+            let mut smallest = request.clone();
+            smallest.bound_conversation(fixed);
+            let (smallest_request, smallest_tokens) = prepare(&smallest)?;
+            if !fits(smallest_tokens) {
+                return Err(ProviderError::InvalidResponse {
+                    message: "compaction request still exceeds context window".into(),
+                });
+            }
+            let (small_len, full_len) = (smallest.prompt.len(), request.prompt.len());
+            let growth_per_mille = u128::from(
+                prepared
+                    .serialized_chars
+                    .saturating_sub(smallest_request.serialized_chars),
+            ) * 1_100
+                / (full_len - small_len).max(1) as u128;
+            let modeled_tokens = |length: usize| {
+                let grown = (length - small_len) as u128 * growth_per_mille / 1_000;
+                let chars = u128::from(smallest_request.serialized_chars) + grown;
+                self.token_estimator.estimate(
+                    provider,
+                    model,
+                    u64::try_from(chars).unwrap_or(u64::MAX),
+                )
+            };
+            // The largest prompt the model says fits, to 256 bytes.
+            let (mut low, mut high) = (small_len, full_len);
+            while high - low > 256 {
+                let middle = low + (high - low) / 2;
+                if fits(modeled_tokens(middle)) {
+                    low = middle;
+                } else {
+                    high = middle;
+                }
+            }
+            (prepared, estimated_tokens) = (smallest_request, smallest_tokens);
+            let mut length = low;
+            for _ in 0..8 {
+                if length <= small_len {
+                    break;
+                }
+                let mut trial = request.clone();
+                trial.bound_conversation(length);
+                let (trial_request, trial_tokens) = prepare(&trial)?;
+                if fits(trial_tokens) {
+                    (prepared, estimated_tokens) = (trial_request, trial_tokens);
+                    break;
+                }
+                length = small_len + (length - small_len) / 10 * 9;
+            }
         }
+        prepared.estimated_tokens = estimated_tokens;
         let ProviderRequestComponents {
             system_bytes,
             history_bytes,
             tool_result_bytes,
             ..
-        } = request.components;
+        } = prepared.components;
         push_runtime_event(
             &mut self.app,
             next_seq,
@@ -725,15 +462,14 @@ impl Runtime {
                 tool_schema_bytes: 0,
                 history_bytes,
                 tool_result_bytes,
-                serialized_chars,
+                serialized_chars: prepared.serialized_chars,
                 estimated_tokens,
-                context_window_tokens: inputs.window,
+                context_window_tokens: window,
             },
         )?;
-        Ok(SummaryRequest {
-            request,
+        Ok(PreparedSummaryCall {
+            request: prepared,
             estimated_tokens,
-            text_only: messages_are_text_only(&summary_messages),
         })
     }
 
@@ -805,273 +541,129 @@ impl Runtime {
         Ok(())
     }
 
-    /// Archives the validated summary, applies it to the history, records
-    /// the commit and announces the compaction.
-    async fn finalize_compaction<A: ProviderAdapter>(
+    /// Joins the answers, appends the file lists within the persistence
+    /// limits, swaps the history, records the commit and announces the
+    /// compaction.
+    fn finalize_compaction<A: ProviderAdapter>(
         &mut self,
-        client: &HttpProviderClient<A>,
-        inputs: &CompactionInputs<'_>,
-        selection: &CompactionSelection,
-        collected: &CompactionSummary,
-        started: Instant,
-        mut next_seq: u64,
-    ) -> Result<CompactionApplied, ProviderError> {
-        let summary = self.redact_sensitive(&collected.text);
-        let summary = self
-            .archive_compaction_summary(
-                selection,
-                summary,
-                inputs.facts,
-                inputs.initial_messages,
-                inputs.cwd,
-            )
-            .await?;
-        let prefix_fingerprint = compaction_prefix_fingerprint(&selection.summarized);
-        let mut compacted_messages =
-            apply_compaction_selection(inputs.messages, selection, summary.clone()).map_err(
-                |message| ProviderError::InvalidResponse {
-                    message: message.into(),
-                },
-            )?;
+        ctx: &LoopCtx<'_, A>,
+        st: &mut LoopState<'_>,
+        tools: &[Value],
+        policy: &CompactionPolicy,
+        inputs: CompactionResultInputs,
+    ) -> Result<CompactionOutcome, ProviderError> {
+        let CompactionResultInputs {
+            reason,
+            preparation,
+            answers,
+            started,
+        } = inputs;
+        let text = preparation
+            .assemble_summary(answers.history.as_deref(), answers.turn_prefix.as_deref())
+            .map_err(|message| ProviderError::InvalidResponse {
+                message: message.into(),
+            })?;
+        // The summarizer saw redacted history; its answer is redacted again
+        // before it is stored or shown to the model.
+        let text = self.redact_sensitive(&text);
+        let fitted =
+            fit_summary_for_persistence(&text, &preparation.file_ops, policy.summary_max_bytes)
+                .map_err(|message| ProviderError::InvalidResponse { message })?;
+        let first_kept_index = preparation.first_kept_index;
+        let canonical_prefix_fingerprint =
+            canonical_prefix_fingerprint(&st.messages[..first_kept_index]);
+        let mut compacted = apply_compaction(st.messages, first_kept_index, &fitted.summary);
+        // The rewritten history is a new prefix: the overlay is anchored again.
+        let channel = mode::ChannelFrame::rebuilt_for(&compacted, self.mcp_awareness(ctx.mode));
+        let request =
+            self.prepare_loop_request(ctx.client, &mut compacted, tools, ctx.mode, &channel)?;
+        let tokens_after = estimate_context_tokens(
+            &compacted,
+            ContextUsage {
+                anchor: None,
+                fixed_tokens: Self::fixed_context_tokens(ctx.client.adapter(), tools),
+            },
+        )
+        .tokens;
         let duration_ms = elapsed_millis(started);
-        let mut compacted_request =
-            self.prepare_loop_request(client, &mut compacted_messages, inputs.tools, inputs.mode)?;
-        let tokens_after = self.token_estimator.estimate(
-            crate::provider::provider_kind_name(client.adapter().kind()),
-            client.adapter().model(),
-            compacted_request.serialized_chars,
-        );
-        compacted_request.estimated_tokens = tokens_after;
         if let Some(handle) = &self.compaction_handle {
             handle.commit_detailed(CompactionCommit {
-                summary,
-                prefix_fingerprint,
-                first_kept_index: selection.first_kept_index,
-                tokens_before: inputs.tokens_before,
+                summary: fitted.summary,
+                canonical_prefix_fingerprint,
+                first_kept_index,
+                tokens_before: preparation.tokens_before,
                 tokens_after,
-                input_tokens: collected.usage.total_input_tokens(),
-                output_tokens: collected.usage.output_tokens,
+                input_tokens: answers.usage.total_input_tokens(),
+                output_tokens: answers.usage.output_tokens,
                 duration_ms,
-                reason: inputs.reason,
-                generation: 0,
+                reason,
+                read_files: fitted.files.read_files,
+                modified_files: fitted.files.modified_files,
             });
             handle.clear_manual();
+            // The summary replaces what the last response's usage described.
+            handle.clear_usage_anchor();
+            handle.mark_compacted(&compacted);
         }
         push_runtime_event(
             &mut self.app,
-            &mut next_seq,
+            &mut st.next_seq,
             crate::EventKind::CompactionState {
                 state: crate::context::CompactionStatus::Applied,
-                reason: inputs.reason,
-                tokens_before: inputs.tokens_before,
+                reason,
+                tokens_before: preparation.tokens_before,
                 tokens_after,
                 duration_ms,
             },
         )?;
         push_runtime_event(
             &mut self.app,
-            &mut next_seq,
+            &mut st.next_seq,
             crate::EventKind::CompactionCompleted,
         )?;
-        Ok(CompactionApplied {
-            messages: compacted_messages,
-            request: compacted_request,
-            next_seq,
-        })
+        *st.messages = compacted;
+        st.channel = channel;
+        st.usage_anchor = None;
+        st.awaiting_response = true;
+        st.recovery.compaction_recoveries = 0;
+        st.governor.forget_compacted_evidence();
+        Ok(CompactionOutcome::Applied(Box::new(request)))
     }
-}
 
-/// One foreground summary request: what to compact and under which budget.
-pub(super) struct CompactionInputs<'a> {
-    messages: &'a [ProviderMessage],
-    initial_messages: &'a [ProviderMessage],
-    cwd: &'a Path,
-    /// Runtime facts kept beside the checkpoint.
-    facts: &'a str,
-    tools: &'a [Value],
-    mode: crate::OperatingMode,
-    tokens_before: u64,
-    window: u64,
-    reserve: u64,
-    reason: CompactionReason,
-}
-
-/// A foreground compaction that replaced the history.
-pub(super) struct CompactionApplied {
-    messages: Vec<ProviderMessage>,
-    request: PreparedProviderRequest,
-    next_seq: u64,
-}
-
-struct SummaryRequest {
-    request: PreparedProviderRequest,
-    estimated_tokens: u64,
-    text_only: bool,
-}
-
-fn append_block(target: &mut String, block: &str) {
-    if block.is_empty() {
-        return;
-    }
-    if !target.is_empty() {
-        target.push_str("\n\n");
-    }
-    target.push_str(block);
-}
-
-/// Jev's fallback: `stats` carries what the attempt spent.
-fn jev_fallback_event(detail: String, stats: crate::context::JevPruneStats) -> crate::EventKind {
-    crate::EventKind::CompactionJevFallback {
-        detail,
-        batches: stats.batches as u64,
-        batches_started: stats.batches_started as u64,
-        batches_completed: stats.batches_completed as u64,
-        input_tokens: stats.input_tokens,
-        output_tokens: stats.output_tokens,
-        usage_unknown: stats.usage_unknown,
-        backend: stats.backend,
-        requested_model: stats.requested_model,
-        model: stats.model,
-        duration_ms: stats.duration_ms,
-    }
-}
-
-/// Stats of a pre-pass that never ran: no batches, zero known usage.
-fn jev_unattempted_stats(
-    backend: Option<String>,
-    requested_model: Option<String>,
-) -> crate::context::JevPruneStats {
-    crate::context::JevPruneStats {
-        input_tokens: Some(0),
-        output_tokens: Some(0),
-        backend,
-        requested_model,
-        ..Default::default()
-    }
-}
-
-/// Elision changes only the active view. Restores uniquely identified
-/// original outputs before archiving; never rereads a mutated file.
-fn restore_superseded_outputs(
-    initial_messages: &[ProviderMessage],
-    events: &[crate::SessionEvent],
-    summarized: &[ProviderMessage],
-) -> Vec<ProviderMessage> {
-    let mut originals = std::collections::HashMap::new();
-    let historical = initial_messages.iter().filter_map(|message| {
-        (message.role == "tool").then_some((
-            message.name.as_deref()?,
-            message.tool_call_id.as_deref()?,
-            message.content.as_str(),
-        ))
-    });
-    let observed = events.iter().filter_map(|event| match &event.kind {
-        crate::EventKind::ToolOutput {
-            name,
-            call_id,
-            output,
-            ..
-        } => Some((name.as_str(), call_id.as_str(), output.as_str())),
-        _ => None,
-    });
-    for (name, id, output) in historical.chain(observed) {
-        if output.starts_with("[superseded ") {
-            continue;
+    pub(super) fn calibrate_latest_request(&mut self, calibration_eligible: bool) {
+        if !calibration_eligible {
+            return;
         }
-        originals
-            .entry((name, id))
-            .and_modify(|value| {
-                if *value != Some(output) {
-                    *value = None;
-                }
+        let events = self.app.events();
+        let Some((start, provider, model, serialized_chars)) = events
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, event)| match &event.kind {
+                crate::EventKind::ContextSnapshot {
+                    provider,
+                    model,
+                    serialized_chars,
+                    ..
+                } => Some((index, provider.as_str(), model.as_str(), *serialized_chars)),
+                _ => None,
             })
-            .or_insert(Some(output));
+        else {
+            return;
+        };
+        let ledger = UsageTotals::from_events(&events[start..], false);
+        let Some(request) = ledger
+            .requests
+            .first()
+            .filter(|request| request.usable_for_calibration())
+        else {
+            return;
+        };
+        self.token_estimator.observe(
+            provider,
+            model,
+            serialized_chars,
+            request.total_input_tokens(),
+        );
     }
-    let mut recovered = summarized.to_vec();
-    for message in &mut recovered {
-        if message.role == "tool" && message.content.starts_with("[superseded ") {
-            if let Some(Some(original)) = originals.get(&(
-                message.name.as_deref().unwrap_or_default(),
-                message.tool_call_id.as_deref().unwrap_or_default(),
-            )) {
-                message.content = (*original).to_owned();
-            }
-        }
-    }
-    recovered
-}
-
-/// The retained-context block that tells the model where the archived
-/// transcript is and how to read it.
-fn transcript_reference(store: &ArtifactStore, transcript: &str, cwd: &Path) -> String {
-    let artifact = store.preview("context-history", transcript.as_bytes());
-    let read_path = artifact
-        .path
-        .strip_prefix(cwd)
-        .ok()
-        .map(|path| path.to_string_lossy().replace('\\', "/"));
-    if let Some(path) = read_path {
-        let path = serde_json::to_string(&path).expect("path serializes");
-        format!("[Prior visible transcript: use read on {path} with offset=1 for an index of user-role messages (including runtime notices), checkpoints and tool_call_id evidence. Follow indexed offset/max_lines and pagination to recover historical text; earlier checkpoints link earlier archives. Apply later user corrections. Opaque reasoning and binary attachments are not included.]")
-    } else {
-        format!("[Prior visible transcript archived at {}; native read cannot access this artifact outside the workspace.]", artifact.path.display())
-    }
-}
-
-/// Stages the transcript and publishes it atomically, unless cancellation
-/// wins first.
-async fn commit_context_artifact(
-    store: ArtifactStore,
-    transcript: String,
-    cancellation: Option<CancellationToken>,
-) -> Result<(), ProviderError> {
-    let stage_store = store.clone();
-    let staged = tokio::task::spawn_blocking(move || {
-        stage_store.stage("context-history", transcript.as_bytes())
-    })
-    .await
-    .map_err(|_| ProviderError::InvalidResponse {
-        message: "context artifact worker failed".into(),
-    })?
-    .map_err(|_| ProviderError::InvalidResponse {
-        message: "context artifact could not be staged".into(),
-    })?;
-    if cancellation
-        .as_ref()
-        .is_some_and(CancellationToken::is_cancelled)
-    {
-        crate::context::ArtifactStore::discard_staged(staged).map_err(|_| {
-            ProviderError::InvalidResponse {
-                message: "cancelled compaction could not discard its staged recovery artifact"
-                    .into(),
-            }
-        })?;
-        return Err(ProviderError::Cancelled);
-    }
-    let committed = tokio::task::spawn_blocking(move || {
-        // This check and the atomic publication share one blocking job.
-        // Cancellation wins until this linearization point; after it,
-        // the checkpoint transaction is committed and the shared,
-        // content-addressed artifact must never be rolled back.
-        if cancellation
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            crate::context::ArtifactStore::discard_staged(staged)?;
-            Ok(None)
-        } else {
-            store.commit_staged(staged).map(Some)
-        }
-    })
-    .await
-    .map_err(|_| ProviderError::InvalidResponse {
-        message: "context artifact worker failed".into(),
-    })?
-    .map_err(|_| ProviderError::InvalidResponse {
-        message: "context artifact could not be committed".into(),
-    })?;
-    if committed.is_none() {
-        return Err(ProviderError::Cancelled);
-    }
-    Ok(())
 }

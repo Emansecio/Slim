@@ -42,7 +42,7 @@ Chaves reconhecidas: `model`, `endpoint`, `effort`, `max_turns`,
 `timeout_secs`, `max_result_bytes` e `[compaction]`. Arquivo ausente e normal;
 arquivo presente e invalido **aborta** com erro nomeando o caminho. Env vence o
 TOML: `SLIM_MODEL`, `SLIM_ENDPOINT`, `SLIM_EFFORT`, `SLIM_MAX_TURNS`,
-`SLIM_TIMEOUT_SECS`, `SLIM_COMPACTOR`.
+`SLIM_TIMEOUT_SECS`.
 
 ## 5. Autenticacao
 

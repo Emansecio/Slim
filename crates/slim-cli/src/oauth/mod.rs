@@ -1480,6 +1480,14 @@ async fn parse_json_response_bounded<T: DeserializeOwned>(
     serde_json::from_slice(&bytes).map_err(|_| OAuthError::InvalidResponse(invalid_message.into()))
 }
 
+impl OAuthService {
+    /// The launcher this service opens authorization URLs with; MCP sign-in
+    /// (`/mcp login`) opens its own URLs with the same one.
+    pub(crate) fn browser(&self) -> Arc<dyn BrowserLauncher> {
+        Arc::clone(&self.worker.browser)
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

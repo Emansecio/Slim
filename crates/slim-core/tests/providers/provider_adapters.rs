@@ -487,7 +487,7 @@ fn anthropic_sends_native_system_as_cacheable_top_level_blocks() {
     // system prompt: cache markers would only bill an ephemeral write.
     assert_eq!(
         compact["system"].as_str(),
-        Some(slim_core::context::COMPACTION_SYSTEM_PROMPT)
+        Some(slim_core::context::SUMMARIZATION_SYSTEM_PROMPT)
     );
     assert!(compact.get("cache_control").is_none());
 
@@ -1343,7 +1343,10 @@ fn codex_request_and_responses_stream_use_subscription_wire_contract() {
     let mut events = Vec::new();
     for payload in [
         json!({"type":"response.output_text.delta","delta":"hello"}),
+        json!({"type":"response.reasoning_summary_part.added","summary_index":0}),
         json!({"type":"response.reasoning_summary_text.delta","delta":"thinking"}),
+        json!({"type":"response.reasoning_summary_part.added","summary_index":1}),
+        json!({"type":"response.reasoning_summary_text.delta","delta":"**Next**"}),
         json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call-1","name":"read","arguments":""}}),
         json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"path\":\"README.md\"}"}),
         json!({"type":"response.completed","response":{"usage":{
@@ -1356,7 +1359,15 @@ fn codex_request_and_responses_stream_use_subscription_wire_contract() {
         events.extend(adapter.parse_event(&payload).expect("event"));
     }
     assert!(events.contains(&ProviderEvent::TextDelta("hello".into())));
-    assert!(events.contains(&ProviderEvent::ReasoningDelta("thinking".into())));
+    // Only a later summary part opens a paragraph.
+    let reasoning: String = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::ReasoningDelta(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasoning, "thinking\n\n**Next**");
     assert!(events.contains(&ProviderEvent::ToolCallDelta {
         index: Some(0),
         id: Some("call-1".into()),

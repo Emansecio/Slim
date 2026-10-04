@@ -3,12 +3,13 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
+use ratatui::layout::Position;
 use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
 
 use slim_tui::api::UiEvent;
 use slim_tui::app::AppState;
-use slim_tui::reducer::{reduce, Action};
+use slim_tui::reducer::{palette_matches, reduce, slash_matches, Action};
 use slim_tui::render::WrapCache;
 use slim_tui::runtime::render_frame;
 use slim_tui::theme::{Capabilities, ColorDepth};
@@ -94,9 +95,9 @@ fn centered_modal_recedes_the_transcript_behind_it() {
     // Group headings carry a rule to the modal edge.
     let heading = text
         .iter()
-        .find(|row| row.contains("sessão"))
-        .expect("session heading");
-    assert!(heading.contains("sessão ───"), "{heading}");
+        .find(|row| row.contains("conversa"))
+        .expect("conversation heading");
+    assert!(heading.contains("conversa ───"), "{heading}");
 }
 
 #[test]
@@ -235,7 +236,11 @@ fn resume_picker_lists_sessions_with_titles_ages_and_states() {
     let screen = text.join("\n");
 
     assert!(screen.contains("Retomar sessão"), "{screen}");
-    assert!(screen.contains("Filtro: Digite para filtrar"), "{screen}");
+    // The filter sits in the title; empty, it invites typing.
+    assert!(
+        screen.contains("Retomar sessão · digite para filtrar"),
+        "{screen}"
+    );
     // Title leads, the first prompt follows it.
     let login = text
         .iter()
@@ -267,7 +272,7 @@ fn resume_picker_lists_sessions_with_titles_ages_and_states() {
     // Detail line names the focused session; footer counts rows.
     assert!(screen.contains("tui-login"), "{screen}");
     assert!(
-        screen.contains("3/4 · ↑↓ navegar · Enter retomar · Esc sair"),
+        screen.contains("3/4 · ↑↓ navegar · Enter retomar · Esc fechar"),
         "{screen}"
     );
 }
@@ -280,7 +285,7 @@ fn resume_picker_filters_and_shows_the_filtered_count() {
         key(&mut state, KeyCode::Char(character), KeyModifiers::NONE);
     }
     let screen = rows(&draw(&state)).join("\n");
-    assert!(screen.contains("Filtro: api"), "{screen}");
+    assert!(screen.contains("Retomar sessão · api"), "{screen}");
     assert!(
         screen.contains("escrever a documentação da API"),
         "{screen}"
@@ -359,7 +364,7 @@ fn rewind_picker_lists_turns_newest_first_with_the_conversation_only_note() {
         "{screen}"
     );
     assert!(
-        screen.contains("1/3 · ↑↓ navegar · Enter voltar · Esc sair"),
+        screen.contains("1/3 · ↑↓ navegar · Enter voltar · Esc fechar"),
         "{screen}"
     );
 }
@@ -407,4 +412,121 @@ fn slash_popup_offers_rename_and_rewind_with_descriptions() {
         screen.contains("/rewind") && screen.contains("voltar a um turno"),
         "{screen}"
     );
+}
+
+#[test]
+fn slash_popup_groups_commands_and_keeps_each_command_visible() {
+    let mut state = conversation();
+    key(&mut state, KeyCode::Char('/'), KeyModifiers::NONE);
+    let text = rows(&draw(&state));
+    let screen = text.join("\n");
+    for heading in ["ajuda ─", "conversa ─", "execução ─"] {
+        assert!(screen.contains(heading), "{screen}");
+    }
+    assert!(find(&text, "/compact").1 < find(&text, "/model").1);
+    assert!(find(&text, "/model").1 < find(&text, "/queue").1);
+
+    for command in slash_matches("") {
+        let (text, _) = draw_sized(&state, WIDTH, 14);
+        assert!(
+            text.iter().any(|row| row.contains(&format!("> {command}"))),
+            "{command} must stay visible despite the headings:\n{}",
+            text.join("\n")
+        );
+        key(&mut state, KeyCode::Down, KeyModifiers::NONE);
+    }
+}
+
+/// Frame at an explicit size and where the caret landed.
+fn draw_sized(state: &AppState, width: u16, height: u16) -> (Vec<String>, Position) {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    let mut cache = WrapCache::default();
+    terminal
+        .draw(|frame| {
+            render_frame(
+                frame,
+                state,
+                Capabilities {
+                    color_depth: ColorDepth::TrueColor,
+                    mouse: false,
+                    clipboard: false,
+                    images: false,
+                    reduced_motion: true,
+                },
+                &mut cache,
+            )
+        })
+        .expect("draw");
+    let cursor = terminal.get_cursor_position().expect("cursor");
+    (rows(terminal.backend().buffer()), cursor)
+}
+
+#[test]
+fn command_palette_is_a_bordered_modal_like_the_pickers() {
+    let mut state = conversation();
+    key(&mut state, KeyCode::Char('p'), KeyModifiers::CONTROL);
+    let total = palette_matches("").len();
+    let (text, _) = draw_sized(&state, WIDTH, HEIGHT);
+    let screen = text.join("\n");
+
+    // The title lives in the rounded border, not in a content row.
+    assert!(
+        text.iter()
+            .any(|row| row.contains("╭") && row.contains(" Comandos ")),
+        "{screen}"
+    );
+    assert!(
+        text.iter()
+            .any(|row| row.contains('╰') && row.contains('╯')),
+        "{screen}"
+    );
+    // Same filter-in-title as the model and session pickers.
+    assert!(
+        screen.contains("Comandos · digite para filtrar"),
+        "{screen}"
+    );
+    assert!(!screen.contains("Buscar:"), "{screen}");
+    // Same `n/total · hints` footer, closing with `Esc fechar`.
+    assert!(
+        screen.contains(&format!(
+            "1/{total} · ↑↓ navegar · Enter executar · Esc fechar"
+        )),
+        "{screen}"
+    );
+
+    // Filtering narrows the counter and the caret follows the typed text.
+    for character in "mod".chars() {
+        key(&mut state, KeyCode::Char(character), KeyModifiers::NONE);
+    }
+    let matching = palette_matches("mod").len();
+    let (text, cursor) = draw_sized(&state, WIDTH, HEIGHT);
+    let screen = text.join("\n");
+    let (x, y) = find(&text, "Comandos · mod");
+    assert_eq!(
+        cursor,
+        Position::new(x + "Comandos · mod".chars().count() as u16, y),
+        "{screen}"
+    );
+    assert!(screen.contains(&format!("1/{matching} · ")), "{screen}");
+}
+
+#[test]
+fn command_palette_keeps_the_focused_command_visible_past_its_capacity() {
+    let mut state = AppState::new();
+    key(&mut state, KeyCode::Char('p'), KeyModifiers::CONTROL);
+    let commands = palette_matches("");
+    // 14 rows tall leaves a 12 row modal: fewer rows than commands plus headings.
+    for (index, command) in commands.iter().enumerate() {
+        let (text, _) = draw_sized(&state, WIDTH, 14);
+        let screen = text.join("\n");
+        assert!(
+            text.iter().any(|row| row.contains(&format!("> {command}"))),
+            "{command} must stay visible:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("{}/{} · ", index + 1, commands.len())),
+            "{screen}"
+        );
+        key(&mut state, KeyCode::Down, KeyModifiers::NONE);
+    }
 }

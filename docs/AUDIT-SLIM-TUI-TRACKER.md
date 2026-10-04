@@ -363,7 +363,7 @@ Legenda: âœ… implementado Â· ðŸŸ¡ parcial Â· âŒ ausente Â· â�
 |---|---|---|
 | Overlays login/modelo/effort | âœ… | Ãºnica fatia M3 integrada |
 | Tokens semÃ¢nticos | ðŸŸ¡ | struct ok `theme.rs:20-48`; valores flat; to_ansi16 colapsa em 5 cores |
-| Inspectors/palette/image wiring | âŒ scaffold | `inspector.rs`/`image.rs` sem referÃªncias em app/runtime |
+| Inspectors/palette wiring | âŒ scaffold | `inspector.rs` sem referÃªncias em app/runtime |
 | Motion/FrameClock | âŒ | spinner estÃ¡tico `â—Œ` |
 | Markdown render | âœ… | `pulldown-cmark`; H1/H2/H3, listas, ênfase, code/link/quote, sanitizer e wrap grapheme-aware |
 | Diff/code blocks | âŒ | tokens definidos, nunca usados |
@@ -833,6 +833,46 @@ reducer Ãºnico, render puro, Windows-only.
 - [x] **L3 â€” `AssistantDelta` nÃ£o forÃ§ar working (B6)** â€” confiar em RunStarted
 
 ## 7. Log de execuÃ§Ã£o
+
+### 2026-10-03 - Seletor de modelos
+
+- Contrato: bullet "Seletor de modelos" da
+  [revisão de 03/10/2026](DESIGN-SLIM-TUI.md#12-direção-visual-revisada).
+  Cabeçalhos de provedor com régua e contagem, modelos recuados, esforço como
+  medidor na linha focada, detalhe sob régua com tokens compactos e posição
+  que conta só modelos.
+- `cargo test -p slim-tui --no-fail-fast`: **424 + 307 + 4 + 7 + 19 + 7 passed,
+  0 failed** (teste novo de layout do seletor). Clippy sem achados no código
+  novo; resta só o `manual_clamp` preexistente da paleta. Cenas
+  `model`, `model-narrow` e `model-search` acrescentadas ao harness
+  `visual_snapshots` e conferidas em texto.
+
+### 2026-10-03 - Organização, minimalismo e agrupamento
+
+- Contrato: [revisão de 03/10/2026](DESIGN-SLIM-TUI.md#12-direção-visual-revisada).
+  A ActivityRail virou a última row do rodapé; `Esc parar`/`Esc forçar`
+  progressivos; execução concluída só no recibo; placeholder sem atalhos;
+  contagem da fila na row do transcript; Todo compacto sem divisória; comando
+  como `$ cmd`; sem `ToolCallId` nem prévia redundante no membro expandido;
+  falhas dentro do grupo de ferramentas, com `×N` e `depois passou`; pensamento
+  em uma row (cauda inline em streaming, `Pensou · Ns` concluído, sem prévia
+  retida); painel Detalhes com abas `←→`; filtro no título das overlays;
+  `/jobs` sem `exit=`; paleta agrupada por assunto.
+- Correção: `↓` depois de `↑` voltava uma row antes do fundo quando a row acima
+  dele era um separador; a descida cuja âncora resolve no fundo volta ao live
+  edge (teste em 12 alturas).
+- `cargo test -p slim-tui --no-fail-fast`: **424 + 306 + 4 + 7 + 19 + 7 passed,
+  0 failed**, 9 ignored (manuais). `cargo test -p slim-cli --no-fail-fast`:
+  todos os alvos verdes exceto
+  `tui::local_session_tests::restored_tasks_repopulate_the_dock_without_execution`,
+  falha preexistente (o teste espera o dock aberto; o `app.rs` do checkout já
+  abria compacto antes desta mudança).
+- Clippy `-p slim-tui --all-targets`: sem achados no código alterado; restam três
+  lints preexistentes (`manual_clamp` ×2, `bool_to_int_with_if`) em linhas não
+  tocadas. Rustfmt limpo nos arquivos alterados.
+- Snapshots visuais regenerados e conferidos em texto; console físico e ConPTY
+  não foram reexecutados. Deploy por `refresh-slim.ps1` (ver
+  [identidade do executável](../release/README.md)).
 
 ### 2026-09-10 - Pensamento refinado e pulso contextual
 

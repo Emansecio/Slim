@@ -18,17 +18,6 @@ macro_rules! sum {
     };
 }
 
-struct JevUsage<'a> {
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-    usage_unknown: bool,
-    failed: bool,
-    backend: Option<&'a str>,
-    requested_model: Option<&'a str>,
-    model: Option<&'a str>,
-    duration_ms: u64,
-}
-
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RequestUsage {
     pub request_kind: RequestKind,
@@ -82,12 +71,6 @@ impl RequestUsage {
             self.cache_read_tokens,
         )
     }
-
-    /// A background compaction that never finished has no confirmed usage.
-    fn abandon(&mut self) {
-        self.usage_unknown = true;
-        self.failed = true;
-    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -119,20 +102,6 @@ pub struct UsageTotals {
     pub duplicate_evidence_bytes_avoided: u64,
     pub compaction_input_tokens: u64,
     pub compaction_output_tokens: u64,
-    pub jev_input_tokens: u64,
-    pub jev_output_tokens: u64,
-    pub jev_latency_ms: u64,
-    pub jev_usage_unknown: bool,
-    /// Confirmed Jev input tokens for which the TypeSafe standard price is
-    /// known. This is deliberately separate from `jev_input_tokens`: tokens
-    /// from Vercel/custom backends must not be treated as TypeSafe cost.
-    pub jev_priced_input_tokens: u64,
-    pub jev_failed_priced_input_tokens: u64,
-    pub jev_failed_usage_unknown: bool,
-    /// At least one Jev event carried usage for a backend/model whose price
-    /// is not part of Slim's static catalogue.
-    pub jev_pricing_unknown: bool,
-    pub jev_failed_pricing_unknown: bool,
     pub compaction_tokens_saved: u64,
     pub post_compaction_reacquisitions: u64,
     pub estimation_error_tokens: i64,
@@ -237,11 +206,10 @@ impl OpenRequest {
 }
 
 /// Folds a session's events into a ledger. Provider requests are delimited by
-/// `ContextSnapshot`; background compaction attempts by their own events.
+/// `ContextSnapshot`.
 struct LedgerBuilder {
     totals: UsageTotals,
     open: Option<OpenRequest>,
-    background: Option<RequestUsage>,
     next_retry: u64,
 }
 
@@ -253,7 +221,6 @@ impl LedgerBuilder {
                 ..UsageTotals::default()
             },
             open: None,
-            background: None,
             next_retry: 0,
         }
     }
@@ -296,13 +263,9 @@ impl LedgerBuilder {
             | EventKind::ToolEvidenceElided { .. }
             | EventKind::ToolCallsSuppressed { .. }
             | EventKind::CausalAnomalyDetected { .. } => self.on_tool(kind),
-            EventKind::CompactionJevPruned { .. }
-            | EventKind::CompactionJevFallback { .. }
-            | EventKind::CompactionUsageUnknown { .. }
-            | EventKind::CompactionState { .. } => self.on_compaction(kind),
-            EventKind::CompactionAttemptStarted { .. }
-            | EventKind::CompactionAttemptCompleted { .. }
-            | EventKind::CompactionAttemptCancelled { .. } => self.on_compaction_attempt(kind),
+            EventKind::CompactionUsageUnknown { .. } | EventKind::CompactionState { .. } => {
+                self.on_compaction(kind)
+            }
             _ => {}
         }
     }
@@ -377,35 +340,6 @@ impl LedgerBuilder {
 
     fn on_compaction(&mut self, kind: &EventKind) {
         match kind {
-            EventKind::CompactionJevPruned {
-                input_tokens,
-                output_tokens,
-                usage_unknown,
-                backend,
-                requested_model,
-                model,
-                duration_ms,
-                ..
-            }
-            | EventKind::CompactionJevFallback {
-                input_tokens,
-                output_tokens,
-                usage_unknown,
-                backend,
-                requested_model,
-                model,
-                duration_ms,
-                ..
-            } => self.totals.record_jev_usage(JevUsage {
-                input_tokens: *input_tokens,
-                output_tokens: *output_tokens,
-                usage_unknown: *usage_unknown,
-                failed: matches!(kind, EventKind::CompactionJevFallback { .. }),
-                backend: backend.as_deref(),
-                requested_model: requested_model.as_deref(),
-                model: model.as_deref(),
-                duration_ms: *duration_ms,
-            }),
             EventKind::CompactionUsageUnknown { .. } => self.totals.usage_unknown = true,
             EventKind::CompactionState {
                 state,
@@ -418,106 +352,8 @@ impl LedgerBuilder {
                     compaction_tokens_saved,
                     tokens_before.saturating_sub(*tokens_after)
                 ),
-                CompactionStatus::Discarded => {
-                    if let Some(request) = self
-                        .totals
-                        .requests
-                        .iter_mut()
-                        .rev()
-                        .find(|request| request.request_kind == RequestKind::Compaction)
-                    {
-                        request.failed = true;
-                    }
-                }
-                _ => {}
+                CompactionStatus::Idle => {}
             },
-            _ => {}
-        }
-    }
-
-    /// A background compaction attempt: one request opened by `Started`,
-    /// settled by `Completed` or `Cancelled`.
-    fn on_compaction_attempt(&mut self, kind: &EventKind) {
-        match kind {
-            EventKind::CompactionAttemptStarted {
-                provider,
-                model,
-                system_bytes,
-                history_bytes,
-                estimated_input_tokens,
-                ..
-            } => {
-                self.abandon_background();
-                self.background = Some(RequestUsage {
-                    provider: provider.clone(),
-                    model: model.clone(),
-                    system_bytes: *system_bytes,
-                    ..compaction_request(*history_bytes, *estimated_input_tokens)
-                });
-            }
-            EventKind::CompactionAttemptCompleted {
-                uncached_input_tokens,
-                cache_write_tokens,
-                cache_read_tokens,
-                output_tokens,
-                reasoning_tokens,
-                time_to_first_byte_ms,
-                time_to_first_semantic_ms,
-                duration_ms,
-                usage_known,
-                system_bytes,
-                history_bytes,
-                estimated_input_tokens,
-            } => {
-                let mut request = self
-                    .background
-                    .take()
-                    .unwrap_or_else(|| compaction_request(0, 0));
-                if let Some(system_bytes) = system_bytes {
-                    request.system_bytes = *system_bytes;
-                }
-                if let Some(history_bytes) = history_bytes {
-                    request.history_bytes = *history_bytes;
-                }
-                if let Some(estimated_input_tokens) = estimated_input_tokens {
-                    request.estimated_input_tokens = *estimated_input_tokens;
-                }
-                request.uncached_input_tokens = *uncached_input_tokens;
-                request.cache_write_tokens = *cache_write_tokens;
-                request.cache_read_tokens = *cache_read_tokens;
-                request.output_tokens = *output_tokens;
-                request.reasoning_tokens = *reasoning_tokens;
-                request.usage_unknown = !*usage_known;
-                request.time_to_first_byte_ms = *time_to_first_byte_ms;
-                request.time_to_first_semantic_ms = *time_to_first_semantic_ms;
-                request.provider_latency_ms = *duration_ms;
-                if !request.usage_unknown {
-                    request.estimation_error_tokens = signed_difference(
-                        request.estimated_input_tokens,
-                        request.total_input_tokens(),
-                    );
-                }
-                self.totals.push_compaction_request(request);
-            }
-            EventKind::CompactionAttemptCancelled {
-                request_bytes,
-                estimated_input_tokens,
-                time_to_first_byte_ms,
-                time_to_first_semantic_ms,
-                duration_ms,
-                ..
-            } => {
-                let mut request = self
-                    .background
-                    .take()
-                    .unwrap_or_else(|| compaction_request(*request_bytes, *estimated_input_tokens));
-                request.abandon();
-                request.time_to_first_byte_ms = *time_to_first_byte_ms;
-                request.time_to_first_semantic_ms = *time_to_first_semantic_ms;
-                request.provider_latency_ms = *duration_ms;
-                request.cancelled = true;
-                self.totals.push_compaction_request(request);
-            }
             _ => {}
         }
     }
@@ -534,28 +370,10 @@ impl LedgerBuilder {
         }
     }
 
-    fn abandon_background(&mut self) {
-        if let Some(mut unfinished) = self.background.take() {
-            unfinished.abandon();
-            self.totals.push_compaction_request(unfinished);
-        }
-    }
-
     fn finish(mut self) -> UsageTotals {
         self.close_open();
-        self.abandon_background();
         self.totals.mark_input_overflow();
         self.totals
-    }
-}
-
-/// A compaction attempt whose start event was not seen.
-fn compaction_request(history_bytes: u64, estimated_input_tokens: u64) -> RequestUsage {
-    RequestUsage {
-        request_kind: RequestKind::Compaction,
-        history_bytes,
-        estimated_input_tokens,
-        ..RequestUsage::default()
     }
 }
 
@@ -641,80 +459,6 @@ impl UsageTotals {
             bump!(self, cancelled_requests, 1);
         }
     }
-
-    fn record_jev_usage(&mut self, usage: JevUsage<'_>) {
-        let JevUsage {
-            input_tokens,
-            output_tokens,
-            usage_unknown,
-            failed,
-            backend,
-            requested_model,
-            model,
-            duration_ms,
-        } = usage;
-        if let Some(tokens) = input_tokens {
-            bump!(self, jev_input_tokens, tokens);
-            bump!(self, compaction_input_tokens, tokens);
-        }
-        if let Some(tokens) = output_tokens {
-            bump!(self, jev_output_tokens, tokens);
-            bump!(self, compaction_output_tokens, tokens);
-        }
-        let missing_counts = input_tokens.is_none() || output_tokens.is_none();
-        if usage_unknown || missing_counts {
-            self.jev_usage_unknown = true;
-            self.usage_unknown = true;
-            if failed {
-                self.jev_failed_usage_unknown = true;
-            }
-        }
-
-        if is_known_typesafe_jev(backend, requested_model, model) {
-            if let Some(tokens) = input_tokens.filter(|tokens| *tokens > 0) {
-                bump!(self, jev_priced_input_tokens, tokens);
-                if failed {
-                    bump!(self, jev_failed_priced_input_tokens, tokens);
-                }
-            }
-        } else {
-            let has_confirmed_usage = input_tokens.is_some_and(|tokens| tokens > 0)
-                || output_tokens.is_some_and(|tokens| tokens > 0);
-            if has_confirmed_usage || missing_counts {
-                if failed {
-                    self.jev_failed_pricing_unknown = true;
-                }
-                self.jev_pricing_unknown = true;
-            }
-        }
-        bump!(self, jev_latency_ms, duration_ms);
-    }
-}
-
-/// TypeSafe's standard Jev price is stable for the built-in model and its
-/// public aliases. Vercel and caller-selected/dynamic models are intentionally
-/// left unpriced until the provider supplies a catalog entry.
-fn is_known_typesafe_jev(
-    backend: Option<&str>,
-    requested_model: Option<&str>,
-    resolved_model: Option<&str>,
-) -> bool {
-    if !backend.is_some_and(|backend| backend.eq_ignore_ascii_case("typesafe")) {
-        return false;
-    }
-    let models = [requested_model, resolved_model];
-    models
-        .iter()
-        .flatten()
-        .all(|model| is_known_typesafe_model(model))
-        && models.iter().flatten().next().is_some()
-}
-
-fn is_known_typesafe_model(model: &str) -> bool {
-    matches!(
-        model.trim().to_ascii_lowercase().as_str(),
-        "jev-1.13.0" | "typesafe-ai/jev" | "typesafe-ai/jev-1.13.0" | "jev"
-    )
 }
 
 /// Sum of the three input-token buckets, saturated at `u64::MAX` (the flag

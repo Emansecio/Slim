@@ -1,7 +1,6 @@
 use super::*;
 
-/// Prefix of the pointer that replaces a result already present in context.
-pub(super) const DUPLICATE_POINTER_PREFIX: &str = "[duplicate ";
+pub(super) use crate::context::DUPLICATE_POINTER_PREFIX;
 
 pub(super) fn duplicate_pointer(tool_name: &str) -> String {
     format!(
@@ -134,6 +133,71 @@ impl<'de> serde::Deserialize<'de> for PathOnly {
 /// full output — and the pointer never outlives its usefulness (reads after
 /// the last write and the mutation's own success result are preserved).
 pub(super) fn elide_superseded_tool_outputs(messages: &mut [ProviderMessage]) -> ElisionStats {
+    let plan = plan_elisions(messages);
+    apply_elisions(messages, plan)
+}
+
+/// [`elide_superseded_tool_outputs`] for a history the provider already caches.
+/// Rewriting a message changes the request from there on, so the rewrite is
+/// made only when the bytes it saves are at least those of the messages after
+/// the first one it rewrites (what the cache would have to take in again).
+/// Otherwise nothing changes now: the next run's seed pass elides it.
+pub(super) fn elide_superseded_tool_outputs_if_it_pays(
+    messages: &mut [ProviderMessage],
+) -> ElisionStats {
+    let plan = plan_elisions(messages);
+    let Some(first) = plan.first().map(|planned| planned.index) else {
+        return ElisionStats::default();
+    };
+    let saved: usize = plan
+        .iter()
+        .map(|planned| messages[planned.index].content.len() - planned.pointer.len())
+        .sum();
+    // What is sent after that message, as the provider view sends it: a
+    // completed large `write` goes out as a short receipt, not its content.
+    let invalidated: usize = messages
+        .iter()
+        .enumerate()
+        .skip(first + 1)
+        .map(|(index, message)| {
+            message.content.len()
+                + message
+                    .content_blocks
+                    .iter()
+                    .map(content_block_bytes)
+                    .sum::<usize>()
+                + message
+                    .tool_calls
+                    .iter()
+                    .map(|call| super::mode::wire_argument_bytes(messages, index, call))
+                    .sum::<usize>()
+        })
+        .sum();
+    if saved < invalidated {
+        return ElisionStats::default();
+    }
+    apply_elisions(messages, plan)
+}
+
+fn content_block_bytes(block: &crate::provider::ProviderContentBlock) -> usize {
+    use crate::provider::ProviderContentBlock as Block;
+    match block {
+        Block::Text(text) => text.len(),
+        Block::Image { media_type, data }
+        | Block::Audio { media_type, data }
+        | Block::File { media_type, data } => media_type.len() + data.len(),
+        Block::Unsupported { kind } => kind.len(),
+    }
+}
+
+/// A tool message and the pointer that replaces its content.
+struct PlannedElision {
+    index: usize,
+    pointer: String,
+}
+
+/// The rewrites [`elide_superseded_tool_outputs`] makes, in history order.
+fn plan_elisions(messages: &[ProviderMessage]) -> Vec<PlannedElision> {
     // Call ids are only unique within one assistant turn (providers recycle
     // short ids), so a tool message resolves against the assistant before it.
     let mut call_paths = vec![None::<(String, String)>; messages.len()];
@@ -143,8 +207,15 @@ pub(super) fn elide_superseded_tool_outputs(messages: &mut [ProviderMessage]) ->
             "assistant" => {
                 turn_calls.clear();
                 for call in &message.tool_calls {
-                    if let Some(path) = tool_call_path(&call.arguments) {
-                        turn_calls.insert(call.id.as_str(), path);
+                    // A shell call is keyed by its exact arguments; the NUL
+                    // keeps that key apart from every path identity.
+                    let key = if call.name == "shell" {
+                        Some((format!("\0{}", call.arguments), String::new()))
+                    } else {
+                        tool_call_path(&call.arguments)
+                    };
+                    if let Some(key) = key {
+                        turn_calls.insert(call.id.as_str(), key);
                     }
                 }
             }
@@ -159,6 +230,9 @@ pub(super) fn elide_superseded_tool_outputs(messages: &mut [ProviderMessage]) ->
     }
     let mut latest_write = std::collections::HashMap::<String, usize>::new();
     let mut latest_mutation = std::collections::HashMap::<String, usize>::new();
+    let mut latest_shell = std::collections::HashMap::<String, usize>::new();
+    // The latest result of a command that is a pointer to an earlier run.
+    let mut shell_pointer = std::collections::HashMap::<String, usize>::new();
     for (index, message) in messages.iter().enumerate() {
         if message.role != "tool" || !message.content_blocks.is_empty() {
             continue;
@@ -174,14 +248,22 @@ pub(super) fn elide_superseded_tool_outputs(messages: &mut [ProviderMessage]) ->
             Some("patch") if message.content.starts_with("patched ") => {
                 latest_mutation.insert(key.clone(), index);
             }
+            // A duplicate pointer stands for one of the earlier runs: they stay.
+            Some("shell") if message.content.starts_with(DUPLICATE_POINTER_PREFIX) => {
+                shell_pointer.insert(key.clone(), index);
+            }
+            // Only a run that finished (not timed out or cancelled) supersedes.
+            Some("shell") if shell_completed_status(&message.content).is_some() => {
+                latest_shell.insert(key.clone(), index);
+            }
             _ => {}
         }
     }
-    if latest_write.is_empty() && latest_mutation.is_empty() {
-        return ElisionStats::default();
+    if latest_write.is_empty() && latest_mutation.is_empty() && latest_shell.is_empty() {
+        return Vec::new();
     }
-    let mut stats = ElisionStats::default();
-    for (index, message) in messages.iter_mut().enumerate() {
+    let mut plan = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
         if message.role != "tool" || !message.content_blocks.is_empty() {
             continue;
         }
@@ -203,20 +285,65 @@ pub(super) fn elide_superseded_tool_outputs(messages: &mut [ProviderMessage]) ->
                     raw = raw.as_str()
                 )
             }
+            // The same command ran again later: only the latest run describes
+            // the workspace. The status stays in the pointer as a record of the
+            // attempt, behind the prefix every consumer of pointers knows.
+            "shell"
+                if latest_shell.get(key).is_some_and(|&later| later > index)
+                    && !shell_pointer.get(key).is_some_and(|&later| later > index) =>
+            {
+                match shell_status(&message.content) {
+                    Some(status) => format!(
+                        "[superseded shell output elided; {status}; the same command ran again later]"
+                    ),
+                    None => continue,
+                }
+            }
             _ => continue,
         };
         if pointer.len() < message.content.len() {
-            stats.elided = stats.elided.saturating_add(1);
-            stats.original_bytes = stats
-                .original_bytes
-                .saturating_add(u64::try_from(message.content.len()).unwrap_or(u64::MAX));
-            stats.emitted_bytes = stats
-                .emitted_bytes
-                .saturating_add(u64::try_from(pointer.len()).unwrap_or(u64::MAX));
-            message.content = pointer;
+            plan.push(PlannedElision { index, pointer });
         }
     }
+    plan
+}
+
+fn apply_elisions(messages: &mut [ProviderMessage], plan: Vec<PlannedElision>) -> ElisionStats {
+    let mut stats = ElisionStats::default();
+    for PlannedElision { index, pointer } in plan {
+        let message = &mut messages[index];
+        stats.elided = stats.elided.saturating_add(1);
+        stats.original_bytes = stats
+            .original_bytes
+            .saturating_add(u64::try_from(message.content.len()).unwrap_or(u64::MAX));
+        stats.emitted_bytes = stats
+            .emitted_bytes
+            .saturating_add(u64::try_from(pointer.len()).unwrap_or(u64::MAX));
+        message
+            .recorded_content
+            .get_or_insert_with(|| Arc::from(message.content.as_str()));
+        message.content = pointer;
+    }
     stats
+}
+
+/// The status of a shell run that finished with an exit code: not a timeout, a
+/// cancellation or a run without one (`exit n/a`).
+fn shell_completed_status(output: &str) -> Option<&str> {
+    shell_status(output).filter(|status| {
+        !status.contains('·')
+            && status
+                .strip_prefix("exit ")
+                .is_some_and(|code| code.trim().parse::<i64>().is_ok())
+    })
+}
+
+/// The status header of a completed shell result (`exit 0`, `exit 1 · timed out`).
+fn shell_status(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .next()
+        .filter(|line| line.starts_with("exit "))
 }
 
 pub(super) fn truncate_result(output: &str, max_bytes: usize) -> String {
@@ -239,5 +366,112 @@ pub(super) fn write_output_is_recovery(output: &str) -> bool {
     output.contains("Current file is below")
         || output.contains("Current file edges are below")
         || output.contains("Suggested unique expected:")
+        || output.contains("Closest text is at line")
+        || output.contains("Nearest text is around line")
         || output.contains("Example context only for the first match at line ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exchange(id: &str, name: &str, path: &str, output: String) -> [ProviderMessage; 2] {
+        [
+            ProviderMessage::assistant(
+                "",
+                vec![ProviderToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    arguments: serde_json::json!({ "path": path }).to_string(),
+                }],
+            ),
+            ProviderMessage::tool(name, id, output),
+        ]
+    }
+
+    /// A read of `a.txt` that a later write supersedes, then `tail_bytes` of
+    /// unrelated output.
+    fn history(tail_bytes: usize) -> Vec<ProviderMessage> {
+        let mut messages = vec![ProviderMessage::user("fix a")];
+        messages.extend(exchange("r1", "read", "a.txt", "old ".repeat(1000)));
+        messages.extend(exchange(
+            "w1",
+            "write",
+            "a.txt",
+            "written a.txt; bytes=5; sha256=abc; exists=true; do not re-read".into(),
+        ));
+        messages.extend(exchange("r2", "read", "b.txt", "b".repeat(tail_bytes)));
+        messages
+    }
+
+    #[test]
+    fn every_patch_recovery_lead_in_marks_the_output_as_recovery() {
+        for lead_in in [
+            "Current file is below:",
+            "Current file edges are below:",
+            "Suggested unique expected:",
+            "Closest text is at line 3",
+            "Nearest text is around line 3",
+        ] {
+            assert!(write_output_is_recovery(&format!("unchanged.\n{lead_in}")));
+        }
+        assert!(!write_output_is_recovery("patched a.txt; 1 edits applied"));
+    }
+
+    #[test]
+    fn a_whole_file_rewrite_costs_its_receipt_not_its_content_when_elision_is_weighed() {
+        use sha2::{Digest, Sha256};
+        let old = "old line\n".repeat(2200);
+        let new = "new line\n".repeat(2200);
+        let hash = format!("{:x}", Sha256::digest(new.as_bytes()));
+        let arguments = serde_json::json!({ "path": "a.txt", "content": new }).to_string();
+        let mut messages = vec![ProviderMessage::user("rewrite a")];
+        messages.extend(exchange("r1", "read", "a.txt", old.clone()));
+        messages.push(ProviderMessage::assistant(
+            "",
+            vec![ProviderToolCall {
+                id: "w1".into(),
+                name: "write".into(),
+                arguments: arguments.clone(),
+            }],
+        ));
+        messages.push(ProviderMessage::tool(
+            "write",
+            "w1",
+            format!(
+                "written a.txt; bytes={}; sha256={}; exists=true; do not re-read",
+                new.len(),
+                &hash[..12]
+            ),
+        ));
+        // Counted by the raw arguments the rewrite would look as costly as the
+        // read it replaces; the provider is sent a receipt instead.
+        assert!(arguments.len() > old.len());
+        assert_eq!(
+            elide_superseded_tool_outputs_if_it_pays(&mut messages).elided,
+            1
+        );
+        assert!(messages[2].content.starts_with("[superseded read output"));
+    }
+
+    #[test]
+    fn a_mid_run_elision_that_saves_more_than_it_invalidates_is_applied() {
+        let mut messages = history(500);
+        let stats = elide_superseded_tool_outputs_if_it_pays(&mut messages);
+        assert_eq!(stats.elided, 1);
+        assert!(messages[2].content.starts_with("[superseded read output"));
+    }
+
+    #[test]
+    fn a_mid_run_elision_that_would_rewrite_more_cache_than_it_saves_is_deferred() {
+        let mut messages = history(20_000);
+        let original = messages.clone();
+        assert_eq!(
+            elide_superseded_tool_outputs_if_it_pays(&mut messages),
+            ElisionStats::default()
+        );
+        assert_eq!(messages, original);
+        // The unconditional pass (the seed of the next run) still elides it.
+        assert_eq!(elide_superseded_tool_outputs(&mut messages).elided, 1);
+    }
 }

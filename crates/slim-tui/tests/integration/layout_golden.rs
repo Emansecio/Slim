@@ -264,17 +264,26 @@ fn long_wide_cwd_is_cell_truncated_without_touching_context() {
 }
 
 #[test]
-fn planner_degrades_session_rail_before_activity() {
-    let spacious = plan_with_session_rail(100, 24, 0, true, true);
+fn planner_degrades_session_rail_before_todo() {
+    let spacious = plan_with_session_rail(100, 24, 0, true);
     assert_eq!(spacious.session_rail.height, 1);
-    assert_eq!(spacious.activity_rail.height, 1);
 
-    let constrained = plan_with_session_rail(80, 12, 5, true, true);
+    let constrained = plan_with_session_rail(80, 12, 6, true);
     assert_eq!(constrained.session_rail.height, 0);
-    assert_eq!(
-        constrained.activity_rail.height, 1,
-        "SessionRail degrades before ActivityRail"
+    assert!(
+        constrained.todo.height > 0,
+        "SessionRail degrades before the Todo dock"
     );
+}
+
+#[test]
+fn a_compact_todo_dock_has_no_divider() {
+    let compact = plan(100, 24, 1);
+    assert_eq!(compact.todo.height, 1);
+    assert_eq!(compact.todo_divider.height, 0);
+    assert_eq!(compact.todo.y + 1, compact.composer.y);
+    let expanded = plan(100, 24, 4);
+    assert_eq!(expanded.todo_divider.height, 1);
 }
 
 #[test]
@@ -435,6 +444,7 @@ fn multiline_composer_cursor_uses_display_cell_width_for_unicode_tail() {
 #[test]
 fn boxed_composer_and_todo_dock_at_normal_height() {
     let mut state = todo_state();
+    reduce(&mut state, slim_tui::reducer::Action::ToggleTodoDock);
     state.authenticated = true;
     state.composer.insert_text("draft text");
     let frame = render_to_string(&state, 80, 24);
@@ -454,7 +464,7 @@ fn boxed_composer_and_todo_dock_at_normal_height() {
     assert!(footer
         .iter()
         .any(|line| line.contains("GPT-5.6 Sol (high)")));
-    assert!(footer.iter().any(|line| line.contains("Ctrl+P")));
+    assert!(footer.iter().any(|line| line.contains("/ comandos")));
     let draft_row = frame
         .lines()
         .find(|line| line.contains("> draft text"))
@@ -498,7 +508,7 @@ fn grok_footer_keeps_aligned_inset_box_and_adjacent_status() {
         assert!(frame.contains("Auto"));
         if width >= 80 {
             assert!(frame.contains("Shift+Tab"));
-            assert!(frame.contains("Ctrl+P"));
+            assert!(frame.contains("/ comandos"));
         } else {
             assert!(frame.contains("⇧Tab") || frame.contains("Auto"));
         }
@@ -582,7 +592,7 @@ fn narrow_active_and_pinned_footers_keep_context_and_navigation() {
 }
 
 #[test]
-fn working_activity_is_immediately_above_inset_composer() {
+fn working_activity_reads_once_in_the_footer_below_the_composer() {
     let mut state = AppState::new();
     state.authenticated = true;
     reduce(
@@ -599,13 +609,14 @@ fn working_activity_is_immediately_above_inset_composer() {
         .position(|line| line.contains('╭'))
         .expect("top border");
     assert!(top_index > 0);
-    assert!(lines[top_index - 1].contains("Em atividade"));
-    let footer = lines.last().expect("footer");
     assert!(
-        !footer.contains("Em atividade"),
-        "activity label must not duplicate"
+        !lines[top_index - 1].contains("Em atividade"),
+        "no activity row above the composer\n{frame}"
     );
-    assert!(footer.contains("Ctrl+C cancelar"));
+    assert_eq!(frame.matches("Em atividade").count(), 1, "{frame}");
+    let footer = lines.last().expect("footer");
+    assert!(footer.contains("Em atividade"), "{footer}");
+    assert!(footer.contains("Esc parar"), "{footer}");
 }
 
 #[test]
@@ -628,17 +639,15 @@ fn constrained_working_state_moves_from_activity_to_footer() {
         },
     ];
 
-    let regions = plan(40, 8, 2, true);
-    assert_eq!(regions.activity_rail.height, 0, "§14.4 degrades rail first");
     let frame = render_to_string(&state, 40, 8);
     let footer = frame.lines().last().expect("footer");
     assert!(
         footer.contains("Em atividade"),
-        "active state migrates to footer"
+        "active state lives in the footer: {footer}"
     );
     assert!(
-        footer.contains("Ctrl+C cancelar"),
-        "the actionable cancellation shortcut remains visible: {footer}"
+        footer.contains("Esc"),
+        "the actionable stop shortcut remains visible: {footer}"
     );
 }
 
@@ -679,7 +688,7 @@ fn pending_images_render_as_honest_composer_chips() {
 #[test]
 fn supported_sizes_keep_three_row_composer_without_op_gap() {
     for (width, height) in [(40, 8), (48, 12), (79, 15), (80, 16), (120, 24)] {
-        let regions = plan(width, height, 0, false);
+        let regions = plan(width, height, 0);
         assert_eq!(regions.composer.height, 3, "size={width}x{height}");
         assert_eq!(regions.op_divider.height, 0, "size={width}x{height}");
         assert_eq!(
@@ -691,12 +700,26 @@ fn supported_sizes_keep_three_row_composer_without_op_gap() {
 }
 
 #[test]
-fn working_activity_sits_immediately_above_composer() {
-    let regions = plan(100, 24, 0, true);
-    assert_eq!(regions.activity_rail.height, 1);
+fn working_activity_takes_no_row_of_its_own() {
+    let mut state = AppState::new();
+    state.authenticated = true;
+    state.apply_event(UiEvent::run_started(1));
+    state.apply_event(UiEvent::ActivityChanged {
+        label: "Pensando".into(),
+    });
+    let frame = render_to_string(&state, 100, 24);
+    let rows = frame.lines().collect::<Vec<_>>();
+    let bottom = rows.iter().rposition(|row| row.contains('╰')).unwrap();
     assert_eq!(
-        regions.activity_rail.y + regions.activity_rail.height,
-        regions.composer.y
+        bottom + 3,
+        rows.len(),
+        "two footer rows follow the composer"
+    );
+    assert!(rows[bottom + 2].contains("Pensando"), "{frame}");
+    assert!(rows[bottom + 2].contains("Esc parar"), "{frame}");
+    assert!(
+        !rows[..bottom].iter().any(|row| row.contains("Esc parar")),
+        "{frame}"
     );
 }
 
@@ -831,7 +854,7 @@ fn estimated_speed_remains_in_diagnostics_only() {
 }
 
 #[test]
-fn completed_todos_collapse_and_can_be_expanded_on_demand() {
+fn completed_todos_stay_compact_and_can_be_expanded_on_demand() {
     let mut state = todo_state();
     state.apply_event(UiEvent::TodoChanged {
         items: state
@@ -857,10 +880,9 @@ fn completed_todos_collapse_and_can_be_expanded_on_demand() {
 #[test]
 fn manual_todo_collapse_survives_subsequent_updates() {
     let mut state = todo_state();
-    assert!(
-        state.todo_dock_open,
-        "pending work opens the dock initially"
-    );
+    assert!(!state.todo_dock_open, "pending work starts compact");
+    reduce(&mut state, slim_tui::reducer::Action::ToggleTodoDock);
+    assert!(state.todo_dock_open);
     reduce(&mut state, slim_tui::reducer::Action::ToggleTodoDock);
     assert!(!state.todo_dock_open);
     assert_eq!(state.todo_dock_user_preference, Some(false));
@@ -926,4 +948,116 @@ fn wide_composer_uses_full_width_for_wrapping_with_and_without_inspector() {
         assert_eq!(bottom - top, 2, "draft fits in one row at full width");
         assert!(lines[top + 1].contains(&"x".repeat(150)));
     }
+}
+
+#[test]
+fn jobs_panel_narrow_footer_and_output_keep_the_visual_contract() {
+    use slim_tui::app::JobsOverlay;
+    let mut state = AppState::new();
+    state.authenticated = true;
+    state.jobs = vec![
+        slim_core::runtime::ShellJobInfo {
+            id: "shell-1".into(),
+            command: "echo progress".into(),
+            origin: "user".into(),
+            state: "running".into(),
+            elapsed_ms: 1000,
+            exit_code: None,
+            output_bytes: 12,
+        },
+        slim_core::runtime::ShellJobInfo {
+            id: "shell-2".into(),
+            command: "echo done".into(),
+            origin: "model".into(),
+            state: "completed".into(),
+            elapsed_ms: 2000,
+            exit_code: Some(0),
+            output_bytes: 12,
+        },
+    ];
+    assert!(render_to_string(&state, 120, 8).contains("1 job ·"));
+    state.jobs_overlay = Some(JobsOverlay::default());
+    let frame = render_to_string(&state, 120, 24);
+    // State already says how a job ended; no `key=value` telemetry, and a
+    // clean exit adds nothing to `concluído`.
+    assert!(
+        frame.contains("shell-1 · rodando") && frame.contains("shell-2 · concluído"),
+        "{frame}"
+    );
+    assert!(!frame.contains("exit="), "{frame}");
+    for width in [40, 80] {
+        let frame = render_to_string(&state, width, 8);
+        assert!(frame.contains("shell-1"), "{frame}");
+        assert!(frame.contains("Esc"), "{frame}");
+    }
+    let overlay = state.jobs_overlay.as_mut().unwrap();
+    overlay.detail = true;
+    overlay.selected = 1;
+    overlay.output = "    a  b\n  indented".into();
+    let frame = render_to_string(&state, 80, 24);
+    assert!(frame.contains("    a  b"), "{frame}");
+    assert!(
+        frame.contains("shell-2 · concluído") && !frame.contains("Some("),
+        "{frame}"
+    );
+    // A failing exit code is the one that adds information.
+    state.jobs[1].state = "failed".into();
+    state.jobs[1].exit_code = Some(2);
+    let frame = render_to_string(&state, 80, 24);
+    assert!(frame.contains("shell-2 · falhou · exit 2"), "{frame}");
+    state.job_exit_confirm = Some(slim_tui::api::UiCommand::Shutdown);
+    let frame = render_to_string(&state, 40, 8);
+    assert!(frame.contains("Enter") && frame.contains("Esc"), "{frame}");
+}
+
+#[test]
+fn jobs_counter_keeps_active_cancel_controls_at_forty_columns() {
+    let mut state = AppState::new();
+    state.authenticated = true;
+    state.working = true;
+    state.jobs.push(slim_core::runtime::ShellJobInfo {
+        id: "shell-1".into(),
+        command: "echo".into(),
+        origin: "user".into(),
+        state: "running".into(),
+        elapsed_ms: 0,
+        exit_code: None,
+        output_bytes: 0,
+    });
+    let frame = render_to_string(&state, 40, 8);
+    assert!(frame.contains("Esc"), "{frame}");
+    assert!(frame.contains("1 job"), "{frame}");
+    state.scroll.mode = FollowMode::Top;
+    state.scroll.unseen = 10;
+    let frame = render_to_string(&state, 40, 8);
+    assert!(
+        frame.contains("1 job") && frame.contains("Esc") && frame.contains("End"),
+        "{frame}"
+    );
+}
+
+#[test]
+fn jobs_counter_keeps_preparation_cancel_controls_at_forty_columns() {
+    let mut state = AppState::new();
+    state.authenticated = true;
+    state.jobs.push(slim_core::runtime::ShellJobInfo {
+        id: "shell-1".into(),
+        command: "echo".into(),
+        origin: "user".into(),
+        state: "running".into(),
+        elapsed_ms: 0,
+        exit_code: None,
+        output_bytes: 0,
+    });
+    state.composer.insert_text("prepare this prompt");
+    reduce(
+        &mut state,
+        slim_tui::reducer::Action::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )),
+    );
+    assert!(state.prompt_is_busy());
+    let frame = render_to_string(&state, 40, 8);
+    assert!(frame.contains("Esc") && frame.contains("1 job"), "{frame}");
 }

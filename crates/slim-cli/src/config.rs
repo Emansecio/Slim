@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use serde::Deserialize;
-use slim_core::context::{CompactionPolicy, JevBackend, JevPruneConfig};
+use slim_core::context::CompactionPolicy;
+use slim_core::mcp::McpExposure;
 
 pub struct Config;
 
@@ -51,10 +52,20 @@ pub struct FileConfig {
     pub max_result_bytes: Option<usize>,
     #[serde(default)]
     pub compaction: Option<FileCompactionConfig>,
+    pub shell_jobs: Option<FileShellJobConfig>,
     #[serde(default)]
     pub lsp: Option<FileLspConfig>,
     #[serde(default)]
     pub mcp: Option<FileMcpConfig>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileShellJobConfig {
+    pub max_running: Option<usize>,
+    pub max_retained: Option<usize>,
+    pub memory_bytes: Option<usize>,
+    pub interrupt_grace_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
@@ -79,6 +90,27 @@ pub struct FileLspServerConfig {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub path: Option<String>,
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_lsp_object")]
+    pub initialization_options: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_optional_lsp_object")]
+    pub settings: Option<serde_json::Value>,
+}
+
+fn deserialize_optional_lsp_object<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if !value.is_object() {
+        return Err(serde::de::Error::custom(
+            "LSP configuration must be a table",
+        ));
+    }
+    Ok(Some(value))
 }
 
 /// Merged LSP configuration with defaults applied.
@@ -96,6 +128,25 @@ pub struct LspConfig {
 pub struct LspServerConfig {
     pub enabled: bool,
     pub path: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub initialization_options: Option<serde_json::Value>,
+    pub settings: Option<serde_json::Value>,
+    /// Values the workspace's `slim.toml` set. A project file can name any
+    /// executable or launcher argument, so they apply only to a trusted
+    /// workspace, like project MCP servers. A project `enabled = false` only
+    /// restricts and is applied directly.
+    pub project: LspProjectOverrides,
+}
+
+/// Launch-affecting LSP fields from the project layer; see
+/// [`LspServerConfig::effective`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LspProjectOverrides {
+    pub enabled: Option<bool>,
+    pub path: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub initialization_options: Option<serde_json::Value>,
+    pub settings: Option<serde_json::Value>,
 }
 
 impl Default for LspServerConfig {
@@ -103,7 +154,46 @@ impl Default for LspServerConfig {
         Self {
             enabled: true,
             path: None,
+            args: None,
+            initialization_options: None,
+            settings: None,
+            project: LspProjectOverrides::default(),
         }
+    }
+}
+
+impl LspServerConfig {
+    /// Whether the workspace's `slim.toml` changes how this server launches.
+    pub fn has_project_overrides(&self) -> bool {
+        self.project != LspProjectOverrides::default()
+    }
+
+    /// The configuration a manager may use: project overrides are layered on
+    /// top only when the workspace is trusted.
+    pub fn effective(&self, trusted: bool) -> LspServerConfig {
+        let mut server = LspServerConfig {
+            project: LspProjectOverrides::default(),
+            ..self.clone()
+        };
+        if trusted {
+            let project = &self.project;
+            if let Some(enabled) = project.enabled {
+                server.enabled = enabled;
+            }
+            if project.path.is_some() {
+                server.path = project.path.clone();
+            }
+            if project.args.is_some() {
+                server.args = project.args.clone();
+            }
+            if project.initialization_options.is_some() {
+                server.initialization_options = project.initialization_options.clone();
+            }
+            if project.settings.is_some() {
+                server.settings = project.settings.clone();
+            }
+        }
+        server
     }
 }
 
@@ -124,6 +214,10 @@ impl Default for LspConfig {
 pub struct FileMcpConfig {
     #[serde(default)]
     pub servers: Option<BTreeMap<String, FileMcpServerConfig>>,
+    /// How long the first model request waits for direct-exposure servers
+    /// that are still connecting (milliseconds).
+    #[serde(default)]
+    pub startup_wait_ms: Option<u64>,
 }
 
 /// One `[mcp.servers.<name>]` entry: stdio (`command`) or streamable HTTP
@@ -137,6 +231,8 @@ pub struct FileMcpServerConfig {
     #[serde(default)]
     pub env: Option<BTreeMap<String, String>>,
     #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
     pub url: Option<String>,
     #[serde(default)]
     pub headers: Option<BTreeMap<String, String>>,
@@ -144,12 +240,51 @@ pub struct FileMcpServerConfig {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub exposure: Option<McpExposure>,
+    #[serde(default)]
+    pub tool_exposure: Option<BTreeMap<String, McpExposure>>,
+    #[serde(default)]
+    pub lazy: Option<bool>,
+    #[serde(default)]
+    pub oauth: Option<FileMcpOAuthConfig>,
+}
+
+/// `[mcp.servers.<name>.oauth]`: pre-registered client and discovery
+/// overrides for an HTTP server.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
+pub struct FileMcpOAuthConfig {
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    #[serde(default)]
+    pub callback_port: Option<u16>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub client_name: Option<String>,
+    #[serde(default)]
+    pub auth_server_metadata_url: Option<String>,
 }
 
 /// Merged MCP configuration with defaults applied.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct McpConfig {
     pub servers: BTreeMap<String, McpServerConfig>,
+    /// `[mcp] startup_wait_ms`; `None` keeps the default (10 s).
+    pub startup_wait_ms: Option<u64>,
+}
+
+/// Which layer defines a merged server entry. Entries touched by the project
+/// `slim.toml` are not started until the workspace is trusted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum McpOrigin {
+    #[default]
+    Global,
+    Project,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -157,11 +292,50 @@ pub struct McpServerConfig {
     pub command: Option<String>,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    pub cwd: Option<String>,
     pub url: Option<String>,
     pub headers: BTreeMap<String, String>,
     pub enabled: bool,
     pub timeout_ms: u64,
+    pub description: Option<String>,
+    pub exposure: McpExposure,
+    pub tool_exposure: BTreeMap<String, McpExposure>,
+    pub lazy: bool,
+    pub oauth: Option<McpOAuthConfig>,
+    pub origin: McpOrigin,
 }
+
+/// Merged OAuth settings; `client_secret` is the raw (uninterpolated) value.
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct McpOAuthConfig {
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub callback_port: Option<u16>,
+    pub scope: Option<String>,
+    pub client_name: Option<String>,
+    pub auth_server_metadata_url: Option<String>,
+}
+
+impl std::fmt::Debug for McpOAuthConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpOAuthConfig")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("callback_port", &self.callback_port)
+            .field("scope", &self.scope)
+            .field("client_name", &self.client_name)
+            .field("auth_server_metadata_url", &self.auth_server_metadata_url)
+            .finish()
+    }
+}
+
+/// Default per-request timeout; progress notifications renew it.
+pub const DEFAULT_MCP_TIMEOUT_MS: u64 = 60_000;
+const MAX_MCP_DESCRIPTION_BYTES: usize = 2048;
 
 impl Default for McpServerConfig {
     fn default() -> Self {
@@ -169,18 +343,61 @@ impl Default for McpServerConfig {
             command: None,
             args: Vec::new(),
             env: BTreeMap::new(),
+            cwd: None,
             url: None,
             headers: BTreeMap::new(),
             enabled: true,
-            timeout_ms: 30_000,
+            timeout_ms: DEFAULT_MCP_TIMEOUT_MS,
+            description: None,
+            exposure: McpExposure::Gateway,
+            tool_exposure: BTreeMap::new(),
+            lazy: false,
+            oauth: None,
+            origin: McpOrigin::Global,
         }
     }
 }
 
+/// `https://...`, or `http://` on a loopback host (`localhost`, `127.0.0.1`,
+/// `[::1]`) - the only endpoints allowed to carry OAuth metadata.
+fn https_or_loopback(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return true;
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    ["localhost", "127.0.0.1", "[::1]"].iter().any(|host| {
+        rest.strip_prefix(host)
+            .is_some_and(|tail| tail.is_empty() || tail.starts_with([':', '/', '?', '#']))
+    })
+}
+
+/// Largest accepted `[mcp] startup_wait_ms`.
+const MAX_MCP_STARTUP_WAIT_MS: u64 = 120_000;
+
 impl McpConfig {
+    /// Time the first model request waits for direct-exposure servers that
+    /// are still connecting in the background.
+    pub fn startup_wait(&self) -> std::time::Duration {
+        self.startup_wait_ms.map_or(
+            slim_core::mcp::DEFAULT_MCP_STARTUP_WAIT,
+            std::time::Duration::from_millis,
+        )
+    }
+
     /// Fails loud on ambiguous server entries so a typo cannot silently
     /// disable or reroute a configured server.
     pub fn validate(&self) -> Result<(), String> {
+        if self
+            .startup_wait_ms
+            .is_some_and(|wait| wait > MAX_MCP_STARTUP_WAIT_MS)
+        {
+            return Err(format!(
+                "mcp.startup_wait_ms must be at most {MAX_MCP_STARTUP_WAIT_MS}"
+            ));
+        }
+        let mut normalized_names = BTreeMap::new();
         for (name, server) in &self.servers {
             if name.is_empty()
                 || name.len() > 64
@@ -190,6 +407,13 @@ impl McpConfig {
             {
                 return Err(format!(
                     "mcp.servers.{name}: name must match ^[A-Za-z0-9_-]{{1,64}}$"
+                ));
+            }
+            // Tool names (`mcp__<server>__<tool>`) fold `-` into `_`, so two
+            // servers differing only there would be indistinguishable.
+            if let Some(other) = normalized_names.insert(name.replace('-', "_"), name) {
+                return Err(format!(
+                    "mcp.servers.{name}: name collides with mcp.servers.{other} (names that differ only in '-' and '_' are the same server)"
                 ));
             }
             match (server.command.is_some(), server.url.is_some()) {
@@ -217,6 +441,60 @@ impl McpConfig {
                     ));
                 }
             }
+            if let Some(cwd) = &server.cwd {
+                if server.command.is_none() {
+                    return Err(format!(
+                        "mcp.servers.{name}: cwd applies to stdio servers (command) only"
+                    ));
+                }
+                if cwd.trim().is_empty() || cwd.contains('\0') {
+                    return Err(format!("mcp.servers.{name}: cwd must be a non-empty path"));
+                }
+            }
+            if let Some(description) = &server.description {
+                if description.trim().is_empty() {
+                    return Err(format!("mcp.servers.{name}: description must not be empty"));
+                }
+                if description.len() > MAX_MCP_DESCRIPTION_BYTES {
+                    return Err(format!(
+                        "mcp.servers.{name}: description must be at most {MAX_MCP_DESCRIPTION_BYTES} bytes"
+                    ));
+                }
+            }
+            if server.tool_exposure.keys().any(String::is_empty) {
+                return Err(format!(
+                    "mcp.servers.{name}: tool_exposure keys must not be empty"
+                ));
+            }
+            if let Some(oauth) = &server.oauth {
+                if server.url.is_none() {
+                    return Err(format!(
+                        "mcp.servers.{name}: oauth applies to HTTP servers (url) only"
+                    ));
+                }
+                if oauth.client_id.as_deref().is_some_and(str::is_empty) {
+                    return Err(format!(
+                        "mcp.servers.{name}: oauth.client_id must not be empty"
+                    ));
+                }
+                if oauth.client_secret.is_some() && oauth.client_id.is_none() {
+                    return Err(format!(
+                        "mcp.servers.{name}: oauth.client_secret requires oauth.client_id"
+                    ));
+                }
+                if oauth.callback_port == Some(0) {
+                    return Err(format!(
+                        "mcp.servers.{name}: oauth.callback_port must be between 1 and 65535"
+                    ));
+                }
+                if let Some(url) = &oauth.auth_server_metadata_url {
+                    if !https_or_loopback(url) {
+                        return Err(format!(
+                            "mcp.servers.{name}: oauth.auth_server_metadata_url must use https (http only on localhost, 127.0.0.1, or [::1])"
+                        ));
+                    }
+                }
+            }
             if !(1_000..=600_000).contains(&server.timeout_ms) {
                 return Err(format!(
                     "mcp.servers.{name}: timeout_ms must be between 1000 and 600000"
@@ -232,15 +510,13 @@ pub struct FileCompactionConfig {
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
-    pub background: Option<bool>,
+    pub reserve_tokens: Option<u64>,
     #[serde(default)]
     pub keep_recent_tokens: Option<u64>,
     #[serde(default)]
     pub summary_max_bytes: Option<usize>,
     #[serde(default)]
     pub manual_instructions_max_bytes: Option<usize>,
-    #[serde(default)]
-    pub strategy: Option<String>,
 }
 
 /// Merged view of every config layer (project wins over global).
@@ -258,6 +534,7 @@ pub struct LayeredConfig {
     pub timeout_secs: Option<u64>,
     pub max_result_bytes: Option<usize>,
     pub compaction: FileCompactionConfig,
+    pub shell_jobs: slim_core::runtime::ShellJobLimits,
     pub lsp: LspConfig,
     pub mcp: McpConfig,
 }
@@ -268,8 +545,11 @@ impl LayeredConfig {
         if let Some(value) = self.compaction.enabled {
             policy.enabled = value;
         }
-        if let Some(value) = self.compaction.background {
-            policy.background = value;
+        if let Some(value) = self.compaction.reserve_tokens {
+            if value == 0 {
+                return Err("compaction.reserve_tokens must be positive".into());
+            }
+            policy.reserve_tokens = value;
         }
         if let Some(value) = self.compaction.keep_recent_tokens {
             if value == 0 {
@@ -290,10 +570,6 @@ impl LayeredConfig {
                 );
             }
             policy.manual_instructions_max_bytes = value;
-        }
-        if let Some(value) = self.compaction.strategy.as_deref() {
-            policy.strategy = slim_core::context::CompactionStrategy::parse(value)
-                .map_err(|error| format!("compaction.strategy: {error}"))?;
         }
         Ok(policy)
     }
@@ -419,20 +695,96 @@ fn save_global_model_to(
     write_config_atomic(path, serialized.as_bytes())
 }
 
-/// Writes or replaces `[mcp.servers.<name>]` in the TOML at `path`,
-/// preserving all other keys. Only fields actually set on `server` are
-/// written, so a re-add does not resurrect stale keys.
+/// Path of the project config layer for `workspace`.
+pub fn project_config_path(workspace: &Path) -> PathBuf {
+    workspace.join(PROJECT_CONFIG_FILE)
+}
+
+fn toml_string_table(entries: &BTreeMap<String, String>) -> toml::Table {
+    entries
+        .iter()
+        .map(|(key, value)| (key.clone(), toml::Value::String(value.clone())))
+        .collect()
+}
+
+/// Updates `fields[key]` (a table) key by key, creating it when missing or
+/// when the existing value is not a table.
+fn merge_into_table(fields: &mut toml::Table, key: &str, update: toml::Table) {
+    let slot = fields
+        .entry(key)
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if !slot.is_table() {
+        *slot = toml::Value::Table(toml::Table::new());
+    }
+    if let Some(table) = slot.as_table_mut() {
+        table.extend(update);
+    }
+}
+
+/// Writes `[mcp.servers.<name>]` in the TOML at `path`, preserving all other
+/// keys. An existing entry is merged, not replaced: only fields set on
+/// `server` change; `env`, `headers`, `tool_exposure` and `oauth` update key
+/// by key. A new `command` replaces the old one's `args` and `cwd`. Choosing
+/// one transport removes the other transport's keys so the entry stays valid.
 pub fn upsert_mcp_server_to(
     path: &Path,
     name: &str,
     server: &FileMcpServerConfig,
 ) -> Result<(), String> {
+    write_mcp_server(path, name, server, false)
+}
+
+/// Replaces `[mcp.servers.<name>]` outright (no merge with an existing
+/// entry); used by `import --force`.
+pub fn replace_mcp_server_to(
+    path: &Path,
+    name: &str,
+    server: &FileMcpServerConfig,
+) -> Result<(), String> {
+    write_mcp_server(path, name, server, true)
+}
+
+/// Whether the TOML at `path` already defines `[mcp.servers.<name>]`.
+pub fn mcp_server_defined_in(path: &Path, name: &str) -> Result<bool, String> {
+    let _write_guard = CONFIG_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut table = read_config_table_locked(path)?;
+    Ok(mcp_servers_table(&mut table).contains_key(name))
+}
+
+fn write_mcp_server(
+    path: &Path,
+    name: &str,
+    server: &FileMcpServerConfig,
+    replace: bool,
+) -> Result<(), String> {
+    if server.command.is_some() && server.url.is_some() {
+        return Err(format!(
+            "mcp.servers.{name}: set either command (stdio) or url (http), not both"
+        ));
+    }
     let _write_guard = CONFIG_WRITE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut table = read_config_table_locked(path)?;
     let entry = mcp_servers_table(&mut table);
-    let mut fields = toml::Table::new();
+    let mut fields = match entry.remove(name) {
+        Some(toml::Value::Table(existing)) if !replace => existing,
+        _ => toml::Table::new(),
+    };
+    if server.command.is_some() {
+        // A new command brings its own arguments and working directory: the
+        // old ones belong to the command it replaces.
+        for key in ["url", "headers", "oauth", "args", "cwd"] {
+            fields.remove(key);
+        }
+    }
+    if server.url.is_some() {
+        for key in ["command", "args", "env", "cwd"] {
+            fields.remove(key);
+        }
+    }
     if let Some(command) = &server.command {
         fields.insert("command".into(), command.clone().into());
     }
@@ -443,28 +795,16 @@ pub fn upsert_mcp_server_to(
         );
     }
     if let Some(env) = &server.env {
-        fields.insert(
-            "env".into(),
-            toml::Value::Table(
-                env.iter()
-                    .map(|(k, v)| (k.clone(), v.clone().into()))
-                    .collect(),
-            ),
-        );
+        merge_into_table(&mut fields, "env", toml_string_table(env));
+    }
+    if let Some(cwd) = &server.cwd {
+        fields.insert("cwd".into(), cwd.clone().into());
     }
     if let Some(url) = &server.url {
         fields.insert("url".into(), url.clone().into());
     }
     if let Some(headers) = &server.headers {
-        fields.insert(
-            "headers".into(),
-            toml::Value::Table(
-                headers
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone().into()))
-                    .collect(),
-            ),
-        );
+        merge_into_table(&mut fields, "headers", toml_string_table(headers));
     }
     if let Some(enabled) = server.enabled {
         fields.insert("enabled".into(), enabled.into());
@@ -477,18 +817,52 @@ pub fn upsert_mcp_server_to(
             i64::try_from(timeout_ms).unwrap_or(i64::MAX).into(),
         );
     }
+    if let Some(description) = &server.description {
+        fields.insert("description".into(), description.clone().into());
+    }
+    if let Some(exposure) = server.exposure {
+        fields.insert("exposure".into(), exposure.as_str().into());
+    }
+    if let Some(tool_exposure) = &server.tool_exposure {
+        let update = tool_exposure
+            .iter()
+            .map(|(tool, exposure)| (tool.clone(), toml::Value::from(exposure.as_str())))
+            .collect();
+        merge_into_table(&mut fields, "tool_exposure", update);
+    }
+    if let Some(lazy) = server.lazy {
+        fields.insert("lazy".into(), lazy.into());
+    }
+    if let Some(oauth) = &server.oauth {
+        let mut update = toml::Table::new();
+        for (key, value) in [
+            ("client_id", &oauth.client_id),
+            ("client_secret", &oauth.client_secret),
+            ("scope", &oauth.scope),
+            ("client_name", &oauth.client_name),
+            ("auth_server_metadata_url", &oauth.auth_server_metadata_url),
+        ] {
+            if let Some(value) = value {
+                update.insert(key.into(), value.clone().into());
+            }
+        }
+        if let Some(port) = oauth.callback_port {
+            update.insert("callback_port".into(), i64::from(port).into());
+        }
+        merge_into_table(&mut fields, "oauth", update);
+    }
     entry.insert(name.to_owned(), toml::Value::Table(fields));
     write_config_table_locked(path, &table)
 }
 
 /// Deletes `[mcp.servers.<name>]` from the first layer that defines it
-/// (project file first, then global). Returns the edited path, or `None`
-/// when the server was not configured anywhere.
-pub fn remove_mcp_server(name: &str) -> Result<Option<PathBuf>, String> {
+/// (the workspace's project file first, then global). Returns the edited
+/// path, or `None` when the server was not configured anywhere.
+pub fn remove_mcp_server(workspace: &Path, name: &str) -> Result<Option<PathBuf>, String> {
     let _write_guard = CONFIG_WRITE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut paths = vec![PathBuf::from(PROJECT_CONFIG_FILE)];
+    let mut paths = vec![project_config_path(workspace)];
     if let Some(global) = global_config_path() {
         paths.push(global);
     }
@@ -504,6 +878,46 @@ pub fn remove_mcp_server(name: &str) -> Result<Option<PathBuf>, String> {
         }
     }
     Ok(None)
+}
+
+/// Deletes `[mcp.servers.<name>]` from the TOML at `path` only. `true` when it
+/// was there.
+pub fn remove_mcp_server_from(path: &Path, name: &str) -> Result<bool, String> {
+    let _write_guard = CONFIG_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut table = read_config_table_locked(path)?;
+    if mcp_servers_table(&mut table).remove(name).is_none() {
+        return Ok(false);
+    }
+    write_config_table_locked(path, &table)?;
+    Ok(true)
+}
+
+/// Undoes a project "disable-only" override: when `[mcp.servers.<name>]` in
+/// the TOML at `path` holds nothing but `enabled = false`, the entry is
+/// deleted (the server is then governed by the file that really defines it)
+/// and `true` is returned. Any other entry is left alone and gives `false`.
+/// Writing `enabled = true` instead would turn the override into a project
+/// definition that needs the workspace to be trusted.
+pub fn clear_mcp_disable_override_to(path: &Path, name: &str) -> Result<bool, String> {
+    let _write_guard = CONFIG_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut table = read_config_table_locked(path)?;
+    let servers = mcp_servers_table(&mut table);
+    let only_disabled = servers
+        .get(name)
+        .and_then(toml::Value::as_table)
+        .is_some_and(|entry| {
+            entry.len() == 1 && entry.get("enabled").and_then(toml::Value::as_bool) == Some(false)
+        });
+    if !only_disabled {
+        return Ok(false);
+    }
+    servers.remove(name);
+    write_config_table_locked(path, &table)?;
+    Ok(true)
 }
 
 fn read_config_table_locked(path: &Path) -> Result<toml::Table, String> {
@@ -613,15 +1027,27 @@ fn replace_config_file(source: &Path, destination: &Path) -> Result<(), String> 
     fs::rename(source, destination).map_err(|error| format!("{}: {error}", destination.display()))
 }
 
-/// Loads global first, then project. Later layers override keys they set
-/// and fill remaining gaps (`project` wins over `global`).
+/// Loads global first, then the project `slim.toml` in the current directory.
+/// Later layers override keys they set and fill remaining gaps (`project`
+/// wins over `global`).
 pub fn load_layered() -> Result<LayeredConfig, String> {
-    let mut paths = Vec::new();
+    load_layered_with_project(PathBuf::from(PROJECT_CONFIG_FILE))
+}
+
+/// Like [`load_layered`] but reads the project layer from `workspace`, the
+/// root MCP servers and sessions actually run in. It differs from the process
+/// directory when a session is resumed from its recorded workspace.
+pub fn load_layered_for(workspace: &Path) -> Result<LayeredConfig, String> {
+    load_layered_with_project(project_config_path(workspace))
+}
+
+fn load_layered_with_project(project: PathBuf) -> Result<LayeredConfig, String> {
+    let mut layers = Vec::new();
     if let Some(global) = global_config_path() {
-        paths.push(global);
+        layers.push((global, McpOrigin::Global));
     }
-    paths.push(PathBuf::from(PROJECT_CONFIG_FILE));
-    let mut config = load_layered_from(paths)?;
+    layers.push((project, McpOrigin::Project));
+    let mut config = load_layers(layers)?;
     // A file value is a default, not an explicit ProviderRunOptions override.
     // Leave env-backed values unset so the shared resolvers validate them;
     // invalid/empty environment settings must not silently fall back to TOML.
@@ -645,91 +1071,125 @@ fn file_default<T>(value: Option<T>, env_key: &str) -> Option<T> {
     value.filter(|_| std::env::var_os(env_key).is_none())
 }
 
-const JEV_BACKEND_ENV: &str = "SLIM_JEV_BACKEND";
-const TYPESAFE_API_KEY_ENV: &str = "TYPESAFE_API_KEY";
-const AI_GATEWAY_API_KEY_ENV: &str = "AI_GATEWAY_API_KEY";
-const JEV_MODEL_ENV: &str = "SLIM_JEV_MODEL";
-
-/// Resolves the Jev pruning credential from the environment. `None` leaves the
-/// runtime on the LLM summary path without any external call.
-///
-/// `SLIM_JEV_BACKEND` (`typesafe` or `vercel`) selects the endpoint explicitly.
-/// With it, the matching credential variable wins; the other variable is only
-/// accepted when the existing key rule identifies the selected backend. Without it,
-/// the credential decides, because Vercel AI Gateway keys carry the `vck_` prefix
-/// Vercel issues, and `TYPESAFE_API_KEY` remains the deterministic preference
-/// when both variables are populated.
-pub fn jev_prune_config_from_env() -> Result<Option<JevPruneConfig>, String> {
-    jev_prune_config_from(|key| std::env::var(key).ok())
-}
-
-pub(crate) fn jev_prune_config_from(
-    env: impl Fn(&str) -> Option<String>,
-) -> Result<Option<JevPruneConfig>, String> {
-    let (backend, api_key) = match nonempty_env(&env, JEV_BACKEND_ENV) {
-        Some(value) => {
-            let backend = JevBackend::parse(&value)?;
-            (backend, jev_api_key_for_backend(&env, backend))
-        }
-        None => {
-            let api_key = nonempty_env(&env, TYPESAFE_API_KEY_ENV)
-                .or_else(|| nonempty_env(&env, AI_GATEWAY_API_KEY_ENV));
-            let backend = JevBackend::for_api_key(api_key.as_deref().unwrap_or_default());
-            (backend, api_key)
-        }
-    };
-    let Some(api_key) = api_key else {
-        return Ok(None);
-    };
-    let config = JevPruneConfig::new(backend, api_key);
-    Ok(Some(match nonempty_env(&env, JEV_MODEL_ENV) {
-        Some(model) => config.with_model(model),
-        None => config,
-    }))
-}
-
-fn jev_api_key_for_backend(
-    env: &impl Fn(&str) -> Option<String>,
-    backend: JevBackend,
-) -> Option<String> {
-    let (preferred, fallback) = match backend {
-        JevBackend::Typesafe => (TYPESAFE_API_KEY_ENV, AI_GATEWAY_API_KEY_ENV),
-        JevBackend::Vercel => (AI_GATEWAY_API_KEY_ENV, TYPESAFE_API_KEY_ENV),
-    };
-    nonempty_env(env, preferred).or_else(|| {
-        nonempty_env(env, fallback).filter(|api_key| JevBackend::for_api_key(api_key) == backend)
-    })
-}
-
-fn nonempty_env(env: &impl Fn(&str) -> Option<String>, key: &str) -> Option<String> {
-    env(key).filter(|value| !value.trim().is_empty())
-}
-
+/// Layered load where every path is a global-origin layer (hermetic tests).
+#[cfg(test)]
 pub(crate) fn load_layered_from(
     paths: impl IntoIterator<Item = PathBuf>,
 ) -> Result<LayeredConfig, String> {
+    load_layers(paths.into_iter().map(|path| (path, McpOrigin::Global)))
+}
+
+fn load_layers(
+    layers: impl IntoIterator<Item = (PathBuf, McpOrigin)>,
+) -> Result<LayeredConfig, String> {
     let mut layered = LayeredConfig::default();
-    for path in paths {
+    for (path, origin) in layers {
         if let Some(config) = FileConfig::load(&path)? {
             // Per-layer rejection: one file setting both transports is a
             // typo; merging then can no longer detect it (a layer's `command`
             // legitimately clears an inherited `url` and vice versa).
             if let Some(servers) = config.mcp.as_ref().and_then(|mcp| mcp.servers.as_ref()) {
                 for (name, server) in servers {
-                    if server.command.is_some() && server.url.is_some() {
-                        return Err(format!(
-                            "mcp.servers.{name}: set either command (stdio) or url (http), not both"
-                        ));
+                    if let Some(error) = layer_server_error(name, server) {
+                        return Err(error);
                     }
                 }
             }
-            merge_layer(&mut layered, config);
+            merge_layer_as(&mut layered, config, origin);
         }
     }
     Ok(layered)
 }
 
-fn merge_layer(target: &mut LayeredConfig, source: FileConfig) {
+/// Per-layer rule for one server entry (see [`load_layers`]).
+fn layer_server_error(name: &str, server: &FileMcpServerConfig) -> Option<String> {
+    if server.command.is_some() && server.url.is_some() {
+        return Some(format!(
+            "mcp.servers.{name}: set either command (stdio) or url (http), not both"
+        ));
+    }
+    if server.url.is_some() && server.cwd.is_some() {
+        return Some(format!(
+            "mcp.servers.{name}: cwd applies to stdio servers (command) only"
+        ));
+    }
+    if server.command.is_some() && server.oauth.is_some() {
+        return Some(format!(
+            "mcp.servers.{name}: oauth applies to HTTP servers (url) only"
+        ));
+    }
+    None
+}
+
+/// Like [`load_layered_for`] for the MCP CLI: one invalid server entry does not
+/// fail the load. Invalid entries are dropped from the result and returned as
+/// `(name, error)` so `slim mcp list` can report them next to the good ones.
+/// A file that cannot be read or parsed is still an error.
+pub(crate) fn load_layered_lenient_for(
+    workspace: &Path,
+) -> Result<(LayeredConfig, Vec<(String, String)>), String> {
+    let mut layers = Vec::new();
+    if let Some(global) = global_config_path() {
+        layers.push((global, McpOrigin::Global));
+    }
+    layers.push((project_config_path(workspace), McpOrigin::Project));
+    let mut layered = LayeredConfig::default();
+    let mut invalid: BTreeMap<String, String> = BTreeMap::new();
+    for (path, origin) in layers {
+        let Some(mut config) = FileConfig::load(&path)? else {
+            continue;
+        };
+        if let Some(servers) = config.mcp.as_mut().and_then(|mcp| mcp.servers.as_mut()) {
+            servers.retain(|name, server| match layer_server_error(name, server) {
+                Some(error) => {
+                    invalid.entry(name.clone()).or_insert(error);
+                    false
+                }
+                None => true,
+            });
+        }
+        merge_layer_as(&mut layered, config, origin);
+    }
+    // An entry invalid in one layer is invalid as a whole: showing the other
+    // layer's version would hide the error.
+    layered
+        .mcp
+        .servers
+        .retain(|name, _| !invalid.contains_key(name));
+    // Merged entries are checked one at a time, then added together so a name
+    // collision blames the later name only.
+    let candidates = std::mem::take(&mut layered.mcp.servers);
+    let mut accepted = McpConfig {
+        startup_wait_ms: layered.mcp.startup_wait_ms,
+        ..McpConfig::default()
+    };
+    accepted.validate()?;
+    for (name, server) in candidates {
+        accepted.servers.insert(name.clone(), server);
+        if let Err(error) = accepted.validate() {
+            accepted.servers.remove(&name);
+            invalid.insert(name, error);
+        }
+    }
+    layered.mcp = accepted;
+    Ok((layered, invalid.into_iter().collect()))
+}
+
+/// A project entry that only turns a server off cannot start anything, so it
+/// does not need the workspace to be trusted.
+fn is_disable_only(server: &FileMcpServerConfig) -> bool {
+    server.enabled == Some(false)
+        && FileMcpServerConfig {
+            enabled: None,
+            ..server.clone()
+        } == FileMcpServerConfig::default()
+}
+
+pub(crate) fn merge_layer(target: &mut LayeredConfig, source: FileConfig) {
+    merge_layer_as(target, source, McpOrigin::Global);
+}
+
+pub(crate) fn merge_layer_as(target: &mut LayeredConfig, source: FileConfig, origin: McpOrigin) {
     if source.model.is_some() {
         target.model = source.model;
     }
@@ -763,6 +1223,20 @@ fn merge_layer(target: &mut LayeredConfig, source: FileConfig) {
     if source.max_result_bytes.is_some() {
         target.max_result_bytes = source.max_result_bytes;
     }
+    if let Some(jobs) = source.shell_jobs {
+        if let Some(v) = jobs.max_running {
+            target.shell_jobs.max_running = v;
+        }
+        if let Some(v) = jobs.max_retained {
+            target.shell_jobs.max_retained = v;
+        }
+        if let Some(v) = jobs.memory_bytes {
+            target.shell_jobs.memory_bytes = v;
+        }
+        if let Some(v) = jobs.interrupt_grace_ms {
+            target.shell_jobs.interrupt_grace_ms = v;
+        }
+    }
     if let Some(lsp) = source.lsp {
         if let Some(enabled) = lsp.enabled {
             target.lsp.enabled = enabled;
@@ -782,25 +1256,68 @@ fn merge_layer(target: &mut LayeredConfig, source: FileConfig) {
         if let Some(servers) = lsp.servers {
             for (name, server) in servers {
                 let entry = target.lsp.servers.entry(name).or_default();
+                if origin == McpOrigin::Project {
+                    // Disabling only restricts; everything else waits for trust.
+                    match server.enabled {
+                        Some(false) => {
+                            entry.enabled = false;
+                            entry.project.enabled = None;
+                        }
+                        Some(true) => entry.project.enabled = Some(true),
+                        None => {}
+                    }
+                    if server.path.is_some() {
+                        entry.project.path = server.path;
+                    }
+                    if server.args.is_some() {
+                        entry.project.args = server.args;
+                    }
+                    if server.initialization_options.is_some() {
+                        entry.project.initialization_options = server.initialization_options;
+                    }
+                    if server.settings.is_some() {
+                        entry.project.settings = server.settings;
+                    }
+                    continue;
+                }
                 if let Some(enabled) = server.enabled {
                     entry.enabled = enabled;
                 }
                 if let Some(path) = server.path {
                     entry.path = Some(path);
                 }
+                if let Some(args) = server.args {
+                    entry.args = Some(args);
+                }
+                if let Some(options) = server.initialization_options {
+                    entry.initialization_options = Some(options);
+                }
+                if let Some(settings) = server.settings {
+                    entry.settings = Some(settings);
+                }
             }
         }
     }
     if let Some(mcp) = source.mcp {
+        if let Some(wait) = mcp.startup_wait_ms {
+            target.mcp.startup_wait_ms = Some(wait);
+        }
         if let Some(servers) = mcp.servers {
             for (name, server) in servers {
+                let touches_beyond_disable = !is_disable_only(&server);
                 let entry = target.mcp.servers.entry(name).or_default();
+                // The project layer owns an entry once it sets anything but
+                // `enabled = false` (which can only reduce what runs).
+                if origin == McpOrigin::Project && touches_beyond_disable {
+                    entry.origin = McpOrigin::Project;
+                }
                 // A layer that picks one transport clears the other's keys so
                 // `command`+`url` never coexist in the merged entry.
                 if let Some(command) = server.command {
                     entry.command = Some(command);
                     entry.url = None;
                     entry.headers.clear();
+                    entry.oauth = None;
                 }
                 if let Some(args) = server.args {
                     entry.args = args;
@@ -813,15 +1330,52 @@ fn merge_layer(target: &mut LayeredConfig, source: FileConfig) {
                     entry.command = None;
                     entry.args.clear();
                     entry.env.clear();
+                    entry.cwd = None;
                 }
                 if let Some(headers) = server.headers {
                     entry.headers.extend(headers);
+                }
+                if let Some(cwd) = server.cwd {
+                    entry.cwd = Some(cwd);
                 }
                 if let Some(enabled) = server.enabled {
                     entry.enabled = enabled;
                 }
                 if let Some(timeout_ms) = server.timeout_ms {
                     entry.timeout_ms = timeout_ms;
+                }
+                if let Some(description) = server.description {
+                    entry.description = Some(description);
+                }
+                if let Some(exposure) = server.exposure {
+                    entry.exposure = exposure;
+                }
+                if let Some(tool_exposure) = server.tool_exposure {
+                    entry.tool_exposure.extend(tool_exposure);
+                }
+                if let Some(lazy) = server.lazy {
+                    entry.lazy = lazy;
+                }
+                if let Some(oauth) = server.oauth {
+                    let merged = entry.oauth.get_or_insert_with(McpOAuthConfig::default);
+                    if oauth.client_id.is_some() {
+                        merged.client_id = oauth.client_id;
+                    }
+                    if oauth.client_secret.is_some() {
+                        merged.client_secret = oauth.client_secret;
+                    }
+                    if oauth.callback_port.is_some() {
+                        merged.callback_port = oauth.callback_port;
+                    }
+                    if oauth.scope.is_some() {
+                        merged.scope = oauth.scope;
+                    }
+                    if oauth.client_name.is_some() {
+                        merged.client_name = oauth.client_name;
+                    }
+                    if oauth.auth_server_metadata_url.is_some() {
+                        merged.auth_server_metadata_url = oauth.auth_server_metadata_url;
+                    }
                 }
             }
         }
@@ -830,8 +1384,8 @@ fn merge_layer(target: &mut LayeredConfig, source: FileConfig) {
         if compaction.enabled.is_some() {
             target.compaction.enabled = compaction.enabled;
         }
-        if compaction.background.is_some() {
-            target.compaction.background = compaction.background;
+        if compaction.reserve_tokens.is_some() {
+            target.compaction.reserve_tokens = compaction.reserve_tokens;
         }
         if compaction.keep_recent_tokens.is_some() {
             target.compaction.keep_recent_tokens = compaction.keep_recent_tokens;
@@ -842,9 +1396,6 @@ fn merge_layer(target: &mut LayeredConfig, source: FileConfig) {
         if compaction.manual_instructions_max_bytes.is_some() {
             target.compaction.manual_instructions_max_bytes =
                 compaction.manual_instructions_max_bytes;
-        }
-        if compaction.strategy.is_some() {
-            target.compaction.strategy = compaction.strategy;
         }
     }
 }
@@ -868,162 +1419,14 @@ mod tests {
     }
 
     #[test]
-    fn jev_credential_resolution_picks_the_backend_and_model() {
-        let resolve = |pairs: &[(&str, &str)]| {
-            let env = pairs
-                .iter()
-                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-                .collect::<BTreeMap<_, _>>();
-            jev_prune_config_from(|key| env.get(key).cloned())
-        };
-
-        // Without a credential the runtime must not call any endpoint.
-        assert_eq!(resolve(&[]), Ok(None));
-        assert_eq!(resolve(&[("TYPESAFE_API_KEY", "  ")]), Ok(None));
-
-        // A plain key stays on TypeSafe's own API.
-        let typesafe = resolve(&[("TYPESAFE_API_KEY", "tsk_1")])
-            .expect("resolved")
-            .expect("configured");
-        assert_eq!(typesafe.backend, JevBackend::Typesafe);
-        assert_eq!(typesafe.api_key, "tsk_1");
-        assert_eq!(typesafe.model, "jev-1.13.0");
-
-        // A `vck_` key selects the Vercel AI Gateway and its model id.
-        let gateway = resolve(&[("AI_GATEWAY_API_KEY", "vck_1")])
-            .expect("resolved")
-            .expect("configured");
-        assert_eq!(gateway.backend, JevBackend::Vercel);
-        assert_eq!(gateway.api_key, "vck_1");
-        assert_eq!(gateway.model, "typesafe-ai/jev");
-
-        // Without an explicit backend, TYPESAFE_API_KEY remains the deterministic
-        // preference when both variables are populated.
-        let both = resolve(&[
-            ("TYPESAFE_API_KEY", "tsk_1"),
-            ("AI_GATEWAY_API_KEY", "vck_1"),
-        ])
-        .expect("resolved")
-        .expect("configured");
-        assert_eq!(both.backend, JevBackend::Typesafe);
-        assert_eq!(both.api_key, "tsk_1");
-
-        // An explicit backend selects its matching variable first, and the model
-        // remains overridable.
-        let explicit_typesafe = resolve(&[
-            ("SLIM_JEV_BACKEND", "typesafe"),
-            ("TYPESAFE_API_KEY", "tsk_1"),
-            ("AI_GATEWAY_API_KEY", "vck_1"),
-            ("SLIM_JEV_MODEL", "jev-1.13.0"),
-        ])
-        .expect("resolved")
-        .expect("configured");
-        assert_eq!(explicit_typesafe.backend, JevBackend::Typesafe);
-        assert_eq!(explicit_typesafe.api_key, "tsk_1");
-        assert_eq!(explicit_typesafe.model, "jev-1.13.0");
-
-        let explicit_vercel = resolve(&[
-            ("SLIM_JEV_BACKEND", "vercel"),
-            ("TYPESAFE_API_KEY", "tsk_1"),
-            ("AI_GATEWAY_API_KEY", "vck_1"),
-        ])
-        .expect("resolved")
-        .expect("configured");
-        assert_eq!(explicit_vercel.backend, JevBackend::Vercel);
-        assert_eq!(explicit_vercel.api_key, "vck_1");
-        assert_eq!(explicit_vercel.model, "typesafe-ai/jev");
-
-        // A missing matching variable may use the other slot only when its key
-        // still identifies the explicitly selected backend.
-        let vercel_key_in_typesafe_slot = resolve(&[
-            ("SLIM_JEV_BACKEND", "vercel"),
-            ("TYPESAFE_API_KEY", "vck_compat"),
-        ])
-        .expect("resolved")
-        .expect("configured");
-        assert_eq!(vercel_key_in_typesafe_slot.backend, JevBackend::Vercel);
-        assert_eq!(vercel_key_in_typesafe_slot.api_key, "vck_compat");
-        assert_eq!(
-            resolve(&[
-                ("SLIM_JEV_BACKEND", "vercel"),
-                ("TYPESAFE_API_KEY", "tsk_1"),
-            ]),
-            Ok(None)
-        );
-        assert_eq!(
-            resolve(&[
-                ("SLIM_JEV_BACKEND", "typesafe"),
-                ("AI_GATEWAY_API_KEY", "vck_1"),
-            ]),
-            Ok(None)
-        );
-        assert_eq!(
-            resolve(&[
-                ("SLIM_JEV_BACKEND", "vercel"),
-                ("AI_GATEWAY_API_KEY", "  "),
-                ("TYPESAFE_API_KEY", "vck_1"),
-            ])
-            .expect("resolved")
-            .expect("configured")
-            .api_key,
-            "vck_1"
-        );
-
-        // The prefix remains authoritative when a Vercel key is stored under
-        // TYPESAFE_API_KEY and no backend is declared.
-        let prefixed_typesafe_slot = resolve(&[("TYPESAFE_API_KEY", "vck_2")])
-            .expect("resolved")
-            .expect("configured");
-        assert_eq!(prefixed_typesafe_slot.backend, JevBackend::Vercel);
-        assert_eq!(prefixed_typesafe_slot.api_key, "vck_2");
-
-        assert!(
-            resolve(&[("SLIM_JEV_BACKEND", "openai"), ("TYPESAFE_API_KEY", "k")]).is_err(),
-            "an unknown backend is rejected instead of silently ignored"
-        );
-    }
-
-    #[test]
-    fn compaction_strategy_defaults_to_jev_and_parses_from_toml() {
-        // Default: Jev pruning with the runtime's summary fallback.
-        let default_policy = LayeredConfig::default()
-            .compaction_policy()
-            .expect("default policy");
-        assert_eq!(
-            default_policy.strategy,
-            slim_core::context::CompactionStrategy::Jev
-        );
-
-        let project =
-            FileConfig::parse("[compaction]\nstrategy = \"summary\"\n").expect("project config");
-        let mut layered = LayeredConfig::default();
-        merge_layer(&mut layered, project);
-        assert_eq!(
-            layered.compaction_policy().expect("policy").strategy,
-            slim_core::context::CompactionStrategy::Summary
-        );
-
-        let global =
-            FileConfig::parse("[compaction]\nstrategy = \"jev\"\n").expect("global config");
-        let mut layered = LayeredConfig::default();
-        merge_layer(&mut layered, global);
-        assert_eq!(
-            layered.compaction_policy().expect("policy").strategy,
-            slim_core::context::CompactionStrategy::Jev
-        );
-    }
-
-    #[test]
-    fn compaction_strategy_rejects_unknown_value() {
-        let config = FileConfig::parse("[compaction]\nstrategy = \"guess\"\n").expect("parses");
+    fn removed_compaction_strategy_key_is_ignored_by_the_parser() {
+        let config =
+            FileConfig::parse("[compaction]\nstrategy = \"summary\"\nkeep_recent_tokens = 1000\n")
+                .expect("legacy strategy key still parses");
         let mut layered = LayeredConfig::default();
         merge_layer(&mut layered, config);
-        let error = layered
-            .compaction_policy()
-            .expect_err("unknown strategy rejected");
-        assert!(error.contains("compaction.strategy"), "{error}");
-        assert!(error.contains("summary"), "{error}");
-        assert!(error.contains("jev"), "{error}");
+        let policy = layered.compaction_policy().expect("policy");
+        assert_eq!(policy.keep_recent_tokens, 1000);
     }
 
     #[test]
@@ -1045,21 +1448,85 @@ mod tests {
     #[test]
     fn parse_and_merge_nested_compaction_policy_field_by_field() {
         let global = FileConfig::parse(
-            "[compaction]\nenabled = true\nbackground = false\nkeep_recent_tokens = 12000\n",
+            "[compaction]\nenabled = true\nreserve_tokens = 20000\nkeep_recent_tokens = 12000\n",
         )
         .expect("global config");
         let project =
-            FileConfig::parse("[compaction]\nbackground = true\nsummary_max_bytes = 32768\n")
-                .expect("project config");
+            FileConfig::parse("[compaction]\nsummary_max_bytes = 32768\n").expect("project config");
         let mut layered = LayeredConfig::default();
         merge_layer(&mut layered, global);
         merge_layer(&mut layered, project);
         let policy = layered.compaction_policy().expect("valid policy");
         assert!(policy.enabled);
-        assert!(policy.background);
+        assert_eq!(policy.reserve_tokens, 20_000);
         assert_eq!(policy.keep_recent_tokens, 12_000);
         assert_eq!(policy.summary_max_bytes, 32_768);
         assert_eq!(policy.manual_instructions_max_bytes, 4 * 1024);
+    }
+
+    #[test]
+    fn compaction_reserve_tokens_defaults_to_pi_and_must_be_positive() {
+        let defaults = LayeredConfig::default()
+            .compaction_policy()
+            .expect("default policy");
+        assert_eq!(defaults.reserve_tokens, 16_384);
+        assert_eq!(defaults.keep_recent_tokens, 20_000);
+
+        let mut layered = LayeredConfig::default();
+        merge_layer(
+            &mut layered,
+            FileConfig::parse("[compaction]\nreserve_tokens = 0\n").expect("parses"),
+        );
+        let error = layered.compaction_policy().expect_err("zero reserve");
+        assert!(error.contains("compaction.reserve_tokens"), "{error}");
+    }
+
+    #[test]
+    fn removed_compaction_background_key_is_ignored_by_the_parser() {
+        let config = FileConfig::parse("[compaction]\nbackground = false\nreserve_tokens = 9000\n")
+            .expect("legacy background key still parses");
+        let mut layered = LayeredConfig::default();
+        merge_layer(&mut layered, config);
+        let policy = layered.compaction_policy().expect("policy");
+        assert_eq!(policy.reserve_tokens, 9000);
+    }
+
+    #[test]
+    fn shell_job_layers_merge_only_provided_fields_and_limits_are_checked() {
+        let mut config = LayeredConfig::default();
+        merge_layer(&mut config,FileConfig::parse("[shell_jobs]\nmax_running=2\nmax_retained=8\nmemory_bytes=4096\ninterrupt_grace_ms=200\n").unwrap());
+        merge_layer(
+            &mut config,
+            FileConfig::parse("[shell_jobs]\nmax_running=1\n").unwrap(),
+        );
+        assert_eq!(
+            config.shell_jobs,
+            slim_core::runtime::ShellJobLimits {
+                max_running: 1,
+                max_retained: 8,
+                memory_bytes: 4096,
+                interrupt_grace_ms: 200
+            }
+        );
+        config.shell_jobs.validate().unwrap();
+        assert!(FileConfig::parse("[shell_jobs]\nmax_runing=1\n").is_err());
+        for layer in [
+            "max_running=0",
+            "max_running=65",
+            "max_retained=0",
+            "max_retained=1025",
+            "memory_bytes=4095",
+            "memory_bytes=16777217",
+            "interrupt_grace_ms=49",
+            "interrupt_grace_ms=10001",
+        ] {
+            let mut invalid = config.clone();
+            merge_layer(
+                &mut invalid,
+                FileConfig::parse(&format!("[shell_jobs]\n{layer}\n")).unwrap(),
+            );
+            assert!(invalid.shell_jobs.validate().is_err(), "{layer}");
+        }
     }
 
     #[test]
@@ -1333,6 +1800,109 @@ mod tests {
     }
 
     #[test]
+    fn project_lsp_launch_overrides_wait_for_trust_but_disabling_applies() {
+        let mut layered = LayeredConfig::default();
+        merge_layer(
+            &mut layered,
+            FileConfig::parse(
+                "[lsp.servers.typescript-language-server]\nargs = ['--stdio']\n[lsp.servers.rust-analyzer]\nenabled = false\n",
+            )
+            .unwrap(),
+        );
+        merge_layer_as(
+            &mut layered,
+            FileConfig::parse(
+                "[lsp.servers.typescript-language-server]\npath = 'repo.mjs'\nargs = ['--stdio', '--log-level', '4']\ninitialization_options = { tsserver = { path = 'repo.js' } }\nsettings = { typescript = {} }\n[lsp.servers.rust-analyzer]\nenabled = true\n[lsp.servers.custom]\nenabled = false\n",
+            )
+            .unwrap(),
+            McpOrigin::Project,
+        );
+        let typescript = &layered.lsp.servers["typescript-language-server"];
+        assert!(typescript.has_project_overrides());
+        let untrusted = typescript.effective(false);
+        assert_eq!(untrusted.path, None);
+        assert_eq!(untrusted.args.as_ref().unwrap(), &["--stdio"]);
+        assert_eq!(untrusted.initialization_options, None);
+        assert_eq!(untrusted.settings, None);
+        assert!(!untrusted.has_project_overrides());
+        let trusted = typescript.effective(true);
+        assert_eq!(trusted.path.as_deref(), Some("repo.mjs"));
+        assert_eq!(
+            trusted.args.as_ref().unwrap(),
+            &["--stdio", "--log-level", "4"]
+        );
+        assert!(trusted.initialization_options.is_some());
+        assert!(trusted.settings.is_some());
+
+        // Re-enabling a globally disabled server is a project decision too.
+        let rust = &layered.lsp.servers["rust-analyzer"];
+        assert!(!rust.effective(false).enabled);
+        assert!(rust.effective(true).enabled);
+        // Disabling only restricts, so it applies without trust.
+        let custom = &layered.lsp.servers["custom"];
+        assert!(!custom.has_project_overrides());
+        assert!(!custom.effective(false).enabled);
+    }
+
+    #[test]
+    fn lsp_overrides_replace_only_present_fields_including_empty_objects() {
+        let mut layered = LayeredConfig::default();
+        merge_layer(&mut layered, FileConfig::parse(
+            "[lsp.servers.typescript-language-server]\nenabled = false\nargs = ['--stdio', '--log-level', '1']\ninitialization_options = { hostInfo = 'global' }\nsettings = { typescript = { preferences = { quotePreference = 'single' } } }\n"
+        ).unwrap());
+        merge_layer(&mut layered, FileConfig::parse(
+            "[lsp.servers.typescript-language-server]\npath = 'lib/cli.mjs'\nsettings = { javascript = { preferences = { quotePreference = 'double' } } }\n"
+        ).unwrap());
+        let server = &layered.lsp.servers["typescript-language-server"];
+        assert!(!server.enabled);
+        assert_eq!(server.path.as_deref(), Some("lib/cli.mjs"));
+        assert_eq!(
+            server.args.as_ref().unwrap(),
+            &["--stdio", "--log-level", "1"]
+        );
+        assert_eq!(
+            server.initialization_options,
+            Some(serde_json::json!({"hostInfo": "global"}))
+        );
+        assert!(server
+            .settings
+            .as_ref()
+            .unwrap()
+            .get("typescript")
+            .is_none());
+        assert_eq!(
+            server.settings.as_ref().unwrap()["javascript"]["preferences"]["quotePreference"],
+            "double"
+        );
+        merge_layer(&mut layered, FileConfig::parse(
+            "[lsp.servers.typescript-language-server]\nargs = []\nsettings = {}\ninitialization_options = {}\n"
+        ).unwrap());
+        let server = &layered.lsp.servers["typescript-language-server"];
+        assert_eq!(server.args, Some(vec![]));
+        assert_eq!(server.settings, Some(serde_json::json!({})));
+        assert_eq!(server.initialization_options, Some(serde_json::json!({})));
+        assert!(!server.enabled);
+    }
+
+    #[test]
+    fn lsp_known_override_types_are_validated_without_rejecting_unknown_keys() {
+        for field in [
+            "args = [1]",
+            "initialization_options = 'invalid'",
+            "settings = []",
+        ] {
+            assert!(FileConfig::parse(&format!(
+                "[lsp.servers.typescript-language-server]\n{field}\n"
+            ))
+            .is_err());
+        }
+        assert!(FileConfig::parse(
+            "[lsp.servers.typescript-language-server]\nfuture_option = 'ignored'\n"
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn mcp_parse_and_project_layer_overrides_global_fields() {
         let mut layered = LayeredConfig::default();
         merge_layer(
@@ -1467,6 +2037,44 @@ mod tests {
     }
 
     #[test]
+    fn startup_wait_merges_by_layer_defaults_to_ten_seconds_and_is_bounded() {
+        let mut layered = LayeredConfig::default();
+        assert_eq!(
+            layered.mcp.startup_wait(),
+            std::time::Duration::from_secs(10)
+        );
+        merge_layer(
+            &mut layered,
+            FileConfig::parse("[mcp]\nstartup_wait_ms = 3000\n").unwrap(),
+        );
+        assert_eq!(
+            layered.mcp.startup_wait(),
+            std::time::Duration::from_secs(3)
+        );
+        // A later layer that does not mention it leaves it alone; one that
+        // does replaces it (0 turns the wait off).
+        merge_layer(
+            &mut layered,
+            FileConfig::parse("[mcp.servers.a]\ncommand = \"x\"\n").unwrap(),
+        );
+        assert_eq!(layered.mcp.startup_wait_ms, Some(3000));
+        merge_layer(
+            &mut layered,
+            FileConfig::parse("[mcp]\nstartup_wait_ms = 0\n").unwrap(),
+        );
+        assert_eq!(layered.mcp.startup_wait(), std::time::Duration::ZERO);
+        layered.mcp.validate().expect("zero is allowed");
+        layered.mcp.startup_wait_ms = Some(120_001);
+        assert!(layered
+            .mcp
+            .validate()
+            .unwrap_err()
+            .contains("startup_wait_ms"));
+        layered.mcp.startup_wait_ms = Some(120_000);
+        layered.mcp.validate().expect("the maximum is allowed");
+    }
+
+    #[test]
     fn mcp_upsert_saturates_timeout_ms_beyond_i64() {
         let path =
             std::env::temp_dir().join(format!("slim-mcp-timeout-{}.toml", std::process::id()));
@@ -1561,5 +2169,479 @@ mod tests {
             .validate()
             .expect_err("non-http url")
             .contains("http://"));
+    }
+
+    fn temp_path(label: &str, extension: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "slim-config-{label}-{}-{:?}.{extension}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn mcp_new_fields_parse_and_merge_across_layers() {
+        let mut layered = LayeredConfig::default();
+        merge_layer(
+            &mut layered,
+            FileConfig::parse(
+                "[mcp.servers.web]\nurl = \"https://mcp.example.com\"\ndescription = \"Docs\"\nexposure = \"direct\"\nlazy = true\n[mcp.servers.web.tool_exposure]\n\"get_*\" = \"hidden\"\nexact = \"gateway\"\n[mcp.servers.web.oauth]\nclient_id = \"cid\"\ncallback_port = 8765\nscope = \"read\"\n",
+            )
+            .unwrap(),
+        );
+        merge_layer_as(
+            &mut layered,
+            FileConfig::parse(
+                "[mcp.servers.web]\nexposure = \"hidden\"\n[mcp.servers.web.tool_exposure]\nextra = \"direct\"\n[mcp.servers.web.oauth]\nclient_secret = \"$SECRET\"\nscope = \"write\"\n",
+            )
+            .unwrap(),
+            McpOrigin::Project,
+        );
+        let web = &layered.mcp.servers["web"];
+        assert_eq!(web.description.as_deref(), Some("Docs"));
+        assert_eq!(web.exposure, McpExposure::Hidden);
+        assert!(web.lazy);
+        assert_eq!(web.timeout_ms, 60_000, "default timeout is 60 s");
+        assert_eq!(web.tool_exposure.len(), 3);
+        assert_eq!(web.tool_exposure["get_*"], McpExposure::Hidden);
+        assert_eq!(web.tool_exposure["extra"], McpExposure::Direct);
+        let oauth = web.oauth.as_ref().expect("oauth merged");
+        assert_eq!(oauth.client_id.as_deref(), Some("cid"));
+        assert_eq!(oauth.client_secret.as_deref(), Some("$SECRET"));
+        assert_eq!(oauth.callback_port, Some(8765));
+        assert_eq!(
+            oauth.scope.as_deref(),
+            Some("write"),
+            "later layer wins per key"
+        );
+        assert_eq!(web.origin, McpOrigin::Project);
+        layered.mcp.validate().expect("valid");
+        // The client secret never appears in Debug output.
+        assert!(!format!("{oauth:?}").contains("$SECRET"));
+    }
+
+    #[test]
+    fn mcp_unknown_exposure_is_a_parse_error() {
+        let error = FileConfig::parse("[mcp.servers.a]\ncommand = \"x\"\nexposure = \"diret\"\n")
+            .expect_err("typo");
+        assert!(error.contains("diret"), "{error}");
+        assert!(FileConfig::parse(
+            "[mcp.servers.a]\ncommand = \"x\"\n[mcp.servers.a.tool_exposure]\nt = \"maybe\"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn mcp_validate_checks_new_fields() {
+        let base = |edit: &dyn Fn(&mut McpServerConfig)| {
+            let mut server = McpServerConfig {
+                command: Some("x".into()),
+                ..McpServerConfig::default()
+            };
+            edit(&mut server);
+            let mut config = McpConfig::default();
+            config.servers.insert("s".into(), server);
+            config.validate()
+        };
+        assert!(base(&|_| {}).is_ok());
+        assert!(base(&|s| s.cwd = Some("  ".into()))
+            .unwrap_err()
+            .contains("cwd"));
+        assert!(base(&|s| s.description = Some(" ".into()))
+            .unwrap_err()
+            .contains("description"));
+        assert!(base(&|s| s.description = Some("x".repeat(3000)))
+            .unwrap_err()
+            .contains("at most"));
+        assert!(base(&|s| {
+            s.tool_exposure.insert(String::new(), McpExposure::Hidden);
+        })
+        .unwrap_err()
+        .contains("tool_exposure"));
+        // oauth is for HTTP servers only.
+        assert!(base(&|s| s.oauth = Some(McpOAuthConfig::default()))
+            .unwrap_err()
+            .contains("HTTP"));
+        let http = |edit: &dyn Fn(&mut McpOAuthConfig)| {
+            let mut oauth = McpOAuthConfig::default();
+            edit(&mut oauth);
+            let mut config = McpConfig::default();
+            config.servers.insert(
+                "h".into(),
+                McpServerConfig {
+                    url: Some("https://mcp.example.com".into()),
+                    oauth: Some(oauth),
+                    ..McpServerConfig::default()
+                },
+            );
+            config.validate()
+        };
+        assert!(http(&|_| {}).is_ok());
+        assert!(http(&|o| o.client_secret = Some("s".into()))
+            .unwrap_err()
+            .contains("client_id"));
+        assert!(http(&|o| {
+            o.client_id = Some("id".into());
+            o.callback_port = Some(0);
+        })
+        .unwrap_err()
+        .contains("callback_port"));
+        assert!(
+            http(&|o| o.auth_server_metadata_url = Some("http://example.com/x".into()))
+                .unwrap_err()
+                .contains("https")
+        );
+        for ok in [
+            "https://auth.example.com/.well-known/openid-configuration",
+            "http://localhost:9000/meta",
+            "http://127.0.0.1/meta",
+            "http://[::1]:1/meta",
+        ] {
+            assert!(
+                http(&|o| o.auth_server_metadata_url = Some(ok.into())).is_ok(),
+                "{ok}"
+            );
+        }
+        assert!(
+            http(&|o| o.auth_server_metadata_url = Some("http://localhost.evil.com/x".into()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mcp_validate_rejects_names_that_differ_only_in_dash_or_underscore() {
+        let mut config = McpConfig::default();
+        for name in ["my-server", "my_server"] {
+            config.servers.insert(
+                name.into(),
+                McpServerConfig {
+                    command: Some("x".into()),
+                    ..McpServerConfig::default()
+                },
+            );
+        }
+        assert!(config.validate().unwrap_err().contains("collides"));
+    }
+
+    #[test]
+    fn mcp_layer_rejects_cwd_with_url_and_oauth_with_command() {
+        let path = temp_path("mcp-mixed", "toml");
+        fs::write(
+            &path,
+            "[mcp.servers.a]\nurl = \"https://x\"\ncwd = \"sub\"\n",
+        )
+        .unwrap();
+        assert!(load_layered_from([path.clone()])
+            .unwrap_err()
+            .contains("cwd applies to stdio"));
+        fs::write(
+            &path,
+            "[mcp.servers.a]\ncommand = \"x\"\n[mcp.servers.a.oauth]\nclient_id = \"id\"\n",
+        )
+        .unwrap();
+        assert!(load_layered_from([path.clone()])
+            .unwrap_err()
+            .contains("oauth applies to HTTP"));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mcp_transport_switch_clears_cwd_and_oauth() {
+        let mut layered = LayeredConfig::default();
+        merge_layer(
+            &mut layered,
+            FileConfig::parse("[mcp.servers.s]\ncommand = \"x\"\ncwd = \"sub\"\n").unwrap(),
+        );
+        merge_layer(
+            &mut layered,
+            FileConfig::parse("[mcp.servers.s]\nurl = \"https://x/mcp\"\n[mcp.servers.s.oauth]\nclient_id = \"id\"\n")
+                .unwrap(),
+        );
+        let s = &layered.mcp.servers["s"];
+        assert!(s.cwd.is_none() && s.command.is_none() && s.oauth.is_some());
+        merge_layer(
+            &mut layered,
+            FileConfig::parse("[mcp.servers.s]\ncommand = \"y\"\n").unwrap(),
+        );
+        let s = &layered.mcp.servers["s"];
+        assert!(s.oauth.is_none() && s.url.is_none());
+        layered.mcp.validate().expect("valid after switches");
+    }
+
+    #[test]
+    fn project_layer_origin_is_tracked_and_disable_only_overrides_stay_global() {
+        let global = temp_path("origin-global", "toml");
+        let project = temp_path("origin-project", "toml");
+        fs::write(
+            &global,
+            "[mcp.servers.g]\ncommand = \"g\"\n[mcp.servers.h]\ncommand = \"h\"\n[mcp.servers.k]\ncommand = \"k\"\n",
+        )
+        .unwrap();
+        fs::write(
+            &project,
+            "[mcp.servers.g]\nenabled = false\n[mcp.servers.h]\nargs = [\"--x\"]\n[mcp.servers.p]\nurl = \"https://p/mcp\"\n",
+        )
+        .unwrap();
+        let layered = load_layers([
+            (global.clone(), McpOrigin::Global),
+            (project.clone(), McpOrigin::Project),
+        ])
+        .unwrap();
+        assert_eq!(layered.mcp.servers["g"].origin, McpOrigin::Global);
+        assert!(!layered.mcp.servers["g"].enabled);
+        assert_eq!(layered.mcp.servers["h"].origin, McpOrigin::Project);
+        assert_eq!(layered.mcp.servers["k"].origin, McpOrigin::Global);
+        assert_eq!(layered.mcp.servers["p"].origin, McpOrigin::Project);
+        fs::remove_file(&global).ok();
+        fs::remove_file(&project).ok();
+    }
+
+    #[test]
+    fn project_layer_is_read_from_the_workspace_not_the_process_directory() {
+        let workspace = std::env::temp_dir().join(format!(
+            "slim-config-workspace-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(
+            project_config_path(&workspace),
+            "[mcp.servers.in-workspace]\ncommand = \"w\"\n",
+        )
+        .unwrap();
+        // The test process directory has no such file; only the workspace does.
+        let layered = load_layered_for(&workspace).expect("loads");
+        let server = &layered.mcp.servers["in-workspace"];
+        assert_eq!(server.origin, McpOrigin::Project);
+        assert_eq!(
+            project_config_path(&workspace),
+            workspace.join(PROJECT_CONFIG_FILE)
+        );
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn mcp_upsert_merges_into_an_existing_table_and_keeps_unrelated_keys() {
+        let path = temp_path("upsert-merge", "toml");
+        fs::write(
+            &path,
+            "model = \"keep\"\n[mcp.servers.fs]\ncommand = \"npx\"\nargs = [\"-y\", \"old\"]\ntimeout_ms = 5000\nenabled = false\ndescription = \"mine\"\n[mcp.servers.fs.env]\nA = \"1\"\nB = \"2\"\n",
+        )
+        .unwrap();
+        let update = FileMcpServerConfig {
+            args: Some(vec!["new".into()]),
+            env: Some(BTreeMap::from([
+                ("B".into(), "3".into()),
+                ("C".into(), "4".into()),
+            ])),
+            ..FileMcpServerConfig::default()
+        };
+        upsert_mcp_server_to(&path, "fs", &update).unwrap();
+        let parsed: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(parsed["model"].as_str(), Some("keep"));
+        let fs_table = parsed["mcp"]["servers"]["fs"].as_table().unwrap();
+        assert_eq!(fs_table["command"].as_str(), Some("npx"));
+        assert_eq!(fs_table["timeout_ms"].as_integer(), Some(5000));
+        assert_eq!(fs_table["enabled"].as_bool(), Some(false));
+        assert_eq!(fs_table["description"].as_str(), Some("mine"));
+        assert_eq!(fs_table["args"].as_array().unwrap().len(), 1);
+        let env = fs_table["env"].as_table().unwrap();
+        assert_eq!(env["A"].as_str(), Some("1"));
+        assert_eq!(env["B"].as_str(), Some("3"));
+        assert_eq!(env["C"].as_str(), Some("4"));
+
+        // Switching to HTTP drops the stdio keys and the oauth/headers of the
+        // old transport but keeps shared settings.
+        let http = FileMcpServerConfig {
+            url: Some("https://x/mcp".into()),
+            oauth: Some(FileMcpOAuthConfig {
+                client_id: Some("cid".into()),
+                callback_port: Some(9000),
+                ..FileMcpOAuthConfig::default()
+            }),
+            exposure: Some(McpExposure::Direct),
+            tool_exposure: Some(BTreeMap::from([("t".into(), McpExposure::Hidden)])),
+            ..FileMcpServerConfig::default()
+        };
+        upsert_mcp_server_to(&path, "fs", &http).unwrap();
+        let parsed: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+        let fs_table = parsed["mcp"]["servers"]["fs"].as_table().unwrap();
+        for gone in ["command", "args", "env", "cwd"] {
+            assert!(fs_table.get(gone).is_none(), "{gone} must be cleared");
+        }
+        assert_eq!(fs_table["timeout_ms"].as_integer(), Some(5000));
+        assert_eq!(fs_table["exposure"].as_str(), Some("direct"));
+        assert_eq!(fs_table["tool_exposure"]["t"].as_str(), Some("hidden"));
+        assert_eq!(fs_table["oauth"]["callback_port"].as_integer(), Some(9000));
+        // The result parses and validates as a layer.
+        let layered = load_layered_from([path.clone()]).expect("loads");
+        assert_eq!(
+            layered.mcp.servers["fs"].url.as_deref(),
+            Some("https://x/mcp")
+        );
+
+        // Back to stdio drops url, headers and oauth.
+        let stdio = FileMcpServerConfig {
+            command: Some("again".into()),
+            ..FileMcpServerConfig::default()
+        };
+        upsert_mcp_server_to(&path, "fs", &stdio).unwrap();
+        let parsed: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+        let fs_table = parsed["mcp"]["servers"]["fs"].as_table().unwrap();
+        assert!(fs_table.get("url").is_none() && fs_table.get("oauth").is_none());
+        load_layered_from([path.clone()]).expect("still valid");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mcp_upsert_of_a_new_command_replaces_the_old_commands_args_and_cwd() {
+        let path = temp_path("upsert-new-command", "toml");
+        fs::write(
+            &path,
+            "[mcp.servers.fs]\ncommand = \"npx\"\nargs = [\"-y\", \"@scope/server\", \".\"]\ncwd = \"work\"\ntimeout_ms = 5000\n",
+        )
+        .unwrap();
+        let update = FileMcpServerConfig {
+            command: Some("node".into()),
+            ..FileMcpServerConfig::default()
+        };
+        upsert_mcp_server_to(&path, "fs", &update).unwrap();
+        let parsed: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+        let fs_table = parsed["mcp"]["servers"]["fs"].as_table().unwrap();
+        assert_eq!(fs_table["command"].as_str(), Some("node"));
+        assert!(fs_table.get("args").is_none(), "{fs_table:?}");
+        assert!(fs_table.get("cwd").is_none(), "{fs_table:?}");
+        assert_eq!(fs_table["timeout_ms"].as_integer(), Some(5000));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mcp_upsert_rejects_both_transports_and_replace_drops_old_keys() {
+        let path = temp_path("upsert-replace", "toml");
+        let both = FileMcpServerConfig {
+            command: Some("x".into()),
+            url: Some("https://x".into()),
+            ..FileMcpServerConfig::default()
+        };
+        assert!(upsert_mcp_server_to(&path, "a", &both)
+            .unwrap_err()
+            .contains("not both"));
+        assert!(!path.exists(), "nothing written on rejection");
+        fs::write(
+            &path,
+            "[mcp.servers.a]\ncommand = \"old\"\nenabled = false\n",
+        )
+        .unwrap();
+        assert!(mcp_server_defined_in(&path, "a").unwrap());
+        assert!(!mcp_server_defined_in(&path, "b").unwrap());
+        let fresh = FileMcpServerConfig {
+            command: Some("new".into()),
+            ..FileMcpServerConfig::default()
+        };
+        replace_mcp_server_to(&path, "a", &fresh).unwrap();
+        let parsed: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+        let table = parsed["mcp"]["servers"]["a"].as_table().unwrap();
+        assert_eq!(table["command"].as_str(), Some("new"));
+        assert!(table.get("enabled").is_none());
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn remove_mcp_server_edits_the_workspace_project_file() {
+        let workspace = std::env::temp_dir().join(format!(
+            "slim-config-remove-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).unwrap();
+        let project = project_config_path(&workspace);
+        fs::write(
+            &project,
+            "model = \"keep\"\n[mcp.servers.gone-from-project]\ncommand = \"x\"\n",
+        )
+        .unwrap();
+        let edited = remove_mcp_server(&workspace, "gone-from-project").unwrap();
+        assert_eq!(edited.as_deref(), Some(project.as_path()));
+        assert!(fs::read_to_string(&project).unwrap().contains("keep"));
+        assert!(!fs::read_to_string(&project)
+            .unwrap()
+            .contains("gone-from-project"));
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn lenient_load_reports_invalid_entries_and_keeps_the_valid_ones() {
+        let workspace = std::env::temp_dir().join(format!(
+            "slim-config-lenient-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(
+            project_config_path(&workspace),
+            "[mcp.servers.len-ok]
+command = \"x\"
+             [mcp.servers.len-both]
+command = \"x\"
+url = \"https://a.test\"
+             [mcp.servers.len-slow]
+command = \"x\"
+timeout_ms = 5
+             [mcp.servers.len-dup]
+command = \"x\"
+             [mcp.servers.len_dup]
+command = \"x\"
+",
+        )
+        .unwrap();
+        let (layered, invalid) = load_layered_lenient_for(&workspace).unwrap();
+        let names: Vec<&str> = invalid.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(layered.mcp.servers.contains_key("len-ok"));
+        for bad in ["len-both", "len-slow"] {
+            assert!(!layered.mcp.servers.contains_key(bad), "{bad}");
+            assert!(names.contains(&bad), "{names:?}");
+        }
+        // The strict loader refuses the same file as a whole.
+        assert!(load_layered_for(&workspace).is_err());
+        // Of two names that only differ in `-`/`_`, the later one is rejected.
+        assert!(layered.mcp.servers.contains_key("len-dup"));
+        assert!(names.contains(&"len_dup"), "{names:?}");
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn remove_mcp_server_from_edits_only_the_given_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "slim-config-remove-from-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("slim.toml");
+        fs::write(
+            &path,
+            "model = \"keep\"
+[mcp.servers.a]
+command = \"x\"
+[mcp.servers.b]
+command = \"y\"
+",
+        )
+        .unwrap();
+        assert!(remove_mcp_server_from(&path, "a").unwrap());
+        assert!(!remove_mcp_server_from(&path, "a").unwrap());
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("keep") && text.contains("[mcp.servers.b]"));
+        // A missing file is "not there", and is not created.
+        let missing = directory.join("missing.toml");
+        assert!(!remove_mcp_server_from(&missing, "a").unwrap());
+        assert!(!missing.exists());
+        let _ = fs::remove_dir_all(&directory);
     }
 }

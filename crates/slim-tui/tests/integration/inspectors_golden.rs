@@ -118,6 +118,37 @@ fn restored_tools_are_neutral_history_in_both_inspectors() {
 }
 
 #[test]
+fn detail_tabs_switch_with_arrows_and_shortcuts_still_land_on_their_tab() {
+    let mut state = AppState::new();
+    reduce(&mut state, ctrl('j'));
+    assert_eq!(state.inspector.active, Some(InspectorKind::Activity));
+    reduce(&mut state, press(KeyCode::Right));
+    assert_eq!(state.inspector.active, Some(InspectorKind::SessionTree));
+    reduce(&mut state, press(KeyCode::Right));
+    reduce(&mut state, press(KeyCode::Right));
+    assert_eq!(
+        state.inspector.active,
+        Some(InspectorKind::Diff),
+        "tabs wrap around"
+    );
+    reduce(&mut state, press(KeyCode::Left));
+    assert_eq!(state.inspector.active, Some(InspectorKind::Diagnostics));
+    // A narrow drawer names the open tab and its place; a wide one lists all.
+    let narrow = render(&state, 100, 30);
+    assert!(narrow.contains("Diagnósticos 4/4 ←→"), "{narrow}");
+    let wide = render(&state, 160, 30);
+    assert!(
+        wide.contains("Alterações · Atividade · Sessão · Diagnósticos"),
+        "{wide}"
+    );
+    // A direct shortcut still opens its own tab of the same panel.
+    reduce(&mut state, ctrl('d'));
+    assert_eq!(state.inspector.active, Some(InspectorKind::Diff));
+    reduce(&mut state, press(KeyCode::Esc));
+    assert_eq!(state.inspector.active, None);
+}
+
+#[test]
 fn inspector_shortcuts_toggle_truthful_responsive_panels() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::AssistantDelta {
@@ -127,7 +158,8 @@ fn inspector_shortcuts_toggle_truthful_responsive_panels() {
     reduce(&mut state, ctrl('d'));
     assert_eq!(state.inspector.active, Some(InspectorKind::Diff));
     let wide = render(&state, 100, 30);
-    assert!(wide.contains("Operações de alteração"), "{wide}");
+    // One Detalhes panel: every tab is named, the open one first in mind.
+    assert!(wide.contains("Alterações 1/4"), "{wide}");
     let normalized = wide
         .replace('│', " ")
         .split_whitespace()

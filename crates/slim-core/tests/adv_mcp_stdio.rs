@@ -16,12 +16,13 @@ use slim_core::process::ExecutableResolver;
 
 /// Mode selected via the `ADV_STDIO_MODE` env var.
 const MODES: &[&str] = &[
-    "healthy",      // normal result replies
-    "null-error",   // replies carry "error": null next to a valid result
-    "noise",        // non-JSON log lines interleaved with replies
-    "huge-line",    // one >16 MiB stdout line, then silence
-    "string-id",    // replies echo the request id as a string
-    "exit-on-init", // child exits before answering initialize
+    "healthy",       // normal result replies
+    "null-error",    // replies carry "error": null next to a valid result
+    "noise",         // non-JSON log lines interleaved with replies
+    "huge-line",     // one >16 MiB stdout line, then silence
+    "string-id",     // replies echo the request id as a string
+    "exit-on-init",  // child exits before answering initialize
+    "crash-on-init", // child prints a diagnostic to stderr, then exits
 ];
 
 #[test]
@@ -55,6 +56,10 @@ fn adv_stdio_fixture() {
             continue;
         };
         if mode == "exit-on-init" {
+            return;
+        }
+        if mode == "crash-on-init" {
+            eprintln!("fixture exploded: bad configuration");
             return;
         }
         if mode == "noise" {
@@ -105,11 +110,13 @@ fn manager(mode: &str, timeout: Duration) -> Arc<McpManager> {
                 "--exact".into(),
                 "adv_stdio_fixture".into(),
                 "--ignored".into(),
+                "--nocapture".into(),
             ],
             env: BTreeMap::from([("ADV_STDIO_MODE".to_owned(), mode.to_owned())]),
         },
         enabled: true,
         timeout,
+        options: Default::default(),
     };
     Arc::new(McpManager::new(
         BTreeMap::from([(spec.name.clone(), spec)]),
@@ -195,4 +202,25 @@ fn stdio_child_exit_before_response_fails_fast() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio");
     let result = runtime.block_on(manager("exit-on-init", Duration::from_secs(15)).test("adv"));
     assert!(result.is_err(), "silent child must fail the handshake");
+}
+
+/// A server that crashes during the handshake is a failed connect that says
+/// why (its stderr tail), not a silent `Disconnected`.
+#[test]
+fn stdio_crash_during_handshake_is_failed_with_the_stderr_tail() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio");
+    let manager = manager("crash-on-init", Duration::from_secs(15));
+    let error = runtime
+        .block_on(manager.test("adv"))
+        .expect_err("crashing child must fail the handshake");
+    assert!(
+        error.to_string().contains("fixture exploded"),
+        "error lost the stderr tail: {error}"
+    );
+    match &manager.statuses()[0].status {
+        slim_core::mcp::McpServerStatus::Failed { error } => {
+            assert!(error.contains("fixture exploded"), "{error}");
+        }
+        other => panic!("expected failed with the reason, got {other:?}"),
+    }
 }

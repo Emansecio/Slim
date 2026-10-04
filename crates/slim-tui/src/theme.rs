@@ -214,6 +214,29 @@ pub(crate) fn mix_rgb(from: (u8, u8, u8), to: (u8, u8, u8), t: f32) -> (u8, u8, 
     (lerp(from.0, to.0), lerp(from.1, to.1), lerp(from.2, to.2))
 }
 
+/// A terminal color moved `amount` of the way to white, re-quantized for
+/// `depth`. `None` for colors that carry no RGB (named, reset, unset), where a
+/// brighter shade cannot be computed.
+pub(crate) fn lift_color(color: Color, depth: ColorDepth, amount: f32) -> Option<Color> {
+    let rgb = match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Indexed(index @ 16..=231) => {
+            let levels = [0_u8, 95, 135, 175, 215, 255];
+            let cube = usize::from(index - 16);
+            (levels[cube / 36], levels[cube / 6 % 6], levels[cube % 6])
+        }
+        Color::Indexed(index @ 232..=255) => {
+            let gray = 8 + 10 * (index - 232);
+            (gray, gray, gray)
+        }
+        _ => return None,
+    };
+    Some(to_terminal_color(
+        depth,
+        mix_rgb(rgb, (255, 255, 255), amount),
+    ))
+}
+
 /// Convert a token RGB to the best color the terminal supports.
 pub fn to_terminal_color(depth: ColorDepth, rgb: (u8, u8, u8)) -> Color {
     match depth {
@@ -331,6 +354,43 @@ mod tests {
         assert_eq!(super::mix_rgb(black, white, 0.5), (100, 50, 25));
         assert_eq!(super::mix_rgb(black, white, -3.0), black);
         assert_eq!(super::mix_rgb(black, white, 7.0), white);
+    }
+
+    #[test]
+    fn lifting_a_color_moves_it_toward_white_at_every_depth_that_has_shades() {
+        use ratatui::style::Color;
+        let rgb = Color::Rgb(100, 50, 0);
+        assert_eq!(
+            super::lift_color(rgb, super::ColorDepth::TrueColor, 0.0),
+            Some(rgb)
+        );
+        assert_eq!(
+            super::lift_color(rgb, super::ColorDepth::TrueColor, 1.0),
+            Some(Color::Rgb(255, 255, 255))
+        );
+        assert_eq!(
+            super::lift_color(rgb, super::ColorDepth::TrueColor, 0.5),
+            Some(Color::Rgb(178, 153, 128))
+        );
+        // Indexed colors are read back from the xterm cube and gray ramp.
+        for index in [16_u8, 59, 144, 231, 232, 244, 255] {
+            assert_eq!(
+                super::lift_color(Color::Indexed(index), super::ColorDepth::Ansi256, 0.0),
+                Some(Color::Indexed(index)),
+                "{index}"
+            );
+        }
+        assert_eq!(
+            super::lift_color(Color::Indexed(59), super::ColorDepth::Ansi256, 1.0),
+            Some(Color::Indexed(231))
+        );
+        // Named, reset and the 16 system colors carry no RGB to lift.
+        for color in [Color::Reset, Color::DarkGray, Color::Indexed(7)] {
+            assert_eq!(
+                super::lift_color(color, super::ColorDepth::Ansi256, 0.5),
+                None
+            );
+        }
     }
 
     #[test]

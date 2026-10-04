@@ -216,6 +216,27 @@ pub fn is_mutating_tool(name: &str) -> bool {
     })
 }
 
+impl InspectorKind {
+    /// Tabs of the Detalhes panel, in display order.
+    pub const TABS: [InspectorKind; 4] = [
+        InspectorKind::Diff,
+        InspectorKind::Activity,
+        InspectorKind::SessionTree,
+        InspectorKind::Diagnostics,
+    ];
+
+    /// The neighboring tab, wrapping at both ends.
+    pub fn step(self, forward: bool) -> InspectorKind {
+        let index = Self::TABS.iter().position(|tab| *tab == self).unwrap_or(0);
+        let len = Self::TABS.len();
+        Self::TABS[if forward {
+            (index + 1) % len
+        } else {
+            (index + len - 1) % len
+        }]
+    }
+}
+
 impl InspectorState {
     pub fn toggle(&mut self, kind: InspectorKind) {
         if self.active == Some(kind) {

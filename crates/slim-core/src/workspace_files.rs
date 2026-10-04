@@ -96,6 +96,33 @@ pub fn list_workspace_files(
     Ok(files)
 }
 
+/// Files enumerated when looking for a missing path's name elsewhere.
+const SAME_NAME_SCAN_FILES: usize = 20_000;
+const MAX_SAME_NAME_FILES: usize = 3;
+
+/// A note naming workspace files that share the file name of `missing`, for a
+/// tool call that got the directory wrong. `None` when there is none or the
+/// listing fails: this is a hint, never the reason a call fails. Files with a
+/// sensitive name (see [`is_sensitive_file_name`]) are never suggested.
+pub(crate) fn same_name_files_note(
+    root: &Path,
+    missing: &Path,
+    cancel: Option<&CancellationToken>,
+) -> Option<String> {
+    let name = missing.file_name()?.to_str()?;
+    let found = list_workspace_files(root, SAME_NAME_SCAN_FILES, cancel)
+        .ok()?
+        .into_iter()
+        .filter(|path| {
+            path.rsplit('/').next().is_some_and(|file| {
+                file.eq_ignore_ascii_case(name) && !is_sensitive_file_name(file)
+            })
+        })
+        .take(MAX_SAME_NAME_FILES)
+        .collect::<Vec<_>>();
+    (!found.is_empty()).then(|| format!("Same file name elsewhere: {}", found.join(", ")))
+}
+
 /// Text of a file mentioned with `@path`, capped at the caller's byte budget.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MentionFile {

@@ -71,11 +71,28 @@ timeout_secs = 120
 
 [compaction]
 enabled = true
-background = true
+reserve_tokens = 16384     # gatilho: janela - reserva
+keep_recent_tokens = 20000
 ```
 
 Arquivos presentes e inválidos causam erro explícito. Credenciais não devem ser
 armazenadas em `slim.toml`.
+
+No modo Auto da TUI, `!& COMANDO` roda em segundo plano e `/jobs` acompanha
+saída, interrupção e cancelamento. Jobs sobrevivem entre prompts da sessão;
+terminar a resposta libera o composer. Limites `[shell_jobs]` e ações do modelo
+estão na [referência de CLI/runtime](docs/reference/CLI-AND-RUNTIME.md).
+
+Servidores MCP (stdio e Streamable HTTP, com OAuth) são declarados em
+`[mcp.servers]`, gerenciados por `slim mcp` ou `/mcp` e importáveis de outros
+clientes (`slim mcp import`). Servidores definidos pelo `slim.toml` do projeto só
+iniciam depois que o workspace é confiável (`/mcp trust` ou `--trust-project`).
+Veja a [referência de MCP](docs/reference/CLI-AND-RUNTIME.md#mcp).
+
+A compactação de contexto é única: o método padrão do Pi portado em Rust
+(gatilho `janela - reserve_tokens`, resumo estruturado pelo próprio modelo da
+sessão). `/compact` roda na hora quando a sessão está ociosa. Detalhes em
+[CLI e runtime](docs/reference/CLI-AND-RUNTIME.md#compactação-de-contexto).
 
 A recuperação do provider limita falhas consecutivas e o total por execução,
 respeita `Retry-After` e mantém a causa da parada na conversa. Consulte a

@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::{reduce, slash_matches, slash_matches_with_skills, Action, Effect};
+use super::{palette_matches, reduce, slash_matches, slash_matches_with_skills, Action, Effect};
 use crate::api::{PromptOrigin, UiCommand};
 use crate::app::AppState;
 
@@ -86,12 +86,44 @@ fn filter_narrows_to_prefix() {
     assert_eq!(slash_matches("lo"), vec!["/login", "/logout"]);
     assert_eq!(slash_matches("logi"), vec!["/login"]);
     assert_eq!(slash_matches("he"), vec!["/help"]);
-    assert_eq!(slash_matches("").len(), 18);
+    assert_eq!(slash_matches("").len(), 19);
+    assert_eq!(slash_matches("job"), vec!["/jobs"]);
     assert_eq!(
         slash_matches("re"),
         vec!["/resume", "/rename", "/rewind", "/retry"]
     );
     assert!(slash_matches("zzz").is_empty());
+}
+
+#[test]
+fn slash_and_palette_navigation_follow_the_visible_category_order() {
+    let commands = slash_matches("");
+    assert_eq!(
+        &commands[3..7],
+        &["/rewind", "/compact", "/model", "/model --default"]
+    );
+    assert_eq!(commands, palette_matches(""));
+
+    let mut state = AppState::new();
+    type_text(&mut state, "/");
+    for _ in 0..4 {
+        press_key(&mut state, KeyCode::Down);
+    }
+    press_key(&mut state, KeyCode::Tab);
+    assert_eq!(state.composer.payload(), "/compact ");
+
+    state.authenticated = true;
+    state.auth_provider = Some(crate::api::LoginProvider::OpenAiCodex);
+    reduce(
+        &mut state,
+        Action::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+    );
+    for _ in 0..5 {
+        press_key(&mut state, KeyCode::Down);
+    }
+    press_key(&mut state, KeyCode::Enter);
+    assert!(state.model_overlay.is_some());
+    assert_eq!(state.composer.payload(), "/compact ");
 }
 
 #[test]

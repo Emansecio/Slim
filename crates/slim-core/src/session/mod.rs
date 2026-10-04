@@ -3,7 +3,7 @@ mod branch_v2;
 mod capabilities;
 mod effects;
 mod event_log;
-mod index;
+mod history_rebuild;
 mod inspection;
 mod jsonl_repo;
 mod manual_drive;
@@ -35,21 +35,21 @@ pub use capabilities::{
     AuthorizationGrant, AuthorizationRequirement, CapabilityCatalog, CapabilityDescriptor,
     CapabilityDispatch, CapabilityDispatcher, CapabilityExecutionState, CapabilityKind,
     CapabilityLedgerError, CapabilityRequest, CapabilitySelection, CapabilityService,
-    CapabilityTerminal, ChildPromotion, ChildRequest, DurableChildStatus, DurableRepoLike,
-    TaskGoalAssurance, TaskMutation, TaskMutationRequest, TaskTodoStatus,
-    CAPABILITY_SCHEMA_VERSION, MAX_ACTIVE_CHILDREN, MAX_BASE_ID_BYTES, MAX_CAPABILITY_ID_BYTES,
-    MAX_CAPABILITY_QUEUE, MAX_CHILD_DEPTH, MAX_CHILD_QUEUE, MAX_DISCOVERED_SKILLS, MAX_FACT_BYTES,
+    CapabilityTerminal, ChildPromotion, ChildRequest, DurableChildStatus, TaskGoalAssurance,
+    TaskMutation, TaskMutationRequest, TaskTodoStatus, CAPABILITY_SCHEMA_VERSION,
+    MAX_ACTIVE_CHILDREN, MAX_BASE_ID_BYTES, MAX_CAPABILITY_ID_BYTES, MAX_CAPABILITY_QUEUE,
+    MAX_CHILD_DEPTH, MAX_CHILD_QUEUE, MAX_DISCOVERED_SKILLS, MAX_FACT_BYTES,
     MAX_MCP_CATALOG_ENTRIES,
 };
 pub use effects::{planned_provider_effects, Effect, EffectId, EffectPlanError};
 pub use event_log::SessionWriter;
-pub use index::SessionIndex;
+pub use history_rebuild::{rebuild_provider_history, RebuiltHistory, SkippedCheckpoint};
 pub use inspection::{inspect_session, SessionFormat, SessionInspection};
 pub use jsonl_repo::JsonlRepo;
 pub use manual_drive::{
     drive_manual, drive_manual_async, restore_manual_run, ConflictKind, ManualDrive,
-    ManualDriveError, ManualDriver, ManualExecutor, ManualRunSpec, ProviderResponse,
-    RunTelemetryContext, RunTelemetryTerminal,
+    ManualDriveError, ManualExecutor, ManualRunSpec, ProviderResponse, RunTelemetryContext,
+    RunTelemetryTerminal,
 };
 pub use manual_journal::ManualRunJournal;
 pub use memory_repo::MemoryRepo;

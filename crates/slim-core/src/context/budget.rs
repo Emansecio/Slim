@@ -1,5 +1,3 @@
-use super::compact::CompactionPolicy;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContextBudget {
     pub window_tokens: u64,
@@ -14,14 +12,6 @@ impl ContextBudget {
             used_tokens,
             reserve_tokens,
         }
-    }
-
-    pub fn should_compact(self) -> bool {
-        CompactionPolicy::default().is_over_hard(
-            self.used_tokens,
-            self.window_tokens,
-            self.reserve_tokens,
-        )
     }
 
     pub fn can_fit(self, additional_tokens: u64) -> bool {

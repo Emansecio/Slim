@@ -24,6 +24,11 @@ impl AgentLoopConfig {
     pub const DEFAULT_MAX_MUTATING_TOOL_CALLS: usize = 32;
     pub const DEFAULT_MAX_READ_TOOL_CALLS: usize = 96;
     pub const DEFAULT_MAX_TOTAL_TOOL_CALLS: usize = 256;
+    /// What the results of one tool batch may present in total, before the
+    /// window squeeze: the results share it in proportion to their own caps.
+    /// A cap above this (`max_result_bytes`, the read presentation size) keeps
+    /// a lone result whole.
+    pub const DEFAULT_MAX_BATCH_RESULT_BYTES: usize = 64 * 1024;
     pub const DEFAULT_PROVIDER_RECOVERY_BACKOFF: std::time::Duration =
         std::time::Duration::from_millis(500);
 }

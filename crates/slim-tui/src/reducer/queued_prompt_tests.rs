@@ -2,8 +2,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{reduce, Action, Effect};
 use crate::api::{PromptAdmission, PromptOrigin, UiCommand, UiEvent};
-use crate::app::AppState;
-use crate::block::BlockKind;
+use crate::app::{AppState, FollowMode, ScrollAnchor};
+use crate::block::{consecutive_queued_user_span, BlockKind, FoldState};
+use crate::render::{HeightIndex, WrapCache};
+use crate::testkit::render_terminal_text;
 
 fn enter() -> KeyEvent {
     KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
@@ -96,6 +98,106 @@ fn second_enqueue_increments_fifo_position() {
     reduce(&mut state, Action::Key(enter()));
 
     assert_eq!(queued_texts(&state), vec!["first", "second"]);
+}
+
+#[test]
+fn queued_texts_expand_together_without_changing_fifo_or_physical_rows() {
+    let mut state = AppState::new();
+    state.enqueue_queued_prompt("alpha\nALPHA_TAIL".into());
+    state.enqueue_queued_prompt("BETA_TAIL".into());
+    let leader = state.blocks()[0].id.clone();
+    let second = state.blocks()[1].id.clone();
+
+    let collapsed = render_terminal_text(&state, 80, 24);
+    assert!(collapsed.contains("2 na fila · alpha"), "{collapsed}");
+    assert!(
+        !collapsed.contains("pendentes"),
+        "the count lives on the queue row only
+{collapsed}"
+    );
+    assert!(!collapsed.contains("ALPHA_TAIL"), "{collapsed}");
+    assert!(!collapsed.contains("BETA_TAIL"), "{collapsed}");
+    assert_eq!(
+        HeightIndex::build(state.blocks(), 79, &mut WrapCache::default()).total_rows,
+        1,
+    );
+    state.scroll.mode = FollowMode::Pinned(ScrollAnchor {
+        block_id: second,
+        row_offset: 0,
+    });
+    assert_eq!(
+        reduce(&mut state, Action::Key(enter())),
+        vec![Effect::RequestRender],
+        "expansion must not prepare or execute a prompt",
+    );
+    assert_eq!(state.blocks()[0].fold, FoldState::Expanded);
+    assert_eq!(state.queue_len(), 2);
+    assert_eq!(queued_texts(&state), vec!["alpha\nALPHA_TAIL", "BETA_TAIL"]);
+    let expanded = render_terminal_text(&state, 80, 24);
+    let first_tail = expanded.find("ALPHA_TAIL").expect("first message body");
+    let second_tail = expanded.find("BETA_TAIL").expect("second message body");
+    assert!(first_tail < second_tail, "{expanded}");
+    let index = HeightIndex::build(state.blocks(), 79, &mut WrapCache::default());
+    assert_eq!(
+        index.total_rows, 4,
+        "one header plus three physical body rows"
+    );
+    for row in 0..index.total_rows {
+        let anchor = index.anchor_for_row(row).expect("visible queue row");
+        assert_eq!(index.row_for_anchor(&anchor), Some(row));
+    }
+    let (changed, command) = state.activate_block(&leader);
+    assert!(changed);
+    assert!(command.is_none());
+    assert_eq!(state.queue_len(), 2);
+    assert_eq!(
+        HeightIndex::build(state.blocks(), 79, &mut WrapCache::default()).total_rows,
+        1,
+    );
+}
+
+#[test]
+fn queue_groups_preserve_output_between_pending_messages_and_editing_indices() {
+    let mut state = AppState::new();
+    state.enqueue_queued_prompt("first pending".into());
+    state.apply_event(UiEvent::AssistantDelta {
+        text: "progress in between".into(),
+    });
+    state.apply_event(UiEvent::AssistantEnded);
+    state.enqueue_queued_prompt("second pending".into());
+    state.enqueue_queued_prompt("third pending".into());
+    assert_eq!(
+        consecutive_queued_user_span(state.blocks(), 0),
+        Some((0, 1))
+    );
+    assert_eq!(consecutive_queued_user_span(state.blocks(), 1), None);
+    assert_eq!(
+        consecutive_queued_user_span(state.blocks(), 3),
+        Some((2, 4))
+    );
+    let third = state.blocks()[3].id.clone();
+    let (changed, command) = state.activate_block(&third);
+    assert!(changed);
+    assert!(command.is_none());
+    let frame = render_terminal_text(&state, 80, 24);
+    let first = frame.find("first pending").expect("first pending position");
+    let progress = frame.find("progress in between").expect("output position");
+    let second = frame
+        .find("second pending")
+        .expect("second pending position");
+    let third = frame.find("third pending").expect("third pending position");
+    assert!(
+        first < progress && progress < second && second < third,
+        "{frame}"
+    );
+    assert_eq!(
+        state.take_queued_prompt_for_edit(1),
+        Some("second pending".into())
+    );
+    assert_eq!(queued_texts(&state), vec!["first pending", "third pending"]);
+    assert_eq!(state.pop_queued_prompt(), Some("first pending".into()));
+    assert_eq!(state.queued_prompt(0), Some("third pending"));
+    assert_eq!(queued_texts(&state), vec!["third pending"]);
 }
 
 #[test]

@@ -122,6 +122,7 @@ fn mcp_meta_tool_only_in_auto_with_enabled_servers() {
             },
             enabled,
             timeout: Duration::from_millis(1_000),
+            options: Default::default(),
         }
     }
     fn manager(enabled: bool) -> Arc<McpManager> {

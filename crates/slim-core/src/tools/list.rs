@@ -38,6 +38,9 @@ struct ListSnapshot {
 #[derive(Clone, Debug)]
 pub(crate) struct ListPage {
     pub entries: Vec<PathBuf>,
+    /// Whether each of `entries` is a directory; the model-facing text marks
+    /// those with a trailing `/`.
+    directories: Vec<bool>,
     pub first: usize,
     pub total: usize,
     pub next_cursor: Option<String>,
@@ -47,15 +50,22 @@ pub(crate) struct ListPage {
 }
 
 impl ListPage {
+    /// An entry as the model reads it: relative to the workspace, a directory
+    /// ending in `/`.
+    pub(crate) fn label(&self, index: usize, display_root: &Path) -> String {
+        let mut label = super::search::display_path(display_root, &self.entries[index])
+            .display()
+            .to_string();
+        if self.directories[index] {
+            label.push('/');
+        }
+        label
+    }
+
     pub(crate) fn present(&self, max_bytes: usize, display_root: &Path) -> super::ToolPresentation {
         let render = |count: usize| {
-            let mut text = self.entries[..count]
-                .iter()
-                .map(|entry| {
-                    super::search::display_path(display_root, entry)
-                        .display()
-                        .to_string()
-                })
+            let mut text = (0..count)
+                .map(|index| self.label(index, display_root))
                 .collect::<Vec<_>>()
                 .join("\n");
             let next = self.first.saturating_add(count);
@@ -268,6 +278,7 @@ fn build_page(
     let next_cursor =
         (next_index < entries.len()).then(|| format!("{id}:{:x}", next_index.saturating_add(1)));
     ListPage {
+        directories: page_entries.iter().map(|entry| entry.is_dir()).collect(),
         entries: page_entries,
         first: first_index.saturating_add(1),
         total: entries.len(),

@@ -8,7 +8,6 @@ pub mod cache;
 pub mod clipboard;
 pub mod composer;
 pub mod fullscreen;
-pub mod image;
 pub mod input;
 pub mod inspector;
 pub mod layout;
@@ -26,6 +25,7 @@ pub mod session_picker;
 pub mod terminal;
 pub mod testkit;
 pub mod theme;
+mod thought;
 pub mod todo;
 pub mod view_model;
 

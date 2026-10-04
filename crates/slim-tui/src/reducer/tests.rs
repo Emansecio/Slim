@@ -1451,6 +1451,7 @@ fn mcp_overlay_remove_requires_confirmation() {
         status: crate::api::McpStatusView::Ready,
         tools: Some(3),
         error: None,
+        ..Default::default()
     }];
     state.composer.insert_text("/mcp");
     reduce(&mut state, Action::Key(enter()));
@@ -1490,6 +1491,7 @@ fn mcp_overlay_enter_tests_selected_server() {
             status: crate::api::McpStatusView::Disconnected,
             tools: None,
             error: None,
+            ..Default::default()
         },
         crate::api::McpServerView {
             name: "web".into(),
@@ -1498,6 +1500,7 @@ fn mcp_overlay_enter_tests_selected_server() {
             status: crate::api::McpStatusView::Disconnected,
             tools: None,
             error: None,
+            ..Default::default()
         },
     ];
     state.composer.insert_text("/mcp");
@@ -1537,6 +1540,125 @@ fn mcp_add_parses_stdio_and_http_forms() {
     })));
 }
 
+#[test]
+fn mcp_add_accepts_quoted_arguments_shell_style() {
+    let mut state = AppState::new();
+    state.composer.insert_text(
+        r#"/mcp add fs "C:\Program Files\node\node.exe" --flag "two words" 'single $x' "" "say \"hi\"""#,
+    );
+    let effects = reduce(&mut state, Action::Key(enter()));
+    assert!(effects.contains(&Effect::Send(UiCommand::McpAdd {
+        name: "fs".into(),
+        command: Some(r"C:\Program Files\node\node.exe".into()),
+        args: vec![
+            "--flag".into(),
+            "two words".into(),
+            "single $x".into(),
+            String::new(),
+            r#"say "hi""#.into(),
+        ],
+        url: None,
+        global: false,
+    })));
+
+    let mut state = AppState::new();
+    state
+        .composer
+        .insert_text(r#"/mcp add web --url "https://mcp.example.com/a b" --global"#);
+    let effects = reduce(&mut state, Action::Key(enter()));
+    assert!(effects.contains(&Effect::Send(UiCommand::McpAdd {
+        name: "web".into(),
+        command: None,
+        args: Vec::new(),
+        url: Some("https://mcp.example.com/a b".into()),
+        global: true,
+    })));
+}
+
+#[test]
+fn mcp_add_with_unterminated_quote_keeps_the_draft_and_sends_nothing() {
+    let mut state = AppState::new();
+    state.composer.insert_text(r#"/mcp add fs npx "oops"#);
+    let effects = reduce(&mut state, Action::Key(enter()));
+    assert!(effects
+        .iter()
+        .all(|effect| !matches!(effect, Effect::Send(UiCommand::McpAdd { .. }))));
+    assert!(state
+        .notifications
+        .iter()
+        .any(|note| note.contains("aspas não fechadas")));
+    assert!(state.composer.payload().contains("/mcp add fs npx"));
+}
+
+#[test]
+fn mcp_trust_and_untrust_subcommands_dispatch_trust_commands() {
+    let mut state = AppState::new();
+    state.composer.insert_text("/mcp trust");
+    let effects = reduce(&mut state, Action::Key(enter()));
+    assert!(effects.contains(&Effect::Send(UiCommand::McpTrust {
+        trust: true,
+        name: None,
+    })));
+
+    let mut state = AppState::new();
+    state.composer.insert_text("/mcp untrust");
+    let effects = reduce(&mut state, Action::Key(enter()));
+    assert!(effects.contains(&Effect::Send(UiCommand::McpTrust {
+        trust: false,
+        name: None,
+    })));
+}
+
+#[test]
+fn mcp_login_and_logout_subcommands_dispatch_oauth_commands() {
+    let mut state = AppState::new();
+    state.composer.insert_text("/mcp login notion");
+    let effects = reduce(&mut state, Action::Key(enter()));
+    assert!(effects.contains(&Effect::Send(UiCommand::McpLogin {
+        name: "notion".into(),
+        redirect_url: None,
+    })));
+
+    // A pasted redirect URL goes to the sign-in already running.
+    let mut state = AppState::new();
+    state
+        .composer
+        .insert_text("/mcp login notion http://127.0.0.1:5000/callback?code=abc&state=xyz");
+    let effects = reduce(&mut state, Action::Key(enter()));
+    assert!(effects.contains(&Effect::Send(UiCommand::McpLogin {
+        name: "notion".into(),
+        redirect_url: Some("http://127.0.0.1:5000/callback?code=abc&state=xyz".into()),
+    })));
+
+    let mut state = AppState::new();
+    state.composer.insert_text("/mcp logout notion");
+    let effects = reduce(&mut state, Action::Key(enter()));
+    assert!(effects.contains(&Effect::Send(UiCommand::McpLogout {
+        name: "notion".into(),
+    })));
+}
+
+#[test]
+fn mcp_login_and_logout_need_a_server_name() {
+    for command in ["/mcp login", "/mcp logout"] {
+        let mut state = AppState::new();
+        state.composer.insert_text(command);
+        let effects = reduce(&mut state, Action::Key(enter()));
+        assert!(effects.iter().all(|effect| !matches!(
+            effect,
+            Effect::Send(UiCommand::McpLogin { .. } | UiCommand::McpLogout { .. })
+        )));
+        assert!(
+            state
+                .notifications
+                .iter()
+                .any(|note| note.contains("login <nome>")),
+            "{command}: usage expected"
+        );
+        assert_eq!(state.composer.payload(), command, "the draft is kept");
+    }
+}
+
 fn mcp_server(name: &str) -> crate::api::McpServerView {
     crate::api::McpServerView {
         name: name.into(),
@@ -1545,6 +1667,7 @@ fn mcp_server(name: &str) -> crate::api::McpServerView {
         status: crate::api::McpStatusView::Disconnected,
         tools: None,
         error: None,
+        ..Default::default()
     }
 }
 
@@ -2004,9 +2127,20 @@ fn todo_dock_preference_survives_todo_updates() {
             status: crate::api::TodoItemStatus::Pending,
         }],
     });
-    assert!(state.todo_dock_open);
-    reduce(&mut state, Action::ToggleTodoDock);
     assert!(!state.todo_dock_open);
+    reduce(&mut state, Action::ToggleTodoDock);
+    assert!(state.todo_dock_open);
+    state.apply_event(UiEvent::TodoChanged {
+        items: vec![crate::api::TodoItemView {
+            reason: None,
+            id: None,
+            title: "completed".into(),
+            status: crate::api::TodoItemStatus::Completed,
+        }],
+    });
+    assert!(state.todo_dock_open);
+    assert_eq!(state.todo_dock_user_preference, Some(true));
+    reduce(&mut state, Action::ToggleTodoDock);
     state.apply_event(UiEvent::TodoChanged {
         items: vec![crate::api::TodoItemView {
             reason: None,
@@ -2016,6 +2150,7 @@ fn todo_dock_preference_survives_todo_updates() {
         }],
     });
     assert!(!state.todo_dock_open);
+    assert_eq!(state.todo_dock_user_preference, Some(false));
 }
 
 #[test]
@@ -2097,16 +2232,8 @@ fn thinking_preview_retention_uses_thinking_start_and_releases_at_boundary() {
         .blocks()
         .iter()
         .find(|block| block.id == thinking_id)
-        .is_some_and(|block| block.preview_retained));
-    state.clock.elapsed_ms = 70;
-    state.apply_event(UiEvent::AssistantDelta {
-        text: "answer".into(),
-    });
-    assert!(state
-        .blocks()
-        .iter()
-        .find(|block| block.id == thinking_id)
-        .is_some_and(|block| !block.preview_retained));
+        .is_some_and(|block| block.ended_ms == Some(60)
+            && block.lifecycle == crate::block::BlockLifecycle::Complete));
 }
 
 #[test]

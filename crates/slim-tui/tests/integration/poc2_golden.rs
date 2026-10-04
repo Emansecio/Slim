@@ -14,7 +14,7 @@ fn approved_surface_sizes_keep_fixed_rows_and_deterministic_status() {
         (140, 40, 2),
         (200, 40, 2),
     ] {
-        let regions = plan(width, height, 2, false);
+        let regions = plan(width, height, 2);
         assert_eq!(regions.todo.height, 2, "size={width}x{height}");
         assert_eq!(regions.todo_divider.height, 1, "size={width}x{height}");
         assert_eq!(

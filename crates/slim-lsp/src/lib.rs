@@ -18,9 +18,10 @@ pub mod pool;
 pub mod position;
 pub mod process;
 pub mod transport;
+mod workspace;
 
 pub use diagnostics::{DiagnosticsStore, StoredDiagnostics};
-pub use discovery::{discover_for_workspace, ServerSpec};
+pub use discovery::{discover_for_workspace, ServerOptions, ServerSpec};
 pub use document::{DocumentStore, OpenDocument};
 pub use instance::{LspServerInstance, ServerInstanceConfig};
 pub use manager::{LspCodeIntelligence, LspManagerConfig};

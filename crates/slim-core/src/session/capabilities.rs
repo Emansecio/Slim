@@ -11,7 +11,6 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::agents::ChildStatus;
 use crate::mcp::{canonical_name, McpCatalog};
 use crate::skills::DiscoveryResult;
 use crate::tools::ToolRegistry;
@@ -453,18 +452,6 @@ impl DurableChildStatus {
     }
 }
 
-impl From<ChildStatus> for DurableChildStatus {
-    fn from(status: ChildStatus) -> Self {
-        match status {
-            ChildStatus::Queued => Self::Queued,
-            ChildStatus::Active => Self::Active,
-            ChildStatus::Completed => Self::Completed,
-            ChildStatus::Cancelled => Self::Cancelled,
-            ChildStatus::Failed => Self::Failed,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ChildRequest {
     pub queue_id: String,
@@ -756,7 +743,7 @@ impl std::error::Error for CapabilityLedgerError {}
 impl<R> CapabilityService<R> {
     pub fn new(repo: R, catalog: CapabilityCatalog) -> Result<Self, CapabilityLedgerError>
     where
-        R: DurableRepoLike,
+        R: DurableRepo,
     {
         let mut service = Self {
             repo,
@@ -825,7 +812,7 @@ impl<R> CapabilityService<R> {
 
     fn effect_id_for(&self, execution_id: &str) -> Result<String, CapabilityLedgerError>
     where
-        R: DurableRepoLike,
+        R: DurableRepo,
     {
         let effect_id = format!("effect.{}.{}", self.repo.header().id, execution_id);
         validate_identifier(&effect_id)?;
@@ -842,7 +829,7 @@ impl<R> CapabilityService<R> {
 
     pub fn enqueue(&mut self, request: CapabilityRequest) -> Result<(), CapabilityLedgerError>
     where
-        R: DurableRepoLike,
+        R: DurableRepo,
     {
         validate_request(&request)?;
         self.catalog.authorize_with_request(&request)?;
@@ -894,7 +881,7 @@ impl<R> CapabilityService<R> {
         dispatcher: F,
     ) -> Result<CapabilityDispatch, CapabilityLedgerError>
     where
-        R: DurableRepoLike,
+        R: DurableRepo,
         F: FnOnce(&CapabilityDescriptor, &str) -> CapabilityTerminal,
     {
         let queue_id = request.queue_id.clone();
@@ -908,7 +895,7 @@ impl<R> CapabilityService<R> {
         dispatcher: F,
     ) -> Result<CapabilityDispatch, CapabilityLedgerError>
     where
-        R: DurableRepoLike,
+        R: DurableRepo,
         F: FnOnce(&CapabilityDescriptor, &str) -> CapabilityTerminal,
     {
         let (request, effect_id, state_kind) = self
@@ -993,7 +980,7 @@ impl<R> CapabilityService<R> {
         authorization: AuthorizationGrant,
     ) -> Result<(), CapabilityLedgerError>
     where
-        R: DurableRepoLike,
+        R: DurableRepo,
     {
         let (request, effect_id, state) = self
             .capabilities
@@ -1060,7 +1047,7 @@ impl<R> CapabilityService<R> {
         authorization: AuthorizationGrant,
     ) -> Result<(), CapabilityLedgerError>
     where
-        R: DurableRepoLike,
+        R: DurableRepo,
     {
         let (request, effect_id, state) = self
             .capabilities
@@ -1103,7 +1090,7 @@ impl<R> CapabilityService<R> {
         dispatcher: F,
     ) -> Result<CapabilityDispatch, CapabilityLedgerError>
     where
-        R: DurableRepoLike,
+        R: DurableRepo,
         F: FnOnce(&CapabilityDescriptor, &str) -> CapabilityTerminal,
     {
         let (request, effect_id, state_kind) = self
@@ -1172,7 +1159,7 @@ impl<R> CapabilityService<R> {
         adapter: &mut D,
     ) -> Result<CapabilityDispatch, CapabilityLedgerError>
     where
-        R: DurableRepoLike,
+        R: DurableRepo,
     {
         self.dispatch(request, |descriptor, effect_id| {
             adapter.dispatch(effect_id, descriptor)
@@ -1186,7 +1173,7 @@ impl<R> CapabilityService<R> {
         authorization: AuthorizationGrant,
     ) -> Result<(), CapabilityLedgerError>
     where
-        R: DurableRepoLike,
+        R: DurableRepo,
     {
         self.catalog.authorize("agent.child", mode, authorization)?;
         validate_child_request(&request)?;
@@ -1284,7 +1271,7 @@ impl<R> CapabilityService<R> {
         authorization: AuthorizationGrant,
     ) -> Result<(), CapabilityLedgerError>
     where
-        R: DurableRepoLike,
+        R: DurableRepo,
     {
         self.catalog.authorize("agent.child", mode, authorization)?;
         self.request_child_cancellation(queue_id)
@@ -1298,7 +1285,7 @@ impl<R> CapabilityService<R> {
         authorization: AuthorizationGrant,
     ) -> Result<(), CapabilityLedgerError>
     where
-        R: DurableRepoLike,
+        R: DurableRepo,
     {
         self.catalog.authorize("agent.child", mode, authorization)?;
         if !status.is_terminal() {
@@ -1316,7 +1303,7 @@ impl<R> CapabilityService<R> {
         authorization: AuthorizationGrant,
     ) -> Result<bool, CapabilityLedgerError>
     where
-        R: DurableRepoLike,
+        R: DurableRepo,
     {
         validate_task_request(&request)?;
         let capability_id = request.mutation.capability_id();
@@ -1636,7 +1623,7 @@ fn validate_task_request(request: &TaskMutationRequest) -> Result<(), Capability
 
 impl<R> CapabilityService<R>
 where
-    R: DurableRepoLike,
+    R: DurableRepo,
 {
     fn append_fact(
         &mut self,
@@ -2078,11 +2065,6 @@ where
         Ok(())
     }
 }
-
-/// Durable repository contract for the capability ledger. Implemented for
-/// every DurableRepo (memory and JSONL).
-pub trait DurableRepoLike: DurableRepo {}
-impl<T: DurableRepo> DurableRepoLike for T {}
 
 fn required_fact_str(value: &Value, field: &str) -> Result<String, CapabilityLedgerError> {
     value

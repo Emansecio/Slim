@@ -130,7 +130,7 @@ fn finished_tool(state: &mut AppState, id: &str, name: &str, summary: &str) {
 
 #[test]
 fn the_turn_marker_carries_how_the_turn_went() {
-    let turn = |lifecycle| {
+    let turn = |lifecycle, glyph| {
         let mut state = connected();
         assert!(state.append_block(Block::new(
             "answer",
@@ -139,16 +139,60 @@ fn the_turn_marker_carries_how_the_turn_went() {
         )));
         let rendered = render(&state, 60, ColorDepth::TrueColor);
         let header = rendered.row("Slim");
-        let marker = rendered.style_at(header, "●").0;
+        let marker = rendered.style_at(header, glyph).0;
         let label = rendered.style_at(header, "Slim").0;
         (marker, label)
     };
-    assert_eq!(turn(BlockLifecycle::Complete), (GREEN, GREEN));
-    assert_eq!(turn(BlockLifecycle::Streaming), (GREEN, GREEN));
-    // The marker turns amber or red; the name keeps a quiet tone instead of
-    // borrowing a warning color.
-    assert_eq!(turn(BlockLifecycle::Cancelled), (AMBER, SECONDARY));
-    assert_eq!(turn(BlockLifecycle::Failed), (RED, SECONDARY));
+    assert_eq!(turn(BlockLifecycle::Complete, "●"), (GREEN, GREEN));
+    assert_eq!(turn(BlockLifecycle::Streaming, "●"), (GREEN, GREEN));
+    // The marker turns amber or red and takes the shape tool rows use for
+    // the same outcome; the name keeps a quiet tone instead of borrowing a
+    // warning color.
+    assert_eq!(turn(BlockLifecycle::Cancelled, "■"), (AMBER, SECONDARY));
+    assert_eq!(turn(BlockLifecycle::Failed, "✕"), (RED, SECONDARY));
+}
+
+#[test]
+fn failed_and_interrupted_turns_differ_from_a_finished_one_by_shape_not_only_color() {
+    for (color_depth, shapes) in [
+        (ColorDepth::TrueColor, ['●', '■', '✕']),
+        (ColorDepth::Ansi16, ['●', '■', '✕']),
+        (ColorDepth::None, ['*', '!', 'x']),
+    ] {
+        let markers: Vec<char> = [
+            BlockLifecycle::Complete,
+            BlockLifecycle::Cancelled,
+            BlockLifecycle::Failed,
+        ]
+        .into_iter()
+        .map(|lifecycle| {
+            let mut state = connected();
+            assert!(state.append_block(Block::new(
+                "answer",
+                BlockKind::Assistant("resposta".into()),
+                lifecycle
+            )));
+            let rendered = render(&state, 60, color_depth);
+            let header = &rendered.rows[rendered.row("Slim")];
+            // One cell: the name stays in the fourth column, where the
+            // pending header's sweep expects it.
+            assert_eq!(
+                header
+                    .find("Slim")
+                    .map(|byte| header[..byte].chars().count()),
+                Some(4)
+            );
+            let marker = header.chars().nth(2).expect("marker");
+            assert_eq!(
+                unicode_width::UnicodeWidthChar::width(marker),
+                Some(1),
+                "{header:?}"
+            );
+            marker
+        })
+        .collect();
+        assert_eq!(markers, shapes, "{color_depth:?}");
+    }
 }
 
 #[test]
@@ -163,13 +207,13 @@ fn a_thought_reads_in_the_reasoning_hue_apart_from_the_tools_around_it() {
     state.clock.elapsed_ms = 10_000;
     let rendered = render(&state, 80, ColorDepth::TrueColor);
 
-    let thought = rendered.row("Pensamento");
+    let thought = rendered.row("Pensou");
     assert_eq!(rendered.style_at(thought, "▸").0, VIOLET);
-    assert_eq!(rendered.style_at(thought, "Pensamento").0, VIOLET);
+    assert_eq!(rendered.style_at(thought, "Pensou").0, VIOLET);
     let read = rendered.row("Leu");
     assert_eq!(rendered.style_at(read, "Leu").0, MUTED);
     assert_ne!(
-        rendered.style_at(thought, "Pensamento").0,
+        rendered.style_at(thought, "Pensou").0,
         rendered.style_at(read, "Leu").0,
         "thought and action must not share a tone"
     );
@@ -185,10 +229,11 @@ fn a_streaming_thought_keeps_the_blue_of_live_indicators() {
     let rendered = render(&state, 80, ColorDepth::TrueColor);
     let header = rendered.row("Pensando");
     assert_eq!(rendered.style_at(header, "○").0, BLUE);
-    // The body under it is italic in the reasoning hue.
-    let body = rendered.row("segunda linha");
-    let (color, modifiers) = rendered.style_at(body, "segunda");
-    assert_eq!(color, VIOLET);
+    // The newest words ride on the header row, italic and a step back from
+    // the label's reasoning hue.
+    assert_eq!(rendered.row("segunda linha"), header);
+    let (color, modifiers) = rendered.style_at(header, "segunda");
+    assert!(luma(color) < luma(VIOLET), "{color:?}");
     assert!(modifiers.contains(Modifier::ITALIC));
 }
 
@@ -218,14 +263,15 @@ fn only_an_applied_change_earns_the_green_check() {
     );
     assert_eq!(rendered.style_at(read, "Leu").0, MUTED);
 
-    let run = rendered.row("Executou");
+    // A command reads as itself: `$` takes the verb's slot and weight.
+    let run = rendered.row("✓ $");
     assert_eq!(
         rendered.style_at(run, "✓").0,
         MUTED,
         "a command is not a change"
     );
     assert_eq!(
-        rendered.style_at(run, "Executou").0,
+        rendered.style_at(run, "$").0,
         SECONDARY,
         "but it reads one step above a read"
     );
@@ -351,7 +397,7 @@ fn a_running_tool_counts_whole_seconds_in_the_slot_its_duration_will_take() {
     let row_at = |state: &mut AppState, elapsed_ms: u64| {
         tick(state, elapsed_ms / 83, elapsed_ms);
         let rendered = render_with(state, 100, moving(ColorDepth::TrueColor));
-        rendered.rows[rendered.row("Executando")]
+        rendered.rows[rendered.row("$ cargo test")]
             .trim_end()
             .to_owned()
     };
@@ -372,7 +418,9 @@ fn a_running_tool_counts_whole_seconds_in_the_slot_its_duration_will_take() {
     });
     tick(&mut state, 900, 75_000);
     let settled = render_with(&state, 100, moving(ColorDepth::TrueColor));
-    let row = settled.rows[settled.row("Executou")].trim_end().to_owned();
+    let row = settled.rows[settled.row("$ cargo test")]
+        .trim_end()
+        .to_owned();
     assert!(row.ends_with("1m05s"), "{row}");
     assert!(!row.contains("1m15s"), "the running clock must stop: {row}");
 }
@@ -547,8 +595,9 @@ fn thinking(text: &str) -> AppState {
 #[test]
 fn a_highlight_sweeps_the_thinking_label_and_leaves_the_clock_alone() {
     let mut state = thinking("plano");
-    let sweep = |state: &mut AppState, frame: u64, capabilities: Capabilities| {
-        tick(state, frame, 3_500);
+    // The runtime clock: one motion frame every 83 ms.
+    let sweep = |state: &mut AppState, elapsed_ms: u64, capabilities: Capabilities| {
+        tick(state, elapsed_ms / 83, elapsed_ms);
         let rendered = render_with(state, 80, capabilities);
         let row = rendered.row("Pensando");
         // "  ⠋ Pensando · 3s": the label fills columns 4..12, the clock follows.
@@ -558,14 +607,17 @@ fn a_highlight_sweeps_the_thinking_label_and_leaves_the_clock_alone() {
         (label, clock, text, rendered.modifiers[row][4..12].to_vec())
     };
 
-    // The peak crosses the label one cell every two frames.
+    // The peak crosses the label one cell every two frames (166 ms); a pass
+    // with its rest is 14 cells, 2_324 ms. Two passes in, the clock reads 5s.
+    let at_cell = |cell: u64| 2 * 2_324 + 166 * cell;
     let mut peaks = Vec::new();
-    for frame in [6, 8, 10, 12] {
-        let (label, clock, text, _) = sweep(&mut state, frame, moving(ColorDepth::TrueColor));
+    for cell in [3, 4, 5, 6] {
+        let (label, clock, text, _) =
+            sweep(&mut state, at_cell(cell), moving(ColorDepth::TrueColor));
         let peak = (0..8).max_by_key(|index| luma(label[*index])).unwrap();
         peaks.push(peak);
         assert!(
-            text.starts_with("Pensando · 3s"),
+            text.starts_with("Pensando · 5s"),
             "text never changes: {text}"
         );
         assert!(
@@ -575,9 +627,17 @@ fn a_highlight_sweeps_the_thinking_label_and_leaves_the_clock_alone() {
     }
     assert_eq!(peaks, [1, 2, 3, 4]);
 
+    // Between those frames the light slides instead of jumping: halfway
+    // across, the two cells it straddles share it, below the full peak.
+    let (whole, ..) = sweep(&mut state, at_cell(4), moving(ColorDepth::TrueColor));
+    let (half, ..) = sweep(&mut state, at_cell(4) + 83, moving(ColorDepth::TrueColor));
+    assert_eq!(half[2], half[3], "{half:?}");
+    assert!(luma(half[2]) < luma(whole[2]), "{half:?}");
+    assert!(luma(half[2]) > luma(whole[3]), "{half:?}");
+
     // The label is brighter at the peak than at rest, and rests in the
     // reasoning hue's own family (not a grey).
-    let (label, ..) = sweep(&mut state, 8, moving(ColorDepth::TrueColor));
+    let (label, ..) = sweep(&mut state, at_cell(4), moving(ColorDepth::TrueColor));
     assert!(luma(label[2]) > luma(label[7]));
     assert!(
         luma(label[7]) < luma(VIOLET) + 1,
@@ -591,28 +651,32 @@ fn a_highlight_sweeps_the_thinking_label_and_leaves_the_clock_alone() {
     }
 
     // Without color the sweep is weight: bold at the peak, plain elsewhere.
-    let (_, _, _, modifiers) = sweep(&mut state, 8, moving(ColorDepth::None));
+    let (_, _, _, modifiers) = sweep(&mut state, at_cell(4), moving(ColorDepth::None));
     assert!(modifiers[2].contains(Modifier::BOLD), "{modifiers:?}");
     assert!(!modifiers[7].contains(Modifier::BOLD), "{modifiers:?}");
 }
 
 #[test]
-fn of_two_preview_rows_the_older_sits_a_step_back() {
-    let state = thinking(&"uma frase longa de raciocínio ".repeat(10));
-    // Reduced motion: no glow, so the rows show their own shades.
+fn a_long_thought_stays_one_row_with_its_newest_words() {
+    use slim_tui::render::{HeightIndex, WrapCache};
+    let state = thinking(&format!(
+        "{}fim do raciocínio",
+        "uma frase longa ".repeat(40)
+    ));
+    // Reduced motion: no glow, so the row shows its resting shades.
     let rendered = render_with(&state, 50, caps(ColorDepth::TrueColor));
-    let older = rendered.row("…");
-    let newest = older + 1;
-    let (older_color, older_modifiers) = rendered.style_at(older, "uma");
-    let (newest_color, newest_modifiers) = rendered.style_at(newest, "a");
-    assert!(
-        luma(older_color) < luma(newest_color),
-        "older {older_color:?} vs newest {newest_color:?}"
-    );
-    assert_eq!(newest_color, VIOLET);
-    assert!(
-        older_modifiers.contains(Modifier::ITALIC) && newest_modifiers.contains(Modifier::ITALIC)
-    );
+    let row = rendered.row("Pensando");
+    let text = rendered.rows[row].trim_end();
+    assert!(text.contains("Pensando · …"), "{text}");
+    assert!(text.ends_with("fim do raciocínio"), "{text}");
+    let (tail, modifiers) = rendered.style_at(row, "fim");
+    assert!(luma(tail) < luma(VIOLET), "{tail:?}");
+    assert!(modifiers.contains(Modifier::ITALIC));
+    // However long the thought, it measures as many rows as a short one.
+    let rows = HeightIndex::build(state.blocks(), 50, &mut WrapCache::default()).total_rows;
+    let short = thinking("plano");
+    let short_rows = HeightIndex::build(short.blocks(), 50, &mut WrapCache::default()).total_rows;
+    assert_eq!(rows, short_rows, "the thought is one measured row");
 }
 
 #[test]
@@ -627,14 +691,23 @@ fn arriving_thought_lights_the_edge_where_it_is_written_and_settles() {
         let rendered = render_with(state, 100, capabilities);
         let row = rendered.row("chegar");
         let end = rendered.rows[row].trim_end().chars().count() - 1;
-        let start = 4; // first text column
+        // The tail rides on the header row; its first word sits past the glow.
+        let start = rendered.rows[row].find("primeira").unwrap();
+        let start = rendered.rows[row][..start].chars().count();
         (
             rendered.foreground[row][end],
             rendered.foreground[row][start],
-            rendered.foreground[row][end - 13],
-            rendered.rows[row].trim_end().to_owned(),
+            rendered.foreground[row][end - 14],
+            // The spinner beside the label moves; the words never do.
+            rendered.rows[row][rendered.rows[row].find("Pensando").unwrap()..]
+                .trim_end()
+                .to_owned(),
         )
     };
+
+    // Reduced motion shows the resting shade of the tail.
+    let (resting, resting_start, ..) = edge(&mut state, 12, 1_000, caps(ColorDepth::TrueColor));
+    assert_eq!(resting, resting_start, "reduced motion has no glow");
 
     let (fresh_edge, start, deep, text) =
         edge(&mut state, 12, 1_000, moving(ColorDepth::TrueColor));
@@ -642,20 +715,46 @@ fn arriving_thought_lights_the_edge_where_it_is_written_and_settles() {
         luma(fresh_edge) > luma(start),
         "the edge is lit: {fresh_edge:?}"
     );
-    assert_eq!(start, VIOLET);
-    assert_eq!(deep, VIOLET, "the glow is 14 cells deep, not the whole row");
+    assert_eq!(start, resting);
+    assert_eq!(
+        deep, resting,
+        "the glow is 14 cells deep, not the whole row"
+    );
 
     // Half-way through it has faded, but is still above the resting shade.
     let (fading, _, _, same_text) = edge(&mut state, 15, 1_250, moving(ColorDepth::TrueColor));
     assert!(luma(fading) < luma(fresh_edge));
-    assert!(luma(fading) > luma(VIOLET));
+    assert!(luma(fading) > luma(resting));
     assert_eq!(same_text, text, "the glow never moves or changes the text");
 
-    // After 450 ms it is gone, and without motion it never appears.
+    // After 450 ms it is gone.
     let (settled, ..) = edge(&mut state, 18, 1_500, moving(ColorDepth::TrueColor));
-    assert_eq!(settled, VIOLET);
-    let (still, ..) = edge(&mut state, 12, 1_000, caps(ColorDepth::TrueColor));
-    assert_eq!(still, VIOLET, "reduced motion");
+    assert_eq!(settled, resting);
+}
+
+#[test]
+fn a_finished_sentence_heads_the_row_upright_and_unlit() {
+    let mut state = thinking("");
+    tick(&mut state, 12, 1_000);
+    state.apply_event(UiEvent::ThinkingDelta {
+        text: "Okay, vou conferir o cache de linhas. Depois leio o render".into(),
+    });
+    let rendered = render_with(&state, 100, moving(ColorDepth::TrueColor));
+    let row = rendered.row("Pensando");
+    let text = rendered.rows[row].trim_end();
+    // The sentence still being written waits; the finished one stands,
+    // without its empty opener.
+    assert!(
+        text.ends_with(" · Vou conferir o cache de linhas"),
+        "{text}"
+    );
+    assert!(!text.contains("Depois"), "{text}");
+    let (color, modifiers) = rendered.style_at(row, "Vou");
+    assert_eq!(color, Color::Rgb(0xBC, 0xB9, 0xAF));
+    assert!(!modifiers.contains(Modifier::ITALIC));
+    // Content has just arrived, but the row holds no words arriving: no glow.
+    let end = text.chars().count() - 1;
+    assert_eq!(rendered.foreground[row][end], color);
 }
 
 // -- The agent is present from the moment the prompt is sent -----------------
@@ -712,10 +811,10 @@ fn the_pending_header_becomes_the_first_blocks_header_without_moving_anything() 
         "one header, same place under the prompt"
     );
     let rows_after = HeightIndex::build(state.blocks(), 80, &mut WrapCache::default()).total_rows;
-    // The header row is now the block's; only the thought's own rows are new.
+    // The header row is now the block's; only the thought's own row is new.
     assert_eq!(
         rows_after,
-        rows_before + 2,
+        rows_before + 1,
         "header row is not counted twice"
     );
     assert!(after.rows[prompt_after + header_offset + 1].contains("Pensando"));

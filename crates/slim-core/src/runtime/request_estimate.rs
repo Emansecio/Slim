@@ -11,6 +11,22 @@ pub(super) fn messages_are_text_only(messages: &[ProviderMessage]) -> bool {
     })
 }
 
+/// The base64 characters of the images in `messages` that a request estimate
+/// does not count: the serialized body holds them whole, the estimate counts
+/// each image as [`crate::context::ESTIMATED_ATTACHMENT_CHARS`].
+pub(super) fn image_payload_discount_chars(messages: &[ProviderMessage]) -> u64 {
+    messages
+        .iter()
+        .flat_map(|message| &message.content_blocks)
+        .fold(0_u64, |total, block| match block {
+            crate::provider::ProviderContentBlock::Image { data, .. } => total.saturating_add(
+                estimate_json_string_chars(data)
+                    .saturating_sub(crate::context::ESTIMATED_ATTACHMENT_CHARS),
+            ),
+            _ => total,
+        })
+}
+
 pub(super) fn estimate_unprepared_request_chars<A: ProviderAdapter>(
     adapter: &A,
     messages: &[ProviderMessage],
@@ -48,8 +64,13 @@ pub(super) fn estimate_unprepared_request_chars<A: ProviderAdapter>(
                 crate::provider::ProviderContentBlock::Text(text) => {
                     estimate_json_string_chars(text)
                 }
-                crate::provider::ProviderContentBlock::Image { media_type, data }
-                | crate::provider::ProviderContentBlock::Audio { media_type, data }
+                // An image costs a fixed number of tokens whatever its bytes
+                // are: Pi's figure, not the length of its base64.
+                crate::provider::ProviderContentBlock::Image { media_type, .. } => {
+                    estimate_json_string_chars(media_type)
+                        .saturating_add(crate::context::ESTIMATED_ATTACHMENT_CHARS)
+                }
+                crate::provider::ProviderContentBlock::Audio { media_type, data }
                 | crate::provider::ProviderContentBlock::File { media_type, data } => {
                     estimate_json_string_chars(media_type)
                         .saturating_add(estimate_json_string_chars(data))
@@ -130,5 +151,41 @@ pub(super) fn estimate_json_chars(value: &Value) -> u64 {
                 .saturating_add(estimate_json_chars(value))
                 .saturating_add(2)
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{
+        OpenAiCompatibleAdapter, ProviderConfig, ProviderContentBlock, ProviderMessage,
+    };
+
+    #[test]
+    fn an_image_costs_a_fixed_figure_whatever_its_base64_length() {
+        let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+            "http://127.0.0.1:1",
+            "fixture",
+            "unused",
+        ))
+        .unwrap();
+        let estimate = |data: String| {
+            let message = ProviderMessage::user("look")
+                .with_content_blocks(vec![ProviderContentBlock::image("image/png", data)]);
+            let messages = [message];
+            let chars = estimate_unprepared_request_chars(&adapter, &messages, &[], None).unwrap();
+            (chars, image_payload_discount_chars(&messages))
+        };
+        let (small, small_discount) = estimate("A".repeat(1_000));
+        let (large, large_discount) = estimate("A".repeat(1_000_000));
+        assert_eq!(small, large);
+        assert_eq!(small_discount, 0);
+        assert_eq!(large_discount, 1_000_002 - 4_800);
+        // The same bytes as text are counted whole.
+        let text = ProviderMessage::user("A".repeat(1_000_000));
+        assert!(
+            estimate_unprepared_request_chars(&adapter, &[text], &[], None).unwrap()
+                > large + 900_000
+        );
     }
 }

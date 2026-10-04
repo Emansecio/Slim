@@ -34,6 +34,80 @@ fn caps() -> Capabilities {
     }
 }
 
+#[test]
+fn grouped_commands_keep_a_gap_after_a_truncated_name() {
+    let palette = Palette::of(caps());
+    let line = super::palette_command_line("/model --default", false, 32, &palette);
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    assert!(text.contains("… salvar"), "{text}");
+}
+
+fn transition_deadline(state: &AppState, now_ms: u64, capabilities: Capabilities) -> Option<u64> {
+    super::next_transition_visual_deadline_ms(
+        state,
+        now_ms,
+        capabilities,
+        &mut WrapCache::default(),
+    )
+}
+
+#[test]
+fn tool_preview_hides_runtime_notes_and_job_control_text() {
+    use super::tool_preview_line;
+    assert_eq!(
+        tool_preview_line(
+            "job_id=shell-54 state=running elapsed_ms=1016
+control hint"
+        ),
+        "shell-54 rodando"
+    );
+    assert_eq!(
+        tool_preview_line("job_id=shell-9 state=completed elapsed_ms=40"),
+        "shell-9 concluído"
+    );
+    assert_eq!(
+        tool_preview_line("exit 1 · timed out · [note: pipe capture may be incomplete]"),
+        "exit 1 · timed out"
+    );
+    assert_eq!(
+        tool_preview_line("exit 3 · [note: nonzero exit with empty stderr — a · b]"),
+        "exit 3"
+    );
+    // Anything else, including a job line with extra fields, is left alone.
+    assert_eq!(
+        tool_preview_line("job_id=shell-1 start_offset=0 next_offset=4 output_bytes=4"),
+        "job_id=shell-1 start_offset=0 next_offset=4 output_bytes=4"
+    );
+    assert_eq!(tool_preview_line("exit 0"), "exit 0");
+}
+
+#[test]
+fn question_focus_tints_label_and_description_without_changing_text() {
+    for color_depth in [
+        ColorDepth::TrueColor,
+        ColorDepth::Ansi256,
+        ColorDepth::Ansi16,
+        ColorDepth::None,
+    ] {
+        let palette = Palette::of(Capabilities {
+            color_depth,
+            ..caps()
+        });
+        for label in [true, false] {
+            let focused = super::overlay_option_row(">   opção 界", 24, true, &palette, label);
+            let resting = super::overlay_option_row(">   opção 界", 24, false, &palette, label);
+            assert_eq!(focused.to_string(), resting.to_string());
+            assert_eq!(focused.spans[0].style.bg, palette.menu_selected.bg);
+            assert_eq!(resting.spans[0].style.bg, None);
+            assert!(focused.to_string().contains(">   opção 界"));
+        }
+    }
+}
+
 fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Event {
     Event::Mouse(MouseEvent {
         kind,
@@ -587,6 +661,34 @@ fn slash_popup_keeps_a_late_selection_visible_in_a_small_viewport() {
     assert!(!frame.contains("/skill-00"), "{frame}");
 }
 
+#[test]
+fn slash_skills_with_a_shared_prefix_remain_distinct_at_minimum_size() {
+    let mut state = AppState::new();
+    state.set_skill_names_for_test(vec!["typescript-symbols".into(), "typescript-refs".into()]);
+    reduce(&mut state, Action::Paste("/typescript".into()));
+    reduce(
+        &mut state,
+        Action::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Down,
+            KeyModifiers::NONE,
+        )),
+    );
+
+    let frame = render_to_string(&state, 40, 8);
+    assert!(frame.contains("/typescript-symbols"), "{frame}");
+    assert!(frame.contains("> /typescript-refs"), "{frame}");
+
+    reduce(
+        &mut state,
+        Action::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Tab,
+            KeyModifiers::NONE,
+        )),
+    );
+    assert_eq!(state.composer.payload(), "/typescript-refs ");
+    assert!(state.slash_suggestions.is_none());
+}
+
 fn render_to_string(state: &AppState, width: u16, height: u16) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("terminal");
@@ -751,10 +853,19 @@ fn toast_deadline_tracks_highlight_then_expiry_and_skips_hidden_rows() {
     state.push_notification("notice".into());
     let count = toast_row_count(&state, 24);
     assert_eq!(count, 1);
-    assert_eq!(
-        super::next_toast_visual_deadline_ms(&state, 0, count, true),
-        Some(super::INFO_TOAST_HIGHLIGHT_MS)
-    );
+    // The highlight settles in steps; each one is a deadline of its own.
+    for (now, next) in [
+        (0, super::SETTLE_STEP_MS),
+        (super::SETTLE_STEP_MS - 1, super::SETTLE_STEP_MS),
+        (super::SETTLE_STEP_MS, 2 * super::SETTLE_STEP_MS),
+        (2 * super::SETTLE_STEP_MS, super::INFO_TOAST_HIGHLIGHT_MS),
+    ] {
+        assert_eq!(
+            super::next_toast_visual_deadline_ms(&state, now, count, true),
+            Some(next),
+            "now={now}"
+        );
+    }
     assert_eq!(
         super::next_toast_visual_deadline_ms(&state, super::INFO_TOAST_HIGHLIGHT_MS, count, true,),
         Some(crate::app::INFO_TOAST_TTL_MS)
@@ -774,7 +885,7 @@ fn toast_deadline_tracks_highlight_then_expiry_and_skips_hidden_rows() {
 }
 
 #[test]
-fn toast_is_bold_only_during_initial_highlight_and_reduced_motion_is_stable() {
+fn toast_settles_in_color_steps_and_reduced_motion_is_stable() {
     let mut state = AppState::new();
     state.push_notification("notice".into());
     let render = |state: &AppState, capabilities| {
@@ -786,24 +897,46 @@ fn toast_is_bold_only_during_initial_highlight_and_reduced_motion_is_stable() {
             .expect("draw");
         terminal.backend().buffer().clone()
     };
-    let notice_modifier = |buffer: &ratatui::buffer::Buffer| {
+    let notice_style = |buffer: &ratatui::buffer::Buffer| {
         for y in 0..buffer.area.height {
             let row = (0..buffer.area.width)
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>();
             if let Some(x) = row.find("notice") {
-                return buffer[(x as u16, y)].modifier;
+                let cell = &buffer[(x as u16, y)];
+                return (cell.fg, cell.modifier);
             }
         }
         panic!("notice cell")
     };
+    let resting = Palette::of(caps()).muted.fg.expect("muted fg");
+    let lifted = |step: usize| {
+        crate::theme::lift_color(resting, ColorDepth::TrueColor, super::SETTLE_LIFT[step])
+            .expect("rgb fg")
+    };
+    let brightness = |color: Color| match color {
+        Color::Rgb(r, g, b) => u32::from(r) + u32::from(g) + u32::from(b),
+        other => panic!("{other:?}"),
+    };
 
-    let highlighted = render(&state, caps());
-    assert!(notice_modifier(&highlighted).contains(Modifier::BOLD));
+    // One step per motion frame; weight never changes at truecolor.
+    for (now, step) in [(0, 0), (82, 0), (83, 1), (165, 1), (166, 2), (248, 2)] {
+        state.clock.elapsed_ms = now;
+        let (fg, modifier) = notice_style(&render(&state, caps()));
+        assert_eq!(fg, lifted(step), "now={now}");
+        assert!(!modifier.contains(Modifier::BOLD), "now={now}");
+    }
+    assert!(brightness(lifted(0)) > brightness(lifted(1)));
+    assert!(brightness(lifted(1)) > brightness(lifted(2)));
+    assert!(brightness(lifted(2)) > brightness(resting));
 
     state.clock.elapsed_ms = super::INFO_TOAST_HIGHLIGHT_MS;
     let stable = render(&state, caps());
-    assert!(!notice_modifier(&stable).contains(Modifier::BOLD));
+    assert_eq!(
+        notice_style(&stable),
+        (resting, Modifier::empty()),
+        "back to the resting style, exactly"
+    );
     state.clock.elapsed_ms += 1_000;
     assert_eq!(stable, render(&state, caps()));
 
@@ -813,9 +946,23 @@ fn toast_is_bold_only_during_initial_highlight_and_reduced_motion_is_stable() {
     };
     state.clock.elapsed_ms = 0;
     let reduced_initial = render(&state, reduced);
-    assert!(!notice_modifier(&reduced_initial).contains(Modifier::BOLD));
+    assert_eq!(notice_style(&reduced_initial), (resting, Modifier::empty()));
     state.clock.elapsed_ms = super::INFO_TOAST_HIGHLIGHT_MS - 1;
     assert_eq!(reduced_initial, render(&state, reduced));
+
+    // Depths without shades keep the weight flip.
+    let ansi16 = Capabilities {
+        color_depth: ColorDepth::Ansi16,
+        ..caps()
+    };
+    state.clock.elapsed_ms = 0;
+    assert!(notice_style(&render(&state, ansi16))
+        .1
+        .contains(Modifier::BOLD));
+    state.clock.elapsed_ms = super::INFO_TOAST_HIGHLIGHT_MS;
+    assert!(!notice_style(&render(&state, ansi16))
+        .1
+        .contains(Modifier::BOLD));
 }
 
 fn mcp_server_view(
@@ -831,6 +978,7 @@ fn mcp_server_view(
         status,
         tools: None,
         error: error.map(str::to_owned),
+        ..Default::default()
     }
 }
 
@@ -872,6 +1020,44 @@ fn mcp_overlay_keeps_error_and_hints_on_their_own_rows() {
 }
 
 #[test]
+fn mcp_overlay_marks_untrusted_project_servers_with_the_trust_hint() {
+    let mut state = AppState::new();
+    state.authenticated = true;
+    state.mcp_overlay = Some(McpOverlay::default());
+    state.mcp_servers = vec![mcp_server_view(
+        "proj-tools",
+        "node server.js",
+        McpStatusView::Untrusted,
+        None,
+    )];
+    let frame = render_to_string(&state, 80, 24);
+    assert!(
+        frame.contains("proj-tools") && frame.contains("projeto sem confiança"),
+        "{frame}"
+    );
+    assert!(frame.contains("/mcp trust"), "{frame}");
+}
+
+#[test]
+fn mcp_overlay_marks_servers_that_need_sign_in_with_the_login_hint() {
+    let mut state = AppState::new();
+    state.authenticated = true;
+    state.mcp_overlay = Some(McpOverlay::default());
+    state.mcp_servers = vec![mcp_server_view(
+        "notion",
+        "https://mcp.notion.example/mcp",
+        McpStatusView::NeedsAuth,
+        None,
+    )];
+    let frame = render_to_string(&state, 80, 24);
+    assert!(
+        frame.contains("notion") && frame.contains("requer login"),
+        "{frame}"
+    );
+    assert!(frame.contains("/mcp login"), "{frame}");
+}
+
+#[test]
 fn mcp_overlay_hides_status_toast() {
     let mut state = AppState::new();
     state.authenticated = true;
@@ -907,11 +1093,7 @@ fn wide_activity_rail_includes_turn_and_this_turn_tool_budgets() {
     assert!(!wide.contains("turnos 1/128"), "{wide}");
     assert!(!wide.contains("leituras 0/96"), "{wide}");
     assert!(!wide.contains("edições 0/32"), "{wide}");
-    assert!(
-        !wide.contains("Ctrl+C stop"),
-        "cancel is already in the footer: {wide}"
-    );
-    assert!(wide.contains("Ctrl+C cancel"), "{wide}");
+    assert!(wide.contains("Esc parar"), "{wide}");
     state.turns_used = 103;
     state.tools_used_read = 77;
     state.tools_used_mutating = 2;
@@ -919,6 +1101,10 @@ fn wide_activity_rail_includes_turn_and_this_turn_tool_budgets() {
     assert!(counters.contains("turnos 103/128"), "{counters}");
     assert!(counters.contains("leituras 77/96"), "{counters}");
     assert!(!counters.contains("edições 2/32"), "{counters}");
+    assert!(
+        counters.contains("Esc"),
+        "the stop control wins over the counters: {counters}"
+    );
     let narrow = render_to_string(&state, 71, 24);
     assert!(!narrow.contains("turn 103/128"), "{narrow}");
 }
@@ -1014,7 +1200,7 @@ fn footer_highlights_hidden_phase_and_unread_value_without_highlighting_controls
 }
 
 #[test]
-fn activity_inspector_ages_keep_status_ticks_without_enabling_spinner() {
+fn activity_inspector_ages_advance_on_status_ticks() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::run_started(1));
     state.apply_event(UiEvent::AssistantDelta {
@@ -1022,11 +1208,6 @@ fn activity_inspector_ages_keep_status_ticks_without_enabling_spinner() {
     });
     state.inspector.active = Some(crate::inspector::InspectorKind::Activity);
     assert!(super::status_clock_visible(&state, 0));
-    assert!(!super::motion_needed(
-        &state,
-        caps(),
-        &mut WrapCache::default()
-    ));
     let mut cache = WrapCache::default();
     let mut terminal = Terminal::new(TestBackend::new(144, 32)).unwrap();
     terminal
@@ -1060,50 +1241,201 @@ fn activity_inspector_ages_keep_status_ticks_without_enabling_spinner() {
 }
 
 #[test]
-fn microtransition_expires_at_249ms_and_reduced_motion_is_immediate() {
+fn motion_and_status_clock_pause_only_behind_a_blocking_modal() {
+    let mut cache = WrapCache::default();
+    let mut working = AppState::new();
+    working.authenticated = true;
+    working.apply_event(UiEvent::run_started(1));
+    assert!(super::motion_needed(&working, caps(), &mut cache));
+
+    type Surface = fn(&mut AppState);
+    let non_blocking: [(&str, Surface); 5] = [
+        ("slash popup", |state| {
+            state.slash_suggestions = Some(SlashSuggestions {
+                query: String::new(),
+                selected: 0,
+            });
+        }),
+        ("search", |state| {
+            state.search = Some(crate::inspector::SearchState {
+                query: String::new(),
+                selected: 0,
+                filter: crate::inspector::SearchFilter::All,
+            });
+        }),
+        ("todo focus", |state| state.todo_focused = true),
+        ("activity inspector", |state| {
+            state.inspector.active = Some(crate::inspector::InspectorKind::Activity);
+        }),
+        ("diagnostics inspector", |state| {
+            state.inspector.active = Some(crate::inspector::InspectorKind::Diagnostics);
+        }),
+    ];
+    for (name, open) in non_blocking {
+        let mut state = working.clone();
+        open(&mut state);
+        assert!(
+            super::motion_needed(&state, caps(), &mut cache),
+            "{name} must not freeze motion"
+        );
+        assert!(
+            super::status_clock_visible(&state, 1),
+            "{name} must not freeze the status clock"
+        );
+    }
+
+    let mut modal = working.clone();
+    modal.palette_query = Some(String::new());
+    assert!(super::blocking_modal_open(&modal));
+    assert!(!super::motion_needed(&modal, caps(), &mut cache));
+    assert!(!super::status_clock_visible(&modal, 1));
+    // Keyboard/mouse capture is untouched by the motion split.
+    let mut popup = working;
+    popup.slash_suggestions = Some(SlashSuggestions {
+        query: String::new(),
+        selected: 0,
+    });
+    assert!(super::navigation_captured(&popup));
+    assert!(super::mouse_navigation_captured(&popup));
+}
+
+#[test]
+fn motion_follows_visible_animation_not_the_activity_rail_row() {
+    let mut state = AppState::new();
+    state.authenticated = true;
+    state.apply_event(UiEvent::run_started(1));
+    state.apply_event(UiEvent::UserMessageAdded {
+        text: "pedido".into(),
+    });
+    state.apply_event(UiEvent::ThinkingStarted);
+    state.apply_event(UiEvent::ThinkingDelta {
+        text: "Inspect the current state".into(),
+    });
+    // An open todo dock outranks the rail when height runs out (layout.rs).
+    state.todo_dock_open = true;
+    state.todo_items = ["a", "b", "c"]
+        .map(|title| TodoItemView {
+            reason: None,
+            id: None,
+            title: title.into(),
+            status: TodoItemStatus::Pending,
+        })
+        .to_vec();
+    let mut cache = WrapCache::default();
+    let (width, short) = (80, 8);
+    let regions = super::plan_regions(&state, width, short, &mut cache);
+    assert!(regions.scrollback.height > 0);
+    assert!(super::motion_on_screen(
+        &state,
+        caps(),
+        &mut cache,
+        &regions
+    ));
+
+    // The visible streaming header owns the shimmer, so the frame changes
+    // with the motion clock even without a rail row.
+    let render = |state: &AppState| {
+        let mut terminal = Terminal::new(TestBackend::new(width, short)).unwrap();
+        terminal
+            .draw(|frame| render_frame(frame, state, caps(), &mut WrapCache::default()))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    };
+    let first = render(&state);
+    state.clock.frame = 6;
+    assert_ne!(first, render(&state), "header sweep must advance");
+
+    // A floating inspector (narrow terminal) covers the transcript; the
+    // footer's activity spinner stays visible beside it.
+    state.inspector.active = Some(crate::inspector::InspectorKind::Diagnostics);
+    assert!(super::motion_on_screen(
+        &state,
+        caps(),
+        &mut cache,
+        &regions
+    ));
+    // A docked inspector leaves the transcript on screen.
+    let wide = super::plan_regions(&state, 144, short, &mut cache);
+    assert!(super::motion_on_screen(&state, caps(), &mut cache, &wide));
+
+    // Not working and nothing streaming: no hidden-rail motion.
+    state.inspector.active = None;
+    state.apply_event(UiEvent::RunCompleted { run_id: 1 });
+    let idle = super::plan_regions(&state, width, short, &mut cache);
+    assert!(!super::motion_on_screen(&state, caps(), &mut cache, &idle));
+}
+
+#[test]
+fn microtransition_settles_in_steps_expires_at_249ms_and_reduced_motion_is_immediate() {
     let mut state = AppState::new();
     state.authenticated = true;
     state.confirmed_setting = Some((ConfirmedSetting::Mode, 0));
     let palette = super::Palette::of(caps());
-    let highlighted = super::footer_segment_style("Auto", false, false, &state, caps(), &palette);
-    assert!(highlighted.add_modifier.contains(Modifier::BOLD));
-    assert_eq!(
-        super::next_transition_visual_deadline_ms(&state, 0, caps()),
-        Some(super::INFO_TOAST_HIGHLIGHT_MS)
-    );
+    let resting = palette.secondary;
+    let lifted = |step: usize| {
+        resting.fg(crate::theme::lift_color(
+            resting.fg.expect("fg"),
+            ColorDepth::TrueColor,
+            super::SETTLE_LIFT[step],
+        )
+        .expect("rgb"))
+    };
 
-    state.clock.elapsed_ms = super::INFO_TOAST_HIGHLIGHT_MS;
-    let expired = super::footer_segment_style("Auto", false, false, &state, caps(), &palette);
-    assert!(!expired.add_modifier.contains(Modifier::BOLD));
+    // The loop is woken at every step boundary the function reports, and the
+    // style at that instant is the next step; the last boundary lands exactly
+    // on the resting style.
+    let mut now = 0;
+    let mut steps = Vec::new();
+    while let Some(next) = transition_deadline(&state, now, caps()) {
+        state.clock.elapsed_ms = now;
+        steps.push((
+            now,
+            super::footer_segment_style("Auto", false, false, &state, caps(), &palette),
+        ));
+        assert!(next > now, "the deadline must move forward");
+        now = next;
+    }
     assert_eq!(
-        super::next_transition_visual_deadline_ms(&state, state.clock.elapsed_ms, caps()),
-        None
+        steps,
+        vec![(0, lifted(0)), (83, lifted(1)), (166, lifted(2))]
     );
+    assert_eq!(now, super::INFO_TOAST_HIGHLIGHT_MS);
+    state.clock.elapsed_ms = now;
+    assert_eq!(
+        super::footer_segment_style("Auto", false, false, &state, caps(), &palette),
+        resting,
+        "expired style is exactly the resting one"
+    );
+    assert_eq!(transition_deadline(&state, now, caps()), None);
 
+    let reduced = Capabilities {
+        reduced_motion: true,
+        ..caps()
+    };
     state.clock.elapsed_ms = 0;
-    let reduced = super::footer_segment_style(
-        "Auto",
-        false,
-        false,
-        &state,
-        Capabilities {
-            reduced_motion: true,
-            ..caps()
-        },
-        &palette,
-    );
-    assert!(!reduced.add_modifier.contains(Modifier::BOLD));
     assert_eq!(
-        super::next_transition_visual_deadline_ms(
-            &state,
-            state.clock.elapsed_ms,
-            Capabilities {
-                reduced_motion: true,
-                ..caps()
-            }
-        ),
-        None
+        super::footer_segment_style("Auto", false, false, &state, reduced, &palette),
+        resting
     );
+    assert_eq!(transition_deadline(&state, 0, reduced), None);
+
+    // Depths without shades keep the weight flip for the same window.
+    let ansi16 = Capabilities {
+        color_depth: ColorDepth::Ansi16,
+        ..caps()
+    };
+    let ansi_palette = super::Palette::of(ansi16);
+    for (now, bold) in [(0, true), (166, true), (249, false)] {
+        state.clock.elapsed_ms = now;
+        let style =
+            super::footer_segment_style("Auto", false, false, &state, ansi16, &ansi_palette);
+        assert_eq!(
+            style.add_modifier.contains(Modifier::BOLD),
+            bold,
+            "now={now}"
+        );
+        assert_eq!(style.fg, ansi_palette.secondary.fg);
+    }
 }
 
 #[test]
@@ -1131,13 +1463,13 @@ fn palette_focus_flash_expires_once_and_reduced_motion_keeps_the_stable_row() {
             .expect("selected row marker")
     };
     assert_eq!(
-        super::next_transition_visual_deadline_ms(&state, 0, caps()),
+        transition_deadline(&state, 0, caps()),
         Some(super::MENU_FOCUS_FLASH_MS)
     );
     assert_eq!(selected_bg(&state, caps()), Color::Rgb(0x34, 0x3B, 0x43));
     state.clock.elapsed_ms = super::MENU_FOCUS_FLASH_MS;
     assert_eq!(
-        super::next_transition_visual_deadline_ms(&state, state.clock.elapsed_ms, caps()),
+        transition_deadline(&state, state.clock.elapsed_ms, caps()),
         None
     );
     assert_eq!(selected_bg(&state, caps()), Color::Rgb(0x2A, 0x2A, 0x2A));
@@ -1146,10 +1478,7 @@ fn palette_focus_flash_expires_once_and_reduced_motion_keeps_the_stable_row() {
         ..caps()
     };
     state.clock.elapsed_ms = 0;
-    assert_eq!(
-        super::next_transition_visual_deadline_ms(&state, 0, reduced),
-        None
-    );
+    assert_eq!(transition_deadline(&state, 0, reduced), None);
     assert_eq!(selected_bg(&state, reduced), Color::Rgb(0x2A, 0x2A, 0x2A));
 }
 
@@ -1160,27 +1489,62 @@ fn idle_completed_block_keeps_frame_emphasis_when_spinner_is_suppressed() {
     state.apply_event(UiEvent::UserMessageAdded {
         text: "mensagem aceita".into(),
     });
-    let user_marker_modifier = |state: &AppState| {
+    // One cache across every frame: the block memo must follow the step.
+    let mut cache = WrapCache::default();
+    let user_marker = |state: &AppState, capabilities: Capabilities, cache: &mut WrapCache| {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
         terminal
-            .draw(|frame| super::render_frame(frame, state, caps(), &mut WrapCache::default()))
+            .draw(|frame| super::render_frame(frame, state, capabilities, cache))
             .expect("draw");
         let buffer = terminal.backend().buffer();
         for row in 0..buffer.area.height {
             for column in 0..buffer.area.width {
                 if buffer[(column, row)].symbol() == "●" {
-                    return buffer[(column, row)].modifier;
+                    return (buffer[(column, row)].fg, buffer[(column, row)].modifier);
                 }
             }
         }
         panic!("user marker");
     };
+    let resting = Palette::of(caps()).user.fg.expect("user fg");
 
-    let recent = user_marker_modifier(&state);
-    assert!(recent.contains(Modifier::BOLD));
+    for (now, step) in [(0, 0), (83, 1), (166, 2)] {
+        state.clock.elapsed_ms = now;
+        let (fg, modifier) = user_marker(&state, caps(), &mut cache);
+        let expected =
+            crate::theme::lift_color(resting, ColorDepth::TrueColor, super::SETTLE_LIFT[step])
+                .expect("rgb");
+        assert_eq!(fg, expected, "now={now}");
+        assert!(!modifier.contains(Modifier::BOLD), "now={now}");
+    }
     state.clock.elapsed_ms = super::INFO_TOAST_HIGHLIGHT_MS;
-    let settled = user_marker_modifier(&state);
-    assert!(!settled.contains(Modifier::BOLD));
+    assert_eq!(
+        user_marker(&state, caps(), &mut cache),
+        (resting, Modifier::DIM),
+        "settled marker is the resting one"
+    );
+
+    // Reduced motion never emphasizes; Ansi16 keeps the weight.
+    state.clock.elapsed_ms = 0;
+    let reduced = Capabilities {
+        reduced_motion: true,
+        ..caps()
+    };
+    assert_eq!(
+        user_marker(&state, reduced, &mut WrapCache::default()),
+        (resting, Modifier::DIM)
+    );
+    let ansi16 = Capabilities {
+        color_depth: ColorDepth::Ansi16,
+        ..caps()
+    };
+    assert!(user_marker(&state, ansi16, &mut WrapCache::default())
+        .1
+        .contains(Modifier::BOLD));
+    state.clock.elapsed_ms = super::INFO_TOAST_HIGHLIGHT_MS;
+    assert!(!user_marker(&state, ansi16, &mut WrapCache::default())
+        .1
+        .contains(Modifier::BOLD));
 }
 
 #[test]
@@ -1819,4 +2183,321 @@ fn slow_spinner_steps_once_a_second_and_falls_back_to_ascii() {
         .map(|second| super::slow_spinner_glyph(second * 1_000, no_color))
         .collect();
     assert_eq!(ascii, ['|', '/', '-', '\\', '|']);
+}
+
+fn paint_with(
+    state: &AppState,
+    capabilities: Capabilities,
+    cache: &mut WrapCache,
+) -> ratatui::buffer::Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+    terminal
+        .draw(|frame| render_frame(frame, state, capabilities, cache))
+        .expect("draw");
+    terminal.backend().buffer().clone()
+}
+
+/// A cell no modal covers: its foreground is the backdrop's.
+fn backdrop_fg(buffer: &ratatui::buffer::Buffer) -> Color {
+    buffer[(0, 0)].fg
+}
+
+fn rgb_brightness(color: Color) -> u32 {
+    match color {
+        Color::Rgb(r, g, b) => u32::from(r) + u32::from(g) + u32::from(b),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn modal_backdrop_settles_in_two_steps_while_the_modal_is_never_delayed() {
+    let mut state = AppState::new();
+    let mut cache = WrapCache::default();
+    let palette = Palette::of(caps());
+    let step_fg = |step: usize| palette.backdrop_entrance[step].fg.expect("step fg");
+    let resting = palette.backdrop.fg.expect("backdrop fg");
+    assert!(rgb_brightness(step_fg(0)) > rgb_brightness(step_fg(1)));
+    assert!(rgb_brightness(step_fg(1)) > rgb_brightness(resting));
+
+    // A frame without a modal, then the open: the edge is detected at paint.
+    state.clock.elapsed_ms = 1_000;
+    assert_ne!(
+        backdrop_fg(&paint_with(&state, caps(), &mut cache)),
+        resting
+    );
+    assert_eq!(
+        super::next_transition_visual_deadline_ms(&state, 1_000, caps(), &mut cache),
+        None
+    );
+    state.palette_query = Some(String::new());
+    state.clock.elapsed_ms = 1_040;
+    let first = paint_with(&state, caps(), &mut cache);
+    assert_eq!(backdrop_fg(&first), step_fg(0));
+    // The modal itself is at full contrast from the first frame.
+    let modal_fg = (0..first.area.height)
+        .flat_map(|y| (0..first.area.width).map(move |x| (x, y)))
+        .find(|&(x, y)| first[(x, y)].symbol() == ">")
+        .map(|(x, y)| first[(x, y)].fg)
+        .expect("selected row marker");
+    assert_ne!(modal_fg, step_fg(0));
+    assert_ne!(modal_fg, resting);
+
+    // The loop is handed each step boundary even though motion is paused.
+    let mut now = 1_040;
+    let mut seen = Vec::new();
+    while let Some(next) =
+        super::next_transition_visual_deadline_ms(&state, now, caps(), &mut cache)
+    {
+        seen.push(next);
+        now = next;
+        state.clock.elapsed_ms = now;
+        let expected = if now < 1_040 + 2 * super::SETTLE_STEP_MS {
+            step_fg(1)
+        } else {
+            resting
+        };
+        assert_eq!(
+            backdrop_fg(&paint_with(&state, caps(), &mut cache)),
+            expected,
+            "now={now}"
+        );
+    }
+    assert_eq!(seen, vec![1_040 + 83, 1_040 + 166]);
+    assert!(!super::motion_needed(&state, caps(), &mut cache));
+
+    // Switching modals later does not replay the entrance.
+    state.palette_query = None;
+    state.mcp_overlay = Some(McpOverlay::default());
+    state.clock.elapsed_ms = 2_000;
+    assert_eq!(
+        backdrop_fg(&paint_with(&state, caps(), &mut cache)),
+        resting
+    );
+    assert_eq!(
+        super::next_transition_visual_deadline_ms(&state, 2_000, caps(), &mut cache),
+        None
+    );
+
+    // Nor does a switch in the middle of the entrance restart it.
+    state.mcp_overlay = None;
+    state.clock.elapsed_ms = 3_000;
+    paint_with(&state, caps(), &mut cache);
+    state.palette_query = Some(String::new());
+    state.clock.elapsed_ms = 3_010;
+    assert_eq!(
+        backdrop_fg(&paint_with(&state, caps(), &mut cache)),
+        step_fg(0)
+    );
+    state.palette_query = None;
+    state.mcp_overlay = Some(McpOverlay::default());
+    state.clock.elapsed_ms = 3_100;
+    assert_eq!(
+        backdrop_fg(&paint_with(&state, caps(), &mut cache)),
+        step_fg(1)
+    );
+
+    // Closing is instant: no backdrop and no pending deadline.
+    state.mcp_overlay = None;
+    state.clock.elapsed_ms = 3_110;
+    assert_ne!(
+        backdrop_fg(&paint_with(&state, caps(), &mut cache)),
+        resting
+    );
+    assert_eq!(
+        super::next_transition_visual_deadline_ms(&state, 3_110, caps(), &mut cache),
+        None
+    );
+}
+
+#[test]
+fn modal_backdrop_entrance_is_off_for_reduced_motion_and_shadeless_depths_and_first_frames() {
+    let open = |capabilities: Capabilities, warm_up: bool| {
+        let mut state = AppState::new();
+        let mut cache = WrapCache::default();
+        if warm_up {
+            paint_with(&state, capabilities, &mut cache);
+        }
+        state.palette_query = Some(String::new());
+        state.clock.elapsed_ms = 10;
+        let fg = backdrop_fg(&paint_with(&state, capabilities, &mut cache));
+        let deadline =
+            super::next_transition_visual_deadline_ms(&state, 10, capabilities, &mut cache);
+        (fg, deadline)
+    };
+    let resting = Palette::of(caps()).backdrop.fg.expect("backdrop fg");
+    let reduced = Capabilities {
+        reduced_motion: true,
+        ..caps()
+    };
+    assert_eq!(open(reduced, true), (resting, None));
+    let ansi16 = Capabilities {
+        color_depth: ColorDepth::Ansi16,
+        ..caps()
+    };
+    let ansi16_resting = Palette::of(ansi16).backdrop.fg.expect("backdrop fg");
+    assert_eq!(open(ansi16, true), (ansi16_resting, None));
+    assert_eq!(open(ansi16, false), (ansi16_resting, None));
+    // A modal on the very first painted frame has no earlier frame to enter from.
+    assert_eq!(open(caps(), false), (resting, None));
+    // After a frame without it, the same open is an entrance.
+    let (fg, deadline) = open(caps(), true);
+    assert_ne!(fg, resting);
+    assert_eq!(deadline, Some(10 + super::SETTLE_STEP_MS));
+}
+
+#[test]
+fn composer_dropdowns_focus_with_bold_text_not_accent() {
+    let mut state = AppState::new();
+    state.slash_suggestions = Some(SlashSuggestions {
+        query: String::new(),
+        selected: 1,
+    });
+    let palette = Palette::of(caps());
+    let buffer = paint_with(&state, caps(), &mut WrapCache::default());
+    let marker = (0..buffer.area.height)
+        .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+        .find(|&(x, y)| {
+            buffer[(x, y)].symbol() == ">"
+                && buffer[(x + 1, y)].symbol() == " "
+                && buffer[(x + 2, y)].symbol() == "/"
+        })
+        .expect("focused slash row");
+    for x in [marker.0, marker.0 + 2] {
+        let cell = &buffer[(x, marker.1)];
+        assert_eq!(Some(cell.fg), palette.text.fg, "x={x}");
+        assert_ne!(Some(cell.fg), palette.accent.fg, "x={x}");
+        assert!(cell.modifier.contains(Modifier::BOLD), "x={x}");
+        assert_eq!(Some(cell.bg), palette.menu_selected.bg, "x={x}");
+    }
+}
+
+fn parallel_tool_event(call: &str, ended: bool) -> UiEvent {
+    let batch_id = ToolBatchId("batch".into());
+    let call_id = ToolCallId(call.into());
+    if ended {
+        UiEvent::ToolEnded {
+            batch_id,
+            call_id,
+            name: "read_file".into(),
+            success: true,
+            duration_ms: 5,
+        }
+    } else {
+        UiEvent::ToolStarted {
+            batch_id,
+            call_id,
+            name: "read_file".into(),
+            arguments_summary: String::new(),
+        }
+    }
+}
+
+#[test]
+fn transition_deadline_memo_matches_a_full_scan_of_every_block() {
+    // Reference: the original behavior, a walk over every block.
+    let full_scan = |state: &AppState, now: u64| -> Option<u64> {
+        assert!(
+            state.confirmed_setting.is_none()
+                && state.cancellation.is_none()
+                && state.retry.is_none()
+                && state.last_execution.is_none()
+        );
+        state
+            .blocks()
+            .iter()
+            .flat_map(|block| [block.started_ms, block.ended_ms])
+            .chain([state.activity.as_ref().map(|activity| activity.started_ms)])
+            .flatten()
+            .filter_map(|at| super::next_settle_boundary_ms(at, now))
+            .min()
+    };
+
+    let mut state = AppState::new();
+    let mut cache = WrapCache::default();
+    // Old blocks cost the memo nothing once their window is over.
+    for _ in 0..300 {
+        state.apply_event(UiEvent::UserMessageAdded { text: "old".into() });
+    }
+    assert!(cache
+        .transition_stamps(state.blocks(), state.revisions.content, 10_000, 249)
+        .is_empty());
+
+    // Parallel calls finish out of order, and new content arrives meanwhile.
+    let base = 10_000;
+    let schedule = [
+        (100, "a", false),
+        (120, "b", false),
+        (130, "c", false),
+        (300, "c", true),
+        (400, "b", true),
+        (500, "a", true),
+    ];
+    let mut pending = schedule.into_iter().peekable();
+    for offset in (0..=900).step_by(3) {
+        let now = base + offset;
+        state.clock.elapsed_ms = now;
+        while pending.peek().is_some_and(|(at, _, _)| *at <= offset) {
+            let (at, call, ended) = pending.next().expect("event");
+            state.clock.elapsed_ms = base + at;
+            state.apply_event(parallel_tool_event(call, ended));
+            state.clock.elapsed_ms = now;
+        }
+        if offset == 639 {
+            state.apply_event(UiEvent::UserMessageAdded { text: "new".into() });
+        }
+        let rev = state.revisions.content;
+        assert_eq!(
+            super::next_transition_visual_deadline_ms(&state, now, caps(), &mut cache),
+            full_scan(&state, now),
+            "now={now} rev={rev}"
+        );
+        // A clock that moves back must rescan, not reuse a narrowed window.
+        if offset % 51 == 0 && offset > 0 {
+            let earlier = now - 40;
+            assert_eq!(
+                super::next_transition_visual_deadline_ms(&state, earlier, caps(), &mut cache),
+                full_scan(&state, earlier),
+                "earlier={earlier} rev={rev}"
+            );
+        }
+    }
+    assert!(pending.next().is_none());
+    // Everything has settled: nothing is left to wake for.
+    assert_eq!(
+        super::next_transition_visual_deadline_ms(&state, base + 5_000, caps(), &mut cache),
+        None
+    );
+}
+
+#[test]
+fn completed_tool_marker_settles_through_the_block_cache_and_returns_to_rest() {
+    let mut state = AppState::new();
+    complete_tool(&mut state, "batch", "call", "read_file", 5);
+    let mut cache = WrapCache::default();
+    let marker_style = |state: &AppState, cache: &mut WrapCache| {
+        let buffer = paint_with(state, caps(), cache);
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                if buffer[(x, y)].symbol() == "\u{2713}" {
+                    return (buffer[(x, y)].fg, buffer[(x, y)].modifier);
+                }
+            }
+        }
+        panic!("completed marker")
+    };
+    let mut fgs = Vec::new();
+    for now in [0, 83, 166] {
+        state.clock.elapsed_ms = now;
+        let (fg, modifier) = marker_style(&state, &mut cache);
+        assert!(!modifier.contains(Modifier::BOLD), "now={now}");
+        fgs.push(fg);
+    }
+    state.clock.elapsed_ms = super::INFO_TOAST_HIGHLIGHT_MS;
+    let rest = marker_style(&state, &mut cache);
+    assert!(!rest.1.contains(Modifier::BOLD));
+    assert!(rgb_brightness(fgs[0]) > rgb_brightness(fgs[1]));
+    assert!(rgb_brightness(fgs[1]) > rgb_brightness(fgs[2]));
+    assert!(rgb_brightness(fgs[2]) > rgb_brightness(rest.0));
+    // The resting style is what a cold cache paints at that instant.
+    assert_eq!(rest, marker_style(&state, &mut WrapCache::default()));
 }

@@ -12,6 +12,7 @@ use slim_core::codeintel::{
     CodeIntelEditPosition, CodeIntelFileUpdate, CodeIntelOutcome, CodeIntelPatch,
     CodeIntelPositionQuery, CodeIntelTextEdit, CodeIntelligence,
 };
+use slim_lsp::discovery::{ServerOptions, RUST_ANALYZER};
 use slim_lsp::pool::{PoolConfig, StdioProcessFactory};
 use slim_lsp::{LspCodeIntelligence, LspManagerConfig, LspProcessPool};
 
@@ -81,11 +82,19 @@ fn manager_with_factory(
             idle_shutdown: None,
             max_servers: 1,
             request_timeout: Duration::from_secs(15),
-            server_config,
-            max_open_documents: 8,
             // Deliberately use rust-analyzer from PATH; this test must not
             // install or replace a server binary.
-            server_path: None,
+            servers: [(
+                RUST_ANALYZER.into(),
+                ServerOptions {
+                    initialization_options: Some(server_config.clone()),
+                    settings: Some(json!({"rust-analyzer": server_config})),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            max_open_documents: 8,
         },
     );
     assert!(root.join("Cargo.toml").is_file());
@@ -356,6 +365,7 @@ mod semantic_utility {
         let symbols = manager
             .symbols(&slim_core::codeintel::CodeIntelSymbolQuery {
                 workspace: root.into(),
+                server: None,
                 path: Some(fixture.source()),
                 max_results: 20,
                 ..Default::default()

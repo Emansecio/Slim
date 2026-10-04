@@ -266,3 +266,147 @@ fn output_cap_cuts_on_a_char_boundary_and_says_so() {
     assert!(cut.contains("saída cortada"));
     assert_eq!(super::cap_text_bytes("curto", 1024), "curto");
 }
+
+#[test]
+fn job_output_read_never_emits_a_metadata_echo() {
+    let root = std::env::temp_dir();
+    let jobs = slim_core::runtime::ShellJobs::default();
+    let context = super::JobCommandContext {
+        jobs,
+        mode: slim_core::OperatingMode::Auto,
+        cwd: root.clone(),
+        tools: Default::default(),
+        store: slim_core::context::ArtifactStore::new(root).unwrap(),
+        secrets: Vec::new(),
+    };
+    let (control_tx, control_rx) = std::sync::mpsc::sync_channel(8);
+    let (data_tx, data_rx) = std::sync::mpsc::sync_channel(8);
+    let sink = super::EventSink {
+        control: Some(control_tx),
+        data: Some(data_tx),
+        wake: slim_tui::api::WakeSignal::new().unwrap(),
+        lane_space: slim_tui::api::WakeSignal::new().unwrap(),
+        drop_probe: None,
+    };
+    assert!(context
+        .handle(
+            UiCommand::JobOutput {
+                id: "missing".into(),
+                offset: None,
+                before: None
+            },
+            &sink
+        )
+        .is_none());
+    let events: Vec<_> = control_rx.try_iter().chain(data_rx.try_iter()).collect();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, UiEvent::JobsChanged { .. })),
+        "read must not echo metadata: {events:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_jobs_persist_start_and_idle_end_without_a_model_turn() {
+    let directory = std::env::temp_dir().join(format!(
+        "slim-job-journal-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("session.jsonl");
+    let repo = slim_core::session::JsonlRepo::create(
+        &path,
+        slim_core::session::DurableSessionHeader::new(
+            "jobs",
+            "now",
+            directory.to_str().unwrap(),
+            None,
+            None,
+        ),
+    )
+    .unwrap();
+    drop(repo);
+    let jobs = slim_core::runtime::ShellJobs::default();
+    let store = slim_core::context::ArtifactStore::new(directory.join("artifacts")).unwrap();
+    let id = jobs
+        .start_user(
+            Default::default(),
+            &directory,
+            if cfg!(windows) {
+                "Write-Output 'idle-done'"
+            } else {
+                "printf idle-done"
+            },
+            &[],
+            store,
+        )
+        .unwrap();
+    let mut startup = super::TuiStartup {
+        request: None,
+        oauth_session: None,
+        options: Default::default(),
+        initial_prompt: None,
+        image_labels: Vec::new(),
+        resume_path: None,
+        resume_preflight: None,
+        pending_session_title: None,
+        persist_sessions: true,
+        mode: slim_core::OperatingMode::Auto,
+        effort: super::ReasoningEffort::High,
+        endpoint_override: None,
+        model_override: None,
+        timeout: Duration::from_secs(10),
+    };
+    startup.options.shell_jobs = Some(jobs.clone());
+    startup.resume_path = Some(path.clone());
+    let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let sink = super::EventSink {
+        control: None,
+        data: None,
+        wake: slim_tui::api::WakeSignal::new().unwrap(),
+        lane_space: slim_tui::api::WakeSignal::new().unwrap(),
+        drop_probe: None,
+    };
+    let command = tokio::time::timeout(
+        Duration::from_secs(1),
+        super::receive_tui_command(
+            &mut rx,
+            &mut startup,
+            &sink,
+            true,
+            tokio::time::Instant::now(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(command, Some(UiCommand::PersistJobs)));
+    assert!(
+        super::session_job_metadata(&slim_core::session::preflight_session(&path).unwrap())
+            .is_empty(),
+        "the cancellable receiver must not open the journal"
+    );
+    super::persist_job_metadata(&mut startup).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while jobs.running() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    super::persist_job_metadata(&mut startup).await.unwrap();
+    let preflight = slim_core::session::preflight_session(&path).unwrap();
+    let info = super::session_job_metadata(&preflight);
+    assert_eq!(info.len(), 1);
+    assert_eq!(info[0].id, id);
+    assert_eq!(info[0].state, "completed");
+    assert!(jobs.take_completions()[0].1.contains("idle-done"));
+    assert!(jobs.take_completions().is_empty());
+    drop(startup);
+    drop(jobs);
+    std::fs::remove_dir_all(directory).unwrap();
+}

@@ -175,6 +175,7 @@ fn hidden_activity_rail_keeps_phase_and_cancel_in_footer() {
                 })
                 .collect(),
         });
+        state.todo_dock_open = true;
         state.context_tokens = 500;
         state.context_window_tokens = 1000;
         for label in ["Pensando", "Aguardando resposta"] {
@@ -185,8 +186,8 @@ fn hidden_activity_rail_keeps_phase_and_cancel_in_footer() {
             let footer = frame.last().expect("footer");
             assert!(footer.contains(label), "{width}x{height}: {footer}");
             assert!(
-                footer.contains("Ctrl+C"),
-                "the compact footer keeps the semantic cancellation shortcut: {footer}"
+                footer.contains("Esc"),
+                "the compact footer keeps the stop shortcut: {footer}"
             );
             assert!(!footer.contains("Em atividade"), "{footer}");
         }
@@ -223,9 +224,10 @@ fn activity_projects_known_phase_and_elapsed() {
     );
 
     let frame = render_state(&state, caps(false)).join("\n");
-    // The visible header owns the thinking time; the rail does not repeat it.
+    // The visible header owns the phase and its time; the rail carries the run.
     assert!(frame.contains("Pensando · 2s"), "{frame}");
-    assert_eq!(frame.matches(" 2s").count(), 1, "{frame}");
+    assert_eq!(frame.matches("Pensando").count(), 1, "{frame}");
+    assert!(frame.contains("execução 2s"), "{frame}");
 }
 
 #[test]
@@ -257,6 +259,119 @@ fn rail_labels_the_run_total_when_it_differs_from_the_thinking_time() {
         .find(|line| line.contains("execução"))
         .expect("rail row");
     assert!(!rail.trim_start().starts_with('·'), "{rail}");
+}
+
+/// A shell call that has run for 5 s inside a run that has lasted 7 s. With
+/// `history` the transcript is long enough to scroll the call out of view.
+fn running_shell_state(history: bool) -> AppState {
+    let tick = |state: &mut AppState, frame: u64, elapsed_ms: u64| {
+        reduce(state, Action::Tick(FrameClock { frame, elapsed_ms }));
+    };
+    let mut state = AppState::new();
+    state.authenticated = true;
+    tick(&mut state, 1, 1_000);
+    state.apply_event(UiEvent::run_started(1));
+    if history {
+        state.apply_event(UiEvent::UserMessageAdded {
+            text: "history\n".repeat(80),
+        });
+    }
+    tick(&mut state, 36, 3_000);
+    state.apply_event(UiEvent::ToolStarted {
+        batch_id: ToolBatchId("batch".into()),
+        call_id: ToolCallId("call".into()),
+        name: "shell".into(),
+        arguments_summary: "command=cargo clippy --all-targets".into(),
+    });
+    tick(&mut state, 96, 8_000);
+    state
+}
+
+#[test]
+fn rail_carries_the_run_while_the_running_tool_row_is_in_the_transcript() {
+    let state = running_shell_state(false);
+    for reduced_motion in [false, true] {
+        let frame = render_state(&state, caps(reduced_motion)).join("\n");
+        assert!(frame.contains("$ cargo clippy"), "{frame}");
+        assert!(
+            !frame.contains("Executando"),
+            "the transcript row owns the phase\n{frame}"
+        );
+        let rail = frame
+            .lines()
+            .find(|line| line.contains("execução"))
+            .expect("activity row");
+        assert!(rail.contains("execução 7s"), "{rail}");
+        assert!(rail.contains("Esc parar"), "{rail}");
+        assert!(!rail.contains("5s"), "{rail}");
+        assert_eq!(
+            Some(rail),
+            frame.lines().last(),
+            "the run reads in the footer\n{frame}"
+        );
+    }
+}
+
+#[test]
+fn rail_keeps_the_full_label_when_the_running_tool_row_is_scrolled_away() {
+    let mut state = running_shell_state(true);
+    state.scroll.mode = slim_tui::app::FollowMode::Top;
+    let frame = render_state(&state, caps(false)).join("\n");
+    assert!(!frame.contains("cargo clippy"), "{frame}");
+    assert!(!frame.contains("execução"), "{frame}");
+    let rail = frame
+        .lines()
+        .find(|line| line.contains("Executando"))
+        .expect("rail label");
+    assert!(rail.contains("Executando comando · 5s"), "{rail}");
+}
+
+#[test]
+fn rail_is_not_blank_while_the_thinking_header_owns_the_phase() {
+    let mut state = AppState::new();
+    state.authenticated = true;
+    reduce(
+        &mut state,
+        Action::Tick(FrameClock {
+            frame: 1,
+            elapsed_ms: 1_000,
+        }),
+    );
+    state.apply_event(UiEvent::run_started(1));
+    state.apply_event(UiEvent::ThinkingStarted);
+    state.apply_event(UiEvent::ThinkingDelta {
+        text: "plan".into(),
+    });
+    reduce(
+        &mut state,
+        Action::Tick(FrameClock {
+            frame: 31,
+            elapsed_ms: 3_500,
+        }),
+    );
+    // The run and the thought started together, so both clocks read 2 s.
+    for capabilities in [
+        caps(false),
+        caps(true),
+        Capabilities {
+            color_depth: ColorDepth::None,
+            ..caps(false)
+        },
+    ] {
+        let frame = render_state(&state, capabilities).join("\n");
+        assert!(frame.contains("Pensando · 2s"), "{frame}");
+        let rail: Vec<&str> = frame
+            .lines()
+            .filter(|line| line.contains("execução"))
+            .collect();
+        assert_eq!(rail.len(), 1, "{frame}");
+        assert!(rail[0].contains("execução 2s"), "{frame}");
+        assert!(
+            !rail[0].trim_start().starts_with("execução"),
+            "the row leads with the run indicator\n{}",
+            rail[0]
+        );
+    }
 }
 
 #[test]
@@ -429,9 +544,10 @@ fn tool_lifecycle_phases_are_distinct_before_execution_starts() {
         state.activity.as_ref().map(|activity| &activity.phase),
         Some(ActivityPhase::RunningTool(name)) if name == "write"
     ));
+    // The transcript row names the running call; the rail no longer repeats it.
     assert!(render_state(&state, caps(false))
         .join("\n")
-        .contains("Editando"));
+        .contains("Escrevendo"));
 }
 
 #[test]
@@ -765,11 +881,11 @@ fn visible_activity_rail_prevents_working_footer_duplication() {
     state.apply_event(UiEvent::run_started(1));
     let frame = render_state(&state, caps(false)).join("\n");
     assert_eq!(frame.matches("Em atividade").count(), 1, "{frame}");
-    assert!(frame.contains("Ctrl+C cancelar"), "{frame}");
     let footer = frame.lines().last().expect("footer");
+    assert!(footer.contains("Em atividade · Esc parar"), "{footer}");
     assert!(
         !footer.contains("Shift+Tab"),
-        "activity rail already owns the turn; footer keeps cancel only\n{footer}"
+        "the run owns the row; the footer keeps the stop only\n{footer}"
     );
 }
 

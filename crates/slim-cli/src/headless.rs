@@ -6,7 +6,7 @@ use std::time::Duration;
 use base64::Engine;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use slim_core::context::{latest_user_instruction_before_boundary, CompactionHandle};
+use slim_core::context::{CompactionHandle, CompactionPolicy};
 use slim_core::provider::{
     clinepass_model, codex_model, command_code_model, history_response_cache_scope,
     open_code_model, xai_model, zen_model, AnthropicAdapter, ClinePassAdapter, CommandCodeAdapter,
@@ -18,10 +18,9 @@ use slim_core::runtime::{
     tool_call_is_read_only, AgentLoopConfig, AgentLoopResult, AgentLoopStop, CancellationToken,
 };
 use slim_core::session::{
-    preflight_session, provider_messages_from_entries, provider_messages_from_records,
-    DurableEntry, DurableErrorClass, DurableOutcome, DurableRepo, DurableSessionHeader, JsonlRepo,
-    ManualRunJournal, ManualRunSpec, ProviderResponse, RunTelemetryContext, RunTelemetryTerminal,
-    SessionFormat, SessionPreflight,
+    preflight_session, provider_messages_from_entries, DurableEntry, DurableErrorClass,
+    DurableOutcome, DurableRepo, DurableSessionHeader, JsonlRepo, ManualRunJournal, ManualRunSpec,
+    ProviderResponse, RunTelemetryContext, RunTelemetryTerminal, SessionFormat, SessionPreflight,
 };
 use slim_core::tools::ToolRegistry;
 use slim_core::{
@@ -222,6 +221,8 @@ pub struct ProviderRunOptions {
     pub history: Vec<ProviderMessage>,
     pub task_facts: Vec<slim_core::session::DurableFact>,
     pub artifact_ids: Vec<String>,
+    pub shell_jobs: Option<slim_core::runtime::ShellJobs>,
+    pub shell_job_limits: slim_core::runtime::ShellJobLimits,
     pub workspace_root: Option<PathBuf>,
     pub artifact_root: Option<PathBuf>,
     pub context_window_tokens: Option<u64>,
@@ -238,10 +239,6 @@ pub struct ProviderRunOptions {
     pub compaction: Option<CompactionHandle>,
     /// Interactive-only retry, scoped to one active run. Never persisted.
     pub manual_retry: Option<slim_core::runtime::ManualRetryHandle>,
-    /// TypeSafe credential for the Jev pruning compaction strategy. `None`
-    /// keeps every run on the LLM summary path; the runtime never calls
-    /// TypeSafe without it.
-    pub jev_prune: Option<slim_core::context::JevPruneConfig>,
     /// Shared for the whole host application; cloned into per-turn runtimes.
     pub code_intelligence: Option<CodeIntelligenceHandle>,
     /// Application-scoped MCP manager; connections stay lazy per server.
@@ -250,6 +247,12 @@ pub struct ProviderRunOptions {
     pub tool_registry: Option<SharedToolRegistry>,
     /// TUI Plan runs the read-only agent loop. Headless Plan stays abort-only.
     pub allow_plan_loop: bool,
+    /// Run only a manual compaction of `history`: no prompt, no model turn.
+    /// Set by the TUI for `/compact` while the session is idle.
+    pub compact_only: bool,
+    /// Start MCP servers defined by the workspace's `slim.toml` for this run
+    /// without a stored trust decision (`--trust-project`). Never persisted.
+    pub trust_project: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -330,13 +333,13 @@ impl ProviderRunOptions {
         self
     }
 
-    pub fn with_compaction_handle(mut self, handle: CompactionHandle) -> Self {
-        self.compaction = Some(handle);
+    pub fn with_trust_project(mut self, trust: bool) -> Self {
+        self.trust_project = trust;
         self
     }
 
-    pub fn with_jev_prune(mut self, config: slim_core::context::JevPruneConfig) -> Self {
-        self.jev_prune = Some(config);
+    pub fn with_compaction_handle(mut self, handle: CompactionHandle) -> Self {
+        self.compaction = Some(handle);
         self
     }
 
@@ -407,7 +410,7 @@ pub struct UsageCostSummary {
     pub compaction_micros: Option<u64>,
     pub cancelled_estimated_micros: Option<u64>,
     /// True when a usage component could not be confirmed (for example an
-    /// interrupted Jev request). Cost fields involving that component remain
+    /// interrupted provider request). Cost fields involving that component remain
     /// `None` instead of presenting a partial number.
     pub usage_unknown: bool,
     /// True when a usage component has no static price catalogue entry.
@@ -423,6 +426,10 @@ pub(crate) struct ProviderExecution {
     pub tool_results: Vec<slim_core::tools::ToolResult>,
     pub limits: ToolLoopLimits,
     pub resume_preflight: Option<SessionPreflight>,
+    /// Durable-session problems the run did not fail on (a compaction
+    /// checkpoint that could not be anchored or applied): the interface shows
+    /// them so none is silent.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -519,7 +526,7 @@ pub fn run_provider_headless_with_resume_and_options(
     let preflight = preflight_session(session_path.as_ref())
         .map_err(|error| resume_error(error.to_string()))?;
     run_provider_resume_with_preflight_events(request, preflight, options, None)
-        .map(|execution| execution.result)
+        .map(into_result_reporting_warnings)
 }
 
 pub(crate) fn run_provider_headless_with_resume_preflight_and_options(
@@ -528,7 +535,15 @@ pub(crate) fn run_provider_headless_with_resume_preflight_and_options(
     options: ProviderRunOptions,
 ) -> Result<ProviderHeadlessResult, ProviderError> {
     run_provider_resume_with_preflight_events(request, preflight, options, None)
-        .map(|execution| execution.result)
+        .map(into_result_reporting_warnings)
+}
+
+/// The result of a run no interface watches: its warnings go to stderr.
+fn into_result_reporting_warnings(execution: ProviderExecution) -> ProviderHeadlessResult {
+    for warning in &execution.warnings {
+        eprintln!("warning: {warning}");
+    }
+    execution.result
 }
 
 pub(crate) fn run_provider_resume_with_preflight_events(
@@ -578,7 +593,7 @@ async fn run_provider_resume_with_preflight_events_inner(
     skill_instructions: Option<SkillInstructions>,
 ) -> Result<ProviderExecution, ProviderError> {
     ensure_resume_preflight(&preflight).map_err(resume_error)?;
-    if request.prompt.trim().is_empty() {
+    if request.prompt.trim().is_empty() && !options.compact_only {
         return Ok(empty_provider_execution(input_required_result(&request)));
     }
     if request.mode == OperatingMode::Plan && !options.allow_plan_loop {
@@ -615,6 +630,7 @@ async fn run_provider_resume_with_preflight_events_inner(
         parent_entry_id,
         entry_ids: _,
         applied_checkpoint_id: _,
+        skipped_checkpoints: mut warnings,
     } = history;
     let workspace = PathBuf::from(
         &preflight
@@ -647,9 +663,22 @@ async fn run_provider_resume_with_preflight_events_inner(
     let mut options = options;
     options.provider_session_id = Some(repo.header().id.clone());
     options.workspace_root = Some(workspace);
+    if options.compact_only {
+        if !keep_live_history(&options.history, &history) {
+            options.history = history;
+        }
+        options.task_facts = session_task_facts(&preflight);
+        options.artifact_ids = session_artifact_ids(&preflight);
+        return run_manual_compaction(request, options, event_sender, repo, warnings).await;
+    }
     // Attach before the first redaction so MCP env/header values are
     // scrubbed from the journal too.
-    let local_mcp = attach_local_mcp(&mut options);
+    let (local_mcp, mcp_warnings) = attach_local_mcp(&mut options);
+    warnings.extend(mcp_warnings);
+    if let Some(manager) = &local_mcp {
+        warnings
+            .extend(crate::mcp::await_direct_startup(manager, options.cancellation.as_ref()).await);
+    }
     let input_message = redact_durable_message(
         ProviderMessage::user(&request.prompt).with_content_blocks(options.content_blocks.clone()),
         &durable_secrets(&request, &options),
@@ -706,87 +735,190 @@ async fn run_provider_resume_with_preflight_events_inner(
     if let Some(manager) = local_mcp {
         manager.disconnect_all().await;
     }
-    let mut journal_guard = journal
-        .lock()
-        .map_err(|_| resume_error("durable run lock poisoned"))?;
-    let repo = journal_guard.repo_mut();
+    // Commits belong to this run: take them whatever its outcome, so a failed
+    // or cancelled run still persists the compactions it applied and none is
+    // left in the handle for a later run to mis-anchor.
+    let commits = compaction_handle
+        .as_ref()
+        .map(slim_core::context::CompactionHandle::take_commits)
+        .unwrap_or_default();
     match drive_result {
         Ok(()) => {
-            for commit in compaction_handle
-                .as_ref()
-                .map(slim_core::context::CompactionHandle::take_commits)
-                .unwrap_or_default()
-            {
-                let persisted = durable_provider_history(&SessionPreflight::from_open_repo(repo))?;
-                if let Some(first_kept_entry_id) = durable_checkpoint_anchor(
-                    &persisted.messages,
-                    &persisted.entry_ids,
-                    commit.first_kept_index,
-                    &commit.prefix_fingerprint,
-                ) {
-                    let seq = repo
-                        .next_seq()
-                        .map_err(|error| resume_error(error.to_string()))?;
-                    repo.append(slim_core::session::DurableRecord::Compaction {
-                        seq,
-                        checkpoint: slim_core::session::CompactionCheckpoint {
-                            checkpoint_id: format!("compact-{}-{seq}", repo.header().id),
-                            summary: commit.summary,
-                            first_kept_entry_id,
-                            prefix_fingerprint: commit.prefix_fingerprint,
-                            previous_checkpoint_id: persisted.applied_checkpoint_id,
-                            tokens_before: commit.tokens_before,
-                            tokens_after: commit.tokens_after,
-                            input_tokens: Some(commit.input_tokens),
-                            output_tokens: Some(commit.output_tokens),
-                            duration_ms: commit.duration_ms,
-                            reason: commit.reason,
-                            read_files: Vec::new(),
-                            modified_files: Vec::new(),
-                        },
-                    })
-                    .map_err(|error| resume_error(error.to_string()))?;
-                }
-            }
+            warnings.extend(persist_commits_off_executor(&journal, commits).await?);
+            let mut journal_guard = journal
+                .lock()
+                .map_err(|_| resume_error("durable run lock poisoned"))?;
+            let repo = journal_guard.repo_mut();
             let mut execution = executor
                 .execution
                 .ok_or_else(|| resume_error("durable provider execution produced no result"))?;
             execution.resume_preflight = Some(SessionPreflight::from_open_repo(repo));
+            warnings.append(&mut execution.warnings);
+            execution.warnings = warnings;
             Ok(execution)
         }
         Err(slim_core::session::ManualDriveError::Execute(error)) => {
-            let seq = repo
-                .next_seq()
+            {
+                let mut journal_guard = journal
+                    .lock()
+                    .map_err(|_| resume_error("durable run lock poisoned"))?;
+                let repo = journal_guard.repo_mut();
+                let seq = repo
+                    .next_seq()
+                    .map_err(|error| resume_error(error.to_string()))?;
+                let kind = if matches!(error, ProviderError::Cancelled) {
+                    slim_core::session::DurableOperationKind::Aborted
+                } else {
+                    slim_core::session::DurableOperationKind::Finished {
+                        outcome: DurableOutcome::Failed,
+                    }
+                };
+                repo.append(slim_core::session::DurableRecord::Operation {
+                    seq,
+                    operation: slim_core::session::DurableOperation { operation_id, kind },
+                })
                 .map_err(|error| resume_error(error.to_string()))?;
-            let kind = if matches!(error, ProviderError::Cancelled) {
-                slim_core::session::DurableOperationKind::Aborted
-            } else {
-                slim_core::session::DurableOperationKind::Finished {
-                    outcome: DurableOutcome::Failed,
-                }
-            };
-            repo.append(slim_core::session::DurableRecord::Operation {
-                seq,
-                operation: slim_core::session::DurableOperation { operation_id, kind },
-            })
-            .map_err(|error| resume_error(error.to_string()))?;
+            }
+            // The run's own failure stays the reported result (a cancel must
+            // keep reading as one); a checkpoint that cannot be appended to the
+            // journal that just recorded that failure is dropped with it, and
+            // the session replays the entries it would have replaced.
+            let _ = persist_commits_off_executor(&journal, commits).await;
             Err(error)
         }
         Err(other) => Err(resume_error(format!("{other:?}"))),
     }
 }
 
+/// A manual /compact of a durable session while it is idle: the summary is
+/// produced without a model turn and its checkpoint is appended to the
+/// session. There is no prompt and so no operation record: a compaction that
+/// fails or is cancelled leaves the session as it was.
+async fn run_manual_compaction(
+    request: ProviderRequest,
+    options: ProviderRunOptions,
+    event_sender: Option<SessionEventSender>,
+    mut repo: JsonlRepo,
+    mut warnings: Vec<String>,
+) -> Result<ProviderExecution, ProviderError> {
+    let compaction_handle = options.compaction.clone();
+    let result =
+        execute_provider_turn_async(request, false, options, None, event_sender, None).await;
+    // The commits are this run's whatever its outcome, so none is left in the
+    // handle for a later run to mis-anchor.
+    let commits = compaction_handle
+        .as_ref()
+        .map(slim_core::context::CompactionHandle::take_commits)
+        .unwrap_or_default();
+    let mut execution = result?;
+    if !commits.is_empty() {
+        // Replaying a large journal per commit stays off the async executor.
+        let persisted = tokio::task::spawn_blocking(move || {
+            let warnings = persist_compaction_commits(&mut repo, commits);
+            (repo, warnings)
+        })
+        .await
+        .map_err(|error| resume_error(format!("checkpoint worker failed: {error}")))?;
+        repo = persisted.0;
+        warnings.extend(persisted.1?);
+    }
+    execution.resume_preflight = Some(SessionPreflight::from_open_repo(&repo));
+    warnings.append(&mut execution.warnings);
+    execution.warnings = warnings;
+    Ok(execution)
+}
+
+/// [`persist_compaction_commits`] on the blocking pool: every commit replays
+/// the whole journal, which must not stall the executor's other tasks. The
+/// journal lock is held on the blocking thread for the duration.
+async fn persist_commits_off_executor(
+    journal: &std::sync::Arc<std::sync::Mutex<ManualRunJournal>>,
+    commits: Vec<slim_core::context::CompactionCommit>,
+) -> Result<Vec<String>, ProviderError> {
+    if commits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let journal = journal.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut journal = journal
+            .lock()
+            .map_err(|_| resume_error("durable run lock poisoned"))?;
+        persist_compaction_commits(journal.repo_mut(), commits)
+    })
+    .await
+    .map_err(|error| resume_error(format!("checkpoint worker failed: {error}")))?
+}
+
+/// Appends the checkpoints a run applied, in order. Each one is anchored on
+/// the history persisted so far, so it chains onto the previous checkpoint. A
+/// commit whose summarized prefix no longer matches the persisted entries has
+/// no durable anchor and is skipped: the session stays valid and replays the
+/// entries the checkpoint would have replaced. The fingerprint covers only
+/// what the journal records, so this is not expected; each skip is returned as
+/// a warning for the interface to show.
+fn persist_compaction_commits(
+    repo: &mut JsonlRepo,
+    commits: Vec<slim_core::context::CompactionCommit>,
+) -> Result<Vec<String>, ProviderError> {
+    let mut warnings = Vec::new();
+    for commit in commits {
+        let persisted = durable_provider_history(&SessionPreflight::from_open_repo(repo))?;
+        let Some(first_kept_entry_id) = durable_checkpoint_anchor(
+            &persisted.messages,
+            &persisted.entry_ids,
+            commit.first_kept_index,
+            &commit.canonical_prefix_fingerprint,
+        ) else {
+            warnings.push(format!(
+                "A compaction ({} -> {} tokens) could not be saved to the session: its history does not match the journal. The session keeps the entries it replaced.",
+                commit.tokens_before, commit.tokens_after
+            ));
+            continue;
+        };
+        let seq = repo
+            .next_seq()
+            .map_err(|error| resume_error(error.to_string()))?;
+        repo.append(slim_core::session::DurableRecord::Compaction {
+            seq,
+            checkpoint: slim_core::session::CompactionCheckpoint {
+                checkpoint_id: format!("compact-{}-{seq}", repo.header().id),
+                summary: commit.summary,
+                first_kept_entry_id,
+                // The journal's own order: what the rebuild checks.
+                prefix_fingerprint: slim_core::context::compaction_prefix_fingerprint(
+                    &persisted.messages[..commit.first_kept_index],
+                ),
+                previous_checkpoint_id: persisted.applied_checkpoint_id,
+                tokens_before: commit.tokens_before,
+                tokens_after: commit.tokens_after,
+                input_tokens: Some(commit.input_tokens),
+                output_tokens: Some(commit.output_tokens),
+                duration_ms: commit.duration_ms,
+                reason: commit.reason,
+                read_files: commit.read_files,
+                modified_files: commit.modified_files,
+            },
+        })
+        .map_err(|error| resume_error(error.to_string()))?;
+    }
+    Ok(warnings)
+}
+
+/// The entry a commit's checkpoint keeps from, when the persisted history
+/// holds the commit's summarized prefix. A parallel batch's results are
+/// journaled as the calls complete and live in call order, so the prefixes
+/// compare by their canonical fingerprint.
 fn durable_checkpoint_anchor(
     messages: &[ProviderMessage],
     entry_ids: &[Option<String>],
     first_kept_index: usize,
-    prefix_fingerprint: &str,
+    canonical_prefix_fingerprint: &str,
 ) -> Option<String> {
     if messages.len() != entry_ids.len()
         || first_kept_index >= messages.len()
         || messages[first_kept_index].role == "tool"
-        || slim_core::context::compaction_prefix_fingerprint(&messages[..first_kept_index])
-            != prefix_fingerprint
+        || slim_core::context::canonical_prefix_fingerprint(&messages[..first_kept_index])
+            != canonical_prefix_fingerprint
     {
         return None;
     }
@@ -870,83 +1002,30 @@ struct DurableProviderHistory {
     parent_entry_id: Option<String>,
     entry_ids: Vec<Option<String>>,
     applied_checkpoint_id: Option<String>,
+    /// Checkpoints of the session that were not applied, as notices.
+    skipped_checkpoints: Vec<String>,
 }
 
 fn durable_provider_history(
     preflight: &SessionPreflight,
 ) -> Result<DurableProviderHistory, ProviderError> {
-    let mut history = Vec::new();
-    let mut entry_ids = Vec::new();
-    let mut parent_entry_id = None;
-    let entries: Vec<_> = preflight
-        .records
-        .iter()
-        .filter_map(|record| match record {
-            slim_core::session::DurableRecord::Entry { entry, .. } => Some(entry),
-            _ => None,
-        })
-        .collect();
-    history.extend(provider_messages_from_records(preflight.records.iter()).map_err(resume_error)?);
-    for entry in entries {
-        parent_entry_id = Some(entry.entry_id.clone());
-        entry_ids.push(Some(entry.entry_id.clone()));
-    }
-    let mut applied_checkpoint_id: Option<String> = None;
-    for checkpoint in preflight.records.iter().filter_map(|record| {
-        if let slim_core::session::DurableRecord::Compaction { checkpoint, .. } = record {
-            Some(checkpoint)
-        } else {
-            None
-        }
-    }) {
-        if checkpoint.previous_checkpoint_id.as_deref() != applied_checkpoint_id.as_deref() {
-            continue;
-        }
-        let Some(anchor_index) = entry_ids.iter().position(|entry_id| {
-            entry_id.as_deref() == Some(checkpoint.first_kept_entry_id.as_str())
-        }) else {
-            continue;
-        };
-        let prefix = slim_core::context::compaction_prefix_fingerprint(&history[..anchor_index]);
-        if prefix != checkpoint.prefix_fingerprint
-            || history[anchor_index].role == "tool"
-            || checkpoint.summary.trim().is_empty()
-            || checkpoint.summary.len() > slim_core::session::MAX_COMPACTION_SUMMARY_BYTES
-        {
-            continue;
-        }
-        let Some((root_index, root)) = history
-            .iter()
-            .enumerate()
-            .find(|(_, message)| message.role == "user")
-        else {
-            continue;
-        };
-        let mut restored = vec![
-            root.clone(),
-            ProviderMessage::user(format!(
-                "[Compacted context]\n{}",
-                checkpoint.summary.trim()
-            )),
-        ];
-        let mut restored_ids = vec![entry_ids[root_index].clone(), None];
-        if let Some((pinned_index, pinned)) =
-            latest_user_instruction_before_boundary(&history, anchor_index)
-        {
-            restored.push(pinned);
-            restored_ids.push(entry_ids[pinned_index].clone());
-        }
-        restored.extend(history[anchor_index..].iter().cloned());
-        restored_ids.extend(entry_ids[anchor_index..].iter().cloned());
-        history = restored;
-        entry_ids = restored_ids;
-        applied_checkpoint_id = Some(checkpoint.checkpoint_id.clone());
-    }
+    let rebuilt =
+        slim_core::session::rebuild_provider_history(&preflight.records).map_err(resume_error)?;
     Ok(DurableProviderHistory {
-        messages: history,
-        parent_entry_id,
-        entry_ids,
-        applied_checkpoint_id,
+        messages: rebuilt.messages,
+        parent_entry_id: rebuilt.parent_entry_id,
+        entry_ids: rebuilt.entry_ids,
+        applied_checkpoint_id: rebuilt.applied_checkpoint_id,
+        skipped_checkpoints: rebuilt
+            .skipped_checkpoints
+            .into_iter()
+            .map(|skipped| {
+                format!(
+                    "Compaction checkpoint {} was not applied ({}): the session replays the entries it would have replaced.",
+                    skipped.checkpoint_id, skipped.reason
+                )
+            })
+            .collect(),
     })
 }
 
@@ -964,23 +1043,41 @@ fn redact_secret(input: &str, secrets: &[String]) -> String {
 /// anything persisted to the durable journal.
 fn durable_secrets(request: &ProviderRequest, options: &ProviderRunOptions) -> Vec<String> {
     let mut secrets = vec![request.api_key.clone()];
-    if let Some(jev) = options.jev_prune.as_ref() {
-        secrets.push(jev.api_key.clone());
-    }
     if let Some(mcp) = options.mcp.as_ref() {
         secrets.extend(mcp.manager().sensitive_values());
     }
     secrets
 }
 
+/// Whether the live message is what the journal recorded of it. The journal
+/// stores user input through the heuristic credential redactor while the live
+/// copy only had its exact secret values replaced, so both sides compare in the
+/// redacted form (redaction is idempotent on what the journal already holds).
 fn durable_visible_eq(left: &ProviderMessage, right: &ProviderMessage) -> bool {
+    // The raw comparison settles the common equal case with one memcmp; the
+    // credential redactor, which copies and may parse its input, only runs
+    // when the raw texts differ.
+    fn strip(message: &ProviderMessage) -> &str {
+        slim_core::without_workspace_snapshot(&message.content)
+    }
+    let blocks_eq = left.content_blocks.len() == right.content_blocks.len()
+        && left
+            .content_blocks
+            .iter()
+            .zip(&right.content_blocks)
+            .all(|pair| match pair {
+                (ProviderContentBlock::Text(left), ProviderContentBlock::Text(right)) => {
+                    left == right || crate::auth::redact(left) == crate::auth::redact(right)
+                }
+                (left, right) => left == right,
+            });
     left.role == right.role
-        && slim_core::without_workspace_snapshot(&left.content)
-            == slim_core::without_workspace_snapshot(&right.content)
+        && (strip(left) == strip(right)
+            || crate::auth::redact(strip(left)) == crate::auth::redact(strip(right)))
         && left.name == right.name
         && left.tool_call_id == right.tool_call_id
         && left.tool_calls == right.tool_calls
-        && left.content_blocks == right.content_blocks
+        && blocks_eq
 }
 
 fn keep_live_history(live: &[ProviderMessage], durable: &[ProviderMessage]) -> bool {
@@ -1007,19 +1104,26 @@ async fn run_bound_agent_loop<A: ProviderAdapter + Send + Sync + 'static>(
     cwd: &Path,
     config: AgentLoopConfig,
     timeouts: ProviderTimeouts,
+    compact_only: bool,
 ) -> Result<Result<AgentLoopResult, ProviderError>, ProviderError> {
     let model = adapter.model().to_owned();
     let adapter = bind_history_scope(adapter, &model, initial_messages, bind);
     let client = HttpProviderClient::with_shared_transport(adapter, timeouts)?;
-    Ok(Box::pin(runtime.run_agent_loop_with_messages(
-        &client,
-        initial_messages,
-        mode,
-        cwd,
-        1,
-        config,
-    ))
-    .await)
+    let first_seq = 1;
+    Ok(if compact_only {
+        Box::pin(runtime.compact_messages(&client, initial_messages, mode, cwd, first_seq, config))
+            .await
+    } else {
+        Box::pin(runtime.run_agent_loop_with_messages(
+            &client,
+            initial_messages,
+            mode,
+            cwd,
+            first_seq,
+            config,
+        ))
+        .await
+    })
 }
 
 fn bind_history_scope<A>(
@@ -1081,7 +1185,7 @@ fn redact_durable_message(mut message: ProviderMessage, secrets: &[String]) -> P
 
 #[cfg(test)]
 #[test]
-fn durable_redaction_covers_jev_key_and_attachment_fields() {
+fn durable_redaction_covers_attachment_fields() {
     let request = ProviderRequest {
         prompt: String::new(),
         mode: slim_core::OperatingMode::Auto,
@@ -1092,28 +1196,24 @@ fn durable_redaction_covers_jev_key_and_attachment_fields() {
         account_id: None,
         timeout: std::time::Duration::from_secs(1),
     };
-    let options =
-        ProviderRunOptions::default().with_jev_prune(slim_core::context::JevPruneConfig::new(
-            slim_core::context::JevBackend::Typesafe,
-            "jev-secret",
-        ));
-    let mut message = ProviderMessage::user("provider-secret jev-secret");
+    let options = ProviderRunOptions::default();
+    let mut message = ProviderMessage::user("provider-secret");
     message.content_blocks = vec![
         ProviderContentBlock::Image {
-            media_type: "image/jev-secret".into(),
+            media_type: "image/provider-secret".into(),
             data: "provider-secret".into(),
         },
         ProviderContentBlock::Audio {
             media_type: "audio/provider-secret".into(),
-            data: "jev-secret".into(),
+            data: "provider-secret".into(),
         },
         ProviderContentBlock::File {
             media_type: "file/provider-secret".into(),
-            data: "jev-secret".into(),
+            data: "provider-secret".into(),
         },
         ProviderContentBlock::File {
             media_type: "application/octet-stream".into(),
-            data: encode_base64(b"prefix jev-secret suffix"),
+            data: encode_base64(b"prefix provider-secret suffix"),
         },
     ];
     let redacted = redact_durable_message(message, &durable_secrets(&request, &options));
@@ -1126,8 +1226,7 @@ fn durable_redaction_covers_jev_key_and_attachment_fields() {
     .unwrap();
     let serialized = serde_json::to_string(&entry).unwrap();
     assert!(!serialized.contains("provider-secret"));
-    assert!(!serialized.contains("jev-secret"));
-    assert!(!serialized.contains(&encode_base64(b"prefix jev-secret suffix")));
+    assert!(!serialized.contains(&encode_base64(b"prefix provider-secret suffix")));
     assert!(serialized.contains("[REDACTED]"));
     assert!(serialized.contains("[REDACTED attachment]"));
 }
@@ -1411,15 +1510,6 @@ fn run_telemetry_terminal(
         "duplicate_evidence_bytes_avoided": totals.duplicate_evidence_bytes_avoided,
         "compaction_input_tokens": totals.compaction_input_tokens,
         "compaction_output_tokens": totals.compaction_output_tokens,
-        "jev_input_tokens": totals.jev_input_tokens,
-        "jev_output_tokens": totals.jev_output_tokens,
-        "jev_latency_ms": totals.jev_latency_ms,
-        "jev_usage_unknown": totals.jev_usage_unknown,
-        "jev_priced_input_tokens": totals.jev_priced_input_tokens,
-        "jev_failed_priced_input_tokens": totals.jev_failed_priced_input_tokens,
-        "jev_failed_usage_unknown": totals.jev_failed_usage_unknown,
-        "jev_pricing_unknown": totals.jev_pricing_unknown,
-        "jev_failed_pricing_unknown": totals.jev_failed_pricing_unknown,
         "compaction_tokens_saved": totals.compaction_tokens_saved,
         "post_compaction_reacquisitions": totals.post_compaction_reacquisitions,
         "estimation_error_tokens": totals.estimation_error_tokens,
@@ -1469,7 +1559,7 @@ fn run_provider_headless_inner(
     session_path: Option<&Path>,
     options: ProviderRunOptions,
 ) -> Result<ProviderHeadlessResult, ProviderError> {
-    execute_provider_turn(request, session_path, options).map(|execution| execution.result)
+    execute_provider_turn(request, session_path, options).map(into_result_reporting_warnings)
 }
 
 pub(crate) fn execute_provider_turn(
@@ -1566,9 +1656,14 @@ async fn execute_provider_turn_with_local_lsp(
     event_sender: Option<SessionEventSender>,
     interaction_route: Option<InteractionRoute>,
 ) -> Result<ProviderExecution, ProviderError> {
-    let local_code_intelligence = attach_local_code_intelligence(&mut options);
-    let local_mcp = attach_local_mcp(&mut options);
-    let result = execute_provider_turn_async(
+    let (local_code_intelligence, lsp_warnings) = attach_local_code_intelligence(&mut options);
+    let (local_mcp, mut mcp_warnings) = attach_local_mcp(&mut options);
+    mcp_warnings.splice(0..0, lsp_warnings);
+    if let Some(manager) = &local_mcp {
+        mcp_warnings
+            .extend(crate::mcp::await_direct_startup(manager, options.cancellation.as_ref()).await);
+    }
+    let mut result = execute_provider_turn_async(
         request,
         capture_transcript,
         options,
@@ -1582,6 +1677,9 @@ async fn execute_provider_turn_with_local_lsp(
     }
     if let Some(manager) = local_mcp {
         manager.disconnect_all().await;
+    }
+    if let Ok(execution) = result.as_mut() {
+        execution.warnings.splice(0..0, mcp_warnings);
     }
     result
 }
@@ -1639,30 +1737,68 @@ pub(crate) fn provider_runtime_handle() -> Result<tokio::runtime::Handle, Provid
 
 fn attach_local_code_intelligence(
     options: &mut ProviderRunOptions,
-) -> Option<CodeIntelligenceHandle> {
+) -> (Option<CodeIntelligenceHandle>, Vec<String>) {
     if options.code_intelligence.is_some() {
-        return None;
+        return (None, Vec::new());
     }
-    let manager = crate::config::load_layered()
-        .ok()
-        .and_then(|layered| crate::code_intel::build_code_intelligence(&layered.lsp))?;
+    let Ok(layered) = crate::config::load_layered() else {
+        return (None, Vec::new());
+    };
+    // load_layered reads the project slim.toml from the process directory.
+    let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let trust = crate::code_intel::project_trust(&layered.lsp, &workspace, options.trust_project);
+    let warnings = trust
+        .notice
+        .map(|notice| {
+            vec![format!(
+                "{notice}. Pass --trust-project to apply them for this run."
+            )]
+        })
+        .unwrap_or_default();
+    let Some(manager) = crate::code_intel::build_code_intelligence(&layered.lsp, trust.trusted)
+    else {
+        return (None, warnings);
+    };
     let handle = CodeIntelligenceHandle::new(manager);
     options.code_intelligence = Some(handle.clone());
-    Some(handle)
+    (Some(handle), warnings)
 }
 
-fn attach_local_mcp(options: &mut ProviderRunOptions) -> Option<Arc<slim_core::mcp::McpManager>> {
+/// Connects the process-local MCP manager for a headless run. Configuration
+/// problems never abort the run and never vanish: they come back as warnings
+/// the caller reports (stderr for headless).
+fn attach_local_mcp(
+    options: &mut ProviderRunOptions,
+) -> (Option<Arc<slim_core::mcp::McpManager>>, Vec<String>) {
     if options.mcp.is_some() {
-        return None;
+        return (None, Vec::new());
     }
-    let layered = crate::config::load_layered().ok()?;
-    let cwd = options
+    let Some(cwd) = options
         .workspace_root
         .clone()
-        .or_else(|| std::env::current_dir().ok())?;
-    let manager = crate::mcp::build_mcp_manager(&layered.mcp, &cwd)?;
-    options.mcp = Some(McpHandle::new(Arc::clone(&manager)));
-    Some(manager)
+        .or_else(|| std::env::current_dir().ok())
+    else {
+        return (
+            None,
+            vec!["MCP disabled: workspace directory unavailable".into()],
+        );
+    };
+    // The project layer is the workspace's slim.toml, which is not the
+    // process directory when a session resumes in its recorded workspace.
+    let load = match crate::mcp::load_mcp(&cwd, options.trust_project) {
+        Ok(load) => load,
+        Err(error) => return (None, vec![format!("MCP disabled: config error: {error}")]),
+    };
+    let warnings =
+        crate::mcp::load_diagnostics(&load, "Pass --trust-project to start them for this run.");
+    let manager = crate::mcp::build_mcp_manager(&load, &cwd);
+    if let Some(manager) = &manager {
+        // Per run: enabled, trusted, non-lazy servers connect in the
+        // background while the run is prepared.
+        manager.start_background_connect();
+        options.mcp = Some(McpHandle::new(Arc::clone(manager)));
+    }
+    (manager, warnings)
 }
 
 pub(crate) async fn execute_provider_turn_async(
@@ -1673,7 +1809,7 @@ pub(crate) async fn execute_provider_turn_async(
     event_sender: Option<SessionEventSender>,
     interaction_route: Option<slim_core::InteractionRoute>,
 ) -> Result<ProviderExecution, ProviderError> {
-    if request.prompt.trim().is_empty() {
+    if request.prompt.trim().is_empty() && !options.compact_only {
         return Ok(empty_provider_execution(input_required_result(&request)));
     }
     let skill_user_prefix = skill_instructions
@@ -1808,6 +1944,13 @@ pub(crate) async fn execute_provider_turn_async(
             message: format!("artifact store: {error}"),
         }
     })?;
+    if let Some(jobs) = options.shell_jobs.clone() {
+        runtime.set_session_shell_jobs(jobs);
+    } else {
+        runtime
+            .set_shell_job_limits(options.shell_job_limits.clone())
+            .map_err(|message| ProviderError::InvalidResponse { message })?;
+    }
     if let Some(bytes) = parse_positive_env_usize("SLIM_READ_PRESENTATION_BYTES")
         .map_err(|message| ProviderError::InvalidResponse { message })?
     {
@@ -1837,33 +1980,9 @@ pub(crate) async fn execute_provider_turn_async(
     }
     if let Some(handle) = options.compaction.clone() {
         runtime.set_compaction_handle(handle);
-        runtime.set_compaction_pricing(resolve_pricing().and_then(|pricing| {
-            Some(slim_core::runtime::CompactionPricing {
-                input: pricing.provider.input_micros_per_million,
-                output: pricing.provider.output_micros_per_million,
-                cache_read: pricing.cache_read_micros_per_million?,
-                cache_write: pricing.cache_write_micros_per_million?,
-            })
-        }));
-        runtime.set_compaction_input_cost_micros_per_million(
-            std::env::var("SLIM_INPUT_COST_MICROS_PER_MILLION")
-                .ok()
-                .and_then(|value| value.parse().ok()),
-        );
-        // Background summaries are break-even-gated by the loop and still
-        // honor `[compaction] background = false`; headless runs overlap
-        // them like interactive ones instead of stalling foreground at the
-        // hard threshold.
-        runtime.set_background_compaction_enabled(true);
     }
     if let Some(handle) = options.manual_retry.clone() {
         runtime.set_manual_retry_handle(handle);
-    }
-    if let Some(config) = &options.jev_prune {
-        runtime.set_jev_judge(Some(std::sync::Arc::new(
-            slim_core::context::HttpJevJudge::new(config.clone()),
-        )));
-        runtime.register_sensitive_value(&config.api_key);
     }
     runtime.register_sensitive_value(&request.api_key);
     runtime.restore_task_facts(&options.task_facts, &cwd)?;
@@ -1881,7 +2000,17 @@ pub(crate) async fn execute_provider_turn_async(
     let provider_timeouts = ProviderTimeouts::production(request.timeout);
     let mut loop_config = AgentLoopConfig {
         context_window_tokens,
-        context_reserve_tokens: max_output_tokens as u64,
+        context_reserve_tokens: context_reserve_tokens(
+            request.kind,
+            max_output_tokens,
+            max_output_tokens_is_explicit(options.max_output_tokens),
+            options
+                .compaction
+                .as_ref()
+                .map_or(CompactionPolicy::default().reserve_tokens, |handle| {
+                    handle.policy().reserve_tokens
+                }),
+        ),
         ..AgentLoopConfig::default()
     };
     loop_config.max_turns = max_turns;
@@ -1902,10 +2031,17 @@ pub(crate) async fn execute_provider_turn_async(
         Some(prefix) => format!("{prefix}{}", request.prompt),
         None => request.prompt.clone(),
     };
-    let initial_message =
-        ProviderMessage::user(user_text).with_content_blocks(options.content_blocks);
+    let compact_only = options.compact_only;
     let mut initial_messages = options.history;
-    initial_messages.push(initial_message);
+    if !compact_only {
+        let mut message =
+            ProviderMessage::user(user_text).with_content_blocks(options.content_blocks);
+        if skill_user_prefix.is_some() {
+            // The journal records the prompt without the skill instructions.
+            message = message.with_recorded_content(request.prompt.clone());
+        }
+        initial_messages.push(message);
+    }
     let loop_result = match provider {
         ProviderKind::OpenAiCompatible => {
             let mut config =
@@ -1924,6 +2060,7 @@ pub(crate) async fn execute_provider_turn_async(
                 &cwd,
                 loop_config,
                 provider_timeouts,
+                compact_only,
             )
             .await?
         }
@@ -1955,6 +2092,7 @@ pub(crate) async fn execute_provider_turn_async(
                 &cwd,
                 loop_config,
                 provider_timeouts,
+                compact_only,
             )
             .await?
         }
@@ -1977,6 +2115,7 @@ pub(crate) async fn execute_provider_turn_async(
                 &cwd,
                 loop_config,
                 provider_timeouts,
+                compact_only,
             )
             .await?
         }
@@ -2002,6 +2141,7 @@ pub(crate) async fn execute_provider_turn_async(
                 &cwd,
                 loop_config,
                 provider_timeouts,
+                compact_only,
             )
             .await?
         }
@@ -2027,6 +2167,7 @@ pub(crate) async fn execute_provider_turn_async(
                 &cwd,
                 loop_config,
                 provider_timeouts,
+                compact_only,
             )
             .await?
         }
@@ -2047,6 +2188,7 @@ pub(crate) async fn execute_provider_turn_async(
                 &cwd,
                 loop_config,
                 provider_timeouts,
+                compact_only,
             )
             .await?
         }
@@ -2068,6 +2210,7 @@ pub(crate) async fn execute_provider_turn_async(
                 &cwd,
                 loop_config,
                 provider_timeouts,
+                compact_only,
             )
             .await?
         }
@@ -2088,6 +2231,7 @@ pub(crate) async fn execute_provider_turn_async(
                 &cwd,
                 loop_config,
                 provider_timeouts,
+                compact_only,
             )
             .await?
         }
@@ -2180,6 +2324,13 @@ pub(crate) async fn execute_provider_turn_async(
     let tool_summary_lines = summarize_tool_events(&events);
     let tool_process_facts = collect_tool_process_facts(&events);
     let tool_job_outputs = collect_tool_job_outputs(&events);
+    // A failed automatic compaction does not fail the run, and its activity
+    // label is replaced by the request that follows: the interface keeps it.
+    let warnings = events
+        .iter()
+        .filter_map(|event| event.kind.auto_compaction_failure())
+        .map(str::to_owned)
+        .collect();
     Ok(ProviderExecution {
         result: ProviderHeadlessResult {
             code,
@@ -2208,6 +2359,7 @@ pub(crate) async fn execute_provider_turn_async(
         tool_results,
         limits: tool_limits,
         resume_preflight: None,
+        warnings,
     })
 }
 
@@ -2590,70 +2742,55 @@ struct UsagePricing {
 }
 
 fn cost_summary_for_usage(usage: &UsageTotals, pricing: Option<UsagePricing>) -> UsageCostSummary {
-    let has_jev_tokens = usage.jev_input_tokens > 0 || usage.jev_output_tokens > 0;
-    let usage_unknown = usage.usage_unknown || usage.jev_usage_unknown;
-    let pricing_unknown = usage.jev_pricing_unknown || usage.jev_failed_pricing_unknown;
+    let usage_unknown = usage.usage_unknown;
     let Some(pricing) = pricing else {
         return UsageCostSummary {
             usage_unknown,
-            pricing_unknown: pricing_unknown || !usage.requests.is_empty() || has_jev_tokens,
+            pricing_unknown: !usage.requests.is_empty(),
             ..UsageCostSummary::default()
         };
     };
-    let provider_weighted = sum_request_weighted_costs(usage.requests.iter(), pricing);
-    let jev_weighted = jev_weighted_cost(usage, false);
     let total_micros = if !usage.overflowed
         && !usage_unknown
-        && !pricing_unknown
         && usage.requests.iter().all(|request| !request.usage_unknown)
-        && (!usage.requests.is_empty() || has_jev_tokens)
+        && !usage.requests.is_empty()
     {
-        provider_weighted
-            .and_then(|provider| provider.checked_add(jev_weighted?))
-            .and_then(weighted_cost_micros)
+        sum_request_weighted_costs(usage.requests.iter(), pricing).and_then(weighted_cost_micros)
     } else {
         None
     };
-    let failed_attempts_micros = if !usage.overflowed
-        && !usage.jev_failed_usage_unknown
-        && !usage.jev_failed_pricing_unknown
-    {
-        let provider = sum_request_weighted_costs(
+    let failed_attempts_micros = if !usage.overflowed {
+        sum_request_weighted_costs(
             usage
                 .requests
                 .iter()
                 .filter(|request| request.failed && !request.cancelled),
             pricing,
-        );
-        provider
-            .and_then(|provider| provider.checked_add(jev_weighted_cost(usage, true)?))
-            .and_then(weighted_cost_micros)
+        )
+        .and_then(weighted_cost_micros)
     } else {
         None
     };
-    let compaction_micros = if !usage.overflowed && !usage_unknown && !pricing_unknown {
-        let provider = sum_request_weighted_costs(
+    let compaction_micros = if !usage.overflowed && !usage_unknown {
+        sum_request_weighted_costs(
             usage
                 .requests
                 .iter()
                 .filter(|request| request.request_kind == RequestKind::Compaction),
             pricing,
-        );
-        provider
-            .and_then(|provider| provider.checked_add(jev_weighted?))
-            .and_then(weighted_cost_micros)
+        )
+        .and_then(weighted_cost_micros)
     } else {
         None
     };
-    let cancelled_estimated_micros =
-        if !usage.overflowed && !usage.jev_usage_unknown && !usage.jev_pricing_unknown {
-            sum_cancelled_estimated_costs(
-                usage.requests.iter().filter(|request| request.cancelled),
-                pricing,
-            )
-        } else {
-            None
-        };
+    let cancelled_estimated_micros = if !usage.overflowed {
+        sum_cancelled_estimated_costs(
+            usage.requests.iter().filter(|request| request.cancelled),
+            pricing,
+        )
+    } else {
+        None
+    };
     UsageCostSummary {
         total_micros,
         cost_per_validated_completion_micros: usage
@@ -2664,7 +2801,7 @@ fn cost_summary_for_usage(usage: &UsageTotals, pricing: Option<UsagePricing>) ->
         compaction_micros,
         cancelled_estimated_micros,
         usage_unknown,
-        pricing_unknown,
+        pricing_unknown: false,
     }
 }
 
@@ -2696,28 +2833,6 @@ fn sum_cancelled_estimated_costs<'a>(
             .and_then(|cost| total.checked_add(cost))
     })?;
     weighted_cost_micros(weighted)
-}
-
-fn jev_weighted_cost(usage: &UsageTotals, failed: bool) -> Option<u128> {
-    let (tokens, usage_unknown, pricing_unknown) = if failed {
-        (
-            usage.jev_failed_priced_input_tokens,
-            usage.jev_failed_usage_unknown,
-            usage.jev_failed_pricing_unknown,
-        )
-    } else {
-        (
-            usage.jev_priced_input_tokens,
-            usage.jev_usage_unknown,
-            usage.jev_pricing_unknown,
-        )
-    };
-    if usage_unknown || pricing_unknown {
-        return None;
-    }
-    u128::from(tokens).checked_mul(u128::from(
-        slim_core::context::TYPESAFE_JEV_INPUT_MICROS_PER_MILLION,
-    ))
 }
 
 fn request_weighted_cost(request: &slim_core::RequestUsage, pricing: UsagePricing) -> Option<u128> {
@@ -3107,6 +3222,32 @@ pub(crate) fn resolve_max_output_tokens(
     })
 }
 
+/// Whether the output limit came from the user (options, `slim.toml` or
+/// `SLIM_MAX_OUTPUT_TOKENS`) rather than from the catalog default.
+fn max_output_tokens_is_explicit(option: Option<u32>) -> bool {
+    option.is_some() || std::env::var_os("SLIM_MAX_OUTPUT_TOKENS").is_some()
+}
+
+/// What the context gate keeps free for the answer. An output limit that goes
+/// on the wire bounds the answer, so the input plus that limit must fit the
+/// window. A catalog default limit the adapter never sends (Codex Responses has
+/// no output field) bounds nothing: reserving all of it, 128k of a 272k window,
+/// would compact at about half the window for no reason, so it reserves no more
+/// than compaction's own reserve. An explicit limit keeps its meaning.
+fn context_reserve_tokens(
+    kind: ProviderKind,
+    max_output_tokens: u32,
+    explicit: bool,
+    compaction_reserve_tokens: u64,
+) -> u64 {
+    let output = u64::from(max_output_tokens);
+    if explicit || kind != ProviderKind::OpenAiCodex {
+        output
+    } else {
+        output.min(compaction_reserve_tokens)
+    }
+}
+
 fn catalog_default_max_output_tokens(kind: ProviderKind, model: &str) -> u32 {
     let Some(catalog) = known_model_max_output_tokens(kind, model) else {
         return DEFAULT_MAX_OUTPUT_TOKENS;
@@ -3314,6 +3455,7 @@ fn empty_provider_execution(result: ProviderHeadlessResult) -> ProviderExecution
             context_window_tokens: AgentLoopConfig::default().context_window_tokens,
         },
         resume_preflight: None,
+        warnings: Vec::new(),
     }
 }
 
@@ -3669,6 +3811,9 @@ mod resume_preflight_transport_tests;
 
 #[cfg(test)]
 mod live_history_resume_tests;
+
+#[cfg(test)]
+mod mcp_attach_tests;
 
 #[cfg(test)]
 mod provider_thread_tests;

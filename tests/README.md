@@ -14,6 +14,42 @@ cargo test -p slim-cli --test smoke_workspace --test e2e_v1 --test e2e_offline
 Fixtures e suporte compartilhado permanecem em `tests/fixtures/` e
 `tests/support/`.
 
+## Integrações LSP
+
+Os alvos de `slim-lsp` preservam fixtures stdio separadas dos gates que exigem
+servidores de linguagem externos:
+
+| Alvo | Contrato exercitado |
+|---|---|
+| [mock_subprocess](../crates/slim-lsp/tests/mock_subprocess.rs) | Pool, processos reais da fixture, leases, cancelamento e projeção semântica |
+| [incremental_sync](../crates/slim-lsp/tests/incremental_sync.rs) | Unicode/CRLF, alterações externas, inputs Cargo e gerações |
+| [post_edit_diagnostics](../crates/slim-lsp/tests/post_edit_diagnostics.rs) | Linha de base, publicação exata, cobertura e limites pós-edição |
+| [typescript](../crates/slim-lsp/tests/typescript.rs) | Defaults automáticos, oito extensões, raiz autorizada, filtro de servidor e lotes mistos |
+| [real_typescript](../crates/slim-lsp/tests/real_typescript.rs) | Gate explícito com TypeScript Language Server real: navegação, diagnósticos, projetos aninhados e refresh de JSONC/arquivos |
+| [real_incremental](../crates/slim-lsp/tests/real_incremental.rs) | Gate explícito com rust-analyzer real e utilidade das consultas semânticas |
+
+```powershell
+.\test-slim.ps1 -Package slim-lsp -TestTarget mock_subprocess,incremental_sync,post_edit_diagnostics,typescript
+# Gate ignorado por padrao; requer dependencias externas ja instaladas.
+cargo test -p slim-lsp --test real_typescript -- --ignored
+# Rust real, com rust-analyzer disponivel no PATH do processo.
+cargo test -p slim-lsp --test real_incremental -- --ignored
+```
+
+O gate `real_typescript` exige Node.js, TypeScript Language Server e TypeScript
+compatíveis, sem instalá-los nem alterar PATH. A variável opcional
+`SLIM_TEST_TYPESCRIPT_LANGUAGE_SERVER` aceita o executável ou entrypoint Node
+de uma instalação existente; ela só seleciona o servidor do teste. Esses testes
+não representam configuração obrigatória ou ativação no Slim. O alvo
+`typescript` usa a fixture controlada e não comprova compatibilidade com o
+servidor externo. A execução e seus resultados devem ser registrados no gate
+correspondente, sem inferir sucesso pela existência dos arquivos.
+
+O gate real exige o `tsserver.js` clássico. Publicações sem versão conservam
+`diagnostic_version=null` e completude desconhecida; pós-edição exige
+`Unverified`. Versões executadas e evidências ficam em
+[release/README.md](../release/README.md).
+
 ## Ciclo local com carga controlada
 
 Use [`test-slim.ps1`](../test-slim.ps1) para selecionar explicitamente os alvos:
@@ -23,6 +59,9 @@ Use [`test-slim.ps1`](../test-slim.ps1) para selecionar explicitamente os alvos:
 .\test-slim.ps1 -Package slim-core -Lib -Filter runtime::shell_jobs
 # Integracoes afetadas, em uma unica invocacao.
 .\test-slim.ps1 -Package slim-core -TestTarget agent_loop,native_tool_recovery
+# CodeMode: isolamento/persistencia e composicao com MCP HTTP/stdio locais.
+.\test-slim.ps1 -Package slim-core -Lib -Filter runtime::codemode
+.\test-slim.ps1 -Package slim-core -TestTarget codemode
 # Providers e catalogos de ambos os pacotes, com dependencias resolvidas juntas.
 .\test-slim.ps1 -Package slim-core,slim-cli -TestTarget providers,catalogs
 # Um modulo do alvo agrupado, sem executar os demais casos.
@@ -80,7 +119,7 @@ de teste encolhem (por exemplo, `rt_session_lock` de 55 MB para 12 MB).
 Para depurar variaveis dos pacotes locais, acrescente `-FullDebug`; a troca
 recompila os alvos afetados. O perfil release mantem as configuracoes anteriores.
 
-Os testes unitarios de runtime e Jev, assim como os de `headless`, `tui`,
+Os testes unitarios de runtime, assim como os de `headless`, `tui`,
 `main`, `reducer` e runtime da TUI, ficam em arquivos de modulos carregados
 somente com `cfg(test)`. Esses arquivos nao sao dependencias Rust do release;
 mantenha novos casos nesses modulos para evitar recompilar producao por uma

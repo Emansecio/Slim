@@ -26,6 +26,7 @@ momento em que foram produzidos.
 - [`PLANO-IMPLEMENTACAO.md`](PLANO-IMPLEMENTACAO.md) — plano e gates históricos.
 - [`PROXIMAS-ETAPAS-AGENTE.md`](PROXIMAS-ETAPAS-AGENTE.md) — prioridades do ciclo.
 - [`HARNESS-V2-TRACKER.md`](HARNESS-V2-TRACKER.md) — tracker do harness durável.
+- [`PROPOSTA-LSP-JS-TS.md`](PROPOSTA-LSP-JS-TS.md) — proposta e implementação nativa de LSP para JavaScript/TypeScript, preservação de Rust e extensão futura para Python.
 
 ## Validação e estudos
 

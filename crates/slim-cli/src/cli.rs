@@ -21,6 +21,7 @@ const HELP: &str = "Slim coding agent
 Usage:
   Slim [TUI OPTIONS]
   Slim --headless [OPTIONS] [PROMPT...]
+  Slim mcp COMMAND [ARGS...]    Manage MCP servers (Slim mcp --help)
 
 Modes:
   --tui              Open the fullscreen TUI (default)
@@ -46,14 +47,13 @@ Input and sessions:
   --abandon-pending  With --recover: abandon unfinished work; effects stay unverified
   --experiment-id ID Label durable run telemetry for a benchmark experiment
   --task-id ID       Label durable run telemetry for a benchmark task
-  --compactor WHICH  Compaction strategy: jev (default, falls back to summary)
-                     or summary (LLM checkpoint). Env: SLIM_COMPACTOR
 
 Output:
   --verbose          Include detailed human-readable events
   --jsonl            Emit machine-readable JSON Lines
 
 Other:
+  --trust-project    Trust this project's slim.toml (MCP servers, LSP overrides) for this run
   -h, --help         Show this help
   -V, --version      Show the version
 
@@ -85,13 +85,13 @@ pub(crate) struct ParsedArgs {
     pub abandon_pending: bool,
     pub experiment_id: Option<String>,
     pub task_id: Option<String>,
-    pub compactor: Option<String>,
     pub image_paths: Vec<String>,
     pub positional: Vec<String>,
     pub tui: bool,
     pub headless: bool,
     pub fake: bool,
     pub verbose: bool,
+    pub trust_project: bool,
 }
 
 pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
@@ -110,13 +110,13 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
         abandon_pending: false,
         experiment_id: None,
         task_id: None,
-        compactor: None,
         image_paths: Vec::new(),
         positional: Vec::new(),
         tui: false,
         headless: false,
         fake: false,
         verbose: false,
+        trust_project: false,
     };
     let mut index = 0;
     // Parsed flags are the only evidence of a selected mode: values such as
@@ -130,6 +130,7 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
             "--fast" => parsed.codex_fast = Some(true),
             "--normal" => parsed.codex_fast = Some(false),
             "--verbose" => parsed.verbose = true,
+            "--trust-project" => parsed.trust_project = true,
             "--plan" => {
                 parsed.mode = OperatingMode::Plan;
             }
@@ -138,8 +139,7 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
             }
             "--jsonl" => parsed.format = OutputFormat::Jsonl,
             "--prompt" | "--provider" | "--model" | "--endpoint" | "--session" | "--resume"
-            | "--recover" | "--image" | "--effort" | "--experiment-id" | "--task-id"
-            | "--compactor" => {
+            | "--recover" | "--image" | "--effort" | "--experiment-id" | "--task-id" => {
                 let option = args[index].clone();
                 index += 1;
                 let value = args.get(index).cloned().ok_or_else(|| {
@@ -157,7 +157,6 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
                     "--image" => parsed.image_paths.push(value),
                     "--experiment-id" => parsed.experiment_id = Some(value),
                     "--task-id" => parsed.task_id = Some(value),
-                    "--compactor" => parsed.compactor = Some(value),
                     _ => unreachable!(),
                 }
             }
@@ -222,13 +221,13 @@ where
         abandon_pending,
         experiment_id,
         task_id,
-        compactor,
         image_paths,
         positional,
         tui: _,
         headless: _,
         fake,
         verbose,
+        trust_project,
     } = match parse_cli_args(&args) {
         Ok(parsed) => parsed,
         Err(output) => return output,
@@ -239,26 +238,6 @@ where
             "--verbose is available only with human text output; remove --jsonl\n",
         );
     }
-    // Validate the flag and the environment value even when the run never
-    // compacts (`--fake`), so a typo is reported instead of silently ignored.
-    let parse_compactor = |value: &str| slim_core::context::CompactionStrategy::parse(value);
-    let cli_compactor = match compactor.as_deref() {
-        Some(value) => match parse_compactor(value) {
-            Ok(strategy) => Some(strategy),
-            Err(error) => return failure(ExitCode::InputRequired, &format!("{error}\n")),
-        },
-        None => None,
-    };
-    let env_compactor = match cli_compactor {
-        Some(strategy) => Some(strategy),
-        None => match std::env::var("SLIM_COMPACTOR") {
-            Ok(value) if !value.trim().is_empty() => match parse_compactor(&value) {
-                Ok(strategy) => Some(strategy),
-                Err(error) => return failure(ExitCode::InputRequired, &format!("{error}\n")),
-            },
-            _ => None,
-        },
-    };
     if fake && (experiment_id.is_some() || task_id.is_some()) {
         return failure(
             ExitCode::InputRequired,
@@ -356,25 +335,9 @@ where
             Ok(config) => config,
             Err(error) => return failure(ExitCode::Internal, &format!("config error: {error}\n")),
         };
-        let mut compaction_policy = match layered_config.compaction_policy() {
+        let compaction_policy = match layered_config.compaction_policy() {
             Ok(policy) => policy,
             Err(error) => return failure(ExitCode::Internal, &format!("config error: {error}\n")),
-        };
-        // Compaction strategy precedence: --compactor > SLIM_COMPACTOR >
-        // [compaction] strategy > default (Jev with summary fallback).
-        if let Some(strategy) = env_compactor {
-            compaction_policy.strategy = strategy;
-        }
-        // The Jev pruning strategy only activates with a Jev credential;
-        // without it the runtime falls back to the LLM summary with an event.
-        let jev_prune = if compaction_policy.strategy == slim_core::context::CompactionStrategy::Jev
-        {
-            match crate::config::jev_prune_config_from_env() {
-                Ok(config) => config,
-                Err(error) => return failure(ExitCode::InputRequired, &format!("{error}\n")),
-            }
-        } else {
-            None
         };
         let credential = match crate::auth::resolve_provider_credential(kind) {
             Ok(Some(credential)) => credential,
@@ -491,9 +454,7 @@ where
         let mut options = ProviderRunOptions::default()
             .with_content_blocks(content_blocks)
             .with_compaction_handle(slim_core::context::CompactionHandle::new(compaction_policy));
-        if let Some(jev_prune) = jev_prune {
-            options = options.with_jev_prune(jev_prune);
-        }
+        options.shell_job_limits = layered_config.shell_jobs;
         if let Some(experiment_id) = experiment_id {
             options = options.with_experiment_id(experiment_id);
         }
@@ -504,6 +465,7 @@ where
             options = options.with_reasoning_effort(effort);
         }
         options.codex_fast = codex_fast;
+        options.trust_project = trust_project;
         if let Some(calls) = layered_config.max_mutating_tool_calls {
             options = options.with_max_tool_calls(calls);
         }

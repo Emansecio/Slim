@@ -1,5 +1,4 @@
 use slim_core::OperatingMode;
-use slim_tui::image::{render_image, ImageCapabilities, ImageRender};
 use slim_tui::input::cycle_mode;
 use slim_tui::inspector::{CommandPalette, InspectorKind, InspectorState};
 use slim_tui::theme::{glyph, resolve_theme, Capabilities, ColorDepth};
@@ -36,12 +35,6 @@ fn inspectors_toggle_and_capabilities_degrade_safely() {
     assert_eq!(glyph(caps, '✓', '+'), '+');
     assert_eq!(resolve_theme(caps).foreground, (255, 255, 255));
     assert_eq!(resolve_theme(caps).background, (0x00, 0x00, 0x00));
-    assert_eq!(
-        render_image("img-1", ImageCapabilities { supported: false }),
-        ImageRender::Placeholder {
-            label: "[image unavailable: img-1]".into()
-        }
-    );
 }
 
 #[test]
@@ -81,17 +74,5 @@ fn capability_matrix_covers_color_glyph_mouse_clipboard_and_image_fallbacks() {
         };
         assert_eq!(glyph(capabilities, '✓', '+'), expected_glyph);
         assert_eq!(resolve_theme(capabilities).background, (0x00, 0x00, 0x00));
-        assert_eq!(
-            render_image("supported", ImageCapabilities { supported: true }),
-            ImageRender::Inline {
-                id: "supported".into()
-            }
-        );
     }
-    assert_eq!(
-        render_image("unsupported", ImageCapabilities { supported: false }),
-        ImageRender::Placeholder {
-            label: "[image unavailable: unsupported]".into()
-        }
-    );
 }

@@ -11,6 +11,7 @@ use slim_core::codeintel::{
     EditVerification,
 };
 use slim_core::runtime::CancellationToken;
+use slim_lsp::discovery::{ServerOptions, RUST_ANALYZER};
 use slim_lsp::pool::{PoolConfig, StdioProcessFactory};
 use slim_lsp::{LspCodeIntelligence, LspManagerConfig, LspProcessPool};
 
@@ -59,15 +60,25 @@ fn manager(_root: &Path, mock: Value) -> (Arc<LspProcessPool>, Arc<LspCodeIntell
         max_servers: 2,
         factory: Arc::new(StdioProcessFactory),
     });
+    let config = json!({ "mock": mock });
     let manager = LspCodeIntelligence::new(
         pool.clone(),
         LspManagerConfig {
             idle_shutdown: None,
             max_servers: 2,
             request_timeout: Duration::from_secs(3),
-            server_config: json!({ "mock": mock }),
+            servers: [(
+                RUST_ANALYZER.into(),
+                ServerOptions {
+                    path: Some(PathBuf::from(env!("CARGO_BIN_EXE_slim-lsp-mock"))),
+                    initialization_options: Some(config.clone()),
+                    settings: Some(json!({"rust-analyzer": config})),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
             max_open_documents: 8,
-            server_path: Some(PathBuf::from(env!("CARGO_BIN_EXE_slim-lsp-mock"))),
         },
     );
     (pool, manager)
@@ -76,6 +87,7 @@ fn manager(_root: &Path, mock: Value) -> (Arc<LspProcessPool>, Arc<LspCodeIntell
 fn query(workspace: &Path, path: &Path) -> CodeIntelDiagnosticsQuery {
     CodeIntelDiagnosticsQuery {
         workspace: workspace.to_path_buf(),
+        server: None,
         path: Some(path.to_path_buf()),
         include_info: false,
         max_results: 20,
@@ -125,6 +137,101 @@ async fn edit(
 fn only_file(report: &EditDiagnosticsReport) -> &EditFileDiagnostics {
     assert_eq!(report.files.len(), 1, "{report:?}");
     &report.files[0]
+}
+
+#[tokio::test]
+async fn edited_dependency_invalidates_other_files_without_invalidating_its_fresh_report() {
+    let dir = TestDir::new("dependent-cache");
+    let first = dir.write("src/first.rs", "fn first() {}\n");
+    let second = dir.write("src/second.rs", "fn second() {}\n");
+    let (pool, manager) = manager(
+        dir.path(),
+        json!({ "errorsFromDocument": true, "skipUnchanged": true }),
+    );
+    warm(&manager, dir.path(), &first).await;
+    warm(&manager, dir.path(), &second).await;
+    let report = edit(
+        &manager,
+        dir.path(),
+        &second,
+        "fn changed_dependency() {}\nlet BROKEN = 1;\n",
+    )
+    .await
+    .unwrap();
+    assert!(
+        only_file(&report)
+            .verification
+            .unverified_reason()
+            .is_none(),
+        "{report:?}"
+    );
+    assert_eq!(only_file(&report).errors.len(), 1);
+    let dependent = manager.diagnostics(&query(dir.path(), &first)).await;
+    assert_eq!(
+        dependent.payload["files"][0]["stale"], true,
+        "{dependent:?}"
+    );
+    pool.close_all().await;
+}
+
+#[tokio::test]
+async fn coverage_counts_unique_files_and_explains_the_batch_limit() {
+    let dir = TestDir::new("coverage-limit");
+    let paths = (0..14)
+        .map(|index| dir.write(&format!("src/file{index}.rs"), "fn source() {}\n"))
+        .collect::<Vec<_>>();
+    let (pool, manager) = manager(dir.path(), json!({ "errorsFromDocument": true }));
+    warm(&manager, dir.path(), &paths[0]).await;
+    let mut inputs = vec![
+        dir.write("NOTES.md", "notes"),
+        dir.path().join("missing.rs"),
+    ];
+    inputs.extend(paths.clone());
+    inputs.extend(paths);
+    let report = manager
+        .diagnostics_after_edits(dir.path(), &inputs, Duration::from_secs(5), None)
+        .await
+        .unwrap();
+    assert_eq!(report.files.len(), 16);
+    assert_eq!(
+        report
+            .files
+            .iter()
+            .filter(|file| file.verification == EditVerification::Unsupported)
+            .count(),
+        1
+    );
+    assert_eq!(
+        report
+            .files
+            .iter()
+            .filter(|file| file.verification == EditVerification::FileUnavailable)
+            .count(),
+        1
+    );
+    assert_eq!(
+        report
+            .files
+            .iter()
+            .filter(|file| file.verification == EditVerification::LimitExceeded)
+            .count(),
+        2
+    );
+    assert_eq!(
+        report
+            .files
+            .iter()
+            .filter(|file| file.verification.unverified_reason().is_none())
+            .count(),
+        12
+    );
+    let note = slim_core::codeintel::render_edit_diagnostics(&report, true).unwrap();
+    assert!(
+        note.contains("Coverage: 12/16 files verified; 4 not verified."),
+        "{note}"
+    );
+    assert!(note.contains("batch limit exceeded"));
+    pool.close_all().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -302,6 +409,48 @@ async fn a_silent_server_is_unverified_never_clean() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn versionless_publications_return_unverified_without_spending_the_deadline() {
+    let dir = TestDir::new("versionless");
+    let source = dir.write("src/first.rs", "fn first() {}\n");
+    let (pool, manager) = manager(
+        dir.path(),
+        json!({ "errorsFromDocument": true, "omitDiagnosticVersion": true }),
+    );
+    warm(&manager, dir.path(), &source).await;
+
+    std::fs::write(&source, "fn first() {}\nlet BROKEN = 1;\n").unwrap();
+    manager
+        .notify_file_changed(
+            dir.path(),
+            &source,
+            Some("fn first() {}\nlet BROKEN = 1;\n".into()),
+        )
+        .await;
+    let started = Instant::now();
+    let report = manager
+        .diagnostics_after_edits(
+            dir.path(),
+            std::slice::from_ref(&source),
+            Duration::from_secs(3),
+            None,
+        )
+        .await
+        .expect("warm server answers");
+
+    let file = only_file(&report);
+    // A versionless publication cannot certify the edited version, so it
+    // neither claims errors nor waits for a certification that cannot come.
+    assert_eq!(file.verification, EditVerification::Unverified);
+    assert!(file.errors.is_empty(), "{report:?}");
+    assert!(
+        started.elapsed() < Duration::from_millis(1_500),
+        "versionless check spent {:?}",
+        started.elapsed()
+    );
+    pool.close_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_publication_for_an_older_version_is_discarded() {
     let dir = TestDir::new("stale");
     let source = dir.write("src/first.rs", "fn first() {}\n");
@@ -357,7 +506,7 @@ async fn a_file_the_edit_opened_has_no_baseline() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn no_warm_server_means_no_report_and_no_spawn() {
+async fn no_warm_server_reports_unverified_without_spawning() {
     let dir = TestDir::new("cold");
     let source = dir.write("src/first.rs", "fn first() {}\n");
     let (pool, manager) = manager(dir.path(), json!({ "errorsFromDocument": true }));
@@ -371,7 +520,10 @@ async fn no_warm_server_means_no_report_and_no_spawn() {
         )
         .await;
 
-    assert!(report.is_none());
+    assert_eq!(
+        only_file(&report.unwrap()).verification,
+        EditVerification::ServerUnavailable
+    );
     assert_eq!(pool.active_leases(), 0);
     pool.close_all().await;
 }
@@ -402,7 +554,7 @@ async fn a_cancelled_run_gets_no_report() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn files_the_server_does_not_serve_are_skipped() {
+async fn files_the_server_does_not_serve_are_reported() {
     let dir = TestDir::new("unserved");
     let source = dir.write("src/first.rs", "fn first() {}\n");
     let notes = dir.write("NOTES.md", "BROKEN prose\n");
@@ -413,6 +565,9 @@ async fn files_the_server_does_not_serve_are_skipped() {
         .diagnostics_after_edits(dir.path(), &[notes], Duration::from_secs(1), None)
         .await;
 
-    assert!(report.is_none());
+    assert_eq!(
+        only_file(&report.unwrap()).verification,
+        EditVerification::Unsupported
+    );
     pool.close_all().await;
 }

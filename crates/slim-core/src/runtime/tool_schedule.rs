@@ -45,17 +45,23 @@ pub(super) fn tool_call_is_parallel_snapshot_read(tools: &ToolRegistry, name: &s
 }
 
 pub(super) fn is_serial_barrier(prepared: &PreparedToolInvocation) -> bool {
-    matches!(prepared.name.as_str(), "shell" | "skill" | "mcp")
-        || matches!(
-            &prepared.arguments,
-            PreparedToolArguments::Write {
-                then_run: Some(_),
-                ..
-            } | PreparedToolArguments::Patch {
-                then_run: Some(_),
-                ..
-            }
-        )
+    // Direct MCP tools (`mcp__<server>__<tool>`) order like the `mcp` gateway.
+    if super::native_mcp_direct::is_direct_mcp_call(&prepared.name) {
+        return true;
+    }
+    matches!(
+        prepared.name.as_str(),
+        "shell" | "skill" | "mcp" | "codemode"
+    ) || matches!(
+        &prepared.arguments,
+        PreparedToolArguments::Write {
+            then_run: Some(_),
+            ..
+        } | PreparedToolArguments::Patch {
+            then_run: Some(_),
+            ..
+        }
+    )
 }
 
 pub(super) fn is_file_mutation(prepared: &PreparedToolInvocation) -> bool {

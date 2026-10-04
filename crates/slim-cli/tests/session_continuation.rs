@@ -131,13 +131,13 @@ fn consecutive_compactions_restore_the_latest_checkpoint_and_pending_tasks() {
     let root = Workspace::new();
     let session = root.0.join("session.jsonl");
     let handle = CompactionHandle::new(CompactionPolicy {
-        background: false,
+        keep_recent_tokens: 1,
         ..CompactionPolicy::default()
     });
     handle.request_manual("").unwrap();
     let summary = |label| {
         json!({"choices":[{"delta":{"content":format!(
-        "## Goal\nOriginal task\n## Constraints\nOffline\n## Progress\n{label}\n## Blocked\nNone\n## Decisions\nPreserve evidence\n## Next steps\nVerify changes\n## Critical context\nFixture"
+        "## Goal\nOriginal task\n## Constraints & Preferences\nOffline\n## Progress\n### Done\n{label}\n### In Progress\n(none)\n### Blocked\nNone\n## Key Decisions\nPreserve evidence\n## Next Steps\nVerify changes\n## Critical Context\nFixture"
     )},"finish_reason":"stop"}]})
     };
     let mut call = tool(
@@ -252,21 +252,640 @@ fn consecutive_compactions_restore_the_latest_checkpoint_and_pending_tasks() {
     assert_eq!(restored.len(), 2, "one bounded review after resume");
     let messages = restored[0]["messages"].as_array().unwrap();
     assert!(messages.iter().any(
-        |message| message["content"]
-            .as_str()
-            .is_some_and(|text| text.starts_with("[Compacted context]")
-                && text.contains("second-checkpoint"))
+        |message| message["content"].as_str().is_some_and(|text| text
+            .starts_with(slim_core::context::COMPACTION_SUMMARY_PREFIX)
+            && text.contains("second-checkpoint"))
     ));
+    // Only the latest checkpoint is restored, and the history the first one
+    // summarized is gone. The second one found nothing but the live turn to
+    // summarize, so the first summary is carried inside it.
     assert!(!messages.iter().any(|message| message["content"]
         .as_str()
-        .is_some_and(|text| text.contains("first-checkpoint") || text.contains("old evidence"))));
+        .is_some_and(|text| text.contains("old evidence"))));
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| {
+                message["content"].as_str().is_some_and(|text| {
+                    text.starts_with(slim_core::context::COMPACTION_SUMMARY_PREFIX)
+                })
+            })
+            .count(),
+        1
+    );
+    // The second compaction ran after the todo call's result and a review
+    // steer. The call carries no opaque reasoning, so, as in Pi, it is
+    // summarized with the rest and the pending task comes back with the
+    // session's task facts (the stop message above).
     assert_eq!(
         messages
             .iter()
             .filter(|message| message["tool_call_id"] == "track")
             .count(),
-        1
+        0
     );
+}
+
+#[test]
+fn a_failed_run_still_persists_the_compaction_it_applied() {
+    use slim_core::context::{CompactionHandle, CompactionPolicy};
+    use slim_core::provider::{ProviderKind, ProviderMessage};
+    use slim_core::session::{preflight_session, DurableRecord};
+
+    let root = Workspace::new();
+    let session = root.0.join("session.jsonl");
+    let handle = CompactionHandle::new(CompactionPolicy {
+        keep_recent_tokens: 1,
+        ..CompactionPolicy::default()
+    });
+    handle.request_manual("").unwrap();
+
+    // The summary request succeeds; the request that follows it is refused.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let server = thread::spawn(move || {
+        for index in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream);
+            let (status, content_type, body) = if index == 0 {
+                let chunk = json!({"choices":[{"delta":{"content":"## Goal\nFailed-run summary"},"finish_reason":"stop"}]});
+                (
+                    "200 OK",
+                    "text/event-stream",
+                    format!(
+                        "data: {chunk}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                        json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2}})
+                    ),
+                )
+            } else {
+                (
+                    "401 Unauthorized",
+                    "application/json",
+                    json!({"error":{"message":"refused"}}).to_string(),
+                )
+            };
+            write!(stream, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    let request = slim_cli::ProviderRequest {
+        prompt: "continue".into(),
+        mode: slim_core::OperatingMode::Auto,
+        kind: ProviderKind::OpenAiCompatible,
+        endpoint,
+        model: "fixture-model".into(),
+        api_key: "fixture-key".into(),
+        account_id: None,
+        timeout: Duration::from_secs(5),
+    };
+    let result = slim_cli::run_provider_headless_with_session_and_options(
+        request,
+        &session,
+        slim_cli::ProviderRunOptions::default()
+            .with_workspace_root(&root.0)
+            .with_context_window_tokens(32_768)
+            .with_max_output_tokens(1024)
+            .with_compaction_handle(handle.clone())
+            .with_history(vec![
+                ProviderMessage::user("Original task"),
+                ProviderMessage::assistant("old evidence ".repeat(4000), Vec::new()),
+            ]),
+    );
+    server.join().unwrap();
+    let failed = match &result {
+        Ok(result) => result.code != slim_cli::ExitCode::Success,
+        Err(_) => true,
+    };
+    assert!(
+        failed,
+        "the second request must fail the run: {:?}",
+        result.as_ref().map(|r| (&r.code, &r.stop, &r.text))
+    );
+
+    let preflight = preflight_session(&session).unwrap();
+    let checkpoints: Vec<_> = preflight
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            DurableRecord::Compaction { checkpoint, .. } => Some(checkpoint),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        checkpoints.len(),
+        1,
+        "a failed run must still persist its checkpoint"
+    );
+    assert!(checkpoints[0].summary.contains("Failed-run summary"));
+    assert_eq!(
+        checkpoints[0].reason,
+        slim_core::context::CompactionReason::Manual
+    );
+    assert!(
+        handle.take_commits().is_empty(),
+        "commits must not outlive their run"
+    );
+}
+
+#[test]
+fn idle_compaction_of_a_durable_session_persists_a_checkpoint_without_a_model_turn() {
+    use slim_core::context::{CompactionHandle, CompactionPolicy};
+    use slim_core::provider::{ProviderKind, ProviderMessage};
+    use slim_core::session::{preflight_session, DurableRecord};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let root = Workspace::new();
+    let session = root.0.join("session.jsonl");
+    let handle = CompactionHandle::new(CompactionPolicy {
+        keep_recent_tokens: 1,
+        ..CompactionPolicy::default()
+    });
+
+    // One endpoint for the three runs: summaries answer summarization
+    // requests, everything else is an ordinary reply.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let server = {
+        let (stop, requests) = (stop.clone(), requests.clone());
+        thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                };
+                let request = read_request(&mut stream);
+                let summarizing = request
+                    .to_string()
+                    .contains("context summarization assistant");
+                let content = if summarizing {
+                    "## Goal\nIdle-compaction summary"
+                } else {
+                    "ordinary reply"
+                };
+                requests.lock().unwrap().push(request);
+                let chunk =
+                    json!({"choices":[{"delta":{"content":content},"finish_reason":"stop"}]});
+                // An ordinary request reports what its history really weighs
+                // (about 13k tokens of evidence): that usage anchors the
+                // command's estimate of the context it compacts.
+                let prompt_tokens = if summarizing { 10 } else { 14_000 };
+                let payload = format!(
+                    "data: {chunk}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    json!({"choices":[],"usage":{"prompt_tokens":prompt_tokens,"completion_tokens":2}})
+                );
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len()).unwrap();
+            }
+        })
+    };
+    let request = |prompt: &str| slim_cli::ProviderRequest {
+        prompt: prompt.into(),
+        mode: slim_core::OperatingMode::Auto,
+        kind: ProviderKind::OpenAiCompatible,
+        endpoint: endpoint.clone(),
+        model: "fixture-model".into(),
+        api_key: "fixture-key".into(),
+        account_id: None,
+        timeout: Duration::from_secs(5),
+    };
+    let options = || {
+        slim_cli::ProviderRunOptions::default()
+            .with_workspace_root(&root.0)
+            .with_context_window_tokens(200_000)
+            .with_max_output_tokens(1024)
+            .with_compaction_handle(handle.clone())
+    };
+
+    slim_cli::run_provider_headless_with_session_and_options(
+        request("continue"),
+        &session,
+        options().with_history(vec![
+            ProviderMessage::user("Original task"),
+            ProviderMessage::assistant("old evidence ".repeat(4000), Vec::new()),
+        ]),
+    )
+    .unwrap();
+    let before = requests.lock().unwrap().len();
+    assert_eq!(before, 1, "the first run is one ordinary request");
+
+    // The session is idle: the command compacts it and nothing else is asked.
+    handle.request_manual("").unwrap();
+    let mut compact = options();
+    compact.compact_only = true;
+    let compacted =
+        slim_cli::run_provider_headless_with_resume_and_options(request(""), &session, compact)
+            .unwrap();
+    assert_eq!(compacted.code, slim_cli::ExitCode::Success);
+    {
+        let requests = requests.lock().unwrap();
+        assert!(requests.len() > before, "the summary is requested");
+        assert!(
+            requests[before..].iter().all(|request| request
+                .to_string()
+                .contains("context summarization assistant")),
+            "only summarization requests: no model turn follows"
+        );
+    }
+    assert_eq!(handle.manual_instructions(), None);
+    assert!(handle.take_commits().is_empty(), "commits are drained");
+
+    let preflight = preflight_session(&session).unwrap();
+    let checkpoints: Vec<_> = preflight
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            DurableRecord::Compaction { checkpoint, .. } => Some(checkpoint),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(checkpoints.len(), 1);
+    assert!(checkpoints[0].summary.contains("Idle-compaction summary"));
+    assert_eq!(
+        checkpoints[0].reason,
+        slim_core::context::CompactionReason::Manual
+    );
+    assert!(checkpoints[0].tokens_before > checkpoints[0].tokens_after);
+
+    // The next prompt resumes from the checkpoint, not from the old history.
+    let sent = requests.lock().unwrap().len();
+    slim_cli::run_provider_headless_with_resume_and_options(request("next"), &session, options())
+        .unwrap();
+    stop.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), sent + 1);
+    let messages = requests[sent]["messages"].as_array().unwrap();
+    assert!(messages.iter().any(
+        |message| message["content"].as_str().is_some_and(|text| text
+            .starts_with(slim_core::context::COMPACTION_SUMMARY_PREFIX)
+            && text.contains("Idle-compaction summary"))
+    ));
+    assert!(!messages.iter().any(|message| message["content"]
+        .as_str()
+        .is_some_and(|text| text.contains("old evidence"))));
+}
+
+/// The checkpoints of the durable session at `session`.
+fn persisted_checkpoints(session: &Path) -> Vec<slim_core::session::CompactionCheckpoint> {
+    slim_core::session::preflight_session(session)
+        .unwrap()
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            slim_core::session::DurableRecord::Compaction { checkpoint, .. } => {
+                Some(checkpoint.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn fixture_request(endpoint: &str, prompt: &str) -> slim_cli::ProviderRequest {
+    slim_cli::ProviderRequest {
+        prompt: prompt.into(),
+        mode: slim_core::OperatingMode::Auto,
+        kind: slim_core::provider::ProviderKind::OpenAiCompatible,
+        endpoint: endpoint.into(),
+        model: "fixture-model".into(),
+        api_key: "fixture-key".into(),
+        account_id: None,
+        timeout: Duration::from_secs(5),
+    }
+}
+
+/// The next prompt of a resumed session starts from the persisted checkpoint:
+/// its summary replaces what the checkpoint summarized.
+fn assert_resume_starts_from_the_checkpoint(
+    root: &Workspace,
+    session: &Path,
+    summary_text: &str,
+    summarized_text: &str,
+) {
+    let (endpoint, server) = spawn_turn(vec![None]);
+    slim_cli::run_provider_headless_with_resume_and_options(
+        fixture_request(&endpoint, "again"),
+        session,
+        slim_cli::ProviderRunOptions::default()
+            .with_workspace_root(&root.0)
+            .with_context_window_tokens(32_768)
+            .with_max_output_tokens(1024),
+    )
+    .unwrap();
+    let requests = server.join().unwrap();
+    let messages = requests[0]["messages"].as_array().unwrap();
+    assert!(messages.iter().any(
+        |message| message["content"].as_str().is_some_and(|text| text
+            .starts_with(slim_core::context::COMPACTION_SUMMARY_PREFIX)
+            && text.contains(summary_text))
+    ));
+    assert!(!messages.iter().any(|message| message["content"]
+        .as_str()
+        .is_some_and(|text| text.contains(summarized_text))));
+}
+
+fn manual_summary(label: &str) -> Value {
+    json!({"choices":[{"delta":{"content":format!("## Goal\n{label}")},"finish_reason":"stop"}]})
+}
+
+fn eager_handle() -> slim_core::context::CompactionHandle {
+    slim_core::context::CompactionHandle::new(slim_core::context::CompactionPolicy {
+        keep_recent_tokens: 1,
+        ..slim_core::context::CompactionPolicy::default()
+    })
+}
+
+fn durable_options(root: &Workspace) -> slim_cli::ProviderRunOptions {
+    slim_cli::ProviderRunOptions::default()
+        .with_workspace_root(&root.0)
+        .with_context_window_tokens(32_768)
+        .with_max_output_tokens(1024)
+}
+
+/// The compaction of a new session's first turn summarizes the prompt with the
+/// workspace listing the live history appended to it; the journal recorded the
+/// prompt alone, and the checkpoint must still persist.
+#[test]
+fn a_compaction_over_the_first_prompt_with_its_workspace_snapshot_is_persisted() {
+    let root = Workspace::new();
+    fs::write(root.0.join("notes.txt"), "listed in the snapshot").unwrap();
+    let session = root.0.join("session.jsonl");
+    let handle = eager_handle();
+    let next = handle.clone();
+    let mut call = tool("probe", "read", json!({"path": "missing.txt"}));
+    call["index"] = json!(0);
+    let (endpoint, server) = spawn_events(
+        vec![
+            json!({"choices":[{"delta":{"tool_calls":[call]},"finish_reason":"tool_calls"}]}),
+            manual_summary("snapshot-summary"),
+            json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}),
+        ],
+        move |index| {
+            if index == 0 {
+                next.request_manual("").unwrap();
+            }
+        },
+    );
+    slim_cli::run_provider_headless_with_session_and_options(
+        fixture_request(&endpoint, "Investigate the workspace"),
+        &session,
+        durable_options(&root).with_compaction_handle(handle.clone()),
+    )
+    .unwrap();
+    let requests = server.join().unwrap();
+    assert!(
+        requests[0].to_string().contains("notes.txt"),
+        "the first request carried the workspace snapshot"
+    );
+
+    let checkpoints = persisted_checkpoints(&session);
+    assert_eq!(checkpoints.len(), 1, "the compaction must be persisted");
+    assert!(checkpoints[0].summary.contains("snapshot-summary"));
+    assert!(handle.take_commits().is_empty());
+    assert_resume_starts_from_the_checkpoint(
+        &root,
+        &session,
+        "snapshot-summary",
+        "Investigate the workspace",
+    );
+}
+
+/// The journal records user input through the heuristic credential redactor
+/// (header lines, re-serialized JSON); the live prefix hashes the same bytes,
+/// so the checkpoint still anchors.
+fn assert_a_compaction_over_redacted_input_is_persisted(prompt: &str, summary: &str) {
+    let root = Workspace::new();
+    let session = root.0.join("session.jsonl");
+    let handle = eager_handle();
+    let next = handle.clone();
+    let mut call = tool("probe", "read", json!({"path": "missing.txt"}));
+    call["index"] = json!(0);
+    let (endpoint, server) = spawn_events(
+        vec![
+            json!({"choices":[{"delta":{"tool_calls":[call]},"finish_reason":"tool_calls"}]}),
+            manual_summary(summary),
+            json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}),
+        ],
+        move |index| {
+            if index == 0 {
+                next.request_manual("").unwrap();
+            }
+        },
+    );
+    slim_cli::run_provider_headless_with_session_and_options(
+        fixture_request(&endpoint, prompt),
+        &session,
+        durable_options(&root).with_compaction_handle(handle.clone()),
+    )
+    .unwrap();
+    server.join().unwrap();
+
+    let checkpoints = persisted_checkpoints(&session);
+    assert_eq!(checkpoints.len(), 1, "the compaction must be persisted");
+    assert!(checkpoints[0].summary.contains(summary));
+    assert!(handle.take_commits().is_empty());
+}
+
+#[test]
+fn a_compaction_over_a_prompt_with_credential_headers_is_persisted() {
+    assert_a_compaction_over_redacted_input_is_persisted(
+        "Debug this request\nAuthorization: Bearer abc.def.ghi\nSet-Cookie: sid=1234\nfails with 401",
+        "header-summary",
+    );
+}
+
+#[test]
+fn a_compaction_over_a_pretty_printed_json_prompt_is_persisted() {
+    assert_a_compaction_over_redacted_input_is_persisted(
+        "{\n  \"request\": {\n    \"x-api-key\": \"k-123\",\n    \"path\": \"/v1\"\n  }\n}",
+        "json-summary",
+    );
+}
+
+/// A compaction whose prefix holds an assistant message with its opaque
+/// reasoning state: the journal keeps no reasoning, the checkpoint persists.
+#[test]
+fn a_compaction_over_a_reasoning_assistant_message_is_persisted() {
+    let root = Workspace::new();
+    let session = root.0.join("session.jsonl");
+    let handle = eager_handle();
+    let next = handle.clone();
+    let (endpoint, server) = spawn_events(
+        vec![
+            // Cut short, so the loop appends a recovery prompt after it.
+            json!({"choices":[{"delta":{
+                "content":"partial answer",
+                "reasoning_details":[{"type":"reasoning.text","text":"private thoughts"}]
+            },"finish_reason":"length"}]}),
+            manual_summary("reasoning-summary"),
+            json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}),
+        ],
+        move |index| {
+            if index == 0 {
+                next.request_manual("").unwrap();
+            }
+        },
+    );
+    slim_cli::run_provider_headless_with_session_and_options(
+        fixture_request(&endpoint, "continue"),
+        &session,
+        durable_options(&root)
+            .with_compaction_handle(handle.clone())
+            .with_history(vec![
+                slim_core::provider::ProviderMessage::user("Original task"),
+                slim_core::provider::ProviderMessage::assistant("earlier answer", Vec::new()),
+            ]),
+    )
+    .unwrap();
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 3);
+
+    let checkpoints = persisted_checkpoints(&session);
+    assert_eq!(checkpoints.len(), 1, "the compaction must be persisted");
+    assert!(checkpoints[0].summary.contains("reasoning-summary"));
+    assert!(handle.take_commits().is_empty());
+    assert_resume_starts_from_the_checkpoint(
+        &root,
+        &session,
+        "reasoning-summary",
+        "partial answer",
+    );
+}
+
+/// A compaction whose prefix holds a read output that the live history
+/// replaced by an elision pointer after a later write: the journal kept the
+/// full output, the checkpoint persists.
+#[test]
+fn a_compaction_over_an_elided_superseded_read_is_persisted() {
+    let root = Workspace::new();
+    fs::write(
+        root.0.join("fixture.txt"),
+        // Large enough that eliding the read pays for the cache it rewrites.
+        "original bytes that will be overwritten entirely\n".repeat(40),
+    )
+    .unwrap();
+    let session = root.0.join("session.jsonl");
+    let handle = eager_handle();
+    let next = handle.clone();
+    let call = |id: &str, name: &str, arguments: Value| {
+        let mut call = tool(id, name, arguments);
+        call["index"] = json!(0);
+        json!({"choices":[{"delta":{"tool_calls":[call]},"finish_reason":"tool_calls"}]})
+    };
+    let (endpoint, server) = spawn_events(
+        vec![
+            call("read-1", "read", json!({"path": "fixture.txt"})),
+            call(
+                "write-1",
+                "write",
+                json!({"path": "fixture.txt", "content": "replaced\n"}),
+            ),
+            call("read-2", "read", json!({"path": "fixture.txt"})),
+            manual_summary("elision-summary"),
+            json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}),
+        ],
+        move |index| {
+            if index == 2 {
+                next.request_manual("").unwrap();
+            }
+        },
+    );
+    slim_cli::run_provider_headless_with_session_and_options(
+        fixture_request(&endpoint, "Replace the fixture"),
+        &session,
+        durable_options(&root)
+            .with_compaction_handle(handle.clone())
+            .with_history(vec![
+                slim_core::provider::ProviderMessage::user("Original task"),
+                slim_core::provider::ProviderMessage::assistant("earlier answer", Vec::new()),
+            ]),
+    )
+    .unwrap();
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert!(
+        requests[2]
+            .to_string()
+            .contains("[superseded read output elided"),
+        "the live history elided the superseded read"
+    );
+
+    let checkpoints = persisted_checkpoints(&session);
+    assert_eq!(checkpoints.len(), 1, "the compaction must be persisted");
+    assert!(checkpoints[0].summary.contains("elision-summary"));
+    assert!(handle.take_commits().is_empty());
+    assert_resume_starts_from_the_checkpoint(
+        &root,
+        &session,
+        "elision-summary",
+        "Replace the fixture",
+    );
+}
+
+/// A hard error (a tool call carrying a credential aborts the run) is not a
+/// result: the compaction the run had applied before it still reaches the
+/// journal.
+#[test]
+fn a_hard_error_still_persists_the_compaction_the_run_applied() {
+    let root = Workspace::new();
+    let session = root.0.join("session.jsonl");
+    let handle = eager_handle();
+    // Served before the first request: it summarizes the history and keeps the
+    // prompt, an entry the journal already holds when the run fails.
+    handle.request_manual("").unwrap();
+    let call = |id: &str, name: &str, arguments: Value| {
+        let mut call = tool(id, name, arguments);
+        call["index"] = json!(0);
+        json!({"choices":[{"delta":{"tool_calls":[call]},"finish_reason":"tool_calls"}]})
+    };
+    let (endpoint, server) = spawn_events(
+        vec![
+            manual_summary("hard-error-summary"),
+            // The request key inside a tool call: the loop fails closed.
+            call(
+                "unsafe",
+                "todo",
+                json!({"todos":[{"title":"saved fixture-key"}]}),
+            ),
+        ],
+        |_| {},
+    );
+    let result = slim_cli::run_provider_headless_with_session_and_options(
+        fixture_request(&endpoint, "continue"),
+        &session,
+        durable_options(&root)
+            .with_compaction_handle(handle.clone())
+            .with_history(vec![
+                slim_core::provider::ProviderMessage::user("Original task"),
+                slim_core::provider::ProviderMessage::assistant("earlier answer", Vec::new()),
+            ]),
+    );
+    server.join().unwrap();
+    assert!(
+        matches!(&result, Err(slim_core::provider::ProviderError::InvalidResponse { message })
+            if message.contains("registered sensitive material")),
+        "the run fails closed: {:?}",
+        result.as_ref().map(|r| &r.stop)
+    );
+
+    let checkpoints = persisted_checkpoints(&session);
+    assert_eq!(checkpoints.len(), 1, "the applied compaction is persisted");
+    assert!(checkpoints[0].summary.contains("hard-error-summary"));
+    assert!(handle.take_commits().is_empty());
+    assert!(!fs::read_to_string(&session)
+        .unwrap()
+        .contains("fixture-key"));
 }
 
 #[test]

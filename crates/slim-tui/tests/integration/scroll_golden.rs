@@ -54,9 +54,7 @@ fn scroll_at_size(state: &mut AppState, intent: ScrollIntent, width: u16, height
 }
 
 fn transcript_rows(frame: &str, width: u16, height: u16) -> Vec<String> {
-    let rows = slim_tui::layout::plan(width, height, 0, false)
-        .scrollback
-        .height as usize;
+    let rows = slim_tui::layout::plan(width, height, 0).scrollback.height as usize;
     frame
         .lines()
         .take(rows)
@@ -137,6 +135,16 @@ fn multiline_error_and_queued_prompt_keep_their_tail_visible() {
     ] {
         let mut state = AppState::new();
         state.apply_event(event);
+        if let Some(id) = state
+            .blocks()
+            .iter()
+            .find(|block| matches!(block.kind(), slim_tui::block::BlockKind::QueuedUser(_)))
+            .map(|block| block.id.clone())
+        {
+            let (changed, command) = state.activate_block(&id);
+            assert!(changed);
+            assert!(command.is_none());
+        }
         let frame = render_at_size(&state, 40, 8);
         assert!(
             frame.contains("_TAIL"),
@@ -356,7 +364,7 @@ fn scrollbar_appears_only_with_overflow() {
     short.apply_event(UiEvent::AssistantEnded);
     let short_frame = render_at_size(&short, 80, 24);
     let long_frame = render_at_size(&overflow_state(), 80, 24);
-    let rows = slim_tui::layout::plan(80, 24, 0, false).scrollback.height as usize;
+    let rows = slim_tui::layout::plan(80, 24, 0).scrollback.height as usize;
     let right_column = |frame: &str| {
         frame
             .lines()
@@ -407,9 +415,14 @@ fn end_key_returns_to_live_edge() {
 
 #[test]
 fn scrolling_back_to_bottom_returns_to_live_edge() {
-    let mut state = overflow_state();
-    scroll_at_size(&mut state, ScrollIntent::Up, 80, 24);
-    scroll_at_size(&mut state, ScrollIntent::Down, 80, 24);
-    assert!(state.scroll.is_live_edge());
-    assert_eq!(state.scroll.unseen, 0);
+    // Every height, including those where the row above the bottom is a
+    // blank separator that Up steps past: one Down undoes one Up.
+    for height in 18..30 {
+        let mut state = overflow_state();
+        scroll_at_size(&mut state, ScrollIntent::Up, 80, height);
+        assert!(state.scroll.is_pinned(), "height {height}");
+        scroll_at_size(&mut state, ScrollIntent::Down, 80, height);
+        assert!(state.scroll.is_live_edge(), "height {height}");
+        assert_eq!(state.scroll.unseen, 0);
+    }
 }

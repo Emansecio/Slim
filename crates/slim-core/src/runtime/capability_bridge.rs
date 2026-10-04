@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::session::{
     AuthorizationGrant, CapabilityCatalog, CapabilityLedgerError, CapabilityService, DurableRecord,
-    DurableRepoLike, TaskGoalAssurance, TaskMutation, TaskMutationRequest, TaskTodoStatus,
+    DurableRepo, TaskGoalAssurance, TaskMutation, TaskMutationRequest, TaskTodoStatus,
 };
 use crate::task::{Assurance, Goal, Plan, TodoStatus, TodoTracker};
 use crate::OperatingMode;
@@ -31,7 +31,7 @@ pub struct RuntimeCapabilityBridge<R> {
 
 impl<R> RuntimeCapabilityBridge<R>
 where
-    R: DurableRepoLike,
+    R: DurableRepo,
 {
     pub fn new(repo: R, catalog: CapabilityCatalog) -> Result<Self, CapabilityLedgerError> {
         let mut bridge = Self {

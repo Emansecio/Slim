@@ -60,3 +60,28 @@ fn session_header_rejects_line_beyond_the_read_cap() {
     assert!(read_session_header(&path).is_none());
     let _ = fs::remove_file(&path);
 }
+
+#[test]
+fn job_finished_notice_reads_as_a_sentence_and_hides_a_clean_exit() {
+    let job = |state: &str, exit_code, elapsed_ms| slim_core::runtime::ShellJobInfo {
+        id: "shell-67".into(),
+        command: String::new(),
+        origin: "model".into(),
+        state: state.into(),
+        elapsed_ms,
+        exit_code,
+        output_bytes: 0,
+    };
+    assert_eq!(
+        super::job_finished_notice(&job("completed", Some(0), 5_300)),
+        "shell-67 · concluído · 5s"
+    );
+    assert_eq!(
+        super::job_finished_notice(&job("failed", Some(3), 420)),
+        "shell-67 · falhou · exit 3 · 420ms"
+    );
+    assert_eq!(
+        super::job_finished_notice(&job("cancelled", None, 12_000)),
+        "shell-67 · cancelado · 12s"
+    );
+}

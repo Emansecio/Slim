@@ -8,6 +8,7 @@ fn tool_result(name: &str) -> ToolResult {
         success: true,
         output: "ok".into(),
         artifact: None,
+        media: Vec::new(),
     }
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::context::compaction_prefix_fingerprint;
 use serde_json::json;
 
 use super::temp_root::TempRoot;
@@ -216,351 +217,6 @@ async fn manual_retry_wait_is_cancelled_and_does_not_bypass_retry_after() {
         assert!(!result.unwrap(), "retry cannot run before Retry-After");
         assert!(!handle.request());
     }
-}
-
-#[test]
-fn jev_prepass_uses_separate_prices_and_an_optimistic_savings_ceiling() {
-    let typesafe = crate::context::JevJudgeMetadata {
-        backend: Some("typesafe".into()),
-        requested_model: Some(crate::context::DEFAULT_JEV_MODEL.into()),
-    };
-    assert_eq!(
-        jev_prepass_can_pay(1_000, 100, Some(1), &typesafe),
-        Some(false)
-    );
-    assert_eq!(
-        jev_prepass_can_pay(1_000, 100, Some(1_000_000), &typesafe),
-        Some(true)
-    );
-    assert_eq!(jev_prepass_can_pay(1_000, 100, None, &typesafe), None);
-    let custom = crate::context::JevJudgeMetadata {
-        requested_model: Some("custom".into()),
-        ..typesafe
-    };
-    assert_eq!(jev_prepass_can_pay(1_000, 100, Some(1), &custom), None);
-}
-
-#[test]
-fn jev_plan_gate_uses_cache_price_and_observed_reduction() {
-    struct Judge;
-    #[async_trait::async_trait]
-    impl crate::context::JevJudge for Judge {
-        fn metadata(&self) -> crate::context::JevJudgeMetadata {
-            crate::context::JevJudgeMetadata {
-                backend: Some("typesafe".into()),
-                requested_model: Some(crate::context::DEFAULT_JEV_MODEL.into()),
-            }
-        }
-        async fn judge(
-            &self,
-            _: &Value,
-            _: &[(String, String)],
-        ) -> Result<crate::context::JevJudgment, String> {
-            panic!("pricing must not call the judge")
-        }
-    }
-    let summarized = vec![
-        ProviderMessage::assistant("read", vec![tool_call("r", "read", "{}")]),
-        ProviderMessage::tool("read", "r", "x".repeat(8_000)),
-    ];
-    let selection = CompactionSelection {
-        root_instruction: "fix".into(),
-        summarized: Vec::new(),
-        pinned: Vec::new(),
-        kept: Vec::new(),
-        first_kept_index: 0,
-        recent_tokens: 0,
-    };
-    let plan = crate::context::jev_prune::PreparedPrune::new(&selection, None, &summarized);
-    let crate::context::JevInputEstimate::Eligible(input) = plan.input else {
-        panic!("eligible");
-    };
-    let mut runtime = Runtime::new();
-    runtime.set_jev_judge(Some(Arc::new(Judge)));
-    runtime.set_compaction_input_cost_micros_per_million(Some(100_000));
-    assert!(runtime.jev_plan_can_pay(&plan, 10_000));
-    runtime.set_compaction_pricing(Some(CompactionPricing {
-        input: 100_000,
-        output: 100_000,
-        cache_read: 0,
-        cache_write: 100_000,
-    }));
-    assert!(!runtime.jev_plan_can_pay(&plan, 10_000));
-    runtime.set_compaction_pricing(None);
-    runtime.jev_economy.observe(&crate::context::JevPruneStats {
-        input_tokens: Some(input),
-        effective_saved_tokens: Some(0),
-        ..Default::default()
-    });
-    assert!(!runtime.jev_plan_can_pay(&plan, 10_000));
-    runtime.set_jev_judge(Some(Arc::new(Judge)));
-    assert!(runtime.jev_plan_can_pay(&plan, 10_000));
-}
-
-fn valid_checkpoint(detail: &str) -> String {
-    format!(
-            "## Goal\n{detail}\n## Constraints\n\n## Progress\n\n## Blocked\n\n## Decisions\n\n## Next steps\n\n## Critical context\n"
-        )
-}
-
-#[tokio::test]
-async fn compaction_archive_recovers_original_outputs_and_chains_checkpoints() {
-    let root = TempRoot::new("indexed-compaction");
-    let mut runtime = Runtime::with_artifact_store(&root).unwrap();
-    runtime.register_sensitive_value("private-fixture-token");
-    let original = ProviderMessage::tool(
-        "read",
-        "old-read",
-        "original versão\nprivate-fixture-token\n",
-    );
-    let initial = vec![
-        ProviderMessage::user("Preserve a interface pública."),
-        original.clone(),
-    ];
-    let mut selection = CompactionSelection {
-        root_instruction: initial[0].content.clone(),
-        summarized: vec![
-            initial[0].clone(),
-            ProviderMessage::tool(
-                "read",
-                "old-read",
-                "[superseded read output elided; file was overwritten]",
-            ),
-        ],
-        pinned: Vec::new(),
-        kept: Vec::new(),
-        first_kept_index: 2,
-        recent_tokens: 0,
-    };
-    let summary = runtime
-        .archive_compaction_summary(
-            &selection,
-            valid_checkpoint("model interpretation"),
-            "run_start_seq=7 validation_revision=1 current=false private-fixture-token",
-            &initial,
-            &root,
-        )
-        .await
-        .unwrap();
-    assert!(summary.contains("validation_revision=1 current=false"));
-    assert!(!summary.contains("private-fixture-token"));
-    let first_path = std::fs::read_dir(&root)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let archived = std::fs::read_to_string(&first_path).unwrap();
-    assert!(archived.contains("original versão\n"));
-    assert!(archived.contains("Preserve a interface pública."));
-    assert!(!archived.contains("private-fixture-token"));
-    assert!(!archived.contains("[superseded read"));
-    assert!(archived.contains("\"offset\""));
-
-    selection.summarized = vec![
-        initial[0].clone(),
-        ProviderMessage::user(format!("[Compacted context]\n{summary}")),
-    ];
-    let second = runtime
-        .archive_compaction_summary(
-            &selection,
-            valid_checkpoint("new interpretation"),
-            "",
-            &initial,
-            &root,
-        )
-        .await
-        .unwrap();
-    let second_path = std::fs::read_dir(&root)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path != &first_path)
-        .unwrap();
-    let previous = std::fs::read_to_string(&second_path).unwrap();
-    assert!(second.contains(
-        &serde_json::to_string(&second_path.file_name().unwrap().to_str().unwrap()).unwrap()
-    ));
-    assert!(previous.contains(
-        &serde_json::to_string(&first_path.file_name().unwrap().to_str().unwrap()).unwrap()
-    ));
-    assert!(previous.contains("validation_revision=1 current=false"));
-    let workspace = root.join("workspace");
-    std::fs::create_dir(&workspace).unwrap();
-    let outside = runtime
-        .archive_compaction_summary(
-            &selection,
-            valid_checkpoint("summary"),
-            "",
-            &initial,
-            &workspace,
-        )
-        .await
-        .unwrap();
-    assert!(outside.contains("native read cannot access this artifact outside the workspace"));
-    assert!(!outside.contains("use read on"));
-}
-
-#[tokio::test]
-async fn compaction_checkpoint_carries_the_tool_call_manifest() {
-    let runtime = Runtime::new();
-    let mut assistant = ProviderMessage::assistant("reading", Vec::new());
-    assistant.tool_calls = vec![tool_call("call-1", "read", "{\"path\":\"a.rs\"}")];
-    let selection = CompactionSelection {
-        root_instruction: "root".into(),
-        summarized: vec![
-            ProviderMessage::user("root"),
-            assistant,
-            ProviderMessage::tool("read", "call-1", "file body"),
-        ],
-        pinned: Vec::new(),
-        kept: Vec::new(),
-        first_kept_index: 3,
-        recent_tokens: 0,
-    };
-    let summary = runtime
-        .archive_compaction_summary(
-            &selection,
-            valid_checkpoint("interpretation"),
-            "",
-            &[],
-            Path::new("."),
-        )
-        .await
-        .unwrap();
-    assert!(summary.contains(
-        "[Prior tool calls; full results are recoverable from the prior visible transcript]"
-    ));
-    assert!(summary.contains("\"call_id\":\"call-1\""));
-    assert!(summary.contains("\"result_present\":true"));
-    assert!(!summary.contains("file body"));
-}
-
-#[tokio::test]
-async fn compaction_manifest_yields_to_higher_priority_recovery_metadata() {
-    let mut runtime = Runtime::new();
-    runtime.set_compaction_handle(CompactionHandle::new(CompactionPolicy {
-        summary_max_bytes: 200,
-        ..CompactionPolicy::default()
-    }));
-    let mut assistant = ProviderMessage::assistant("reading", Vec::new());
-    assistant.tool_calls = vec![tool_call("call-1", "read", "{\"path\":\"a.rs\"}")];
-    let selection = CompactionSelection {
-        root_instruction: "root".into(),
-        summarized: vec![
-            ProviderMessage::user("root"),
-            assistant,
-            ProviderMessage::tool("read", "call-1", "file body"),
-        ],
-        pinned: Vec::new(),
-        kept: Vec::new(),
-        first_kept_index: 3,
-        recent_tokens: 0,
-    };
-    let error = runtime
-        .archive_compaction_summary(
-            &selection,
-            valid_checkpoint("summary"),
-            "run_start_seq=7 failure call_id=failed-write",
-            &[],
-            Path::new("."),
-        )
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        ProviderError::InvalidResponse { message }
-            if message.contains("cannot retain operational metadata")
-    ));
-}
-
-#[tokio::test]
-async fn compaction_archive_reserves_bounded_facts_without_an_artifact_store() {
-    let mut runtime = Runtime::new();
-    let max_bytes = 1024;
-    runtime.set_compaction_handle(CompactionHandle::new(CompactionPolicy {
-        summary_max_bytes: max_bytes,
-        ..CompactionPolicy::default()
-    }));
-    let selection = CompactionSelection {
-        root_instruction: "root".into(),
-        summarized: Vec::new(),
-        pinned: Vec::new(),
-        kept: Vec::new(),
-        first_kept_index: 0,
-        recent_tokens: 0,
-    };
-    let summary = runtime
-        .archive_compaction_summary(
-            &selection,
-            valid_checkpoint(&"😀".repeat((max_bytes - 200) / 4)),
-            "run_start_seq=11 failure call_id=failed-write",
-            &[],
-            Path::new("."),
-        )
-        .await
-        .unwrap();
-    assert!(summary.len() <= max_bytes);
-    assert!(summary.contains("checkpoint sections truncated"));
-    assert!(summary.ends_with("failure call_id=failed-write"));
-    assert!(!summary.contains("Prior visible transcript"));
-    assert!(runtime
-        .archive_compaction_summary(
-            &selection,
-            valid_checkpoint("summary"),
-            &"x".repeat(max_bytes),
-            &[],
-            Path::new(".")
-        )
-        .await
-        .is_err());
-    runtime.set_compaction_handle(CompactionHandle::new(CompactionPolicy {
-        summary_max_bytes: 4,
-        ..CompactionPolicy::default()
-    }));
-    assert!(runtime
-        .archive_compaction_summary(
-            &selection,
-            valid_checkpoint("😀😀"),
-            "",
-            &[],
-            Path::new(".")
-        )
-        .await
-        .is_err());
-}
-
-#[tokio::test]
-async fn impossible_checkpoint_budget_does_not_create_recovery_artifact() {
-    let root = TempRoot::reserved("checkpoint-transaction");
-    let mut runtime = Runtime::with_artifact_store(&root).unwrap();
-    runtime.set_compaction_handle(CompactionHandle::new(CompactionPolicy {
-        summary_max_bytes: 128,
-        ..CompactionPolicy::default()
-    }));
-    let selection = CompactionSelection {
-        root_instruction: "root".into(),
-        summarized: vec![ProviderMessage::user("historical evidence")],
-        pinned: Vec::new(),
-        kept: Vec::new(),
-        first_kept_index: 1,
-        recent_tokens: 0,
-    };
-
-    let result = runtime
-        .archive_compaction_summary(
-            &selection,
-            valid_checkpoint("goal"),
-            "run_start_seq=1 failure call_id=write",
-            &[],
-            Path::new("."),
-        )
-        .await;
-
-    assert!(result.is_err());
-    assert!(
-        !root.exists(),
-        "preflight failure must not write an artifact"
-    );
 }
 
 #[test]
@@ -864,6 +520,21 @@ async fn ordinary_mcp_configuration_preserves_native_arguments_and_durable_ids()
     let durable = std::fs::read_to_string(root.join("session.jsonl")).unwrap();
     assert!(durable.contains("call-0") && durable.contains("call-1"));
     assert!(!durable.contains("synthetic-credential-long-42"));
+    // The batch's wall time is journaled once, naming every call it ran.
+    let batches: Vec<serde_json::Value> = durable
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|record| record["fact"]["namespace"] == "tool.batch.v1")
+        .map(|record| record["fact"]["value"].clone())
+        .collect();
+    assert_eq!(batches.len(), 1, "{durable}");
+    assert_eq!(batches[0]["batch_id"], "batch");
+    assert_eq!(batches[0]["calls"], 2);
+    assert_eq!(
+        batches[0]["call_ids"],
+        serde_json::json!(["call-0", "call-1"])
+    );
+    assert!(batches[0]["wall_ms"].is_u64());
 }
 
 #[test]
@@ -1613,6 +1284,79 @@ fn context_overflow_does_not_match_auth_usage_or_output_limits() {
     }));
 }
 
+#[test]
+fn context_overflow_follows_pis_patterns_and_the_providers_own_codes() {
+    let api = |status: Option<u16>, code: Option<&str>, message: &str| ProviderError::Api {
+        metadata: Box::new(crate::provider::ProviderErrorMetadata {
+            status,
+            code: code.map(str::to_owned),
+            error_type: None,
+            detail_code: None,
+            retry_after: None,
+        }),
+        message: message.into(),
+    };
+    // Pi's patterns match the text of any invalid request.
+    for error in [
+        api(
+            Some(400),
+            None,
+            "prompt is too long: 213462 tokens > 200000 maximum",
+        ),
+        api(Some(413), None, "request_too_large"),
+        api(
+            Some(400),
+            Some("invalid_request_error"),
+            "Your input exceeds the context window of this model",
+        ),
+        api(
+            None,
+            None,
+            "Input length (265330) exceeds model's maximum context length (262144).",
+        ),
+        ProviderError::Remote {
+            message: "Prompt exceeds max length".into(),
+        },
+    ] {
+        assert!(is_context_overflow_error(&error), "{error:?}");
+    }
+    // The provider's own code needs no matching text.
+    assert!(is_context_overflow_error(&api(
+        Some(400),
+        Some("context_length_exceeded"),
+        "rejected"
+    )));
+    // Throttling and rate limits are never overflow, even with Pi's generic
+    // fallback wording; neither is any status but the invalid-request ones.
+    assert!(!is_context_overflow_error(&api(
+        Some(429),
+        None,
+        "Rate limit: too many tokens per minute"
+    )));
+    assert!(!is_context_overflow_error(&api(
+        Some(400),
+        None,
+        "Throttling error: Too many tokens, please wait"
+    )));
+    assert!(!is_context_overflow_error(&api(
+        Some(500),
+        None,
+        "prompt is too long"
+    )));
+    // Pi has no status gate: any client error whose text says overflow is one.
+    assert!(is_context_overflow_error(&api(
+        Some(424),
+        None,
+        "prompt is too long"
+    )));
+    assert!(!is_context_overflow_error(&api(
+        Some(408),
+        None,
+        "prompt is too long"
+    )));
+    assert!(!is_context_overflow_error(&ProviderError::Cancelled));
+}
+
 const DEFAULT_BACKOFF: std::time::Duration = AgentLoopConfig::DEFAULT_PROVIDER_RECOVERY_BACKOFF;
 
 #[test]
@@ -1781,17 +1525,18 @@ fn evidence_dedup_requires_the_original_tool_content_in_active_history() {
         ProviderMessage::assistant("done", vec![]),
         ProviderMessage::user("read it again"),
     ];
-    let selection = select_compaction_history(
+    let plan = prepare_compaction(
         &messages,
         &CompactionPolicy {
             keep_recent_tokens: 1,
             ..CompactionPolicy::default()
-        },
+        }
+        .settings(),
+        ContextUsage::default(),
     )
-    .expect("compaction selection");
-    assert_eq!(selection.first_kept_index, 4);
-    let mut compacted =
-        apply_compaction_selection(&messages, &selection, &output).expect("compacted history");
+    .expect("compaction plan");
+    assert_eq!(plan.first_kept_index, 4);
+    let mut compacted = apply_compaction(&messages, plan.first_kept_index, &output);
     assert!(compacted.iter().all(|message| message.role != "tool"));
     compacted.push(ProviderMessage::tool("read", "pointer", pointer));
     assert!(!tool_output_already_in_context(&compacted, "read", &output));
@@ -1848,6 +1593,100 @@ fn elision_replaces_evidence_superseded_by_a_later_successful_write() {
         messages[6].content,
         "written a.txt; bytes=5; sha256=abc; exists=true; do not re-read"
     );
+}
+
+#[test]
+fn elision_replaces_shell_output_superseded_by_a_later_run_of_the_same_command() {
+    let shell = |id: &str, command: &str| {
+        ProviderMessage::assistant(
+            "",
+            vec![tool_call(
+                id,
+                "shell",
+                format!(r#"{{"command":"{command}"}}"#),
+            )],
+        )
+    };
+    let failed = format!(
+        "exit 101\nstdout:\n{}stderr:\n",
+        "test a ... FAILED\n".repeat(30)
+    );
+    let other = format!("exit 0\nstdout:\n{}stderr:\n", "M file\n".repeat(30));
+    let timed_out = format!(
+        "exit n/a · timed out\nstdout:\n{}stderr:\n",
+        "x".repeat(300)
+    );
+    let passed = "exit 0\nstdout:\ntest result: ok\nstderr:\n";
+    let mut messages = vec![
+        ProviderMessage::user("fix a"),
+        shell("s1", "cargo test"),
+        ProviderMessage::tool("shell", "s1", &failed),
+        shell("s2", "git status"),
+        ProviderMessage::tool("shell", "s2", &other),
+        shell("s3", "cargo test"),
+        ProviderMessage::tool("shell", "s3", passed),
+        shell("s4", "git status"),
+        ProviderMessage::tool("shell", "s4", &timed_out),
+    ];
+    let stats = elide_superseded_tool_outputs(&mut messages);
+    assert_eq!(stats.elided, 1);
+    assert_eq!(
+        messages[2].content,
+        "[superseded shell output elided; exit 101; the same command ran again later]"
+    );
+    assert_eq!(
+        messages[2].recorded_content.as_deref(),
+        Some(failed.as_str())
+    );
+    // A different command, the latest run, and a run superseded only by an
+    // unfinished one all stay.
+    assert_eq!(messages[4].content, other);
+    assert_eq!(messages[6].content, passed);
+    assert_eq!(messages[8].content, timed_out);
+}
+
+#[test]
+fn shell_elision_keeps_runs_a_later_pointer_refers_to_and_ignores_runs_without_an_exit_code() {
+    let shell = |id: &str| {
+        ProviderMessage::assistant(
+            "",
+            vec![tool_call(id, "shell", r#"{"command":"cargo test"}"#)],
+        )
+    };
+    let failed = format!("exit 101\nstdout:\n{}stderr:\n", "FAILED\n".repeat(40));
+    let passed = format!("exit 0\nstdout:\n{}stderr:\n", "ok\n".repeat(40));
+    let pointer = duplicate_pointer("shell");
+    // A later duplicate pointer stands for one of the earlier runs: they stay.
+    let mut messages = vec![
+        shell("s1"),
+        ProviderMessage::tool("shell", "s1", &failed),
+        shell("s2"),
+        ProviderMessage::tool("shell", "s2", &passed),
+        shell("s3"),
+        ProviderMessage::tool("shell", "s3", &pointer),
+    ];
+    assert_eq!(elide_superseded_tool_outputs(&mut messages).elided, 0);
+    assert_eq!(messages[1].content, failed);
+    // A later run without an exit code is not a completed run.
+    let no_code = format!("exit n/a\nstdout:\n{}stderr:\n", "x".repeat(300));
+    let mut messages = vec![
+        shell("s1"),
+        ProviderMessage::tool("shell", "s1", &failed),
+        shell("s2"),
+        ProviderMessage::tool("shell", "s2", &no_code),
+    ];
+    assert_eq!(elide_superseded_tool_outputs(&mut messages).elided, 0);
+    // The elided message is a pointer like the others: it carries the prefix
+    // that compaction recognises.
+    let mut messages = vec![
+        shell("s1"),
+        ProviderMessage::tool("shell", "s1", &failed),
+        shell("s2"),
+        ProviderMessage::tool("shell", "s2", &passed),
+    ];
+    assert_eq!(elide_superseded_tool_outputs(&mut messages).elided, 1);
+    assert!(messages[1].content.starts_with("[superseded "));
+    assert_eq!(elide_superseded_tool_outputs(&mut messages).elided, 0);
 }
 
 #[test]
@@ -2024,6 +1863,44 @@ fn elision_ignores_other_paths_failed_mutations_and_reruns_idempotently() {
         elide_superseded_tool_outputs(&mut messages),
         ElisionStats::default()
     );
+}
+
+#[test]
+fn an_elided_output_keeps_the_compaction_fingerprint_of_what_the_journal_recorded() {
+    let output = "old bytes ".repeat(40);
+    let mut messages = vec![
+        ProviderMessage::user("fix a"),
+        ProviderMessage::assistant("", vec![call("r1", "read", "a.txt")]),
+        ProviderMessage::tool("read", "r1", &output),
+        ProviderMessage::assistant(
+            "",
+            vec![tool_call(
+                "w1",
+                "write",
+                r#"{"path":"a.txt","content":"new"}"#,
+            )],
+        ),
+        ProviderMessage::tool(
+            "write",
+            "w1",
+            "written a.txt; bytes=3; sha256=x; exists=true",
+        ),
+        ProviderMessage::assistant("kept", Vec::new()),
+    ];
+    let recorded = compaction_prefix_fingerprint(&messages[..5]);
+    let stats = elide_superseded_tool_outputs(&mut messages);
+    assert_eq!(stats.elided, 1);
+    assert!(messages[2]
+        .content
+        .starts_with("[superseded read output elided;"));
+    // The live message changed, the journal's did not: the fingerprints agree.
+    assert_eq!(compaction_prefix_fingerprint(&messages[..5]), recorded);
+    // Eliding again keeps the first recorded form.
+    elide_superseded_tool_outputs(&mut messages);
+    assert_eq!(compaction_prefix_fingerprint(&messages[..5]), recorded);
+    // A different output is a different prefix.
+    messages[2].recorded_content = Some(Arc::from("something else"));
+    assert_ne!(compaction_prefix_fingerprint(&messages[..5]), recorded);
 }
 
 #[test]
@@ -2823,6 +2700,198 @@ fn todo_reviews_are_bounded_and_do_not_invent_statuses() {
 }
 
 #[test]
+fn a_batch_of_results_shares_one_presentation_budget() {
+    let runtime = Runtime::new();
+    let config = AgentLoopConfig::default();
+    let present = |count: usize| {
+        let calls: Vec<ProviderToolCall> = (0..count)
+            .map(|index| ProviderToolCall {
+                id: format!("c{index}"),
+                name: "shell".into(),
+                arguments: "{}".into(),
+            })
+            .collect();
+        // Each result is at its own 16 KiB cap.
+        let results: Vec<ToolResult> = (0..count)
+            .map(|index| {
+                ToolResult::ok(
+                    "shell",
+                    format!("{index}{}", "x".repeat(config.max_result_bytes - 1)),
+                )
+            })
+            .collect();
+        let batch = presentation::PresentationBatch {
+            id: "b",
+            calls: &calls,
+            results: &results,
+        };
+        let plan = runtime.presentation_plan(&batch, &[], &config, Path::new("."));
+        let presentations = runtime.present_batch(&plan, 1000);
+        (results, presentations)
+    };
+    // A batch under the cap is untouched.
+    let (results, presentations) = present(4);
+    for (result, presentation) in results.iter().zip(&presentations) {
+        assert_eq!(presentation.text, result.output);
+        assert!(presentation.complete);
+    }
+    // A batch over it shares the cap: every result is cut, none starved.
+    let (results, presentations) = present(8);
+    let total: usize = presentations
+        .iter()
+        .map(|presentation| presentation.text.len())
+        .sum();
+    let limit = AgentLoopConfig::DEFAULT_MAX_BATCH_RESULT_BYTES;
+    assert!(total <= limit + 8 * 128, "{total}");
+    assert!(
+        total
+            < results
+                .iter()
+                .map(|result| result.output.len())
+                .sum::<usize>()
+    );
+    assert!(presentations
+        .iter()
+        .all(|presentation| !presentation.complete && presentation.text.len() > limit / 16));
+}
+
+/// How a batch of `(tool, output)` results is presented at `scale` per mille
+/// over `base` history.
+fn present_results(
+    base: &[ProviderMessage],
+    results: &[(&str, String)],
+    scale: usize,
+) -> Vec<crate::tools::ToolPresentation> {
+    let runtime = Runtime::new();
+    let config = AgentLoopConfig::default();
+    let calls: Vec<ProviderToolCall> = results
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _))| tool_call(&format!("c{index}"), name, "{}"))
+        .collect();
+    let results: Vec<ToolResult> = results
+        .iter()
+        .map(|(name, output)| ToolResult::ok(*name, output.clone()))
+        .collect();
+    let batch = presentation::PresentationBatch {
+        id: "b",
+        calls: &calls,
+        results: &results,
+    };
+    let plan = runtime.presentation_plan(&batch, base, &config, Path::new("."));
+    runtime.present_batch(&plan, scale)
+}
+
+#[test]
+fn small_and_repeated_results_are_not_charged_to_the_batch_cap() {
+    let page = |letter: &str| letter.repeat(16 * 1024);
+    // Six large reads and a receipt: the receipt is under an equal share of
+    // the cap and reaches the model whole; the reads share the rest.
+    let receipt =
+        "written a.txt; bytes=9; sha256=abcdef012345; exists=true; do not re-read".to_owned();
+    let mut batch: Vec<(&str, String)> = ["a", "b", "c", "d", "e", "f"]
+        .iter()
+        .map(|letter| ("read", page(letter)))
+        .collect();
+    batch.push(("write", receipt.clone()));
+    let presented = present_results(&[], &batch, 1000);
+    assert_eq!(presented[6].text, receipt);
+    assert!(presented[6].complete);
+    let reads: usize = presented[..6].iter().map(|p| p.text.len()).sum();
+    assert!(reads <= AgentLoopConfig::DEFAULT_MAX_BATCH_RESULT_BYTES + 6 * 128);
+    assert!(presented[..6]
+        .iter()
+        .all(|presentation| !presentation.complete && presentation.text.len() > 8 * 1024));
+
+    // Two of five reads are already in context: they cost a pointer, so the
+    // three new ones fit the cap and are not cut.
+    let base = [
+        ProviderMessage::tool("read", "old-a", page("a")),
+        ProviderMessage::tool("read", "old-b", page("b")),
+    ];
+    let batch: Vec<(&str, String)> = ["a", "b", "c", "d", "e"]
+        .iter()
+        .map(|letter| ("read", page(letter)))
+        .collect();
+    let presented = present_results(&base, &batch, 1000);
+    let pointer = duplicate_pointer("read");
+    assert_eq!(presented[0].text, pointer);
+    assert_eq!(presented[1].text, pointer);
+    for (presentation, letter) in presented[2..].iter().zip(["c", "d", "e"]) {
+        assert_eq!(presentation.text, page(letter));
+        assert!(presentation.complete);
+    }
+    // The same output twice in one batch: the second is a pointer too.
+    let batch = vec![("read", page("a")); 5];
+    let presented = present_results(&[], &batch, 1000);
+    assert_eq!(presented[0].text, page("a"));
+    assert!(presented[1..].iter().all(|p| p.text == pointer));
+}
+
+#[test]
+fn a_cut_result_is_never_longer_than_the_result_it_cuts() {
+    let batch = vec![
+        ("shell", "exit 0\nok".to_owned()),
+        ("read", "tiny".to_owned()),
+        ("read", "x".repeat(4000)),
+    ];
+    // Even with no room at all, a small result is not swapped for a notice
+    // that is longer than it is.
+    for scale in [0, 1, 10, 1000] {
+        let presented = present_results(&[], &batch, scale);
+        for ((_, output), presentation) in batch.iter().zip(&presented) {
+            assert!(
+                presentation.complete || presentation.text.len() < output.len(),
+                "scale {scale}: {} bytes for {}",
+                presentation.text.len(),
+                output.len()
+            );
+        }
+        assert_eq!(presented[0].text, "exit 0\nok");
+        assert_eq!(presented[1].text, "tiny");
+    }
+}
+
+#[test]
+fn anthropic_refusal_and_context_window_stops_are_filtered_and_truncated() {
+    use recovery::ProviderTurnStop;
+    for (reason, stop) in [
+        ("refusal", ProviderTurnStop::Filtered),
+        ("model_context_window_exceeded", ProviderTurnStop::Truncated),
+        ("max_tokens", ProviderTurnStop::Truncated),
+        ("end_turn", ProviderTurnStop::Normal),
+    ] {
+        assert_eq!(classify_provider_stop_reason(reason, &[]).unwrap(), stop);
+    }
+    assert!(classify_provider_stop_reason("pause_turn_unknown", &[]).is_err());
+}
+
+#[test]
+fn the_models_own_todo_updates_do_not_spend_the_stale_list_reminder() {
+    let item = |status: &str| {
+        vec![crate::TodoChangedItem {
+            reason: None,
+            id: Some(1),
+            title: "verify".into(),
+            status: status.into(),
+        }]
+    };
+    let mut cadence = TodoCadence::default();
+    // Creation, then two updates of the model's own: only creation is nudged.
+    assert!(cadence.after_batch(&item("pending")));
+    assert!(!cadence.after_batch(&item("in_progress")));
+    let mut updated = item("in_progress");
+    updated[0].reason = Some("waiting".into());
+    assert!(!cadence.after_batch(&updated));
+    // The list then goes stale: the second reminder is still available.
+    for _ in 0..3 {
+        assert!(!cadence.after_batch(&updated));
+    }
+    assert!(cadence.after_batch(&updated));
+    assert!(!cadence.after_batch(&updated));
+}
+
+#[test]
 fn skill_listing_keeps_invalid_skill_diagnostics_accessible() {
     let root = TempRoot::new("skill-diagnostics");
     let skill_root = root.join("skills");
@@ -2876,47 +2945,6 @@ fn skill_profile_is_discovered_once_and_refreshed_next_run() {
     assert!(!has_skill(&runtime), "profile must not change mid-run");
     runtime.prepare_loop_capabilities(&root).unwrap();
     assert!(has_skill(&runtime));
-}
-
-#[tokio::test]
-async fn cache_pricing_gates_the_background_plan_without_touching_history() {
-    let mut runtime = Runtime::new();
-    runtime.set_compaction_handle(CompactionHandle::default());
-    runtime.set_background_compaction_enabled(true);
-    let client = HttpProviderClient::new(
-        crate::provider::OpenAiCompatibleAdapter::new(crate::provider::ProviderConfig::openai(
-            "http://127.0.0.1:1",
-            "fixture-model",
-            "unused",
-        ))
-        .unwrap(),
-        std::time::Duration::from_secs(1),
-    )
-    .unwrap();
-    let messages = vec![
-        ProviderMessage::user("root"),
-        ProviderMessage::assistant("old context ".repeat(20_000), vec![]),
-        ProviderMessage::user("continue"),
-    ];
-    let original = messages.clone();
-    let policy = CompactionPolicy::default();
-    let budget = ContextBudget::new(300_000, 220_000, 0);
-    let baseline = runtime
-        .build_background_compaction_plan(&client, &messages, &policy, budget, false, 10)
-        .unwrap();
-    assert!(baseline.profitable);
-    runtime.set_compaction_pricing(Some(CompactionPricing {
-        input: 1000,
-        output: 1000,
-        cache_read: 0,
-        cache_write: 1000,
-    }));
-    let priced = runtime
-        .build_background_compaction_plan(&client, &messages, &policy, budget, false, 10)
-        .unwrap();
-    assert!(!priced.profitable);
-    assert!(priced.request.is_none());
-    assert_eq!(messages, original);
 }
 
 #[test]
@@ -3617,19 +3645,39 @@ fn skill_script_dispatch_never_runs_and_names_the_denial() {
     assert!(!marker.exists(), "the model cannot grant user trust");
 }
 
-#[test]
-fn compaction_summary_rejects_missing_required_headings() {
-    let summary = CompactionSummary {
-        text: "plain summary".into(),
-        stop_reason: Some("stop".into()),
+fn summary_response(text: &str, stop_reason: Option<&str>) -> CompactionSummary {
+    CompactionSummary {
+        text: text.into(),
+        stop_reason: stop_reason.map(str::to_owned),
         ..CompactionSummary::default()
-    };
+    }
+}
 
-    assert!(matches!(
-        summary.validate(64 * 1024),
-        Err(ProviderError::InvalidResponse { ref message })
-            if message.contains("required heading")
-    ));
+#[test]
+fn compaction_summary_accepts_any_text_that_stopped_normally() {
+    // Pi checks how the response ended, not its format.
+    assert!(summary_response("plain summary", Some("stop"))
+        .validate()
+        .is_ok());
+    assert!(summary_response("plain summary", Some("end_turn"))
+        .validate()
+        .is_ok());
+}
+
+#[test]
+fn compaction_summary_rejects_an_incomplete_response() {
+    let rejected = |summary: CompactionSummary| match summary.validate() {
+        Err(ProviderError::InvalidResponse { message }) => message,
+        other => panic!("expected an invalid response, got {other:?}"),
+    };
+    assert!(rejected(summary_response("text", None)).contains("without a stop reason"));
+    assert!(rejected(summary_response("text", Some("length"))).contains("truncated"));
+    assert!(rejected(summary_response("text", Some("content_filter"))).contains("filtered"));
+    assert!(rejected(summary_response("text", Some("tool_calls"))).contains("tool"));
+    assert!(rejected(summary_response(" \n", Some("stop"))).contains("empty"));
+    let mut with_tool_call = summary_response("text", Some("stop"));
+    with_tool_call.saw_tool_call = true;
+    assert!(rejected(with_tool_call).contains("tool"));
 }
 
 #[test]
@@ -3708,278 +3756,6 @@ fn runtime_goal_assurance_requires_validation_after_the_latest_mutation() {
         progress(1, crate::CausalProgressKind::ValidationGreen, 0),
         progress(2, crate::CausalProgressKind::WorkspaceChanged, 1),
     ]));
-}
-
-/// A background compaction whose task already finished without a summary.
-async fn finished_pending_background() -> PendingBackgroundCompaction {
-    let plan = BackgroundCompactionPlan {
-        selection: CompactionSelection {
-            root_instruction: "root".into(),
-            summarized: vec![ProviderMessage::user("root")],
-            pinned: Vec::new(),
-            kept: Vec::new(),
-            first_kept_index: 1,
-            recent_tokens: 0,
-        },
-        request: None,
-        provider: "provider".into(),
-        model: "model".into(),
-        provider_identity: "provider:model".into(),
-        strategy: crate::context::CompactionStrategy::Summary,
-        jev_plan: None,
-        previous_checkpoint: None,
-        context_window_tokens: 1,
-        reserve_tokens: 0,
-        serialized_chars: 1,
-        system_bytes: 0,
-        history_bytes: 0,
-        summary_max_bytes: 64 * 1024,
-        source_len: 1,
-        tokens_before: 1,
-        projected_tokens_after: 1,
-        request_bytes: 1,
-        estimated_input_tokens: 1,
-        projected_savings_tokens: 1,
-        estimated_cost_tokens: 1,
-        safety_margin_tokens: 1,
-        future_turns: 1,
-        profitable: true,
-    };
-    let task = tokio::spawn(async move {
-        BackgroundCompactionResult {
-            plan,
-            summary: String::new(),
-            usage: crate::UsageBreakdown::default(),
-            time_to_first_byte_ms: None,
-            time_to_first_semantic_ms: None,
-            duration_ms: 1,
-            valid: false,
-            usage_known: false,
-            cancelled: false,
-        }
-    });
-    while !task.is_finished() {
-        tokio::task::yield_now().await;
-    }
-    PendingBackgroundCompaction {
-        task,
-        cancellation: CancellationToken::new(),
-        progress: Arc::new(Mutex::new(CompactionAttemptProgress::default())),
-        jev_outcome: Arc::new(Mutex::new(None)),
-        request_bytes: 1,
-        estimated_input_tokens: 1,
-        tokens_before: 1,
-        started: Instant::now(),
-    }
-}
-
-#[test]
-fn cancel_pending_background_harvests_finished_task() {
-    tokio::runtime::Runtime::new()
-        .expect("runtime")
-        .block_on(async {
-            let mut pending = Some(finished_pending_background().await);
-            let mut runtime = Runtime::new();
-            let mut next_seq = 1;
-
-            runtime
-                .cancel_pending_background(&mut pending, &mut next_seq, "loop_finished")
-                .await
-                .expect("settle finished task");
-            let usage = UsageTotals::from_events(runtime.app.events(), false);
-
-            assert!(pending.is_none());
-            assert_eq!(usage.provider_turns, 0);
-            assert_eq!(usage.requests.len(), 1);
-            assert_eq!(
-                usage.requests[0].request_kind,
-                crate::RequestKind::Compaction
-            );
-            assert!(usage.requests[0].usage_unknown);
-            assert!(runtime.app.events().iter().any(|event| matches!(
-                event.kind,
-                crate::EventKind::CompactionAttemptCompleted { .. }
-            )));
-            assert!(!runtime.app.events().iter().any(|event| matches!(
-                event.kind,
-                crate::EventKind::CompactionAttemptCancelled { .. }
-            )));
-        });
-}
-
-#[tokio::test]
-async fn failed_background_settle_does_not_replace_the_original_event_error() {
-    let mut pending = Some(finished_pending_background().await);
-    let mut runtime = Runtime::new();
-    // The event lands, then the sequence cannot advance: the original error.
-    // Settling the background attempt afterwards fails with a different one.
-    let mut next_seq = u64::MAX;
-
-    let error = runtime
-        .push_or_cancel_background(
-            &mut pending,
-            &mut next_seq,
-            crate::EventKind::ThinkingEnded,
-            "test",
-        )
-        .await
-        .expect_err("sequence overflow");
-
-    assert!(pending.is_none());
-    assert!(
-        matches!(&error, ProviderError::InvalidResponse { message } if message == "event sequence overflow"),
-        "{error:?}"
-    );
-}
-
-#[tokio::test]
-async fn completed_background_usage_reports_the_rebuilt_pruned_request() {
-    let plan = || BackgroundCompactionPlan {
-        selection: CompactionSelection {
-            root_instruction: "root".into(),
-            summarized: vec![ProviderMessage::user("root")],
-            pinned: Vec::new(),
-            kept: Vec::new(),
-            first_kept_index: 1,
-            recent_tokens: 0,
-        },
-        request: None,
-        provider: "provider".into(),
-        model: "model".into(),
-        provider_identity: "provider:model".into(),
-        strategy: crate::context::CompactionStrategy::Jev,
-        jev_plan: None,
-        previous_checkpoint: None,
-        context_window_tokens: 1,
-        reserve_tokens: 0,
-        serialized_chars: 11,
-        system_bytes: 22,
-        history_bytes: 33,
-        summary_max_bytes: 64 * 1024,
-        source_len: 1,
-        tokens_before: 1,
-        projected_tokens_after: 1,
-        request_bytes: 44,
-        estimated_input_tokens: 55,
-        projected_savings_tokens: 1,
-        estimated_cost_tokens: 1,
-        safety_margin_tokens: 1,
-        future_turns: 1,
-        profitable: true,
-    };
-    let result = |cancelled: bool| BackgroundCompactionResult {
-        plan: plan(),
-        summary: "summary".into(),
-        usage: crate::UsageBreakdown::default(),
-        time_to_first_byte_ms: None,
-        time_to_first_semantic_ms: None,
-        duration_ms: 1,
-        valid: true,
-        usage_known: true,
-        cancelled,
-    };
-    let attempt = || PendingBackgroundCompaction {
-        task: tokio::spawn(std::future::pending::<BackgroundCompactionResult>()),
-        cancellation: CancellationToken::new(),
-        progress: Arc::new(Mutex::new(CompactionAttemptProgress::default())),
-        jev_outcome: Arc::new(Mutex::new(None)),
-        request_bytes: 99,
-        estimated_input_tokens: 99,
-        tokens_before: 1,
-        started: Instant::now(),
-    };
-    let policy = CompactionPolicy::default();
-    let compaction_request = |runtime: &Runtime| {
-        UsageTotals::from_events(runtime.app.events(), false)
-            .requests
-            .into_iter()
-            .find(|request| request.request_kind == crate::RequestKind::Compaction)
-            .expect("compaction request")
-    };
-
-    // Completed: the ledger carries the rebuilt (pruned) request, not the
-    // stale figures the attempt was launched with.
-    let mut runtime = Runtime::new();
-    let mut next_seq = 1;
-    runtime
-        .finish_background_attempt(attempt(), Ok(result(false)), &policy, &mut next_seq)
-        .unwrap();
-    let request = compaction_request(&runtime);
-    assert_eq!(request.system_bytes, 22);
-    assert_eq!(request.history_bytes, 33);
-    assert_eq!(request.estimated_input_tokens, 55);
-
-    // Cancelled with a rebuilt plan: the cancellation event reports the
-    // plan's size, not the launch-time estimate.
-    let mut runtime = Runtime::new();
-    let mut next_seq = 1;
-    runtime
-        .finish_background_attempt(attempt(), Ok(result(true)), &policy, &mut next_seq)
-        .unwrap();
-    assert!(runtime.app.events().iter().any(|event| matches!(
-        event.kind,
-        crate::EventKind::CompactionAttemptCancelled {
-            request_bytes: 44,
-            estimated_input_tokens: 55,
-            ..
-        }
-    )));
-    let request = compaction_request(&runtime);
-    assert!(request.cancelled && request.usage_unknown);
-    assert_eq!(request.estimated_input_tokens, 55);
-
-    // Aborted without a result: only the launch-time figures exist.
-    let aborted = tokio::spawn(std::future::pending::<BackgroundCompactionResult>());
-    aborted.abort();
-    let joined = aborted.await;
-    assert!(joined.is_err());
-    let mut runtime = Runtime::new();
-    let mut next_seq = 1;
-    runtime
-        .finish_background_attempt(attempt(), joined, &policy, &mut next_seq)
-        .unwrap();
-    assert!(runtime.app.events().iter().any(|event| matches!(
-        event.kind,
-        crate::EventKind::CompactionAttemptCancelled {
-            request_bytes: 99,
-            estimated_input_tokens: 99,
-            ..
-        }
-    )));
-    let request = compaction_request(&runtime);
-    assert!(request.cancelled && request.usage_unknown);
-    assert_eq!(request.estimated_input_tokens, 99);
-}
-
-#[tokio::test]
-async fn dropping_pending_background_compaction_aborts_its_task() {
-    let probe = std::sync::Arc::new(());
-    let weak = std::sync::Arc::downgrade(&probe);
-    let task = tokio::spawn(async move {
-        let _held = probe;
-        std::future::pending::<()>().await;
-        unreachable!("background compaction task must be aborted on drop");
-    });
-    drop(PendingBackgroundCompaction {
-        task,
-        cancellation: CancellationToken::new(),
-        progress: Arc::new(Mutex::new(CompactionAttemptProgress::default())),
-        jev_outcome: Arc::new(Mutex::new(None)),
-        request_bytes: 0,
-        estimated_input_tokens: 0,
-        tokens_before: 0,
-        started: Instant::now(),
-    });
-    for _ in 0..100 {
-        if weak.upgrade().is_none() {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        weak.upgrade().is_none(),
-        "dropping the handle must abort the task and free its state"
-    );
 }
 
 #[test]
@@ -4522,147 +4298,6 @@ fn largest_fitting_scale_finds_the_boundary_and_keeps_the_floor() {
     assert_eq!(largest_fitting_scale(|scale| scale, fits_up_to(0)), 0);
     // Nothing fits, not even scale 0: the floor is still returned.
     assert_eq!(largest_fitting_scale(|scale| scale, |_| false), 0);
-}
-
-#[test]
-fn completed_provider_turns_matches_the_usage_ledger() {
-    fn snapshot(kind: crate::RequestKind) -> crate::EventKind {
-        crate::EventKind::ContextSnapshot {
-            request_kind: kind,
-            provider: "p".into(),
-            model: "m".into(),
-            system_bytes: 0,
-            tool_schema_bytes: 0,
-            history_bytes: 0,
-            tool_result_bytes: 0,
-            serialized_chars: 0,
-            estimated_tokens: 0,
-            context_window_tokens: 0,
-        }
-    }
-    fn completed(cancelled: bool, failed: bool) -> crate::EventKind {
-        crate::EventKind::RequestCompleted {
-            provider_latency_ms: 1,
-            cancelled,
-            failed,
-        }
-    }
-    use crate::RequestKind::{Compaction, ProviderTurn};
-    let kinds = vec![
-        snapshot(ProviderTurn),
-        completed(false, false),
-        snapshot(ProviderTurn),
-        completed(false, true),
-        snapshot(Compaction),
-        completed(false, false),
-        snapshot(ProviderTurn),
-        completed(true, true),
-        snapshot(ProviderTurn),
-        snapshot(ProviderTurn),
-        completed(false, false),
-        snapshot(Compaction),
-        completed(true, true),
-        snapshot(ProviderTurn),
-    ];
-    let events = kinds
-        .into_iter()
-        .enumerate()
-        .map(|(index, kind)| crate::SessionEvent::new(index as u64 + 1, kind))
-        .collect::<Vec<_>>();
-    for end in 0..=events.len() {
-        let ledger = UsageTotals::from_events(&events[..end], false)
-            .requests
-            .iter()
-            .filter(|request| {
-                request.request_kind == crate::RequestKind::ProviderTurn
-                    && !request.failed
-                    && !request.cancelled
-            })
-            .count();
-        assert_eq!(
-            events::completed_provider_turns(&events[..end]),
-            ledger,
-            "prefix of {end} events"
-        );
-    }
-    assert_eq!(events::completed_provider_turns(&events), 4);
-}
-
-#[test]
-fn compaction_economics_prices_savings_against_the_summary_cost() {
-    use super::compaction_background::{compaction_economics, TurnForecast};
-    let forecast = |remaining, observed, completed, open| TurnForecast {
-        remaining,
-        observed,
-        completed,
-        open,
-    };
-    let cost = 1_000 + COMPACTION_MAX_OUTPUT_TOKENS;
-    let margin = cost.div_ceil(4);
-
-    let paying = compaction_economics(None, forecast(8, 0, 0, 0), 10_000, 4_000, 1_000);
-    assert_eq!(paying.future_turns, 2);
-    assert_eq!(paying.projected_savings_tokens, 12_000);
-    assert_eq!(paying.estimated_cost_tokens, cost);
-    assert_eq!(paying.safety_margin_tokens, margin);
-    assert_eq!(paying.profitable, 12_000 > cost + margin);
-    assert!(paying.profitable);
-
-    // The turn budget caps how many turns the saving accrues on.
-    let two_turns = compaction_economics(None, forecast(8, 0, 0, 0), 10_000, 8_000, 1_000);
-    assert_eq!(two_turns.projected_savings_tokens, 4_000);
-    assert!(two_turns.profitable);
-    let last_turn = compaction_economics(None, forecast(1, 0, 0, 0), 10_000, 8_000, 1_000);
-    assert_eq!(last_turn.future_turns, 1);
-    assert_eq!(last_turn.projected_savings_tokens, 2_000);
-    assert!(!last_turn.profitable);
-
-    // Nothing saved is never profitable.
-    let no_saving = compaction_economics(None, forecast(8, 0, 0, 0), 4_000, 10_000, 1_000);
-    assert_eq!(no_saving.projected_savings_tokens, 0);
-    assert!(!no_saving.profitable);
-
-    // The savings must strictly exceed cost plus margin.
-    let edge_tokens = cost + margin;
-    let at_edge = compaction_economics(None, forecast(8, 0, 0, 0), edge_tokens, 0, 1_000);
-    assert_eq!(at_edge.projected_savings_tokens, edge_tokens * 2);
-    assert!(at_edge.profitable);
-    let below_edge = compaction_economics(None, forecast(8, 0, 0, 0), edge_tokens / 2, 0, 1_000);
-    assert_eq!(below_edge.projected_savings_tokens, edge_tokens / 2 * 2);
-    assert_eq!(below_edge.profitable, edge_tokens / 2 * 2 > edge_tokens);
-}
-
-#[test]
-fn projected_retained_tokens_equals_the_estimate_over_the_retained_history() {
-    let mut system = ProviderMessage::user("follow the repository rules");
-    system.role = "system".into();
-    let mut developer = ProviderMessage::user("tooling notes");
-    developer.role = "developer".into();
-    let selection = CompactionSelection {
-        root_instruction: "fix the build".into(),
-        summarized: vec![
-            system.clone(),
-            ProviderMessage::user("fix the build"),
-            ProviderMessage::assistant("looking", Vec::new()),
-            developer.clone(),
-            ProviderMessage::tool("read", "call-1", "file contents"),
-        ],
-        pinned: vec![ProviderMessage::user("also keep the tests green")],
-        kept: vec![
-            ProviderMessage::assistant("running tests", Vec::new()),
-            ProviderMessage::tool("shell", "call-2", "ok"),
-        ],
-        first_kept_index: 5,
-        recent_tokens: 0,
-    };
-    let mut retained = vec![system, developer];
-    retained.push(ProviderMessage::user(selection.root_instruction.clone()));
-    retained.extend(selection.pinned.iter().cloned());
-    retained.extend(selection.kept.iter().cloned());
-    assert_eq!(
-        super::compaction_background::projected_retained_tokens(&selection),
-        estimate_provider_message_tokens(&retained)
-    );
 }
 
 #[test]

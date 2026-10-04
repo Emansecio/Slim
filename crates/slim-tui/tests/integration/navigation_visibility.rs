@@ -79,11 +79,11 @@ fn palette_end_keeps_the_last_grouped_command_visible() {
     let frame = render(&state, 100, 30);
     assert_eq!(state.palette_selected, palette_matches("").len() - 1);
     assert!(
-        frame.contains("inspeção"),
+        frame.contains("detalhes"),
         "group heading must render:\n{frame}"
     );
     assert!(
-        frame.contains("> /diagnostics"),
+        frame.contains("> /jobs"),
         "End-selected command must remain visible:\n{frame}"
     );
 }
@@ -104,7 +104,7 @@ fn login_end_keeps_the_last_provider_visible_in_a_short_viewport() {
         "last provider must be visible after End:\n{frame}"
     );
     assert!(
-        frame.contains("Esc cancelar"),
+        frame.contains("Esc fechar"),
         "action hint must remain visible:\n{frame}"
     );
 }
@@ -136,7 +136,7 @@ fn model_cursor_highlight_does_not_move_the_active_model_marker() {
         .find(|line| line.contains("GPT-5.6 Terra"))
         .expect("selected model row");
     assert!(
-        selected_row.contains(">   GPT-5.6 Terra"),
+        selected_row.contains(">     GPT-5.6 Terra"),
         "cursor highlight follows the selected row:\n{frame}"
     );
     assert!(

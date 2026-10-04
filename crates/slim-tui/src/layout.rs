@@ -9,7 +9,6 @@ pub struct Rect {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LayoutRegions {
     pub session_rail: Rect,
-    pub activity_rail: Rect,
     pub scrollback: Rect,
     pub todo: Rect,
     pub todo_divider: Rect,
@@ -62,22 +61,17 @@ pub fn todo_height(expanded: bool, item_count: usize, _has_active: bool) -> u16 
     }
 }
 
-/// Normal layout (§14.1/§15.3/§21.4). Activity and Todo degrade before the
-/// approved composer silhouette; its bottom border directly precedes footer.
-pub fn plan_checked(
-    width: u16,
-    height: u16,
-    todo_rows: u16,
-    working: bool,
-) -> Result<LayoutRegions, LayoutError> {
-    plan_checked_internal(width, height, todo_rows, working, false, 1)
+/// Normal layout (§14.1/§15.3/§21.4). The run's activity is a row of the
+/// footer, not a region of its own; Todo degrades before the approved composer
+/// silhouette, whose bottom border directly precedes the footer.
+pub fn plan_checked(width: u16, height: u16, todo_rows: u16) -> Result<LayoutRegions, LayoutError> {
+    plan_checked_internal(width, height, todo_rows, false, 1)
 }
 
 fn plan_checked_internal(
     width: u16,
     height: u16,
     todo_rows: u16,
-    working: bool,
     show_session_rail: bool,
     composer_lines: usize,
 ) -> Result<LayoutRegions, LayoutError> {
@@ -85,25 +79,24 @@ fn plan_checked_internal(
         return Err(LayoutError::TerminalTooSmall);
     }
     let mut session = u16::from(show_session_rail && width >= 80 && height >= 12);
-    let mut activity = u16::from(working);
     let mut operational = operational_height(height);
     let composer = composer_height_for_lines(height, composer_lines);
     let mut todo = todo_rows;
     let mut use_dividers = true;
     let mut todo_div;
     loop {
-        todo_div = u16::from(use_dividers && todo > 0);
-        let fixed = session + activity + operational + composer + todo + todo_div;
+        // A one-row dock reads as its own line; only the expanded list is
+        // set apart from the composer.
+        todo_div = u16::from(use_dividers && todo > 1);
+        let fixed = session + operational + composer + todo + todo_div;
         if height > fixed {
             break;
         }
-        // Degradation order (§14.4): SessionRail, ActivityRail, Todo; never composer.
+        // Degradation order (§14.4): SessionRail, Todo; never composer.
         if operational > 1 {
             operational -= 1;
         } else if session > 0 {
             session = 0;
-        } else if activity > 0 {
-            activity = 0;
         } else if use_dividers {
             use_dividers = false;
         } else if todo > 1 {
@@ -114,7 +107,7 @@ fn plan_checked_internal(
             return Err(LayoutError::InsufficientHeight);
         }
     }
-    let scrollback_height = height - session - activity - operational - composer - todo - todo_div;
+    let scrollback_height = height - session - operational - composer - todo - todo_div;
     let mut y = 0;
     let session_rail = Rect {
         x: 0,
@@ -144,13 +137,6 @@ fn plan_checked_internal(
         height: todo_div,
     };
     y += todo_div;
-    let activity_rail = Rect {
-        x: 0,
-        y,
-        width,
-        height: activity,
-    };
-    y += activity;
     let composer_rect = Rect {
         x: 0,
         y,
@@ -166,7 +152,6 @@ fn plan_checked_internal(
     };
     Ok(LayoutRegions {
         session_rail,
-        activity_rail,
         scrollback,
         todo: todo_rect,
         todo_divider,
@@ -183,36 +168,29 @@ fn plan_checked_internal(
 
 /// Emergency layout for terminals below 40x8 (§14.5): dividers dropped,
 /// todo truncated to one row, one composer row, one operational row.
-pub fn plan(width: u16, height: u16, todo_rows: u16, working: bool) -> LayoutRegions {
-    plan_with_session_rail(width, height, todo_rows, working, false)
+pub fn plan(width: u16, height: u16, todo_rows: u16) -> LayoutRegions {
+    plan_with_session_rail(width, height, todo_rows, false)
 }
 
 pub fn plan_with_session_rail(
     width: u16,
     height: u16,
     todo_rows: u16,
-    working: bool,
     show_session_rail: bool,
 ) -> LayoutRegions {
-    plan_with_session_rail_and_composer(width, height, todo_rows, working, show_session_rail, 1)
+    plan_with_session_rail_and_composer(width, height, todo_rows, show_session_rail, 1)
 }
 
 pub fn plan_with_session_rail_and_composer(
     width: u16,
     height: u16,
     todo_rows: u16,
-    working: bool,
     show_session_rail: bool,
     composer_lines: usize,
 ) -> LayoutRegions {
-    if let Ok(layout) = plan_checked_internal(
-        width,
-        height,
-        todo_rows,
-        working,
-        show_session_rail,
-        composer_lines,
-    ) {
+    if let Ok(layout) =
+        plan_checked_internal(width, height, todo_rows, show_session_rail, composer_lines)
+    {
         return layout;
     }
     let operational_height = u16::from(height > 0);
@@ -222,12 +200,6 @@ pub fn plan_with_session_rail_and_composer(
         height.saturating_sub(todo_height + composer_height + operational_height);
     LayoutRegions {
         session_rail: Rect {
-            x: 0,
-            y: 0,
-            width,
-            height: 0,
-        },
-        activity_rail: Rect {
             x: 0,
             y: 0,
             width,

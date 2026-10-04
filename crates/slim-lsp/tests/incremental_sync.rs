@@ -7,6 +7,7 @@ use slim_core::codeintel::{
     CodeIntelEditPosition, CodeIntelFileUpdate, CodeIntelPatch, CodeIntelPositionQuery,
     CodeIntelServerState, CodeIntelTextEdit, CodeIntelligence,
 };
+use slim_lsp::discovery::{rust_analyzer_spec, ServerOptions, RUST_ANALYZER};
 use slim_lsp::pool::{PoolConfig, StdioProcessFactory};
 use slim_lsp::{LspCodeIntelligence, LspManagerConfig, LspProcessPool};
 
@@ -71,9 +72,18 @@ fn manager_with_mock(
             idle_shutdown: None,
             max_servers: 2,
             request_timeout: Duration::from_secs(3),
-            server_config: config.clone(),
+            servers: [(
+                RUST_ANALYZER.into(),
+                ServerOptions {
+                    path: Some(PathBuf::from(mock_binary())),
+                    initialization_options: Some(config.clone()),
+                    settings: Some(json!({"rust-analyzer": config})),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
             max_open_documents: 8,
-            server_path: Some(PathBuf::from(mock_binary())),
         },
     );
     assert!(root.join("Cargo.toml").is_file());
@@ -128,6 +138,178 @@ fn client_messages(log: &Path) -> Vec<Value> {
         .collect()
 }
 
+#[tokio::test]
+async fn workspace_queries_refresh_external_edits_and_reject_old_pages() {
+    use slim_core::codeintel::CodeIntelSymbolQuery;
+    let dir = TestDir::new("external-refresh");
+    let first = write_workspace(dir.path(), "fn first() {}\n");
+    let second = dir.path().join("src/second.rs");
+    std::fs::write(&second, "fn old() {}\n").unwrap();
+    let log = dir.path().join("refresh.jsonl");
+    let (pool, manager, config) = manager_with_mock(dir.path(), json!({"logPath": log}));
+    manager.hover(&query(dir.path(), &first)).await;
+    manager.hover(&query(dir.path(), &second)).await;
+    let symbol_query = CodeIntelSymbolQuery {
+        workspace: dir.path().to_path_buf(),
+        server: None,
+        query: Some("target".into()),
+        max_results: 1,
+        ..Default::default()
+    };
+    let page = manager.symbols(&symbol_query).await;
+    let revision = page.payload["revision"].as_u64().expect("page revision");
+    std::fs::write(&second, "fn externally_changed() {}\n").unwrap();
+    let stale = manager
+        .symbols(&CodeIntelSymbolQuery {
+            revision: Some(revision),
+            ..symbol_query.clone()
+        })
+        .await;
+    assert!(stale.payload.get("error").is_some(), "{stale:?}");
+    let state = server_state(&pool, dir.path(), &config, &second).await;
+    assert_eq!(state["text"], "fn externally_changed() {}\n");
+    let fresh = manager.symbols(&symbol_query).await;
+    assert!(fresh.payload.get("error").is_none(), "{fresh:?}");
+    let messages = client_messages(&log);
+    let watched = messages
+        .iter()
+        .position(|m| m["method"] == "workspace/didChangeWatchedFiles")
+        .unwrap();
+    let synced = messages
+        .iter()
+        .position(|m| m["method"] == "textDocument/didChange")
+        .unwrap();
+    let queried = messages
+        .iter()
+        .rposition(|m| m["method"] == "workspace/symbol")
+        .unwrap();
+    assert!(watched < synced && synced < queried);
+    pool.close_all().await;
+}
+
+#[tokio::test]
+async fn new_and_removed_closed_files_notify_the_server_before_queries() {
+    use slim_core::codeintel::CodeIntelSymbolQuery;
+    let dir = TestDir::new("external-file-set");
+    let first = write_workspace(dir.path(), "fn first() {}\n");
+    let log = dir.path().join("file-set.jsonl");
+    let (pool, manager, _) = manager_with_mock(dir.path(), json!({"logPath": log}));
+    manager.hover(&query(dir.path(), &first)).await;
+    let created = dir.path().join("src/created.rs");
+    let query = CodeIntelSymbolQuery {
+        workspace: dir.path().to_path_buf(),
+        server: None,
+        query: Some("target".into()),
+        max_results: 20,
+        ..Default::default()
+    };
+    std::fs::write(&created, "fn created() {}\n").unwrap();
+    manager.symbols(&query).await;
+    std::fs::remove_file(&created).unwrap();
+    manager.symbols(&query).await;
+    let messages = client_messages(&log);
+    let kinds = messages
+        .iter()
+        .filter(|m| m["method"] == "workspace/didChangeWatchedFiles")
+        .flat_map(|m| m["params"]["changes"].as_array().unwrap())
+        .filter(|event| event["uri"].as_str().unwrap().ends_with("created.rs"))
+        .map(|event| event["type"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, [1, 3]);
+    pool.close_all().await;
+}
+
+#[tokio::test]
+async fn project_inputs_and_deleted_open_files_retire_the_server_generation() {
+    let dir = TestDir::new("project-refresh");
+    let first = write_workspace(dir.path(), "fn first() {}\n");
+    let second = dir.path().join("src/second.rs");
+    std::fs::write(&second, "fn second() {}\n").unwrap();
+    let (pool, manager, config) = manager_with_mock(dir.path(), json!({}));
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    manager.hover(&query(dir.path(), &first)).await;
+    let generation = pool
+        .acquire_warm(
+            &root,
+            &rust_analyzer_spec(mock_binary()),
+            &config,
+            &json!({"rust-analyzer": config}),
+        )
+        .await
+        .unwrap()
+        .instance()
+        .id();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname='changed'\nversion='0.1.0'\n",
+    )
+    .unwrap();
+    let response = manager.hover(&query(dir.path(), &first)).await;
+    assert!(response.payload.get("error").is_none(), "{response:?}");
+    let renewed = pool
+        .acquire_warm(
+            &root,
+            &rust_analyzer_spec(mock_binary()),
+            &config,
+            &json!({"rust-analyzer": config}),
+        )
+        .await
+        .unwrap()
+        .instance()
+        .id();
+    assert_ne!(generation, renewed);
+    manager.hover(&query(dir.path(), &second)).await;
+    std::fs::remove_file(second).unwrap();
+    let response = manager.hover(&query(dir.path(), &first)).await;
+    assert!(response.payload.get("error").is_none(), "{response:?}");
+    let final_generation = pool
+        .acquire_warm(
+            &root,
+            &rust_analyzer_spec(mock_binary()),
+            &config,
+            &json!({"rust-analyzer": config}),
+        )
+        .await
+        .unwrap()
+        .instance()
+        .id();
+    assert_ne!(renewed, final_generation);
+    pool.close_all().await;
+}
+
+#[tokio::test]
+async fn discovery_tracks_a_new_nearer_manifest_and_its_removal() {
+    let dir = TestDir::new("root-refresh");
+    write_workspace(dir.path(), "fn first() {}\n");
+    let nested = dir.path().join("src/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let (pool, manager, _) = manager_with_mock(dir.path(), json!({}));
+    let outer_root = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        manager.status(&nested).await.payload["servers"][0]["root"],
+        outer_root
+    );
+    std::fs::write(nested.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let inner_root = std::fs::canonicalize(&nested)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        manager.status(&nested).await.payload["servers"][0]["root"],
+        inner_root
+    );
+    std::fs::remove_file(nested.join("Cargo.toml")).unwrap();
+    assert_eq!(
+        manager.status(&nested).await.payload["servers"][0]["root"],
+        outer_root
+    );
+    assert_eq!(pool.running_servers().await, 0);
+    pool.close_all().await;
+}
+
 async fn server_state(
     pool: &Arc<LspProcessPool>,
     root: &Path,
@@ -136,7 +318,12 @@ async fn server_state(
 ) -> Value {
     let root = std::fs::canonicalize(root).expect("canonical test root");
     let lease = pool
-        .acquire_warm(&root, "rust-analyzer", config)
+        .acquire_warm(
+            &root,
+            &rust_analyzer_spec(mock_binary()),
+            config,
+            &json!({"rust-analyzer": config}),
+        )
         .await
         .expect("warm mock server");
     let path = std::fs::canonicalize(path).expect("canonical test path");
@@ -408,8 +595,9 @@ async fn restart_reopens_document_with_full_did_open() {
     let lease = pool
         .acquire_warm(
             &std::fs::canonicalize(dir.path()).expect("canonical root"),
-            "rust-analyzer",
+            &rust_analyzer_spec(mock_binary()),
             &config,
+            &json!({"rust-analyzer": config}),
         )
         .await
         .expect("warm mock server");

@@ -26,6 +26,7 @@ use slim_core::codeintel::{
     MAX_CODE_INTEL_RESULTS,
 };
 
+use crate::discovery::{ServerOptions, ServerSpec, RUST_ANALYZER, TYPESCRIPT_LANGUAGE_SERVER};
 use crate::pool::{Lease, LspProcessPool, PoolConfig};
 use crate::position::{PositionCodec, PositionEncoding};
 
@@ -44,17 +45,17 @@ const MAX_REFERENCE_SCAN: usize = 65_536;
 const MAX_DISCOVERY_CACHE_ENTRIES: usize = 32;
 /// Edited files validated per batch; the rest is left to `code_intel`.
 const MAX_POST_EDIT_FILES: usize = 12;
+/// Workspace sources tried, shallowest first, to load a TypeScript project
+/// before a file-less symbol query.
+const MAX_WORKSPACE_ANCHOR_ATTEMPTS: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct LspManagerConfig {
     pub idle_shutdown: Option<Duration>,
     pub max_servers: usize,
     pub request_timeout: Duration,
-    /// initializationOptions + workspace/configuration section value.
-    pub server_config: Value,
     pub max_open_documents: usize,
-    /// Optional explicit binary path for the configured server.
-    pub server_path: Option<PathBuf>,
+    pub servers: BTreeMap<String, ServerOptions>,
 }
 
 impl Default for LspManagerConfig {
@@ -63,9 +64,11 @@ impl Default for LspManagerConfig {
             idle_shutdown: Some(Duration::from_secs(15 * 60)),
             max_servers: 4,
             request_timeout: Duration::from_secs(30),
-            server_config: json!({ "checkOnSave": false }),
             max_open_documents: crate::document::DEFAULT_MAX_OPEN_DOCUMENTS,
-            server_path: None,
+            servers: [RUST_ANALYZER, TYPESCRIPT_LANGUAGE_SERVER]
+                .into_iter()
+                .map(|id| (id.into(), ServerOptions::default()))
+                .collect(),
         }
     }
 }
@@ -74,7 +77,9 @@ pub struct LspCodeIntelligence {
     pool: Arc<LspProcessPool>,
     config: LspManagerConfig,
     discovery_cache: Mutex<HashMap<DiscoveryCacheKey, crate::discovery::DiscoveryResult>>,
-    workspace_revisions: Mutex<HashMap<PathBuf, u64>>,
+    /// Per root and server: a change seen by one profile must not invalidate
+    /// the results or continuation tokens of another profile on the same root.
+    workspace_revisions: Mutex<HashMap<(PathBuf, String), u64>>,
     stopped: AtomicBool,
 }
 
@@ -84,6 +89,14 @@ struct DiscoveryCacheKey {
     configured_server: Option<PathBuf>,
     config_hash: u64,
     path_generation: u64,
+}
+
+#[derive(Clone)]
+struct ResolvedServer {
+    root: PathBuf,
+    spec: ServerSpec,
+    initialization_options: Value,
+    settings: Value,
 }
 
 /// A live server plus the pool lease that keeps it alive for the complete
@@ -209,20 +222,138 @@ impl LspCodeIntelligence {
         self.pool.close_all().await;
     }
 
-    fn discovery_cache_key(&self, workspace: &Path) -> DiscoveryCacheKey {
-        let workspace = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.into());
-        let mut path_hasher = std::collections::hash_map::DefaultHasher::new();
-        std::env::var_os("PATH").hash(&mut path_hasher);
-        DiscoveryCacheKey {
-            workspace,
-            configured_server: self.config.server_path.clone(),
-            config_hash: crate::discovery::config_hash(&self.config.server_config),
-            path_generation: path_hasher.finish(),
+    fn profile_for_path(path: &Path) -> Option<&'static str> {
+        match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+            "rs" => Some(RUST_ANALYZER),
+            "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" => {
+                Some(TYPESCRIPT_LANGUAGE_SERVER)
+            }
+            _ => None,
         }
     }
 
-    fn discover(&self, workspace: &Path) -> crate::discovery::DiscoveryResult {
-        let key = self.discovery_cache_key(workspace);
+    fn enabled(&self, server: &str) -> bool {
+        self.config
+            .servers
+            .get(server)
+            .is_some_and(|options| options.enabled)
+    }
+
+    fn select_server(
+        &self,
+        workspace: &Path,
+        path: Option<&Path>,
+        filter: Option<&str>,
+    ) -> Result<String, CodeIntelOutcome> {
+        let inferred = path.and_then(Self::profile_for_path);
+        if path.is_some() && inferred.is_none() {
+            return Err(CodeIntelOutcome::unavailable(
+                "lsp",
+                "file extension is not served by a native LSP profile",
+            ));
+        }
+        if let Some(server) = filter {
+            if ![RUST_ANALYZER, TYPESCRIPT_LANGUAGE_SERVER].contains(&server) {
+                return Err(CodeIntelOutcome::unavailable(
+                    server,
+                    "unknown native LSP server",
+                ));
+            }
+            if inferred.is_some_and(|profile| profile != server) {
+                return Err(CodeIntelOutcome::unavailable(
+                    server,
+                    "server filter is incompatible with the file extension",
+                ));
+            }
+            if !self.enabled(server) {
+                return Err(CodeIntelOutcome::unavailable(
+                    server,
+                    "language server is disabled",
+                ));
+            }
+            return Ok(server.into());
+        }
+        if let Some(server) = inferred {
+            if !self.enabled(server) {
+                return Err(CodeIntelOutcome::unavailable(
+                    server,
+                    "language server is disabled",
+                ));
+            }
+            return Ok(server.into());
+        }
+        let mut applicable = Vec::new();
+        if self.enabled(RUST_ANALYZER)
+            && crate::discovery::find_root_marker(workspace, &["Cargo.toml"]).is_some()
+        {
+            applicable.push(RUST_ANALYZER);
+        }
+        if self.enabled(TYPESCRIPT_LANGUAGE_SERVER)
+            && ["package.json", "tsconfig.json", "jsconfig.json"]
+                .iter()
+                .any(|marker| workspace.join(marker).is_file())
+        {
+            applicable.push(TYPESCRIPT_LANGUAGE_SERVER);
+        }
+        if applicable.is_empty() && self.enabled(TYPESCRIPT_LANGUAGE_SERVER) {
+            applicable.push(TYPESCRIPT_LANGUAGE_SERVER);
+        }
+        match applicable.as_slice() {
+            [server] => Ok((*server).into()),
+            [] => Err(CodeIntelOutcome::unavailable(
+                "lsp",
+                "no enabled native LSP profile applies to this workspace",
+            )),
+            _ => Err(CodeIntelOutcome {
+                meta: CodeIntelOutcome::unavailable("lsp", "ambiguous language server").meta,
+                payload: json!({"error":format!("ambiguous language server ({}); repeat the query with server", applicable.join(", ")), "servers":applicable}),
+            }),
+        }
+    }
+
+    fn settings(&self, server: &str) -> (Value, Value) {
+        let options = &self.config.servers[server];
+        let defaults = if server == RUST_ANALYZER {
+            (
+                json!({"checkOnSave":false}),
+                json!({"rust-analyzer":{"checkOnSave":false}}),
+            )
+        } else {
+            // TLS can route early queries to a syntax-only project while the
+            // semantic project loads. Agent queries need the semantic result.
+            (
+                json!({"hostInfo":"slim","tsserver":{"useSyntaxServer":"never"}}),
+                json!({}),
+            )
+        };
+        (
+            options.initialization_options.clone().unwrap_or(defaults.0),
+            options.settings.clone().unwrap_or(defaults.1),
+        )
+    }
+
+    fn discover(&self, workspace: &Path, server: &str) -> crate::discovery::DiscoveryResult {
+        let options = &self.config.servers[server];
+        // Re-resolve npm metadata so a newly installed local server takes precedence.
+        if server == TYPESCRIPT_LANGUAGE_SERVER {
+            return crate::discovery::discover_server(
+                workspace,
+                server,
+                options.path.as_deref(),
+                options.args.as_deref(),
+            );
+        }
+        let mut path_hasher = std::collections::hash_map::DefaultHasher::new();
+        std::env::var_os("PATH").hash(&mut path_hasher);
+        let (initialization_options, settings) = self.settings(server);
+        let key = DiscoveryCacheKey {
+            workspace: std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.into()),
+            configured_server: options.path.clone(),
+            config_hash: crate::discovery::config_hash(
+                &json!({"args":options.args,"initialization_options":initialization_options,"settings":settings}),
+            ),
+            path_generation: path_hasher.finish(),
+        };
         let cached = self
             .discovery_cache
             .lock()
@@ -230,12 +361,10 @@ impl LspCodeIntelligence {
             .get(&key)
             .cloned();
         if let Some(cached) = cached {
-            // Cheap marker/binary stamps are checked outside the lock. This
-            // keeps successful entries current without repeating discovery.
-            let root_exists = cached
-                .root
-                .as_ref()
-                .is_some_and(|root| root.join("Cargo.toml").is_file());
+            let root_exists = cached.root.as_ref().is_some_and(|root| {
+                crate::discovery::find_root_marker(workspace, &["Cargo.toml"]).as_ref()
+                    == Some(root)
+            });
             let binary_exists = cached
                 .spec
                 .as_ref()
@@ -243,20 +372,18 @@ impl LspCodeIntelligence {
             if root_exists && binary_exists && !cached.binary_missing {
                 return cached;
             }
-            self.discovery_cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&key);
         }
-
-        // Directory walking and PATH probes deliberately happen outside the
-        // cache lock so unrelated workspaces cannot block each other.
-        let discovery =
-            crate::discovery::discover_for_workspace(workspace, self.config.server_path.as_deref());
+        let discovery = crate::discovery::discover_server(
+            workspace,
+            server,
+            options.path.as_deref(),
+            options.args.as_deref(),
+        );
         let mut cache = self
             .discovery_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.remove(&key);
         if cache.len() >= MAX_DISCOVERY_CACHE_ENTRIES {
             cache.clear();
         }
@@ -268,40 +395,85 @@ impl LspCodeIntelligence {
 
     fn resolve_discovery(
         &self,
+        server: &str,
         discovery: crate::discovery::DiscoveryResult,
-    ) -> Result<(PathBuf, crate::discovery::ServerSpec), CodeIntelOutcome> {
-        let Some(root) = discovery.root else {
-            return Err(CodeIntelOutcome::unavailable(
-                "rust-analyzer",
-                "no Cargo.toml found in the workspace (rust-analyzer serves Cargo projects only)",
-            ));
-        };
-        let Some(root) = crate::path_policy::canonical_root(&root) else {
-            return Err(CodeIntelOutcome::unavailable(
-                "rust-analyzer",
-                "workspace root is missing or cannot be canonicalized",
-            ));
-        };
-        let Some(spec) = discovery.spec else {
-            return Err(CodeIntelOutcome::unavailable(
-                "rust-analyzer",
-                "no language server configured for this workspace",
-            ));
-        };
+    ) -> Result<ResolvedServer, CodeIntelOutcome> {
+        let unavailable = |message: &str| CodeIntelOutcome::unavailable(server, message);
+        let root = discovery
+            .root
+            .ok_or_else(|| unavailable("no project root found for this language server"))?;
+        let root = crate::path_policy::canonical_root(&root)
+            .ok_or_else(|| unavailable("workspace root is missing or cannot be canonicalized"))?;
+        let spec = discovery
+            .spec
+            .ok_or_else(|| unavailable("no language server configured for this workspace"))?;
         if discovery.binary_missing {
-            return Err(CodeIntelOutcome::unavailable(
-                "rust-analyzer",
-                "rust-analyzer binary not found on PATH (install it or set lsp.servers.rust-analyzer.path in slim.toml)",
+            return Err(unavailable(
+                discovery
+                    .unavailable_reason
+                    .as_deref()
+                    .unwrap_or("language server binary is unavailable"),
             ));
         }
-        Ok((root, spec))
+        let (initialization_options, settings) = self.settings(server);
+        Ok(ResolvedServer {
+            root,
+            spec,
+            initialization_options,
+            settings,
+        })
     }
 
     fn resolve(
         &self,
         workspace: &Path,
-    ) -> Result<(PathBuf, crate::discovery::ServerSpec), CodeIntelOutcome> {
-        self.resolve_discovery(self.discover(workspace))
+        path: Option<&Path>,
+        filter: Option<&str>,
+    ) -> Result<ResolvedServer, CodeIntelOutcome> {
+        let hint = filter
+            .or_else(|| path.and_then(Self::profile_for_path))
+            .unwrap_or("lsp");
+        let root = crate::path_policy::canonical_root(workspace)
+            .ok_or_else(|| CodeIntelOutcome::unavailable(hint, "workspace is unavailable"))?;
+        let server = self.select_server(&root, path, filter)?;
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(CodeIntelOutcome::unavailable(
+                &server,
+                "language servers shut down",
+            ));
+        }
+        if path
+            .is_some_and(|path| crate::path_policy::existing_workspace_path(&root, path).is_none())
+        {
+            return Err(CodeIntelOutcome::unavailable(
+                &server,
+                "file is outside the workspace or unavailable",
+            ));
+        }
+        self.resolve_discovery(&server, self.discover(&root, &server))
+    }
+
+    async fn acquire_warm(&self, resolved: &ResolvedServer) -> Option<Lease> {
+        self.pool
+            .acquire_warm(
+                &resolved.root,
+                &resolved.spec,
+                &resolved.initialization_options,
+                &resolved.settings,
+            )
+            .await
+    }
+
+    async fn timed_query(
+        &self,
+        server: &str,
+        operation: impl std::future::Future<Output = CodeIntelOutcome>,
+    ) -> CodeIntelOutcome {
+        let started = Instant::now();
+        match tokio::time::timeout(self.config.request_timeout, operation).await {
+            Ok(outcome) => outcome,
+            Err(_) => Self::degraded(server, "language server query deadline exceeded", started),
+        }
     }
 
     /// Continuation token binding a result page to both the workspace
@@ -311,21 +483,23 @@ impl LspCodeIntelligence {
         (instance_id << 32) ^ workspace_revision
     }
 
-    fn workspace_revision(&self, root: &Path) -> u64 {
+    fn workspace_revision(&self, root: &Path, server: &str) -> u64 {
         self.workspace_revisions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(root)
+            .get(&(root.to_path_buf(), server.to_owned()))
             .copied()
             .unwrap_or(0)
     }
 
-    fn bump_workspace_revision(&self, root: &Path) {
+    fn bump_workspace_revision(&self, root: &Path, server: &str) {
         let mut revisions = self
             .workspace_revisions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let revision = revisions.entry(root.to_path_buf()).or_insert(0);
+        let revision = revisions
+            .entry((root.to_path_buf(), server.to_owned()))
+            .or_insert(0);
         *revision = revision.saturating_add(1);
     }
 
@@ -338,17 +512,38 @@ impl LspCodeIntelligence {
 
     async fn acquire(
         &self,
-        root: PathBuf,
-        spec: crate::discovery::ServerSpec,
+        resolved: ResolvedServer,
         cancellation: Option<&slim_core::runtime::CancellationToken>,
     ) -> Result<AcquiredServer, CodeIntelOutcome> {
-        let acquire = self.pool.acquire(
-            root,
-            spec,
-            &self.config.server_config,
-            self.transport_options(),
-            self.config.max_open_documents,
-        );
+        let root = &resolved.root;
+        let server = &resolved.spec.id;
+        let acquire = async {
+            for _ in 0..2 {
+                let lease = self
+                    .pool
+                    .acquire(
+                        root.clone(),
+                        resolved.spec.clone(),
+                        &resolved.initialization_options,
+                        &resolved.settings,
+                        self.transport_options(),
+                        self.config.max_open_documents,
+                    )
+                    .await
+                    .map_err(|error| {
+                        crate::transport::TransportError::Protocol(error.to_string())
+                    })?;
+                if lease.instance().refresh_workspace().await? {
+                    self.bump_workspace_revision(root, server);
+                }
+                if !lease.instance().is_closed() {
+                    return Ok(lease);
+                }
+            }
+            Err(crate::transport::TransportError::Protocol(
+                "workspace changed again during server refresh; retry the query".into(),
+            ))
+        };
         let cancelled = async {
             match cancellation {
                 Some(token) => token.cancelled().await,
@@ -357,13 +552,14 @@ impl LspCodeIntelligence {
         };
         let lease = tokio::select! {
             biased;
-            _ = cancelled => return Err(CodeIntelOutcome::unavailable("rust-analyzer", "request cancelled during server acquisition")),
+            _ = cancelled => return Err(CodeIntelOutcome::unavailable(server, "request cancelled during server acquisition")),
             result = acquire => result,
-        }.map_err(|error| CodeIntelOutcome::unavailable("rust-analyzer", &error.to_string()))?;
+        }.map_err(|error| CodeIntelOutcome::unavailable(server, &error.to_string()))?;
         Ok(AcquiredServer::new(lease))
     }
 
     fn base_meta(
+        server: &str,
         state: CodeIntelServerState,
         completeness: CodeIntelCompleteness,
         document_version: Option<i64>,
@@ -371,7 +567,7 @@ impl LspCodeIntelligence {
         started: Instant,
     ) -> CodeIntelMeta {
         CodeIntelMeta {
-            server: "rust-analyzer".into(),
+            server: server.into(),
             state,
             completeness,
             document_version,
@@ -399,9 +595,10 @@ impl LspCodeIntelligence {
         }
     }
 
-    fn degraded(error: &str, started: Instant) -> CodeIntelOutcome {
+    fn degraded(server: &str, error: &str, started: Instant) -> CodeIntelOutcome {
         CodeIntelOutcome {
             meta: Self::base_meta(
+                server,
                 CodeIntelServerState::Degraded,
                 CodeIntelCompleteness::Unknown,
                 None,
@@ -489,7 +686,9 @@ impl LspCodeIntelligence {
         instance: &crate::instance::LspServerInstance,
         document: &SyncedDocument,
     ) -> bool {
-        if self.workspace_revision(instance.root()) != document.workspace_revision {
+        if self.workspace_revision(instance.root(), &instance.spec().id)
+            != document.workspace_revision
+        {
             return true;
         }
         let Some((version, _content)) = instance
@@ -513,6 +712,7 @@ impl LspCodeIntelligence {
         started: Instant,
     ) -> CodeIntelMeta {
         Self::base_meta(
+            &instance.spec().id,
             state,
             completeness,
             Some(document.version),
@@ -723,111 +923,107 @@ fn parse_location(
 
 #[async_trait::async_trait]
 impl CodeIntelligence for LspCodeIntelligence {
-    fn supports_workspace(&self, workspace: &Path) -> bool {
-        !self.stopped.load(Ordering::Acquire) && self.resolve(workspace).is_ok()
+    fn supports_workspace(&self, _workspace: &Path) -> bool {
+        !self.stopped.load(Ordering::Acquire)
+            && [RUST_ANALYZER, TYPESCRIPT_LANGUAGE_SERVER]
+                .into_iter()
+                .any(|server| self.enabled(server))
     }
 
     async fn status(&self, workspace: &Path) -> CodeIntelOutcome {
         let started = Instant::now();
-        let discovery = self.discover(workspace);
-        let binary_missing = discovery.binary_missing;
-        let no_root = discovery.root.is_none();
-        let mut servers: Vec<Value> = Vec::new();
-        let baseline_summary;
-        if let Some(discovered_root) = discovery.root.as_ref() {
-            let root = crate::path_policy::canonical_root(discovered_root)
-                .unwrap_or_else(|| discovered_root.clone());
-            let binary = discovery
-                .spec
-                .as_ref()
-                .map(|spec| spec.command.clone())
-                .unwrap_or_else(|| "rust-analyzer".into());
-            servers.push(json!({
-                "server": "rust-analyzer",
-                "root": root.to_string_lossy(),
-                "binary": binary,
-                "binary_missing": discovery.binary_missing,
-                "state": if discovery.binary_missing { "unavailable" } else { "configured" },
-                "language": "rust",
-            }));
-            baseline_summary = if discovery.binary_missing {
-                "rust-analyzer: configured for this workspace but the binary is not available"
-                    .into()
-            } else {
-                "rust-analyzer: configured for this workspace".into()
-            };
-        } else {
-            baseline_summary =
-                "no Cargo.toml found for this workspace; rust-analyzer stays inactive".into();
-        }
-        let mut summary = baseline_summary;
-        if let Ok((root, spec)) = self.resolve_discovery(discovery) {
-            if let Some(instance) = self
-                .pool
-                .acquire_warm(&root, &spec.id, &self.config.server_config)
-                .await
-            {
-                let snapshot = instance.instance().snapshot().await;
-                if let Some(server) = servers.iter_mut().find(|server| {
-                    server.get("server").and_then(Value::as_str) == Some("rust-analyzer")
-                }) {
-                    let state = if snapshot.indexing_active {
+        let stopped = self.stopped.load(Ordering::Acquire);
+        let mut servers = Vec::new();
+        let mut ready = false;
+        let mut indexing = false;
+        let mut configured = false;
+        for (id, options) in &self.config.servers {
+            if ![RUST_ANALYZER, TYPESCRIPT_LANGUAGE_SERVER].contains(&id.as_str()) {
+                servers.push(json!({"server":id,"state":"unsupported","reason":"unknown native LSP profile"}));
+                continue;
+            }
+            if stopped || !options.enabled {
+                servers.push(json!({"server":id,"state":if stopped {"stopped"} else {"disabled"}}));
+                continue;
+            }
+            let discovery = self.discover(workspace, id);
+            let mut row = json!({
+                "server":id,
+                "root":discovery.root.as_ref().map(|root| crate::path_policy::canonical_root(root).unwrap_or_else(|| root.clone())),
+                "binary":discovery.spec.as_ref().map(|spec| &spec.command),
+                "binary_missing":discovery.binary_missing,
+                "reason":discovery.unavailable_reason,
+                "state":if discovery.binary_missing || discovery.root.is_none() {"unavailable"} else {"configured"},
+            });
+            configured |= !discovery.binary_missing && discovery.root.is_some();
+            if let Ok(resolved) = self.resolve_discovery(id, discovery) {
+                if let Some(lease) = self.acquire_warm(&resolved).await {
+                    let snapshot = lease.instance().snapshot().await;
+                    indexing |= snapshot.indexing_active;
+                    ready |= !snapshot.indexing_active;
+                    row["state"] = json!(if snapshot.indexing_active {
                         "indexing"
                     } else {
                         "ready"
-                    };
-                    server["state"] = json!(state);
-                    server["indexing"] = json!(snapshot.indexing_active);
-                    server["indexing_observed"] = json!(snapshot.indexing_observed);
-                    server["open_documents"] = json!(snapshot.open_documents);
-                    server["diagnostic_uris"] = json!(snapshot.diagnostic_uris);
-                    summary = format!(
-                        "rust-analyzer {state} ({} open document(s))",
-                        snapshot.open_documents
-                    );
+                    });
+                    row["indexing"] = json!(snapshot.indexing_active);
+                    row["indexing_observed"] = json!(snapshot.indexing_observed);
+                    row["open_documents"] = json!(snapshot.open_documents);
+                    row["diagnostic_uris"] = json!(snapshot.diagnostic_uris);
                 }
             }
+            servers.push(row);
         }
-        let stopped = self.stopped.load(Ordering::Acquire);
-        let state = if servers
-            .iter()
-            .any(|server| server.get("state").and_then(Value::as_str) == Some("ready"))
-        {
-            CodeIntelServerState::Ready
-        } else if stopped {
+        let state = if stopped {
             CodeIntelServerState::Stopped
-        } else if binary_missing || no_root {
-            CodeIntelServerState::Unavailable
-        } else {
+        } else if indexing {
+            CodeIntelServerState::Indexing
+        } else if ready {
+            CodeIntelServerState::Ready
+        } else if configured {
+            // Launchable but not started yet: servers start on first query.
             CodeIntelServerState::Starting
+        } else {
+            CodeIntelServerState::Unavailable
         };
-        if stopped {
-            summary = "rust-analyzer shut down".into();
-        }
+        let server = if self.config.servers.len() == 1 {
+            self.config.servers.keys().next().unwrap().as_str()
+        } else {
+            "lsp"
+        };
         CodeIntelOutcome {
-            meta: Self::base_meta(state, CodeIntelCompleteness::Complete, None, false, started),
-            payload: json!({ "servers": servers, "summary": summary }),
+            meta: Self::base_meta(
+                server,
+                state,
+                CodeIntelCompleteness::Unknown,
+                None,
+                false,
+                started,
+            ),
+            payload: json!({"servers":servers,"summary":if stopped {"language servers shut down"} else {"native language servers start automatically on semantic queries; configured does not mean running"}}),
         }
     }
 
     async fn definition(&self, query: &CodeIntelPositionQuery) -> CodeIntelOutcome {
+        self.timed_query(Self::profile_for_path(&query.path).unwrap_or("lsp"), async {
         let started = Instant::now();
-        let (root, spec) = match self.resolve(&query.workspace) {
-            Ok(pair) => pair,
+        let resolved = match self.resolve(&query.workspace, Some(&query.path), None) {
+            Ok(resolved) => resolved,
             Err(outcome) => return outcome,
         };
+        let root = resolved.root.clone();
         let instance = match self
-            .acquire(root.clone(), spec, query.cancellation.as_ref())
+            .acquire(resolved, query.cancellation.as_ref())
             .await
         {
             Ok(instance) => instance,
             Err(outcome) => return outcome,
         };
-        let mut documents = OperationDocuments::new(&root, self.workspace_revision(&root));
+        let mut documents = OperationDocuments::new(&root, self.workspace_revision(&root, &instance.spec().id));
         let Some(document) = Self::ensure_document(&instance, &mut documents, &query.path).await
         else {
             return CodeIntelOutcome::unavailable(
-                "rust-analyzer",
+                &instance.spec().id,
                 "file is outside the workspace, too large, unreadable, or not served",
             );
         };
@@ -961,26 +1157,29 @@ impl CodeIntelligence for LspCodeIntelligence {
                 "locations_out_of_scope": locations_out_of_scope,
             }),
         }
+        }).await
     }
 
     async fn references(&self, query: &CodeIntelPositionQuery) -> CodeIntelOutcome {
+        self.timed_query(Self::profile_for_path(&query.path).unwrap_or("lsp"), async {
         let started = Instant::now();
         let max_results = query.max_results.clamp(1, MAX_CODE_INTEL_RESULTS);
-        let (root, spec) = match self.resolve(&query.workspace) {
-            Ok(pair) => pair,
+        let resolved = match self.resolve(&query.workspace, Some(&query.path), None) {
+            Ok(resolved) => resolved,
             Err(outcome) => return outcome,
         };
+        let root = resolved.root.clone();
         let instance = match self
-            .acquire(root.clone(), spec, query.cancellation.as_ref())
+            .acquire(resolved, query.cancellation.as_ref())
             .await
         {
             Ok(instance) => instance,
             Err(outcome) => return outcome,
         };
-        let mut documents = OperationDocuments::new(&root, self.workspace_revision(&root));
+        let mut documents = OperationDocuments::new(&root, self.workspace_revision(&root, &instance.spec().id));
         let revision = Self::page_revision(documents.workspace_revision, instance.id());
         if query.revision.is_some_and(|expected| expected != revision) {
-            return Self::degraded(
+            return Self::degraded(&instance.spec().id,
                 "workspace or server state changed since the previous page; re-run with \"offset\": 0",
                 started,
             );
@@ -988,7 +1187,7 @@ impl CodeIntelligence for LspCodeIntelligence {
         let Some(document) = Self::ensure_document(&instance, &mut documents, &query.path).await
         else {
             return CodeIntelOutcome::unavailable(
-                "rust-analyzer",
+                &instance.spec().id,
                 "file is outside the workspace, too large, unreadable, or not served",
             );
         };
@@ -1124,109 +1323,129 @@ impl CodeIntelligence for LspCodeIntelligence {
                 "symbol": query.symbol.clone(),
             }),
         }
+        }).await
     }
 
     async fn hover(&self, query: &CodeIntelPositionQuery) -> CodeIntelOutcome {
-        let started = Instant::now();
-        let (root, spec) = match self.resolve(&query.workspace) {
-            Ok(pair) => pair,
-            Err(outcome) => return outcome,
-        };
-        let instance = match self
-            .acquire(root.clone(), spec, query.cancellation.as_ref())
-            .await
-        {
-            Ok(instance) => instance,
-            Err(outcome) => return outcome,
-        };
-        let mut documents = OperationDocuments::new(&root, self.workspace_revision(&root));
-        let Some(document) = Self::ensure_document(&instance, &mut documents, &query.path).await
-        else {
-            return CodeIntelOutcome::unavailable(
-                "rust-analyzer",
-                "file is outside the workspace, too large, unreadable, or not served",
-            );
-        };
-        let snapshot = instance.snapshot().await;
-        let encoding = snapshot.encoding;
-        let (state, completeness) = Self::indexing_state(&snapshot);
-        let Some((lsp_line, lsp_char)) =
-            Self::human_to_lsp(encoding, &document.content, query.line, query.column)
-        else {
-            return CodeIntelOutcome {
-                meta: self
-                    .document_meta(&instance, &document, state, completeness, started)
-                    .await,
-                payload: json!({ "error": "position is outside the file" }),
-            };
-        };
-        let Some(uri) = file_uri_string(&document.path) else {
-            return self
-                .degraded_document(
-                    &instance,
-                    &document,
-                    "failed to convert document path to URI",
-                    started,
-                )
-                .await;
-        };
-        let response_value = match instance
-            .request_value_cancellable(
-                "textDocument/hover",
-                json!({
-                    "textDocument": { "uri": uri },
-                    "position": { "line": lsp_line, "character": lsp_char },
-                }),
-                query.cancellation.as_ref(),
-            )
-            .await
-        {
-            Ok(value) => value,
-            Err(error) => {
-                return self
-                    .degraded_document(&instance, &document, &error.to_string(), started)
-                    .await;
-            }
-        };
-        let payload = match serde_json::from_value::<Option<lsp_types::Hover>>(response_value) {
-            Ok(Some(hover)) => {
-                let raw = hover_text(&hover.contents);
-                let text = truncate_text(&raw, MAX_HOVER_TEXT_CHARS);
-                json!({
-                    "found": !raw.is_empty(),
-                    "text": text,
-                    "truncated": text != raw,
-                })
-            }
-            Ok(None) => json!({ "found": false, "text": "", "truncated": false }),
-            Err(error) => {
-                return self
-                    .degraded_document(
-                        &instance,
-                        &document,
-                        &format!("hover response: {error}"),
-                        started,
+        self.timed_query(
+            Self::profile_for_path(&query.path).unwrap_or("lsp"),
+            async {
+                let started = Instant::now();
+                let resolved = match self.resolve(&query.workspace, Some(&query.path), None) {
+                    Ok(resolved) => resolved,
+                    Err(outcome) => return outcome,
+                };
+                let root = resolved.root.clone();
+                let instance = match self.acquire(resolved, query.cancellation.as_ref()).await {
+                    Ok(instance) => instance,
+                    Err(outcome) => return outcome,
+                };
+                let mut documents = OperationDocuments::new(
+                    &root,
+                    self.workspace_revision(&root, &instance.spec().id),
+                );
+                let Some(document) =
+                    Self::ensure_document(&instance, &mut documents, &query.path).await
+                else {
+                    return CodeIntelOutcome::unavailable(
+                        &instance.spec().id,
+                        "file is outside the workspace, too large, unreadable, or not served",
+                    );
+                };
+                let snapshot = instance.snapshot().await;
+                let encoding = snapshot.encoding;
+                let (state, completeness) = Self::indexing_state(&snapshot);
+                let Some((lsp_line, lsp_char)) =
+                    Self::human_to_lsp(encoding, &document.content, query.line, query.column)
+                else {
+                    return CodeIntelOutcome {
+                        meta: self
+                            .document_meta(&instance, &document, state, completeness, started)
+                            .await,
+                        payload: json!({ "error": "position is outside the file" }),
+                    };
+                };
+                let Some(uri) = file_uri_string(&document.path) else {
+                    return self
+                        .degraded_document(
+                            &instance,
+                            &document,
+                            "failed to convert document path to URI",
+                            started,
+                        )
+                        .await;
+                };
+                let response_value = match instance
+                    .request_value_cancellable(
+                        "textDocument/hover",
+                        json!({
+                            "textDocument": { "uri": uri },
+                            "position": { "line": lsp_line, "character": lsp_char },
+                        }),
+                        query.cancellation.as_ref(),
                     )
                     .await
-            }
-        };
-        CodeIntelOutcome {
-            meta: self
-                .document_meta(&instance, &document, state, completeness, started)
-                .await,
-            payload,
-        }
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return self
+                            .degraded_document(&instance, &document, &error.to_string(), started)
+                            .await;
+                    }
+                };
+                let payload =
+                    match serde_json::from_value::<Option<lsp_types::Hover>>(response_value) {
+                        Ok(Some(hover)) => {
+                            let raw = hover_text(&hover.contents);
+                            let text = truncate_text(&raw, MAX_HOVER_TEXT_CHARS);
+                            json!({
+                                "found": !raw.is_empty(),
+                                "text": text,
+                                "truncated": text != raw,
+                            })
+                        }
+                        Ok(None) => json!({ "found": false, "text": "", "truncated": false }),
+                        Err(error) => {
+                            return self
+                                .degraded_document(
+                                    &instance,
+                                    &document,
+                                    &format!("hover response: {error}"),
+                                    started,
+                                )
+                                .await
+                        }
+                    };
+                CodeIntelOutcome {
+                    meta: self
+                        .document_meta(&instance, &document, state, completeness, started)
+                        .await,
+                    payload,
+                }
+            },
+        )
+        .await
     }
 
     async fn symbols(&self, query: &CodeIntelSymbolQuery) -> CodeIntelOutcome {
-        let started = Instant::now();
-        let max_results = query.max_results.clamp(1, MAX_CODE_INTEL_RESULTS);
-        let (root, spec) = match self.resolve(&query.workspace) {
-            Ok(pair) => pair,
+        let selected = match self.select_server(
+            &query.workspace,
+            query.path.as_deref(),
+            query.server.as_deref(),
+        ) {
+            Ok(server) => server,
             Err(outcome) => return outcome,
         };
+        self.timed_query(&selected, async {
+        let started = Instant::now();
+        let max_results = query.max_results.clamp(1, MAX_CODE_INTEL_RESULTS);
+        let resolved = match self.resolve(&query.workspace, query.path.as_deref(), Some(&selected)) {
+            Ok(resolved) => resolved,
+            Err(outcome) => return outcome,
+        };
+        let root = resolved.root.clone();
         let instance = match self
-            .acquire(root.clone(), spec, query.cancellation.as_ref())
+            .acquire(resolved, query.cancellation.as_ref())
             .await
         {
             Ok(instance) => instance,
@@ -1235,10 +1454,10 @@ impl CodeIntelligence for LspCodeIntelligence {
         let snapshot = instance.snapshot().await;
         let encoding = snapshot.encoding;
         let (state, completeness) = Self::indexing_state(&snapshot);
-        let mut documents = OperationDocuments::new(&root, self.workspace_revision(&root));
+        let mut documents = OperationDocuments::new(&root, self.workspace_revision(&root, &instance.spec().id));
         let revision = Self::page_revision(documents.workspace_revision, instance.id());
         if query.revision.is_some_and(|expected| expected != revision) {
-            return Self::degraded(
+            return Self::degraded(&instance.spec().id,
                 "workspace or server state changed since the previous page; re-run with \"offset\": 0",
                 started,
             );
@@ -1249,7 +1468,7 @@ impl CodeIntelligence for LspCodeIntelligence {
             let Some(document) = Self::ensure_document(&instance, &mut documents, path).await
             else {
                 return CodeIntelOutcome::unavailable(
-                    "rust-analyzer",
+                    &instance.spec().id,
                     "file is outside the workspace, too large, unreadable, or not served",
                 );
             };
@@ -1435,6 +1654,38 @@ impl CodeIntelligence for LspCodeIntelligence {
             };
         }
 
+        let completeness = if instance.spec().id == TYPESCRIPT_LANGUAGE_SERVER {
+            // tsserver has no loaded project until a source has been opened.
+            // One anchor initializes a project without promising coverage of
+            // every nested configuration in the authorized workspace.
+            // An oversized, unreadable or non-UTF-8 shallowest source (e.g. a
+            // generated bundle) must not block the query: try the next ones.
+            let anchors = instance
+                .workspace_source_anchors(MAX_WORKSPACE_ANCHOR_ATTEMPTS)
+                .await;
+            let mut opened = anchors.is_empty();
+            for anchor in &anchors {
+                if instance.is_closed() {
+                    break;
+                }
+                if Self::ensure_document(&instance, &mut documents, anchor)
+                    .await
+                    .is_some()
+                {
+                    opened = true;
+                    break;
+                }
+            }
+            if !opened {
+                return CodeIntelOutcome::unavailable(
+                    &instance.spec().id,
+                    "workspace source could not be opened to load the TypeScript project",
+                );
+            }
+            CodeIntelCompleteness::Unknown
+        } else {
+            completeness
+        };
         let params = WorkspaceSymbolParams {
             query: query.query.clone().unwrap_or_default(),
             ..Default::default()
@@ -1448,7 +1699,7 @@ impl CodeIntelligence for LspCodeIntelligence {
             .await
         {
             Ok(value) => value,
-            Err(error) => return Self::degraded(&error.to_string(), started),
+            Err(error) => return Self::degraded(&instance.spec().id, &error.to_string(), started),
         };
         let response =
             match serde_json::from_value::<Option<WorkspaceSymbolResponse>>(response_value) {
@@ -1456,7 +1707,7 @@ impl CodeIntelligence for LspCodeIntelligence {
                     response.unwrap_or_else(|| WorkspaceSymbolResponse::Flat(Vec::new()))
                 }
                 Err(error) => {
-                    return Self::degraded(
+                    return Self::degraded(&instance.spec().id,
                         &format!("workspace symbols response: {error}"),
                         started,
                     );
@@ -1568,7 +1819,7 @@ impl CodeIntelligence for LspCodeIntelligence {
         }
         let shown = symbols.len();
         CodeIntelOutcome {
-            meta: Self::base_meta(state, completeness, None, false, started),
+            meta: Self::base_meta(&instance.spec().id, state, completeness, None, false, started),
             payload: json!({
                 "kind": "workspace",
                 "query": query.query.clone(),
@@ -1582,304 +1833,390 @@ impl CodeIntelligence for LspCodeIntelligence {
                 "symbols": symbols,
             }),
         }
+        }).await
     }
 
     async fn diagnostics(&self, query: &CodeIntelDiagnosticsQuery) -> CodeIntelOutcome {
-        let started = Instant::now();
-        let max_results = query.max_results.clamp(1, MAX_CODE_INTEL_RESULTS);
-        let (root, spec) = match self.resolve(&query.workspace) {
-            Ok(pair) => pair,
+        let selected = match self.select_server(
+            &query.workspace,
+            query.path.as_deref(),
+            query.server.as_deref(),
+        ) {
+            Ok(server) => server,
             Err(outcome) => return outcome,
         };
-        let instance = match self
-            .acquire(root.clone(), spec, query.cancellation.as_ref())
-            .await
-        {
-            Ok(instance) => instance,
-            Err(outcome) => return outcome,
-        };
-        if query
-            .cancellation
-            .as_ref()
-            .is_some_and(slim_core::runtime::CancellationToken::is_cancelled)
-        {
-            return Self::degraded("diagnostics query cancelled", started);
-        }
-        let snapshot = instance.snapshot().await;
-        let encoding = snapshot.encoding;
-        let mut documents = OperationDocuments::new(&root, self.workspace_revision(&root));
-        let (state, completeness) = Self::indexing_state(&snapshot);
-
-        if let Some(path) = &query.path {
-            let Some(document) = Self::ensure_document(&instance, &mut documents, path).await
-            else {
-                return CodeIntelOutcome::unavailable(
-                    "rust-analyzer",
-                    "file is outside the workspace, too large, unreadable, or not served",
-                );
+        self.timed_query(&selected, async {
+            let started = Instant::now();
+            let max_results = query.max_results.clamp(1, MAX_CODE_INTEL_RESULTS);
+            let resolved =
+                match self.resolve(&query.workspace, query.path.as_deref(), Some(&selected)) {
+                    Ok(resolved) => resolved,
+                    Err(outcome) => return outcome,
+                };
+            let root = resolved.root.clone();
+            let instance = match self.acquire(resolved, query.cancellation.as_ref()).await {
+                Ok(instance) => instance,
+                Err(outcome) => return outcome,
             };
             if query
                 .cancellation
                 .as_ref()
                 .is_some_and(slim_core::runtime::CancellationToken::is_cancelled)
             {
-                return self
-                    .degraded_document(&instance, &document, "diagnostics query cancelled", started)
-                    .await;
+                return Self::degraded(&instance.spec().id, "diagnostics query cancelled", started);
             }
-            let Some(uri) = crate::instance::file_uri(&document.path) else {
-                return self
-                    .degraded_document(
-                        &instance,
-                        &document,
-                        "failed to convert document path to URI",
-                        started,
+            let snapshot = instance.snapshot().await;
+            let encoding = snapshot.encoding;
+            let mut documents =
+                OperationDocuments::new(&root, self.workspace_revision(&root, &instance.spec().id));
+            let (state, completeness) = Self::indexing_state(&snapshot);
+
+            if let Some(path) = &query.path {
+                let Some(document) = Self::ensure_document(&instance, &mut documents, path).await
+                else {
+                    return CodeIntelOutcome::unavailable(
+                        &instance.spec().id,
+                        "file is outside the workspace, too large, unreadable, or not served",
+                    );
+                };
+                if query
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(slim_core::runtime::CancellationToken::is_cancelled)
+                {
+                    return self
+                        .degraded_document(
+                            &instance,
+                            &document,
+                            "diagnostics query cancelled",
+                            started,
+                        )
+                        .await;
+                }
+                let Some(uri) = crate::instance::file_uri(&document.path) else {
+                    return self
+                        .degraded_document(
+                            &instance,
+                            &document,
+                            "failed to convert document path to URI",
+                            started,
+                        )
+                        .await;
+                };
+                instance
+                    .wait_for_diagnostics(
+                        &document.path,
+                        tokio::time::Instant::now() + Duration::from_millis(400),
+                        query.cancellation.as_ref(),
                     )
                     .await;
-            };
-            let diagnostics = instance
-                .diagnostics_snapshot(&uri, query.include_info)
-                .await;
-            let diagnostic_version = diagnostics.as_ref().and_then(|stored| stored.version);
-            let received = diagnostics.is_some();
-            let publication_stale = diagnostics.as_ref().is_some_and(|stored| stored.stale);
-            let total = diagnostics.as_ref().map(|stored| stored.total);
-            let storage_truncated = diagnostics.as_ref().is_some_and(|stored| stored.truncated);
-            let mut rows = Vec::new();
-            if let Some(diagnostics) = diagnostics {
-                for item in diagnostics.items.into_iter().take(max_results) {
-                    rows.push(Self::diagnostic_row(encoding, &document.content, item));
+                if query
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(slim_core::runtime::CancellationToken::is_cancelled)
+                {
+                    return self
+                        .degraded_document(
+                            &instance,
+                            &document,
+                            "diagnostics query cancelled",
+                            started,
+                        )
+                        .await;
                 }
+                if instance.is_closed() {
+                    return self
+                        .degraded_document(
+                            &instance,
+                            &document,
+                            "server closed during diagnostics wait",
+                            started,
+                        )
+                        .await;
+                }
+                let diagnostics = instance
+                    .diagnostics_snapshot(&uri, query.include_info)
+                    .await;
+                let diagnostic_version = diagnostics.as_ref().and_then(|stored| stored.version);
+                let received = diagnostics.is_some();
+                let publication_stale = diagnostics.as_ref().is_some_and(|stored| stored.stale);
+                let total = diagnostics.as_ref().map(|stored| stored.total);
+                let storage_truncated = diagnostics.as_ref().is_some_and(|stored| stored.truncated);
+                let mut rows = Vec::new();
+                if let Some(diagnostics) = diagnostics {
+                    for item in diagnostics.items.into_iter().take(max_results) {
+                        rows.push(Self::diagnostic_row(encoding, &document.content, item));
+                    }
+                }
+                let stale = self.document_is_stale(&instance, &document).await
+                    || publication_stale
+                    || diagnostic_version.is_some_and(|version| version != document.version);
+                let has_more = total.is_some_and(|total| total > rows.len());
+                // A versionless publication can be useful, but cannot certify
+                // which document version the server actually validated.
+                let completeness = if !received || stale || diagnostic_version.is_none() {
+                    CodeIntelCompleteness::Unknown
+                } else if has_more || storage_truncated {
+                    CodeIntelCompleteness::Partial
+                } else {
+                    completeness
+                };
+                let file = documents.relative_path(&document.path).unwrap_or_default();
+                return CodeIntelOutcome {
+                    meta: Self::base_meta(
+                        &instance.spec().id,
+                        state,
+                        completeness,
+                        Some(document.version),
+                        stale,
+                        started,
+                    ),
+                    payload: json!({
+                        "shown": rows.len(),
+                        "total": total,
+                        "has_more": has_more,
+                        "storage_truncated": storage_truncated,
+                        "files": [{
+                            "file": file,
+                            "count": rows.len(),
+                            "document_version": document.version,
+                            "diagnostic_version": diagnostic_version,
+                            "received": received,
+                            "stale": stale,
+                            "diagnostics": rows,
+                        }]
+                    }),
+                };
             }
-            let stale = self.document_is_stale(&instance, &document).await
-                || publication_stale
-                || diagnostic_version.is_some_and(|version| version != document.version);
-            let has_more = total.is_some_and(|total| total > rows.len());
-            // A versionless publication can be useful, but cannot certify
-            // which document version the server actually validated.
-            let completeness = if !received || stale || diagnostic_version.is_none() {
-                CodeIntelCompleteness::Unknown
-            } else if has_more || storage_truncated {
-                CodeIntelCompleteness::Partial
-            } else {
-                completeness
-            };
-            let file = documents.relative_path(&document.path).unwrap_or_default();
-            return CodeIntelOutcome {
-                meta: Self::base_meta(state, completeness, Some(document.version), stale, started),
-                payload: json!({
-                    "shown": rows.len(),
-                    "total": total,
-                    "has_more": has_more,
-                    "storage_truncated": storage_truncated,
-                    "files": [{
-                        "file": file,
-                        "count": rows.len(),
-                        "document_version": document.version,
-                        "diagnostic_version": diagnostic_version,
-                        "received": received,
-                        "stale": stale,
-                        "diagnostics": rows,
-                    }]
-                }),
-            };
-        }
 
-        let (mut published_total, mut storage_truncated, publication_revision) =
-            instance.diagnostic_totals(query.include_info).await;
-        let mut total = 0_usize;
-        let mut any_stale = false;
-        let mut files = Vec::new();
-        for uri in instance.diagnostic_uris().await {
-            if total >= max_results {
-                break;
-            }
-            if query
-                .cancellation
-                .as_ref()
-                .is_some_and(slim_core::runtime::CancellationToken::is_cancelled)
-            {
-                return Self::degraded("diagnostics query cancelled", started);
-            }
-            let Some(path) = documents.resolve_url(&uri) else {
-                continue;
-            };
-            let Some(file) = documents.relative_path(&path) else {
-                continue;
-            };
-            let Some(diagnostics) = instance
-                .diagnostics_snapshot(&uri, query.include_info)
-                .await
-            else {
-                continue;
-            };
-            let document = instance.document_content_snapshot_async(&path).await;
-            let document_version = document.as_ref().map(|(version, _)| *version);
-            let stamp_stale = document
-                .as_ref()
-                .is_none_or(|(_, content)| !content.stamp_matches_path(&path));
-            let stale = diagnostics.stale
-                || diagnostics
-                    .version
-                    .zip(document_version)
-                    .is_some_and(|(published, version)| published != version)
-                || stamp_stale;
-            let content = match document.as_ref() {
-                Some((_, content)) if !stamp_stale => Arc::clone(content),
-                _ => match documents.load(&path) {
-                    Some((_path, content)) => content,
-                    None => match document.as_ref() {
-                        Some((_, content)) => Arc::clone(content),
-                        None => continue,
-                    },
-                },
-            };
-            any_stale |= stale;
-            let mut rows = Vec::new();
-            for item in diagnostics.items {
+            let (mut published_total, mut storage_truncated, publication_revision) =
+                instance.diagnostic_totals(query.include_info).await;
+            let mut total = 0_usize;
+            let mut any_stale = false;
+            let mut files = Vec::new();
+            for uri in instance.diagnostic_uris().await {
                 if total >= max_results {
                     break;
                 }
-                rows.push(Self::diagnostic_row(encoding, &content, item));
-                total = total.saturating_add(1);
+                if query
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(slim_core::runtime::CancellationToken::is_cancelled)
+                {
+                    return Self::degraded(
+                        &instance.spec().id,
+                        "diagnostics query cancelled",
+                        started,
+                    );
+                }
+                let Some(path) = documents.resolve_url(&uri) else {
+                    continue;
+                };
+                let Some(file) = documents.relative_path(&path) else {
+                    continue;
+                };
+                let Some(diagnostics) = instance
+                    .diagnostics_snapshot(&uri, query.include_info)
+                    .await
+                else {
+                    continue;
+                };
+                let document = instance.document_content_snapshot_async(&path).await;
+                let document_version = document.as_ref().map(|(version, _)| *version);
+                let stamp_stale = document
+                    .as_ref()
+                    .is_none_or(|(_, content)| !content.stamp_matches_path(&path));
+                let stale = diagnostics.stale
+                    || diagnostics
+                        .version
+                        .zip(document_version)
+                        .is_some_and(|(published, version)| published != version)
+                    || stamp_stale;
+                let content = match document.as_ref() {
+                    Some((_, content)) if !stamp_stale => Arc::clone(content),
+                    _ => match documents.load(&path) {
+                        Some((_path, content)) => content,
+                        None => match document.as_ref() {
+                            Some((_, content)) => Arc::clone(content),
+                            None => continue,
+                        },
+                    },
+                };
+                any_stale |= stale;
+                let mut rows = Vec::new();
+                for item in diagnostics.items {
+                    if total >= max_results {
+                        break;
+                    }
+                    rows.push(Self::diagnostic_row(encoding, &content, item));
+                    total = total.saturating_add(1);
+                }
+                if !rows.is_empty() {
+                    files.push(json!({
+                        "file": file,
+                        "count": rows.len(),
+                        "document_version": document_version,
+                        "diagnostic_version": diagnostics.version,
+                        "stale": stale,
+                        "diagnostics": rows,
+                    }));
+                }
             }
-            if !rows.is_empty() {
-                files.push(json!({
-                    "file": file,
-                    "count": rows.len(),
-                    "document_version": document_version,
-                    "diagnostic_version": diagnostics.version,
-                    "stale": stale,
-                    "diagnostics": rows,
-                }));
+            any_stale |=
+                self.workspace_revision(&root, &instance.spec().id) != documents.workspace_revision;
+            let (_, latest_truncated, latest_revision) =
+                instance.diagnostic_totals(query.include_info).await;
+            if latest_revision != publication_revision {
+                // Do not combine counts from one publication with rows from another.
+                published_total = None;
             }
-        }
-        any_stale |= self.workspace_revision(&root) != documents.workspace_revision;
-        let (_, latest_truncated, latest_revision) =
-            instance.diagnostic_totals(query.include_info).await;
-        if latest_revision != publication_revision {
-            // Do not combine counts from one publication with rows from another.
-            published_total = None;
-        }
-        storage_truncated |= latest_truncated;
-        CodeIntelOutcome {
-            // Push diagnostics cover only publications received so far. Even
-            // an idle server does not certify coverage of every workspace file.
-            meta: Self::base_meta(
-                state,
-                CodeIntelCompleteness::Unknown,
-                None,
-                any_stale,
-                started,
-            ),
-            payload: json!({
-                "scope": "published",
-                "shown": total,
-                "total": published_total,
-                "has_more": published_total.map(|available| available > total),
-                "storage_truncated": storage_truncated,
-                "files": files,
-            }),
-        }
+            storage_truncated |= latest_truncated;
+            CodeIntelOutcome {
+                // Push diagnostics cover only publications received so far. Even
+                // an idle server does not certify coverage of every workspace file.
+                meta: Self::base_meta(
+                    &instance.spec().id,
+                    state,
+                    CodeIntelCompleteness::Unknown,
+                    None,
+                    any_stale,
+                    started,
+                ),
+                payload: json!({
+                    "scope": "published",
+                    "shown": total,
+                    "total": published_total,
+                    "has_more": published_total.map(|available| available > total),
+                    "storage_truncated": storage_truncated,
+                    "files": files,
+                }),
+            }
+        })
+        .await
     }
 
     async fn diagnostics_after_edits(
         &self,
         workspace: &Path,
         paths: &[PathBuf],
-        deadline: Duration,
+        budget: Duration,
         cancellation: Option<slim_core::runtime::CancellationToken>,
     ) -> Option<slim_core::codeintel::EditDiagnosticsReport> {
-        use slim_core::codeintel::{
-            EditDiagnostic, EditDiagnosticsReport, EditFileDiagnostics, EditVerification,
-        };
-        let (root, spec) = self.resolve(workspace).ok()?;
-        // Warm only: validating an edit must never start a language server.
-        let lease = self
-            .pool
-            .acquire_warm(&root, &spec.id, &self.config.server_config)
-            .await?;
-        let instance = lease.instance();
-        let deadline = tokio::time::Instant::now() + deadline;
-        let mut documents = OperationDocuments::new(&root, self.workspace_revision(&root));
-        let mut files = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for path in paths.iter().take(MAX_POST_EDIT_FILES) {
-            if cancellation
-                .as_ref()
-                .is_some_and(slim_core::runtime::CancellationToken::is_cancelled)
-            {
-                return None;
-            }
-            let Some(path) = crate::path_policy::existing_workspace_path(&root, path) else {
-                continue;
-            };
-            if instance.language_id_for(&path).is_none() || !seen.insert(path.clone()) {
-                continue;
-            }
-            let relative = documents.relative_path(&path).unwrap_or_default();
-            let unverified = || EditFileDiagnostics {
-                path: relative.clone(),
-                verification: EditVerification::Unverified,
-                errors: Vec::new(),
-            };
-            if !instance.document_is_open(&path).await
-                && Self::ensure_document(instance, &mut documents, &path)
-                    .await
-                    .is_none()
-            {
-                files.push(unverified());
-                continue;
-            }
-            let Some(outcome) = instance
-                .edit_diagnostics(&path, deadline, cancellation.as_ref())
-                .await
-            else {
-                if cancellation
-                    .as_ref()
-                    .is_some_and(slim_core::runtime::CancellationToken::is_cancelled)
-                {
-                    return None;
-                }
-                files.push(unverified());
-                continue;
-            };
-            if !outcome.fresh {
-                files.push(unverified());
-                continue;
-            }
-            let errors = outcome
-                .errors
-                .into_iter()
-                .map(|item| {
-                    let (line, column) = Self::human_position(
-                        outcome.encoding,
-                        &outcome.content,
-                        item.range.start.line,
-                        item.range.start.character,
-                    );
-                    EditDiagnostic {
-                        line,
-                        column,
-                        code: item.code.as_ref().map(diagnostic_code_string),
-                        message: item.message,
-                    }
-                })
-                .collect();
-            files.push(EditFileDiagnostics {
-                path: relative,
-                verification: if outcome.baseline_known {
-                    EditVerification::Verified
-                } else {
-                    EditVerification::VerifiedWithoutBaseline
-                },
-                errors,
-            });
+        use slim_core::codeintel::{EditDiagnosticsReport, EditFileDiagnostics, EditVerification};
+        if cancellation
+            .as_ref()
+            .is_some_and(slim_core::runtime::CancellationToken::is_cancelled)
+        {
+            return None;
         }
-        (!files.is_empty()).then(|| EditDiagnosticsReport {
-            server: spec.id.clone(),
-            files,
-        })
+        let deadline = tokio::time::Instant::now() + budget;
+        let root = crate::path_policy::canonical_root(workspace)
+            .unwrap_or_else(|| workspace.to_path_buf());
+        let mut seen = std::collections::HashSet::new();
+        let mut inputs = Vec::new();
+        for input in paths {
+            let path = crate::path_policy::existing_workspace_path(&root, input);
+            let identity = path.clone().unwrap_or_else(|| {
+                if input.is_absolute() {
+                    input.clone()
+                } else {
+                    root.join(input)
+                }
+            });
+            if !seen.insert(identity.clone()) {
+                continue;
+            }
+            let profile = Self::profile_for_path(&identity);
+            let relative = identity
+                .strip_prefix(&root)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| input.to_string_lossy().into_owned());
+            inputs.push((
+                path,
+                profile,
+                EditFileDiagnostics {
+                    path: relative,
+                    server: profile.map(str::to_owned),
+                    verification: if profile.is_none() {
+                        EditVerification::Unsupported
+                    } else {
+                        EditVerification::ServerUnavailable
+                    },
+                    errors: Vec::new(),
+                },
+            ));
+        }
+        let resolve_group = |id| {
+            inputs
+                .iter()
+                .find(|(path, profile, _)| path.is_some() && *profile == Some(id))
+                .and_then(|(path, _, _)| self.resolve(&root, path.as_deref(), Some(id)).ok())
+        };
+        let rust = resolve_group(RUST_ANALYZER);
+        let typescript = resolve_group(TYPESCRIPT_LANGUAGE_SERVER);
+        let (rust_lease, ts_lease) = tokio::join!(
+            self.warm_for_batch(rust.as_ref(), deadline),
+            self.warm_for_batch(typescript.as_ref(), deadline),
+        );
+        let mut attempted = 0;
+        let mut rust_paths = Vec::new();
+        let mut ts_paths = Vec::new();
+        for (index, (path, profile, report)) in inputs.iter_mut().enumerate() {
+            let Some(path) = path else {
+                report.verification = EditVerification::FileUnavailable;
+                continue;
+            };
+            let Some(profile) = profile else {
+                continue;
+            };
+            let (lease, candidates) = if *profile == RUST_ANALYZER {
+                (&rust_lease, &mut rust_paths)
+            } else {
+                (&ts_lease, &mut ts_paths)
+            };
+            if lease.is_none() {
+                continue;
+            }
+            if attempted >= MAX_POST_EDIT_FILES {
+                report.verification = EditVerification::LimitExceeded;
+                continue;
+            }
+            attempted += 1;
+            report.verification = EditVerification::Unverified;
+            candidates.push((index, path.clone()));
+        }
+        let (rust_results, ts_results) = tokio::join!(
+            self.check_edit_group(
+                rust_lease.as_ref(),
+                &rust_paths,
+                deadline,
+                cancellation.as_ref()
+            ),
+            self.check_edit_group(
+                ts_lease.as_ref(),
+                &ts_paths,
+                deadline,
+                cancellation.as_ref()
+            ),
+        );
+        if cancellation
+            .as_ref()
+            .is_some_and(slim_core::runtime::CancellationToken::is_cancelled)
+        {
+            return None;
+        }
+        for (index, verification, errors) in rust_results.into_iter().chain(ts_results) {
+            inputs[index].2.verification = verification;
+            inputs[index].2.errors = errors;
+        }
+        let files: Vec<_> = inputs.into_iter().map(|(_, _, report)| report).collect();
+        let mut profiles = files.iter().filter_map(|file| file.server.as_deref());
+        let first = profiles.next();
+        let server = match first {
+            Some(first) if profiles.all(|profile| profile == first) => first.to_owned(),
+            _ => "lsp".into(),
+        };
+        (!files.is_empty()).then_some(EditDiagnosticsReport { server, files })
     }
 
     async fn notify_file_changed(&self, workspace: &Path, path: &Path, text: Option<String>) {
@@ -1898,6 +2235,136 @@ impl CodeIntelligence for LspCodeIntelligence {
 }
 
 impl LspCodeIntelligence {
+    async fn warm_for_batch(
+        &self,
+        resolved: Option<&ResolvedServer>,
+        deadline: tokio::time::Instant,
+    ) -> Option<Lease> {
+        let resolved = resolved?;
+        tokio::time::timeout_at(deadline, self.acquire_warm(resolved))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn check_edit_group(
+        &self,
+        lease: Option<&Lease>,
+        paths: &[(usize, PathBuf)],
+        deadline: tokio::time::Instant,
+        cancellation: Option<&slim_core::runtime::CancellationToken>,
+    ) -> Vec<(
+        usize,
+        slim_core::codeintel::EditVerification,
+        Vec<slim_core::codeintel::EditDiagnostic>,
+    )> {
+        use slim_core::codeintel::{EditDiagnostic, EditVerification};
+        let Some(lease) = lease else {
+            return Vec::new();
+        };
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        let instance = lease.instance();
+        // Each profile runs refresh and document checks independently. A slow
+        // refresh must not consume the other profile's chance to certify files.
+        let refresh = tokio::time::timeout_at(deadline, instance.refresh_workspace()).await;
+        match refresh {
+            Ok(Ok(changed)) => {
+                if changed {
+                    self.bump_workspace_revision(instance.root(), &instance.spec().id);
+                }
+            }
+            _ => {
+                return paths
+                    .iter()
+                    .map(|(index, _)| (*index, EditVerification::RefreshFailed, Vec::new()))
+                    .collect()
+            }
+        }
+        if instance.is_closed() {
+            return paths
+                .iter()
+                .map(|(index, _)| (*index, EditVerification::ServerUnavailable, Vec::new()))
+                .collect();
+        }
+        let revision = self.workspace_revision(instance.root(), &instance.spec().id);
+        let mut checks = tokio::task::JoinSet::new();
+        let mut pending = paths.iter();
+        let concurrency = self.config.max_open_documents.clamp(1, MAX_POST_EDIT_FILES);
+        let mut results = Vec::new();
+        loop {
+            while checks.len() < concurrency && tokio::time::Instant::now() < deadline {
+                let Some((index, path)) = pending.next() else {
+                    break;
+                };
+                let index = *index;
+                let path = path.clone();
+                let instance = Arc::clone(instance);
+                let cancellation = cancellation.cloned();
+                // At most twelve jobs, owned and drained by this operation. Silent
+                // documents cannot delay synchronization or checks of ready ones.
+                checks.spawn(async move {
+                    let mut documents = OperationDocuments::new(instance.root(), revision);
+                    let verification = match tokio::time::timeout_at(
+                        deadline,
+                        Self::ensure_document(&instance, &mut documents, &path),
+                    )
+                    .await
+                    {
+                        Ok(Some(_)) => None,
+                        Ok(None) => Some(EditVerification::FileUnavailable),
+                        Err(_) => Some(EditVerification::Unverified),
+                    };
+                    if let Some(verification) = verification {
+                        return (index, verification, Vec::new());
+                    }
+                    let Some(outcome) = instance
+                        .edit_diagnostics(&path, deadline, cancellation.as_ref())
+                        .await
+                        .filter(|outcome| outcome.fresh)
+                    else {
+                        return (index, EditVerification::Unverified, Vec::new());
+                    };
+                    let errors = outcome
+                        .errors
+                        .into_iter()
+                        .map(|item| {
+                            let (line, column) = Self::human_position(
+                                outcome.encoding,
+                                &outcome.content,
+                                item.range.start.line,
+                                item.range.start.character,
+                            );
+                            EditDiagnostic {
+                                line,
+                                column,
+                                code: item.code.as_ref().map(diagnostic_code_string),
+                                message: item.message,
+                            }
+                        })
+                        .collect();
+                    (
+                        index,
+                        if outcome.baseline_known {
+                            EditVerification::Verified
+                        } else {
+                            EditVerification::VerifiedWithoutBaseline
+                        },
+                        errors,
+                    )
+                });
+            }
+            let Some(result) = checks.join_next().await else {
+                break;
+            };
+            if let Ok(result) = result {
+                results.push(result);
+            }
+        }
+        results
+    }
+
     async fn notify_update(
         &self,
         workspace: &Path,
@@ -1905,18 +2372,15 @@ impl LspCodeIntelligence {
         text: Option<String>,
         patch: Option<&slim_core::codeintel::CodeIntelPatch>,
     ) {
-        let Ok((root, spec)) = self.resolve(workspace) else {
+        let Ok(resolved) = self.resolve(workspace, Some(path), None) else {
             return;
         };
-        let Some(path) = crate::path_policy::existing_workspace_path(&root, path) else {
+        let root = &resolved.root;
+        let Some(path) = crate::path_policy::existing_workspace_path(root, path) else {
             return;
         };
-        self.bump_workspace_revision(&root);
-        let Some(instance) = self
-            .pool
-            .acquire_warm(&root, &spec.id, &self.config.server_config)
-            .await
-        else {
+        self.bump_workspace_revision(root, &resolved.spec.id);
+        let Some(instance) = self.acquire_warm(&resolved).await else {
             return;
         };
         if !instance.instance().document_is_open(&path).await {
@@ -1945,6 +2409,42 @@ impl LspCodeIntelligence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typescript_defaults_use_a_semantic_server_and_explicit_options_replace_them() {
+        let manager = LspCodeIntelligence::from_config(LspManagerConfig::default());
+        assert_eq!(
+            manager.settings(TYPESCRIPT_LANGUAGE_SERVER),
+            (
+                json!({"hostInfo":"slim","tsserver":{"useSyntaxServer":"never"}}),
+                json!({}),
+            )
+        );
+        assert_eq!(
+            manager.settings(RUST_ANALYZER),
+            (
+                json!({"checkOnSave":false}),
+                json!({"rust-analyzer":{"checkOnSave":false}}),
+            )
+        );
+        for options in [
+            json!({}),
+            json!({"hostInfo":"custom"}),
+            json!({"tsserver":{"useSyntaxServer":"auto"}}),
+        ] {
+            let mut config = LspManagerConfig::default();
+            config
+                .servers
+                .get_mut(TYPESCRIPT_LANGUAGE_SERVER)
+                .unwrap()
+                .initialization_options = Some(options.clone());
+            let manager = LspCodeIntelligence::from_config(config);
+            assert_eq!(
+                manager.settings(TYPESCRIPT_LANGUAGE_SERVER),
+                (options, json!({}))
+            );
+        }
+    }
 
     #[test]
     fn truncation_preserves_boundaries_and_unicode() {
@@ -2076,12 +2576,11 @@ mod tests {
             let log = root.join("wire.jsonl");
             let manager = LspCodeIntelligence::from_config(LspManagerConfig {
                 idle_shutdown: None,
-                server_path: Some(binary.clone()),
-                server_config: json!({"mock":{"logPath":log,"responses":{"textDocument/references":locations}}}),
+                servers: [(RUST_ANALYZER.into(), ServerOptions {path:Some(binary.clone()), initialization_options:Some(json!({"mock":{"logPath":log,"responses":{"textDocument/references":locations}}})), ..Default::default()})].into_iter().collect(),
                 ..Default::default()
             });
-            let (resolved, spec) = manager.resolve(&root).unwrap();
-            drop(manager.acquire(resolved, spec, None).await.unwrap());
+            let resolved = manager.resolve(&root, None, Some(RUST_ANALYZER)).unwrap();
+            drop(manager.acquire(resolved, None).await.unwrap());
             let query = CodeIntelPositionQuery {
                 workspace: root.clone(),
                 path: source,

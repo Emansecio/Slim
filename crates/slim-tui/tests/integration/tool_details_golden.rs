@@ -436,7 +436,8 @@ fn collapsed_single_tool_keeps_compact_target_and_result() {
     });
 
     let collapsed = render_at(&state);
-    assert!(collapsed.contains("✓ Executou"), "{collapsed}");
+    assert!(collapsed.contains("✓ $ Get-ChildItem"), "{collapsed}");
+    assert!(!collapsed.contains("Executou"), "{collapsed}");
     assert!(collapsed.contains("854ms"), "{collapsed}");
     assert!(
         collapsed.contains("$ Get-ChildItem"),
@@ -477,7 +478,8 @@ fn running_shell_shows_command_limit_and_live_progress() {
     });
 
     let frame = render_at(&state);
-    assert!(frame.contains("Executando $ cargo"), "{frame}");
+    assert!(frame.contains(" $ cargo test"), "{frame}");
+    assert!(!frame.contains("Executando $"), "{frame}");
     assert!(frame.contains("limit 120s"), "{frame}");
     assert!(frame.contains("Compiling slim-core"), "{frame}");
 }
@@ -501,19 +503,19 @@ fn running_tool_summary_stays_on_one_row_and_preserves_progress_metadata() {
     });
 
     let frame = render_at_width(&state, 64);
-    let transcript_rows = slim_tui::layout::plan(64, 24, 0, true).scrollback.height;
+    let transcript_rows = slim_tui::layout::plan(64, 24, 0).scrollback.height;
     let matching = frame
         .lines()
         .take(transcript_rows as usize)
         .filter(|line| {
-            ["Executando", "limit 120s", "out 128 B", "err 0 B"]
+            ["○ $", "limit 120s", "out 128 B", "err 0 B"]
                 .iter()
                 .any(|needle| line.contains(needle))
         })
         .collect::<Vec<_>>();
     assert_eq!(matching.len(), 1, "tool summary wrapped:\n{frame}");
     let summary = matching[0];
-    assert!(summary.contains("Executando"), "{summary}");
+    assert!(summary.contains("○ $"), "{summary}");
     assert!(summary.contains("limit 120s"), "{summary}");
     assert!(summary.contains("out 128 B"), "{summary}");
     assert!(summary.contains("err 0 B"), "{summary}");
@@ -585,7 +587,7 @@ fn collapsed_failed_tool_drops_telemetry_and_keeps_the_short_reason() {
     let frame = render_at(&state);
     let summary = frame
         .lines()
-        .find(|line| line.contains("Executou"))
+        .find(|line| line.contains("✕ $"))
         .expect("failed shell row");
     assert!(summary.contains("exit 1"), "{summary}");
     assert!(summary.contains("733ms"), "{summary}");
@@ -665,6 +667,25 @@ fn projected_patch_and_shell_rows_read_as_verb_target_and_outcome() {
     );
     state.clock.elapsed_ms = 10_000;
 
+    // Collapsed, the edit and the failed command are one group; the failure
+    // keeps a row of its own under the header.
+    let collapsed = render_at_width(&state, 100);
+    let header = collapsed
+        .lines()
+        .find(|line| line.contains("1 edição, 1 comando"))
+        .unwrap_or_else(|| panic!("group header\n{collapsed}"));
+    assert!(header.contains("✓ "), "{header}");
+    let failure = collapsed
+        .lines()
+        .find(|line| line.contains("✕ $"))
+        .unwrap_or_else(|| panic!("failure row\n{collapsed}"));
+    assert!(
+        failure.starts_with("    ✕ $ cargo test · exit 101"),
+        "the failure sits one step in from the header\n{collapsed}"
+    );
+
+    let leader = state.blocks()[0].id.clone();
+    assert!(state.activate_block(&leader).0);
     let frame = render_at_width(&state, 100);
     let patch = frame
         .lines()
@@ -678,12 +699,14 @@ fn projected_patch_and_shell_rows_read_as_verb_target_and_outcome() {
         !patch.contains("patched"),
         "the receipt stays behind details\n{patch}"
     );
+    assert!(failure.contains("4.2s"), "{failure}");
+    // Expanded, the member row carries the full arguments and outcome.
     let shell = frame
         .lines()
-        .find(|line| line.contains("Executou"))
+        .find(|line| line.contains("✕ $"))
         .unwrap_or_else(|| panic!("shell row\n{frame}"));
     assert!(
-        shell.contains("✕ Executou $ cargo test · exit 101"),
+        shell.contains("✕ $ cargo test") && shell.contains("exit 101"),
         "{shell}"
     );
     assert!(shell.contains("4.2s"), "{shell}");
@@ -784,4 +807,10 @@ fn expanded_patch_shows_its_applied_diff_before_the_receipt() {
     assert_ne!(color(removed), color(added));
     assert_ne!(color(header), color(added));
     assert_ne!(color(header), color(removed));
+    let background = |row: usize, x| buffer[(x, row as u16)].bg;
+    assert_ne!(background(removed, 4), background(added, 4));
+    assert_ne!(background(header, 4), background(added, 4));
+    // The tint fills the code viewport, leaving its indentation neutral.
+    assert_eq!(background(added, 4), background(added, 90));
+    assert_ne!(background(added, 3), background(added, 4));
 }

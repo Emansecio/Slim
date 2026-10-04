@@ -134,7 +134,11 @@ impl OpenAiCodexAdapter {
                 input.push(json!({
                     "type": "function_call_output",
                     "call_id": message.tool_call_id,
-                    "output": message.content,
+                    "output": if message.content_blocks.is_empty() {
+                        Value::String(message.content.clone())
+                    } else {
+                        Value::Array(codex_content(message))
+                    },
                 }));
                 continue;
             }
@@ -242,6 +246,10 @@ impl ProviderAdapter for OpenAiCodexAdapter {
         ProviderKind::OpenAiCodex
     }
 
+    fn accepts_tool_result_images(&self) -> bool {
+        true
+    }
+
     fn model(&self) -> &str {
         &self.config.model
     }
@@ -344,6 +352,19 @@ impl ProviderAdapter for OpenAiCodexAdapter {
                 .and_then(Value::as_str)
                 .map(|text| vec![ProviderEvent::ReasoningDelta(text.into())])
                 .unwrap_or_default(),
+            // Each summary part after the first opens a paragraph of its own;
+            // its `**title**` would otherwise run into the previous sentence.
+            "response.reasoning_summary_part.added" => {
+                if value
+                    .get("summary_index")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|index| index > 0)
+                {
+                    vec![ProviderEvent::ReasoningDelta("\n\n".into())]
+                } else {
+                    Vec::new()
+                }
+            }
             "response.output_item.added" => {
                 let item = value.get("item").unwrap_or(&Value::Null);
                 if item.get("type").and_then(Value::as_str) == Some("function_call") {

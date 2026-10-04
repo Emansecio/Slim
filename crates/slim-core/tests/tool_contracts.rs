@@ -1040,6 +1040,79 @@ fn shell_nonzero_exit_with_quiet_stderr_is_annotated() {
 }
 
 #[test]
+fn shell_nonzero_exit_with_only_terminal_noise_on_stderr_is_annotated() {
+    let registry = ToolRegistry::default();
+    let noisy = registry.execute(
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        "shell",
+        &serde_json::json!({
+            "command": "[Console]::Error.Write([string][char]27 + '[?25h' + \"`r\"); exit 7"
+        })
+        .to_string(),
+    );
+    assert!(!noisy.success);
+    assert!(
+        noisy
+            .output
+            .contains("stderr:\n\n[note: nonzero exit with empty stderr"),
+        "{}",
+        noisy.output
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn shell_redirected_native_stderr_is_neither_a_failure_nor_an_error_frame() {
+    let registry = ToolRegistry::default();
+    let run = |command: &str| {
+        registry.execute(
+            OperatingMode::Auto,
+            std::env::temp_dir(),
+            "shell",
+            &serde_json::json!({ "command": command }).to_string(),
+        )
+    };
+    let warned = run("cmd /c \"echo warn 1>&2 & exit 0\" 2>&1");
+    assert!(warned.success, "{}", warned.output);
+    assert!(warned.output.starts_with("exit 0\n"), "{}", warned.output);
+    assert!(warned.output.contains("warn"), "{}", warned.output);
+    for frame in ["NativeCommandError", "CategoryInfo", "~~~"] {
+        assert!(!warned.output.contains(frame), "{}", warned.output);
+    }
+    // Real failures keep their status: a native exit code, and a cmdlet that
+    // fails after a native program succeeded.
+    let failed = run("cmd /c \"echo bad 1>&2 & exit 3\" 2>&1");
+    assert!(failed.output.starts_with("exit 3\n"), "{}", failed.output);
+    let cmdlet = run("cmd /c \"echo warn 1>&2 & exit 0\" 2>&1; Get-Item C:\\slim-no-such-item");
+    assert!(cmdlet.output.starts_with("exit 1\n"), "{}", cmdlet.output);
+}
+
+/// PowerShell 7 runs `&&`; Windows PowerShell 5.1 rejects the script, and the
+/// model must be told why in text it can read.
+#[cfg(windows)]
+#[test]
+fn shell_statement_separator_parse_error_is_explained() {
+    let chained = ToolRegistry::default().execute(
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        "shell",
+        &serde_json::json!({ "command": "echo first && echo second" }).to_string(),
+    );
+    if chained.success {
+        assert!(chained.output.contains("second"), "{}", chained.output);
+    } else {
+        assert!(
+            chained
+                .output
+                .contains("[note: nothing ran — Windows PowerShell 5.1 has no `&&`/`||`"),
+            "{}",
+            chained.output
+        );
+    }
+}
+
+#[test]
 fn shell_program_arguments_remain_literal_and_script_form_uses_powershell() {
     #[cfg(windows)]
     {
@@ -1345,4 +1418,293 @@ fn registry_rejects_paths_outside_workspace_for_every_file_tool() {
     );
 
     let _ = fs::remove_dir_all(parent);
+}
+
+#[cfg(windows)]
+fn run_script(dir: &std::path::Path, script: &str) -> slim_core::tools::ToolResult {
+    ToolRegistry::default().execute(
+        OperatingMode::Auto,
+        dir,
+        "shell",
+        &serde_json::json!({ "command": script }).to_string(),
+    )
+}
+
+/// `exit` stays the truth about the script; the note says what the code alone
+/// would hide.
+#[cfg(windows)]
+#[test]
+fn a_script_ending_after_a_failed_native_command_keeps_exit_zero_and_says_so() {
+    let dir = temp_path("native-exit-note");
+    fs::create_dir_all(&dir).unwrap();
+    let hidden = run_script(&dir, "cmd /c \"exit 3\"; Write-Output done");
+    assert!(hidden.success, "{}", hidden.output);
+    assert!(hidden.output.starts_with("exit 0"), "{}", hidden.output);
+    assert!(hidden.output.contains("done"), "{}", hidden.output);
+    assert!(
+        hidden
+            .output
+            .contains("[note: exit 0, but the last native command exited 3]"),
+        "{}",
+        hidden.output
+    );
+    // Other endings carry no such note.
+    for script in [
+        "cmd /c \"exit 3\"",
+        "Write-Output hi",
+        "cmd /c \"exit 0\"; Write-Output ok",
+        "cmd /c \"exit 3\"; cmd /c \"exit 0\"",
+    ] {
+        let result = run_script(&dir, script);
+        assert!(
+            !result.output.contains("[note: exit 0, but"),
+            "{script}: {}",
+            result.output
+        );
+    }
+    assert!(run_script(&dir, "cmd /c \"exit 3\"")
+        .output
+        .starts_with("exit 3"));
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
+}
+
+/// PowerShell reports `At line:N`; N must be the line of the script as the
+/// model wrote it, not N plus the lines of the setup.
+#[cfg(windows)]
+#[test]
+fn powershell_error_positions_are_the_lines_of_the_script_as_written() {
+    let dir = temp_path("error-line-numbers");
+    fs::create_dir_all(&dir).unwrap();
+    let result = run_script(
+        &dir,
+        "Write-Output a\nWrite-Output b\nGet-Item .\\definitely-missing-file",
+    );
+    // Windows PowerShell prints `linha:3 `, PowerShell 7 a `   3 |` gutter.
+    let at_line = |line: u8| {
+        result.output.contains(&format!(":{line} "))
+            || result.output.contains(&format!("   {line} |"))
+    };
+    assert!(at_line(3), "{}", result.output);
+    assert!(!at_line(7), "{}", result.output);
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
+}
+
+#[cfg(windows)]
+#[test]
+fn shell_defaults_read_utf8_and_keep_json_and_files_intact() {
+    let dir = temp_path("shell-defaults");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("in.txt"), "ação\n").unwrap();
+    let read = run_script(&dir, "Get-Content -LiteralPath in.txt");
+    assert!(read.output.contains("ação"), "{}", read.output);
+    // No `ConvertTo-Json -Depth` default: the object graph of a FileInfo fans
+    // out without bound at a large depth.
+    let started = Instant::now();
+    let json = run_script(
+        &dir,
+        "(Get-Item -LiteralPath in.txt | ConvertTo-Json -Compress).Length",
+    );
+    assert!(json.success, "{}", json.output);
+    let length: usize = json
+        .output
+        .lines()
+        .find_map(|line| line.trim().parse().ok())
+        .unwrap_or_else(|| panic!("{}", json.output));
+    assert!(length < 100_000, "{length}");
+    assert!(started.elapsed() < Duration::from_secs(30));
+    let written = run_script(&dir, "'ação' | Out-File -LiteralPath out.txt");
+    assert!(written.success, "{}", written.output);
+    let bytes = fs::read(dir.join("out.txt")).unwrap();
+    let text = String::from_utf8(bytes).expect("Out-File writes UTF-8");
+    assert!(
+        text.trim_start_matches('\u{feff}').starts_with("ação"),
+        "{text:?}"
+    );
+    let parameters = run_script(
+        &dir,
+        "$PSDefaultParameterValues['Invoke-WebRequest:UseBasicParsing']; \
+         $PSDefaultParameterValues.ContainsKey('Set-Content:Encoding'); \
+         $PSDefaultParameterValues.ContainsKey('Add-Content:Encoding'); \
+         $PSDefaultParameterValues.ContainsKey('ConvertTo-Json:Depth')",
+    );
+    assert!(
+        parameters.output.contains("True\nFalse\nFalse\nFalse"),
+        "{}",
+        parameters.output
+    );
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
+}
+
+#[cfg(windows)]
+#[test]
+fn a_description_on_shell_is_ignored_and_an_oversized_script_is_refused_before_running() {
+    let dir = temp_path("shell-script-size");
+    fs::create_dir_all(&dir).unwrap();
+    let described = ToolRegistry::default().execute(
+        OperatingMode::Auto,
+        &dir,
+        "shell",
+        r#"{"command":"Write-Output hi","description":"say hi"}"#,
+    );
+    assert!(described.success, "{}", described.output);
+    assert!(described.output.contains("hi"), "{}", described.output);
+    let marker = dir.join("ran.txt");
+    let too_long = run_script(&dir, &format!("New-Item ran.txt # {}", "x".repeat(33_000)));
+    assert!(!too_long.success);
+    assert!(
+        too_long
+            .output
+            .contains("too long for the Windows command line")
+            && too_long.output.contains("write"),
+        "{}",
+        too_long.output
+    );
+    assert!(!marker.exists(), "the script must not have started");
+    let fits = run_script(&dir, &format!("Write-Output fits # {}", "x".repeat(30_000)));
+    assert!(fits.success, "{}", fits.output);
+    assert!(fits.output.contains("fits"), "{}", fits.output);
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
+}
+
+/// One note on a parse error, and only where PowerShell 7 syntax cannot work.
+#[cfg(windows)]
+#[test]
+fn powershell_parse_errors_get_one_note_naming_the_unavailable_syntax() {
+    let dir = temp_path("parse-error-note");
+    fs::create_dir_all(&dir).unwrap();
+    let edition = run_script(&dir, "$PSVersionTable.PSEdition");
+    let windows_powershell = edition.output.contains("Desktop");
+    let generic = "[note: this host is Windows PowerShell 5.1; PowerShell 7 syntax (`&&`, `||`, `??`, `?.`, `?:`) is unavailable]";
+    let chained_note = "[note: nothing ran — Windows PowerShell 5.1 has no `&&`/`||`";
+
+    let unclosed = run_script(&dir, "if ($true) {");
+    assert!(!unclosed.success, "{}", unclosed.output);
+    assert_eq!(
+        unclosed.output.contains(generic),
+        windows_powershell,
+        "{}",
+        unclosed.output
+    );
+    assert!(
+        !unclosed.output.contains(chained_note),
+        "{}",
+        unclosed.output
+    );
+
+    let chained = run_script(&dir, "echo first && echo second");
+    if windows_powershell {
+        assert!(!chained.success, "{}", chained.output);
+        assert!(chained.output.contains(chained_note), "{}", chained.output);
+        assert!(
+            chained
+                .output
+                .contains("`??`, `?.` and `?:` are unavailable too"),
+            "{}",
+            chained.output
+        );
+        assert!(!chained.output.contains(generic), "{}", chained.output);
+        assert_eq!(
+            chained.output.matches("[note:").count(),
+            1,
+            "{}",
+            chained.output
+        );
+    } else {
+        assert!(!chained.output.contains(generic));
+    }
+    // A runtime error is not a parse error.
+    let runtime = run_script(&dir, "Get-Item .\\definitely-missing-file");
+    assert!(!runtime.output.contains(generic), "{}", runtime.output);
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
+}
+
+/// The setup and epilogue are ours: PowerShell quotes the whole script before
+/// some error messages, and the model should read only its own.
+#[cfg(windows)]
+#[test]
+fn shell_errors_do_not_quote_the_setup_or_the_epilogue() {
+    let dir = temp_path("error-scaffolding");
+    fs::create_dir_all(&dir).unwrap();
+    for script in [
+        "Write-Error boom",
+        "Write-Output before\nWrite-Error boom",
+        "throw 'boom'",
+        "Get-Item .\\definitely-missing-file",
+    ] {
+        let result = run_script(&dir, script);
+        assert!(!result.success, "{script}: {}", result.output);
+        for ours in [
+            "$utf8",
+            "PSDefaultParameterValues",
+            "LASTEXITCODE",
+            "UTF8Encoding",
+        ] {
+            assert!(
+                !result.output.contains(ours),
+                "{script}: {ours} in {}",
+                result.output
+            );
+        }
+        assert!(result.output.contains("boom") || script.contains("missing"));
+        assert!(result.output.len() < 700, "{script}: {}", result.output);
+    }
+    let result = run_script(&dir, "Write-Error boom");
+    // Windows PowerShell quotes the statement, PowerShell 7 names the cmdlet.
+    assert!(
+        result.output.contains("Write-Error boom : boom")
+            || result.output.contains("Write-Error: boom"),
+        "{}",
+        result.output
+    );
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
+}
+
+/// A trailing backtick continues the line: without a blank line before the
+/// epilogue it would swallow it (printed as output, exit logic skipped).
+#[cfg(windows)]
+#[test]
+fn a_command_ending_in_a_backtick_does_not_swallow_the_exit_logic() {
+    let dir = temp_path("trailing-backtick");
+    fs::create_dir_all(&dir).unwrap();
+    let ok = run_script(&dir, "Write-Output hi `");
+    assert!(ok.success, "{}", ok.output);
+    assert!(ok.output.starts_with("exit 0"), "{}", ok.output);
+    assert!(!ok.output.contains("LASTEXITCODE"), "{}", ok.output);
+    let failed = run_script(&dir, "cmd /c \"exit 4\" `");
+    assert!(!failed.success, "{}", failed.output);
+    assert!(failed.output.starts_with("exit 4"), "{}", failed.output);
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
+}
+
+/// "nothing ran" is for a script that itself failed to parse, not for a parse
+/// error that a running script printed.
+#[cfg(windows)]
+#[test]
+fn a_parse_error_printed_by_a_running_script_is_not_reported_as_nothing_ran() {
+    let dir = temp_path("runtime-parse-error");
+    fs::create_dir_all(&dir).unwrap();
+    for script in [
+        "Invoke-Expression 'echo first && echo second'",
+        "Write-Output before\nInvoke-Expression 'echo first && echo second'",
+        "Invoke-Expression 'if ('",
+    ] {
+        let result = run_script(&dir, script);
+        // `&&` is valid in PowerShell 7, where those two scripts succeed.
+        assert!(
+            !result.success || script.contains("&&"),
+            "{script}: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("nothing ran"),
+            "{script}: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("this host is Windows PowerShell"),
+            "{script}: {}",
+            result.output
+        );
+    }
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
 }

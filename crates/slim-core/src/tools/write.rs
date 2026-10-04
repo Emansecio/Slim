@@ -15,6 +15,7 @@ use super::{
 };
 
 pub const MAX_MUTATING_FILE_BYTES: usize = 10 * 1024 * 1024;
+pub(super) const UTF8_BOM: char = '\u{feff}';
 static PATH_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -93,11 +94,21 @@ pub(crate) fn write_file_with_receipt(
         let uniform_crlf = super::patch::has_only_crlf_newlines(&observed.content);
         let (matches, preserve_crlf) = match precondition {
             FilePrecondition::ExactText(expected) => {
-                let normalized = observed.content != expected
+                // A BOM is invisible in what a read shows: `expected` need not
+                // spell it.
+                let current = if expected.starts_with(UTF8_BOM) {
+                    observed.content.as_str()
+                } else {
+                    observed
+                        .content
+                        .strip_prefix(UTF8_BOM)
+                        .unwrap_or(&observed.content)
+                };
+                let normalized = current != expected
                     && uniform_crlf
                     && !expected.contains('\r')
-                    && observed.content.replace("\r\n", "\n") == expected;
-                (observed.content == expected || normalized, normalized)
+                    && current.replace("\r\n", "\n") == expected;
+                (current == expected || normalized, normalized)
             }
             FilePrecondition::ObservedDigest(expected) => (
                 <[u8; 32]>::from(Sha256::digest(observed.content.as_bytes())) == expected,
@@ -117,6 +128,9 @@ pub(crate) fn write_file_with_receipt(
         }
         if preserve_crlf {
             content = Cow::Owned(content.replace("\r\n", "\n").replace('\n', "\r\n"));
+        }
+        if observed.content.starts_with(UTF8_BOM) && !content.starts_with(UTF8_BOM) {
+            content = Cow::Owned(format!("{UTF8_BOM}{content}"));
         }
         Some(observed)
     } else {
@@ -367,6 +381,12 @@ pub(super) fn read_existing_file_observed(
     cancellation: Option<&CancellationToken>,
     on_lock_wait: &mut impl FnMut(),
 ) -> Result<ObservedText, ToolExecutionError> {
+    if path.is_dir() {
+        return Err(ToolError::InvalidInput {
+            message: super::read::DIRECTORY_PATH_MESSAGE.into(),
+        }
+        .into());
+    }
     let mut file = open_precondition_file(path)?;
     let mut reported_wait = false;
     loop {
@@ -409,8 +429,14 @@ pub(super) fn read_existing_file_observed(
     }
     let bytes_read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     let content = String::from_utf8(bytes).map_err(|error| {
+        let message = super::read::non_utf8_message(
+            path,
+            error.as_bytes(),
+            error.utf8_error().valid_up_to(),
+            1,
+        );
         ToolExecutionError::observed(
-            io::Error::new(io::ErrorKind::InvalidData, error).into(),
+            ToolError::InvalidInput { message },
             vec![dependency.clone()],
             bytes_read,
         )

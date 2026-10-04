@@ -944,7 +944,17 @@ fn shared_native_contracts_reach_chat_messages_and_responses() {
     );
     assert_eq!(
         branches[2]["properties"]["action"]["enum"],
-        json!(["diagnostics", "status"])
+        json!(["diagnostics"])
+    );
+    assert_eq!(
+        branches[3]["properties"]["action"]["enum"],
+        json!(["status"])
+    );
+    assert_eq!(branches[0]["not"], json!({"required":["server"]}));
+    assert_eq!(branches[3]["not"], json!({"required":["server"]}));
+    assert_eq!(
+        intel["input_schema"]["properties"]["server"]["type"],
+        "string"
     );
     tools.push(intel);
     let mut adapters: Vec<Box<dyn ProviderAdapter>> = vec![
@@ -1150,6 +1160,94 @@ fn patch_unique_identical_match_succeeds_without_changing_file() {
 }
 
 #[test]
+fn failed_patch_differing_only_in_whitespace_returns_the_exact_lines_to_copy() {
+    let root = Workspace::new();
+    let filler = "// filler line\n".repeat(40);
+    let body = format!("{filler}fn a() {{\n\tlet x = 1;  \n\treturn x;\n}}\n{filler}");
+    fs::write(root.0.join("t.rs"), &body).unwrap();
+    let patch = |expected: &str| {
+        root.call(
+            "patch",
+            json!({"path":"t.rs","edits":[{"expected":expected,"replacement":"y"}]}),
+        )
+    };
+    let near = patch("    let x = 1;\n    return x;\n");
+    assert!(!near.success, "{}", near.output);
+    assert!(
+        near.output.ends_with(
+            "Closest text is at lines 42-43 and differs from expected only in whitespace. Retry patch with it copied exactly; do not read again:\n\tlet x = 1;  \n\treturn x;"
+        ),
+        "{}",
+        near.output
+    );
+    assert!(!near.output.contains("filler"), "{}", near.output);
+    // The lines it names are the excerpt that applies.
+    let exact = root.call(
+        "patch",
+        json!({"path":"t.rs","edits":[{"expected":"\tlet x = 1;  \n\treturn x;","replacement":"\treturn 1;"}]}),
+    );
+    assert!(exact.success, "{}", exact.output);
+    // Several candidate runs, or none, keep the whole-file recovery.
+    for expected in ["//  filler line", "let y = 2;"] {
+        let other = patch(expected);
+        assert!(!other.output.contains("Closest text"), "{}", other.output);
+        assert!(
+            other.output.contains("Current file is below"),
+            "{}",
+            other.output
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(root.0.join("t.rs")).unwrap().len(),
+        body.len() - 14
+    );
+}
+
+#[test]
+fn missing_file_failures_name_the_same_file_elsewhere() {
+    let root = Workspace::new();
+    fs::create_dir_all(root.0.join("crates/core/src")).unwrap();
+    fs::write(root.0.join("crates/core/src/Config.rs"), "x\n").unwrap();
+    for (name, args) in [
+        ("read", json!({"path":"src/config.rs"})),
+        (
+            "patch",
+            json!({"path":"src/config.rs","edits":[{"expected":"x","replacement":"y"}]}),
+        ),
+        (
+            "write",
+            json!({"path":"src/config.rs","content":"y","expected":"x\n"}),
+        ),
+    ] {
+        let result = root.call(name, args);
+        assert!(!result.success, "{name}: {}", result.output);
+        assert!(
+            result
+                .output
+                .ends_with("\nSame file name elsewhere: crates/core/src/Config.rs"),
+            "{name}: {}",
+            result.output
+        );
+    }
+    // No namesake, or a failure on a file that exists: no note.
+    let absent = root.call("read", json!({"path":"src/other.rs"}));
+    assert!(
+        !absent.output.contains("Same file name"),
+        "{}",
+        absent.output
+    );
+    let present = root.call(
+        "patch",
+        json!({"path":"crates/core/src/Config.rs","edits":[{"expected":"zzz","replacement":"y"}]}),
+    );
+    assert!(
+        !present.output.contains("Same file name"),
+        "{}",
+        present.output
+    );
+}
+
+#[test]
 fn failed_patch_zero_match_includes_current_file_for_retry_without_a_new_read() {
     let root = Workspace::new();
     fs::write(root.0.join("t.txt"), "hello\nworld\n").unwrap();
@@ -1274,8 +1372,16 @@ fn python_environment_search_noise_is_skipped_but_explicit_reads_work() {
         "{}",
         first.output
     );
+    // A result with hits does not repeat the exclusions; a miss discloses them.
+    assert!(!first.output.contains("[skipped:"), "{}", first.output);
+    let miss = tools.execute(
+        OperatingMode::Auto,
+        &root.0,
+        "search",
+        &json!({"path":".","query":"absent-term"}).to_string(),
+    );
     assert!(
-        first.output.contains(".venv"),
+        miss.output.contains(".venv"),
         "exclusions must be disclosed"
     );
     let marker = "pass \"cursor\": \"";
@@ -1453,7 +1559,9 @@ fn recovery_guidance_is_bounded_without_duplicate_actions_or_evidence_loss() {
         .contains("non-ASCII; copy current text verbatim."));
     assert!(batch.output.contains("Current file edges are below"));
     assert!(
-        recovery_guidance_bytes(&batch.output, &root.0.join("large.txt")) <= 256,
+        // 256 plus the sentence that says the line numbers count the proposed
+        // content after edits 1-63.
+        recovery_guidance_bytes(&batch.output, &root.0.join("large.txt")) <= 320,
         "guidance bytes={}",
         recovery_guidance_bytes(&batch.output, &root.0.join("large.txt"))
     );
@@ -1480,7 +1588,8 @@ fn recovery_guidance_is_bounded_without_duplicate_actions_or_evidence_loss() {
     assert!(!complete_batch.success);
     assert!(complete_batch.output.ends_with(&complete));
     assert!(
-        recovery_guidance_bytes(&complete_batch.output, &root.0.join("large.txt")) <= 256,
+        // Same allowance for the proposed-content sentence as above.
+        recovery_guidance_bytes(&complete_batch.output, &root.0.join("large.txt")) <= 320,
         "guidance bytes={}",
         recovery_guidance_bytes(&complete_batch.output, &root.0.join("large.txt"))
     );
@@ -1542,4 +1651,537 @@ fn recovery_guidance_bytes(output: &str, path: &std::path::Path) -> usize {
         guidance.replace_range(start..start + length, "");
     }
     guidance.len()
+}
+
+/// Empty output used to be the answer both to an empty file and to an offset
+/// past its last line.
+#[test]
+fn read_says_whether_the_file_is_empty_or_the_offset_is_past_the_end() {
+    let root = Workspace::new();
+    fs::write(root.0.join("empty.txt"), "").unwrap();
+    fs::write(root.0.join("three.txt"), "a\nb\nc\n").unwrap();
+    let read = |path: &str, offset: u64| {
+        let result = root.call("read", json!({"path": path, "offset": offset}));
+        assert!(result.success, "{}", result.output);
+        result.output
+    };
+    assert_eq!(read("empty.txt", 1), "[empty file]");
+    assert_eq!(read("empty.txt", 5), "[empty file]");
+    assert_eq!(read("three.txt", 3), "c\n");
+    assert_eq!(
+        read("three.txt", 4),
+        "[offset 4 is past the end; file has 3 lines]"
+    );
+    assert_eq!(
+        read("three.txt", 99),
+        "[offset 99 is past the end; file has 3 lines]"
+    );
+}
+
+#[test]
+fn read_failures_on_unreadable_files_say_what_to_do_instead() {
+    let root = Workspace::new();
+    let mut utf16 = vec![0xFF, 0xFE];
+    utf16.extend("ação\n".encode_utf16().flat_map(u16::to_le_bytes));
+    fs::write(root.0.join("wide.txt"), &utf16).unwrap();
+    fs::write(root.0.join("latin.txt"), b"fine\nbad \xe9 byte\n").unwrap();
+    let mut big_endian = vec![0xFE, 0xFF];
+    big_endian.extend("x".encode_utf16().flat_map(u16::to_be_bytes));
+    fs::write(root.0.join("be.txt"), &big_endian).unwrap();
+
+    for (name, args) in [
+        ("read", json!({"path": "wide.txt"})),
+        (
+            "write",
+            json!({"path": "wide.txt", "content": "x", "expected": "y"}),
+        ),
+        (
+            "patch",
+            json!({"path": "wide.txt", "edits": [{"expected": "x", "replacement": "y"}]}),
+        ),
+    ] {
+        let result = root.call(name, args);
+        assert!(!result.success, "{name}");
+        assert!(
+            result
+                .output
+                .contains("wide.txt is a UTF-16 LE file (BOM detected)"),
+            "{name}: {}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("Get-Content -LiteralPath 'wide.txt' -Encoding Unicode"),
+            "{name}: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("write tool"),
+            "{name}: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("io error"),
+            "{name}: {}",
+            result.output
+        );
+    }
+    let big = root.call("read", json!({"path": "be.txt"}));
+    assert!(big.output.contains("UTF-16 BE"), "{}", big.output);
+    assert!(
+        big.output.contains("-Encoding BigEndianUnicode"),
+        "{}",
+        big.output
+    );
+    let latin = root.call("read", json!({"path": "latin.txt"}));
+    assert!(!latin.success);
+    assert!(
+        latin
+            .output
+            .contains("latin.txt is not valid UTF-8 (invalid byte 0xe9 at line 2)"),
+        "{}",
+        latin.output
+    );
+}
+
+#[test]
+fn read_limit_failures_name_a_way_around_them() {
+    let root = Workspace::new();
+    let one_line = root.0.join("one-line.txt");
+    fs::write(&one_line, "x".repeat(1024 * 1024 + 1)).unwrap();
+    let long = root.call("read", json!({"path": "one-line.txt"}));
+    assert!(!long.success);
+    assert!(
+        long.output
+            .contains("read page exceeds the 1048576-byte safety limit"),
+        "{}",
+        long.output
+    );
+    assert!(
+        long.output.contains("Line 1 alone is over the limit")
+            && long.output.contains("Search for a distinctive substring")
+            && long
+                .output
+                .contains("(Get-Content -LiteralPath 'one-line.txt')[0].Substring(0, 4000)"),
+        "{}",
+        long.output
+    );
+    // Many lines over the page budget: fewer lines per page is the way.
+    fs::write(
+        root.0.join("wide-page.txt"),
+        format!("{}\n", "y".repeat(300 * 1024)).repeat(4),
+    )
+    .unwrap();
+    let wide = root.call("read", json!({"path": "wide-page.txt", "max_lines": 4}));
+    assert!(!wide.success);
+    assert!(wide.output.contains("smaller max_lines"), "{}", wide.output);
+
+    let huge = fs::File::create(root.0.join("huge.log")).unwrap();
+    huge.set_len(10 * 1024 * 1024 + 1).unwrap();
+    drop(huge);
+    let huge = root.call("read", json!({"path": "huge.log"}));
+    assert!(!huge.success);
+    assert!(huge.output.contains("safety limit"), "{}", huge.output);
+    assert!(
+        huge.output
+            .contains("Slice it with shell instead, for example `Get-Content -LiteralPath 'huge.log' -TotalCount 200`"),
+        "{}",
+        huge.output
+    );
+}
+
+#[test]
+fn write_and_patch_aimed_at_a_directory_say_it_is_a_directory() {
+    let root = Workspace::new();
+    fs::create_dir(root.0.join("folder")).unwrap();
+    for (name, args) in [
+        ("write", json!({"path": "folder", "content": "x"})),
+        (
+            "write",
+            json!({"path": "folder", "content": "x", "expected": "y"}),
+        ),
+        (
+            "patch",
+            json!({"path": "folder", "edits": [{"expected": "x", "replacement": "y"}]}),
+        ),
+        ("read", json!({"path": "folder"})),
+    ] {
+        let result = root.call(name, args);
+        assert!(!result.success, "{name}");
+        assert!(
+            result
+                .output
+                .contains("path is a directory; use list to see its entries"),
+            "{name}: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("os error"),
+            "{name}: {}",
+            result.output
+        );
+    }
+}
+
+#[test]
+fn a_utf8_bom_neither_makes_expected_stale_nor_is_dropped_by_an_overwrite() {
+    let root = Workspace::new();
+    let path = root.0.join("bom.txt");
+    fs::write(&path, "\u{feff}one\ntwo\n").unwrap();
+    // `expected` is what a read shows: the BOM is invisible there.
+    let first = root.call(
+        "write",
+        json!({"path": "bom.txt", "content": "three\n", "expected": "one\ntwo\n"}),
+    );
+    assert!(first.success, "{}", first.output);
+    assert_eq!(fs::read(&path).unwrap(), b"\xEF\xBB\xBFthree\n");
+    // Spelling it is accepted too, and the new text may spell it.
+    let second = root.call(
+        "write",
+        json!({"path": "bom.txt", "content": "\u{feff}four\n", "expected": "\u{feff}three\n"}),
+    );
+    assert!(second.success, "{}", second.output);
+    assert_eq!(fs::read(&path).unwrap(), b"\xEF\xBB\xBFfour\n");
+    // A write authorized by the digest of a complete read keeps the BOM too
+    // (one registry: the digest lives in its read cache).
+    let tools = ToolRegistry::default();
+    let run = |name: &str, args: Value| {
+        tools.execute(OperatingMode::Auto, &root.0, name, &args.to_string())
+    };
+    let read = run("read", json!({"path": "bom.txt"}));
+    assert!(read.success, "{}", read.output);
+    let third = run("write", json!({"path": "bom.txt", "content": "five\n"}));
+    assert!(third.success, "{}", third.output);
+    assert_eq!(fs::read(&path).unwrap(), b"\xEF\xBB\xBFfive\n");
+    // A different expected is still stale.
+    let stale = root.call(
+        "write",
+        json!({"path": "bom.txt", "content": "x", "expected": "other\n"}),
+    );
+    assert!(
+        !stale.success && stale.output.contains("stale read"),
+        "{}",
+        stale.output
+    );
+    // A patch that spells the BOM in `expected` does not remove it either.
+    let patched = root.call(
+        "patch",
+        json!({"path": "bom.txt", "edits": [{"expected": "\u{feff}five", "replacement": "six"}]}),
+    );
+    assert!(patched.success, "{}", patched.output);
+    assert_eq!(fs::read(&path).unwrap(), b"\xEF\xBB\xBFsix\n");
+    // A file without a BOM does not gain one.
+    fs::write(root.0.join("plain.txt"), "one\n").unwrap();
+    let plain = root.call(
+        "write",
+        json!({"path": "plain.txt", "content": "two\n", "expected": "one\n"}),
+    );
+    assert!(plain.success, "{}", plain.output);
+    assert_eq!(fs::read(root.0.join("plain.txt")).unwrap(), b"two\n");
+}
+
+#[test]
+fn list_marks_directories_with_a_trailing_slash() {
+    let root = Workspace::new();
+    fs::create_dir_all(root.0.join("src/inner")).unwrap();
+    fs::write(root.0.join("a.txt"), "x").unwrap();
+    fs::write(root.0.join("src/lib.rs"), "x").unwrap();
+    let top = root.call("list", json!({"path": "."}));
+    assert!(top.success, "{}", top.output);
+    assert_eq!(top.output, "a.txt\nsrc/");
+    let sub = root.call("list", json!({"path": "src"}));
+    let separator = std::path::MAIN_SEPARATOR;
+    assert_eq!(
+        sub.output,
+        format!("src{separator}inner/\nsrc{separator}lib.rs"),
+        "{}",
+        sub.output
+    );
+}
+
+#[test]
+fn search_arguments_in_common_spellings_run_with_an_admission_note() {
+    let root = Workspace::new();
+    fs::write(root.0.join("a.txt"), "needle one\nother\n").unwrap();
+    let aliased = root.call("search", json!({"pattern": "needle", "path": "a.txt"}));
+    assert!(aliased.success, "{}", aliased.output);
+    assert!(
+        aliased.output.contains("pattern -> query"),
+        "{}",
+        aliased.output
+    );
+    assert!(
+        aliased.output.contains("1: needle one"),
+        "{}",
+        aliased.output
+    );
+    let encoded = root.call(
+        "search",
+        json!({"patterns": "[\"needle\", \"other\"]", "path": "a.txt", "max_hits": "10"}),
+    );
+    assert!(encoded.success, "{}", encoded.output);
+    assert!(
+        encoded.output.contains("patterns JSON string decoded once"),
+        "{}",
+        encoded.output
+    );
+    assert!(
+        encoded.output.contains("max_hits coerced to integer 10"),
+        "{}",
+        encoded.output
+    );
+    let file = root.call("read", json!({"file_path": "a.txt", "limit": 1}));
+    assert!(file.success, "{}", file.output);
+    assert!(file.output.contains("file_path -> path"), "{}", file.output);
+    assert!(file.output.contains("needle one"), "{}", file.output);
+    let multiline = root.call("search", json!({"query": "needle one\nother"}));
+    assert!(!multiline.success);
+    assert!(
+        multiline.output.contains("single lines"),
+        "{}",
+        multiline.output
+    );
+    let unknown = root.call("read", json!({"path": "a.txt", "whole": true}));
+    assert!(
+        unknown
+            .output
+            .contains("valid fields: path, offset, max_lines, lines"),
+        "{}",
+        unknown.output
+    );
+}
+
+#[test]
+fn failed_patch_recovery_prefers_a_small_located_excerpt_to_the_whole_file() {
+    let root = Workspace::new();
+    let filler = "// filler line\n".repeat(60);
+    let body = format!(
+        "{filler}fn main() {{\n    let value = compute(1, 2);\n    println!(\"{{}}\", value);\n}}\n{filler}fn tail() {{\n    let unique_marker_value = 42;\n    keep();\n}}\n{filler}"
+    );
+    fs::write(root.0.join("t.rs"), &body).unwrap();
+    let patch = |expected: &str| {
+        root.call(
+            "patch",
+            json!({"path":"t.rs","edits":[{"expected":expected,"replacement":"y"}]}),
+        )
+    };
+
+    // Whitespace differs inside the lines and the excerpt starts mid-line.
+    let substring = patch("let value=compute(1,2);println!(\"{}\",value);");
+    assert!(!substring.success, "{}", substring.output);
+    assert!(
+        substring.output.ends_with(
+            "Closest text is at lines 62-63 and differs from expected only in whitespace. Retry patch with it copied exactly; do not read again:\n    let value = compute(1, 2);\n    println!(\"{}\", value);"
+        ),
+        "{}",
+        substring.output
+    );
+    assert!(!substring.output.contains("Current file is below"));
+
+    // One line is right and the rest is not: the neighbourhood, as nearest text.
+    let nearest = patch("fn not_there() {\n    let unique_marker_value = 42;\n    changed();\n}");
+    assert!(!nearest.success, "{}", nearest.output);
+    assert!(
+        nearest.output.contains("Nearest text is around line 126, where one line of expected occurs exactly once (lines 122-131)"),
+        "{}",
+        nearest.output
+    );
+    assert!(
+        nearest
+            .output
+            .contains("    let unique_marker_value = 42;\n    keep();"),
+        "{}",
+        nearest.output
+    );
+    assert!(!nearest.output.contains("Current file is below"));
+    assert!(nearest.output.len() < 1024, "{}", nearest.output.len());
+
+    // Copied search markers are not file text.
+    let marked = patch("62: fn main() {\n63-     let value = compute(1, 2);");
+    assert!(!marked.success, "{}", marked.output);
+    assert!(
+        marked.output.contains("starts with a search marker"),
+        "{}",
+        marked.output
+    );
+    assert!(!marked.output.contains("Current file is below"));
+
+    // Nothing to anchor on: the whole-file recovery stays.
+    let none = patch("nothing like it\nat all, anywhere");
+    assert!(
+        none.output.contains("Current file is below")
+            || none.output.contains("Current file edges are below"),
+        "{}",
+        none.output
+    );
+    assert_eq!(fs::read_to_string(root.0.join("t.rs")).unwrap(), body);
+}
+
+/// "Same file name elsewhere" answers a wrong directory, nothing else.
+#[test]
+fn the_same_name_note_is_only_for_a_missing_file_and_never_names_secrets() {
+    let root = Workspace::new();
+    fs::create_dir_all(root.0.join("crates/core/src")).unwrap();
+    fs::write(root.0.join("crates/core/src/Config.rs"), "x\n").unwrap();
+    fs::write(root.0.join("crates/core/src/.env"), "SECRET=1\n").unwrap();
+    let eleven_mib = "x".repeat(11 * 1024 * 1024);
+    // Creating a file, or failing on its size, is not a wrong directory.
+    for args in [
+        json!({"path":"src/config.rs","content":"y"}),
+        json!({"path":"src/config.rs","content": eleven_mib}),
+        json!({"path":"src/config.rs","content": eleven_mib, "expected":"x\n"}),
+    ] {
+        let result = root.call("write", args);
+        assert!(
+            !result.output.contains("Same file name"),
+            "{}",
+            &result.output[..result.output.len().min(300)]
+        );
+    }
+    fs::remove_file(root.0.join("src/config.rs")).ok();
+    // A write that checks an EXISTING file is the wrong-directory case.
+    let wrong = root.call(
+        "write",
+        json!({"path":"src/config.rs","content":"y","expected":"x\n"}),
+    );
+    assert!(
+        wrong
+            .output
+            .ends_with("\nSame file name elsewhere: crates/core/src/Config.rs"),
+        "{}",
+        wrong.output
+    );
+    // A secret with the same name is never suggested.
+    let secret = root.call("read", json!({"path":"src/.env"}));
+    assert!(!secret.success);
+    assert!(
+        !secret.output.contains("Same file name"),
+        "{}",
+        secret.output
+    );
+    assert!(!secret.output.contains(".env\n"), "{}", secret.output);
+}
+
+#[test]
+fn truthful_recovery_text_for_one_line_files_quotes_and_utf32() {
+    let root = Workspace::new();
+    fs::write(root.0.join("one.txt"), "only\n").unwrap();
+    let past = root.call("read", json!({"path":"one.txt","offset":2}));
+    assert_eq!(past.output, "[offset 2 is past the end; file has 1 line]");
+    let mut utf32 = vec![0xFF, 0xFE, 0x00, 0x00];
+    utf32.extend("a".chars().flat_map(|c| (c as u32).to_le_bytes()));
+    fs::write(root.0.join("it's utf32.txt"), &utf32).unwrap();
+    let wide = root.call("read", json!({"path":"it's utf32.txt"}));
+    assert!(!wide.success);
+    assert!(
+        wide.output.contains("a UTF-32 LE file (BOM detected)"),
+        "{}",
+        wide.output
+    );
+    assert!(!wide.output.contains("UTF-16"), "{}", wide.output);
+    // The quote inside the name is doubled in the command to run.
+    assert!(
+        wide.output
+            .contains("Get-Content -LiteralPath 'it''s utf32.txt' -Encoding UTF32"),
+        "{}",
+        wide.output
+    );
+    fs::write(root.0.join("it's long.txt"), "x".repeat(1024 * 1024 + 1)).unwrap();
+    let long = root.call("read", json!({"path":"it's long.txt"}));
+    assert!(
+        long.output
+            .contains("(Get-Content -LiteralPath 'it''s long.txt')[0]"),
+        "{}",
+        long.output
+    );
+    let huge = fs::File::create(root.0.join("it's huge.log")).unwrap();
+    huge.set_len(10 * 1024 * 1024 + 1).unwrap();
+    drop(huge);
+    let huge = root.call("read", json!({"path":"it's huge.log"}));
+    assert!(
+        huge.output
+            .contains("-LiteralPath 'it''s huge.log' -TotalCount 200"),
+        "{}",
+        huge.output
+    );
+}
+
+#[test]
+fn multi_edit_recovery_says_its_line_numbers_count_the_proposed_content() {
+    let root = Workspace::new();
+    fs::write(root.0.join("m.txt"), "a\nb\nc\n  target( x )\nd\n").unwrap();
+    let edits = |first: &str| {
+        root.call(
+            "patch",
+            json!({"path":"m.txt","edits":[
+                {"expected":"a\n","replacement":first},
+                {"expected":"target(x)","replacement":"y"}
+            ]}),
+        )
+    };
+    let failed = edits("a\nnew1\nnew2\n");
+    assert!(!failed.success, "{}", failed.output);
+    // Line 4 on disk, line 6 once the first edit has added two lines.
+    assert!(
+        failed
+            .output
+            .contains("Edit 2 rejected in proposed content; no edits applied. Line numbers below count the proposed content (edit 1 applied)."),
+        "{}",
+        failed.output
+    );
+    assert!(
+        failed.output.contains("Closest text is at line 6"),
+        "{}",
+        failed.output
+    );
+    // The first edit's own failure counts the file on disk: no such sentence.
+    let first = root.call(
+        "patch",
+        json!({"path":"m.txt","edits":[
+            {"expected":"target(x)","replacement":"y"},
+            {"expected":"a\n","replacement":"z\n"}
+        ]}),
+    );
+    assert!(first.output.contains("Edit 1 rejected"), "{}", first.output);
+    assert!(
+        !first.output.contains("Line numbers below"),
+        "{}",
+        first.output
+    );
+    assert!(
+        first.output.contains("Closest text is at line 4"),
+        "{}",
+        first.output
+    );
+    assert_eq!(
+        fs::read_to_string(root.0.join("m.txt")).unwrap(),
+        "a\nb\nc\n  target( x )\nd\n"
+    );
+}
+
+/// The excerpt functions share one work budget: a huge file with a long
+/// near-match falls back to the current-file text instead of stalling.
+#[test]
+fn patch_recovery_on_a_huge_near_match_is_bounded() {
+    let root = Workspace::new();
+    fs::write(root.0.join("big.txt"), "x\n".repeat(200_000)).unwrap();
+    let expected = format!("{}y", "x \n".repeat(1_999));
+    let started = std::time::Instant::now();
+    let result = root.call(
+        "patch",
+        json!({"path":"big.txt","edits":[{"expected": expected, "replacement":"z"}]}),
+    );
+    let elapsed = started.elapsed();
+    assert!(!result.success);
+    assert!(
+        result.output.contains("Current file edges are below"),
+        "{}",
+        &result.output[..result.output.len().min(400)]
+    );
+    assert!(elapsed < std::time::Duration::from_secs(4), "{elapsed:?}");
+    assert_eq!(
+        fs::read_to_string(root.0.join("big.txt")).unwrap().len(),
+        400_000
+    );
 }

@@ -205,7 +205,7 @@ fn spawn_mcp_fixture() -> McpFixture {
                         "jsonrpc":"2.0", "id":id,
                         "result":{
                             "protocolVersion":"2025-11-25",
-                            "capabilities":{},
+                            "capabilities":{"tools":{}},
                             "serverInfo":{"name":"fixture","version":"1"}
                         }
                     }),

@@ -191,6 +191,29 @@ fn keep_live_history_requires_visible_identity() {
 }
 
 #[test]
+fn live_history_matches_the_journal_form_of_credential_bearing_input() {
+    use slim_core::provider::ProviderContentBlock;
+    // The journal stores input through the heuristic credential redactor.
+    for raw in [
+        "debug\nAuthorization: Bearer abc.def\nfails",
+        "{\n  \"api-key\": \"k\",\n  \"path\": \"/v1\"\n}",
+    ] {
+        let journaled = crate::auth::redact(raw);
+        assert_ne!(journaled, raw);
+        let live = vec![
+            ProviderMessage::user(raw).with_content_blocks(vec![ProviderContentBlock::text(raw)]),
+            ProviderMessage::assistant("b", vec![]),
+        ];
+        let durable = vec![
+            ProviderMessage::user(journaled.clone())
+                .with_content_blocks(vec![ProviderContentBlock::text(journaled)]),
+            ProviderMessage::assistant("b", vec![]),
+        ];
+        assert!(keep_live_history(&live, &durable));
+    }
+}
+
+#[test]
 fn mismatched_live_history_is_replaced_by_durable_prefix() {
     let path = temp_session("mismatch");
     create_v2_with_visible_history(&path);
@@ -301,4 +324,71 @@ fn cold_resume_does_not_invent_reasoning() {
     assert!(body.contains("seed question"), "{body}");
     assert!(!body.contains("hold this thought"), "{body}");
     let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+}
+
+/// A skill-invoked prompt reaches the model with the skill instructions the
+/// journal never records. A compaction over that prompt still persists its
+/// checkpoint.
+#[test]
+fn a_compaction_over_a_skill_invoked_prompt_is_persisted() {
+    use super::{run_provider_resume_with_preflight_events_interactive_async, SkillInstructions};
+    use slim_core::context::{CompactionHandle, CompactionPolicy};
+
+    let path = temp_session("skill-compaction");
+    create_empty_v2(&path);
+    let workspace = path.parent().expect("parent").to_path_buf();
+    std::fs::write(workspace.join("notes.txt"), "read by the run").expect("notes");
+    let tool_call = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"probe\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"notes.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+    let summary = b"data: {\"choices\":[{\"delta\":{\"content\":\"## Goal skill summary\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let done = b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let (endpoint, bodies, server) = spawn_turns(vec![tool_call, summary, done]);
+    let handle = CompactionHandle::new(CompactionPolicy {
+        keep_recent_tokens: 1,
+        ..CompactionPolicy::default()
+    });
+    handle.request_manual("").expect("manual request");
+    let options = ProviderRunOptions::default()
+        .with_context_window_tokens(32_000)
+        .with_workspace_root(&workspace)
+        .with_compaction_handle(handle);
+    let skill = SkillInstructions {
+        name: "review-code".into(),
+        body: "Inspect the change carefully.".into(),
+        source: workspace.join("SKILL.md"),
+    };
+    let (route, _responder) = slim_core::interaction::interaction_route();
+    let execution =
+        super::block_on_provider(run_provider_resume_with_preflight_events_interactive_async(
+            request(endpoint, "Review the module"),
+            preflight_session(&path).expect("preflight"),
+            options,
+            Some(skill),
+            None,
+            route,
+        ))
+        .expect("skill run");
+    server.join().expect("server");
+    assert_eq!(execution.result.code, super::ExitCode::Success);
+    let captured = bodies.lock().expect("bodies");
+    assert!(
+        captured[0].contains("Inspect the change carefully."),
+        "the model saw the skill instructions"
+    );
+    assert!(captured[1].contains("Review the module"), "{}", captured[1]);
+
+    let records = preflight_session(&path).expect("persisted").records;
+    let checkpoints = records
+        .iter()
+        .filter_map(|record| match record {
+            DurableRecord::Compaction { checkpoint, .. } => Some(checkpoint),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(checkpoints.len(), 1, "the compaction must be persisted");
+    assert!(checkpoints[0].summary.contains("skill summary"));
+    assert!(execution
+        .warnings
+        .iter()
+        .all(|warning| !warning.contains("could not be saved")));
+    let _ = std::fs::remove_dir_all(workspace);
 }

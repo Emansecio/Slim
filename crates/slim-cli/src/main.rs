@@ -4,6 +4,10 @@ const MAX_STDIN_BYTES: usize = 8 * 1024 * 1024;
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    // `slim mcp ...` manages MCP servers; it needs no session or credentials.
+    if args.first().map(String::as_str) == Some("mcp") {
+        std::process::exit(slim_cli::run_mcp_cli(&args[1..]));
+    }
     let special = args
         .iter()
         .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version" | "-V"));

@@ -1,10 +1,14 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde_json::Value;
 use tokio::sync::Notify;
+
+use crate::mcp::client::{McpProgressSink, McpServerHandshake};
+use crate::mcp::oauth::McpAuthHandle;
 
 /// MCP protocol revision negotiated during `initialize`.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -17,6 +21,120 @@ pub struct McpServerSpec {
     pub transport: McpTransport,
     pub enabled: bool,
     pub timeout: Duration,
+    pub options: McpServerOptions,
+}
+
+/// Default per-request timeout for a server that does not configure one.
+pub const DEFAULT_MCP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default time the first model request waits for direct-exposure servers
+/// that are still connecting (`[mcp] startup_wait_ms`).
+pub const DEFAULT_MCP_STARTUP_WAIT: Duration = Duration::from_secs(10);
+
+impl McpServerSpec {
+    /// Enabled server with the default timeout and no optional settings.
+    pub fn new(name: impl Into<String>, transport: McpTransport) -> Self {
+        Self {
+            name: name.into(),
+            transport,
+            enabled: true,
+            timeout: DEFAULT_MCP_TIMEOUT,
+            options: McpServerOptions::default(),
+        }
+    }
+}
+
+/// How a server's tools reach the model.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpExposure {
+    /// Reachable through the `mcp` gateway tool and codemode (default).
+    #[default]
+    Gateway,
+    /// Declared to the model as `mcp__<server>__<tool>` provider tools.
+    Direct,
+    /// Registered but unreachable.
+    Hidden,
+}
+
+impl McpExposure {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gateway => "gateway",
+            Self::Direct => "direct",
+            Self::Hidden => "hidden",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "gateway" => Some(Self::Gateway),
+            "direct" => Some(Self::Direct),
+            "hidden" => Some(Self::Hidden),
+            _ => None,
+        }
+    }
+}
+
+/// OAuth settings for an HTTP server (`client_secret` is already resolved).
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct McpOAuthSpec {
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub callback_port: Option<u16>,
+    pub scope: Option<String>,
+    pub client_name: Option<String>,
+    pub auth_server_metadata_url: Option<String>,
+}
+
+impl std::fmt::Debug for McpOAuthSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpOAuthSpec")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("callback_port", &self.callback_port)
+            .field("scope", &self.scope)
+            .field("client_name", &self.client_name)
+            .field("auth_server_metadata_url", &self.auth_server_metadata_url)
+            .finish()
+    }
+}
+
+/// Why a configured server must not start. The entry stays listed so the
+/// reason is visible in `/mcp` and to the model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum McpServerBlock {
+    /// Defined (or overridden) by a project `slim.toml` whose workspace is
+    /// not trusted yet.
+    Untrusted,
+    /// A configuration value could not be resolved (missing environment
+    /// variable, failing `!command`, ...). The text never contains values.
+    Invalid(String),
+}
+
+/// Optional per-server settings. All default to "not configured".
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct McpServerOptions {
+    /// Working directory for stdio servers; relative paths resolve against
+    /// the workspace root. `None` uses the workspace root.
+    pub cwd: Option<PathBuf>,
+    /// One-sentence description shown to the model and in `/mcp`.
+    pub description: Option<String>,
+    pub exposure: McpExposure,
+    /// Per-tool exposure overrides: exact tool name or `*` glob.
+    pub tool_exposure: BTreeMap<String, McpExposure>,
+    /// Connect only on first use instead of at session start.
+    pub lazy: bool,
+    pub oauth: Option<McpOAuthSpec>,
+    pub block: Option<McpServerBlock>,
+    /// OAuth state machine of an HTTP server without a configured
+    /// `Authorization` header. Built by the host (it owns the token store);
+    /// does not take part in spec equality.
+    pub auth: Option<McpAuthHandle>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,7 +158,7 @@ impl McpTransport {
         }
     }
 
-    /// Human-target shown in `/mcp`; never includes header or env values.
+    /// Human-target shown in `/mcp`; HTTP credentials are omitted.
     pub fn target(&self) -> String {
         match self {
             Self::Stdio { command, args, .. } => {
@@ -50,7 +168,7 @@ impl McpTransport {
                     format!("{command} {}", args.join(" "))
                 }
             }
-            Self::Http { url, .. } => url.clone(),
+            Self::Http { url, .. } => super::http::sanitized_url(url),
         }
     }
 
@@ -97,6 +215,7 @@ pub struct McpToolSummary {
     pub name: String,
     pub description: Option<String>,
     pub schema: Value,
+    pub output_schema: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -104,8 +223,20 @@ pub enum McpServerStatus {
     Disabled,
     Disconnected,
     Connecting,
-    Ready { tools: Arc<Vec<McpToolSummary>> },
-    Failed { error: String },
+    Ready {
+        tools: Arc<Vec<McpToolSummary>>,
+    },
+    Failed {
+        error: String,
+    },
+    /// Project-defined server waiting for the workspace to be trusted.
+    Untrusted,
+    /// The server needs OAuth sign-in (or a new one: expired grant, more
+    /// scope asked). Nothing opens a browser by itself: the user signs in
+    /// with `/mcp login`.
+    NeedsAuth {
+        reason: String,
+    },
 }
 
 /// Snapshot of one server for status surfaces (`/mcp` overlay, `list`).
@@ -115,7 +246,11 @@ pub struct McpServerInfo {
     pub transport: &'static str,
     pub target: String,
     pub enabled: bool,
+    pub description: Option<String>,
+    pub exposure: McpExposure,
     pub status: McpServerStatus,
+    /// What the server reported in `initialize`; present while connected.
+    pub handshake: Option<Arc<McpServerHandshake>>,
 }
 
 #[derive(Debug)]
@@ -124,17 +259,28 @@ pub enum McpError {
     Protocol(String),
     Timeout(Duration),
     Closed,
+    /// The HTTP server no longer knows the session (404 on a request that
+    /// carried `mcp-session-id`): it restarted or expired the session. The
+    /// request may or may not have run; only idempotent requests are retried
+    /// on a new session.
+    SessionExpired,
     Server {
         code: i64,
         message: String,
     },
     UnknownServer(String),
     Disabled(String),
+    /// Server cannot start: untrusted project configuration or an
+    /// unresolvable configuration value. The text is safe to show.
+    Blocked(String),
     CancelledBeforeSend,
     OutcomeUncertain {
         interruption: McpInterruption,
         cleanup: McpCleanupStatus,
     },
+    /// The HTTP server needs OAuth sign-in. The request was rejected before
+    /// it ran (HTTP 401/403), so nothing executed. The text is safe to show.
+    AuthRequired(String),
 }
 
 /// Why an in-flight MCP request stopped. This is separate from a normal
@@ -279,9 +425,13 @@ impl std::fmt::Display for McpError {
                 )
             }
             Self::Closed => write!(formatter, "connection closed"),
+            Self::SessionExpired => write!(formatter, "MCP session expired"),
             Self::Server { code, message } => write!(formatter, "server error {code}: {message}"),
             Self::UnknownServer(name) => write!(formatter, "unknown MCP server: {name}"),
             Self::Disabled(name) => write!(formatter, "MCP server is disabled: {name}"),
+            Self::Blocked(message) | Self::AuthRequired(message) => {
+                write!(formatter, "{message}")
+            }
             Self::CancelledBeforeSend => write!(formatter, "MCP request cancelled before send"),
             Self::OutcomeUncertain {
                 interruption,
@@ -352,8 +502,12 @@ pub trait McpConnection: Send + Sync {
                         cleanup: McpCleanupStatus::Unconfirmed,
                     }
                 }
-                Err(McpError::Io(_) | McpError::Protocol(_) | McpError::Closed)
-                    if method == "tools/call" =>
+                Err(
+                    McpError::Io(_)
+                    | McpError::Protocol(_)
+                    | McpError::Closed
+                    | McpError::SessionExpired,
+                ) if method == "tools/call" =>
                 {
                     McpRequestOutcome::OutcomeUncertain {
                         interruption: McpInterruption::ConnectionClosed,
@@ -369,10 +523,34 @@ pub trait McpConnection: Send + Sync {
         }
     }
 
+    /// Cancel-aware request that also tracks progress. With `Some(sink)` the
+    /// request carries a `progressToken`; the connection renews the request
+    /// timeout on every matching `notifications/progress` and forwards it to
+    /// the sink. Transports that cannot track progress ignore the sink.
+    async fn request_with_progress(
+        &self,
+        method: &str,
+        params: Value,
+        cancellation: McpCancellation,
+        progress: Option<McpProgressSink>,
+    ) -> McpRequestOutcome<Value> {
+        let _ = progress;
+        self.request_cancellable(method, params, cancellation).await
+    }
+
+    /// Records the revision negotiated in `initialize`; HTTP replays it in
+    /// the `MCP-Protocol-Version` header.
+    fn set_protocol_version(&self, _version: &str) {}
+
     /// Requests transport shutdown and waits only for bounded cleanup.
     async fn close_for_cleanup(&self) -> McpCleanupStatus {
         McpCleanupStatus::NotRequired
     }
+    /// Ends the server-side session in an orderly way (HTTP `DELETE`, bounded
+    /// to one second) and returns once that finished or timed out. Callers
+    /// that are about to drop the connection await this so the notice is not
+    /// lost to process exit; transports with nothing to end do nothing.
+    async fn end_session(&self) {}
     /// Sends a notification with cancellation observation. Transports without
     /// write admission tracking conservatively report uncertainty once the
     /// notification future may have started.
@@ -406,7 +584,18 @@ pub trait McpConnection: Send + Sync {
     fn take_tools_stale(&self) -> bool {
         false
     }
+    /// Server signalled `notifications/resources/list_changed` since last
+    /// check; resource caches must be refreshed.
+    fn take_resources_stale(&self) -> bool {
+        false
+    }
     /// Re-arms the stale flag after a failed refresh so the next `list_tools`
     /// retries instead of serving the cached list forever.
     fn mark_tools_stale(&self) {}
+    /// Why a connection that just closed under a pending handshake request
+    /// went away, with the diagnostics the transport kept (a stdio server's
+    /// stderr tail). `None` for transports that keep none.
+    async fn closed_reason(&self) -> Option<McpError> {
+        None
+    }
 }

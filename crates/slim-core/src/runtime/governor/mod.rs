@@ -1,10 +1,9 @@
 //! Causal progress ledger: classifies each completed tool call as progress,
-//! an uncertainty boundary or an anomaly, and keeps the facts a compaction
-//! snapshot must preserve.
+//! an uncertainty boundary or an anomaly.
 //!
 //! - `observation`: the events the ledger emits and the in-flight call;
 //! - `evidence`: identities and digests of results and states;
-//! - `compaction`: the bounded execution-facts snapshot.
+//! - `compaction`: what the ledger forgets when a compaction drops evidence.
 
 mod compaction;
 mod evidence;
@@ -13,14 +12,13 @@ mod observation;
 mod tests;
 
 use crate::tools::{
-    dependency_key, path_identity, DependencyKind, DependencyObservation, PreparedToolInvocation,
+    dependency_key, DependencyKind, DependencyObservation, PreparedToolInvocation,
     ToolDependencyScope, ToolEffectClass, ToolExecutionReceipt, ToolOperationalSpec,
     ToolReplayPolicy, ToolResult, ToolVolatility,
 };
 use crate::{
     CausalAnomalyKind, CausalBoundaryKind, CausalConfidence, CausalProgressKind, CausalShadowAction,
 };
-use compaction::{MAX_COMPACTION_FAILURES, MAX_COMPACTION_MUTATIONS};
 use evidence::{
     evidence_applicable, evidence_id, evidence_scope, hash_tagged, mutations_digest,
     observations_digest, seen_key, stateful_call_fingerprint, validation_green,
@@ -49,10 +47,6 @@ struct ProgressLedger {
     evidence: HashMap<String, EvidenceRecord>,
     seen_evidence: HashSet<String>,
     validations: HashMap<String, ValidationResult>,
-    pending_failures: BTreeMap<String, PendingFailure>,
-    pending_failure_omitted: usize,
-    mutations: BTreeMap<String, u64>,
-    mutation_omitted: usize,
     stagnant_turns: u32,
     turn: TurnState,
     compacted_fingerprints: HashSet<String>,
@@ -129,18 +123,8 @@ enum EvidenceRecording {
 
 struct ValidationResult {
     success: bool,
-    tool_name: String,
-    call_id: String,
     workspace_revision: u64,
     uncertainty_epoch: u64,
-}
-
-struct PendingFailure {
-    tool_name: String,
-    call_id: String,
-    workspace_revision: u64,
-    uncertainty_epoch: u64,
-    validation: bool,
 }
 
 /// How a receipt's dependencies compare with what the ledger already knows.
@@ -166,55 +150,6 @@ impl CausalGovernor {
                 self.ledger
                     .is_current(result.workspace_revision, result.uncertainty_epoch)
             })
-    }
-
-    fn remember_failure(&mut self, pending: &PendingCall, result: &ToolResult) {
-        if result.success {
-            self.ledger
-                .pending_failures
-                .remove(&pending.canonical_fingerprint);
-            return;
-        }
-        let fact = PendingFailure {
-            tool_name: pending.tool_name.clone(),
-            call_id: pending.call_id.clone(),
-            workspace_revision: self.ledger.workspace_revision,
-            uncertainty_epoch: self.ledger.uncertainty_epoch,
-            validation: !pending.structural_rejection && pending.is_validation(),
-        };
-        if !insert_bounded(
-            &mut self.ledger.pending_failures,
-            pending.canonical_fingerprint.clone(),
-            fact,
-            MAX_COMPACTION_FAILURES,
-        ) {
-            self.ledger.pending_failure_omitted =
-                self.ledger.pending_failure_omitted.saturating_add(1);
-        }
-    }
-
-    fn remember_mutations(&mut self, receipt: &ToolExecutionReceipt) {
-        let governor_revision = self.ledger.workspace_revision;
-        for mutation in receipt
-            .mutations
-            .iter()
-            .filter(|mutation| mutation.changed())
-        {
-            let path = path_identity(&mutation.path);
-            let revision = self
-                .ledger
-                .mutations
-                .get(&path)
-                .map_or(governor_revision, |known| (*known).max(governor_revision));
-            if !insert_bounded(
-                &mut self.ledger.mutations,
-                path,
-                revision,
-                MAX_COMPACTION_MUTATIONS,
-            ) {
-                self.ledger.mutation_omitted = self.ledger.mutation_omitted.saturating_add(1);
-            }
-        }
     }
 
     fn note_stop(&mut self, action: CausalShadowAction) {
@@ -315,12 +250,9 @@ impl CausalGovernor {
         receipt: &ToolExecutionReceipt,
     ) -> Vec<GovernorObservation> {
         if pending.structural_rejection {
-            self.remember_failure(&pending, result);
             return self.observe_evidence(pending, result, EvidenceOutcome::Failure);
         }
         let source_revision = self.sync_revision(receipt);
-        self.remember_mutations(receipt);
-        self.remember_failure(&pending, result);
         let Some(spec) = pending.spec else {
             return Vec::new();
         };
@@ -589,8 +521,6 @@ impl CausalGovernor {
             pending.canonical_fingerprint.clone(),
             ValidationResult {
                 success,
-                tool_name: pending.tool_name.clone(),
-                call_id: pending.call_id.clone(),
                 // The revision the call actually tested, not the one at
                 // completion: a mutation in between makes it stale.
                 workspace_revision: evidence_revision,

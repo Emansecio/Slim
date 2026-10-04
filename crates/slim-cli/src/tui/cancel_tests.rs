@@ -1,9 +1,10 @@
 use super::{
-    advance_pending_delivery, associate_projected_run, attach_workspace_to_snapshot,
-    esc_forces_quit, execution_result_events, project_core_event, project_sync_tui_events,
-    send_cancel_result, take_run_id, ContentStore, EventSink, PendingDeliveryStep, PendingRun,
-    WakeSignal, CONTENT_ENTRY_BYTES, CONTENT_PAGE_BYTES, CONTENT_STORE_BYTES,
-    CONTENT_STORE_ENTRIES, ESC_FORCE_WINDOW,
+    abort_active_with_grace, advance_pending_delivery, associate_projected_run,
+    attach_workspace_to_snapshot, esc_forces_quit, execution_result_events, project_core_event,
+    project_sync_tui_events, request_compaction_during_run, send_cancel_result, take_run_id,
+    ActiveRun, ContentStore, EventSink, PendingDeliveryStep, PendingRun, WakeSignal,
+    CONTENT_ENTRY_BYTES, CONTENT_PAGE_BYTES, CONTENT_STORE_BYTES, CONTENT_STORE_ENTRIES,
+    ESC_FORCE_WINDOW,
 };
 use crate::exit_codes::ExitCode;
 use crate::headless::{ProviderExecution, ProviderHeadlessResult, ToolLoopLimits};
@@ -260,6 +261,7 @@ fn execution(code: ExitCode) -> ProviderExecution {
             context_window_tokens: AgentLoopConfig::default().context_window_tokens,
         },
         resume_preflight: None,
+        warnings: Vec::new(),
     }
 }
 
@@ -684,6 +686,7 @@ fn exact_full_pending_delivery_services_cancel_without_losing_truth() {
     }
     let cancellation = CancellationToken::new();
     let mut run = PendingRun {
+        jobs: None,
         run_id: 7,
         admission: None,
         result: None,
@@ -699,7 +702,14 @@ fn exact_full_pending_delivery_services_cancel_without_losing_truth() {
     commands.send(UiCommand::CancelRun).expect("cancel");
 
     assert_eq!(
-        advance_pending_delivery(&mut run, &mut command_rx, &sink, &mut false, &None),
+        advance_pending_delivery(
+            &mut run,
+            &mut command_rx,
+            &sink,
+            &mut false,
+            &None,
+            &Default::default()
+        ),
         PendingDeliveryStep::Complete
     );
     assert!(cancellation.is_cancelled());
@@ -729,6 +739,7 @@ fn exact_full_pending_delivery_services_shutdown() {
     }
     let cancellation = CancellationToken::new();
     let mut run = PendingRun {
+        jobs: None,
         run_id: 7,
         admission: None,
         result: None,
@@ -744,7 +755,14 @@ fn exact_full_pending_delivery_services_shutdown() {
     commands.send(UiCommand::Shutdown).expect("shutdown");
 
     assert_eq!(
-        advance_pending_delivery(&mut run, &mut command_rx, &sink, &mut false, &None),
+        advance_pending_delivery(
+            &mut run,
+            &mut command_rx,
+            &sink,
+            &mut false,
+            &None,
+            &Default::default()
+        ),
         PendingDeliveryStep::Shutdown
     );
     assert!(cancellation.is_cancelled());
@@ -766,6 +784,7 @@ fn exact_full_pending_delivery_queues_unbound_interaction_ack_without_blocking()
     }
     let request_id = InteractionRequestId("pending-input".into());
     let mut run = PendingRun {
+        jobs: None,
         run_id: 7,
         admission: None,
         result: None,
@@ -786,7 +805,14 @@ fn exact_full_pending_delivery_queues_unbound_interaction_ack_without_blocking()
         .expect("answer");
 
     assert_eq!(
-        advance_pending_delivery(&mut run, &mut command_rx, &sink, &mut false, &None),
+        advance_pending_delivery(
+            &mut run,
+            &mut command_rx,
+            &sink,
+            &mut false,
+            &None,
+            &Default::default()
+        ),
         PendingDeliveryStep::Pending
     );
     assert_eq!(
@@ -800,7 +826,14 @@ fn exact_full_pending_delivery_queues_unbound_interaction_ack_without_blocking()
 
     commands.send(UiCommand::CancelRun).expect("cancel");
     assert_eq!(
-        advance_pending_delivery(&mut run, &mut command_rx, &sink, &mut false, &None),
+        advance_pending_delivery(
+            &mut run,
+            &mut command_rx,
+            &sink,
+            &mut false,
+            &None,
+            &Default::default()
+        ),
         PendingDeliveryStep::Complete
     );
     assert_eq!(
@@ -829,6 +862,7 @@ fn exact_full_pending_delivery_queues_unbound_interaction_ack_without_blocking()
 fn pending_run_cancel_is_recorded_and_interrupts_projector() {
     let cancellation = CancellationToken::new();
     let mut run = PendingRun {
+        jobs: None,
         run_id: 1,
         admission: None,
         result: Some(Ok(Ok(execution(ExitCode::Success)))),
@@ -870,4 +904,97 @@ fn cancellation_terminal_result_emits_cancelled() {
         control_rx.recv().expect("terminal event"),
         UiEvent::RunCancelled { run_id: 1 }
     );
+}
+
+/// A forced abort drops the run's task where it stands, so the core never
+/// reaches its own clearing: the interface clears the manual request of an
+/// idle `/compact`, and leaves the one queued during a normal run alone.
+#[tokio::test]
+async fn a_forced_abort_clears_only_the_manual_request_of_an_idle_compaction() {
+    let handle = slim_core::context::CompactionHandle::default();
+    let active_run = |idle: bool| ActiveRun {
+        run_id: 1,
+        admission: None,
+        cancellation_from_preparation: false,
+        // A run that ignores its cancellation token.
+        task: tokio::spawn(async { std::future::pending().await }),
+        projector: std::thread::spawn(|| {}),
+        cancellation: CancellationToken::new(),
+        durable: false,
+        content_store: Default::default(),
+        interaction_responder: None,
+        manual_retry: Default::default(),
+        workspace_root: None,
+        idle_compaction: idle.then(|| handle.clone()),
+    };
+
+    handle.request_manual("queued during a normal run").unwrap();
+    let mut active = Some(active_run(false));
+    let pending = abort_active_with_grace(&mut active, Duration::ZERO).await;
+    assert!(pending.is_some() && active.is_none());
+    assert_eq!(
+        handle.manual_instructions().as_deref(),
+        Some("queued during a normal run"),
+        "a normal run keeps the /compact queued for its next boundary"
+    );
+
+    let mut active = Some(active_run(true));
+    let pending = abort_active_with_grace(&mut active, Duration::ZERO).await;
+    assert!(pending.is_some() && active.is_none());
+    assert_eq!(handle.manual_instructions(), None);
+}
+
+/// An idle `/compact` has already read its instructions and clears the handle
+/// when it ends: a second `/compact` typed meanwhile must be refused, not
+/// acknowledged as queued and dropped. During a normal run it still queues.
+#[tokio::test]
+async fn a_second_compact_during_an_idle_compaction_is_refused() {
+    let handle = slim_core::context::CompactionHandle::default();
+    let options = crate::ProviderRunOptions {
+        compaction: Some(handle.clone()),
+        ..crate::ProviderRunOptions::default()
+    };
+    let active_run = |idle: bool| ActiveRun {
+        run_id: 1,
+        admission: None,
+        cancellation_from_preparation: false,
+        task: tokio::spawn(async { std::future::pending().await }),
+        projector: std::thread::spawn(|| {}),
+        cancellation: CancellationToken::new(),
+        durable: false,
+        content_store: Default::default(),
+        interaction_responder: None,
+        manual_retry: Default::default(),
+        workspace_root: None,
+        idle_compaction: idle.then(|| handle.clone()),
+    };
+    let notification = |control: &mpsc::Receiver<UiEvent>, data: &mpsc::Receiver<UiEvent>| {
+        control
+            .try_recv()
+            .or_else(|_| data.try_recv())
+            .expect("a notification")
+    };
+
+    let (sink, control_rx, data_rx) = sink();
+    let idle = active_run(true);
+    request_compaction_during_run(Some(&idle), &options, "focus on db".into(), &sink);
+    assert_eq!(handle.manual_instructions(), None);
+    assert_eq!(
+        notification(&control_rx, &data_rx),
+        UiEvent::Notification {
+            message: "A compaction is already running".into()
+        }
+    );
+
+    let normal = active_run(false);
+    request_compaction_during_run(Some(&normal), &options, "focus on db".into(), &sink);
+    assert_eq!(handle.manual_instructions().as_deref(), Some("focus on db"));
+    assert_eq!(
+        notification(&control_rx, &data_rx),
+        UiEvent::Notification {
+            message: "Compaction queued for the next safe boundary".into()
+        }
+    );
+    idle.task.abort();
+    normal.task.abort();
 }

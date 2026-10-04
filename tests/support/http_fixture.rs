@@ -13,9 +13,6 @@ use std::time::{Duration, Instant};
 /// Resposta SSE de uma unica mensagem final, sem uso de ferramentas.
 pub const SSE_FINAL_ANSWER: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"final answer\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
 
-/// Resumo de compactacao valido com uso de tokens.
-pub const SSE_COMPACTION_SUMMARY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\nprepared\\n## Constraints\\nNone\\n## Progress\\nPrepared\\n## Blocked\\nNone\\n## Decisions\\nReuse\\n## Next steps\\nContinue\\n## Critical context\\nFixture\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":29,\"completion_tokens\":6}}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-
 /// Listener em loopback com porta efemera, ja em modo nao bloqueante.
 pub fn bind_listener() -> (TcpListener, SocketAddr) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");

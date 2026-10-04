@@ -1,4 +1,4 @@
-use slim_core::{EventKind, OperatingMode, ProfileCatalog, ProfileId, SessionEvent};
+use slim_core::{EventKind, OperatingMode, SessionEvent};
 
 #[test]
 fn event_sequence_is_monotonic_and_covers_the_initial_contract() {
@@ -90,9 +90,6 @@ fn event_sequence_is_monotonic_and_covers_the_initial_contract() {
     assert!(OperatingMode::Auto.allows_mutation());
     assert!(!OperatingMode::ReadOnly.allows_mutation());
     assert!(!OperatingMode::Plan.allows_mutation());
-
-    let profiles = ProfileCatalog;
-    assert_eq!(profiles.get(ProfileId::Deep).effort, "high");
 }
 
 #[test]
