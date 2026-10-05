@@ -366,9 +366,10 @@ fn same_batch_groups_different_names_and_expands_in_provider_order() {
     complete(&mut state, "batch-a", "call-2", "shell", "cmd=two", 5);
     settle(&mut state);
 
+    // A group of two names what it did; the counts are for larger ones.
     let collapsed = render_terminal_text(&state, 120, 30);
     assert!(
-        collapsed.contains("✓ 1 leitura, 1 comando · 12ms"),
+        collapsed.contains("✓ Leu one · Executou cmd=two · 12ms"),
         "{collapsed}"
     );
     assert!(
@@ -389,23 +390,27 @@ fn same_batch_groups_different_names_and_expands_in_provider_order() {
     );
     assert!(state.blocks()[0].group_expanded);
     let expanded = render_terminal_text(&state, 120, 30);
+    // The open header points down and keeps saying what the group did; its
+    // members sit one step in.
     assert!(
-        expanded.contains("✓ 1 leitura, 1 comando · 12ms"),
+        expanded.contains("▾ Leu one · Executou cmd=two · 12ms"),
         "{expanded}"
     );
     assert!(
         !expanded.contains("Enter detalhes"),
         "expanded header must not keep the collapse-competing hint\n{expanded}"
     );
-    let first = expanded.find("Leu one").expect("first member");
-    let second = expanded.find("Executou cmd=two").expect("second member");
+    let first = expanded.find("    ✓ Leu one").expect("first member");
+    let second = expanded
+        .find("    ✓ Executou cmd=two")
+        .expect("second member");
     assert!(first < second, "provider order changed\n{expanded}");
     // Call ids are internal identity, not something the reader acts on.
     assert!(!expanded.contains("call-1"), "{expanded}");
     assert!(!expanded.contains("call-2"), "{expanded}");
     let first_row = expanded
         .lines()
-        .find(|line| line.contains("Leu one"))
+        .find(|line| line.contains("    ✓ Leu one"))
         .expect("first member row");
     assert!(
         !first_row.contains("cmd=two"),
@@ -431,7 +436,7 @@ fn same_batch_groups_equal_names_by_batch_identity() {
     settle(&mut state);
 
     let frame = render_terminal_text(&state, 80, 24);
-    assert!(frame.contains("✓ 2 leituras · 7ms"), "{frame}");
+    assert!(frame.contains("✓ Leu one · Leu two · 7ms"), "{frame}");
     assert!(!frame.contains("✓ read"), "{frame}");
 }
 
@@ -578,7 +583,7 @@ fn enter_details_only_on_selected_or_last_live_collapsed_group() {
         "only the last live collapsed group may hint\n{live}"
     );
     assert!(
-        hint_lines[0].contains("1 edição, 1 comando"),
+        hint_lines[0].contains("Executou three · Escreveu four"),
         "{hint_lines:?}"
     );
 
@@ -604,7 +609,10 @@ fn enter_details_only_on_selected_or_last_live_collapsed_group() {
         1,
         "selected collapsed group must regain the hint\n{selected}"
     );
-    assert!(hint_lines[0].contains("2 leituras"), "{hint_lines:?}");
+    assert!(
+        hint_lines[0].contains("Leu one · Leu two"),
+        "{hint_lines:?}"
+    );
 }
 
 #[test]
@@ -796,13 +804,13 @@ fn fresh_tool_keeps_its_row_until_the_emphasis_expires() {
         "each just-finished call keeps a row\n{fresh}"
     );
     assert!(
-        !fresh.contains("2 leituras"),
+        !fresh.contains("Leu one · Leu two"),
         "the group waits out the emphasis\n{fresh}"
     );
 
     settle(&mut state);
     let grouped = render_terminal_text(&state, 80, 24);
-    assert!(grouped.contains("2 leituras"), "{grouped}");
+    assert!(grouped.contains("✓ Leu one · Leu two"), "{grouped}");
     assert!(
         !grouped.contains("✓ read"),
         "settled calls fold into the group\n{grouped}"
@@ -846,7 +854,7 @@ fn reduced_motion_folds_a_finished_tool_immediately() {
         text.push('\n');
     }
     assert!(
-        text.contains("2 leituras"),
+        text.contains("✓ Leu one · Leu two"),
         "reduced motion shows the settled group\n{text}"
     );
 }

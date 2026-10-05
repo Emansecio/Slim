@@ -349,6 +349,14 @@ pub(crate) fn user_prompt_text_width(width: u16) -> u16 {
     width.saturating_sub(USER_PROMPT_PREFIX_COLS).max(1)
 }
 
+/// Cells an open group steps its members in from its own header.
+pub(crate) const GROUP_MEMBER_INDENT: u16 = 2;
+
+/// Width left to a member of an open group once it steps in.
+fn group_member_width(width: u16) -> u16 {
+    width.saturating_sub(GROUP_MEMBER_INDENT).max(1)
+}
+
 /// Align reasoning text beneath the header after its marker and disclosure glyph.
 pub(crate) fn thinking_body_width(width: u16) -> u16 {
     width.saturating_sub(4).max(1)
@@ -431,7 +439,10 @@ fn block_height(block: &Block, width: u16, cache: &mut WrapCache) -> usize {
                 )
             }
         }
-        BlockKind::System(_) | BlockKind::Activity(_) | BlockKind::Receipt(_) => 1,
+        BlockKind::System(_)
+        | BlockKind::Activity(_)
+        | BlockKind::Receipt(_)
+        | BlockKind::Work(_) => 1,
         BlockKind::Error(text) | BlockKind::QueuedUser(text) => {
             crate::markdown::plain_row_count(text, width.saturating_sub(4).max(1))
         }
@@ -542,6 +553,31 @@ impl<'a> HeightIndex<'a> {
             // rows (turn header or breathing row) are the span's and precede
             // every member row.
             let gap = crate::block::leading_rows(blocks, index) as u64;
+            // The folded work of a finished turn: one row (and one per failure)
+            // stands for every block it folds, which keep their place in the
+            // transcript and resolve to that row for anchors and search.
+            if matches!(block.kind(), BlockKind::Work(_))
+                && block.fold != crate::block::FoldState::Expanded
+            {
+                let end = crate::work::span_end(blocks, index);
+                let failure_rows: Vec<usize> =
+                    crate::block::group_failure_rows(&blocks[index + 1..end])
+                        .into_iter()
+                        .map(|row| row.member + 1)
+                        .collect();
+                let entry_prefix = prefix;
+                prefix = record_grouped_member_rows(
+                    &mut block_rows,
+                    prefix.saturating_add(gap),
+                    &blocks[index..end],
+                    false,
+                    &[],
+                    &failure_rows,
+                );
+                spans.push((entry_prefix, index, index, end));
+                index = end;
+                continue;
+            }
             let tool_span = if cache.present_tool_hold {
                 crate::block::consecutive_presented_tool_span(
                     blocks,
@@ -568,7 +604,7 @@ impl<'a> HeightIndex<'a> {
                         blocks[start..end]
                             .iter()
                             .map(|member| {
-                                (block_height(member, width, cache)
+                                (block_height(member, group_member_width(width), cache)
                                     - usize::from(member.turn_boundary_before()))
                                     as u64
                             })
@@ -600,7 +636,7 @@ impl<'a> HeightIndex<'a> {
                             blocks[start..end]
                                 .iter()
                                 .map(|member| {
-                                    (block_height(member, width, cache)
+                                    (block_height(member, group_member_width(width), cache)
                                         - usize::from(member.turn_boundary_before()))
                                         as u64
                                 })
@@ -830,6 +866,11 @@ impl<'a> HeightIndex<'a> {
             if let FollowMode::Pinned(anchor) = mode {
                 let anchors = self.fitted_fold_anchors();
                 if !anchors.is_empty() {
+                    // A view resting on a block that is folded away (under a
+                    // work row or a collapsed group) stands where its leader
+                    // is: that is the row on screen.
+                    let resting = self.visible_leader_anchor(anchor, &anchors);
+                    let anchor = resting.as_ref().unwrap_or(anchor);
                     let current = anchors.iter().rposition(|target| {
                         target.block_id == anchor.block_id && target.row_offset <= anchor.row_offset
                     });
@@ -875,6 +916,33 @@ impl<'a> HeightIndex<'a> {
         (idx, skipped)
     }
 
+    /// The anchor of the leader that presents `anchor`'s block, when the block
+    /// itself is not one of `anchors` (it is folded under a leader).
+    fn visible_leader_anchor(
+        &self,
+        anchor: &ScrollAnchor,
+        anchors: &[ScrollAnchor],
+    ) -> Option<ScrollAnchor> {
+        if anchors
+            .iter()
+            .any(|target| target.block_id == anchor.block_id)
+        {
+            return None;
+        }
+        let position = self
+            .blocks
+            .iter()
+            .position(|block| block.id == anchor.block_id)?;
+        self.memo
+            .spans
+            .iter()
+            .find(|&&(_, _, start, end)| start <= position && position < end)
+            .map(|&(_, leader, _, _)| ScrollAnchor {
+                block_id: self.blocks[leader].id.clone(),
+                row_offset: 0,
+            })
+    }
+
     /// Focus targets come from the presented spans, including the tool hold.
     /// Only a transcript that fits needs block navigation rather than scrolling.
     fn fitted_fold_anchors(&self) -> Vec<ScrollAnchor> {
@@ -886,7 +954,7 @@ impl<'a> HeightIndex<'a> {
                 if members.len() > 1 || tool.content_handle.is_some() || tool.has_expanded_body());
             if matches!(
                 block.kind(),
-                BlockKind::Thinking(_) | BlockKind::QueuedUser(_)
+                BlockKind::Thinking(_) | BlockKind::QueuedUser(_) | BlockKind::Work(_)
             ) || foldable_tool
             {
                 anchors.push(ScrollAnchor {
@@ -935,7 +1003,7 @@ impl<'a> HeightIndex<'a> {
                 if members.len() > 1 || state.content_handle.is_some() || state.has_expanded_body());
             if matches!(
                 block.kind(),
-                BlockKind::Thinking(_) | BlockKind::QueuedUser(_)
+                BlockKind::Thinking(_) | BlockKind::QueuedUser(_) | BlockKind::Work(_)
             ) || foldable_tool
             {
                 return Some(ScrollAnchor {

@@ -49,7 +49,8 @@ fn restored_tasks_repopulate_the_dock_without_execution() {
         slim_tui::reducer::reduce(&mut app, slim_tui::reducer::Action::UiEventReceived(event));
     assert_eq!(app.todo_items.len(), 1);
     assert_eq!(app.todo_items[0].title, "retained pending task");
-    assert!(app.todo_dock_open);
+    // The Todo starts compact and only the user expands it (DESIGN §1.2).
+    assert!(!app.todo_dock_open);
     assert!(effects
         .iter()
         .all(|effect| matches!(effect, slim_tui::reducer::Effect::RequestRender)));

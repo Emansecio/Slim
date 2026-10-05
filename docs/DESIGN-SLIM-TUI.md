@@ -749,6 +749,122 @@ real, com degradação explícita e testes golden (G340–G341).
 
 ### 1.2 Direção visual revisada
 
+**Revisão de 05/10/2026 (organização do transcript e movimento de estado):** o
+transcript de um turno concluído separa o trabalho da resposta, os grupos pequenos
+dizem o que fizeram, e três sinais de estado ganham movimento. Nada anima
+altura, layout ou posição de texto, não há timer novo (os quadros vêm do clock
+de 83 ms que já roda durante execução ou streaming e dos limites de 83 ms já
+agendados para a ênfase de 249 ms), e movimento reduzido mostra o estilo estável.
+
+- **Trabalho e resposta.** Quando uma execução termina bem e seu último bloco é
+  a resposta do agente, tudo o que fica entre o cabeçalho `● Slim` e essa
+  resposta vira uma row recolhida: `▸ Trabalhou 12s · 4 leituras, 2 edições, 2
+  comandos`. O trecho é inteiro, do primeiro bloco do agente à resposta, e
+  inclui o que não é o agente trabalhando: perguntas e aprovações respondidas,
+  avisos do sistema (uma compactação no meio da execução) e um prompt enfileirado
+  enquanto ela rodava. A contagem usa os substantivos do grupo (leituras, buscas,
+  edições, comandos, nessa ordem) e a duração, o formato do recibo (`12s`,
+  `1m05s`), ambas sobre o turno todo; a duração vai do início do primeiro bloco
+  ao fim do último, some quando os blocos não têm tempo (sessão restaurada) e
+  também quando o turno tem recibo, que já a diz (`▸ Trabalhou · 4 leituras, 2
+  edições, 2 comandos` sobre `✓ 2 arquivos · … · 12s`). Cada falha continua visível, uma row por falha um passo para dentro,
+  como num grupo recolhido (`✕ $ cargo test · exit 101`, `×N`, `depois
+  passou`). Enter na row a abre: ela vira `▾ Trabalhou …` e, abaixo dela, o
+  transcript é exatamente o de antes (os mesmos grupos, na mesma ordem); Enter
+  de novo a recolhe. Só dobra um turno concluído: nunca com a execução ativa,
+  nunca em turno falho, interrompido ou com chamada cancelada, nunca com uma
+  pergunta sem resposta, nunca sem uma resposta final concluída, e nunca com
+  menos de dois blocos antes da resposta
+  (um pensamento ou uma chamada isolada já é uma row). A row é um bloco
+  (`BlockKind::Work`, `crate::work`) inserido antes do trecho quando a execução
+  conclui, e para cada turno concluído de uma sessão restaurada (numa só
+  passada), que ganha a mesma apresentação, sem duração (as chamadas salvas não
+  têm tempo). O fim do trecho é a resposta, por identidade e não por contagem:
+  o prompt enfileirado que a fila consome depois não o desloca. Os blocos
+  dobrados continuam no transcript e na busca: âncoras, seleção por teclado e
+  busca resolvem para a row (a busca acha o texto dobrado e marca a row, Enter
+  na row ou numa falha dobrada a abre, e Ctrl+Y copia o bloco em que a vista
+  repousa); Ctrl+D continua listando o que o trabalho alterou, e o recibo não
+  muda. ↑/↓ a partir de um bloco dobrado partem da row que o apresenta (também para
+  membros de um grupo recolhido), e a barra de rolagem conta só as rows
+  apresentadas: blocos dobrados não somam. Uma row vazia separa a row recolhida
+  da resposta. Esta revisão
+  substitui, para turnos concluídos, a regra de §15.2.1 e §21.4 de que thinking
+  e tools ficam adjacentes e visíveis no turno, e acrescenta `Work` às variantes
+  de §11.2.
+- **Grupos pequenos dizem o que fizeram.** Um grupo recolhido de até duas
+  chamadas mostra o rótulo curto de cada uma, na ordem e separados por ` · `
+  (`✓ Editou src/parser.rs · $ cargo test parser · 2.4s`), de modo que grupos
+  consecutivos deixam de parecer iguais. O rótulo é o verbo com o alvo, ou
+  `$ comando`; um rótulo longo é cortado com `…`, e os dois cedem em direção ao piso de 14
+  células antes de a contagem tomar o lugar.
+  Se ainda assim não couber, se uma chamada não tem alvo, ou se o grupo tem três
+  chamadas ou mais, vale a contagem de substantivos de antes. Substitui, para
+  grupos de até duas chamadas, o resumo por contagem de §15.2.1 e da revisão de
+  28/09/2026 (organização do turno do agente).
+- **Hierarquia no grupo aberto.** O cabeçalho de um grupo aberto troca o `✓` por
+  `▾` (e o `✕` do grupo só de falhas idênticas), mantendo texto e cor, e os
+  membros, o que pertence a eles (detalhes, diff, saída) e os pensamentos
+  intercalados descem um passo de duas células, o mesmo passo das rows de falha
+  de um grupo recolhido. A quebra e a medição de altura dos membros descontam o
+  passo. Substitui, em §11.4.1, os membros no mesmo eixo e glifo do cabeçalho.
+- **Razão da falha.** Verificado no código de produção: `RunFailed` já põe no
+  transcript, sob o texto parcial, a row `✕ <razão>` seguida de `Envie uma nova
+  mensagem nesta conversa para continuar.`; o que não alimentava a razão era a
+  cena `turn-failed`, que agora usa o evento. `/retry` não é oferecido ali: ele
+  só retoma uma conexão pausada dentro de uma execução ativa, e o harness
+  responde `Nenhuma falha de conexão está aguardando /retry` depois da falha.
+  Nenhum comportamento mudou.
+- **Código e citação.** A régua de código continua `│` sobre `code_bg`. Um bloco
+  cercado que informa a linguagem ganha como primeira row a tag dela (`│ rust`,
+  só a primeira palavra da info string, ou a primeira classe de `{.python}`,
+  até 24 células medidas) em `code_rail` sobre o
+  fundo do bloco, e em dim sem cor; um bloco sem linguagem e um bloco dentro de
+  um item de lista não ganham a row (a tag é só a linguagem: o caminho de §19.4
+  não é conhecido do bloco). A citação passa a usar a régua tracejada `┆`, em
+  `secondary_text` e sem fundo: sem cor e em ANSI16, onde o fundo do código
+  colapsa no preto, a régua é o que as separa. Substitui a régua `│` das
+  citações da revisão de 28/09/2026 e, para citações, a régua `│` de §15.2.1.
+- **Âncora do prompt.** O prompt já assenta sobre o band `user_prompt_bg` em
+  largura total, cabeçalho e corpo (§2 e §21.4); o trecho de §15.2.1 que dizia
+  `sem fundo elevado` estava desatualizado e é corrigido aqui. Onde o band não
+  se mostra (ANSI16 e `NO_COLOR`, em que `#141414` colapsa no preto), o
+  cabeçalho do prompt usa o `>` ASCII do composer em vez do `●`/`*`, que ficam
+  com o agente. Nenhuma outra mensagem ganha fundo, borda ou card. Substitui, para o
+  cabeçalho do prompt, o `*` sem cor da revisão de 28/09/2026 (organização do
+  turno do agente).
+- **Ferramenta assenta.** Quando uma chamada vai de em execução para concluída
+  ou falha, o glifo e o verbo da row descem de um tom mais claro (até 55% do
+  caminho ao branco) ao tom de repouso, numa curva smoothstep: tom exato em
+  truecolor e 256 cores, negrito durante a janela em ANSI16 e sem cor. A
+  janela é a de 249 ms que a row espera antes de entrar no grupo
+  (`TOOL_GROUP_HOLD_MS`), então há um só tempo; a falha, que não espera, usa a
+  mesma janela. A curva é quantizada em oito níveis e a row é remontada a cada nível, sem
+  tocar outro bloco, mas os quadros vêm dos despertares de 83 ms já agendados:
+  são cerca de quatro por janela. Substitui o realce em três degraus do glifo de ferramenta
+  concluída.
+- **Cauda do comando.** Uma row de shell em execução mostra a última linha de
+  saída depois do relógio, um passo mais quieta (`muted` a 30% em direção ao
+  fundo; dim em ANSI16 e sem cor): `○ $ cargo clippy · limit 600s · 5s ·
+  Checking slim-tui…`. A linha vem do snapshot que o harness já publica (`<linha>
+  · out N B · err M B`, no máximo a 1 Hz) e é trocada quando outra chega, sem
+  nada quando `no output yet`. Ocupa só a largura que sobra, cortada numa palavra
+  com `…`, nunca menos de 8 células, e a row continua uma row só; os bytes
+  drenados e o resto da row não encolhem por causa dela. Refina o snapshot de
+  §15.4, que listava a última linha entre os segmentos da chamada.
+- **Brilho na resposta.** O texto da resposta em streaming ganha o brilho de
+  chegada do pensamento: por 450 ms depois de cada conteúdo do provider, até 14
+  células no fim da linha mais nova sobem do tom do texto ao verde de
+  identidade e voltam ao repouso, mais fortes na borda de escrita, com a mesma
+  curva contínua; as linhas já estáveis não são tocadas e o caret mantém a sua
+  cor. Em 256 cores e abaixo, quatro degraus, com o pico em negrito onde os tons
+  não se distinguem; com movimento reduzido não aparece. Completa a revisão de
+  28/09/2026 (pensamento em streaming), que o limitava ao pensamento.
+
+Esta revisão substitui as prescrições conflitantes de §11.4.1, §15.2.1, §15.4,
+§19.4 e §21.4, citadas em cada item; os registros históricos de §1.1 e §30
+continuam descrevendo o passado.
+
 **Revisão de 04/10/2026 (leitura do pensamento):** a row de um pensamento em
 streaming deixa de rastejar a cada token e passa a dizer do que ele trata. Vale
 para qualquer provedor; não há chamada, timer nem altura nova.

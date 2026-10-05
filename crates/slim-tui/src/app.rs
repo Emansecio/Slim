@@ -1541,9 +1541,48 @@ impl AppState {
             };
             self.blocks.push(block);
         }
+        // Every turn is planned against the transcript as restored, then the
+        // rows go in with the blocks in a single pass.
+        let plans: Vec<(usize, crate::work::WorkState)> = (0..self.blocks.len())
+            .filter(|index| matches!(self.blocks[*index].kind(), BlockKind::User(_)))
+            .filter_map(|prompt| crate::work::plan_turn(&self.blocks, prompt))
+            .collect();
+        if !plans.is_empty() {
+            let mut rows = Vec::with_capacity(plans.len());
+            for (at, work) in plans {
+                let id = self.fresh_id("work");
+                let mut row = Block::new(id, BlockKind::Work(work), BlockLifecycle::Complete);
+                row.fold = FoldState::Collapsed;
+                rows.push((at, row));
+            }
+            let restored = std::mem::take(&mut self.blocks);
+            let mut folded = Vec::with_capacity(restored.len() + rows.len());
+            let mut rows = rows.into_iter().peekable();
+            for (index, block) in restored.into_iter().enumerate() {
+                while let Some((_, row)) = rows.next_if(|(at, _)| *at == index) {
+                    folded.push(row);
+                }
+                folded.push(block);
+            }
+            self.blocks = folded;
+        }
         self.revisions.content += 1;
         self.revisions.status += 1;
         self.revisions.viewport += 1;
+    }
+
+    /// Folds the work of the finished turn whose prompt is at `prompt` under
+    /// one collapsed row, when it has any to fold (`crate::work`).
+    fn fold_turn_work(&mut self, prompt: Option<usize>) {
+        let Some((at, work)) =
+            prompt.and_then(|prompt| crate::work::plan_turn(&self.blocks, prompt))
+        else {
+            return;
+        };
+        let id = self.fresh_id("work");
+        let mut row = Block::new(id, BlockKind::Work(work), BlockLifecycle::Complete);
+        row.fold = FoldState::Collapsed;
+        self.blocks.insert(at, row);
     }
 
     pub fn push_notification(&mut self, message: String) {
@@ -1818,9 +1857,14 @@ impl AppState {
             FollowMode::LiveEdge { .. } => return None,
         };
         let index = self.blocks.iter().position(|block| &block.id == id)?;
+        // A block folded away with its turn's work is reached through the row
+        // that folds it: that is the row the view shows there.
+        if let Some(row) = crate::work::collapsed_row_over(&self.blocks, index) {
+            return Some(&self.blocks[row].id);
+        }
         let block = &self.blocks[index];
         let foldable = match block.kind() {
-            BlockKind::Thinking(_) => true,
+            BlockKind::Thinking(_) | BlockKind::Work(_) => true,
             BlockKind::Tool(tool) => {
                 tool.content_handle.is_some()
                     || tool.has_expanded_body()
@@ -1857,12 +1901,47 @@ impl AppState {
         true
     }
 
+    /// Opens or closes the folded work of a turn. A pinned view that rests on
+    /// a block of that work moves to the row, which is where the block is
+    /// while the work is closed and stays the way back to it once open.
+    fn toggle_work(&mut self, row: usize) -> bool {
+        if !matches!(self.blocks[row].kind(), BlockKind::Work(_)) {
+            return false;
+        }
+        let end = crate::work::span_end(&self.blocks, row);
+        let block = &mut self.blocks[row];
+        block.fold = match block.fold {
+            FoldState::Expanded => FoldState::Collapsed,
+            FoldState::Auto | FoldState::Collapsed => FoldState::Expanded,
+        };
+        let opened = block.fold == FoldState::Expanded;
+        let row_id = block.id.clone();
+        if let FollowMode::Pinned(anchor) = &mut self.scroll.mode {
+            let inside = self.blocks[row + 1..end]
+                .iter()
+                .any(|member| member.id == anchor.block_id);
+            if anchor.block_id == row_id || (inside && !opened) {
+                anchor.block_id = row_id;
+                anchor.row_offset = 0;
+            }
+        }
+        self.revisions.fold += 1;
+        true
+    }
+
     /// Activates a foldable block. Thinking toggles synchronously; tool output
     /// pages are requested causally and materialized only by a matching event.
     pub fn activate_block(&mut self, id: &BlockId) -> (bool, Option<UiCommand>) {
         let Some(index) = self.blocks.iter().position(|block| &block.id == id) else {
             return (false, None);
         };
+        // The row of a turn's work opens and closes it; a block folded inside
+        // it opens it first, because nothing else of it is on screen.
+        let row = crate::work::collapsed_row_over(&self.blocks, index)
+            .or_else(|| matches!(self.blocks[index].kind(), BlockKind::Work(_)).then_some(index));
+        if let Some(row) = row {
+            return (self.toggle_work(row), None);
+        }
         if matches!(self.blocks[index].kind(), BlockKind::Thinking(_)) {
             let tool_group = self.blocks[..index]
                 .iter()
@@ -3114,6 +3193,11 @@ impl AppState {
                     let pending = self.pending_todo_count();
                     self.finish_execution(run_id, RunOutcomeKind::Completed, pending);
                     self.append_turn_receipt(crate::receipt::ReceiptOutcome::Completed);
+                    self.fold_turn_work(
+                        self.blocks
+                            .iter()
+                            .rposition(|block| matches!(block.kind(), BlockKind::User(_))),
+                    );
                     if pending > 0 {
                         let id = self.fresh_id("pending-tasks");
                         self.blocks.push(Block::new(

@@ -1019,16 +1019,19 @@ fn workspace_regions(state: &AppState, scrollback: ratatui::layout::Rect) -> Wor
     }
 }
 
+/// Whether the transcript certainly needs a scrollbar: a lower bound of the
+/// rows it presents already exceeds the viewport. Blocks folded under a
+/// collapsed work row present nothing of their own, so the row stands for all
+/// of them.
 fn scrollbar_is_guaranteed(blocks: &[Block], viewport: u64) -> bool {
     if viewport == 0 {
         return false;
     }
     let vp = viewport as usize;
-    if blocks.len() > vp {
-        return true;
-    }
     let mut min_rows = 0usize;
-    for (index, block) in blocks.iter().enumerate() {
+    let mut index = 0;
+    while index < blocks.len() {
+        let block = &blocks[index];
         let base = match block.kind() {
             BlockKind::User(_) => 2,
             _ => 1,
@@ -1040,6 +1043,11 @@ fn scrollbar_is_guaranteed(blocks: &[Block], viewport: u64) -> bool {
         if min_rows > vp {
             return true;
         }
+        index = if matches!(block.kind(), BlockKind::Work(_)) && block.fold != FoldState::Expanded {
+            crate::work::span_end(blocks, index)
+        } else {
+            index + 1
+        };
     }
     false
 }
@@ -1127,6 +1135,12 @@ pub(crate) struct Palette {
     /// The sweep across the agent name while it has not answered yet: the
     /// identity green, from dim to bright.
     presence: Ramp,
+    /// The glow at the edge of the answer being written: from the text color
+    /// up to the identity green, so fresh words read as wet ink.
+    arrival: Ramp,
+    /// The last output line of a running command, a step quieter than the
+    /// clock it follows.
+    tail: Style,
     heading: Style,
     h1: Style,
     link: Style,
@@ -1135,6 +1149,7 @@ pub(crate) struct Palette {
     inline_code: Style,
     code_block: Style,
     code_rail: Style,
+    code_label: Style,
     diff_add: Style,
     diff_remove: Style,
     diff_add_bg: Style,
@@ -1236,6 +1251,19 @@ impl Palette {
                 mix_rgb(theme.assistant_accent, theme.background, 0.35),
                 green_peak,
             ),
+            arrival: scale(
+                theme.foreground,
+                mix_rgb(theme.assistant_accent, theme.foreground, 0.2),
+            ),
+            tail: match capabilities.color_depth {
+                ColorDepth::TrueColor | ColorDepth::Ansi256 => {
+                    base.fg(color(mix_rgb(theme.muted, theme.background, 0.30)))
+                }
+                // Quantized depths cannot hold an in-between shade.
+                ColorDepth::Ansi16 | ColorDepth::None => {
+                    base.fg(color(theme.muted)).add_modifier(Modifier::DIM)
+                }
+            },
             heading: base
                 .fg(color(theme.heading_accent))
                 .add_modifier(Modifier::BOLD),
@@ -1258,6 +1286,12 @@ impl Palette {
             },
             code_block: base.fg(color(theme.foreground)).bg(color(theme.code_bg)),
             code_rail: base.fg(color(theme.code_rail)),
+            // Without color the tag is told from a line of code by weight.
+            code_label: if capabilities.color_depth == ColorDepth::None {
+                base.fg(color(theme.code_rail)).add_modifier(Modifier::DIM)
+            } else {
+                base.fg(color(theme.code_rail))
+            },
             diff_add: base.fg(color(theme.diff_add)),
             diff_remove: base.fg(color(theme.diff_remove)),
             diff_add_bg: base.bg(color(theme.diff_add_bg)),
@@ -2041,6 +2075,16 @@ fn render_scrollback(
             {
                 member_state = member_state.wrapping_mul(31).wrapping_add(ctx.caret.tag());
             }
+            if matches!(member.kind(), BlockKind::Tool(_)) {
+                member_state =
+                    member_state
+                        .wrapping_mul(31)
+                        .wrapping_add(u64::from(tool_settle_level(
+                            member,
+                            state.clock.elapsed_ms,
+                            capabilities,
+                        )));
+            }
             // Transition emphasis is a short-lived visual state. Key the
             // memo on its settle step (zero outside the window) so the style
             // advances and expires without adding the full frame clock to
@@ -2088,6 +2132,8 @@ fn render_scrollback(
             };
             let mut built = if matches!(block.kind(), BlockKind::QueuedUser(_)) {
                 grouped_queued_user_lines(block, members, show_enter_hint, &static_ctx)
+            } else if matches!(block.kind(), BlockKind::Work(_)) {
+                work_lines(block, members, &static_ctx, cache)
             } else if members.len() > 1 {
                 if crate::block::is_failed_tool(block)
                     && !members.iter().any(crate::block::is_complete_tool)
@@ -2219,21 +2265,41 @@ fn render_scrollback(
         // written, then settle. The preview keeps no caret, so this is what
         // shows the thought is still pouring in when it arrives in bursts.
         // A collapsed thought showing a headline has no such edge: its row
-        // holds a settled sentence, not the words arriving.
+        // holds a settled sentence, not the words arriving. The answer has a
+        // caret, and the glow adds to it.
         if spinner_motion_enabled
             && members.len() == 1
             && block.lifecycle == BlockLifecycle::Streaming
             && written > 0
             && skip + written == block_lines.len()
         {
-            if let BlockKind::Thinking(text) = block.kind() {
-                if let Some(freshness) = glow_freshness(state).filter(|_| {
-                    !text.trim().is_empty()
-                        && (block.fold == FoldState::Expanded
-                            || !crate::thought::has_headline(text))
-                }) {
-                    apply_frontier_glow(buf, text_area, y - 1, palette, freshness);
+            match block.kind() {
+                BlockKind::Thinking(text) => {
+                    if let Some(freshness) = glow_freshness(state).filter(|_| {
+                        !text.trim().is_empty()
+                            && (block.fold == FoldState::Expanded
+                                || !crate::thought::has_headline(text))
+                    }) {
+                        apply_frontier_glow(buf, text_area, y - 1, &palette.glow, freshness, false);
+                    }
                 }
+                // The answer being written lights its newest words the same
+                // way; lines already settled above it keep their colors.
+                BlockKind::Assistant(text) => {
+                    if let Some(freshness) =
+                        glow_freshness(state).filter(|_| !text.trim().is_empty())
+                    {
+                        apply_frontier_glow(
+                            buf,
+                            text_area,
+                            y - 1,
+                            &palette.arrival,
+                            freshness,
+                            matches!(ctx.caret, CaretPhase::On | CaretPhase::Stalled),
+                        );
+                    }
+                }
+                _ => {}
             }
         }
         rows += written;
@@ -2839,7 +2905,13 @@ fn grouped_tool_lines(
         })
         .unwrap_or_default();
     let marker = if ctx.selected { "> " } else { "  " };
-    let complete = glyph(ctx.capabilities, '\u{2713}', '+');
+    // An open group points down, like an open thought; closed it keeps the
+    // check that says its calls settled.
+    let complete = if leader.group_expanded {
+        glyph(ctx.capabilities, '\u{25be}', 'v')
+    } else {
+        glyph(ctx.capabilities, '\u{2713}', '+')
+    };
     let names: Vec<&str> = members
         .iter()
         .filter_map(|block| match block.kind() {
@@ -2859,12 +2931,21 @@ fn grouped_tool_lines(
         format!("{phrase}{duration}")
     };
     let compact = format!("{tool_count} ferramentas{duration}");
-    let detail = if UnicodeWidthStr::width(marker)
+    let chrome = UnicodeWidthStr::width(marker)
         + UnicodeWidthStr::width(" ")
-        + UnicodeWidthStr::width(complete.to_string().as_str())
-        + UnicodeWidthStr::width(detailed.as_str())
-        <= ctx.width as usize
-    {
+        + UnicodeWidthStr::width(complete.to_string().as_str());
+    let named = (tool_count <= 2)
+        .then(|| {
+            named_group_detail(
+                members,
+                &duration,
+                (ctx.width as usize).saturating_sub(chrome),
+            )
+        })
+        .flatten();
+    let detail = if let Some(named) = named {
+        named
+    } else if chrome + UnicodeWidthStr::width(detailed.as_str()) <= ctx.width as usize {
         detailed
     } else {
         compact
@@ -2937,6 +3018,60 @@ fn grouped_tool_lines(
         lines.extend(group_failure_lines(members, selected_member, ctx, cache));
     }
     lines
+}
+
+/// What a small group did, in its own words: the short label of each call
+/// (`Editou src/parser.rs · $ cargo test parser`) so consecutive groups can be
+/// told apart. A long label is shortened with the usual ellipsis down to a
+/// readable minimum; when the labels still do not fit `room` cells the group
+/// reads as counts instead.
+fn named_group_detail(members: &[Block], duration: &str, room: usize) -> Option<String> {
+    const MIN_LABEL_CELLS: usize = 14;
+    let mut labels: Vec<String> = members
+        .iter()
+        .filter(|block| crate::block::is_settled_tool(block))
+        .map(tool_short_label)
+        .collect::<Option<_>>()?;
+    let separators = UnicodeWidthStr::width(" · ") * labels.len().saturating_sub(1);
+    let fixed = separators + UnicodeWidthStr::width(duration);
+    let total = |labels: &[String]| -> usize {
+        labels
+            .iter()
+            .map(|label| UnicodeWidthStr::width(label.as_str()))
+            .sum::<usize>()
+            + fixed
+    };
+    // The longest label gives up what it can (down to the floor), then the
+    // next one, until everything fits or every label is at its floor.
+    while total(&labels) > room {
+        let excess = total(&labels) - room;
+        let longest = labels
+            .iter()
+            .enumerate()
+            .filter(|(_, label)| UnicodeWidthStr::width(label.as_str()) > MIN_LABEL_CELLS)
+            .max_by_key(|(_, label)| UnicodeWidthStr::width(label.as_str()))
+            .map(|(index, _)| index)?;
+        let current = UnicodeWidthStr::width(labels[longest].as_str());
+        let target = current.saturating_sub(excess).max(MIN_LABEL_CELLS);
+        labels[longest] = truncate_cells(&labels[longest], target);
+    }
+    Some(format!("{}{duration}", labels.join(" · ")))
+}
+
+/// One call as its collapsed row names it, without status or timing: the verb
+/// and target (`Leu src/parser.rs`), or `$ command` for a shell call. A call
+/// with no target says nothing a count does not, so it has no label.
+fn tool_short_label(block: &Block) -> Option<String> {
+    let BlockKind::Tool(tool) = block.kind() else {
+        return None;
+    };
+    let name = sanitize_terminal_text(&tool.name);
+    let args = sanitize_terminal_text(&tool.arguments_summary);
+    let target = first_tool_segment(&args).map(|segment| tool_target(&segment))?;
+    if is_command_target(&target) {
+        return Some(target);
+    }
+    Some(format!("{} {target}", tool_title(&name, block.lifecycle)))
 }
 
 /// Rows a collapsed group keeps for its failures, one step in from the
@@ -3161,7 +3296,11 @@ fn grouped_failed_tool_lines(
         parts.push(ToolDetailPart::flexible(reason_text, 1, 1));
     }
     let marker = if ctx.selected { "> " } else { "  " };
-    let failed = glyph(ctx.capabilities, '\u{2715}', 'x');
+    let failed = if leader.group_expanded {
+        glyph(ctx.capabilities, '\u{25be}', 'v')
+    } else {
+        glyph(ctx.capabilities, '\u{2715}', 'x')
+    };
     let glyph_text = format!("{failed} ");
     let hint = "Enter detalhes";
     let marker_width = UnicodeWidthStr::width(marker);
@@ -3203,26 +3342,40 @@ fn grouped_tool_member_lines(
     cache: &mut WrapCache,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    // The members of an open group sit one step in from its header; so do
+    // the details and the thoughts that belong to them.
+    let width = ctx
+        .width
+        .saturating_sub(crate::render::GROUP_MEMBER_INDENT)
+        .max(1);
     for member in members {
         let member_ctx = BlockRender {
             selected: selected == Some(&member.id),
+            width,
             ..*ctx
         };
-        if matches!(member.kind(), BlockKind::Tool(_)) {
-            lines.extend(tool_member_lines(
+        let rows = if matches!(member.kind(), BlockKind::Tool(_)) {
+            tool_member_lines(
                 member,
                 member_ctx.selected,
                 ctx.palette,
                 ctx.capabilities,
-                ctx.width,
+                width,
                 ctx.frame,
                 ctx.now_ms,
                 true,
                 cache,
-            ));
+            )
         } else {
-            lines.extend(safe_block_lines(member, &member_ctx, cache));
-        }
+            safe_block_lines(member, &member_ctx, cache)
+        };
+        lines.extend(rows.into_iter().map(|mut row| {
+            row.spans.insert(
+                0,
+                Span::raw(" ".repeat(usize::from(crate::render::GROUP_MEMBER_INDENT))),
+            );
+            row
+        }));
     }
     lines
 }
@@ -3324,14 +3477,26 @@ fn tool_member_lines(
             Some("cancelada"),
         ),
     };
-    let completion_phase = (block.lifecycle == BlockLifecycle::Complete)
-        .then(|| settle_phase(block.ended_ms, now_ms, capabilities))
-        .flatten();
-    let glyph_style = settled(glyph_style, completion_phase, capabilities.color_depth);
+    // The glyph and the verb ease from a brighter tone to their resting one
+    // right after the call settles, success or failure, inside the window
+    // the row keeps before it joins a group.
+    let settle = tool_settle_level(block, now_ms, capabilities);
+    let glyph_style = tool_settled(glyph_style, settle, capabilities.color_depth);
+    let name_style = tool_settled(name_style, settle, capabilities.color_depth);
     let marker = if selected { "> " } else { "  " };
     let name = sanitize_terminal_text(&state.name);
     let args = sanitize_terminal_text(&state.arguments_summary);
-    let preview = tool_preview_line(&state.preview);
+    // A running command's last output line rides after the clock instead of
+    // among the call's own segments; its byte counts stay where they were,
+    // and the line takes only the width they leave.
+    let (live_tail, preview) = if block.lifecycle == BlockLifecycle::Streaming
+        && !state.historical
+        && state.name == "shell"
+    {
+        split_shell_progress(&tool_preview_line(&state.preview))
+    } else {
+        (None, tool_preview_line(&state.preview))
+    };
     let first_target = first_tool_segment(&args).map(|segment| tool_target(&segment));
     let command_row = !state.historical && first_target.as_deref().is_some_and(is_command_target);
     let show_args = !state.historical
@@ -3458,12 +3623,24 @@ fn tool_member_lines(
         parts.push(ToolDetailPart::fixed(value.to_owned()));
     }
     let occupied = UnicodeWidthStr::width(marker) + UnicodeWidthStr::width(glyph_text.as_str());
-    let detail = fit_tool_detail(parts, (width as usize).saturating_sub(occupied));
+    let available = (width as usize).saturating_sub(occupied);
+    let detail = fit_tool_detail(parts, available);
     let mut header_spans = vec![
         Span::styled(marker.to_owned(), palette.muted),
         Span::styled(glyph_text, glyph_style),
     ];
     header_spans.extend(tool_detail_spans(&detail, &title, name_style, palette));
+    if let Some(tail) = live_tail {
+        // Whatever the row leaves free, never more: nothing else shrinks for
+        // it and the row keeps its single line.
+        let room = available.saturating_sub(
+            UnicodeWidthStr::width(detail.as_str()) + UnicodeWidthStr::width(" · "),
+        );
+        if room >= LIVE_TAIL_MIN_CELLS {
+            header_spans.push(Span::styled(" · ", palette.muted));
+            header_spans.push(Span::styled(crate::thought::fit(&tail, room), palette.tail));
+        }
+    }
     let mut lines = vec![Line::from(header_spans)];
     if block.fold == FoldState::Expanded && state.has_expanded_body() {
         let body_width = width.saturating_sub(4).max(1);
@@ -3504,6 +3681,30 @@ fn tool_member_lines(
         ));
     }
     lines
+}
+
+/// Narrowest tail worth showing; below it the row would only show a stub.
+const LIVE_TAIL_MIN_CELLS: usize = 8;
+
+/// Splits the progress of a running command (`<last line> · out N B · err M B`)
+/// into its last output line, whitespace folded, and the byte counts. Nothing
+/// has been printed yet when the line is the harness's `no output yet`; a
+/// preview in any other shape is left alone.
+fn split_shell_progress(preview: &str) -> (Option<String>, String) {
+    let segments: Vec<&str> = preview.split(" · ").collect();
+    let [line @ .., out, err] = segments.as_slice() else {
+        return (None, preview.to_owned());
+    };
+    if line.is_empty() || !out.starts_with("out ") || !err.starts_with("err ") {
+        return (None, preview.to_owned());
+    }
+    let line = line.join(" · ");
+    let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let counts = format!("{out} · {err}");
+    (
+        (!line.is_empty() && line != "no output yet").then_some(line),
+        counts,
+    )
 }
 
 /// First line of a tool's preview as a summary row reads it. Runtime
@@ -3818,12 +4019,70 @@ fn settled(style: Style, phase: Option<u8>, depth: ColorDepth) -> Style {
     style.add_modifier(Modifier::BOLD)
 }
 
+/// Steps the tool settle is quantized to: the lines of a row are memoized per
+/// level, so a motion frame inside the window only re-lays that one row.
+const TOOL_SETTLE_LEVELS: u8 = 8;
+/// Share of the way to white the glyph starts from.
+const TOOL_SETTLE_LIFT: f32 = 0.55;
+
+/// How far a tool row that just settled still is from its resting tone, from
+/// `TOOL_SETTLE_LEVELS` (just settled) down to `0` (at rest). The window is
+/// the hold the row keeps before it joins a group, so one timing serves both,
+/// and the curve is a smoothstep: it leaves quickly and lands softly.
+/// Reduced motion shows the resting tone at once.
+fn tool_settle_level(block: &Block, now_ms: u64, capabilities: Capabilities) -> u8 {
+    if capabilities.reduced_motion || !crate::block::is_settled_tool(block) {
+        return 0;
+    }
+    let Some(ended) = block.ended_ms else {
+        return 0;
+    };
+    let elapsed = now_ms.saturating_sub(ended);
+    if elapsed >= crate::block::TOOL_GROUP_HOLD_MS {
+        return 0;
+    }
+    let progress = elapsed as f32 / crate::block::TOOL_GROUP_HOLD_MS as f32;
+    let remaining = 1.0 - progress * progress * (3.0 - 2.0 * progress);
+    ((remaining * f32::from(TOOL_SETTLE_LEVELS)).ceil() as u8).clamp(1, TOOL_SETTLE_LEVELS)
+}
+
+/// `style` with the tone of settle `level`: truecolor and 256-color terminals
+/// get the exact shade between the lifted and the resting foreground; depths
+/// that cannot tell shades apart carry the first moments in weight.
+fn tool_settled(style: Style, level: u8, depth: ColorDepth) -> Style {
+    if level == 0 {
+        return style;
+    }
+    if matches!(depth, ColorDepth::TrueColor | ColorDepth::Ansi256) {
+        let lift = TOOL_SETTLE_LIFT * f32::from(level) / f32::from(TOOL_SETTLE_LEVELS);
+        if let Some(fg) = style
+            .fg
+            .and_then(|fg| crate::theme::lift_color(fg, depth, lift))
+        {
+            return style.fg(fg);
+        }
+    }
+    style.add_modifier(Modifier::BOLD)
+}
+
 fn block_transition_phase(block: &Block, ctx: &BlockRender<'_>) -> Option<u8> {
     settle_phase(
         block.ended_ms.or(block.started_ms),
         ctx.now_ms,
         ctx.capabilities,
     )
+}
+
+/// Marker of the prompt's header. The raised band tells the prompt from the
+/// answer wherever shades show; at 16 colors and under `NO_COLOR` the band
+/// collapses into the background, so the shape does it: the prompt takes the
+/// composer's own ASCII `>` (what you typed), while the agent keeps its dot
+/// (`*` without color).
+fn user_marker(capabilities: Capabilities) -> char {
+    match capabilities.color_depth {
+        ColorDepth::TrueColor | ColorDepth::Ansi256 => '●',
+        ColorDepth::Ansi16 | ColorDepth::None => '>',
+    }
 }
 
 fn user_message_lines(
@@ -3851,7 +4110,7 @@ fn user_message_lines(
     let mut lines = vec![band(vec![
         Span::styled("  ", surface),
         Span::styled(
-            glyph(ctx.capabilities, '●', '*').to_string(),
+            user_marker(ctx.capabilities).to_string(),
             marker_style.patch(surface),
         ),
         Span::styled(" Você", ctx.palette.secondary.patch(surface)),
@@ -4302,9 +4561,90 @@ fn block_lines(block: &Block, ctx: &BlockRender<'_>, cache: &mut WrapCache) -> V
             grouped_queued_user_lines(block, std::slice::from_ref(block), ctx.selected, ctx)
         }
         BlockKind::Receipt(receipt) => vec![receipt_line(receipt, ctx)],
+        BlockKind::Work(_) => work_lines(block, std::slice::from_ref(block), ctx, cache),
     };
     if block.turn_boundary_before() {
         lines.insert(0, Line::default());
+    }
+    lines
+}
+
+/// The row that folds the work of a finished turn: `▸ Trabalhou 12s · 4
+/// leituras, 2 edições, 2 comandos`, then one row per failure, stepped in as a
+/// collapsed group steps them. Opened, it is only the row (`▾`): the blocks it
+/// folded are back in the transcript as they were. `members` is the row alone
+/// when open, or the row followed by what it folds.
+fn work_lines(
+    leader: &Block,
+    members: &[Block],
+    ctx: &BlockRender<'_>,
+    cache: &mut WrapCache,
+) -> Vec<Line<'static>> {
+    let BlockKind::Work(work) = leader.kind() else {
+        return Vec::new();
+    };
+    let expanded = leader.fold == FoldState::Expanded;
+    let palette = ctx.palette;
+    let marker = if ctx.selected { "> " } else { "  " };
+    let indicator = if expanded {
+        glyph(ctx.capabilities, '\u{25be}', 'v')
+    } else {
+        glyph(ctx.capabilities, '\u{25b8}', '>')
+    };
+    let strongest = members[1..]
+        .iter()
+        .filter_map(|block| match block.kind() {
+            BlockKind::Tool(tool) => Some(tool_effect(&tool.name)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(ToolEffect::Observes);
+    let width = usize::from(ctx.width);
+    let hint = ctx.selected.then_some(if expanded {
+        "Enter recolher"
+    } else {
+        "Enter expandir"
+    });
+    let mut used =
+        UnicodeWidthStr::width(marker) + UnicodeWidthStr::width(indicator.to_string().as_str());
+    used += 1;
+    let mut spans = vec![
+        Span::styled(marker.to_owned(), palette.muted),
+        Span::styled(format!("{indicator} "), palette.muted),
+    ];
+    let mut push = |text: String, style: Style, used: &mut usize| {
+        *used += UnicodeWidthStr::width(text.as_str());
+        spans.push(Span::styled(text, style));
+    };
+    push(
+        crate::work::WORK_LABEL.to_owned(),
+        settled_verb_style(strongest, palette),
+        &mut used,
+    );
+    if let Some(duration) = work.duration_ms {
+        push(
+            format!(" {}", crate::receipt::format_duration(duration)),
+            palette.muted,
+            &mut used,
+        );
+    }
+    if !work.tally.is_empty() {
+        let reserved = hint.map_or(0, |hint| hint.len() + 2);
+        let room = width.saturating_sub(used + reserved + UnicodeWidthStr::width(" · "));
+        if room > 0 {
+            push(" · ".into(), palette.muted, &mut used);
+            push(truncate_cells(&work.tally, room), palette.muted, &mut used);
+        }
+    }
+    if let Some(hint) = hint {
+        if used + 2 + hint.len() <= width {
+            spans.push(Span::raw(" ".repeat(width - used - hint.len())));
+            spans.push(Span::styled(hint, palette.secondary));
+        }
+    }
+    let mut lines = vec![Line::from(spans)];
+    if !expanded {
+        lines.extend(group_failure_lines(&members[1..], None, ctx, cache));
     }
     lines
 }
@@ -4400,6 +4740,7 @@ fn assistant_body(
         code: ctx.palette.inline_code,
         code_block: ctx.palette.code_block,
         code_rail: ctx.palette.code_rail,
+        code_label: ctx.palette.code_label,
         diff_add: ctx.palette.diff_add,
         diff_remove: ctx.palette.diff_remove,
         diff_add_bg: ctx.palette.diff_add_bg,
@@ -6194,6 +6535,10 @@ pub(crate) fn inspector_lines(
                         receipt_text = receipt.summary();
                         ("Recibo", receipt_text.as_str())
                     }
+                    BlockKind::Work(work) => {
+                        receipt_text = work.summary();
+                        ("Trabalho", receipt_text.as_str())
+                    }
                     BlockKind::User(text) => ("Você", text.as_str()),
                     BlockKind::Assistant(text) => ("Slim", text.as_str()),
                     BlockKind::Thinking(text) => ("Pensamento", text.as_str()),
@@ -7371,7 +7716,7 @@ fn render_palette(
     let width = (((u32::from(frame_area.width) * 4) / 5) as u16)
         .clamp(38, 76)
         .min(frame_area.width);
-    let height = frame_area.height.saturating_sub(2).min(18).max(1);
+    let height = frame_area.height.saturating_sub(2).clamp(1, 18);
     let area = centered(frame_area, width, height);
     let inner = ratatui::layout::Rect {
         x: area.x.saturating_add(1),
@@ -7528,24 +7873,26 @@ fn apply_frontier_glow(
     buf: &mut ratatui::buffer::Buffer,
     area: ratatui::layout::Rect,
     y: u16,
-    palette: &Palette,
+    ramp: &Ramp,
     freshness: f32,
+    caret_visible: bool,
 ) {
     // Text starts in the fourth column of the transcript, after the gutter.
     let first = area.x.saturating_add(4);
     let last = area.right().saturating_sub(1);
-    let Some(end) = (first..=last)
-        .rev()
-        .find(|x| !buf[(*x, y)].symbol().trim().is_empty())
-    else {
+    // The caret rides after the last word and keeps its own color.
+    let Some(end) = (first..=last).rev().find(|x| {
+        let symbol = buf[(*x, y)].symbol();
+        !symbol.trim().is_empty() && !(caret_visible && symbol == "▌")
+    }) else {
         return;
     };
     for depth in 0..GLOW_CELLS.min(end - first + 1) {
         let strength = (1.0 - f32::from(depth) / f32::from(GLOW_CELLS)) * freshness;
         // Below the first step the stepped light would only repaint the
         // words in their own color; the continuous one still rises.
-        if palette.glow.ends.is_some() || strength >= 0.5 / 3.0 {
-            buf[(end - depth, y)].set_style(palette.glow.at(strength));
+        if ramp.ends.is_some() || strength >= 0.5 / 3.0 {
+            buf[(end - depth, y)].set_style(ramp.at(strength));
         }
     }
 }

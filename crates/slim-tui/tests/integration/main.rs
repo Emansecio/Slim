@@ -20,4 +20,5 @@ mod scroll_golden;
 mod state_markers_golden;
 mod thinking_expansion_golden;
 mod tool_details_golden;
+mod transcript_organization_golden;
 mod welcome_golden;

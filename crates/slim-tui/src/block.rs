@@ -336,6 +336,9 @@ pub enum BlockKind {
     QueuedUser(String),
     /// What the turn that just ended changed (files, lines, commands).
     Receipt(crate::receipt::ReceiptState),
+    /// The row that folds the work of a finished turn: it stands before the
+    /// blocks it folds and hides them while collapsed.
+    Work(crate::work::WorkState),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -553,7 +556,7 @@ impl ResponseHeader {
 fn is_agent_output(block: &Block) -> bool {
     matches!(
         block.kind(),
-        BlockKind::Assistant(_) | BlockKind::Thinking(_) | BlockKind::Tool(_)
+        BlockKind::Assistant(_) | BlockKind::Thinking(_) | BlockKind::Tool(_) | BlockKind::Work(_)
     )
 }
 
@@ -637,7 +640,14 @@ pub fn transition_gap(blocks: &[Block], index: usize) -> bool {
     match block.kind() {
         // The receipt closes a turn: always set apart from what precedes it.
         BlockKind::Receipt(_) => true,
-        BlockKind::Assistant(_) => is_work(previous) && response_header(blocks, index).is_none(),
+        // A note folded away with the rest of the work still counts as work
+        // above the answer: the folded row and the answer do not touch.
+        BlockKind::Assistant(_) => {
+            (is_work(previous)
+                || (matches!(previous.kind(), BlockKind::Assistant(_))
+                    && crate::work::collapsed_row_over(blocks, index - 1).is_some()))
+                && response_header(blocks, index).is_none()
+        }
         // Work after a receipt is not part of the closed turn (a `!command`).
         _ if is_work(block) => {
             matches!(previous.kind(), BlockKind::Receipt(_))

@@ -159,6 +159,7 @@ pub fn block_matches_query(block: &Block, query_lower: &str) -> bool {
         | BlockKind::Activity(text)
         | BlockKind::QueuedUser(text) => str_contains_ignore_case(text, query_lower),
         BlockKind::Receipt(receipt) => str_contains_ignore_case(&receipt.summary(), query_lower),
+        BlockKind::Work(work) => str_contains_ignore_case(&work.summary(), query_lower),
         BlockKind::Tool(tool) => {
             if str_contains_ignore_case(&tool.name, query_lower)
                 || str_contains_ignore_case(&tool.arguments_summary, query_lower)

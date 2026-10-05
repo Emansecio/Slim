@@ -181,16 +181,18 @@ impl LspServerConfig {
                 server.enabled = enabled;
             }
             if project.path.is_some() {
-                server.path = project.path.clone();
+                server.path.clone_from(&project.path);
             }
             if project.args.is_some() {
-                server.args = project.args.clone();
+                server.args.clone_from(&project.args);
             }
             if project.initialization_options.is_some() {
-                server.initialization_options = project.initialization_options.clone();
+                server
+                    .initialization_options
+                    .clone_from(&project.initialization_options);
             }
             if project.settings.is_some() {
-                server.settings = project.settings.clone();
+                server.settings.clone_from(&project.settings);
             }
         }
         server

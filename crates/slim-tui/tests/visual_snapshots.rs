@@ -282,6 +282,23 @@ fn scenes() -> Vec<(&'static str, AppState, u16, u16)> {
         ));
         state
     };
+    // A failed run reaches the transcript as the harness reports it: the
+    // partial answer, then the failure with its reason and the way on.
+    let failed = {
+        let mut state = connected();
+        state.apply_event(UiEvent::UserMessageAdded {
+            text: "Rode a suíte e corrija o que falhar.".into(),
+        });
+        state.apply_event(UiEvent::run_started(1));
+        state.apply_event(UiEvent::AssistantDelta {
+            text: "Rodei a suíte e três testes falharam. Comecei pelo".into(),
+        });
+        state.apply_event(UiEvent::RunFailed {
+            run_id: Some(1),
+            message: "provedor indisponível: http 503 após 3 tentativas".into(),
+        });
+        state
+    };
 
     let mut mention = session(false);
     for character in "veja @lib".chars() {
@@ -574,7 +591,7 @@ fn scenes() -> Vec<(&'static str, AppState, u16, u16)> {
         ("agent-turn-80", agent_turn(), 80, 60),
         ("thinking-streaming", thinking, 120, 24),
         ("turn-interrupted", ended(BlockLifecycle::Cancelled), 80, 14),
-        ("turn-failed", ended(BlockLifecycle::Failed), 80, 14),
+        ("turn-failed", failed, 80, 14),
         ("mode-read-only", read_only, 80, 24),
         ("mode-plan", plan, 80, 24),
         ("palette", palette, 120, 40),
@@ -623,16 +640,25 @@ fn escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn html(name: &str, state: &AppState, width: u16, height: u16, reduced_motion: bool) -> String {
-    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
-    let mut cache = WrapCache::default();
-    let capabilities = Capabilities {
-        color_depth: ColorDepth::TrueColor,
+fn capabilities(color_depth: ColorDepth, reduced_motion: bool) -> Capabilities {
+    Capabilities {
+        color_depth,
         mouse: false,
         clipboard: false,
         images: false,
         reduced_motion,
-    };
+    }
+}
+
+fn html(
+    name: &str,
+    state: &AppState,
+    width: u16,
+    height: u16,
+    capabilities: Capabilities,
+) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    let mut cache = WrapCache::default();
     terminal
         .draw(|frame| render_frame(frame, state, capabilities, &mut cache))
         .expect("draw");
@@ -678,7 +704,13 @@ fn write_visual_snapshots() {
         });
     std::fs::create_dir_all(&directory).expect("snapshot directory");
     for (name, state, width, height) in scenes() {
-        let page = html(name, &state, width, height, true);
+        let page = html(
+            name,
+            &state,
+            width,
+            height,
+            capabilities(ColorDepth::TrueColor, true),
+        );
         assert!(page.contains("<span"), "{name} rendered nothing");
         let path = directory.join(format!("{name}.html"));
         std::fs::write(&path, page).expect("write snapshot");
@@ -686,12 +718,221 @@ fn write_visual_snapshots() {
     }
     // The thinking display with motion on, a few moments apart.
     for (name, state) in thinking_motion() {
-        let page = html(&name, &state, 100, 10, false);
+        let page = html(
+            &name,
+            &state,
+            100,
+            10,
+            capabilities(ColorDepth::TrueColor, false),
+        );
         assert!(page.contains("<span"), "{name} rendered nothing");
         let path = directory.join(format!("{name}.html"));
         std::fs::write(&path, page).expect("write snapshot");
         eprintln!("{}", path.display());
     }
+    // The same scenes where color is missing or scarce, and the other motions.
+    for (name, state, width, height, caps) in fallback_and_motion_scenes() {
+        let page = html(&name, &state, width, height, caps);
+        assert!(page.contains("<span"), "{name} rendered nothing");
+        let path = directory.join(format!("{name}.html"));
+        std::fs::write(&path, page).expect("write snapshot");
+        eprintln!("{}", path.display());
+    }
+}
+
+/// A turn that shows what organizes the transcript: a prompt, a quote and a
+/// fenced block with its language.
+fn answer_with_quote_and_code() -> AppState {
+    let mut state = connected();
+    state.apply_event(UiEvent::UserMessageAdded {
+        text: "Mostre como o split deve ficar e o que não foi testado.".into(),
+    });
+    state.apply_event(UiEvent::run_started(1));
+    state.apply_event(UiEvent::AssistantDelta {
+        text: "Fica assim:\n\n```rust\nfn split(t: &str) -> Lines<'_> {\n    t.lines()\n}\n```\n\n> Não rodei o build release.\n".into(),
+    });
+    state.apply_event(UiEvent::AssistantEnded);
+    state.apply_event(UiEvent::RunCompleted { run_id: 1 });
+    state.clock.elapsed_ms += 10_000;
+    state
+}
+
+/// A running command, `elapsed_ms` after it started, that has reported
+/// `progress` (nothing when empty).
+fn running_command(elapsed_ms: u64, progress: &str) -> AppState {
+    let mut state = connected();
+    state.apply_event(UiEvent::UserMessageAdded {
+        text: "Rode o clippy e corrija o que aparecer.".into(),
+    });
+    state.apply_event(UiEvent::run_started(1));
+    project(
+        &mut state,
+        EventKind::ToolStarted {
+            batch_id: "batch-live".into(),
+            call_id: "call-live".into(),
+            name: "shell".into(),
+            arguments: r#"{"command":"cargo clippy --all-targets"}"#.into(),
+        },
+    );
+    state.clock.elapsed_ms += elapsed_ms;
+    if !progress.is_empty() {
+        state.apply_event(UiEvent::ToolProgress {
+            batch_id: ToolBatchId("batch-live".into()),
+            call_id: ToolCallId("call-live".into()),
+            name: "shell".into(),
+            preview: progress.into(),
+            content_handle: None,
+        });
+    }
+    state
+}
+
+/// A read that succeeded and a command that failed, `later` ms ago: the glyph
+/// and the verb ease down to their resting tone while the rows keep their
+/// place.
+fn tool_settling(later: u64) -> AppState {
+    let mut state = connected();
+    state.apply_event(UiEvent::UserMessageAdded {
+        text: "Leia o parser.".into(),
+    });
+    state.apply_event(UiEvent::run_started(1));
+    for (id, ok) in [("a", true), ("b", false)] {
+        project(
+            &mut state,
+            EventKind::ToolStarted {
+                batch_id: format!("batch-{id}"),
+                call_id: format!("call-{id}"),
+                name: if ok { "read" } else { "shell" }.into(),
+                arguments: if ok {
+                    r#"{"path":"src/parser.rs"}"#.into()
+                } else {
+                    r#"{"command":"cargo test parser"}"#.into()
+                },
+            },
+        );
+    }
+    state.clock.elapsed_ms += 1_200;
+    for (id, ok) in [("a", true), ("b", false)] {
+        project(
+            &mut state,
+            EventKind::ToolFinished {
+                batch_id: format!("batch-{id}"),
+                call_id: format!("call-{id}"),
+                name: if ok { "read" } else { "shell" }.into(),
+                success: ok,
+                duration_ms: 1_200,
+            },
+        );
+    }
+    state.clock.elapsed_ms += later;
+    state
+}
+
+/// An answer that is still arriving: the newest words glow, then settle.
+fn answer_arriving(later: u64) -> AppState {
+    const ARRIVED_MS: u64 = 3_400;
+    let mut state = connected();
+    state.apply_event(UiEvent::UserMessageAdded {
+        text: "Explique o cache.".into(),
+    });
+    state.apply_event(UiEvent::run_started(1));
+    state.clock = FrameClock {
+        frame: ARRIVED_MS / 83,
+        elapsed_ms: ARRIVED_MS,
+    };
+    state.apply_event(UiEvent::AssistantDelta {
+        text: "O cache guarda cada resultado pelo peso em bytes, e não pelo número de entradas. Assim uma entrada grande não expulsa dez pequenas sem motivo.".into(),
+    });
+    let elapsed_ms = ARRIVED_MS + later;
+    state.clock = FrameClock {
+        frame: elapsed_ms / 83,
+        elapsed_ms,
+    };
+    state
+}
+
+fn fallback_and_motion_scenes() -> Vec<(String, AppState, u16, u16, Capabilities)> {
+    let mut scenes = Vec::new();
+    for (label, depth) in [
+        ("truecolor", ColorDepth::TrueColor),
+        ("ansi16", ColorDepth::Ansi16),
+        ("nocolor", ColorDepth::None),
+    ] {
+        scenes.push((
+            format!("quote-and-code-{label}"),
+            answer_with_quote_and_code(),
+            80,
+            22,
+            capabilities(depth, true),
+        ));
+        let mut turn = agent_turn();
+        turn.scroll.mode = FollowMode::Top;
+        scenes.push((
+            format!("prompt-markers-{label}"),
+            turn,
+            80,
+            16,
+            capabilities(depth, true),
+        ));
+    }
+    let mut expanded = agent_turn();
+    let work = expanded
+        .blocks()
+        .iter()
+        .find(|block| matches!(block.kind(), BlockKind::Work(_)))
+        .expect("a finished turn folds its work")
+        .id
+        .clone();
+    reduce(&mut expanded, Action::ToggleBlock(work));
+    scenes.push((
+        "work-expanded".into(),
+        expanded,
+        80,
+        60,
+        capabilities(ColorDepth::TrueColor, true),
+    ));
+    let progress =
+        r"Checking slim-tui v0.1.0 (C:\Projects\demo\crates\slim-tui) · out 0 B · err 212 B";
+    for (name, width, state) in [
+        ("tool-live-tail", 120, running_command(5_300, progress)),
+        (
+            "tool-live-tail-narrow",
+            60,
+            running_command(5_300, progress),
+        ),
+        (
+            "tool-live-silent",
+            100,
+            running_command(5_300, "no output yet · out 0 B · err 0 B"),
+        ),
+    ] {
+        scenes.push((
+            name.into(),
+            state,
+            width,
+            14,
+            capabilities(ColorDepth::TrueColor, false),
+        ));
+    }
+    for later in [0u64, 83, 166, 249] {
+        scenes.push((
+            format!("tool-settle-{later:03}"),
+            tool_settling(later),
+            80,
+            12,
+            capabilities(ColorDepth::TrueColor, false),
+        ));
+    }
+    for later in [0u64, 166, 332, 498] {
+        scenes.push((
+            format!("answer-glow-{later:03}"),
+            answer_arriving(later),
+            80,
+            12,
+            capabilities(ColorDepth::TrueColor, false),
+        ));
+    }
+    scenes
 }
 
 /// A thought that just received text, shown 0, 166, 332, 498, 664 and 830 ms

@@ -298,15 +298,15 @@ fn a_folded_group_takes_the_weight_of_its_strongest_call() {
         (
             rendered.rows[row].trim_end().to_owned(),
             rendered.style_at(row, "✓").0,
-            rendered.style_at(row, "1 leitura").0,
+            rendered.style_at(row, "Leu a").0,
         )
     };
     let (text, marker, tally) = group(&[("read", "path=a"), ("search", "pattern=x")]);
-    assert!(text.contains("1 leitura, 1 busca"), "{text}");
+    assert!(text.contains(r#"Leu a · Buscou "x""#), "{text}");
     assert_eq!((marker, tally), (MUTED, MUTED), "observing stays quiet");
 
     let (text, marker, tally) = group(&[("read", "path=a"), ("shell", "command=ls")]);
-    assert!(text.contains("1 leitura, 1 comando"), "{text}");
+    assert!(text.contains("Leu a · $ ls"), "{text}");
     assert_eq!(
         (marker, tally),
         (MUTED, SECONDARY),
@@ -314,7 +314,7 @@ fn a_folded_group_takes_the_weight_of_its_strongest_call() {
     );
 
     let (text, marker, tally) = group(&[("read", "path=a"), ("patch", "path=b")]);
-    assert!(text.contains("1 leitura, 1 edição"), "{text}");
+    assert!(text.contains("Leu a · Editou b"), "{text}");
     assert_eq!((marker, tally), (GREEN, SECONDARY), "an edit was applied");
 }
 

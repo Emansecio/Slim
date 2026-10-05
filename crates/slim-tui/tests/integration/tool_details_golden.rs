@@ -672,7 +672,7 @@ fn projected_patch_and_shell_rows_read_as_verb_target_and_outcome() {
     let collapsed = render_at_width(&state, 100);
     let header = collapsed
         .lines()
-        .find(|line| line.contains("1 edição, 1 comando"))
+        .find(|line| line.contains("Editou src/lib.rs · $ cargo test"))
         .unwrap_or_else(|| panic!("group header\n{collapsed}"));
     assert!(header.contains("✓ "), "{header}");
     let failure = collapsed
@@ -689,7 +689,7 @@ fn projected_patch_and_shell_rows_read_as_verb_target_and_outcome() {
     let frame = render_at_width(&state, 100);
     let patch = frame
         .lines()
-        .find(|line| line.contains("Editou"))
+        .find(|line| line.contains("✓ Editou"))
         .unwrap_or_else(|| panic!("patch row\n{frame}"));
     assert!(
         patch.contains("✓ Editou src/lib.rs · +2 -1 · 8ms"),

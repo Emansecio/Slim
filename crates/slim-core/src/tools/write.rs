@@ -231,7 +231,7 @@ fn replace_observed_file_with_publisher(
     let observed_failure = |error: ToolError| {
         ToolExecutionError::observed(error, vec![dependency.clone()], bytes_read)
     };
-    ensure_mutation_size(content.len()).map_err(&observed_failure)?;
+    ensure_mutation_size(content.len()).map_err(observed_failure)?;
     // Windows refuses replacing a readonly target; reject before preparing a
     // replacement so this known pre-commit failure creates no recovery files.
     #[cfg(windows)]

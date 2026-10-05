@@ -28,5 +28,6 @@ pub mod theme;
 mod thought;
 pub mod todo;
 pub mod view_model;
+pub mod work;
 
 pub use runtime::{run_app, run_app_with_initial_prompt};

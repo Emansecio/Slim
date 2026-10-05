@@ -1072,12 +1072,28 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         return vec![Effect::RequestRender];
     }
     if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        let selected = state.selected_block_id().and_then(|id| {
-            state
+        // A view resting on a block folded into its turn's work (a search
+        // hit) copies that block's own text; the row stands for it on screen.
+        let folded = match &state.scroll.mode {
+            FollowMode::Pinned(anchor) => state
                 .blocks()
                 .iter()
-                .find(|block| &block.id == id)
-                .and_then(copyable_block_text)
+                .enumerate()
+                .find(|(_, block)| block.id == anchor.block_id)
+                .filter(|(index, _)| {
+                    crate::work::collapsed_row_over(state.blocks(), *index).is_some()
+                })
+                .and_then(|(_, block)| copyable_block_text(block)),
+            _ => None,
+        };
+        let selected = folded.or_else(|| {
+            state.selected_block_id().and_then(|id| {
+                state
+                    .blocks()
+                    .iter()
+                    .find(|block| &block.id == id)
+                    .and_then(copyable_block_text)
+            })
         });
         let text = selected.or_else(|| {
             state
@@ -1360,6 +1376,7 @@ fn copyable_block_text(block: &crate::block::Block) -> Option<String> {
         | BlockKind::Activity(text)
         | BlockKind::QueuedUser(text) => Some(text.clone()),
         BlockKind::Receipt(receipt) => Some(receipt.summary()),
+        BlockKind::Work(work) => Some(work.summary()),
         BlockKind::Tool(tool) => (!tool.materialized_output.is_empty())
             .then(|| tool.materialized_output.clone())
             .or_else(|| (!tool.preview.is_empty()).then(|| tool.preview.clone())),

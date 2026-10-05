@@ -1171,6 +1171,20 @@ fn new_session_reopens_in_another_process_with_tools_and_fresh_file_guards() {
         "both final answers must remain visible alongside the restored tools: {frame}"
     );
     assert!(!frame.contains("Add-Content"));
+    // A restored turn folds its calls under one row, which reaches them: the
+    // first activation of a folded call opens the row, the next one opens the
+    // call itself.
+    let effects = slim_tui::reducer::reduce(
+        &mut app,
+        slim_tui::reducer::Action::ToggleBlock(shell_id.clone()),
+    );
+    assert!(!effects
+        .iter()
+        .any(|effect| matches!(effect, slim_tui::reducer::Effect::Send(_))));
+    assert!(app.blocks().iter().any(|block| {
+        matches!(block.kind(), slim_tui::block::BlockKind::Work(_))
+            && block.fold == slim_tui::block::FoldState::Expanded
+    }));
     let effects =
         slim_tui::reducer::reduce(&mut app, slim_tui::reducer::Action::ToggleBlock(shell_id));
     assert!(!effects

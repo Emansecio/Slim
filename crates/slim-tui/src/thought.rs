@@ -246,7 +246,7 @@ fn has_paired_emphasis(line: &str) -> bool {
 
 /// `text` in at most `cells` cells, cut at a word with `…` when it does not
 /// fit.
-fn fit(text: &str, cells: usize) -> String {
+pub(crate) fn fit(text: &str, cells: usize) -> String {
     if UnicodeWidthStr::width(text) <= cells {
         return text.to_owned();
     }

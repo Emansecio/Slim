@@ -536,6 +536,7 @@ impl ViewModel {
                 BlockKind::Receipt(receipt) => {
                     lines.push(format!("receipt: {}", receipt.summary()))
                 }
+                BlockKind::Work(work) => lines.push(format!("work: {}", work.summary())),
             }
         }
         if state.activity.is_some() {

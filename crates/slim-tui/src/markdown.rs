@@ -14,6 +14,9 @@ pub(crate) struct MarkdownStyles {
     pub code: Style,
     pub code_block: Style,
     pub code_rail: Style,
+    /// The language tag above a fenced block: quiet, and still apart from
+    /// the code where color is missing.
+    pub code_label: Style,
     pub diff_add: Style,
     pub diff_remove: Style,
     pub diff_add_bg: Style,
@@ -30,8 +33,18 @@ enum Tone {
     Link,
     Code,
     CodeBlock,
+    /// The language tag of a fenced block, in the quiet tone of its rail.
+    CodeLabel,
     Quote,
 }
+
+/// Rail of quoted prose: dashed, so a quote never reads as code (solid `│`)
+/// where color or the raised background is not available.
+const QUOTE_RAIL: &str = "┆ ";
+/// Rail of code and diffs.
+const CODE_RAIL: &str = "│ ";
+/// Cells a language label may take on its row.
+const CODE_LABEL_CELLS: usize = 24;
 
 #[derive(Clone)]
 struct Piece {
@@ -47,6 +60,8 @@ enum LineKind {
     /// Quoted prose: wrapped inside a two-cell rail drawn on every row.
     Quote,
     Code,
+    /// The row that names the language of a fenced block.
+    CodeLabel,
     DiffAdd,
     DiffRemove,
     DiffHeader,
@@ -541,6 +556,30 @@ pub(crate) fn plain_row_count(source: &str, width: u16) -> usize {
         .max(1)
 }
 
+/// The language of a fence's info string (`rust` in ```` ```rust,ignore ````):
+/// its first word, kept to the characters a language name uses.
+fn code_label(info: &str) -> Option<String> {
+    // `{.python}` and `{.python .numberLines}` name the language by class.
+    let word = info
+        .trim_start_matches(|character: char| character == '{' || character.is_whitespace())
+        .trim_start_matches('.')
+        .split(|character: char| character.is_whitespace() || matches!(character, ',' | '{' | '}'))
+        .next()?;
+    let mut label = String::new();
+    let mut cells = 0;
+    for character in word.chars().filter(|character| {
+        character.is_alphanumeric() || matches!(character, '+' | '-' | '#' | '.' | '_')
+    }) {
+        let width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+        if cells + width > CODE_LABEL_CELLS {
+            break;
+        }
+        cells += width;
+        label.push(character);
+    }
+    (!label.trim_matches(['-', '.']).is_empty()).then_some(label)
+}
+
 fn project(source: &str, width: usize) -> Vec<LogicalLine> {
     let safe = sanitize_terminal_text_cow(source);
     let mut options = Options::empty();
@@ -602,6 +641,21 @@ fn project(source: &str, width: usize) -> Vec<LogicalLine> {
                         if matches!(label.trim().to_ascii_lowercase().as_str(), "diff" | "patch")
                 );
                 projection.block_tone = BlockTone::Code { diff };
+                // A list item shares its row with the code that starts in it,
+                // so only a block at the root gets the language row.
+                if projection.at_root() {
+                    if let CodeBlockKind::Fenced(info) = &kind {
+                        if let Some(label) = code_label(info) {
+                            projection.finish_line(false);
+                            let mut line = LogicalLine {
+                                kind: LineKind::CodeLabel,
+                                ..LogicalLine::default()
+                            };
+                            line.push(label, Tone::CodeLabel, Modifier::empty());
+                            projection.lines.push(line);
+                        }
+                    }
+                }
             }
             Event::End(TagEnd::CodeBlock) => {
                 projection.finish_line(false);
@@ -828,7 +882,7 @@ fn wrap(logical: &[LogicalLine], width: usize, styles: MarkdownStyles) -> Vec<Li
         for row in wrap_pieces(line, content_width) {
             let mut spans = Vec::new();
             if kind == LineKind::Quote {
-                spans.push(Span::styled("│ ", styles.quote));
+                spans.push(Span::styled(QUOTE_RAIL, styles.quote));
             }
             for piece in row {
                 let style = style_for(piece.tone, piece.modifiers, styles);
@@ -1004,6 +1058,7 @@ fn style_for(tone: Tone, modifiers: Modifier, styles: MarkdownStyles) -> Style {
         Tone::Link => styles.link,
         Tone::Code => styles.code,
         Tone::CodeBlock => styles.code_block,
+        Tone::CodeLabel => styles.code_label,
         Tone::Quote => styles.quote,
     };
     style.add_modifier(modifiers)
@@ -1035,11 +1090,21 @@ fn decorate_code_row(
     let background = match kind {
         LineKind::DiffAdd => styles.diff_add_bg,
         LineKind::DiffRemove => styles.diff_remove_bg,
-        LineKind::Code | LineKind::DiffHeader | LineKind::DiffContext => styles.code_block,
+        LineKind::Code | LineKind::CodeLabel | LineKind::DiffHeader | LineKind::DiffContext => {
+            styles.code_block
+        }
         LineKind::Text | LineKind::Quote => Style::default(),
     };
     for span in &mut spans {
-        span.style = span.style.patch(background);
+        span.style = if kind == LineKind::CodeLabel {
+            // The tag keeps the rail's quiet color on the block's surface.
+            styles.code_label.patch(Style {
+                bg: background.bg,
+                ..Style::default()
+            })
+        } else {
+            span.style.patch(background)
+        };
     }
     if matches!(kind, LineKind::DiffAdd | LineKind::DiffRemove) {
         style_diff_marker(
@@ -1056,7 +1121,7 @@ fn decorate_code_row(
         .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
         .sum::<usize>();
     let mut decorated = Vec::with_capacity(spans.len() + 2);
-    decorated.push(Span::styled("│ ", styles.code_rail.patch(background)));
+    decorated.push(Span::styled(CODE_RAIL, styles.code_rail.patch(background)));
     decorated.extend(spans);
     decorated.push(Span::styled(
         " ".repeat(width.saturating_sub(2).saturating_sub(used)),
@@ -1268,6 +1333,7 @@ mod tests {
             code: Style::default(),
             code_block: Style::default(),
             code_rail: Style::default(),
+            code_label: Style::default(),
             diff_add: Style::default(),
             diff_remove: Style::default(),
             diff_add_bg: Style::default(),

@@ -1483,6 +1483,55 @@ fn palette_focus_flash_expires_once_and_reduced_motion_keeps_the_stable_row() {
 }
 
 #[test]
+fn a_settling_tool_row_is_woken_only_inside_the_hold_window_and_never_when_reduced() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::ToolStarted {
+        batch_id: ToolBatchId("b".into()),
+        call_id: ToolCallId("c".into()),
+        name: "read".into(),
+        arguments_summary: "path=a.rs".into(),
+    });
+    state.clock.elapsed_ms = 1_000;
+    state.apply_event(UiEvent::ToolEnded {
+        batch_id: ToolBatchId("b".into()),
+        call_id: ToolCallId("c".into()),
+        name: "read".into(),
+        success: true,
+        duration_ms: 1_000,
+    });
+    let block = state.blocks()[0].clone();
+    let level = |elapsed: u64, capabilities: Capabilities| {
+        super::tool_settle_level(&block, 1_000 + elapsed, capabilities)
+    };
+    // The curve is the window of the hold: starts at the top, only ever goes
+    // down, lands on rest exactly when the row joins its group.
+    let curve: Vec<u8> = [0, 40, 83, 120, 166, 200, 248]
+        .into_iter()
+        .map(|elapsed| level(elapsed, caps()))
+        .collect();
+    assert_eq!(curve[0], super::TOOL_SETTLE_LEVELS);
+    assert!(curve.windows(2).all(|pair| pair[0] >= pair[1]), "{curve:?}");
+    assert!(curve.iter().all(|level| *level >= 1), "{curve:?}");
+    assert_eq!(level(crate::block::TOOL_GROUP_HOLD_MS, caps()), 0);
+    let reduced = Capabilities {
+        reduced_motion: true,
+        ..caps()
+    };
+    assert_eq!(level(0, reduced), 0);
+    // The loop is woken at the boundaries of that window, then left alone:
+    // no timer runs once the row is at rest, and none runs when reduced.
+    let mut now = 1_000;
+    let mut wakes = 0;
+    while let Some(next) = transition_deadline(&state, now, caps()) {
+        assert!(next > now && next <= 1_000 + crate::block::TOOL_GROUP_HOLD_MS);
+        now = next;
+        wakes += 1;
+    }
+    assert_eq!(wakes, 3);
+    assert_eq!(transition_deadline(&state, 1_000, reduced), None);
+}
+
+#[test]
 fn idle_completed_block_keeps_frame_emphasis_when_spinner_is_suppressed() {
     let mut state = AppState::new();
     state.authenticated = true;
@@ -1499,7 +1548,7 @@ fn idle_completed_block_keeps_frame_emphasis_when_spinner_is_suppressed() {
         let buffer = terminal.backend().buffer();
         for row in 0..buffer.area.height {
             for column in 0..buffer.area.width {
-                if buffer[(column, row)].symbol() == "●" {
+                if matches!(buffer[(column, row)].symbol(), "●" | ">") {
                     return (buffer[(column, row)].fg, buffer[(column, row)].modifier);
                 }
             }

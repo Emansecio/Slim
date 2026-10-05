@@ -109,7 +109,7 @@ pub enum ReceiptSegment {
     },
 }
 
-fn format_duration(ms: u64) -> String {
+pub(crate) fn format_duration(ms: u64) -> String {
     match ms {
         0..=999 => format!("{ms}ms"),
         1_000..=59_999 => format!("{}s", ms / 1_000),

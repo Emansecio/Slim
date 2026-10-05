@@ -62,6 +62,9 @@ fn render(markdown: &str, width: u16) -> Rendered {
             text: markdown.into(),
         }),
     );
+    // Colors are read once the words have settled: the newest words of an
+    // answer being written glow for a moment.
+    state.clock.elapsed_ms = 1_000;
     render_state(&state, width)
 }
 
@@ -160,12 +163,12 @@ fn blockquote_keeps_text_on_the_rail_row_instead_of_leaving_a_lone_rail() {
         .position(|row| row.contains("Não rodei"))
         .expect("quote text");
     assert!(
-        rendered.rows[quote].starts_with("    │ Não rodei o build release."),
+        rendered.rows[quote].starts_with("    ┆ Não rodei o build release."),
         "{}",
         rendered.text()
     );
     assert!(
-        rendered.rows.iter().all(|row| row.trim() != "│"),
+        rendered.rows.iter().all(|row| row.trim() != "┆"),
         "a rail must never stand alone above its text:\n{}",
         rendered.text()
     );
@@ -183,11 +186,11 @@ fn long_blockquote_wraps_under_its_rail_and_measures_the_same() {
     let rows: Vec<&String> = rendered
         .rows
         .iter()
-        .filter(|row| row.contains('│'))
+        .filter(|row| row.contains('┆'))
         .collect();
     assert!(rows.len() >= 3, "{}", rendered.text());
     assert!(
-        rows.iter().all(|row| row.starts_with("    │ ")),
+        rows.iter().all(|row| row.starts_with("    ┆ ")),
         "every wrapped row keeps the rail:\n{}",
         rendered.text()
     );
@@ -208,15 +211,15 @@ fn quote_paragraphs_share_one_rail_separated_by_a_rail_only_row() {
     let first = rendered
         .rows
         .iter()
-        .position(|row| row.contains("│ um"))
+        .position(|row| row.contains("┆ um"))
         .expect("first paragraph");
     assert!(
-        rendered.rows[first + 1].trim_end() == "    │",
+        rendered.rows[first + 1].trim_end() == "    ┆",
         "{}",
         rendered.text()
     );
     assert!(
-        rendered.rows[first + 2].starts_with("    │ dois"),
+        rendered.rows[first + 2].starts_with("    ┆ dois"),
         "{}",
         rendered.text()
     );
@@ -773,8 +776,10 @@ fn user_marker_settles_without_changing_the_label_or_layout() {
             ..caps()
         },
     );
-    assert!(plain.text().contains("  * Você"));
-    assert_eq!(plain.word_style("*").0, Color::Reset);
+    // Without color the band is gone, so the prompt takes the composer's
+    // chevron while the agent keeps its dot.
+    assert!(plain.text().contains("  > Você"));
+    assert_eq!(plain.word_style(">").0, Color::Reset);
 }
 
 #[test]
