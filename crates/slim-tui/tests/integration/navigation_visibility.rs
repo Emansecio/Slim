@@ -301,7 +301,7 @@ fn inspector_wheel_uses_the_real_panel_and_respects_modal_precedence() {
     .expect("transcript wheel action");
     assert!(matches!(
         outside,
-        Action::Scroll {
+        Action::WheelScroll {
             intent: ScrollIntent::Down,
             ..
         }

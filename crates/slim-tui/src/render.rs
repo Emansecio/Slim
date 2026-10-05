@@ -1111,7 +1111,9 @@ pub struct WrapCache {
     #[allow(clippy::type_complexity)]
     search_memo: Option<((String, SearchFilter, u64), Arc<[usize]>)>,
     /// Foldable selected-block probe keyed by (content, fold, scroll mode).
-    selected_memo: Option<((u64, u64, FollowMode), Option<BlockId>)>,
+    /// Keyed by (content, fold, scroll mode, whether the wheel set the pin).
+    #[allow(clippy::type_complexity)]
+    selected_memo: Option<((u64, u64, FollowMode, bool), Option<BlockId>)>,
     /// Last collapsed tool-group leader keyed by (content, fold, hold epoch).
     tool_leader_memo: Option<((u64, u64, u64), Option<BlockId>)>,
     /// Live clock for tool-group hold. Direct `HeightIndex::build` leaves
@@ -1414,6 +1416,7 @@ impl WrapCache {
                 state.revisions.content,
                 state.revisions.fold,
                 state.scroll.mode.clone(),
+                state.scroll.pointer,
             ),
             || state.selected_block_id().cloned(),
         )

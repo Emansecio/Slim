@@ -639,7 +639,7 @@ fn wheel_still_scrolls_when_mouse_is_captured() {
     );
     assert!(matches!(
         action,
-        Some(Action::Scroll {
+        Some(Action::WheelScroll {
             intent: ScrollIntent::Up,
             ..
         })

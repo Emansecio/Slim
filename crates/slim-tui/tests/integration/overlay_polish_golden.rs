@@ -388,9 +388,15 @@ fn session_name_leads_the_rail_and_reads_as_text() {
         text[y as usize]
     );
     let name = buffer[(x, y)].style();
-    let (rest_x, _) = find(&text[y as usize..=y as usize], "projeto");
-    let rest = buffer[(rest_x, y)].style();
-    assert_ne!(name.fg, rest.fg, "the name is brighter than the directory");
+    let (parent_x, _) = find(&text[y as usize..=y as usize], "dev");
+    let parent = buffer[(parent_x, y)].style();
+    assert_ne!(
+        name.fg, parent.fg,
+        "the name is brighter than the parent path"
+    );
+    // The project folder, the last component, shares the text tone.
+    let (folder_x, _) = find(&text[y as usize..=y as usize], "projeto");
+    assert_eq!(buffer[(folder_x, y)].style().fg, name.fg);
     // Clearing the name restores the plain rail.
     state.apply_event(UiEvent::SessionTitleChanged { title: None });
     let text = rows(&draw(&state));

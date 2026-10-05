@@ -49,6 +49,12 @@ pub enum Action {
         intent: ScrollIntent,
         metrics: ScrollMetrics,
     },
+    /// The mouse wheel over the transcript: it moves the viewport and nothing
+    /// else (no selection, no jumps between foldable rows).
+    WheelScroll {
+        intent: ScrollIntent,
+        metrics: ScrollMetrics,
+    },
     InspectorScroll {
         intent: ScrollIntent,
         total_rows: usize,
@@ -367,7 +373,12 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
         }
         Action::Scroll { intent, metrics } => {
             clear_screen_selection(state);
-            reduce_scroll(state, intent, &metrics);
+            reduce_scroll(state, intent, &metrics, false);
+            vec![Effect::RequestRender]
+        }
+        Action::WheelScroll { intent, metrics } => {
+            clear_screen_selection(state);
+            reduce_scroll(state, intent, &metrics, true);
             vec![Effect::RequestRender]
         }
         Action::InspectorScroll {
@@ -442,6 +453,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
         }
         Action::StartPinnedScreenSelection { x, y, area, anchor } => {
             state.scroll.mode = FollowMode::Pinned(anchor);
+            state.scroll.pointer = false;
             state.revisions.viewport += 1;
             reduce(state, Action::StartScreenSelection { x, y, area })
         }
@@ -1075,7 +1087,7 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         // A view resting on a block folded into its turn's work (a search
         // hit) copies that block's own text; the row stands for it on screen.
         let folded = match &state.scroll.mode {
-            FollowMode::Pinned(anchor) => state
+            FollowMode::Pinned(anchor) if !state.scroll.pointer => state
                 .blocks()
                 .iter()
                 .enumerate()
@@ -1514,6 +1526,7 @@ fn reduce_search_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             block_id: state.blocks()[index].id.clone(),
             row_offset: 0,
         });
+        state.scroll.pointer = false;
         state.revisions.viewport += 1;
     }
     state.search = Some(search);
@@ -3403,8 +3416,20 @@ fn reduce_palette_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     vec![Effect::RequestRender]
 }
 
-fn reduce_scroll(state: &mut AppState, intent: ScrollIntent, metrics: &ScrollMetrics) {
+/// Moves the viewport. `wheel` is the mouse wheel: the same steps, but never
+/// fold navigation, and it leaves no block selected. Keyboard moves keep
+/// selecting whatever block the pinned view rests on.
+fn reduce_scroll(state: &mut AppState, intent: ScrollIntent, metrics: &ScrollMetrics, wheel: bool) {
     if metrics.viewport_rows == 0 {
+        return;
+    }
+    if wheel && metrics.total_rows <= metrics.viewport_rows {
+        // Everything is on screen: there is nothing to scroll. A selection
+        // made earlier by keyboard is dropped, the view stays where it is.
+        if state.scroll.pointer != state.scroll.is_pinned() {
+            state.scroll.pointer = state.scroll.is_pinned();
+            state.revisions.viewport += 1;
+        }
         return;
     }
     let was_live = state.scroll.is_live_edge();
@@ -3416,7 +3441,9 @@ fn reduce_scroll(state: &mut AppState, intent: ScrollIntent, metrics: &ScrollMet
         intent,
         ScrollIntent::Up | ScrollIntent::Down | ScrollIntent::PageUp | ScrollIntent::PageDown
     );
-    let fitted_fold_mode = if was_live && intent == ScrollIntent::Up {
+    let fitted_fold_mode = if wheel {
+        None
+    } else if was_live && intent == ScrollIntent::Up {
         metrics
             .last_visible_foldable_anchor
             .clone()
@@ -3461,6 +3488,7 @@ fn reduce_scroll(state: &mut AppState, intent: ScrollIntent, metrics: &ScrollMet
             }
         }
     };
+    state.scroll.pointer = wheel && state.scroll.is_pinned();
     if state.scroll.is_live_edge() {
         state.scroll.unseen = 0;
     }

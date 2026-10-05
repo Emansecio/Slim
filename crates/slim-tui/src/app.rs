@@ -131,6 +131,11 @@ impl Default for FollowMode {
 pub struct ScrollState {
     pub mode: FollowMode,
     pub unseen: u32,
+    /// The current pin was set by the mouse wheel. The wheel only moves the
+    /// viewport: a view it left resting on a block does not select that
+    /// block, so no marker or `Enter` hint is drawn for it. Keyboard
+    /// navigation, search and a click pin without this flag and select again.
+    pub pointer: bool,
 }
 
 impl ScrollState {
@@ -1851,6 +1856,9 @@ impl AppState {
     /// The foldable block addressed by the stable scroll anchor. Live edge
     /// intentionally has no focused block so Enter keeps its composer role.
     pub fn selected_block_id(&self) -> Option<&BlockId> {
+        if self.scroll.pointer {
+            return None;
+        }
         let id = match &self.scroll.mode {
             FollowMode::Pinned(anchor) => &anchor.block_id,
             FollowMode::Top => &self.blocks.first()?.id,

@@ -914,6 +914,68 @@ fn fallback_and_motion_scenes() -> Vec<(String, AppState, u16, u16, Capabilities
             capabilities(ColorDepth::TrueColor, false),
         ));
     }
+    // The workspace identity in the rail: home as `~`, folder in the text tone.
+    if let Some(home) = ["USERPROFILE", "HOME"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|home| !home.trim().is_empty())
+    {
+        for (label, depth, title) in [
+            ("truecolor", ColorDepth::TrueColor, None),
+            (
+                "title",
+                ColorDepth::TrueColor,
+                Some("Corrigir CRLF no parser"),
+            ),
+            ("nocolor", ColorDepth::None, Some("Corrigir CRLF no parser")),
+        ] {
+            let mut state = agent_turn();
+            state.apply_event(UiEvent::SessionSnapshot {
+                session_id: SessionId("rail".into()),
+                cwd: format!(r"{}\Projects\Slim", home.trim_end_matches(['/', '\u{5c}'])),
+                skill_names: Vec::new(),
+            });
+            state.apply_event(UiEvent::SessionTitleChanged {
+                title: title.map(str::to_owned),
+            });
+            scenes.push((
+                format!("session-rail-{label}"),
+                state,
+                100,
+                14,
+                capabilities(depth, true),
+            ));
+        }
+    }
+    // The wheel scrolled the view: it rests on a row, and nothing is selected.
+    let mut wheeled = agent_turn();
+    let rest = wheeled
+        .blocks()
+        .iter()
+        .find(|block| matches!(block.kind(), BlockKind::Thinking(_)))
+        .expect("a thought")
+        .id
+        .clone();
+    wheeled.scroll.mode = FollowMode::Pinned(ScrollAnchor {
+        block_id: rest,
+        row_offset: 0,
+    });
+    wheeled.scroll.pointer = true;
+    scenes.push((
+        "wheel-scrolled".into(),
+        wheeled.clone(),
+        80,
+        24,
+        capabilities(ColorDepth::TrueColor, true),
+    ));
+    wheeled.scroll.pointer = false;
+    scenes.push((
+        "keyboard-selected".into(),
+        wheeled,
+        80,
+        24,
+        capabilities(ColorDepth::TrueColor, true),
+    ));
     for later in [0u64, 83, 166, 249] {
         scenes.push((
             format!("tool-settle-{later:03}"),

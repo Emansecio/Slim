@@ -749,6 +749,49 @@ real, com degradação explícita e testes golden (G340–G341).
 
 ### 1.2 Direção visual revisada
 
+**Revisão de 05/10/2026 (roda do mouse e identidade do workspace):** a roda do
+mouse deixa de se comportar como seta, e a rail do topo passa a dizer onde o
+Slim roda sem exigir leitura. Nenhuma row, timer, token de paleta ou fonte de
+dados nova.
+
+- **A roda só rola.** Antes, a roda emitia o mesmo `ScrollIntent::Up/Down` das
+  setas e o reducer o tratava como navegação por dobras: do live edge, `Up`
+  prendia a vista no último bloco dobrável visível; com o transcript cabendo na
+  viewport, `Up/Down` saltavam entre âncoras dobráveis; e a seleção era
+  derivada do bloco em que a âncora fixada repousava. O resultado era o marcador
+  `>` e a dica `Enter expandir` aparecendo, durante uma execução, em qualquer
+  linha onde a roda parasse. Agora a roda (`Action::WheelScroll`) move a
+  viewport e mais nada: nunca seleciona um bloco, nunca desenha o `>` nem a dica
+  `Enter …`, nunca salta entre rows dobráveis. Se o transcript cabe, a roda não
+  faz nada (sem fixar, sem contador de não vistos, sem `End recentes`), e do
+  live edge uma roda para cima sobre conteúdo que cabe continua no live edge.
+  Se há mais conteúdo que rows, o passo é o de antes e a roda para baixo no
+  fundo volta ao live edge. O estado de rolagem registra de onde veio a fixação
+  (`ScrollState.pointer`): a seleção só é derivada quando ela não veio da roda.
+  Setas, PgUp/PgDn, Home/End e Enter na row selecionada mantêm o comportamento
+  de antes, inclusive a seleção e a navegação por dobras; um movimento de
+  teclado depois da roda seleciona de novo a partir de onde a vista está, e a
+  roda depois de uma seleção por teclado a solta. Busca e clique que fixa a
+  vista continuam selecionando como antes (um clique em row dobrável faz o que
+  fazia). O cartão de aprovação e o painel do inspetor continuam donos da roda
+  sobre eles. Substitui, em §15.2 (seleção de teclado como `BlockId` na
+  `ScrollAnchor`), a leitura de que toda vista fixada seleciona o bloco sob a
+  âncora, e a regra de §18 de que roda e setas compartilham o comportamento de
+  navegação (compartilham só o `ScrollMetrics`).
+- **Identidade do workspace.** O diretório home aparece como `~` (comparação
+  sem distinção de maiúsculas e de separador, com a mesma detecção de home de
+  `is_trivial_cwd`): `SLIM · ~\Projects\Slim`; um caminho fora do home não
+  muda. A última componente, a pasta do projeto, fica no tom de texto, e o
+  caminho pai e os separadores continuam quietos, como o título da sessão já
+  tinha a sua faixa; com título, ele continua na frente
+  (`SLIM · <título> · ~\Projects\Slim`). Com pouca largura o pai cai primeiro,
+  por componentes inteiros, e a pasta é o último a ceder: `~\Projects\Slim`,
+  `…\Projects\Slim`, `…\Slim`; só uma pasta mais larga que o espaço é cortada,
+  pela esquerda. Sem cor a pasta se distingue só por peso (negrito, porque os
+  tons colapsam); em ANSI16 os tons continuam distintos e não há negrito.
+  Substitui, em §14.1, o `SLIM · cwd` em um tom só e o corte do meio de
+  `truncate_middle` para o cwd da rail.
+
 **Revisão de 05/10/2026 (organização do transcript e movimento de estado):** o
 transcript de um turno concluído separa o trabalho da resposta, os grupos pequenos
 dizem o que fizeram, e três sinais de estado ganham movimento. Nada anima

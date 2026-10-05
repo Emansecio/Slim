@@ -38,16 +38,81 @@ pub(crate) fn is_trivial_cwd(cwd: &str) -> bool {
     if cwd.is_empty() || cwd == "~" {
         return true;
     }
+    home_dirs().iter().any(|home| cwd == normalized(home))
+}
+
+/// The user's home directories as the environment names them.
+fn home_dirs() -> &'static [String] {
     static HOMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    let homes = HOMES.get_or_init(|| {
+    HOMES.get_or_init(|| {
         [std::env::var("USERPROFILE"), std::env::var("HOME")]
             .into_iter()
             .flatten()
             .filter(|home| !home.trim().is_empty())
-            .map(|home| normalized(&home))
             .collect()
-    });
-    homes.iter().any(|home| &cwd == home)
+    })
+}
+
+fn is_separator(character: char) -> bool {
+    matches!(character, '/' | '\\')
+}
+
+/// `path` with a leading home directory written as `~` (`~\Projects\Slim`).
+/// The comparison ignores case and the kind of separator; a path outside the
+/// home, or one that only shares a name prefix with it, is returned as is.
+pub(crate) fn abbreviate_home(path: &str, homes: &[String]) -> String {
+    for home in homes {
+        let home = display_cwd(home);
+        let home = home.trim_end_matches(is_separator);
+        if home.is_empty() {
+            continue;
+        }
+        let mut rest = path.chars();
+        let matches = home.chars().all(|expected| {
+            rest.next().is_some_and(|actual| {
+                (is_separator(expected) && is_separator(actual))
+                    || actual.to_lowercase().eq(expected.to_lowercase())
+            })
+        });
+        let tail = rest.as_str();
+        if matches && (tail.is_empty() || tail.starts_with(is_separator)) {
+            return format!("~{tail}");
+        }
+    }
+    path.to_owned()
+}
+
+/// `path` fitted to `max_width` cells, and the byte range of its last
+/// component (the project folder) in the result. The parent goes first: whole
+/// leading components give way to `…`, so the folder is the last thing to
+/// lose (`~\Projects\Slim`, `…\Projects\Slim`, `…\Slim`); only a folder wider
+/// than the room is itself cut, from the left.
+pub(crate) fn shorten_path(
+    path: &str,
+    max_width: usize,
+) -> (String, Option<std::ops::Range<usize>>) {
+    use unicode_width::UnicodeWidthStr;
+    let folder_of = |text: &str| {
+        let start = text.rfind(is_separator).map_or(0, |index| index + 1);
+        (start < text.len()).then_some(start..text.len())
+    };
+    if UnicodeWidthStr::width(path) <= max_width {
+        return (path.to_owned(), folder_of(path));
+    }
+    let separator = path.chars().find(|c| is_separator(*c)).unwrap_or('\\');
+    let components: Vec<&str> = path.split(is_separator).collect();
+    for kept in (1..components.len()).rev() {
+        let tail = components[components.len() - kept..].join(&separator.to_string());
+        let text = format!("…{separator}{tail}");
+        if UnicodeWidthStr::width(text.as_str()) <= max_width {
+            let folder = folder_of(&text);
+            return (text, folder);
+        }
+    }
+    let folder = components.last().copied().unwrap_or(path);
+    let text = truncate_middle(folder, max_width);
+    let range = (!text.is_empty()).then_some(0..text.len());
+    (text, range)
 }
 
 pub(crate) fn run_status_label(state: &AppState) -> &'static str {
@@ -324,6 +389,9 @@ pub(crate) struct SessionRailProjection {
     pub identity: String,
     /// Byte range of the `/rename` title inside `identity`, when one is shown.
     pub title: Option<std::ops::Range<usize>>,
+    /// Byte range of the project folder (the last path component) inside
+    /// `identity`, when the directory is shown.
+    pub folder: Option<std::ops::Range<usize>>,
     pub status: String,
     pub gap: usize,
 }
@@ -411,11 +479,20 @@ pub(crate) fn session_rail_projection(
     available: usize,
     _activity_rail_visible: bool,
 ) -> SessionRailProjection {
+    session_rail_projection_with_homes(state, available, home_dirs())
+}
+
+fn session_rail_projection_with_homes(
+    state: &AppState,
+    available: usize,
+    homes: &[String],
+) -> SessionRailProjection {
     let mut title_range = None;
+    let mut folder_range = None;
     let identity = if is_trivial_cwd(&state.cwd) {
         truncate_display_width("SLIM", available)
     } else {
-        let safe_cwd = display_cwd(&state.cwd);
+        let safe_cwd = abbreviate_home(&display_cwd(&state.cwd), homes);
         let prefix = "SLIM · ";
         let prefix_width = unicode_width::UnicodeWidthStr::width(prefix);
         // A session name leads the rail; the directory keeps whatever room is
@@ -432,23 +509,31 @@ pub(crate) fn session_rail_projection(
                 let used = prefix_width
                     + unicode_width::UnicodeWidthStr::width(title.as_str())
                     + unicode_width::UnicodeWidthStr::width(separator);
-                let cwd = truncate_middle(&safe_cwd, available.saturating_sub(used));
+                let (cwd, folder) = shorten_path(&safe_cwd, available.saturating_sub(used));
                 title_range = Some(prefix.len()..prefix.len() + title.len());
+                let start = prefix.len() + title.len() + separator.len();
+                folder_range = folder.map(|range| start + range.start..start + range.end);
                 truncate_display_width(&format!("{prefix}{title}{separator}{cwd}"), available)
             }
             None => {
                 let cwd_budget = available.saturating_sub(prefix_width);
-                let cwd = truncate_middle(&safe_cwd, cwd_budget);
+                let (cwd, folder) = shorten_path(&safe_cwd, cwd_budget);
+                folder_range =
+                    folder.map(|range| prefix.len() + range.start..prefix.len() + range.end);
                 truncate_display_width(&format!("{prefix}{cwd}"), available)
             }
         }
     };
-    let title_range =
-        title_range.map(|range| range.start.min(identity.len())..range.end.min(identity.len()));
+    let clamp = |range: std::ops::Range<usize>| {
+        range.start.min(identity.len())..range.end.min(identity.len())
+    };
+    let title_range = title_range.map(clamp);
+    let folder_range = folder_range.map(clamp);
     let gap = available.saturating_sub(unicode_width::UnicodeWidthStr::width(identity.as_str()));
     SessionRailProjection {
         identity,
         title: title_range.filter(|range| range.start < range.end),
+        folder: folder_range.filter(|range| range.start < range.end),
         status: String::new(),
         gap,
     }
@@ -1051,5 +1136,119 @@ mod activity_label_tests {
             requested_ms: 40_000,
         });
         assert_eq!(activity_label(&state), "Interrupção solicitada");
+    }
+}
+
+#[cfg(test)]
+mod rail_tests {
+    use super::*;
+
+    fn homes() -> Vec<String> {
+        vec![r"C:\Users\Thiago Emanuel".into()]
+    }
+
+    fn state(cwd: &str, title: Option<&str>) -> AppState {
+        let mut state = AppState::new();
+        state.cwd = cwd.into();
+        state.session_title = title.map(str::to_owned);
+        state
+    }
+
+    fn rail(cwd: &str, title: Option<&str>, width: usize) -> (String, Option<String>) {
+        let projection = session_rail_projection_with_homes(&state(cwd, title), width, &homes());
+        let folder = projection
+            .folder
+            .map(|range| projection.identity[range].to_owned());
+        (projection.identity, folder)
+    }
+
+    #[test]
+    fn the_home_directory_becomes_a_tilde_whatever_the_case_or_separator() {
+        let homes = homes();
+        for (path, expected) in [
+            (r"C:\Users\Thiago Emanuel\Projects\Slim", r"~\Projects\Slim"),
+            (r"c:\users\thiago emanuel\Projects\Slim", r"~\Projects\Slim"),
+            ("C:/Users/Thiago Emanuel/Projects/Slim", "~/Projects/Slim"),
+            (
+                "\x5c\x5c?\x5cC:\x5cUsers\x5cThiago Emanuel\x5cWork",
+                r"~\Work",
+            ),
+            // Outside the home, or only sharing a name prefix with it.
+            (r"D:\Projects\Slim", r"D:\Projects\Slim"),
+            (
+                r"C:\Users\Thiago Emanuel2\Slim",
+                r"C:\Users\Thiago Emanuel2\Slim",
+            ),
+            (r"C:\Users\Someone\Slim", r"C:\Users\Someone\Slim"),
+        ] {
+            assert_eq!(
+                abbreviate_home(&display_cwd(path), &homes),
+                expected,
+                "{path}"
+            );
+        }
+        assert_eq!(abbreviate_home("x", &[]), "x");
+    }
+
+    #[test]
+    fn the_rail_names_the_project_folder_and_keeps_the_rest_quiet() {
+        let (identity, folder) = rail(r"C:\Users\Thiago Emanuel\Projects\Slim", None, 80);
+        assert_eq!(identity, r"SLIM · ~\Projects\Slim");
+        assert_eq!(folder.as_deref(), Some("Slim"));
+        // A path outside the home is shown whole.
+        let (identity, folder) = rail(r"D:\Work\Slim", None, 80);
+        assert_eq!(identity, r"SLIM · D:\Work\Slim");
+        assert_eq!(folder.as_deref(), Some("Slim"));
+        // The session title still leads.
+        let (identity, folder) = rail(
+            r"C:\Users\Thiago Emanuel\Projects\Slim",
+            Some("Corrigir CRLF"),
+            80,
+        );
+        assert_eq!(identity, r"SLIM · Corrigir CRLF · ~\Projects\Slim");
+        assert_eq!(folder.as_deref(), Some("Slim"));
+    }
+
+    #[test]
+    fn a_short_rail_drops_the_parent_first_and_keeps_the_folder() {
+        let path = r"C:\Users\Thiago Emanuel\Projects\Slim";
+        for (width, expected) in [
+            (22, r"SLIM · ~\Projects\Slim"),
+            (21, r"SLIM · …\Slim"),
+            (16, r"SLIM · …\Slim"),
+            (13, r"SLIM · …\Slim"),
+        ] {
+            let (identity, folder) = rail(path, None, width);
+            assert_eq!(identity, expected, "width {width}");
+            assert_eq!(folder.as_deref(), Some("Slim"), "width {width}");
+        }
+        // Leading components go one at a time, never mid-word.
+        let deep = r"D:\Work\Group\Projects\Slim";
+        assert_eq!(
+            rail(deep, None, 40).0,
+            r"SLIM · D:\Work\Group\Projects\Slim"
+        );
+        assert_eq!(rail(deep, None, 28).0, r"SLIM · …\Group\Projects\Slim");
+        assert_eq!(rail(deep, None, 22).0, r"SLIM · …\Projects\Slim");
+        assert_eq!(rail(deep, None, 21).0, r"SLIM · …\Slim");
+        // Only a folder that cannot fit itself is cut, from the left.
+        let (identity, folder) = rail(path, None, 10);
+        assert_eq!(identity, "SLIM · …im");
+        assert_eq!(folder.as_deref(), Some("…im"));
+        // With a title the folder still outlives the parent.
+        let (identity, folder) = rail(path, Some("Corrigir CRLF"), 32);
+        assert_eq!(identity, r"SLIM · Corrigir CRLF · …\Slim");
+        assert_eq!(folder.as_deref(), Some("Slim"));
+        // Never wider than the room, at any width.
+        for width in 0..60 {
+            let (identity, _) = rail(path, Some("Corrigir CRLF"), width);
+            assert!(unicode_width::UnicodeWidthStr::width(identity.as_str()) <= width);
+        }
+    }
+
+    #[test]
+    fn the_home_itself_and_an_empty_directory_stay_a_bare_brand() {
+        assert_eq!(rail(r"C:\Users\Thiago Emanuel", None, 40).0, "SLIM");
+        assert_eq!(rail("", None, 40).0, "SLIM");
     }
 }

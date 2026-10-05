@@ -749,7 +749,7 @@ fn mouse_action(
                     capacity: metrics.capacity,
                 });
             }
-            Some(Action::Scroll {
+            Some(Action::WheelScroll {
                 intent,
                 metrics: measure_scrollback(state, size.0, size.1, cache),
             })
@@ -1402,6 +1402,7 @@ pub fn render_frame(
             chrome_area(to_ratatui(regions.session_rail), band),
             state,
             &palette,
+            capabilities,
         );
     }
     // The rail may suppress its spinner when it is hidden, idle, or otherwise
@@ -1812,6 +1813,7 @@ fn render_session_rail(
     area: ratatui::layout::Rect,
     state: &AppState,
     palette: &Palette,
+    capabilities: Capabilities,
 ) {
     if area.height == 0 {
         return;
@@ -1821,7 +1823,13 @@ fn render_session_rail(
         area,
     );
     let projection = session_rail_projection(state, area.width as usize, state.working);
-    let mut spans = session_rail_spans(&projection.identity, projection.title.clone(), palette);
+    let mut spans = session_rail_spans(
+        &projection.identity,
+        projection.title.clone(),
+        projection.folder.clone(),
+        palette,
+        capabilities,
+    );
     if projection.gap > 0 {
         spans.push(Span::raw(" ".repeat(projection.gap)));
     }
@@ -1834,32 +1842,60 @@ fn render_session_rail(
     );
 }
 
+/// The rail as spans: the brand (and a session title's lead-in) in the
+/// secondary tone, the title and the project folder in the text tone, and the
+/// rest (separators, the parent path) quiet. With `NO_COLOR` the tones
+/// collapse into one, so the project folder is told apart by weight alone.
 fn session_rail_spans(
     identity: &str,
     title: Option<std::ops::Range<usize>>,
+    folder: Option<std::ops::Range<usize>>,
     palette: &Palette,
+    capabilities: Capabilities,
 ) -> Vec<Span<'static>> {
-    if let Some(range) = title.filter(|range| {
+    let on_boundary = |range: &std::ops::Range<usize>| {
         identity.is_char_boundary(range.start) && identity.is_char_boundary(range.end)
-    }) {
-        // `SLIM · <title> · <cwd>`: the name reads as text, the rest stays quiet.
-        return vec![
-            Span::styled(identity[..range.start].to_owned(), palette.secondary),
-            Span::styled(identity[range.clone()].to_owned(), palette.text),
-            Span::styled(identity[range.end..].to_owned(), palette.muted),
-        ];
-    }
-    if let Some(path) = identity.strip_prefix("SLIM · ") {
-        vec![
-            Span::styled("SLIM", palette.secondary),
-            Span::styled(" · ", palette.muted),
-            Span::styled(path.to_owned(), palette.muted),
-        ]
-    } else if identity == "SLIM" {
-        vec![Span::styled("SLIM", palette.secondary)]
+    };
+    let title = title.filter(on_boundary);
+    let folder = folder.filter(on_boundary);
+    let folder_style = if capabilities.color_depth == ColorDepth::None {
+        palette.text.add_modifier(Modifier::BOLD)
     } else {
-        vec![Span::styled(identity.to_owned(), palette.muted)]
+        palette.text
+    };
+    // Where the secondary lead ends: before the title, or after `SLIM`.
+    let lead_end = match &title {
+        Some(range) => range.start,
+        None if identity.starts_with("SLIM") => 4,
+        None => 0,
+    };
+    let mut cuts = vec![0, lead_end.min(identity.len()), identity.len()];
+    for range in title.iter().chain(folder.iter()) {
+        cuts.extend([range.start, range.end]);
     }
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts.windows(2)
+        .filter(|pair| pair[0] < pair[1])
+        .map(|pair| {
+            let (start, end) = (pair[0], pair[1]);
+            let inside = |range: &Option<std::ops::Range<usize>>| {
+                range
+                    .as_ref()
+                    .is_some_and(|range| range.start <= start && end <= range.end)
+            };
+            let style = if inside(&title) {
+                palette.text
+            } else if inside(&folder) {
+                folder_style
+            } else if end <= lead_end {
+                palette.secondary
+            } else {
+                palette.muted
+            };
+            Span::styled(identity[start..end].to_owned(), style)
+        })
+        .collect()
 }
 
 /// Which live rows of the current phase the transcript painted this frame.
