@@ -98,7 +98,7 @@ pub fn detect_capabilities() -> Capabilities {
         // Default on: capturing without in-app selection stole native copy/paste.
         // SLIM_MOUSE=0 restores the previous "leave the mouse to the terminal" mode.
         mouse: env_flag_enabled("SLIM_MOUSE", true),
-        clipboard: cfg!(windows)
+        clipboard: cfg!(any(windows, target_os = "macos"))
             || std::env::var_os("SLIM_CLIPBOARD").is_some_and(|value| value == "1"),
         images: std::env::var_os("SLIM_IMAGES").is_some_and(|value| value == "1"),
         reduced_motion: reduced_motion_from(

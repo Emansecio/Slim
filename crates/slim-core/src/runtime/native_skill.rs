@@ -9,7 +9,7 @@ pub(super) fn skill_tool_definition() -> Value {
             "properties": {
                 "name": {"type": "string"},
                 "list": {"type": "boolean"},
-                "script": {"type": "string", "description": "Filename inside skill directory; no ./ or absolute path. Default run.ps1."}
+                "script": {"type": "string", "description": format!("Filename inside skill directory; no ./ or absolute path. Default {}.", crate::skills::DEFAULT_SKILL_SCRIPT)}
             },
             "additionalProperties": false
         }

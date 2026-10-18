@@ -79,7 +79,7 @@ impl OAuthStore {
     pub fn default_path() -> Result<Self, OAuthError> {
         let path = auth_file_path()
             .map_err(|error| OAuthError::Store(error.to_string()))?
-            .ok_or_else(|| OAuthError::Store("USERPROFILE is unavailable".into()))?;
+            .ok_or_else(|| OAuthError::Store("home directory is unavailable".into()))?;
         Ok(Self::at(path))
     }
 

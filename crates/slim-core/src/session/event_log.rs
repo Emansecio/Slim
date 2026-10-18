@@ -263,6 +263,9 @@ pub(crate) fn open_checked(mut options: OpenOptions, path: &Path) -> io::Result<
     }
     #[cfg(windows)]
     options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    // The check above can race a swap to a symlink; refuse one at open too.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW);
     let file = options.open(path)?;
     if is_reparse_metadata(&file.metadata()?) {
         return Err(reparse_error(path));

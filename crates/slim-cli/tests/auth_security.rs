@@ -512,6 +512,7 @@ fn default_user_profile_path_is_used_when_explicit_path_is_absent() {
     let _env = EnvGuard::capture(&[
         "SLIM_AUTH_FILE",
         "USERPROFILE",
+        "HOME",
         "SLIM_API_KEY",
         "OPENAI_API_KEY",
     ]);
@@ -524,7 +525,11 @@ fn default_user_profile_path_is_used_when_explicit_path_is_absent() {
     )
     .expect("write default auth fixture");
     std::env::remove_var("SLIM_AUTH_FILE");
-    std::env::set_var("USERPROFILE", temp.path());
+    // The home variable the default path reads on this platform.
+    std::env::set_var(
+        if cfg!(windows) { "USERPROFILE" } else { "HOME" },
+        temp.path(),
+    );
     std::env::remove_var("SLIM_API_KEY");
     std::env::remove_var("OPENAI_API_KEY");
 

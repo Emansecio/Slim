@@ -377,6 +377,21 @@ impl ProcessRunner {
         }
     }
 
+    /// Interpreter for script-form shell commands outside Windows: `bash` on
+    /// PATH (a newer Homebrew bash wins over macOS's 3.2), then `/bin/bash`,
+    /// then `/bin/sh`. zsh is not used: its `no matches found` on an
+    /// unmatched glob and its word splitting break scripts written for bash.
+    #[cfg(not(windows))]
+    pub fn resolve_unix_shell(&self) -> io::Result<Option<PathBuf>> {
+        if let Some(program) = self.resolver.resolve("bash")? {
+            return Ok(Some(program));
+        }
+        Ok(["/bin/bash", "/bin/sh"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|candidate| candidate.is_file()))
+    }
+
     pub fn run(&self, request: ProcessRequest) -> io::Result<ProcessRunOutput> {
         self.run_with_progress(request, |_| {})
     }
@@ -431,7 +446,7 @@ impl ProcessRunner {
         #[cfg(unix)]
         let pid = child.id();
         #[cfg(unix)]
-        let _tree = UnixTree(pid);
+        let _tree = UnixTree::new(pid);
         let stdout = child.stdout.take().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "process stdout pipe unavailable")
         })?;
@@ -618,13 +633,91 @@ impl ProcessRunner {
 #[cfg(unix)]
 struct UnixTree(u32);
 #[cfg(unix)]
+impl UnixTree {
+    fn new(pid: u32) -> Self {
+        live_groups::register(pid as i32);
+        Self(pid)
+    }
+}
+#[cfg(unix)]
 impl Drop for UnixTree {
     fn drop(&mut self) {
+        live_groups::unregister(self.0 as i32);
         // SAFETY: only the group created for this child is targeted.
         unsafe {
             libc::kill(-(self.0 as i32), libc::SIGKILL);
         }
     }
+}
+
+/// Process groups of running tool children, so a terminating signal can take
+/// them down before Slim exits: `UnixTree`'s `Drop` does not run when SIGINT,
+/// SIGTERM or SIGHUP kill the process, and a child in its own group never
+/// receives the terminal's Ctrl+C. (Windows gets this from the job object's
+/// `KILL_ON_JOB_CLOSE`.) Lock-free slots, because the signal handler may only
+/// use async-signal-safe operations.
+#[cfg(unix)]
+mod live_groups {
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    const SLOTS: usize = 256;
+    static GROUPS: [AtomicI32; SLOTS] = [const { AtomicI32::new(0) }; SLOTS];
+
+    pub(super) fn register(group: i32) {
+        // A full table only loses the cleanup on signal, never the child.
+        let _ = GROUPS.iter().any(|slot| {
+            slot.compare_exchange(0, group, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        });
+    }
+
+    pub(super) fn unregister(group: i32) {
+        let _ = GROUPS.iter().any(|slot| {
+            slot.compare_exchange(group, 0, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        });
+    }
+
+    extern "C" fn on_termination(signal: libc::c_int) {
+        for slot in &GROUPS {
+            let group = slot.load(Ordering::Acquire);
+            if group > 0 {
+                // SAFETY: kill is async-signal-safe; the group was created
+                // for a tool child and is still registered.
+                unsafe {
+                    libc::kill(-group, libc::SIGKILL);
+                }
+            }
+        }
+        // SAFETY: signal and raise are async-signal-safe. Restoring the
+        // default disposition and re-raising keeps the conventional exit
+        // status (128 + signal) for the parent shell.
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        }
+    }
+
+    pub(super) fn install() {
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: the handler only performs async-signal-safe calls; a
+            // zeroed sigaction with an empty mask is a valid initial value.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = on_termination as extern "C" fn(libc::c_int) as usize;
+                libc::sigemptyset(&mut action.sa_mask);
+                libc::sigaction(signal, &action, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
+/// Makes SIGINT, SIGTERM and SIGHUP kill running tool process groups before
+/// Slim exits. Call once at startup; a no-op on Windows, where the job object
+/// already ties children to the process.
+pub fn install_termination_cleanup() {
+    #[cfg(unix)]
+    live_groups::install();
 }
 
 #[cfg(windows)]
@@ -1293,8 +1386,17 @@ mod tests {
     fn resolver_caches_by_environment_without_where_processes() {
         let root = temp_root("cache");
         fs::create_dir_all(&root).expect("root");
+        // Unix resolution requires the execute bit.
+        let write_executable = |path: &Path, bytes: &[u8]| {
+            fs::write(path, bytes).expect("executable");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("mode");
+            }
+        };
         let executable = root.join(if cfg!(windows) { "fake.EXE" } else { "fake" });
-        fs::write(&executable, b"fake").expect("executable");
+        write_executable(&executable, b"fake");
         let resolver = ExecutableResolver::with_environment(
             std::env::join_paths([&root]).expect("PATH"),
             OsString::from(if cfg!(windows) { ".EXE" } else { "" }),
@@ -1302,15 +1404,14 @@ mod tests {
 
         assert_eq!(resolver.resolve("fake").expect("resolve"), Some(executable));
         assert_eq!(resolver.resolve("missing").expect("negative"), None);
-        fs::write(
-            root.join(if cfg!(windows) {
+        write_executable(
+            &root.join(if cfg!(windows) {
                 "missing.EXE"
             } else {
                 "missing"
             }),
             b"late",
-        )
-        .expect("late executable");
+        );
         assert_eq!(resolver.resolve("missing").expect("cached negative"), None);
         resolver.bump_generation();
         assert!(resolver.resolve("missing").expect("invalidated").is_some());

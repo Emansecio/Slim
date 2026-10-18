@@ -4,9 +4,9 @@
 corpo alinhado ao rótulo e fundo igual ao histórico. Apenas o marcador verde
 recebe realce breve ao enviar; com movimento reduzido, permanece estático.
 
-Harness de coding agent em Rust para Windows x64/MSVC. O projeto reúne CLI
-headless, TUI fullscreen, providers, ferramentas nativas, sessões, compactação e
-integração LSP em um único workspace.
+Harness de coding agent em Rust para Windows x64/MSVC e macOS (arm64). O
+projeto reúne CLI headless, TUI fullscreen, providers, ferramentas nativas,
+sessões, compactação e integração LSP em um único workspace.
 
 > **Estado:** checkpoint de integração parcial (`0.1.0`), ainda não uma v1
 > concluída. O estado executável é definido pelo código; relatórios e medições
@@ -31,6 +31,22 @@ ambiente documentada para o provider escolhido.
 slim
 slim --headless --fake --prompt "hello"
 ```
+
+### macOS
+
+Requer Rust stable (`rustup`) e as Command Line Tools do Xcode.
+
+```sh
+./refresh-slim.sh          # release + instalação em ~/.local/bin/slim + smoke
+./refresh-slim.sh --keep   # mantém target/ para rebuilds (o padrão limpa)
+```
+
+No macOS a ferramenta `shell` executa scripts com `bash --noprofile --norc -c`
+(PowerShell não é necessário), as skills usam `run.sh` por padrão (`.ps1`
+continua indo para `pwsh`), credenciais ficam em `~/.slim/auth.json` com modo
+`0600`, o clipboard usa `pbcopy`/`pbpaste`/`osascript` e o OAuth abre o
+navegador com `open`. SIGINT/SIGTERM/SIGHUP encerram os processos das
+ferramentas antes de o Slim sair.
 
 Veja [BOOTSTRAP.md](BOOTSTRAP.md) para instalação em uma máquina limpa e a
 [referência detalhada de CLI/runtime](docs/reference/CLI-AND-RUNTIME.md) para

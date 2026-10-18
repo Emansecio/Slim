@@ -272,13 +272,34 @@ pub(super) fn wire_argument_bytes(
         .map_or(call.arguments.len(), |projected| projected.len())
 }
 
+/// The script shell the Auto stanzas name, so the model writes for the shell
+/// that actually runs (`tools::shell`).
+#[cfg(windows)]
+macro_rules! shell_note {
+    () => {
+        " Shell runs PowerShell, not bash."
+    };
+}
+#[cfg(target_os = "macos")]
+macro_rules! shell_note {
+    () => {
+        " Shell runs bash on macOS, not PowerShell; BSD tools (`sed -i ''`)."
+    };
+}
+#[cfg(all(not(windows), not(target_os = "macos")))]
+macro_rules! shell_note {
+    () => {
+        " Shell runs bash, not PowerShell."
+    };
+}
+
 pub(super) fn channel_stanza(mode: crate::OperatingMode, can_ask: bool) -> &'static str {
     match (mode, can_ask) {
         (crate::OperatingMode::Auto, true) => {
-            "\n\nHarness channel: Auto, interactive. Act on the request without asking. Use ask_question only before irreversible loss of data the request does not cover, production or external writes it does not cover, exposing secrets, or a material decision the request and code cannot settle. Shell runs PowerShell, not bash."
+            concat!("\n\nHarness channel: Auto, interactive. Act on the request without asking. Use ask_question only before irreversible loss of data the request does not cover, production or external writes it does not cover, exposing secrets, or a material decision the request and code cannot settle.", shell_note!())
         }
         (crate::OperatingMode::Auto, false) => {
-            "\n\nHarness channel: Auto, unattended. No interactive pause (ask_question is not available). Take the most reasonable reading and finish the work. Skip only irreversible loss of data the request does not cover, production or external writes it does not cover, and exposing secrets; report what you skipped and why. Shell runs PowerShell, not bash."
+            concat!("\n\nHarness channel: Auto, unattended. No interactive pause (ask_question is not available). Take the most reasonable reading and finish the work. Skip only irreversible loss of data the request does not cover, production or external writes it does not cover, and exposing secrets; report what you skipped and why.", shell_note!())
         }
         (crate::OperatingMode::Plan, _) => {
             "\n\nHarness channel: Plan. Inspect and report only. Workspace mutations, shell, todo, skill and ask_question are not available."
@@ -625,10 +646,10 @@ mod tests {
         assert!(unattended.contains("Auto, unattended"));
         assert!(unattended.contains("ask_question is not available"));
         assert!(!unattended.contains("Auto, interactive"));
-        assert!(interactive.contains("Shell runs PowerShell"));
-        assert!(unattended.contains("Shell runs PowerShell"));
-        assert!(!channel_stanza(OperatingMode::Plan, true).contains("PowerShell"));
-        assert!(!channel_stanza(OperatingMode::ReadOnly, true).contains("PowerShell"));
+        assert!(interactive.ends_with(shell_note!()));
+        assert!(unattended.ends_with(shell_note!()));
+        assert!(!channel_stanza(OperatingMode::Plan, true).contains("Shell runs"));
+        assert!(!channel_stanza(OperatingMode::ReadOnly, true).contains("Shell runs"));
         assert!(channel_stanza(OperatingMode::Plan, true).contains("Plan."));
         assert!(!channel_stanza(OperatingMode::Plan, true).contains("Use ask_question"));
         let readonly = channel_stanza(OperatingMode::ReadOnly, true);

@@ -11,6 +11,7 @@ use crate::runtime::CancellationToken;
 
 const SHELL_CAPTURE_CAP_BYTES: usize = 8 * 1024 * 1024;
 /// CreateProcess takes at most 32,767 UTF-16 units, terminator included.
+#[cfg(windows)]
 const MAX_WINDOWS_COMMAND_LINE_CHARS: usize = 32_766;
 
 /// Runs before the model's script and shares its first line, so a position
@@ -237,6 +238,30 @@ fn run_with_runner(
     })
 }
 
+/// Outside Windows a script runs as `bash --noprofile --norc -c <script>`:
+/// no setup or epilogue is needed, the exit status is already the last
+/// command's, and skipping the rc files keeps each call fast and free of
+/// user aliases.
+#[cfg(not(windows))]
+fn shell_invocation(
+    runner: &ProcessRunner,
+    command: &str,
+) -> Result<(PathBuf, Vec<OsString>), ToolError> {
+    let program = runner.resolve_unix_shell()?.ok_or_else(|| ToolError::Io {
+        message: "no bash or /bin/sh was found".into(),
+    })?;
+    let is_bash = program
+        .file_stem()
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("bash"));
+    let mut args = Vec::with_capacity(4);
+    if is_bash {
+        args.extend(["--noprofile", "--norc"].map(OsString::from));
+    }
+    args.extend(["-c", command].map(OsString::from));
+    Ok((program, args))
+}
+
+#[cfg(windows)]
 fn shell_invocation(
     runner: &ProcessRunner,
     command: &str,
@@ -256,7 +281,7 @@ fn shell_invocation(
     .map(OsString::from)
     .collect::<Vec<_>>();
     let command_line_chars = windows_command_line_chars(&program, &args);
-    if cfg!(windows) && command_line_chars > MAX_WINDOWS_COMMAND_LINE_CHARS {
+    if command_line_chars > MAX_WINDOWS_COMMAND_LINE_CHARS {
         return Err(ToolError::InvalidInput {
             message: format!(
                 "shell script is too long for the Windows command line ({command_line_chars} of {MAX_WINDOWS_COMMAND_LINE_CHARS} characters, setup included); save it to a .ps1 file with write and run the file, for example `& ([scriptblock]::Create((Get-Content -Raw -LiteralPath script.ps1)))`"
@@ -269,6 +294,7 @@ fn shell_invocation(
 /// Length of the command line `std::process::Command` builds on Windows: the
 /// program always quoted, an argument quoted when it holds a space, tab or
 /// nothing, and each quote escaped along with the backslashes before it.
+#[cfg(any(windows, test))]
 fn windows_command_line_chars(program: &Path, args: &[OsString]) -> usize {
     fn argument_chars(argument: &str, force_quotes: bool) -> usize {
         let quoted = force_quotes || argument.is_empty() || argument.contains([' ', '\t']);
@@ -300,11 +326,12 @@ fn windows_command_line_chars(program: &Path, args: &[OsString]) -> usize {
 /// Whether script commands run in Windows PowerShell 5.1 rather than
 /// PowerShell 7 (`pwsh`).
 pub(crate) fn script_shell_is_windows_powershell(runner: &ProcessRunner) -> bool {
-    powershell_program(runner).is_ok_and(|program| {
-        program
-            .file_stem()
-            .is_some_and(|stem| stem.eq_ignore_ascii_case("powershell"))
-    })
+    cfg!(windows)
+        && powershell_program(runner).is_ok_and(|program| {
+            program
+                .file_stem()
+                .is_some_and(|stem| stem.eq_ignore_ascii_case("powershell"))
+        })
 }
 
 fn powershell_program(runner: &ProcessRunner) -> Result<PathBuf, ToolError> {
@@ -569,6 +596,7 @@ mod tests {
         ))
     }
 
+    #[cfg(windows)]
     #[test]
     fn script_invocation_always_uses_powershell() {
         let root = fixture_root("script");
@@ -600,6 +628,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(windows)]
     #[test]
     fn script_lines_keep_their_numbers_after_the_setup() {
         let root = fixture_root("script-lines");
@@ -623,6 +652,38 @@ mod tests {
         for untouched in ["Set-Content:", "Add-Content:", "ConvertTo-Json"] {
             assert!(!script.contains(untouched), "{untouched}");
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn script_invocation_uses_bash_without_rc_files_outside_windows() {
+        let root = fixture_root("script-unix");
+        let bash = write_executable(&root, "bash");
+        write_executable(&root, "pwsh");
+        let runner = runner_for(&root);
+        let (program, args) = shell_invocation(&runner, "first\nsecond").expect("resolve");
+
+        assert_eq!(program, bash);
+        assert_eq!(
+            args,
+            ["--noprofile", "--norc", "-c", "first\nsecond"].map(OsString::from)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn scripts_run_their_text_as_written_and_keep_the_exit_status() {
+        let root = fixture_root("script-unix-run");
+        let output = run_shell_timeout(
+            &root,
+            "printf 'a\\n'; [[ -n \"$HOME\" ]] && echo ok; exit 7",
+            Duration::from_secs(10),
+        )
+        .expect("run");
+        assert_eq!(String::from_utf8_lossy(&output.output.stdout), "a\nok\n");
+        assert_eq!(output.output.status.code(), Some(7));
         let _ = fs::remove_dir_all(root);
     }
 

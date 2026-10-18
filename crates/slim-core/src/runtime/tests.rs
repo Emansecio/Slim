@@ -2575,6 +2575,8 @@ async fn code_intel_batch_preserves_admission_feedback_in_output_event() {
     assert_eq!(event_output, Some(&results[0].output));
 }
 
+// PowerShell's non-terminating error semantics.
+#[cfg(windows)]
 #[test]
 fn native_shell_process_facts_keep_nonterminating_error_boundary() {
     let root = TempRoot::new("shell-process-facts");
@@ -3590,8 +3592,8 @@ fn skill_dispatch_validates_list_and_script_types_before_dispatch() {
         json!({"name": "fixture"}),
         json!({"list": false, "name": "fixture"}),
         json!({"name": "fixture", "script": ""}),
-        json!({"name": "fixture", "script": "run.ps1"}),
-        json!({"name": "fixture", "script": "./run.ps1"}),
+        json!({"name": "fixture", "script": crate::skills::DEFAULT_SKILL_SCRIPT}),
+        json!({"name": "fixture", "script": format!("./{}", crate::skills::DEFAULT_SKILL_SCRIPT)}),
     ] {
         let result = dispatch(arguments);
         assert!(result.success, "valid skill arguments failed: {result:?}");

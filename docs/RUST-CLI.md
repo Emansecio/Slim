@@ -1477,7 +1477,9 @@ Cada fase abaixo é uma vertical slice com gate próprio.
 
 ### Não planejado — superfícies fora do Windows fullscreen
 
-- inline TUI, PTY Unix, Linux/macOS e servidor remoto;
+- inline TUI, PTY Unix e servidor remoto;
+- Linux *(superado para macOS: porte funcional em 17/10/2026; ver o
+  [README](../README.md#macos))*;
 - SQLite/FTS como store de sessão e embedding ABI/WASM;
 - PGO só poderia existir como otimização interna posterior, nunca como requisito
   de produto.

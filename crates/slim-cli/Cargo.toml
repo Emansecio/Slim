@@ -21,7 +21,12 @@ slim-core = { path = "../slim-core" }
 slim-lsp = { path = "../slim-lsp" }
 slim-tui = { path = "../slim-tui" }
 tokio = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [[test]]
 name = "smoke_workspace"

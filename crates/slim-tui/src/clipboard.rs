@@ -1,7 +1,8 @@
-//! Windows clipboard access. Text copy/paste plus the composer's image pull
-//! (DESIGN-SLIM-TUI §20): a pasted bitmap is materialized as a PNG file in the
-//! user temp directory so the existing `/image PATH` attachment pipeline can
-//! load it. Stale pastes are pruned on the next paste.
+//! Clipboard access (Win32 on Windows, `pbcopy`/`pbpaste`/`osascript` on
+//! macOS). Text copy/paste plus the composer's image pull (DESIGN-SLIM-TUI
+//! §20): a pasted bitmap is materialized as a PNG file in the user temp
+//! directory so the existing `/image PATH` attachment pipeline can load it.
+//! Stale pastes are pruned on the next paste.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -9,11 +10,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Prefix of the per-process directory holding pasted bitmaps.
+#[cfg(any(windows, target_os = "macos"))]
 const PASTE_DIR_PREFIX: &str = "slim-paste-";
 /// Terminal images are pastes, not documents: anything older than this is
 /// garbage from a previous session.
+#[cfg(any(windows, target_os = "macos"))]
 const PASTE_TTL: Duration = Duration::from_secs(60 * 60);
 
+#[cfg(any(windows, target_os = "macos"))]
 static NEXT_PASTE: AtomicU64 = AtomicU64::new(0);
 
 pub fn copy_text(text: &str) -> io::Result<()> {
@@ -212,15 +216,18 @@ fn write_paste_file(png: &[u8]) -> Result<String, String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn paste_directory() -> PathBuf {
     std::env::temp_dir().join(format!("{PASTE_DIR_PREFIX}{}", std::process::id()))
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn next_paste_id() -> u64 {
     NEXT_PASTE.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Best-effort cleanup of pasted bitmaps left by earlier sessions.
+#[cfg(any(windows, target_os = "macos"))]
 fn prune_stale_paste_directories(current: &Path) {
     let Some(entries) = current
         .parent()
@@ -256,12 +263,109 @@ fn wide_null(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-#[cfg(not(windows))]
+/// `pbcopy`/`pbpaste` pick the text encoding from the locale; pin UTF-8 so
+/// accented text survives a C/POSIX locale.
+#[cfg(target_os = "macos")]
+fn pasteboard_command(program: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command.env("LC_CTYPE", "UTF-8");
+    command
+}
+
+#[cfg(target_os = "macos")]
+fn copy_text_platform(text: &str) -> io::Result<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = pasteboard_command("/usr/bin/pbcopy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let written = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("pbcopy stdin is unavailable"))
+        .and_then(|mut stdin| stdin.write_all(text.as_bytes()));
+    let status = child.wait()?;
+    written?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("pbcopy exited with {status}")))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn paste_text_platform() -> io::Result<String> {
+    let output = pasteboard_command("/usr/bin/pbpaste")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "pbpaste exited with {}",
+            output.status
+        )));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
+/// Materializes a clipboard PNG (`«class PNGf»`, which screenshots and most
+/// apps provide) as a file in one `osascript` call. `Ok(None)` keeps the text
+/// path for clipboards without an image.
+#[cfg(target_os = "macos")]
+fn paste_image_platform() -> Result<Option<String>, String> {
+    const SCRIPT: &str = r#"on run argv
+    try
+        set png to the clipboard as «class PNGf»
+    on error
+        return "none"
+    end try
+    set target to open for access (POSIX file (item 1 of argv)) with write permission
+    try
+        set eof target to 0
+        write png to target
+        close access target
+    on error message
+        close access target
+        error message
+    end try
+    return "ok"
+end run"#;
+
+    let directory = paste_directory();
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
+    let path = directory.join(format!("clipboard-{}.png", next_paste_id()));
+    let output = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(SCRIPT)
+        .arg(&path)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("cannot read the clipboard image: {error}"))?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&path);
+        return Err(format!(
+            "cannot read the clipboard image: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if String::from_utf8_lossy(&output.stdout).trim() != "ok" {
+        return Ok(None);
+    }
+    prune_stale_paste_directories(&directory);
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn paste_image_platform() -> Result<Option<String>, String> {
     Ok(None)
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn copy_text_platform(_text: &str) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -269,7 +373,7 @@ fn copy_text_platform(_text: &str) -> io::Result<()> {
     ))
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn paste_text_platform() -> io::Result<String> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,

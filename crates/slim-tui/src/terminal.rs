@@ -187,6 +187,7 @@ impl TerminalGuard {
     }
 }
 
+#[cfg(any(windows, test))]
 fn enable_with_rollback(
     enable: impl FnOnce() -> io::Result<()>,
     rollback: impl FnOnce(),

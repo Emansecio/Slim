@@ -3,6 +3,7 @@ use std::io::Read;
 const MAX_STDIN_BYTES: usize = 8 * 1024 * 1024;
 
 fn main() {
+    slim_core::process::install_termination_cleanup();
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     // `slim mcp ...` manages MCP servers; it needs no session or credentials.
     if args.first().map(String::as_str) == Some("mcp") {

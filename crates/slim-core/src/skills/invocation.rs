@@ -113,22 +113,11 @@ pub(crate) fn invoke_script_with_limits_and_runner(
         return Err(SkillInvocationError::Cancelled);
     }
     let (path, canonical_dir) = resolve_script_path_with_dir(request.skill_dir, request.script)?;
-    let program = runner
-        .resolve_powershell()
-        .map_err(|error| SkillInvocationError::Io(error.to_string()))?
-        .ok_or_else(|| {
-            SkillInvocationError::Io("neither pwsh nor powershell was found on PATH".into())
-        })?;
+    let (program, args) = skill_interpreter(runner, &path)?;
     let process_request = ProcessRequest {
         cwd: launch_path_for_powershell(&canonical_dir),
         program,
-        args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-File"]
-            .into_iter()
-            .map(OsString::from)
-            .chain(std::iter::once(
-                launch_path_for_powershell(&path).into_os_string(),
-            ))
-            .collect(),
+        args,
         timeout: request.timeout,
         cancellation: request.cancellation.cloned(),
         output_budget: ProcessOutputBudget::per_stream(request.max_output_bytes.saturating_add(1)),
@@ -150,6 +139,48 @@ pub(crate) fn invoke_script_with_limits_and_runner(
         return Err(SkillInvocationError::OutputTooLarge);
     }
     Ok(output.output)
+}
+
+/// Interpreter and arguments for a resolved skill script. A `.ps1` runs under
+/// PowerShell (`pwsh -File`) everywhere; outside Windows any other script
+/// runs under bash, so a `run.sh` needs no execute bit.
+fn skill_interpreter(
+    runner: &ProcessRunner,
+    path: &Path,
+) -> Result<(PathBuf, Vec<OsString>), SkillInvocationError> {
+    #[cfg(not(windows))]
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ps1"))
+    {
+        let program = runner
+            .resolve_unix_shell()
+            .map_err(|error| SkillInvocationError::Io(error.to_string()))?
+            .ok_or_else(|| SkillInvocationError::Io("no bash or /bin/sh was found".into()))?;
+        let is_bash = program
+            .file_stem()
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("bash"));
+        let mut args = Vec::with_capacity(3);
+        if is_bash {
+            args.extend(["--noprofile", "--norc"].map(OsString::from));
+        }
+        args.push(path.as_os_str().to_owned());
+        return Ok((program, args));
+    }
+    let program = runner
+        .resolve_powershell()
+        .map_err(|error| SkillInvocationError::Io(error.to_string()))?
+        .ok_or_else(|| {
+            SkillInvocationError::Io("neither pwsh nor powershell was found on PATH".into())
+        })?;
+    let args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-File"]
+        .into_iter()
+        .map(OsString::from)
+        .chain(std::iter::once(
+            launch_path_for_powershell(path).into_os_string(),
+        ))
+        .collect();
+    Ok((program, args))
 }
 
 /// Resolves a skill script without allowing an absolute path, a parent

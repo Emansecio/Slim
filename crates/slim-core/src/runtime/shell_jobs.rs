@@ -1382,6 +1382,13 @@ impl Runtime {
 mod tests {
     use super::*;
 
+    /// An 8 s sleep in the platform's script shell.
+    const SLEEP_8S: &str = if cfg!(windows) {
+        "Start-Sleep -Seconds 8"
+    } else {
+        "sleep 8"
+    };
+
     #[cfg(windows)]
     #[tokio::test]
     async fn deferred_shell_log_completion_keeps_artifact_handle() {
@@ -2020,7 +2027,11 @@ mod tests {
         let tools = ToolRegistry::default();
         let call = prepared(
             &tools,
-            "Write-Output 'started'; Start-Sleep -Seconds 8; Write-Output 'should-not-finish'",
+            if cfg!(windows) {
+                "Write-Output 'started'; Start-Sleep -Seconds 8; Write-Output 'should-not-finish'"
+            } else {
+                "echo started; sleep 8; echo should-not-finish"
+            },
             10_000,
         );
         let id = jobs.start(tools, call, None, invocation()).unwrap();
@@ -2070,7 +2081,7 @@ mod tests {
             let scope = jobs.scope();
             let parent = CancellationToken::new();
             let tools = ToolRegistry::default();
-            let call = prepared(&tools, "Start-Sleep -Seconds 8", 10_000);
+            let call = prepared(&tools, SLEEP_8S, 10_000);
             jobs.start(tools, call, Some(parent.clone()), invocation())
                 .unwrap();
             if parent_cancel {
@@ -2094,7 +2105,7 @@ mod tests {
         let jobs = ShellJobs::default();
         let _scope = jobs.scope();
         let tools = ToolRegistry::default();
-        let call = prepared(&tools, "Start-Sleep -Seconds 8", 10_000);
+        let call = prepared(&tools, SLEEP_8S, 10_000);
         for _ in 0..MAX_RUNNING {
             jobs.start(tools.clone(), call.clone(), None, invocation())
                 .unwrap();
@@ -2102,7 +2113,7 @@ mod tests {
         assert!(jobs.start(tools.clone(), call, None, invocation()).is_err());
         jobs.shutdown().await;
         let jobs = ShellJobs::default();
-        let call = prepared(&tools, "Start-Sleep -Seconds 8", 100);
+        let call = prepared(&tools, SLEEP_8S, 100);
         jobs.start(tools, call, None, invocation()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while jobs.running() {

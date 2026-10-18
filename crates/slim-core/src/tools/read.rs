@@ -142,10 +142,7 @@ impl ReadService {
                     &dependency,
                     0,
                 ),
-                format!(
-                    "Slice it with shell instead, for example `Get-Content -LiteralPath {path} -TotalCount 200`, `Get-Content -LiteralPath {path} -Tail 200` or `Select-String -LiteralPath {path} -Pattern <text>`.",
-                    path = powershell_literal(canonical)
-                ),
+                slice_hint(canonical),
             ));
         }
         let requested_first = start_line.max(1);
@@ -260,11 +257,7 @@ impl ReadService {
                         bytes_read,
                     ),
                     if returned == 0 {
-                        format!(
-                            "Line {current_line} alone is over the limit. Search for a distinctive substring of it (a hit on a long line is windowed around the match), or slice it with shell, for example `(Get-Content -LiteralPath {path})[{index}].Substring(0, 4000)`.",
-                            path = powershell_literal(canonical),
-                            index = current_line - 1
-                        )
+                        long_line_hint(canonical, current_line)
                     } else {
                         "Pass a smaller max_lines to read fewer lines per page.".into()
                     },
@@ -507,8 +500,48 @@ fn empty_page_note(file_len: u64, offset: usize, lines: usize) -> String {
 }
 
 /// `path` as a PowerShell single-quoted literal: a quote inside it is doubled.
-fn powershell_literal(path: &Path) -> String {
+#[cfg(windows)]
+fn shell_literal(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "''"))
+}
+
+/// `path` as a POSIX single-quoted literal: a quote inside it becomes `'\''`.
+#[cfg(not(windows))]
+fn shell_literal(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+#[cfg(windows)]
+fn slice_hint(path: &Path) -> String {
+    format!(
+        "Slice it with shell instead, for example `Get-Content -LiteralPath {path} -TotalCount 200`, `Get-Content -LiteralPath {path} -Tail 200` or `Select-String -LiteralPath {path} -Pattern <text>`.",
+        path = shell_literal(path)
+    )
+}
+
+#[cfg(not(windows))]
+fn slice_hint(path: &Path) -> String {
+    format!(
+        "Slice it with shell instead, for example `head -n 200 {path}`, `tail -n 200 {path}` or `grep -n -F -- <text> {path}`.",
+        path = shell_literal(path)
+    )
+}
+
+#[cfg(windows)]
+fn long_line_hint(path: &Path, line: usize) -> String {
+    format!(
+        "Line {line} alone is over the limit. Search for a distinctive substring of it (a hit on a long line is windowed around the match), or slice it with shell, for example `(Get-Content -LiteralPath {path})[{index}].Substring(0, 4000)`.",
+        path = shell_literal(path),
+        index = line - 1
+    )
+}
+
+#[cfg(not(windows))]
+fn long_line_hint(path: &Path, line: usize) -> String {
+    format!(
+        "Line {line} alone is over the limit. Search for a distinctive substring of it (a hit on a long line is windowed around the match), or slice it with shell, for example `sed -n '{line}p' {path} | cut -c 1-4000`.",
+        path = shell_literal(path)
+    )
 }
 
 fn with_context(mut failure: ToolExecutionError, context: String) -> ToolExecutionError {
@@ -526,14 +559,23 @@ pub(super) fn non_utf8_message(
     first_line: usize,
 ) -> String {
     // UTF-32 LE begins with the UTF-16 LE mark: test the longer one first.
-    let (what, encoding) = if first_line == 1 && bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) {
-        ("a UTF-32 LE file (BOM detected)".to_owned(), "UTF32")
+    // (PowerShell `-Encoding`, iconv `-f`) for each detected encoding.
+    let (what, (encoding, iconv)) = if first_line == 1
+        && bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00])
+    {
+        (
+            "a UTF-32 LE file (BOM detected)".to_owned(),
+            ("UTF32", "UTF-32LE"),
+        )
     } else if first_line == 1 && bytes.starts_with(&[0xFF, 0xFE]) {
-        ("a UTF-16 LE file (BOM detected)".to_owned(), "Unicode")
+        (
+            "a UTF-16 LE file (BOM detected)".to_owned(),
+            ("Unicode", "UTF-16LE"),
+        )
     } else if first_line == 1 && bytes.starts_with(&[0xFE, 0xFF]) {
         (
             "a UTF-16 BE file (BOM detected)".to_owned(),
-            "BigEndianUnicode",
+            ("BigEndianUnicode", "UTF-16BE"),
         )
     } else {
         let line = first_line + bytes[..valid_up_to].iter().filter(|b| **b == b'\n').count();
@@ -542,13 +584,23 @@ pub(super) fn non_utf8_message(
                 "not valid UTF-8 (invalid byte 0x{:02x} at line {line}); probably a legacy 8-bit encoding",
                 bytes.get(valid_up_to).copied().unwrap_or_default()
             ),
-            "Default",
+            ("Default", "WINDOWS-1252"),
+        )
+    };
+    let reader = if cfg!(windows) {
+        format!(
+            "Get-Content -LiteralPath {literal} -Encoding {encoding}",
+            literal = shell_literal(path)
+        )
+    } else {
+        format!(
+            "iconv -f {iconv} -t UTF-8 {literal}",
+            literal = shell_literal(path)
         )
     };
     format!(
-        "{path} is {what}; read it with shell `Get-Content -LiteralPath {literal} -Encoding {encoding}`; to replace it with UTF-8 text, remove or rename it with shell, then create it with the write tool",
-        path = path.display(),
-        literal = powershell_literal(path)
+        "{path} is {what}; read it with shell `{reader}`; to replace it with UTF-8 text, remove or rename it with shell, then create it with the write tool",
+        path = path.display()
     )
 }
 

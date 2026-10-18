@@ -1879,6 +1879,24 @@ fn cap_shell_bytes(raw: &[u8], previously_discarded_bytes: usize, basis: &str) -
     )
 }
 
+macro_rules! shell_tool_description_tail {
+    () => {
+        "Inspect workspace metadata before Git. Exit status alone does not validate the task. Use file tools for edits. In the agent loop, returns a job after yield_ms; continue independent work. Completion is delivered automatically; use shell_job to list, inspect, read output, wait, interrupt or cancel; do not poll. background=true yields immediately. TUI jobs survive responses within the session; headless waits. Run cancellation stops jobs launched by that run; do not detach child processes. Avoid concurrent edits to files used by a running job."
+    };
+}
+/// `shell` tool description: the script form names the interpreter
+/// `tools::shell` actually launches on this platform.
+#[cfg(windows)]
+const SHELL_TOOL_DESCRIPTION: &str = concat!(
+    "Run in workspace. Without args (or null), command is PowerShell script; with args (even []), an executable with literal arguments. .bat/.cmd keep their interpreter. For native checks, prefer command + args. In scripts, capture $LASTEXITCODE immediately after the native command, before filtering or printing, and explicitly exit with that saved code. ",
+    shell_tool_description_tail!()
+);
+#[cfg(not(windows))]
+const SHELL_TOOL_DESCRIPTION: &str = concat!(
+    "Run in workspace. Without args (or null), command is a bash script (`bash -c`, no rc files); with args (even []), an executable with literal arguments. For native checks, prefer command + args. A script exits with its last command's status: chain with `&&` or `set -e` when an earlier failure matters, and `set -o pipefail` before piping a native command into a filter. ",
+    shell_tool_description_tail!()
+);
+
 fn tool_definition(name: &str) -> Value {
     let then_run_schema = json!({
         "type": "object",
@@ -1947,7 +1965,7 @@ fn tool_definition(name: &str) -> Value {
             json!(["path"]),
         ),
         "shell" => (
-            "Run in workspace. Without args (or null), command is PowerShell script; with args (even []), an executable with literal arguments. .bat/.cmd keep their interpreter. For native checks, prefer command + args. In scripts, capture $LASTEXITCODE immediately after the native command, before filtering or printing, and explicitly exit with that saved code. Inspect workspace metadata before Git. Exit status alone does not validate the task. Use file tools for edits. In the agent loop, returns a job after yield_ms; continue independent work. Completion is delivered automatically; use shell_job to list, inspect, read output, wait, interrupt or cancel; do not poll. background=true yields immediately. TUI jobs survive responses within the session; headless waits. Run cancellation stops jobs launched by that run; do not detach child processes. Avoid concurrent edits to files used by a running job.",
+            SHELL_TOOL_DESCRIPTION,
             json!({"command": {"type": "string"}, "args": {"type": ["array", "null"], "items": {"type": "string"}}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_MS, "default": DEFAULT_SHELL_TIMEOUT_MS}, "yield_ms": {"type": "integer", "minimum": 0, "maximum": 10000, "default": 1000}, "background": {"type": "boolean", "default": false}}),
             json!(["command"]),
         ),

@@ -87,7 +87,7 @@ impl OpenCodeCatalog {
             }
             PathBuf::from(path)
         } else {
-            let profile = std::env::var_os("USERPROFILE").ok_or(CatalogError::UnsafeCache)?;
+            let profile = crate::auth::user_home_var().ok_or(CatalogError::UnsafeCache)?;
             if profile.is_empty() {
                 return Err(CatalogError::UnsafeCache);
             }

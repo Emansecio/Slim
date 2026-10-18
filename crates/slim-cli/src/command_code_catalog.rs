@@ -51,7 +51,7 @@ impl CommandCodeCatalog {
         let cache_path = if let Some(path) = std::env::var_os("SLIM_COMMANDCODE_MODELS_FILE") {
             PathBuf::from(path)
         } else {
-            let profile = std::env::var_os("USERPROFILE").ok_or_else(|| {
+            let profile = crate::auth::user_home_var().ok_or_else(|| {
                 slim_core::ProviderError::InvalidResponse {
                     message: "Command Code catalog cache path is unsafe".into(),
                 }

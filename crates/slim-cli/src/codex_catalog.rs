@@ -78,7 +78,7 @@ impl CodexCatalog {
             }
             PathBuf::from(path)
         } else {
-            let profile = std::env::var_os("USERPROFILE").ok_or(CodexCatalogError::UnsafeCache)?;
+            let profile = crate::auth::user_home_var().ok_or(CodexCatalogError::UnsafeCache)?;
             if profile.is_empty() {
                 return Err(CodexCatalogError::UnsafeCache);
             }

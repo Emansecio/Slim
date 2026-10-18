@@ -1906,7 +1906,10 @@ fn admit_shell_command(
         }
         return Ok(());
     }
-    note_bash_syntax(command, admission_notes);
+    // Outside Windows the script form is bash, so bash syntax is the norm.
+    if cfg!(windows) {
+        note_bash_syntax(command, admission_notes);
+    }
     if command.contains('\n') && has_inline_eval(command) {
         admission_notes.push(
             "possible quoting risk: this multiline script uses inline `-c`/`-e` eval; if parsing fails, consider a script file"
@@ -3190,12 +3193,15 @@ mod tests {
             program_path.admission_notes
         );
 
+        // Outside Windows the script form is bash: bash syntax gets no note.
         let bash = prepare(&root, "shell", json!({"command":"ls -la | head -5"}));
         assert!(bash.error.is_none(), "{:?}", bash.error);
-        assert!(bash
-            .admission_notes
-            .iter()
-            .any(|note| note.contains("bash syntax")));
+        assert_eq!(
+            bash.admission_notes
+                .iter()
+                .any(|note| note.contains("bash syntax")),
+            cfg!(windows)
+        );
         let powershell = prepare(
             &root,
             "shell",
@@ -3207,11 +3213,12 @@ mod tests {
         assert!(script_block.error.is_none(), "{:?}", script_block.error);
         let bash_literal = prepare(&root, "shell", json!({"command":"Write-Output 'head -5'"}));
         assert!(bash_literal.error.is_none(), "{:?}", bash_literal.error);
-        assert!(
+        assert_eq!(
             bash_literal
                 .admission_notes
                 .iter()
                 .any(|note| note.contains("possible") && note.contains("compatibility/quoting")),
+            cfg!(windows),
             "{:?}",
             bash_literal.admission_notes
         );
@@ -3278,10 +3285,11 @@ mod tests {
             "curl -s https://example.test",
         ] {
             let bash = prepare(&root, "shell", json!({"command": script}));
-            assert!(
+            assert_eq!(
                 bash.admission_notes
                     .iter()
                     .any(|note| note.contains("bash syntax")),
+                cfg!(windows),
                 "{script}: {:?}",
                 bash.admission_notes
             );
@@ -3317,7 +3325,7 @@ mod tests {
             "Write-Output 'head -5'",
         ] {
             let call = prepare(&root, "shell", json!({"command": script}));
-            assert!(!call.admission_notes.is_empty(), "{script}");
+            assert_eq!(!call.admission_notes.is_empty(), cfg!(windows), "{script}");
         }
 
         let _ = fs::remove_dir_all(root);

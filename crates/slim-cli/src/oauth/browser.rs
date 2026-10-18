@@ -39,7 +39,27 @@ fn open_system_browser(url: &str) -> Result<(), OAuthError> {
     }
 }
 
+/// `open` (macOS) or `xdg-open` hands the URL to the default browser and
+/// returns at once; the URL is an argument, never shell text.
 #[cfg(not(windows))]
-fn open_system_browser(_url: &str) -> Result<(), OAuthError> {
-    Err(OAuthError::Browser)
+fn open_system_browser(url: &str) -> Result<(), OAuthError> {
+    use std::process::{Command, Stdio};
+
+    let program = if cfg!(target_os = "macos") {
+        "/usr/bin/open"
+    } else {
+        "xdg-open"
+    };
+    let status = Command::new(program)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| OAuthError::Browser)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(OAuthError::Browser)
+    }
 }

@@ -535,12 +535,10 @@ fn parse_auth_document(contents: &[u8]) -> Result<AuthDocument, AuthError> {
 }
 
 pub(crate) struct AuthStoreLock {
-    #[cfg(windows)]
     _file: File,
 }
 
 pub(crate) struct OAuthRefreshLock {
-    #[cfg(windows)]
     _file: File,
 }
 
@@ -608,11 +606,42 @@ pub(crate) fn lock_auth_store_until(
     #[cfg(not(windows))]
     {
         let _ = parent;
-        if cancelled() || Instant::now() >= deadline {
-            Err(AuthError::Locked)
-        } else {
-            Ok(AuthStoreLock {})
+        let lock_path = auth_lock_path(auth_file)?;
+        loop {
+            if cancelled() || Instant::now() >= deadline {
+                return Err(AuthError::Locked);
+            }
+            if let Some(file) = try_lock_file(&lock_path)? {
+                if cancelled() || Instant::now() >= deadline {
+                    drop(file);
+                    return Err(AuthError::Locked);
+                }
+                return Ok(AuthStoreLock { _file: file });
+            }
+            thread::sleep(Duration::from_millis(50));
         }
+    }
+}
+
+/// Opens (creating, `0600`) the lock file and takes an exclusive `flock` on
+/// it without blocking: `None` while another process holds it. The lock goes
+/// with the returned handle.
+#[cfg(not(windows))]
+fn try_lock_file(lock_path: &Path) -> Result<Option<File>, AuthError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(lock_path)
+        .map_err(|_| AuthError::Locked)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(_)) => Err(AuthError::Locked),
     }
 }
 
@@ -657,11 +686,25 @@ pub(crate) fn lock_oauth_refresh(
     }
     #[cfg(not(windows))]
     {
-        let _ = lock_path;
-        if cancelled() {
-            return Err(OAuthRefreshLockError::Cancelled);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if cancelled() {
+                return Err(OAuthRefreshLockError::Cancelled);
+            }
+            match try_lock_file(&lock_path)? {
+                Some(file) => {
+                    if cancelled() {
+                        drop(file);
+                        return Err(OAuthRefreshLockError::Cancelled);
+                    }
+                    return Ok(OAuthRefreshLock { _file: file });
+                }
+                None if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                None => return Err(OAuthRefreshLockError::Auth(AuthError::Locked)),
+            }
         }
-        Ok(OAuthRefreshLock {})
     }
 }
 
@@ -737,13 +780,17 @@ pub(crate) fn auth_file_path() -> Result<Option<PathBuf>, AuthError> {
         }
         return Ok(Some(PathBuf::from(path)));
     }
-    let Some(profile) = std::env::var_os("USERPROFILE") else {
+    let Some(profile) = user_home_var() else {
         return Ok(None);
     };
-    if profile.is_empty() {
-        return Ok(None);
-    }
     Ok(Some(PathBuf::from(profile).join(".slim").join("auth.json")))
+}
+
+/// The user's home directory variable, non-empty: `USERPROFILE` on Windows,
+/// `HOME` elsewhere. `~/.slim` (auth, model catalogs) lives under it.
+pub(crate) fn user_home_var() -> Option<std::ffi::OsString> {
+    let variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(variable).filter(|value| !value.is_empty())
 }
 
 #[cfg(windows)]
@@ -752,8 +799,8 @@ pub(crate) fn secure_auth_file(path: &Path) -> Result<Vec<u8>, AuthError> {
 }
 
 #[cfg(not(windows))]
-pub(crate) fn secure_auth_file(_path: &Path) -> Result<Vec<u8>, AuthError> {
-    Err(AuthError::UnsafePermissions)
+pub(crate) fn secure_auth_file(path: &Path) -> Result<Vec<u8>, AuthError> {
+    unix_auth_file::secure_and_read(path)
 }
 
 #[cfg(windows)]
@@ -762,8 +809,80 @@ pub(crate) fn create_secure_auth_file(path: &Path) -> Result<File, AuthError> {
 }
 
 #[cfg(not(windows))]
-pub(crate) fn create_secure_auth_file(_path: &Path) -> Result<File, AuthError> {
-    Err(AuthError::UnsafePermissions)
+pub(crate) fn create_secure_auth_file(path: &Path) -> Result<File, AuthError> {
+    unix_auth_file::create_secure(path)
+}
+
+/// Unix counterpart of `native_acl`: the credential file is a regular file
+/// owned by the effective user with mode `0600`. Symlinks are refused
+/// (`O_NOFOLLOW` to open, `O_EXCL` to create), and group/other bits found on
+/// an existing file are removed before it is read, as the Windows path
+/// reinstalls its DACL.
+#[cfg(not(windows))]
+mod unix_auth_file {
+    use std::fs::{self, File, OpenOptions};
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::path::Path;
+
+    use super::{AuthError, MAX_AUTH_FILE_BYTES};
+
+    const MODE: u32 = 0o600;
+
+    pub(super) fn create_secure(path: &Path) -> Result<File, AuthError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(MODE)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|_| AuthError::Write)?;
+        // The umask can only narrow the mode; set it exactly anyway.
+        file.set_permissions(fs::Permissions::from_mode(MODE))
+            .map_err(|_| AuthError::Write)?;
+        ensure_owned_regular_file(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn secure_and_read(path: &Path) -> Result<Vec<u8>, AuthError> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|_| AuthError::UnsafePermissions)?;
+        let metadata = ensure_owned_regular_file(&file)?;
+        if metadata.mode() & 0o7077 != 0 {
+            file.set_permissions(fs::Permissions::from_mode(MODE))
+                .map_err(|_| AuthError::UnsafePermissions)?;
+        }
+        // Size is checked before allocating, and the read stays bounded in
+        // case the file grows meanwhile.
+        if metadata.len() > MAX_AUTH_FILE_BYTES as u64 {
+            return Err(AuthError::Read);
+        }
+        let mut contents = Vec::with_capacity(metadata.len() as usize);
+        (&mut file)
+            .take(MAX_AUTH_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut contents)
+            .map_err(|_| AuthError::Read)?;
+        if contents.len() > MAX_AUTH_FILE_BYTES {
+            return Err(AuthError::Read);
+        }
+        Ok(contents)
+    }
+
+    fn ensure_owned_regular_file(file: &File) -> Result<fs::Metadata, AuthError> {
+        let metadata = file.metadata().map_err(|_| AuthError::InvalidPath)?;
+        if !metadata.file_type().is_file() {
+            return Err(AuthError::InvalidPath);
+        }
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(AuthError::UnsafePermissions);
+        }
+        Ok(metadata)
+    }
 }
 
 pub fn redact(input: &str) -> String {
