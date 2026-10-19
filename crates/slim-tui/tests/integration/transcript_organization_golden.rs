@@ -302,13 +302,13 @@ fn a_finished_turn_folds_its_work_into_one_row_under_the_header() {
     // One row says what the work was; the failure keeps a row of its own.
     let header = rendered.row("● Slim");
     assert_eq!(
-        rendered.rows[header + 1].trim_end(),
-        "  ▸ Trabalhou · 3 leituras, 1 busca, 2 edições, 2 comandos",
+        rendered.rows[header + 2].trim_end(),
+        "▌ ▸ Trabalhou · 3 leituras, 1 busca, 2 edições, 2 comandos",
         "{}",
         rendered.text()
     );
     assert!(
-        rendered.rows[header + 2].starts_with("    ✕ $ cargo test parser · exit 101"),
+        rendered.rows[header + 3].starts_with("▌   ✕ $ cargo test parser · exit 101"),
         "{}",
         rendered.text()
     );
@@ -362,7 +362,7 @@ fn enter_on_the_row_restores_the_unfolded_presentation_and_folds_again() {
     // The open row points down and keeps what it said; below it the transcript
     // reads as it did before the fold: the same blocks, the same rows.
     assert!(
-        open.rows[open.row("● Slim") + 1]
+        open.rows[open.row("● Slim") + 2]
             .trim_end()
             .starts_with("> ▾ Trabalhou · 3 leituras"),
         "{}",
@@ -378,9 +378,11 @@ fn enter_on_the_row_restores_the_unfolded_presentation_and_folds_again() {
     let reference = render(&unfolded, 80, 70);
     let expected = reference.between("● Slim", "✓ 2 arquivos");
     let actual = open.between("▾ Trabalhou", "✓ 2 arquivos");
+    // Both ranges start below the header; the reference still carries the rule
+    // that closes it, which the open row replaces.
     assert_eq!(
         actual,
-        expected,
+        expected[1..],
         "open:\n{}\nreference:\n{}",
         open.text(),
         reference.text()
@@ -764,7 +766,7 @@ fn small_groups_name_their_calls_and_larger_ones_count() {
     assert!(text.contains("✓ 2 leituras, 1 comando · 3.6s"), "{text}");
     // The row is still one row.
     let rows = HeightIndex::build(two.blocks(), 100, &mut WrapCache::default()).total_rows;
-    assert_eq!(rows, 5, "prompt (3 rows), the agent header and the group");
+    assert_eq!(rows, 6, "prompt (3 rows), the agent header and the group");
 }
 
 // ---- 3. an open group ----------------------------------------------------
@@ -824,31 +826,31 @@ fn an_open_group_points_down_and_steps_its_members_in() {
         };
         let header = open.row(named);
         assert!(
-            open.rows[header].starts_with(&format!("  {named}")),
+            open.rows[header].starts_with(&format!("▌ {named}")),
             "{}",
             open.text()
         );
         // Members and the thought sit one step in from the header, with
         // their own text one step further.
         assert!(
-            open.rows[header + 1].starts_with("    ✓ Leu"),
+            open.rows[header + 1].starts_with("▌   ✓ Leu"),
             "{}",
             open.text()
         );
         let thought = open.row("▾ Pensou");
         assert!(
-            open.rows[thought].starts_with("    ▾ Pensou"),
+            open.rows[thought].starts_with("▌   ▾ Pensou"),
             "{}",
             open.text()
         );
         assert!(
-            open.rows[thought + 1].starts_with("      "),
+            open.rows[thought + 1].starts_with("▌     "),
             "{}",
             open.text()
         );
         let edit = open.row("✓ Editou");
         assert!(
-            open.rows[edit].starts_with("    ✓ Editou"),
+            open.rows[edit].starts_with("▌   ✓ Editou"),
             "{}",
             open.text()
         );
@@ -889,13 +891,13 @@ fn an_open_group_of_identical_failures_steps_its_members_in_too() {
     let open = render(&state, 80, 20);
     let header = open.row("▾ $ cargo test");
     assert!(
-        open.rows[header].starts_with("  ▾ $ cargo test"),
+        open.rows[header].starts_with("▌ ▾ $ cargo test"),
         "{}",
         open.text()
     );
     for member in 1..=3 {
         assert!(
-            open.rows[header + member].starts_with("    ✕ $ cargo test"),
+            open.rows[header + member].starts_with("▌   ✕ $ cargo test"),
             "{}",
             open.text()
         );
@@ -964,14 +966,14 @@ fn fenced_code_names_its_language_and_quotes_keep_a_rail_of_their_own() {
     let rendered = render(&state, 60, 24);
     let label = rendered.row("│ rust");
     // The tag is a quiet first row on the code surface; the code follows.
-    assert_eq!(rendered.rows[label + 1].trim_end(), "    │ fn main() {}");
+    assert_eq!(rendered.rows[label + 1].trim_end(), "▌   │ fn main() {}");
     assert_eq!(rendered.fg("rust"), CODE_RAIL);
     assert_eq!(rendered.bg("rust"), CODE_BG);
     assert_eq!(rendered.fg("fn main"), TEXT);
     // The quote has its own rail, its own tone and no surface.
     let quote = rendered.row("Não rodei");
     assert!(
-        rendered.rows[quote].starts_with("    ┆ Não rodei o build."),
+        rendered.rows[quote].starts_with("▌   ┆ Não rodei o build."),
         "{}",
         rendered.text()
     );
@@ -991,10 +993,21 @@ fn fenced_code_names_its_language_and_quotes_keep_a_rail_of_their_own() {
     // Without color the two stay apart by the rail itself, and the tag stays
     // apart from the code by weight.
     for depth in [ColorDepth::Ansi16, ColorDepth::None] {
+        // The rail is the one glyph that changes with the depth.
+        let rail = if depth == ColorDepth::None {
+            "|"
+        } else {
+            "▌"
+        };
         let plain = render_with(&state, 60, 24, caps(depth, true), &mut WrapCache::default());
-        assert!(plain.text().contains("    │ fn main() {}"), "{depth:?}");
         assert!(
-            plain.text().contains("    ┆ Não rodei o build."),
+            plain.text().contains(&format!("{rail}   │ fn main() {{}}")),
+            "{depth:?}"
+        );
+        assert!(
+            plain
+                .text()
+                .contains(&format!("{rail}   ┆ Não rodei o build.")),
             "{depth:?}"
         );
     }
@@ -1016,24 +1029,24 @@ fn only_a_fence_that_names_a_language_gets_a_tag() {
         rendered
             .rows
             .iter()
-            .filter(|row| row.starts_with("    │ "))
+            .filter(|row| row.starts_with("▌   │ "))
             .map(|row| row.trim_end().to_owned())
             .collect::<Vec<_>>()
     };
-    assert_eq!(tags("```\nplain\n```"), ["    │ plain"]);
-    assert_eq!(tags("```rust,ignore\nx\n```"), ["    │ rust", "    │ x"]);
+    assert_eq!(tags("```\nplain\n```"), ["▌   │ plain"]);
+    assert_eq!(tags("```rust,ignore\nx\n```"), ["▌   │ rust", "▌   │ x"]);
     assert_eq!(
         tags("```diff\n-a\n+b\n```"),
-        ["    │ diff", "    │ -a", "    │ +b"]
+        ["▌   │ diff", "▌   │ -a", "▌   │ +b"]
     );
     assert_eq!(
         tags("```c++ title=x\nint a;\n```"),
-        ["    │ c++", "    │ int a;"]
+        ["▌   │ c++", "▌   │ int a;"]
     );
     // A list item shares its row with the code that starts in it.
     assert!(tags("- item\n\n  ```rust\n  x\n  ```")
         .iter()
-        .all(|row| row != "    │ rust"));
+        .all(|row| row != "▌   │ rust"));
 }
 
 // ---- 6. the prompt's marker ----------------------------------------------
@@ -1041,19 +1054,23 @@ fn only_a_fence_that_names_a_language_gets_a_tag() {
 #[test]
 fn the_prompt_is_found_by_its_band_or_by_a_marker_of_its_own() {
     let state = turn(true);
-    for (depth, user, agent) in [
-        (ColorDepth::TrueColor, "● Você", "● Slim"),
-        (ColorDepth::Ansi256, "● Você", "● Slim"),
-        (ColorDepth::Ansi16, "> Você", "● Slim"),
-        (ColorDepth::None, "> Você", "* Slim"),
+    // The rail is the same glyph everywhere; only the marks change with depth.
+    for (depth, rail, user, agent) in [
+        (ColorDepth::TrueColor, "▌", "● Você", "● Slim"),
+        (ColorDepth::Ansi256, "▌", "● Você", "● Slim"),
+        (ColorDepth::Ansi16, "▌", "> Você", "● Slim"),
+        (ColorDepth::None, "|", "> Você", "* Slim"),
     ] {
         let rendered = render_with(&state, 80, 40, caps(depth, true), &mut WrapCache::default());
         assert!(
-            rendered.text().contains(&format!("  {user}")),
+            rendered.text().contains(&format!("{rail} {user}")),
             "{depth:?}\n{}",
             rendered.text()
         );
-        assert!(rendered.text().contains(&format!("  {agent}")), "{depth:?}");
+        assert!(
+            rendered.text().contains(&format!("{rail} {agent}")),
+            "{depth:?}"
+        );
         // The two sides never share a marker where the band cannot show.
         if matches!(depth, ColorDepth::Ansi16 | ColorDepth::None) {
             assert_ne!(user.chars().next(), agent.chars().next(), "{depth:?}");
@@ -1232,12 +1249,12 @@ fn a_running_command_shows_its_last_output_line_after_the_clock() {
     let row = silent.row("○ $ cargo clippy");
     assert_eq!(
         silent.rows[row].trim_end(),
-        "  ○ $ cargo clippy --all-targets · limit 600s · out 0 B · err 0 B · 5s"
+        "▌ ○ $ cargo clippy --all-targets · limit 600s · out 0 B · err 0 B · 5s"
     );
     let first = render(&running(&[], 5_300), 100, 20);
     assert_eq!(
         first.rows[first.row("○ $ cargo clippy")].trim_end(),
-        "  ○ $ cargo clippy --all-targets · limit 600s · 5s"
+        "▌ ○ $ cargo clippy --all-targets · limit 600s · 5s"
     );
 
     // The newest line follows the clock, a step quieter than it.
@@ -1790,12 +1807,16 @@ fn a_fence_label_takes_a_pandoc_class_and_is_measured_in_cells() {
         let y = rendered.row("│ x");
         rendered.rows[y - 1].trim_end().to_owned()
     };
-    assert_eq!(tags("{.python}"), "    │ python");
-    assert_eq!(tags("{.python .numberLines}"), "    │ python");
-    assert_eq!(tags("{python}"), "    │ python");
+    assert_eq!(tags("{.python}"), "▌   │ python");
+    assert_eq!(tags("{.python .numberLines}"), "▌   │ python");
+    assert_eq!(tags("{python}"), "▌   │ python");
     // 20 wide characters are 40 cells; the tag stops at 24.
     let wide = tags(&"字".repeat(20));
-    let label = wide.trim_start().trim_start_matches("│ ");
+    let label = wide
+        .trim_start()
+        .trim_start_matches('▌')
+        .trim_start()
+        .trim_start_matches("│ ");
     assert_eq!(label, "字".repeat(12), "{wide}");
     assert_eq!(unicode_width::UnicodeWidthStr::width(label), 24);
 }

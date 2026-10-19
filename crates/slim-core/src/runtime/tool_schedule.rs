@@ -323,6 +323,11 @@ pub(super) const BUDGET_FINALIZE_PROMPT: &str = "Budget exhausted. Respond now a
 
 pub(super) const NO_PROGRESS_FINALIZE_PROMPT: &str = "Execution stopped because repeated tool work produced no new evidence or workspace progress. Give a brief final answer: what is known, what remains incomplete, and what new information or changed state would allow progress. Do not call tools or claim completion without evidence.";
 
+pub(super) const TUNING_FINALIZE_PROMPT: &str = "Execution stopped because consecutive turns only retuned numbers or colours. Give a brief final answer: the result against the task's own criterion, changed files, validation result and remaining risks. Do not call tools.";
+
+/// The tool error of a tuning-only patch in the time budget's finalize phase.
+pub(super) const TUNING_CLOSED_ERROR: &str = "patch refused: the time budget is in its finalize phase and this edit only retunes numbers or colours. Keep the current values; make a structural fix only if the task's check fails, then validate and answer.";
+
 /// Between-turns steer cap: nudges are bounded so they can never inflate context.
 pub(super) const MAX_BUDGET_STEERS: usize = 2;
 

@@ -30,6 +30,8 @@ pub enum CausalAnomalyKind {
     RedundantValidation,
     StagnantTurn,
     NoProgressCandidate,
+    /// Consecutive turns whose only edits retuned numbers or colours.
+    TuningLoop,
 }
 
 /// Ordered from least to most trusted: `Low < Medium < High`.

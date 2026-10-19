@@ -8,7 +8,7 @@ use crate::CausalAnomalyKind::{RedundantValidation, RepeatedFailure, ReusableEvi
 use crate::CausalProgressKind::{
     DependencyChanged, DistinctFailure, NewEvidence, ValidationGreen, WorkspaceChanged,
 };
-use crate::CausalShadowAction::{WouldReuse, WouldWarn};
+use crate::CausalShadowAction::{WouldReuse, WouldStop, WouldWarn};
 use crate::{CausalAnomalyKind, CausalProgressKind, CausalShadowAction, OperatingMode};
 use std::fs;
 
@@ -1069,4 +1069,100 @@ fn canonical_defaults_share_a_prepared_fingerprint() {
     );
     assert!(optional_code_intel_path.error.is_none());
     assert!(optional_code_intel_path.target_paths.is_empty());
+}
+
+/// Prepara um patch de `old` para `new` em `scene.js`.
+fn scene_patch(rig: &Rig, old: &str, new: &str) -> PreparedToolInvocation {
+    rig.prep(
+        "patch",
+        &serde_json::json!({"path": "scene.js", "expected": old, "replacement": new}).to_string(),
+    )
+}
+
+/// Aplica um patch real em `scene.js` e fecha o turno.
+fn patch_turn(rig: &mut Rig, call_id: &str, old: &str, new: &str) -> Observed {
+    let prepared = scene_patch(rig, old, new);
+    let (outcome, mut observed) = rig.run(&prepared, call_id);
+    assert!(outcome.result.success, "{}", outcome.result.output);
+    observed.extend(rig.governor.finish_turn());
+    observed
+}
+
+#[test]
+fn consecutive_tuning_turns_warn_then_stop() {
+    let mut rig = Rig::new("tuning-loop");
+    rig.put("scene.js", "glow(0.10);\n");
+    let mut current = "glow(0.10);".to_owned();
+    for turn in 1..=6u32 {
+        let next = format!("glow(0.{});", 10 + turn);
+        let observed = patch_turn(&mut rig, &format!("t{turn}"), &current, &next);
+        current = next;
+        match turn {
+            1 | 2 => assert!(!has_anomaly(&observed, CausalAnomalyKind::TuningLoop)),
+            3..=5 => assert!(has_anomaly_with(
+                &observed,
+                CausalAnomalyKind::TuningLoop,
+                WouldWarn
+            )),
+            _ => assert!(has_anomaly_with(
+                &observed,
+                CausalAnomalyKind::TuningLoop,
+                WouldStop
+            )),
+        }
+        assert!(has_progress(&observed, WorkspaceChanged));
+        assert_eq!(rig.governor.stop_requested(), turn == 6, "turn {turn}");
+    }
+    assert!(rig.governor.tuning_stop());
+}
+
+#[test]
+fn structural_edits_reset_the_tuning_count_and_turns_without_edits_keep_it() {
+    let mut rig = Rig::new("tuning-reset");
+    rig.put("scene.js", "glow(0.10);\n");
+    patch_turn(&mut rig, "a", "glow(0.10);", "glow(0.11);");
+    patch_turn(&mut rig, "b", "glow(0.11);", "glow(0.12);");
+    // Looking at the output between retunes does not interrupt the loop.
+    let look = rig.prep("read", r#"{"path":"scene.js"}"#);
+    rig.run(&look, "look");
+    assert!(rig.governor.finish_turn().is_empty());
+    let observed = patch_turn(&mut rig, "c", "glow(0.12);", "glow(0.13);");
+    assert!(has_anomaly_with(
+        &observed,
+        CausalAnomalyKind::TuningLoop,
+        WouldWarn
+    ));
+
+    let observed = patch_turn(&mut rig, "d", "glow(0.13);", "bloom(0.13);");
+    assert!(!has_anomaly(&observed, CausalAnomalyKind::TuningLoop));
+    patch_turn(&mut rig, "e", "bloom(0.13);", "bloom(0.14);");
+    let observed = patch_turn(&mut rig, "f", "bloom(0.14);", "bloom(0.15);");
+    assert!(
+        !has_anomaly(&observed, CausalAnomalyKind::TuningLoop),
+        "the structural edit restarted the count"
+    );
+    assert!(!rig.governor.stop_requested());
+}
+
+#[test]
+fn refused_retunes_still_count_as_tuning_turns() {
+    let mut rig = Rig::new("tuning-refused");
+    rig.put("scene.js", "glow(0.10);\n");
+    for turn in 1..=3u32 {
+        let mut prepared = scene_patch(&rig, "glow(0.10);", &format!("glow(0.{});", 10 + turn));
+        assert!(prepared.is_tuning_patch());
+        prepared.reject("refused");
+        let (outcome, mut observed) = rig.run(&prepared, &format!("r{turn}"));
+        assert!(!outcome.result.success);
+        observed.extend(rig.governor.finish_turn());
+        assert_eq!(
+            has_anomaly(&observed, CausalAnomalyKind::TuningLoop),
+            turn == 3,
+            "turn {turn}: {observed:?}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(rig.root.join("scene.js")).unwrap(),
+        "glow(0.10);\n"
+    );
 }

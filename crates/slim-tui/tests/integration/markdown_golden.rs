@@ -44,6 +44,33 @@ impl Rendered {
     }
 }
 
+/// The rail every row of a turn carries in its first cell, and the column
+/// where the prompt, the prose and the tool markers start.
+const RAIL: char = '▌';
+const TEXT_COLUMN: usize = 4;
+
+/// A transcript row without its turn rail.
+fn body(row: &str) -> &str {
+    row.strip_prefix(RAIL).unwrap_or(row)
+}
+
+/// Column (in cells) where `needle` starts in `row`.
+fn column_of(row: &str, needle: &str) -> Option<usize> {
+    row.find(needle)
+        .map(|byte| unicode_width::UnicodeWidthStr::width(&row[..byte]))
+}
+
+/// Whether `needle` starts in the text column the prompt, the prose, the tool
+/// markers and the quote rail share.
+fn at_text_column(row: &str, needle: &str) -> bool {
+    column_of(row, needle) == Some(TEXT_COLUMN)
+}
+
+/// The rule that closes an agent header: a hairline across the row.
+fn is_rule(row: &str) -> bool {
+    !row.trim().is_empty() && row.trim_matches('─').trim().is_empty()
+}
+
 fn caps() -> Capabilities {
     Capabilities {
         color_depth: ColorDepth::TrueColor,
@@ -163,18 +190,18 @@ fn blockquote_keeps_text_on_the_rail_row_instead_of_leaving_a_lone_rail() {
         .position(|row| row.contains("Não rodei"))
         .expect("quote text");
     assert!(
-        rendered.rows[quote].starts_with("    ┆ Não rodei o build release."),
+        at_text_column(&rendered.rows[quote], "┆ Não rodei o build release."),
         "{}",
         rendered.text()
     );
     assert!(
-        rendered.rows.iter().all(|row| row.trim() != "┆"),
+        rendered.rows.iter().all(|row| body(row).trim() != "┆"),
         "a rail must never stand alone above its text:\n{}",
         rendered.text()
     );
     // One breathing row on each side, like any other root block.
-    assert!(rendered.rows[quote - 1].trim().is_empty());
-    assert!(rendered.rows[quote + 1].trim().is_empty());
+    assert!(body(&rendered.rows[quote - 1]).trim().is_empty());
+    assert!(body(&rendered.rows[quote + 1]).trim().is_empty());
     assert!(rendered.rows[quote - 2].contains("Antes."));
     assert!(rendered.rows[quote + 2].contains("Depois."));
 }
@@ -190,7 +217,7 @@ fn long_blockquote_wraps_under_its_rail_and_measures_the_same() {
         .collect();
     assert!(rows.len() >= 3, "{}", rendered.text());
     assert!(
-        rows.iter().all(|row| row.starts_with("    ┆ ")),
+        rows.iter().all(|row| at_text_column(row, "┆ ")),
         "every wrapped row keeps the rail:\n{}",
         rendered.text()
     );
@@ -201,8 +228,9 @@ fn long_blockquote_wraps_under_its_rail_and_measures_the_same() {
         Action::UiEventReceived(UiEvent::AssistantDelta { text: text.into() }),
     );
     let measured = HeightIndex::build(state.blocks(), 30, &mut WrapCache::default()).total_rows;
-    // A lone block also carries the turn header and its blank row above it.
-    assert_eq!(measured, rows.len() as u64 + 2, "{}", rendered.text());
+    // A lone block also carries its blank row, the turn header and the rule
+    // that closes it.
+    assert_eq!(measured, rows.len() as u64 + 3, "{}", rendered.text());
 }
 
 #[test]
@@ -214,12 +242,13 @@ fn quote_paragraphs_share_one_rail_separated_by_a_rail_only_row() {
         .position(|row| row.contains("┆ um"))
         .expect("first paragraph");
     assert!(
-        rendered.rows[first + 1].trim_end() == "    ┆",
+        at_text_column(&rendered.rows[first + 1], "┆")
+            && rendered.rows[first + 1].trim_end().ends_with('┆'),
         "{}",
         rendered.text()
     );
     assert!(
-        rendered.rows[first + 2].starts_with("    ┆ dois"),
+        at_text_column(&rendered.rows[first + 2], "┆ dois"),
         "{}",
         rendered.text()
     );
@@ -380,10 +409,11 @@ fn assistant_body_uses_role_label_and_foreground() {
                 .position(|row| row.contains("Slim"))
                 .expect("agent role");
             assert!(rendered.rows[label - 1].trim().is_empty());
-            assert!(rendered.rows[label + 1].contains("plain answer"));
+            assert!(is_rule(&rendered.rows[label + 1]), "{}", rendered.text());
+            assert!(rendered.rows[label + 2].contains("plain answer"));
             assert_eq!(
                 HeightIndex::build(state.blocks(), 40, &mut WrapCache::default()).total_rows,
-                3
+                4
             );
             if color_depth == ColorDepth::TrueColor {
                 assert_eq!(rendered.word_style("plain").0, Color::Rgb(0xE8, 0xE5, 0xDB));
@@ -437,8 +467,8 @@ fn agent_header_shares_the_prompt_gutter_and_degrades_to_ascii() {
         .position(|row| row.contains("● Você"))
         .expect("prompt");
     assert_eq!(
-        color.rows[header].find('●'),
-        color.rows[prompt].find('●'),
+        column_of(&color.rows[header], "●"),
+        column_of(&color.rows[prompt], "●"),
         "both roles put their marker in the same gutter column"
     );
     assert_eq!(
@@ -453,15 +483,25 @@ fn agent_header_shares_the_prompt_gutter_and_degrades_to_ascii() {
         .iter()
         .position(|row| row.contains("✓"))
         .expect("tool row");
-    assert_eq!(tool, header + 1, "{}", color.text());
-    assert!(color.rows[tool].starts_with("  ✓ "), "{}", color.text());
+    assert_eq!(tool, header + 2, "{}", color.text());
+    assert!(
+        color.rows[header + 1].trim_start().starts_with('─'),
+        "{}",
+        color.text()
+    );
+    assert_eq!(
+        column_of(&color.rows[tool], "✓"),
+        column_of(&color.rows[header], "●"),
+        "work rows hang their marker in the same gutter column"
+    );
     let answer = color
         .rows
         .iter()
         .position(|row| row.contains("pronto"))
         .expect("prose");
-    assert!(
-        color.rows[answer].starts_with("    pronto"),
+    assert_eq!(
+        column_of(&color.rows[answer], "pronto"),
+        Some(TEXT_COLUMN),
         "{}",
         color.text()
     );
@@ -475,7 +515,7 @@ fn agent_header_shares_the_prompt_gutter_and_degrades_to_ascii() {
         },
     );
     assert!(
-        plain.rows.iter().any(|row| row.starts_with("  * Slim")),
+        plain.rows.iter().any(|row| row.starts_with("| * Slim")),
         "{}",
         plain.text()
     );
@@ -508,14 +548,23 @@ fn user_header_and_body_are_followed_by_one_blank_row() {
         .position(|row| row.contains("answer"))
         .expect("answer");
     assert_eq!(question, you + 1, "user header precedes the body");
-    assert!(rendered.rows[you].starts_with("  ● Você"));
-    assert!(rendered.rows[question].starts_with("    question"));
-    assert!(rendered.rows[question + 1].trim().is_empty());
-    // One breathing row, the same whether the agent opens with prose or work.
-    assert_eq!(rendered.rows[question + 2].trim_end(), "  ● Slim");
-    assert_eq!(answer, question + 3);
     assert!(
-        rendered.rows[answer].starts_with("    answer"),
+        rendered.rows[you].starts_with("▌ ● Você"),
+        "{}",
+        rendered.text()
+    );
+    assert_eq!(
+        column_of(&rendered.rows[question], "question"),
+        Some(TEXT_COLUMN)
+    );
+    assert!(body(&rendered.rows[question + 1]).trim().is_empty());
+    // One breathing row, the same whether the agent opens with prose or work.
+    assert_eq!(rendered.rows[question + 2].trim_end(), "▌ ● Slim");
+    assert!(is_rule(&rendered.rows[question + 3]), "{}", rendered.text());
+    assert_eq!(answer, question + 4);
+    assert_eq!(
+        column_of(&rendered.rows[answer], "answer"),
+        Some(TEXT_COLUMN),
         "agent prose shares the prompt's text column"
     );
 }
@@ -551,10 +600,12 @@ fn agent_turn_opens_with_one_header_above_thinking_and_prose() {
         .expect("thought");
     // The header owns the work that precedes the first prose of the turn.
     assert_eq!(header, prompt + 3, "{}", rendered.text());
-    assert_eq!(thought, header + 1, "{}", rendered.text());
+    assert!(is_rule(&rendered.rows[header + 1]), "{}", rendered.text());
+    assert_eq!(thought, header + 2, "{}", rendered.text());
     assert!(rendered.rows[thought + 1].trim().is_empty());
-    assert!(
-        rendered.rows[thought + 2].starts_with("    Oi! Tudo certo?"),
+    assert_eq!(
+        column_of(&rendered.rows[thought + 2], "Oi! Tudo certo?"),
+        Some(TEXT_COLUMN),
         "{}",
         rendered.text()
     );
@@ -567,8 +618,9 @@ fn agent_turn_opens_with_one_header_above_thinking_and_prose() {
 }
 
 fn role_header(row: &str) -> bool {
-    // The marker is the turn's state: done, interrupted or failed.
-    let trimmed = row.trim();
+    // The marker is the turn's state: done, interrupted or failed. The turn's
+    // rail stands in the first cell.
+    let trimmed = row.trim().trim_start_matches(RAIL).trim();
     ["●", "■", "✕"].iter().any(|marker| {
         trimmed == format!("{marker} Slim") || trimmed.starts_with(&format!("{marker} Slim ·"))
     })
@@ -778,7 +830,7 @@ fn user_marker_settles_without_changing_the_label_or_layout() {
     );
     // Without color the band is gone, so the prompt takes the composer's
     // chevron while the agent keeps its dot.
-    assert!(plain.text().contains("  > Você"));
+    assert!(plain.text().contains("| > Você"));
     assert_eq!(plain.word_style(">").0, Color::Reset);
 }
 
@@ -796,11 +848,15 @@ fn user_wrapping_keeps_body_alignment_and_measured_height() {
             .unwrap();
         let body: Vec<_> = rendered.rows[header + 1..]
             .iter()
-            .take_while(|row| !row.trim().is_empty())
+            .take_while(|row| !body(row).trim().is_empty())
             .collect();
         assert!(body.len() > 1);
         for row in &body {
-            assert!(row.starts_with("    "));
+            assert_eq!(
+                column_of(row, row.trim_start_matches(['▌', ' '])),
+                Some(TEXT_COLUMN),
+                "{row:?}"
+            );
         }
         assert_eq!(
             body.iter()

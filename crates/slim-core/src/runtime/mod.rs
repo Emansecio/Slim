@@ -62,6 +62,7 @@ mod presentation;
 mod recovery;
 mod redaction;
 mod request_estimate;
+mod run_guards;
 mod shell_jobs;
 mod stream_normalizer;
 #[cfg(test)]
@@ -129,7 +130,8 @@ use tool_schedule::{
     mark_cancelled_tool_outcome, phase1_snapshot_indices, phase1_snapshot_indices_ready,
     should_stop_after_tool_budget_cut, split_calls_for_budget, suppressed_calls_steer,
     tool_call_slots, PoolOutcome, ToolInvocation, ToolStartedNotice, BATCH_CONCURRENCY,
-    BUDGET_FINALIZE_PROMPT, MAX_BUDGET_STEERS, NO_PROGRESS_FINALIZE_PROMPT,
+    BUDGET_FINALIZE_PROMPT, MAX_BUDGET_STEERS, NO_PROGRESS_FINALIZE_PROMPT, TUNING_CLOSED_ERROR,
+    TUNING_FINALIZE_PROMPT,
 };
 pub use usage::{RequestUsage, UsageTotals};
 
@@ -203,6 +205,11 @@ pub struct Runtime {
     write_projection_cache: Mutex<mode::WriteProjectionCache>,
     code_intel: Option<Arc<dyn CodeIntelligence>>,
     edited: EditedFiles,
+    /// The run is in its time budget's finalize phase: tuning-only patches
+    /// are refused.
+    tuning_closed: bool,
+    /// Re-read, full-rewrite and failing-command holds of this run.
+    run_guards: run_guards::RunGuards,
     mcp: Option<Arc<McpManager>>,
     codemode: codemode::CodeMode,
     token_estimator: AdaptiveTokenEstimator,
@@ -263,6 +270,8 @@ impl Runtime {
             write_projection_cache: Mutex::new(mode::WriteProjectionCache::default()),
             code_intel: None,
             edited: EditedFiles::default(),
+            tuning_closed: false,
+            run_guards: run_guards::RunGuards::default(),
             mcp: None,
             codemode: codemode::CodeMode::default(),
             token_estimator: AdaptiveTokenEstimator::default(),

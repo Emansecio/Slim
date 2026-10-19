@@ -39,6 +39,19 @@ impl Rendered {
             .unwrap_or_else(|| panic!("row with {needle:?} missing\n{}", self.rows.join("\n")))
     }
 
+    /// Column of the streaming caret: the half block that closes the message
+    /// being written, past the rail of the turn. `None` while it is off.
+    fn caret_column(&self, row: usize) -> Option<usize> {
+        let text = self.rows[row].trim_end();
+        if !text.ends_with('▌') {
+            return None;
+        }
+        // A blank row of the turn carries only its rail, which is the same
+        // glyph; the caret closes a line that has text on it.
+        let body = text.trim_start_matches(['▌', ' ']).trim_end_matches('▌');
+        (!body.trim().is_empty()).then(|| unicode_width::UnicodeWidthStr::width(text) - 1)
+    }
+
     /// Foreground and modifiers at the first cell of `word` on `row`.
     fn style_at(&self, row: usize, word: &str) -> (Color, Modifier) {
         let text = &self.rows[row];
@@ -477,10 +490,16 @@ fn the_streaming_caret_blinks_and_dims_when_the_provider_goes_quiet() {
         let row = rendered.row("resposta em curso");
         match expected {
             Some(color) => {
-                assert!(rendered.rows[row].contains('▌'), "frame {frame}");
-                assert_eq!(rendered.style_at(row, "▌").0, color, "frame {frame}");
+                let column = rendered.caret_column(row).unwrap_or_else(|| {
+                    panic!("caret missing at frame {frame}: {:?}", rendered.rows[row])
+                });
+                assert_eq!(rendered.foreground[row][column], color, "frame {frame}");
             }
-            None => assert!(!rendered.rows[row].contains('▌'), "frame {frame}"),
+            None => assert!(
+                rendered.caret_column(row).is_none(),
+                "frame {frame}: {:?}",
+                rendered.rows[row]
+            ),
         }
         // The cell is reserved in every phase: text never moves or rewraps.
         let start = rendered.rows[row].find("resposta").unwrap();
@@ -494,7 +513,8 @@ fn the_streaming_caret_blinks_and_dims_when_the_provider_goes_quiet() {
     });
     let resumed = render_with(&state, 80, moving(ColorDepth::TrueColor));
     let row = resumed.row("e continua");
-    assert_eq!(resumed.style_at(row, "▌").0, GREEN);
+    let column = resumed.caret_column(row).expect("caret back");
+    assert_eq!(resumed.foreground[row][column], GREEN);
 }
 
 #[test]
@@ -506,10 +526,10 @@ fn the_caret_blinks_without_color_too_and_reduced_motion_removes_it() {
         text: "sem cor".into(),
     });
     let has_caret = |state: &AppState, capabilities: Capabilities| {
-        render_with(state, 60, capabilities)
-            .rows
-            .iter()
-            .any(|row| row.contains('▌'))
+        // The caret closes the row the answer is being written on; the rail of
+        // the turn stands at its start, in the same glyph.
+        let rendered = render_with(state, 60, capabilities);
+        (0..rendered.rows.len()).any(|row| rendered.caret_column(row).is_some())
     };
     tick(&mut state, 0, 0);
     assert!(has_caret(&state, moving(ColorDepth::None)));
@@ -768,7 +788,7 @@ fn prompt_sent() -> AppState {
 
 fn header_rows(rendered: &Rendered) -> Vec<usize> {
     (0..rendered.rows.len())
-        .filter(|row| rendered.rows[*row].trim_end() == "  ● Slim")
+        .filter(|row| rendered.rows[*row].trim_end() == "▌ ● Slim")
         .collect()
 }
 
@@ -811,13 +831,17 @@ fn the_pending_header_becomes_the_first_blocks_header_without_moving_anything() 
         "one header, same place under the prompt"
     );
     let rows_after = HeightIndex::build(state.blocks(), 80, &mut WrapCache::default()).total_rows;
-    // The header row is now the block's; only the thought's own row is new.
+    // The header is now the block's (label plus rule); only the thought's own
+    // row is new.
     assert_eq!(
         rows_after,
         rows_before + 1,
         "header row is not counted twice"
     );
-    assert!(after.rows[prompt_after + header_offset + 1].contains("Pensando"));
+    assert!(
+        after.rows[prompt_after + header_offset + 2].contains("Pensando"),
+        "the rule closes the header, the thought follows it"
+    );
 }
 
 #[test]
@@ -884,7 +908,7 @@ fn the_pending_name_is_swept_in_green_and_still_when_motion_is_reduced() {
         let (name, marker, text) = cells(&mut state, frame, moving(ColorDepth::TrueColor));
         peaks.push((0..4).max_by_key(|index| luma(name[*index])).unwrap());
         assert_eq!(marker, GREEN, "the marker stays the identity green");
-        assert_eq!(text, "  ● Slim", "the sweep only restyles");
+        assert_eq!(text, "▌ ● Slim", "the sweep only restyles");
     }
     assert_eq!(peaks, [0, 1, 2, 3]);
     for frame in [0, 6, 12] {
@@ -936,7 +960,10 @@ fn ran(state: &mut AppState, id: &str, success: bool) {
 fn receipt_row(rendered: &Rendered) -> Option<usize> {
     // The last such row: a folded group of tools reads similarly, above it.
     (0..rendered.rows.len()).rev().find(|row| {
-        let text = rendered.rows[*row].trim_start();
+        let text = rendered.rows[*row]
+            .trim_start()
+            .trim_start_matches('▌')
+            .trim_start();
         ["✓ ", "✕ ", "■ "]
             .iter()
             .any(|glyph| text.starts_with(glyph))
@@ -960,7 +987,7 @@ fn a_turn_that_changed_files_ends_with_a_receipt() {
     let row = receipt_row(&rendered).expect("receipt row");
     assert_eq!(
         rendered.rows[row].trim_end(),
-        "  ✓ 2 arquivos · +2 -4 · 1 comando · 6s   Ctrl+D"
+        "▌ ✓ 2 arquivos · +2 -4 · 1 comando · 6s   Ctrl+D"
     );
     // The receipt sits in the text column, set apart from the prose above it.
     assert!(
@@ -984,7 +1011,13 @@ fn the_marker_follows_how_the_turn_ended() {
         state.apply_event(finish);
         let rendered = render_with(&state, 100, caps(ColorDepth::TrueColor));
         let row = receipt_row(&rendered).expect("receipt row");
-        let glyph = rendered.rows[row].trim_start().chars().next().unwrap();
+        let glyph = rendered.rows[row]
+            .trim_start()
+            .trim_start_matches('▌')
+            .trim_start()
+            .chars()
+            .next()
+            .unwrap();
         (
             glyph,
             rendered.style_at(row, &glyph.to_string()).0,
@@ -1051,7 +1084,7 @@ fn a_narrow_receipt_drops_pieces_from_the_right_and_never_overflows() {
             unicode_width::UnicodeWidthStr::width(text) <= usize::from(width),
             "{width}: {text:?}"
         );
-        assert!(text.starts_with("  ✓ 1 arquivo"), "{width}: {text:?}");
+        assert!(text.starts_with("▌ ✓ 1 arquivo"), "{width}: {text:?}");
     }
     let wide = render_with(&state, 100, caps(ColorDepth::TrueColor));
     assert!(wide.rows[receipt_row(&wide).unwrap()].contains("Ctrl+D"));

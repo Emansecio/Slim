@@ -83,7 +83,7 @@ fn palette_end_keeps_the_last_grouped_command_visible() {
         "group heading must render:\n{frame}"
     );
     assert!(
-        frame.contains("> /jobs"),
+        frame.contains("› /jobs"),
         "End-selected command must remain visible:\n{frame}"
     );
 }
@@ -136,7 +136,7 @@ fn model_cursor_highlight_does_not_move_the_active_model_marker() {
         .find(|line| line.contains("GPT-5.6 Terra"))
         .expect("selected model row");
     assert!(
-        selected_row.contains(">     GPT-5.6 Terra"),
+        selected_row.contains("›   GPT-5.6 Terra"),
         "cursor highlight follows the selected row:\n{frame}"
     );
     assert!(

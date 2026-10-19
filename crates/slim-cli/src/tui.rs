@@ -887,6 +887,9 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
     if let Some(turns) = layered_config.max_turns {
         options = options.with_max_turns(turns);
     }
+    if let Some(secs) = layered_config.time_budget_secs {
+        options = options.with_time_budget_secs(secs);
+    }
     if let Some(tokens) = layered_config.max_output_tokens {
         options = options.with_max_output_tokens(tokens);
     }

@@ -295,10 +295,16 @@ fn run_loop(
             capabilities,
             &mut render_cache,
         );
-        let next_expiry_ms = [next_toast_deadline_ms, next_transition_deadline_ms]
-            .into_iter()
-            .flatten()
-            .min();
+        let next_welcome_deadline_ms = welcome_motion(&state, capabilities, &regions)
+            .then(|| next_welcome_sweep_ms(runtime_clock(elapsed).elapsed_ms));
+        let next_expiry_ms = [
+            next_toast_deadline_ms,
+            next_transition_deadline_ms,
+            next_welcome_deadline_ms,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         let visual_deadline = next_visual_deadline(
             elapsed,
             last_motion_frame,
@@ -525,8 +531,17 @@ fn send(commands: &std::sync::mpsc::Sender<UiCommand>, command: UiCommand) -> io
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI runtime disconnected"))
 }
 
-/// A centered modal that dims the whole frame (`dim_backdrop`). Everything
-/// behind it is backdrop, so motion and the status clock may rest meanwhile.
+/// Dialogs are boxes over the transcript, so they recede what is behind them.
+/// A picker owns the whole terminal and has nothing to dim.
+fn dimmed_modal_open(state: &AppState) -> bool {
+    state.login_overlay.is_some()
+        || state.mcp_overlay.is_some()
+        || state.jobs_overlay.is_some()
+        || state.job_exit_confirm.is_some()
+}
+
+/// A modal surface owns the screen: nothing behind it takes the mouse, the
+/// keyboard or the motion clock while it is open.
 fn blocking_modal_open(state: &AppState) -> bool {
     state.login_overlay.is_some()
         || state.model_overlay.is_some()
@@ -1138,6 +1153,9 @@ pub(crate) struct Palette {
     /// The glow at the edge of the answer being written: from the text color
     /// up to the identity green, so fresh words read as wet ink.
     arrival: Ramp,
+    /// The welcome wordmark, from a quiet gray up to a white touched by the
+    /// identity green where its sheen passes.
+    mark: Ramp,
     /// The last output line of a running command, a step quieter than the
     /// clock it follows.
     tail: Style,
@@ -1255,6 +1273,10 @@ impl Palette {
                 theme.foreground,
                 mix_rgb(theme.assistant_accent, theme.foreground, 0.2),
             ),
+            mark: scale(
+                mix_rgb(theme.muted, theme.foreground, 0.30),
+                mix_rgb(theme.foreground, theme.assistant_accent, 0.22),
+            ),
             tail: match capabilities.color_depth {
                 ColorDepth::TrueColor | ColorDepth::Ansi256 => {
                     base.fg(color(mix_rgb(theme.muted, theme.background, 0.30)))
@@ -1365,7 +1387,7 @@ pub fn render_frame(
     cache: &mut WrapCache,
 ) {
     cache.set_tool_presentation(state.clock.elapsed_ms, capabilities.reduced_motion);
-    let modal_open = blocking_modal_open(state);
+    let modal_open = dimmed_modal_open(state);
     let modal_opened_ms = cache.note_modal_frame(modal_open, state.clock.elapsed_ms);
     cache.selection_regions = [None, None];
     cache.selection_scroll_anchor = None;
@@ -1567,11 +1589,20 @@ pub fn render_frame(
             frame,
             picker,
             &palette,
+            capabilities,
             cursor_target == Some(InputCursorTarget::SessionFilter),
         );
     }
     if let Some(overlay) = &state.effort_overlay {
-        render_effort_overlay(frame, overlay, &palette);
+        render_effort_overlay(
+            frame,
+            overlay,
+            state.effort,
+            &crate::api::ModelAlias::parse(&state.model)
+                .map_or_else(|| state.model.clone(), |alias| alias.label().to_owned()),
+            &palette,
+            capabilities,
+        );
     }
     if let Some(overlay) = &state.login_overlay {
         render_login_overlay(
@@ -1588,6 +1619,7 @@ pub fn render_frame(
             state.palette_selected,
             state.palette_viewport_start,
             &palette,
+            capabilities,
             cache,
             cursor_target == Some(InputCursorTarget::Palette),
         );
@@ -1745,7 +1777,7 @@ fn next_transition_visual_deadline_ms(
     }
     if let Some(next) = cache
         .modal_opened_ms()
-        .filter(|_| backdrop_entrance_enabled(capabilities) && blocking_modal_open(state))
+        .filter(|_| backdrop_entrance_enabled(capabilities) && dimmed_modal_open(state))
         .and_then(|opened| {
             next_step_boundary_ms(
                 opened,
@@ -1797,6 +1829,9 @@ fn motion_on_screen(
     cache: &mut WrapCache,
     regions: &crate::layout::LayoutRegions,
 ) -> bool {
+    if welcome_motion(state, capabilities, regions) {
+        return welcome_sweep_progress(state.clock.elapsed_ms).is_some();
+    }
     if !motion_needed(state, capabilities, cache) {
         return false;
     }
@@ -1830,8 +1865,33 @@ fn render_session_rail(
         palette,
         capabilities,
     );
-    if projection.gap > 0 {
-        spans.push(Span::raw(" ".repeat(projection.gap)));
+    // The right edge says who the session is talking to: the workspace is
+    // already named on the left, and the footer owns the model and the
+    // context, so this is the one fact the chrome was missing.
+    let chip = state
+        .auth_provider
+        .filter(|_| state.authenticated)
+        .map(|provider| {
+            provider
+                .label()
+                .split(" — ")
+                .next()
+                .unwrap_or_else(|| provider.label())
+                .to_owned()
+        });
+    let chip_width = chip
+        .as_ref()
+        .map_or(0, |chip| UnicodeWidthStr::width(chip.as_str()) + 2);
+    let gap = projection.gap.saturating_sub(chip_width);
+    if gap > 0 {
+        spans.push(Span::raw(" ".repeat(gap)));
+    }
+    if let Some(chip) = chip.filter(|_| gap > 0) {
+        spans.push(Span::styled(
+            format!("{} ", glyph(capabilities, '\u{25cf}', '*')),
+            palette.success,
+        ));
+        spans.push(Span::styled(chip, palette.muted));
     }
     if !projection.status.is_empty() {
         spans.push(Span::styled(projection.status, palette.secondary));
@@ -2227,6 +2287,43 @@ fn render_scrollback(
             buf.set_line(text_area.x, y, line, content_width);
             y += 1;
         }
+        if let Some(tone) = rail_tone(block, palette) {
+            // The turn's edge: one cell of tone down the gutter of every row
+            // the block painted, over the surfaces already there (the prompt
+            // band, a diff, a code block). The header's rule and the breathing
+            // rows between blocks keep their own row.
+            let rail = glyph(capabilities, '\u{258c}', '|');
+            let header_rows = response_header.map_or(0, crate::block::ResponseHeader::rows);
+            // The rail starts at the label that opens the turn: the blank row
+            // above it, the rule under it and the breathing rows between blocks
+            // keep their own row.
+            let lead_blank = response_header.map_or(0, |header| usize::from(header.lead_blank));
+            let rule_row = response_header.map(|header| header.rows() - 1);
+            let gap_row = transition_gap.then_some(header_rows);
+            let boundary_row = block
+                .turn_boundary_before()
+                .then_some(header_rows + usize::from(transition_gap));
+            for (offset, row) in (block_start_y..y).enumerate() {
+                let index = skip + offset;
+                if index < lead_blank
+                    || Some(index) == rule_row
+                    || Some(index) == gap_row
+                    || Some(index) == boundary_row
+                {
+                    continue;
+                }
+                // A row under the keyboard cursor keeps its marker where the
+                // rail would stand: the cursor is the reader's own position.
+                if buf[(text_area.x, row)].symbol() == ">" {
+                    continue;
+                }
+                let cell = &mut buf[(text_area.x, row)];
+                cell.set_char(rail);
+                if let Some(fg) = tone.fg {
+                    cell.set_fg(fg);
+                }
+            }
+        }
         if search_match && written > 0 {
             let selected_match = selected_search_id
                 .is_some_and(|id| id == &block.id || members.iter().any(|member| &member.id == id));
@@ -2279,17 +2376,17 @@ fn render_scrollback(
             }
         }
         // A prompt still waiting for its first agent output sweeps the name in
-        // its pending header, in the last row of the block. `● Slim`: the name
-        // starts in the fourth column.
+        // its pending header: the label, one row above the rule that closes it.
+        // `● Slim`: the name starts in the fourth column.
         if spinner_motion_enabled
             && block.awaiting_agent()
-            && written > 0
+            && written >= 2
             && skip + written == block_lines.len()
         {
             for index in 0..AGENT_NAME_CELLS {
                 let x = text_area.x.saturating_add(4 + index as u16);
                 if x < text_area.right() {
-                    buf[(x, y - 1)].set_style(palette.presence.at(sweep_strength(
+                    buf[(x, y - 2)].set_style(palette.presence.at(sweep_strength(
                         index,
                         AGENT_NAME_CELLS,
                         ctx.now_ms,
@@ -2782,12 +2879,147 @@ fn tool_activity_is_active(state: &AppState) -> bool {
     )
 }
 
+/// The welcome wordmark, drawn in half blocks: three rows, one width.
+const WELCOME_MARK: [&str; 3] = [
+    "\u{2584}\u{2580}\u{2580}\u{2580}  \u{2588}     \u{2588}  \u{2588}\u{2584} \u{2584}\u{2588}",
+    " \u{2580}\u{2580}\u{2584}  \u{2588}     \u{2588}  \u{2588} \u{2580} \u{2588}",
+    "\u{2580}\u{2580}\u{2580}   \u{2580}\u{2580}\u{2580}\u{2580}  \u{2580}  \u{2580}   \u{2580}",
+];
+const WELCOME_MARK_CELLS: u16 = 20;
+/// Resting light of each mark row: lit from above, settling toward the base.
+const WELCOME_MARK_REST: [f32; 3] = [0.34, 0.17, 0.0];
+/// A slanted sheen crosses the mark once per period, after a short pause at
+/// launch; between passes the screen stays still and the loop sleeps.
+const WELCOME_SWEEP_DELAY_MS: u64 = 400;
+const WELCOME_SWEEP_MS: u64 = 1_800;
+const WELCOME_SWEEP_PERIOD_MS: u64 = 8_000;
+/// Half width of the sheen, in cells, and how far it leans per row.
+const WELCOME_SHEEN_HALF: f32 = 3.5;
+const WELCOME_SHEEN_LEAN: f32 = 1.5;
+/// One tip per launch: a key or command, then what it does.
+const WELCOME_TIPS: [(&str, &str); 6] = [
+    ("Esc", "cancela o turno em andamento"),
+    ("\u{2191}", "recupera o prompt anterior"),
+    ("!&", "roda um comando em segundo plano"),
+    ("/resume", "retoma uma sessão anterior"),
+    ("/model", "troca o modelo"),
+    ("/jobs", "controla os processos em execução"),
+];
+
+/// What the welcome card has room for, besides name, state and action.
+#[derive(Clone, Copy)]
+struct WelcomeSections {
+    spaced: bool,
+    cwd: bool,
+    mark: bool,
+    tip: bool,
+}
+
+fn welcome_sections(state: &AppState, area: ratatui::layout::Rect) -> WelcomeSections {
+    let spaced = area.height >= 8;
+    // Name, state and action, plus one row of air on each side.
+    let mut used = if spaced { 4 } else { 3 } + 2;
+    let mut fits = |rows: u16| {
+        let fit = used + rows <= area.height;
+        if fit {
+            used += rows;
+        }
+        fit
+    };
+    let cwd = spaced && !is_trivial_cwd(&state.cwd) && fits(2);
+    let mark =
+        spaced && area.width >= WELCOME_MARK_CELLS + 4 && fits(WELCOME_MARK.len() as u16 + 1);
+    let tip = spaced && fits(2);
+    WelcomeSections {
+        spaced,
+        cwd,
+        mark,
+        tip,
+    }
+}
+
+/// How far the current sheen has crossed the mark, from 0.0 to 1.0; `None`
+/// between passes.
+fn welcome_sweep_progress(elapsed_ms: u64) -> Option<f32> {
+    let since = elapsed_ms.checked_sub(WELCOME_SWEEP_DELAY_MS)?;
+    let into = since % WELCOME_SWEEP_PERIOD_MS;
+    (into < WELCOME_SWEEP_MS).then(|| into as f32 / WELCOME_SWEEP_MS as f32)
+}
+
+/// When the next sheen starts.
+fn next_welcome_sweep_ms(elapsed_ms: u64) -> u64 {
+    match elapsed_ms.checked_sub(WELCOME_SWEEP_DELAY_MS) {
+        None => WELCOME_SWEEP_DELAY_MS,
+        Some(since) => {
+            WELCOME_SWEEP_DELAY_MS + (since / WELCOME_SWEEP_PERIOD_MS + 1) * WELCOME_SWEEP_PERIOD_MS
+        }
+    }
+}
+
+/// Whether the welcome mark is on screen and allowed to move.
+fn welcome_motion(
+    state: &AppState,
+    capabilities: Capabilities,
+    regions: &crate::layout::LayoutRegions,
+) -> bool {
+    !capabilities.reduced_motion
+        && capabilities.color_depth != ColorDepth::None
+        && welcome_visible(state)
+        && !blocking_modal_open(state)
+        && welcome_sections(state, to_ratatui(regions.scrollback)).mark
+}
+
+/// Light of mark cell `column` on `row`: its resting shade, raised where the
+/// sheen passes. The sheen starts off the left edge and leaves on the right.
+fn welcome_mark_strength(row: usize, column: usize, progress: Option<f32>) -> f32 {
+    let rest = WELCOME_MARK_REST[row];
+    let Some(progress) = progress else {
+        return rest;
+    };
+    let lean = WELCOME_SHEEN_LEAN * (WELCOME_MARK.len() - 1) as f32;
+    let travel = f32::from(WELCOME_MARK_CELLS) + 2.0 * WELCOME_SHEEN_HALF + lean;
+    let center = progress * travel - WELCOME_SHEEN_HALF;
+    let distance = (column as f32 + WELCOME_SHEEN_LEAN * row as f32 - center).abs();
+    let reach = (1.0 - distance / WELCOME_SHEEN_HALF).max(0.0);
+    rest.max(reach * reach * (3.0 - 2.0 * reach))
+}
+
+fn welcome_mark_lines(palette: &Palette, progress: Option<f32>) -> Vec<Line<'static>> {
+    WELCOME_MARK
+        .iter()
+        .enumerate()
+        .map(|(row, text)| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut run = String::new();
+            let mut run_style = Style::default();
+            for (column, character) in text.chars().enumerate() {
+                let style = if character == ' ' {
+                    run_style
+                } else {
+                    palette
+                        .mark
+                        .at(welcome_mark_strength(row, column, progress))
+                };
+                if !run.is_empty() && style != run_style {
+                    spans.push(Span::styled(std::mem::take(&mut run), run_style));
+                }
+                run_style = style;
+                run.push(character);
+            }
+            if !run.is_empty() {
+                spans.push(Span::styled(run, run_style));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
 fn render_welcome(
     frame: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
     state: &AppState,
     palette: &Palette,
-    _capabilities: Capabilities,
+    capabilities: Capabilities,
 ) {
     let (status, hint, connected) = if state.authenticated {
         (
@@ -2813,7 +3045,6 @@ fn render_welcome(
     let title_style = palette
         .text
         .patch(Style::default().add_modifier(Modifier::BOLD));
-    let cwd = (!is_trivial_cwd(&state.cwd)).then(|| display_cwd(&state.cwd));
     let inset = if area.width > 4 { 2 } else { 1 };
     let content_area = if area.width > inset * 2 {
         ratatui::layout::Rect {
@@ -2824,38 +3055,9 @@ fn render_welcome(
     } else {
         area
     };
-    let block_width = content_area.width;
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("SLIM", title_style),
-            Span::styled(concat!(" v", env!("CARGO_PKG_VERSION")), palette.muted),
-        ]),
-        Line::from(vec![
-            Span::styled(format!("{dot}  "), dot_style),
-            Span::styled(status, palette.muted),
-        ]),
-        Line::from(Span::styled(
-            hint,
-            if connected {
-                palette.secondary
-            } else {
-                palette.accent
-            },
-        )),
-    ];
-    // Workspace path stays on the welcome card; shortcuts live in the footer.
-    if area.height >= 8 {
-        if let Some(cwd) = cwd {
-            lines.push(Line::from(Span::styled(
-                truncate_display_width(&cwd, block_width as usize),
-                palette.muted,
-            )));
-        }
-    } else {
-        lines.retain(|line| !line.spans.is_empty());
-    }
-    if area.height <= 5 {
-        lines = vec![
+    let block_width = content_area.width as usize;
+    let lines = if area.height <= 5 {
+        vec![
             Line::from(Span::styled("SLIM", title_style)),
             Line::from(vec![
                 Span::styled(format!("{dot}  "), dot_style),
@@ -2868,17 +3070,78 @@ fn render_welcome(
                     palette.muted,
                 ),
             ]),
-        ];
-    }
+        ]
+    } else {
+        let sections = welcome_sections(state, area);
+        let mut lines = Vec::new();
+        if sections.mark {
+            let progress = if capabilities.reduced_motion {
+                None
+            } else {
+                welcome_sweep_progress(state.clock.elapsed_ms)
+            };
+            lines.extend(welcome_mark_lines(palette, progress));
+            lines.push(Line::default());
+        }
+        lines.push(Line::from(vec![
+            Span::styled("SLIM", title_style),
+            Span::styled(concat!("  v", env!("CARGO_PKG_VERSION")), palette.muted),
+        ]));
+        if sections.spaced {
+            lines.push(Line::default());
+        }
+        lines.push(Line::from(vec![
+            Span::styled(format!("{dot}  "), dot_style),
+            Span::styled(
+                truncate_display_width(&status, block_width.saturating_sub(3)),
+                palette.muted,
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            hint,
+            if connected {
+                palette.secondary
+            } else {
+                palette.accent
+            },
+        )));
+        // Workspace path stays on the welcome card; shortcuts live in the footer.
+        if sections.cwd {
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                truncate_display_width(&display_cwd(&state.cwd), block_width),
+                palette.muted,
+            )));
+        }
+        if sections.tip {
+            let (key, what) = WELCOME_TIPS[std::process::id() as usize % WELCOME_TIPS.len()];
+            let tip = format!("Dica  {key} {what}");
+            lines.push(Line::default());
+            lines.push(if UnicodeWidthStr::width(tip.as_str()) <= block_width {
+                Line::from(vec![
+                    Span::styled("Dica  ", palette.tail),
+                    Span::styled(key, palette.secondary),
+                    Span::styled(format!(" {what}"), palette.muted),
+                ])
+            } else {
+                Line::from(Span::styled(
+                    truncate_display_width(&tip, block_width),
+                    palette.muted,
+                ))
+            });
+        }
+        lines
+    };
     let welcome_height = (lines.len() as u16).min(content_area.height);
-    let gap = u16::from(content_area.height > welcome_height);
+    // Optically centered: a little more air below than above.
+    let top = content_area.height.saturating_sub(welcome_height) * 2 / 5;
     let welcome_area = ratatui::layout::Rect {
-        y: content_area.y + content_area.height.saturating_sub(welcome_height + gap),
+        y: content_area.y + top,
         height: welcome_height,
         ..content_area
     };
     frame.render_widget(
-        Paragraph::new(lines).alignment(Alignment::Left),
+        Paragraph::new(lines).alignment(Alignment::Center),
         welcome_area,
     );
 }
@@ -4109,6 +4372,24 @@ fn block_transition_phase(block: &Block, ctx: &BlockRender<'_>) -> Option<u8> {
     )
 }
 
+/// Tone of the rail that runs down a block's rows: the turn's edge. The
+/// user's side keeps the ivory of its marker, the agent's the identity green,
+/// a thought the violet it reasons in, a call still running the blue every
+/// live indicator uses, and settled work the quiet grey of the gutter.
+fn rail_tone(block: &Block, palette: &Palette) -> Option<Style> {
+    match block.kind() {
+        BlockKind::User(_) | BlockKind::QueuedUser(_) => Some(palette.user),
+        BlockKind::Assistant(_) => Some(palette.assistant),
+        BlockKind::Thinking(_) => Some(palette.reasoning),
+        BlockKind::Tool(_) => Some(match block.lifecycle {
+            BlockLifecycle::Pending | BlockLifecycle::Streaming => palette.accent,
+            _ => palette.muted,
+        }),
+        BlockKind::Work(_) | BlockKind::Receipt(_) => Some(palette.muted),
+        _ => None,
+    }
+}
+
 /// Marker of the prompt's header. The raised band tells the prompt from the
 /// answer wherever shades show; at 16 colors and under `NO_COLOR` the band
 /// collapses into the background, so the shape does it: the prompt takes the
@@ -4162,7 +4443,9 @@ fn user_message_lines(
                 )])
             }),
     );
-    lines.push(Line::default());
+    // One row of air inside the band closes the prompt, so the next turn never
+    // starts against the text.
+    lines.push(band(Vec::new()));
     if awaiting_agent {
         // The agent has not produced anything yet. Its header is already
         // here, in the row the first block will take over.
@@ -4332,6 +4615,12 @@ fn response_header_lines(
         Span::styled(format!("{marker} "), marker_style),
         Span::styled(assistant_label(lifecycle), label_style),
     ]));
+    // A rule closes the header, so every turn opens as a section and the
+    // agent's work reads under its own edge.
+    lines.push(Line::from(Span::styled(
+        "─".repeat(usize::from(ctx.width)),
+        ctx.palette.border,
+    )));
     lines
 }
 
@@ -6743,14 +7032,24 @@ fn model_group_of(provider: LoginProvider) -> usize {
     }
 }
 
-/// Reasoning depth as a meter over the levels this model offers, then the
-/// level's name: `▰▰▰▱ High`. The arrows in the footer move it. Bars, not
-/// dots, so it never reads as the `●` that marks the active model.
-fn effort_meter(
+/// Cells the effort field keeps when no model in the list offers a level:
+/// four rungs plus the arrows that adjust the focused one.
+const EFFORT_FIELD_MIN_CELLS: usize = 8;
+
+/// The effort field of a picker row: `← ▰▰▰▱ →` where the cursor is, the
+/// resting meter elsewhere, blanks for a model that offers no levels. The
+/// field is as wide as the deepest ladder in the list, so the level column
+/// never moves between rows.
+fn effort_field(
     levels: &[crate::api::ReasoningEffort],
-    current: crate::api::ReasoningEffort,
+    current: Option<crate::api::ReasoningEffort>,
+    focused: bool,
     capabilities: Capabilities,
+    cells: usize,
 ) -> String {
+    let Some(current) = current.filter(|_| !levels.is_empty()) else {
+        return " ".repeat(cells);
+    };
     let position = levels
         .iter()
         .position(|level| *level == current)
@@ -6760,12 +7059,237 @@ fn effort_meter(
     let meter: String = (0..levels.len())
         .map(|index| if index <= position { filled } else { empty })
         .collect();
-    format!("{meter} {}", current.label())
+    let core = if focused {
+        format!("← {meter} →")
+    } else {
+        format!("  {meter}  ")
+    };
+    let pad = cells.saturating_sub(UnicodeWidthStr::width(core.as_str()));
+    let lead = pad / 2;
+    format!(
+        "{}{core}{}",
+        " ".repeat(lead),
+        " ".repeat(pad.saturating_sub(lead))
+    )
+}
+
+/// Key glyphs of a picker's hint bar: the compact form where the font can
+/// show it, the spelled key where it cannot.
+struct HintKeys {
+    up_down: &'static str,
+    left_right: &'static str,
+    enter: &'static str,
+    tab: &'static str,
+    esc: &'static str,
+}
+
+/// The hint bar's keys at this terminal's depth.
+fn hint_keys(capabilities: Capabilities) -> HintKeys {
+    if capabilities.color_depth == ColorDepth::None {
+        HintKeys {
+            up_down: "↑↓",
+            left_right: "←→",
+            enter: "Enter",
+            tab: "Tab",
+            esc: "Esc",
+        }
+    } else {
+        HintKeys {
+            up_down: "↑↓",
+            left_right: "←→",
+            enter: "↵",
+            tab: "⇥",
+            esc: "esc",
+        }
+    }
+}
+
+/// Rows of a full-bleed picker panel. The panel reads as one surface with
+/// rules instead of a box: a header naming the command, an optional filter
+/// row, the list, an optional detail block for the focused item, and the hint
+/// bar. The list always keeps at least one row; the detail block yields first,
+/// then the filter.
+struct PickerRegions {
+    header: ratatui::layout::Rect,
+    filter: Option<ratatui::layout::Rect>,
+    list: ratatui::layout::Rect,
+    detail: Option<ratatui::layout::Rect>,
+}
+
+fn picker_regions(area: ratatui::layout::Rect, with_filter: bool, detail: u16) -> PickerRegions {
+    // Header, its rule, the closing rule and the hint bar are always spent,
+    // and the list keeps one row of its own; the filter brings a row and its
+    // rule, the detail block brings a rule and its rows.
+    const ALWAYS: u16 = 5;
+    let mut detail = detail;
+    let mut filter = with_filter;
+    let over = |filter: bool, detail: u16| {
+        ALWAYS + if filter { 2 } else { 0 } + if detail > 0 { detail + 1 } else { 0 } > area.height
+    };
+    while detail > 0 && over(filter, detail) {
+        detail -= 1;
+    }
+    if over(filter, detail) {
+        filter = false;
+    }
+    let row = |y: u16, height: u16| ratatui::layout::Rect {
+        x: area.x,
+        y,
+        width: area.width,
+        height,
+    };
+    let header = row(area.y, 1);
+    let mut y = area.y.saturating_add(2);
+    let filter = filter.then(|| {
+        let rect = row(y, 1);
+        y = y.saturating_add(2);
+        rect
+    });
+    let hints_y = area.bottom().saturating_sub(1);
+    let mut list_end = hints_y.saturating_sub(1);
+    let detail = (detail > 0).then(|| {
+        list_end = list_end.saturating_sub(detail + 1);
+        row(list_end.saturating_add(1), detail)
+    });
+    PickerRegions {
+        header,
+        filter,
+        list: row(y, list_end.saturating_sub(y)),
+        detail,
+    }
+}
+
+/// First row of a picker: the command it belongs to, then the position in the
+/// list, so the panel says what it is before it says what is in it.
+fn picker_header(command: &str, right: &str, width: usize, palette: &Palette) -> Line<'static> {
+    let used = 2 + UnicodeWidthStr::width(command) + UnicodeWidthStr::width(right);
+    Line::from(vec![
+        Span::styled("› ", palette.accent),
+        Span::styled(
+            command.to_owned(),
+            palette.text.add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ".repeat(width.saturating_sub(used).max(1)), palette.text),
+        Span::styled(right.to_owned(), palette.muted),
+    ])
+}
+
+/// The filter row of a picker: `/` and the draft, with the caret cell the
+/// cursor rides on. Empty, it invites typing.
+fn picker_filter(
+    filter: &str,
+    placeholder: &str,
+    width: usize,
+    palette: &Palette,
+) -> (Line<'static>, usize) {
+    let safe = sanitize_terminal_text(filter);
+    let budget = width.saturating_sub(4);
+    let (value, style) = if safe.is_empty() {
+        (
+            crate::view_model::truncate_display_width(placeholder, budget),
+            palette.muted,
+        )
+    } else {
+        (
+            crate::view_model::truncate_display_width(&safe, budget),
+            palette.text,
+        )
+    };
+    let (spans, caret) = if safe.is_empty() {
+        (
+            vec![
+                Span::styled("/ ", palette.muted),
+                Span::styled("▏", palette.accent),
+                Span::styled(value, style),
+            ],
+            2,
+        )
+    } else {
+        let caret = 2 + UnicodeWidthStr::width(value.as_str());
+        (
+            vec![
+                Span::styled("/ ", palette.muted),
+                Span::styled(value, style),
+                Span::styled("▏", palette.accent),
+            ],
+            caret,
+        )
+    };
+    (Line::from(spans), caret)
+}
+
+/// A hairline across the panel, in the tone the transcript uses for its own
+/// opening rule.
+fn picker_rule(width: usize, palette: &Palette) -> Line<'static> {
+    Line::from(Span::styled("─".repeat(width), palette.border))
+}
+
+/// The panel's last row: the keys that act on it, quiet, in the order the
+/// picker offers them.
+fn picker_hints(hints: &[&str], width: usize, palette: &Palette) -> Line<'static> {
+    let hint = hints
+        .iter()
+        .copied()
+        .find(|hint| UnicodeWidthStr::width(*hint) <= width)
+        .unwrap_or("esc fechar");
+    Line::from(Span::styled(hint.to_owned(), palette.muted))
+}
+
+/// Cells the level column takes in a picker row: the longest label (`xHigh`)
+/// plus its space, so rows without levels keep the column.
+const LEVEL_CELLS: usize = 6;
+
+/// One row of a picker's detail block: what the focused item is on the left,
+/// the numbers that describe it on the right.
+fn detail_row(
+    left: Vec<Span<'static>>,
+    right: String,
+    width: usize,
+    palette: &Palette,
+) -> Line<'static> {
+    let used: usize = left.iter().map(Span::width).sum();
+    let right_width = UnicodeWidthStr::width(right.as_str());
+    let gap = width.saturating_sub(used + right_width).max(1);
+    let mut spans = left;
+    spans.push(Span::styled(" ".repeat(gap), palette.text));
+    spans.push(Span::styled(right, palette.muted));
+    Line::from(spans)
+}
+
+/// Marker of a picker row: the accent chevron where the cursor is, a quiet dot
+/// everywhere else. One cell and its space, so labels share a column.
+fn picker_marker(selected: bool, palette: &Palette) -> Span<'static> {
+    if selected {
+        Span::styled("› ", palette.accent.add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("· ", palette.muted)
+    }
+}
+
+/// Label of a picker row: the navigation blue carries the focus, the text tone
+/// carries the rest.
+fn picker_label(text: String, selected: bool, palette: &Palette) -> Span<'static> {
+    if selected {
+        Span::styled(text, palette.accent.add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled(text, palette.text)
+    }
+}
+
+/// Position of the focused row among the choices, headings excluded. Without a
+/// choice under the cursor the panel only says how many there are.
+fn picker_position(choices: usize, focused: Option<usize>, noun: &str, plural: &str) -> String {
+    let plural = if choices == 1 { noun } else { plural };
+    match focused {
+        Some(index) => format!("{}/{choices} {plural}", index.saturating_add(1)),
+        None => format!("{choices} {plural}"),
+    }
 }
 
 /// `/model`: provider groups as section headings with their model count,
-/// models one step in under them, the focused model's effort as a meter, and
-/// a detail pane set apart by a rule. Height stays fixed while filtering.
+/// models one step in under them, the effort meter of the focused model, and
+/// the facts of that model under the list. The panel owns the terminal, the
+/// way a picker does in the Devin CLI.
 #[allow(clippy::too_many_arguments)]
 fn render_model_overlay(
     frame: &mut ratatui::Frame,
@@ -6782,13 +7306,11 @@ fn render_model_overlay(
     capabilities: Capabilities,
     cursor_focused: bool,
 ) {
-    let frame_area = frame.area();
-    let width = ((u32::from(frame_area.width) * 9) / 10) as u16;
-    let width = width.clamp(28, 84).min(frame_area.width);
-    // Keep the panel anchored while filtering or catalogs refresh. Only a
-    // terminal resize changes its geometry; the list scrolls inside it.
-    let height = frame_area.height.saturating_sub(2).clamp(1, 20);
-    let area = centered(frame_area, width, height);
+    // A picker owns the terminal: the transcript behind it is settled and the
+    // list is what the eye reads. Only a resize changes its geometry.
+    let area = frame.area();
+    let width = usize::from(area.width);
+    let keys = hint_keys(capabilities);
     let group_size = |group: usize| match group {
         0 => crate::api::ModelAlias::ALL.len(),
         1 => opencode.len(),
@@ -6796,36 +7318,84 @@ fn render_model_overlay(
         3 => command_code.len(),
         _ => zen.len(),
     };
-    let inner_width = usize::from(area.width.saturating_sub(2));
-    let inner_height = usize::from(area.height.saturating_sub(2));
-    let detail_rows = match inner_height {
-        11.. => 2,
-        7..=10 => 1,
+    let detail_rows = match area.height {
+        14.. => 2,
+        10..=13 => 1,
         _ => 0,
     };
-    // Detail rows sit under a rule; the footer closes the panel.
-    let reserved = detail_rows + usize::from(detail_rows > 0) + 1;
-    let capacity = inner_height.saturating_sub(reserved).max(1);
+    let regions = picker_regions(area, true, detail_rows);
+    let capacity = usize::from(regions.list.height).max(1);
     let window = visible_window(
         rows.len(),
         overlay.selected,
         capacity,
         overlay.viewport_start,
     );
-    // Rows span the inner width less one cell of breathing room each side.
-    let row_budget = inner_width.saturating_sub(1);
+    let choices = rows
+        .iter()
+        .filter(|row| !matches!(row, ModelRow::Header(_)))
+        .count();
+    let focused = rows.get(overlay.selected);
+    let focused_choice = rows
+        .get(..overlay.selected.min(rows.len().saturating_sub(1)))
+        .map_or(0, |before| {
+            before
+                .iter()
+                .filter(|row| !matches!(row, ModelRow::Header(_)))
+                .count()
+        });
+    let position = picker_position(
+        choices,
+        focused
+            .filter(|row| !matches!(row, ModelRow::Header(_)))
+            .map(|_| focused_choice),
+        "modelo",
+        "modelos",
+    );
+    // The effort field is as wide as the deepest ladder any row shows, so the
+    // level column is one axis for the whole list.
+    let field_cells = EFFORT_FIELD_MIN_CELLS.max(
+        crate::api::ModelAlias::ALL
+            .iter()
+            .map(|alias| crate::api::ReasoningEffort::supported(*alias).len())
+            .chain(opencode.iter().map(|model| model.reasoning_levels.len()))
+            .chain(clinepass.iter().map(|model| model.reasoning_levels.len()))
+            .chain(
+                command_code
+                    .iter()
+                    .map(|model| model.reasoning_levels.len()),
+            )
+            .chain(zen.iter().map(|model| model.reasoning_levels.len()))
+            .max()
+            .unwrap_or(0)
+            .max(4)
+            + 4,
+    );
     let mut lines: Vec<Line> = Vec::new();
+    lines.push(picker_header("/model", &position, width, palette));
+    lines.push(picker_rule(width, palette));
+    let mut filter_caret = 0;
+    if regions.filter.is_some() {
+        let (line, caret) = picker_filter(
+            &overlay.filter,
+            "filtrar por nome ou provedor",
+            width,
+            palette,
+        );
+        lines.push(line);
+        lines.push(picker_rule(width, palette));
+        filter_caret = caret;
+    }
+    let list_start = lines.len();
     if rows.is_empty() {
         lines.push(Line::from(Span::styled(
-            truncate_cells(" Nenhum modelo corresponde ao filtro", inner_width),
+            " Nenhum modelo corresponde ao filtro",
             palette.muted,
         )));
     }
     for index in window {
         let row = &rows[index];
         let selected = index == overlay.selected;
-        let marker = if selected { "> " } else { "  " };
-        let style = focus_text(selected, palette);
         let spans = if let ModelRow::Header(group) = row {
             // `▾ OpenAI Codex ───── 4`: a heading, not a choice.
             let fold = if overlay.collapsed[*group] {
@@ -6835,22 +7405,26 @@ fn render_model_overlay(
             };
             let title = model_group_title(*group);
             let count = group_size(*group).to_string();
-            let used = 2 + 2 + UnicodeWidthStr::width(title) + 1 + 1 + count.len();
-            let rule = row_budget.saturating_sub(used);
-            let heading = if selected { style } else { palette.secondary };
-            let mut spans = vec![
-                Span::styled(marker.to_owned(), style),
-                Span::styled(format!("{fold} "), palette.muted),
+            // The fold caret stands in the gutter the choices mark, so the
+            // heading sits one step out from the models under it.
+            let used = 2 + UnicodeWidthStr::width(title) + 2 + count.len();
+            let rule = width.saturating_sub(used).max(1);
+            let heading = if selected {
+                palette.text.add_modifier(Modifier::BOLD)
+            } else {
+                palette.secondary
+            };
+            let caret = if selected {
+                palette.accent.add_modifier(Modifier::BOLD)
+            } else {
+                palette.muted
+            };
+            vec![
+                Span::styled(format!("{fold} "), caret),
                 Span::styled(title.to_owned(), heading),
-            ];
-            if rule > 0 {
-                spans.push(Span::styled(
-                    format!(" {} ", "─".repeat(rule)),
-                    palette.border,
-                ));
-                spans.push(Span::styled(count, palette.muted));
-            }
-            spans
+                Span::styled(format!(" {}", "─".repeat(rule)), palette.border),
+                Span::styled(format!(" {count}"), palette.muted),
+            ]
         } else {
             let choice = row.choice(opencode, clinepass, command_code, zen);
             let active = choice.as_ref().is_some_and(|choice| {
@@ -6860,69 +7434,85 @@ fn render_model_overlay(
             let name = choice
                 .as_ref()
                 .map_or_else(String::new, |choice| sanitize_terminal_text(&choice.name));
+            // The effort column is the meter of the level in use where the
+            // cursor rests or on the model in use; elsewhere it stays blank,
+            // so the column never moves and the eye scans one axis.
+            let current = choice
+                .as_ref()
+                .filter(|_| selected || active)
+                .map(|choice| overlay.pending_effort(choice, active_effort));
+            let levels = choice
+                .as_ref()
+                .map(|choice| choice.levels.as_slice())
+                .unwrap_or(&[]);
+            let meter = effort_field(levels, current, selected, capabilities, field_cells);
+            let level = current.map_or_else(String::new, |effort| effort.label().to_owned());
             // The right column says the one thing worth reading on this row:
-            // the adjustable effort where the cursor is, the effort in use on
-            // the active model, or the provider of a search result.
-            let (right, right_style) = match &choice {
-                Some(choice) if selected && !choice.levels.is_empty() => (
-                    effort_meter(
-                        &choice.levels,
-                        overlay.pending_effort(choice, active_effort),
-                        capabilities,
-                    ),
-                    palette.link,
-                ),
-                Some(choice) if active && !choice.levels.is_empty() => (
-                    overlay
-                        .pending_effort(choice, active_effort)
-                        .label()
-                        .to_owned(),
-                    palette.muted,
-                ),
-                Some(choice) if !overlay.filter.is_empty() => (
-                    model_group_title(model_group_of(choice.target.provider())).to_owned(),
-                    palette.muted,
-                ),
-                _ => (String::new(), palette.muted),
-            };
-            let active_marker = if active {
-                format!("{} ", glyph(capabilities, '\u{25cf}', '*'))
+            // the model in use, or the speed the focused alias toggles.
+            let speed = selected
+                && choice.as_ref().is_some_and(|choice| {
+                    matches!(choice.target, crate::app::EffortTarget::Alias(_))
+                });
+            let speed_label = if overlay.pending_fast {
+                "Rápida"
             } else {
-                "  ".to_owned()
+                "Normal"
             };
-            // Under a heading, models sit one step in.
-            let indent = if overlay.filter.is_empty() { "  " } else { "" };
-            let lead = 2 + indent.len() + 2;
+            let right = match (active, speed) {
+                (true, true) => format!("● em uso · {} velocidade {speed_label}", keys.tab),
+                (true, false) => "● em uso".to_owned(),
+                (false, true) => format!("{} velocidade {speed_label}", keys.tab),
+                (false, false) => String::new(),
+            };
             let right_width = UnicodeWidthStr::width(right.as_str());
-            let name = truncate_cells(
-                &name,
-                row_budget.saturating_sub(lead + right_width + usize::from(right_width > 0) * 2),
-            );
-            let gap = row_budget
-                .saturating_sub(lead + UnicodeWidthStr::width(name.as_str()) + right_width)
-                .max(1);
+            // Under a heading, models sit one step in; a filtered list has no
+            // headings left to nest under.
+            let indent = if overlay.filter.is_empty() { "  " } else { "" };
+            // A name column that grew with the terminal would push the effort
+            // far from what it describes; it stops at a name's length and the
+            // gap takes the rest.
+            let name_budget = width
+                .saturating_sub(4 + indent.len() + field_cells + LEVEL_CELLS + right_width + 2)
+                .clamp(6, 32);
+            let name = pad_cells(&truncate_cells(&name, name_budget), name_budget);
+            let used = 2 + indent.len() + name_budget + 1 + field_cells + 1 + LEVEL_CELLS;
+            let gap = width.saturating_sub(used + right_width).max(1);
+            let meter_style = if selected {
+                palette.accent
+            } else if active {
+                palette.secondary
+            } else {
+                palette.muted
+            };
+            let level_style = if selected {
+                palette.text.add_modifier(Modifier::BOLD)
+            } else if active {
+                palette.secondary
+            } else {
+                palette.muted
+            };
             let mut spans = vec![
-                Span::styled(marker.to_owned(), style),
+                picker_marker(selected, palette),
                 Span::raw(indent),
-                Span::styled(active_marker, if active { palette.success } else { style }),
-                Span::styled(name, style),
+                picker_label(name, selected, palette),
+                Span::styled(" ".to_owned(), palette.text),
+                Span::styled(meter, meter_style),
+                Span::styled(" ".to_owned(), palette.text),
+                Span::styled(format!("{level:<LEVEL_CELLS$}"), level_style),
             ];
             if !right.is_empty() {
-                spans.push(Span::raw(" ".repeat(gap)));
-                spans.push(Span::styled(right, right_style));
+                spans.push(Span::styled(" ".repeat(gap), palette.text));
+                spans.push(Span::styled(right, palette.muted));
             }
             spans
         };
-        lines.push(menu_line(spans, selected, inner_width, palette));
+        lines.push(menu_line(spans, selected, width, palette));
     }
-    while lines.len() < capacity {
+    while lines.len() < list_start + capacity {
         lines.push(Line::default());
     }
-    if detail_rows > 0 {
-        lines.push(Line::from(Span::styled(
-            format!(" {}", "─".repeat(inner_width.saturating_sub(2))),
-            palette.border,
-        )));
+    if let Some(detail) = regions.detail {
+        lines.push(picker_rule(width, palette));
         let focused_row = rows.get(overlay.selected);
         let focused =
             focused_row.and_then(|row| row.choice(opencode, clinepass, command_code, zen));
@@ -6951,29 +7541,19 @@ fn render_model_overlay(
             if choice.accepts_images == Some(true) {
                 facts.push("imagens".to_owned());
             }
-            if matches!(choice.target, crate::app::EffortTarget::Alias(_)) {
-                facts.push(format!(
-                    "velocidade {}",
-                    if overlay.pending_fast {
-                        "Rápida"
-                    } else {
-                        "Normal"
-                    }
-                ));
-            }
             facts.push("só nesta sessão".to_owned());
             (
                 vec![
                     Span::styled(
-                        format!(" {}", sanitize_terminal_text(&choice.name)),
+                        format!(
+                            " {} · {}",
+                            model_group_title(model_group_of(choice.target.provider())),
+                            sanitize_terminal_text(&choice.name)
+                        ),
                         palette.text,
                     ),
                     Span::styled(
-                        format!(
-                            "  {} · {}",
-                            sanitize_terminal_text(&choice.id),
-                            model_group_title(model_group_of(choice.target.provider()))
-                        ),
+                        format!("  {}", sanitize_terminal_text(&choice.id)),
                         palette.muted,
                     ),
                 ],
@@ -6999,29 +7579,46 @@ fn render_model_overlay(
         } else {
             (Vec::new(), String::new())
         };
-        lines.push(Line::from(truncate_spans(title, inner_width)));
-        if detail_rows > 1 {
-            lines.push(Line::from(Span::styled(
-                truncate_cells(&format!(" {facts}"), inner_width),
-                palette.muted,
-            )));
+        lines.push(detail_row(title, facts, width, palette));
+        if detail.height > 1 {
+            let levels = focused
+                .as_ref()
+                .filter(|choice| !choice.levels.is_empty())
+                .map(|choice| {
+                    format!(
+                        " esforço {}",
+                        choice
+                            .levels
+                            .iter()
+                            .map(|level| level.id())
+                            .collect::<Vec<_>>()
+                            .join(" · ")
+                    )
+                })
+                .unwrap_or_default();
+            let speed = focused
+                .as_ref()
+                .filter(|choice| matches!(choice.target, crate::app::EffortTarget::Alias(_)))
+                .map(|_| {
+                    format!(
+                        "velocidade {} ({} alterna)",
+                        if overlay.pending_fast {
+                            "Rápida"
+                        } else {
+                            "Normal"
+                        },
+                        keys.tab
+                    )
+                })
+                .unwrap_or_default();
+            lines.push(detail_row(
+                vec![Span::styled(levels, palette.muted)],
+                speed,
+                width,
+                palette,
+            ));
         }
     }
-    // The position counts models; headings are not choices.
-    let models = rows
-        .iter()
-        .filter(|row| !matches!(row, ModelRow::Header(_)))
-        .count();
-    let position = match rows.get(overlay.selected) {
-        Some(ModelRow::Header(_)) | None => format!("{models} modelos"),
-        Some(_) => format!(
-            "{}/{models}",
-            rows[..=overlay.selected]
-                .iter()
-                .filter(|row| !matches!(row, ModelRow::Header(_)))
-                .count()
-        ),
-    };
     let speed_hint = rows
         .get(overlay.selected)
         .is_some_and(|row| matches!(row, ModelRow::Alias(_)));
@@ -7029,68 +7626,101 @@ fn render_model_overlay(
         .get(overlay.selected)
         .and_then(|row| row.choice(opencode, clinepass, command_code, zen))
         .is_some_and(|choice| !choice.levels.is_empty());
-    let hints: &[&str] = if !effort_hint {
-        &[
-            "↑↓ navegar · Enter aplicar · Esc fechar",
-            "Enter aplicar · Esc fechar",
+    let hints: Vec<String> = if !effort_hint {
+        vec![
+            format!(
+                "{} navegar · {} aplicar · {} fechar",
+                keys.up_down, keys.enter, keys.esc
+            ),
+            format!("{} aplicar · {} fechar", keys.enter, keys.esc),
         ]
     } else if speed_hint {
-        &[
-            "↑↓ navegar · ←→ esforço · Tab velocidade · Enter aplicar · Esc fechar",
-            "←→ esforço · Tab velocidade · Enter aplicar · Esc fechar",
-            "←→ esforço · Tab velocidade · Enter aplicar",
-            "Enter aplicar · Esc fechar",
+        vec![
+            format!(
+                "{} navegar · {} esforço · {} velocidade · {} aplicar · {} fechar",
+                keys.up_down, keys.left_right, keys.tab, keys.enter, keys.esc
+            ),
+            format!(
+                "{} esforço · {} velocidade · {} aplicar · {} fechar",
+                keys.left_right, keys.tab, keys.enter, keys.esc
+            ),
+            format!(
+                "{} esforço · {} velocidade · {} aplicar",
+                keys.left_right, keys.tab, keys.enter
+            ),
+            format!("{} aplicar · {} fechar", keys.enter, keys.esc),
         ]
     } else {
-        &[
-            "↑↓ navegar · ←→ esforço · Enter aplicar · Esc fechar",
-            "←→ esforço · Enter aplicar · Esc fechar",
-            "Enter aplicar · Esc fechar",
+        vec![
+            format!(
+                "{} navegar · {} esforço · {} aplicar · {} fechar",
+                keys.up_down, keys.left_right, keys.enter, keys.esc
+            ),
+            format!(
+                "{} esforço · {} aplicar · {} fechar",
+                keys.left_right, keys.enter, keys.esc
+            ),
+            format!("{} aplicar · {} fechar", keys.enter, keys.esc),
         ]
     };
-    lines.push(modal_footer(&position, hints, inner_width, palette));
-    let (block, cursor) = filter_modal_block("Modelo", &overlay.filter, area.width, palette);
+    let hints: Vec<&str> = hints.iter().map(String::as_str).collect();
+    lines.push(picker_rule(width, palette));
+    lines.push(picker_hints(&hints, width, palette));
     frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    frame.render_widget(Paragraph::new(lines).style(palette.surface_alt), area);
     if cursor_focused {
-        set_filter_cursor(frame, area, cursor);
+        if let Some(filter) = regions.filter {
+            set_cursor_in_rect(frame, filter, filter_caret, 0);
+        }
     }
 }
 
 /// `/resume` and `/rewind` lists: filter line, one row per session or turn,
-/// a detail line for the focused row and a `n/total` footer (§15.8).
+/// a detail line for the focused row and a `n/total` header (§15.8). Same
+/// panel anatomy as `/model`, so every picker is learned once.
 fn render_session_picker(
     frame: &mut ratatui::Frame,
     picker: &crate::session_picker::SessionPicker,
     palette: &Palette,
+    capabilities: Capabilities,
     cursor_focused: bool,
 ) {
     use crate::session_picker::{compact_size, relative_age, PickerKind, PickerRow};
-    let frame_area = frame.area();
-    let width = ((u32::from(frame_area.width) * 9) / 10) as u16;
-    let width = width.clamp(28, 96).min(frame_area.width);
-    // Sized by the unfiltered list so typing a filter never resizes the panel:
-    // detail line, footer and borders around the rows (min 3).
-    let listed = picker.counts().1.max(3);
-    let height = u16::try_from(listed + 4)
-        .unwrap_or(u16::MAX)
-        .min(frame_area.height.saturating_sub(2).clamp(1, 20));
-    let area = centered(frame_area, width, height);
-    let inner_width = usize::from(area.width.saturating_sub(2));
-    let inner_height = usize::from(area.height.saturating_sub(2));
+    let area = frame.area();
+    let width = usize::from(area.width);
+    let keys = hint_keys(capabilities);
     let rewind = picker.kind == PickerKind::Rewind;
-
-    let mut lines: Vec<Line> = Vec::new();
-
+    let regions = picker_regions(area, true, 1);
     let rows = picker.rows();
     let (shown, total) = picker.counts();
-    // Detail line and footer are fixed; the list gets the rest.
-    // The rewind note is a promise about what does not come back, so it yields
-    // last: it stays as long as the panel can also show one row.
-    let detail_rows = usize::from(inner_height >= if rewind { 4 } else { 5 });
-    let capacity = inner_height.saturating_sub(1 + detail_rows).max(1);
+    let capacity = usize::from(regions.list.height).max(1);
     let window =
         crate::picker::visible_window(rows.len(), picker.selected, capacity, picker.viewport_start);
+    let position = if shown == 0 {
+        "0/0".to_owned()
+    } else if shown == total {
+        format!("{}/{shown}", picker.selected.saturating_add(1))
+    } else {
+        format!("{}/{shown} de {total}", picker.selected.saturating_add(1))
+    };
+    let mut lines: Vec<Line> = vec![
+        picker_header(
+            if rewind { "/rewind" } else { "/resume" },
+            &position,
+            width,
+            palette,
+        ),
+        picker_rule(width, palette),
+    ];
+    let mut filter_caret = 0;
+    if regions.filter.is_some() {
+        let (line, caret) =
+            picker_filter(&picker.filter, "filtrar por nome ou prompt", width, palette);
+        lines.push(line);
+        lines.push(picker_rule(width, palette));
+        filter_caret = caret;
+    }
+    let list_start = lines.len();
     let placeholder = if picker.loading {
         Some((" Carregando…".to_owned(), palette.muted))
     } else if let Some(error) = &picker.error {
@@ -7105,18 +7735,15 @@ fn render_session_picker(
     } else {
         None
     };
-    let mut list_lines = 0usize;
     if let Some((text, style)) = placeholder {
         lines.push(Line::from(Span::styled(
-            truncate_cells(&text, inner_width),
+            truncate_cells(&text, width),
             style,
         )));
-        list_lines += 1;
     } else {
         for position in window {
             let selected = position == picker.selected;
-            let marker = if selected { "> " } else { "  " };
-            let (label, label_style, meta, meta_style) = match rows[position] {
+            let (label, meta, meta_style) = match rows[position] {
                 PickerRow::Session(session) => {
                     let mut label = match (&session.title, session.first_prompt.is_empty()) {
                         (Some(title), false) => {
@@ -7138,29 +7765,21 @@ fn render_session_picker(
                         meta.push(age);
                     }
                     meta.push(compact_size(session.bytes));
-                    let style = if session.current || session.in_use {
-                        palette.muted
-                    } else {
-                        focus_text(selected, palette)
-                    };
                     let meta_style = if session.in_use && !session.current {
                         palette.warning
                     } else {
                         palette.muted
                     };
-                    (label, style, meta.join(" · "), meta_style)
+                    (label, meta.join(" · "), meta_style)
                 }
                 PickerRow::Turn(turn) => {
                     let removed = picker.turns.len().saturating_sub(turn.index);
-                    let label = format!(
-                        "#{} {}",
-                        turn.index + 1,
-                        sanitize_terminal_text(&turn.prompt)
-                    );
-                    let style = focus_text(selected, palette);
                     (
-                        label,
-                        style,
+                        format!(
+                            "#{} {}",
+                            turn.index + 1,
+                            sanitize_terminal_text(&turn.prompt)
+                        ),
                         format!(
                             "volta {removed} turno{}",
                             if removed == 1 { "" } else { "s" }
@@ -7170,32 +7789,33 @@ fn render_session_picker(
                 }
             };
             let meta_width = UnicodeWidthStr::width(meta.as_str());
-            let label_budget = inner_width.saturating_sub(2 + meta_width + 2).max(4);
-            let label = truncate_cells(&label, label_budget);
+            let label = truncate_cells(&label, width.saturating_sub(meta_width + 6).max(4));
             let used = 2 + UnicodeWidthStr::width(label.as_str());
-            let gap = inner_width.saturating_sub(used + meta_width).max(1);
-            let spans = vec![
-                Span::styled(marker.to_owned(), label_style),
-                Span::styled(label, label_style),
-                Span::raw(" ".repeat(gap)),
-                Span::styled(
-                    meta,
-                    if selected {
-                        palette.secondary
-                    } else {
-                        meta_style
-                    },
-                ),
-            ];
-            lines.push(menu_line(spans, selected, inner_width, palette));
-            list_lines += 1;
+            let gap = width.saturating_sub(used + meta_width).max(1);
+            lines.push(menu_line(
+                vec![
+                    picker_marker(selected, palette),
+                    picker_label(label, selected, palette),
+                    Span::styled(" ".repeat(gap), palette.text),
+                    Span::styled(
+                        meta,
+                        if selected {
+                            palette.secondary
+                        } else {
+                            meta_style
+                        },
+                    ),
+                ],
+                selected,
+                width,
+                palette,
+            ));
         }
     }
-    while list_lines < capacity {
+    while lines.len() < list_start + capacity {
         lines.push(Line::default());
-        list_lines += 1;
     }
-    if detail_rows > 0 {
+    if regions.detail.is_some() {
         let detail = match picker.selected_row() {
             Some(PickerRow::Session(session)) => format!(" {}", session.id),
             Some(PickerRow::Turn(_)) => {
@@ -7206,37 +7826,31 @@ fn render_session_picker(
             }
             None => String::new(),
         };
-        lines.push(Line::from(Span::styled(
-            truncate_cells(&detail, inner_width),
-            palette.secondary,
-        )));
+        lines.push(picker_rule(width, palette));
+        lines.push(detail_row(
+            vec![Span::styled(detail, palette.secondary)],
+            String::new(),
+            width,
+            palette,
+        ));
     }
-    let position = if shown == 0 {
-        "0/0".to_owned()
-    } else if shown == total {
-        format!("{}/{shown}", picker.selected.saturating_add(1))
-    } else {
-        format!("{}/{shown} de {total}", picker.selected.saturating_add(1))
-    };
+    lines.push(picker_rule(width, palette));
     let action = if rewind { "voltar" } else { "retomar" };
-    let long = format!("↑↓ navegar · Enter {action} · Esc fechar");
-    let short = format!("Enter {action} · Esc fechar");
-    lines.push(modal_footer(
-        &position,
-        &[long.as_str(), short.as_str()],
-        inner_width,
-        palette,
-    ));
-    let title = if rewind {
-        "Voltar a um turno · nova sessão"
-    } else {
-        "Retomar sessão"
-    };
-    let (block, cursor) = filter_modal_block(title, &picker.filter, area.width, palette);
+    let hints = [
+        format!(
+            "{} navegar · {} {action} · {} fechar",
+            keys.up_down, keys.enter, keys.esc
+        ),
+        format!("{} {action} · {} fechar", keys.enter, keys.esc),
+    ];
+    let hints: Vec<&str> = hints.iter().map(String::as_str).collect();
+    lines.push(picker_hints(&hints, width, palette));
     frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    frame.render_widget(Paragraph::new(lines).style(palette.surface_alt), area);
     if cursor_focused {
-        set_filter_cursor(frame, area, cursor);
+        if let Some(filter) = regions.filter {
+            set_cursor_in_rect(frame, filter, filter_caret, 0);
+        }
     }
 }
 
@@ -7369,57 +7983,109 @@ fn job_state_label(state: &str) -> &str {
     }
 }
 
-fn render_effort_overlay(frame: &mut ratatui::Frame, overlay: &EffortOverlay, palette: &Palette) {
+fn render_effort_overlay(
+    frame: &mut ratatui::Frame,
+    overlay: &EffortOverlay,
+    active: crate::api::ReasoningEffort,
+    active_model: &str,
+    palette: &Palette,
+    capabilities: Capabilities,
+) {
+    let area = frame.area();
+    let width = usize::from(area.width);
+    let keys = hint_keys(capabilities);
     let levels = overlay.levels();
-    // The speed row only exists for Codex aliases; catalog steps are one row
-    // shorter instead of advertising a toggle that does nothing.
     let speed = overlay.speed_toggle();
-    let area = centered(
-        frame.area(),
-        72,
-        (levels.len() * 2 + if speed { 6 } else { 5 }) as u16,
-    );
-    let mut lines = vec![Line::default()];
+    let regions = picker_regions(area, false, 1);
+    let filled = glyph(capabilities, '\u{25b0}', '#');
+    let empty = glyph(capabilities, '\u{25b1}', '-');
+    let mut lines: Vec<Line> = vec![
+        picker_header("/effort", active_model, width, palette),
+        picker_rule(width, palette),
+    ];
     for (index, effort) in levels.iter().enumerate() {
         let selected = index == overlay.selected;
-        let marker = if selected { "> " } else { "  " };
-        let style = focus_text(selected, palette);
-        lines.push(menu_line(
+        let in_use = *effort == active;
+        // The ladder marks where this level sits; the row in use says so.
+        let meter: String = levels
+            .iter()
+            .enumerate()
+            .map(|(step, _)| if step <= index { filled } else { empty })
+            .collect();
+        let right = if in_use { "● em uso" } else { "" };
+        let mut spans = vec![
+            picker_marker(selected, palette),
+            picker_label(
+                pad_cells(effort.label(), LEVEL_CELLS + 2),
+                selected,
+                palette,
+            ),
+            Span::styled(
+                meter,
+                if selected {
+                    palette.accent
+                } else {
+                    palette.muted
+                },
+            ),
+            Span::styled("   ".to_owned(), palette.text),
+            Span::styled(effort.description().to_owned(), palette.muted),
+        ];
+        if !right.is_empty() {
+            let used: usize = spans.iter().map(Span::width).sum();
+            let gap = width
+                .saturating_sub(used + UnicodeWidthStr::width(right))
+                .max(1);
+            spans.push(Span::styled(" ".repeat(gap), palette.text));
+            spans.push(Span::styled("● ".to_owned(), palette.success));
+            spans.push(Span::styled("em uso".to_owned(), palette.muted));
+        }
+        lines.push(menu_line(spans, selected, width, palette));
+    }
+    while lines.len() < 2 + usize::from(regions.list.height) {
+        lines.push(Line::default());
+    }
+    if regions.detail.is_some() {
+        let right = if speed {
+            format!(
+                "velocidade {} ({} alterna)",
+                if overlay.fast { "Rápida" } else { "Normal" },
+                keys.tab
+            )
+        } else {
+            String::new()
+        };
+        lines.push(picker_rule(width, palette));
+        lines.push(detail_row(
             vec![Span::styled(
-                format!("{marker}{:<6}  {}", effort.label(), effort.description()),
-                style,
+                " esforço e velocidade valem só nesta sessão".to_owned(),
+                palette.muted,
             )],
-            selected,
-            usize::from(area.width.saturating_sub(2)),
+            right,
+            width,
             palette,
         ));
-        if index + 1 < levels.len() {
-            lines.push(Line::default());
-        }
     }
-    lines.push(Line::default());
-    if speed {
-        lines.push(Line::from(Span::styled(
-            format!(
-                " Velocidade: {} · Tab alternar",
-                if overlay.fast {
-                    "Rápida (maior uso)"
-                } else {
-                    "Normal"
-                }
-            ),
-            palette.muted,
-        )));
-    }
-    lines.push(Line::from(Span::styled(
-        " Enter selecionar · Esc voltar",
-        palette.muted,
-    )));
+    lines.push(picker_rule(width, palette));
+    let hints = [
+        format!(
+            "{} navegar · {} ajustar · {} velocidade · {} aplicar · {} fechar",
+            keys.up_down, keys.left_right, keys.tab, keys.enter, keys.esc
+        ),
+        format!(
+            "{} navegar · {} ajustar · {} aplicar · {} fechar",
+            keys.up_down, keys.left_right, keys.enter, keys.esc
+        ),
+        format!(
+            "{} ajustar · {} aplicar · {} fechar",
+            keys.left_right, keys.enter, keys.esc
+        ),
+        format!("{} aplicar · {} fechar", keys.enter, keys.esc),
+    ];
+    let hints: Vec<&str> = hints.iter().map(String::as_str).collect();
+    lines.push(picker_hints(&hints, width, palette));
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(lines).block(modal_block(" Selecionar esforço ", palette)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).style(palette.surface_alt), area);
 }
 
 fn masked_api_key(key: &crate::api::SensitiveText, budget: usize) -> String {
@@ -7624,6 +8290,7 @@ fn render_slash_popup(
         Some(suggestions.selected),
         inner_width.saturating_sub(2),
         palette,
+        false,
     );
     let selected_row = rows
         .iter()
@@ -7738,36 +8405,29 @@ fn render_mention_popup(
     );
 }
 
+/// `/` or `Ctrl+P`: the command palette as a picker panel. The typed text is
+/// the filter, so it rides in the header instead of spending a row of its own.
+#[allow(clippy::too_many_arguments)]
 fn render_palette(
     frame: &mut ratatui::Frame,
     query: &str,
     selected: usize,
     viewport_start: usize,
     palette: &Palette,
+    capabilities: Capabilities,
     cache: &mut WrapCache,
     cursor_focused: bool,
 ) {
     let matches = cache.palette_matches(query);
-    let frame_area = frame.area();
-    let width = (((u32::from(frame_area.width) * 4) / 5) as u16)
-        .clamp(38, 76)
-        .min(frame_area.width);
-    let height = frame_area.height.saturating_sub(2).clamp(1, 18);
-    let area = centered(frame_area, width, height);
-    let inner = ratatui::layout::Rect {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    };
-    let inner_width = usize::from(inner.width);
-    let row_width = usize::from(area.width.saturating_sub(4));
-    let rows = grouped_command_lines(&matches, Some(selected), row_width, palette);
+    let area = frame.area();
+    let width = usize::from(area.width);
+    let keys = hint_keys(capabilities);
+    let regions = picker_regions(area, false, 0);
+    let rows = grouped_command_lines(&matches, Some(selected), width, palette, true);
     // The viewport is measured in rendered rows, not command indices: group
-    // headings consume the same vertical space as a command and therefore
-    // must participate in keeping the focused command visible. The footer is
-    // the only fixed row; the filter sits in the title.
-    let capacity = usize::from(inner.height.saturating_sub(1)).max(1);
+    // headings and the focused command's description consume the same vertical
+    // space as a command, so they participate in keeping the focus visible.
+    let capacity = usize::from(regions.list.height).max(1);
     let selected_row = rows
         .iter()
         .position(|row| row.command_index == Some(selected));
@@ -7782,39 +8442,87 @@ fn render_palette(
         capacity,
     );
     let end = start.saturating_add(capacity).min(rows.len());
-    let mut lines: Vec<Line> = rows[start..end]
-        .iter()
-        .map(|row| row.line.clone())
-        .collect();
+    let (header, caret) = palette_header(query, selected, matches.len(), width, palette);
+    let mut lines: Vec<Line> = vec![header, picker_rule(width, palette)];
+    let list_start = lines.len();
     if rows.is_empty() {
         lines.push(Line::from(Span::styled(
             " Nenhum comando encontrado",
             palette.muted,
         )));
+    } else {
+        lines.extend(rows[start..end].iter().map(|row| row.line.clone()));
     }
-    while lines.len() < usize::from(inner.height.saturating_sub(1)) {
+    while lines.len() < list_start + capacity {
         lines.push(Line::default());
     }
-    let position = if matches.is_empty() {
+    lines.push(picker_rule(width, palette));
+    let hints = [
+        format!(
+            "{} navegar · {} executar · {} fechar",
+            keys.up_down, keys.enter, keys.esc
+        ),
+        format!("{} executar · {} fechar", keys.enter, keys.esc),
+    ];
+    let hints: Vec<&str> = hints.iter().map(String::as_str).collect();
+    lines.push(picker_hints(&hints, width, palette));
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).style(palette.surface_alt), area);
+    if cursor_focused {
+        set_cursor_in_rect(frame, regions.header, caret, 0);
+    }
+}
+
+/// First row of the palette: the draft as it is typed, and how far the list
+/// has moved. Empty, it invites typing where the cursor rests.
+fn palette_header(
+    query: &str,
+    selected: usize,
+    matches: usize,
+    width: usize,
+    palette: &Palette,
+) -> (Line<'static>, usize) {
+    let safe = sanitize_terminal_text(query);
+    let (value, style) = if safe.is_empty() {
+        (
+            crate::view_model::truncate_display_width("digite um comando", width.saturating_sub(6)),
+            palette.muted,
+        )
+    } else {
+        (
+            crate::view_model::truncate_display_width(&safe, width.saturating_sub(6)),
+            palette.text,
+        )
+    };
+    let empty = safe.is_empty();
+    let caret = if empty {
+        3
+    } else {
+        3 + UnicodeWidthStr::width(value.as_str())
+    };
+    let position = if matches == 0 {
         "0/0".to_owned()
     } else {
-        format!("{}/{}", selected.saturating_add(1), matches.len())
+        format!("{}/{}", selected.saturating_add(1), matches)
     };
-    lines.push(modal_footer(
-        &position,
-        &[
-            "↑↓ navegar · Enter executar · Esc fechar",
-            "Enter executar · Esc fechar",
-        ],
-        inner_width,
-        palette,
-    ));
-    let (block, cursor) = filter_modal_block("Comandos", query, area.width, palette);
-    frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-    if cursor_focused {
-        set_filter_cursor(frame, area, cursor);
+    let used = caret
+        + UnicodeWidthStr::width(value.as_str())
+        + UnicodeWidthStr::width(position.as_str())
+        + 2;
+    let mut spans = vec![Span::styled("› /", palette.accent)];
+    if empty {
+        spans.push(Span::styled("▏", palette.accent));
     }
+    spans.push(Span::styled(value, style));
+    if !empty {
+        spans.push(Span::styled("▏", palette.accent));
+    }
+    spans.push(Span::styled(
+        " ".repeat(width.saturating_sub(used).max(1)),
+        palette.text,
+    ));
+    spans.push(Span::styled(position, palette.muted));
+    (Line::from(spans), caret)
 }
 
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -7944,48 +8652,66 @@ fn slow_spinner_glyph(elapsed_ms: u64, capabilities: Capabilities) -> char {
     }
 }
 
+/// Shortcut a command already has outside the palette, if any.
+fn palette_command_hint(command: &str) -> &'static str {
+    match command {
+        "/model" => "Ctrl+L",
+        "/mode" => "Shift+Tab",
+        _ => "",
+    }
+}
+
+/// Cells a command name takes before its description: wide enough for the
+/// longest command, narrow enough to leave the description a reading measure.
+const PALETTE_HEAD_CELLS: usize = 24;
+/// Cells a description needs before it is worth a row of its own; below that
+/// the name keeps the whole width instead of trailing a stub.
+const PALETTE_DESCRIPTION_CELLS: usize = 12;
+
 fn palette_command_line(
     command: &str,
     selected_here: bool,
     width: usize,
     palette: &Palette,
+    describe_below: bool,
 ) -> Line<'static> {
-    let marker = if selected_here { "> " } else { "  " };
-    let style = focus_text(selected_here, palette);
     let detail = crate::reducer::palette_description(command);
-    let head_width = if detail.is_empty() {
-        width
-    } else {
-        (width / 3).clamp(13, 24).min(width)
-    };
-    let head = format!(
-        "{marker}{}",
-        truncate_cells(command, head_width.saturating_sub(2))
-    );
-    let hint = match command {
-        "/model" => "Ctrl+L",
-        "/mode" => "Shift+Tab",
-        _ => "",
-    };
+    let head_width = PALETTE_HEAD_CELLS.min(width);
+    let hint = palette_command_hint(command);
     let hint_width = UnicodeWidthStr::width(hint);
-    let description_gap = usize::from(!detail.is_empty() && head_width < width);
-    let description_width = width.saturating_sub(head_width + description_gap + hint_width + 2);
-    let description = truncate_cells(detail, description_width);
-    let gap = width.saturating_sub(
-        head_width + description_gap + UnicodeWidthStr::width(description.as_str()) + hint_width,
-    );
-    menu_line(
-        vec![
-            Span::styled(format!("{head:<head_width$}"), style),
-            Span::raw(" ".repeat(description_gap)),
-            Span::styled(description, palette.muted),
-            Span::raw(" ".repeat(gap)),
-            Span::styled(hint.to_owned(), palette.link),
-        ],
-        selected_here,
-        width.saturating_add(2),
-        palette,
-    )
+    let mut spans = vec![
+        picker_marker(selected_here, palette),
+        picker_label(
+            pad_cells(&truncate_cells(command, head_width), head_width),
+            selected_here,
+            palette,
+        ),
+    ];
+    // Where the palette describes the focused command on the row below, the
+    // row keeps the label only; the composer's list, which has no room for a
+    // second row per suggestion, keeps the description beside it.
+    if (!selected_here || !describe_below) && !detail.is_empty() {
+        let room = width.saturating_sub(2 + head_width + hint_width + 2);
+        if room >= PALETTE_DESCRIPTION_CELLS {
+            spans.push(Span::styled(truncate_cells(detail, room), palette.muted));
+        }
+    }
+    if !hint.is_empty() {
+        let used: usize = spans.iter().map(Span::width).sum();
+        let gap = width.saturating_sub(used + hint_width).max(1);
+        spans.push(Span::styled(" ".repeat(gap), palette.text));
+        spans.push(Span::styled(hint.to_owned(), palette.link));
+    }
+    menu_line(spans, selected_here, width, palette)
+}
+
+/// Description of the focused command, on its own row under the label.
+fn palette_command_detail(command: &str, width: usize, palette: &Palette) -> Line<'static> {
+    let detail = crate::reducer::palette_description(command);
+    Line::from(Span::styled(
+        truncate_cells(&format!("   {detail}"), width),
+        palette.muted,
+    ))
 }
 
 struct PaletteRow {
@@ -7998,6 +8724,7 @@ fn grouped_command_lines(
     selected: Option<usize>,
     width: usize,
     palette: &Palette,
+    describe_below: bool,
 ) -> Vec<PaletteRow> {
     let mut lines = Vec::new();
     for (group, members) in crate::reducer::COMMAND_GROUPS {
@@ -8021,8 +8748,20 @@ fn grouped_command_lines(
         for (index, command) in visible {
             lines.push(PaletteRow {
                 command_index: Some(index),
-                line: palette_command_line(command, selected == Some(index), width, palette),
+                line: palette_command_line(
+                    command,
+                    selected == Some(index),
+                    width,
+                    palette,
+                    describe_below,
+                ),
             });
+            if describe_below && selected == Some(index) {
+                lines.push(PaletteRow {
+                    command_index: None,
+                    line: palette_command_detail(command, width, palette),
+                });
+            }
         }
     }
     let ungrouped = commands
@@ -8040,8 +8779,20 @@ fn grouped_command_lines(
         for (index, command) in ungrouped {
             lines.push(PaletteRow {
                 command_index: Some(index),
-                line: palette_command_line(command, selected == Some(index), width, palette),
+                line: palette_command_line(
+                    command,
+                    selected == Some(index),
+                    width,
+                    palette,
+                    describe_below,
+                ),
             });
+            if describe_below && selected == Some(index) {
+                lines.push(PaletteRow {
+                    command_index: None,
+                    line: palette_command_detail(command, width, palette),
+                });
+            }
         }
     }
     lines
@@ -8109,27 +8860,6 @@ fn focus_text(selected: bool, palette: &Palette) -> Style {
     }
 }
 
-/// Footer row of a filterable modal: `position` then the longest of `hints`
-/// that fits, falling back to the bare close hint.
-fn modal_footer(
-    position: &str,
-    hints: &[&str],
-    inner_width: usize,
-    palette: &Palette,
-) -> Line<'static> {
-    let hint = hints
-        .iter()
-        .copied()
-        .find(|hint| {
-            UnicodeWidthStr::width(*hint) + UnicodeWidthStr::width(position) + 4 <= inner_width
-        })
-        .unwrap_or("Esc fechar");
-    Line::from(Span::styled(
-        truncate_cells(&format!(" {position} · {hint}"), inner_width),
-        palette.muted,
-    ))
-}
-
 fn modal_block<'a>(title: &'a str, palette: &'a Palette) -> RatatuiBlock<'a> {
     RatatuiBlock::default()
         .title(title)
@@ -8138,61 +8868,6 @@ fn modal_block<'a>(title: &'a str, palette: &'a Palette) -> RatatuiBlock<'a> {
         .border_type(BorderType::Rounded)
         .border_style(palette.border)
         .style(palette.surface_alt)
-}
-
-/// Border of a filterable list. The filter lives in the title
-/// (` Comandos · api `), so it spends no row of its own; empty, it invites
-/// typing. Returns the block and the caret column from the panel's left edge.
-fn filter_modal_block(
-    title: &str,
-    filter: &str,
-    panel_width: u16,
-    palette: &Palette,
-) -> (RatatuiBlock<'static>, usize) {
-    let head = format!(" {title} · ");
-    let head_width = UnicodeWidthStr::width(head.as_str());
-    // Corners and one trailing space stay clear of the title.
-    let budget = usize::from(panel_width)
-        .saturating_sub(3)
-        .saturating_sub(head_width);
-    let safe = sanitize_terminal_text(filter);
-    let (value, value_style, value_width) = if safe.is_empty() {
-        (
-            crate::view_model::truncate_display_width("digite para filtrar", budget),
-            palette.muted,
-            0,
-        )
-    } else {
-        let value = truncate_search_query(&safe, budget.saturating_sub(1));
-        let width = UnicodeWidthStr::width(value.as_str());
-        (value, palette.text, width)
-    };
-    let title = Line::from(vec![
-        Span::styled(format!(" {title}"), palette.heading),
-        Span::styled(" · ", palette.muted),
-        Span::styled(value, value_style),
-        Span::styled(" ", palette.muted),
-    ]);
-    let block = RatatuiBlock::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(palette.border)
-        .style(palette.surface_alt);
-    (block, 1 + head_width + value_width)
-}
-
-/// Caret on the title row of a [`filter_modal_block`].
-fn set_filter_cursor(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, column: usize) {
-    set_cursor_in_rect(
-        frame,
-        ratatui::layout::Rect {
-            height: area.height.min(1),
-            ..area
-        },
-        column,
-        0,
-    );
 }
 
 fn centered(

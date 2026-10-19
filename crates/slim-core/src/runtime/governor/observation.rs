@@ -130,6 +130,8 @@ pub(in crate::runtime) struct PendingCall {
     pub(super) diagnostics: bool,
     pub(super) admission_prefix: Option<String>,
     pub(super) structural_rejection: bool,
+    /// A patch that only retunes numbers or colours.
+    pub(super) tuning: bool,
 }
 
 impl PendingCall {
@@ -154,6 +156,7 @@ impl PendingCall {
             diagnostics: false,
             admission_prefix: None,
             structural_rejection: false,
+            tuning: false,
         }
     }
 

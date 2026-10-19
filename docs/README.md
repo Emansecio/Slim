@@ -27,6 +27,7 @@ momento em que foram produzidos.
 - [`PROXIMAS-ETAPAS-AGENTE.md`](PROXIMAS-ETAPAS-AGENTE.md) — prioridades do ciclo.
 - [`HARNESS-V2-TRACKER.md`](HARNESS-V2-TRACKER.md) — tracker do harness durável.
 - [`PROPOSTA-LSP-JS-TS.md`](PROPOSTA-LSP-JS-TS.md) — proposta e implementação nativa de LSP para JavaScript/TypeScript, preservação de Rust e extensão futura para Python.
+- [`mockups/tui-redesign.html`](mockups/tui-redesign.html) — mockup navegável que originou a revisão visual de 18/10/2026 (rail de turno, barra de estado e painéis no idioma do Devin CLI); proposta histórica, o contrato vigente é o de [`DESIGN-SLIM-TUI.md`](DESIGN-SLIM-TUI.md).
 
 ## Validação e estudos
 

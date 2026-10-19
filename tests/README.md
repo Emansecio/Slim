@@ -153,6 +153,17 @@ continuam iguais, mas o binario fica maior e seu desempenho em uso nao foi
 comparado. O comando sem a opcao conserva o perfil padrao; alternar perfis pode
 recompilar o executavel. Use o padrao para publicar o build plenamente otimizado.
 
+No perfil `dev`, as crates do workspace usam `debug = 1`: nelas o codegen e
+dominado pela informacao de tipo, e um rebuild completo das quatro caiu de
+57,4 s para 39,4 s (CPU de 51,5 s para 35,4 s) nesta maquina. Panicos e
+backtraces continuam apontando arquivo e linha; tipos completos voltam com
+`cargo build --config profile.dev.debug=2`. O perfil de teste mantem
+`debug = 1` nos membros; leva-los a `0` corta um rebuild de `slim-tui` de 39,2 s
+para 29,9 s, ao custo das linhas nos backtraces de teste. Medido neste checkout
+a um job: build release frio de 366 s contra 145 s com metade dos nucleos, e
+`cargo check -p slim-tui` de 0,5 s contra 1,7 s do `--lib --no-run` no loop de
+edicao. Paralelismo troca CPU por tempo; os demais cortes reduzem o trabalho.
+
 Os scripts mostram tempo total de cada comando e habilitam `--timings`, cujo
 HTML fica em `target/cargo-timings/`. O relatorio Cargo mede compilacao; a saida
 do harness informa execucao dos testes. Compare o mesmo alvo, toolchain e estado

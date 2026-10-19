@@ -1,4 +1,4 @@
-use super::{format_run_stop_message, ToolLoopLimits};
+use super::{format_run_stop_message, resolve_time_budget, ProviderRunOptions, ToolLoopLimits};
 use slim_core::tool_call_is_read_only;
 use slim_core::tools::ToolResult;
 
@@ -62,6 +62,10 @@ fn turn_limit_and_repeated_failed_tool_messages_are_humanized() {
         "Stopped: no progress in recent turns. Send a follow-up to continue."
     );
     assert_eq!(
+        format_run_stop_message("time_limit", &[], limits),
+        "Time budget spent. Send a follow-up to continue."
+    );
+    assert_eq!(
         format_run_stop_message("provider_truncated", &[], limits),
         "Output truncated (initial max_output_tokens=4096). Automatic recovery is bounded by retry, turn, model and context limits. Progress is preserved. Increase max_output_tokens within the model limit or request a smaller next step before continuing."
     );
@@ -81,4 +85,15 @@ fn turn_limit_and_repeated_failed_tool_messages_are_humanized() {
         ),
         "Configured tool budgets are zero. Increase the tool limits to continue with tools."
     );
+}
+
+#[test]
+fn time_budget_comes_from_the_options_and_refuses_zero() {
+    let options = ProviderRunOptions::default().with_time_budget_secs(1500);
+    assert_eq!(
+        resolve_time_budget(&options).expect("budget"),
+        Some(std::time::Duration::from_secs(1500))
+    );
+    let zero = ProviderRunOptions::default().with_time_budget_secs(0);
+    assert!(resolve_time_budget(&zero).is_err());
 }

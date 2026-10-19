@@ -9015,3 +9015,344 @@ fn a_closing_request_that_keeps_the_tools_is_sent_as_the_turns_are() {
         .unwrap()
         .contains("Budget exhausted"));
 }
+
+/// One write with a fused `then_run` carrying `final`, served as the first
+/// model turn; `check` is the command (`exit 0`/`exit 3` parse alike in bash
+/// and PowerShell).
+fn then_run_final_turn(check: &str) -> String {
+    let args = json!({
+        "path": "out.txt",
+        "content": "done\n",
+        "then_run": {"command": check, "final": "Wrote out.txt; the check passed."}
+    });
+    sse_tool_calls(
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"write-1",
+        "function":{"name":"write","arguments":args.to_string()}}]}}]}),
+    )
+}
+
+#[test]
+fn passing_then_run_with_final_ends_the_run_without_another_model_turn() {
+    let root = TempRoot::new("then-run-final-pass");
+    let (listener, address) = bind_listener();
+    // Exactly one model request: a second one finds no server and fails the loop.
+    let server = thread::spawn(move || {
+        let (mut stream, _) = accept_request(&listener);
+        write_sse(&mut stream, &then_run_final_turn("exit 0"));
+    });
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(2));
+    let mut runtime = Runtime::new();
+    let result = run_loop(
+        &mut runtime,
+        &client,
+        "Write out.txt and check it",
+        OperatingMode::Auto,
+        &root,
+        1,
+        test_loop_config(),
+    )
+    .expect("loop");
+    server.join().expect("server");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(result.turns, 1);
+    assert_eq!(
+        std::fs::read_to_string(root.join("out.txt")).expect("out"),
+        "done\n"
+    );
+    let answer = runtime
+        .app
+        .events()
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::AssistantTextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(answer, "Wrote out.txt; the check passed.");
+}
+
+#[test]
+fn failing_then_run_ignores_final_and_returns_the_output_to_the_model() {
+    let root = TempRoot::new("then-run-final-fail");
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = accept_request(&listener);
+        write_sse(&mut stream, &then_run_final_turn("exit 3"));
+        let (mut stream, request) = accept_request(&listener);
+        let wire: Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").expect("body").1).expect("json");
+        let messages = wire["messages"].as_array().expect("messages");
+        let output = messages.last().expect("tool result")["content"]
+            .as_str()
+            .expect("content");
+        assert!(output.contains("then_run: failed"), "{output}");
+        write_sse(&mut stream, &text_response("The check failed with exit 3."));
+    });
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(2));
+    let mut runtime = Runtime::new();
+    let result = run_loop(
+        &mut runtime,
+        &client,
+        "Write out.txt and check it",
+        OperatingMode::Auto,
+        &root,
+        1,
+        test_loop_config(),
+    )
+    .expect("loop");
+    server.join().expect("server");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(result.turns, 2);
+    assert!(!runtime.app.events().iter().any(|event| matches!(
+        &event.kind,
+        EventKind::AssistantTextDelta { text } if text.contains("the check passed")
+    )));
+}
+
+/// One `patch` call replacing `old` with `new` in `path`.
+fn patch_call_response(id: &str, path: &str, old: &str, new: &str) -> String {
+    sse_tool_calls(json!({"choices": [{"delta": {"tool_calls": [{
+        "index": 0,
+        "id": id,
+        "function": {
+            "name": "patch",
+            "arguments": json!({"path": path, "expected": old, "replacement": new}).to_string()
+        }
+    }]}}]}))
+}
+
+#[test]
+fn a_tuning_loop_is_warned_then_stopped_with_its_own_final_prompt() {
+    let root = TempRoot::new("tuning-loop");
+    std::fs::write(root.join("scene.txt"), "glow(0.10);\n").expect("scene");
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for turn in 0..7u32 {
+            let (mut stream, request) = accept_request(&listener);
+            requests.push(request);
+            if turn == 6 {
+                write_sse(&mut stream, SSE_FINAL_ANSWER);
+                continue;
+            }
+            let old = format!("glow(0.{});", 10 + turn);
+            let new = format!("glow(0.{});", 11 + turn);
+            write_sse(
+                &mut stream,
+                &patch_call_response(&format!("retune-{turn}"), "scene.txt", &old, &new),
+            );
+        }
+        requests
+    });
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(2));
+    let mut runtime = Runtime::new();
+    let result = run_loop(
+        &mut runtime,
+        &client,
+        "make the glow look right",
+        OperatingMode::Auto,
+        &root,
+        1,
+        AgentLoopConfig {
+            max_turns: 12,
+            ..test_loop_config()
+        },
+    )
+    .expect("loop");
+    let requests = server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::NoProgress);
+    assert_eq!(result.turns, 6);
+    let warning = "consecutive turns only retuned numbers or colours. Check the result";
+    assert!(
+        !requests[2].contains(warning),
+        "two retunes are not a loop yet"
+    );
+    assert!(
+        requests[3].contains(warning),
+        "the third retune warns the model"
+    );
+    assert!(requests[6].contains("Execution stopped because consecutive turns only retuned"));
+    assert!(!requests[6].contains("\"tools\""));
+    assert_eq!(
+        std::fs::read_to_string(root.join("scene.txt")).expect("scene"),
+        "glow(0.16);\n"
+    );
+}
+
+#[test]
+fn a_spent_time_budget_stops_the_run_and_asks_for_the_final_answer() {
+    let root = TempRoot::new("time-limit");
+    std::fs::write(root.join("scene.txt"), "glow(0.10);\n").expect("scene");
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = accept_request(&listener);
+        thread::sleep(Duration::from_millis(400));
+        write_sse(
+            &mut stream,
+            &patch_call_response("slow", "scene.txt", "glow(0.10);", "bloom(0.10);"),
+        );
+        let (mut stream, closing) = accept_request(&listener);
+        write_sse(&mut stream, SSE_FINAL_ANSWER);
+        closing
+    });
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let mut runtime = Runtime::new();
+    let result = run_loop(
+        &mut runtime,
+        &client,
+        "rework the scene",
+        OperatingMode::Auto,
+        &root,
+        1,
+        AgentLoopConfig {
+            time_budget: Some(Duration::from_millis(300)),
+            ..test_loop_config()
+        },
+    )
+    .expect("loop");
+    let closing = server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::TimeLimit);
+    assert_eq!(result.turns, 1);
+    assert!(closing.contains("Budget exhausted"));
+    assert!(
+        !closing.contains("[Time budget]"),
+        "a spent budget skips the finalize steer"
+    );
+}
+
+#[test]
+fn the_finalize_phase_tells_the_numbers_and_refuses_tuning_only_patches() {
+    let root = TempRoot::new("finalize-phase");
+    std::fs::write(root.join("scene.txt"), "glow(0.10);\n").expect("scene");
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        let (mut stream, request) = accept_request(&listener);
+        requests.push(request);
+        // Past three quarters of the 4 s budget when the batch ends.
+        thread::sleep(Duration::from_millis(3_100));
+        write_sse(
+            &mut stream,
+            &patch_call_response("before", "scene.txt", "glow(0.10);", "glow(0.11);"),
+        );
+        let (mut stream, request) = accept_request(&listener);
+        requests.push(request);
+        write_sse(
+            &mut stream,
+            &patch_call_response("after", "scene.txt", "glow(0.11);", "glow(0.12);"),
+        );
+        let (mut stream, request) = accept_request(&listener);
+        requests.push(request);
+        write_sse(&mut stream, &text_response("done"));
+        requests
+    });
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(10));
+    let mut runtime = Runtime::new();
+    let result = run_loop(
+        &mut runtime,
+        &client,
+        "make the glow look right",
+        OperatingMode::Auto,
+        &root,
+        1,
+        AgentLoopConfig {
+            time_budget: Some(Duration::from_secs(4)),
+            ..test_loop_config()
+        },
+    )
+    .expect("loop");
+    let requests = server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert!(!requests[0].contains("[Time budget]"));
+    assert!(requests[1].contains("[Time budget]"));
+    assert!(requests[1].contains("s of 4 s used"));
+    assert!(requests[2].contains("patch refused: the time budget is in its finalize phase"));
+    assert_eq!(
+        std::fs::read_to_string(root.join("scene.txt")).expect("scene"),
+        "glow(0.11);\n",
+        "the retune before the phase applied; the one after was refused"
+    );
+}
+
+/// One call of `tool` with `arguments`.
+fn tool_call_response(id: &str, tool: &str, arguments: Value) -> String {
+    sse_tool_calls(json!({"choices": [{"delta": {"tool_calls": [{
+        "index": 0,
+        "id": id,
+        "function": {"name": tool, "arguments": arguments.to_string()}
+    }]}}]}))
+}
+
+#[test]
+fn run_guards_hold_a_failing_command_and_a_second_full_rewrite_once() {
+    let root = TempRoot::new("run-guards");
+    let big = "x".repeat(4096);
+    std::fs::write(root.join("big.txt"), &big).expect("big");
+    let failing = "exit 3";
+    let script = vec![
+        tool_call_response("fail-1", "shell", json!({"command": failing})),
+        tool_call_response("fail-2", "shell", json!({"command": failing})),
+        tool_call_response("fail-3", "shell", json!({"command": failing})),
+        tool_call_response("fail-4", "shell", json!({"command": failing})),
+        tool_call_response("look", "read", json!({"path": "big.txt"})),
+        tool_call_response(
+            "rewrite-1",
+            "write",
+            json!({"path": "big.txt", "content": format!("{big}y")}),
+        ),
+        tool_call_response("look-again", "read", json!({"path": "big.txt"})),
+        tool_call_response(
+            "rewrite-2",
+            "write",
+            json!({"path": "big.txt", "content": format!("{big}z")}),
+        ),
+        text_response("done"),
+    ];
+    let turns = script.len();
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for response in script {
+            let (mut stream, request) = accept_request(&listener);
+            requests.push(request);
+            write_sse(&mut stream, &response);
+        }
+        requests
+    });
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(10));
+    let mut runtime = Runtime::new();
+    let result = run_loop(
+        &mut runtime,
+        &client,
+        "build it",
+        OperatingMode::Auto,
+        &root,
+        1,
+        AgentLoopConfig {
+            max_turns: 16,
+            ..test_loop_config()
+        },
+    )
+    .expect("loop");
+    let requests = server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(requests.len(), turns);
+    let loop_hold = "This exact command failed 2 times in a row.";
+    assert!(!requests[2].contains(loop_hold));
+    assert!(requests[3].contains(loop_hold), "the third try is held");
+    assert!(
+        !requests[4].contains("failed 3 times"),
+        "the deliberate rerun ran"
+    );
+    assert!(requests[6].contains("You rewrote all of big.txt."));
+    assert!(requests[8].contains("big.txt exists; change it with patch"));
+    assert_eq!(
+        std::fs::read_to_string(root.join("big.txt")).expect("big"),
+        format!("{big}y"),
+        "the second rewrite was held"
+    );
+}

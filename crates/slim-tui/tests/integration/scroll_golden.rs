@@ -110,10 +110,14 @@ fn live_edge_uses_physical_rows_inside_wrapped_user_block() {
         }),
     );
 
-    let frame = render_at_size(&state, 40, 8);
-    let visible_body: String = transcript_rows(&frame, 40, 8)
+    let frame = render_at_size(&state, 40, 9);
+    let visible_body: String = transcript_rows(&frame, 40, 9)
         .iter()
-        .map(|row| row.trim_end_matches(['│', '┃']).trim())
+        .map(|row| {
+            row.trim_end_matches(['│', '┃'])
+                .trim_start_matches('▌')
+                .trim()
+        })
         .collect();
     assert!(
         visible_body.ends_with("TAIL_VISIBLE"),
@@ -206,7 +210,10 @@ fn latest_short_turn_page_fills_from_its_prompt_after_long_history() {
         question_row, 1,
         "an overflowing history starts with the header followed by its body\n{frame}"
     );
-    assert_eq!(transcript[0].trim_end_matches(['│', '┃']).trim(), "● Você");
+    assert_eq!(
+        transcript[0].trim_end_matches(['│', '┃']).trim(),
+        "▌ ● Você"
+    );
     assert!(frame.contains("LATEST_ANSWER"));
     assert!(
         !frame.contains("OLD_ANSWER_3"),

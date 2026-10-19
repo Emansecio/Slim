@@ -914,7 +914,7 @@ impl ToolRegistry {
                 }
                 self.invalidate_cached_evidence_for_paths(&prepared.target_paths);
                 edited.output.push_str(if shell.success {
-                    "\nthen_run: passed\n"
+                    THEN_RUN_PASSED
                 } else {
                     "\nthen_run: failed; edit remains applied\n"
                 });
@@ -1897,13 +1897,18 @@ const SHELL_TOOL_DESCRIPTION: &str = concat!(
     shell_tool_description_tail!()
 );
 
+/// Marks a write/patch result whose fused `then_run` exited successfully;
+/// the agent loop keys `then_run.final` on it.
+pub(crate) const THEN_RUN_PASSED: &str = "\nthen_run: passed\n";
+
 fn tool_definition(name: &str) -> Value {
     let then_run_schema = json!({
         "type": "object",
         "properties": {
             "command": {"type": "string", "minLength": 1},
             "args": {"type": ["array", "null"], "items": {"type": "string"}},
-            "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_MS, "default": DEFAULT_SHELL_TIMEOUT_MS}
+            "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_MS, "default": DEFAULT_SHELL_TIMEOUT_MS},
+            "final": {"type": "string", "minLength": 1, "description": "Your closing answer to the user. If the command exits 0, the task ends with this text and no further turn; on failure it is ignored and you see the output."}
         },
         "required": ["command"],
         "additionalProperties": false
@@ -1947,7 +1952,7 @@ fn tool_definition(name: &str) -> Value {
             });
         }
         "write" => (
-            "Write a complete UTF-8 file, creating parents. See expected for overwrite requirements; stale content is rejected. Prefer patch for local edits. Failure may return recovery text. Success needs no confirmation read; independent paths may share a turn. Optional then_run runs shell only after the write succeeds, waits for completion, and reports both results; a failed command leaves the edit applied.",
+            "Write a complete UTF-8 file, creating parents. See expected for overwrite requirements; stale content is rejected. Prefer patch for local edits. Failure may return recovery text. Success needs no confirmation read; independent paths may share a turn. When a check or test command exists, attach it as then_run on the last edit instead of a separate shell call: it runs only after the write succeeds, waits, and reports both results; a failed command leaves the edit applied. Add then_run.final when a pass completes the task.",
             json!({
                 "path": {"type": "string", "description": "Workspace-relative path."},
                 "content": {"type": "string"},
@@ -1960,7 +1965,7 @@ fn tool_definition(name: &str) -> Value {
             json!(["path", "content"]),
         ),
         "patch" => (
-            "Apply atomic ordered edits to one file: edits OR top-level expected/replacement. Match unique raw text; never line numbers, headers or [truncated] markers. Unique search hits need no complete read. LF matches uniform CRLF. Failure leaves the file unchanged and may return recovery text. Success authorizes overwrite; no confirmation read. Independent paths may share a turn. Optional then_run runs shell only after the patch succeeds, waits for completion, and reports both results; a failed command leaves the edit applied.",
+            "Apply atomic ordered edits to one file: edits OR top-level expected/replacement. Match unique raw text; never line numbers, headers or [truncated] markers. Unique search hits need no complete read. LF matches uniform CRLF. Failure leaves the file unchanged and may return recovery text. Success authorizes overwrite; no confirmation read. Independent paths may share a turn. When a check or test command exists, attach it as then_run on the last edit instead of a separate shell call: it runs only after the patch succeeds, waits, and reports both results; a failed command leaves the edit applied. Add then_run.final when a pass completes the task.",
             json!({"path": {"type": "string", "description": "Workspace-relative path."}, "edits": {"type": "array", "minItems": 1, "maxItems": patch::MAX_PATCH_EDITS, "items": {"type": "object", "properties": {"expected": {"type": "string", "minLength": 1, "description": "Unique raw file substring from read or search (strip `N: `/`N- ` prefixes)."}, "replacement": {"type": "string"}}, "required": ["expected", "replacement"], "additionalProperties": false}}, "expected": {"type": "string", "minLength": 1, "description": "Legacy unique raw file substring."}, "replacement": {"type": "string", "description": "Legacy replacement text."}, "then_run": then_run_schema}),
             json!(["path"]),
         ),

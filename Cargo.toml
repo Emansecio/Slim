@@ -58,6 +58,15 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
+# Same reasoning as the dependencies below, for the crates that change: in the
+# dev profile, codegen is dominated by the type information of the workspace
+# crates (measured: 57.4s -> 41.2s on a full rebuild of the four crates, and
+# 51.5s -> 36.9s of CPU). Line tables keep panics and backtraces pointing at a
+# file and a line; full types come back for a debugging session with
+# `cargo build --config profile.dev.debug=2`.
+[profile.dev]
+debug = 1
+
 # Third-party code is rarely stepped through: keep backtrace symbols and lines, but
 # drop its type information, which dominates every test binary's PDB and link time.
 # Set on dev so test builds keep reusing the dev dependency artifacts.

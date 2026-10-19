@@ -691,6 +691,24 @@ impl PreparedToolInvocation {
             })
     }
 
+    /// A patch whose every edit only retunes numeric literals or hex colours.
+    pub(crate) fn is_tuning_patch(&self) -> bool {
+        matches!(
+            &self.arguments,
+            PreparedToolArguments::Patch { edits, .. }
+                if !edits.is_empty()
+                    && edits
+                        .iter()
+                        .all(|(expected, replacement)| super::patch::tuning_only_edit(expected, replacement))
+        )
+    }
+
+    /// Refuses the call before any executor runs, as argument admission does.
+    pub(crate) fn reject(&mut self, message: &str) {
+        self.error = Some(message.to_owned());
+        self.structural_rejection = self.spec.is_some();
+    }
+
     pub(crate) fn new(
         mode: OperatingMode,
         cwd: &Path,
@@ -1800,9 +1818,19 @@ fn prepare_then_run(
             if object.contains_key("yield_ms") {
                 return Err("then_run waits for completion; yield_ms is not allowed".into());
             }
-            value.to_string()
+            // `final` is the run's closing answer, read by the agent loop
+            // (`then_run_final_answer`); the shell call itself never sees it.
+            let final_answer = match object.get("final") {
+                None => None,
+                Some(Value::String(text)) if !text.trim().is_empty() => Some(text.clone()),
+                Some(_) => return Err("then_run.final must be a non-empty string".into()),
+            };
+            let mut shell = object.clone();
+            shell.remove("final");
+            (Value::Object(shell).to_string(), final_answer)
         }
     };
+    let (raw, final_answer) = raw;
     let canonical_workspace = Ok(workspace.to_path_buf());
     let prepared = PreparedToolInvocation::from_workspace(
         mode,
@@ -1835,6 +1863,9 @@ fn prepare_then_run(
         "args": args,
         "timeout_ms": timeout_ms,
     });
+    if let Some(final_answer) = final_answer {
+        arguments["then_run"]["final"] = Value::String(final_answer);
+    }
     admission_notes.extend(
         prepared
             .admission_notes

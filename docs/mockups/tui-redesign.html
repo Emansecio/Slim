@@ -1,0 +1,212 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Slim — revisão da TUI</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 40px 32px 80px; background: #0b0b0b; color: #ddd;
+         font: 14px/1.5 -apple-system, "Segoe UI", sans-serif; }
+  h1 { font-size: 22px; margin: 0 0 6px; color: #f2efe6; }
+  .lede { max-width: 78ch; color: #a9a69c; margin: 0 0 28px; }
+  .lede b { color: #e8e5db; font-weight: 600; }
+  .tokens { display: flex; flex-wrap: wrap; gap: 10px 18px; margin: 0 0 34px; padding: 0; list-style: none; }
+  .tokens li { display: flex; align-items: center; gap: 7px; color: #a9a69c; font-size: 12px; }
+  .swatch { width: 11px; height: 11px; border-radius: 2px; display: inline-block; }
+  .grid { display: flex; flex-direction: column; gap: 42px; }
+  .frame header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 10px; }
+  .frame h2 { font-size: 14px; margin: 0; color: #e8e5db; font-weight: 600; }
+  .frame header p { margin: 0; color: #7f7d75; font-size: 13px; }
+  .frame pre { margin: 0; padding: 14px 16px; border: 1px solid #232323; border-radius: 8px;
+      background: #000; color: #e8e5db; overflow-x: auto;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 13px;
+      line-height: 1.32; font-variant-ligatures: none; white-space: pre; }
+  .note { max-width: 96ch; color: #7f7d75; font-size: 13px; margin: 10px 0 0; }
+</style>
+<body>
+<h1>Slim — revisão da TUI</h1>
+<p class="lede">Mockup da revisão visual: <b>a mesma paleta, mais estrutura</b>. Nenhuma cor nova entra; o que muda é onde cada tom trabalha — rail de turno, réguas, medidores, selos e hierarquia na barra de estado. Os modais passam a seguir a anatomia do seletor do Devin CLI: painel de largura total, cabeçalho com o comando, linha de filtro, réguas entre blocos, foco como barra com o nome no azul e o detalhe do item focado logo abaixo. Frames desenhados na grade de células (104×30, 104×28, 76×10, 60×18), com glifos e estilos que o ratatui já desenha: ▌ ▰ ▱ ▸ ▾ ✓ ✕ ⠋ › ─ ╭ ╮ ╰ ╯</p>
+<ul class="tokens"><li><span class="swatch" style="background:#E8E5DB"></span>texto</li><li><span class="swatch" style="background:#BCB9AF"></span>secundário</li><li><span class="swatch" style="background:#99978E"></span>mudo</li><li><span class="swatch" style="background:#8AADD4"></span>azul de navegação / foco</li><li><span class="swatch" style="background:#72CC91"></span>identidade / sucesso</li><li><span class="swatch" style="background:#A99FD6"></span>raciocínio</li><li><span class="swatch" style="background:#E7C15A"></span>aviso</li><li><span class="swatch" style="background:#E87973"></span>erro</li><li><span class="swatch" style="background:#2A2A2A"></span>barra de seleção</li><li><span class="swatch" style="background:#141414"></span>banda do prompt</li></ul>
+<div class="grid">
+<section class="frame">
+  <header><h2>Tela principal · ociosa</h2><p>chrome com identidade, boas-vindas centrada, barra de estado em dois níveis</p></header>
+  <pre style="width:104ch"><span style="color:#E8E5DB;font-weight:bold"> SLIM</span><span style="color:#99978E">  v0.1.0</span><span style="color:#99978E">                                                   </span><span style="color:#72CC91">●</span><span style="color:#99978E"> Conectado · Anthropic — Claude Pro/Max</span>
+<span style="color:#3A3A3A">────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+
+
+
+
+<span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style="color:#BCB9AF">▄▀▀▀  █     █  █▄ ▄█</span>
+<span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style="color:#BCB9AF"> ▀▀▄  █     █  █ ▀ █</span>
+<span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style="color:#BCB9AF">▀▀▀   ▀▀▀▀  ▀  ▀   ▀</span>
+
+<span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style="color:#E8E5DB;font-weight:bold">SLIM</span><span style="color:#99978E">  v0.1.0</span><span style="color:#99978E">   ·   </span><span style="color:#BCB9AF">C:\Projects\demo</span><span style="color:#99978E">   ·   </span><span style="color:#BCB9AF">Corrigir CRLF no parser</span>
+
+<span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style="color:#8AADD4">›</span><span style="color:#E8E5DB"> Descreva uma tarefa para começar</span>
+
+<span style=""> </span><span style=""> </span><span style=""> </span><span style="color:#8AADD4">›</span><span style="color:#99978E"> explique este repositório</span><span style="color:#99978E">      ·      </span><span style="color:#8AADD4">›</span><span style="color:#99978E"> corrija os testes que falham</span><span style="color:#99978E">      ·      </span><span style="color:#8AADD4">›</span><span style="color:#99978E"> revise o diff</span>
+
+<span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style=""> </span><span style="color:#99978E">Dica  /model troca o modelo   ·   @ anexa arquivos   ·   !&amp; roda em segundo plano</span>
+
+
+
+
+
+
+
+
+<span style="color:#3A3A3A">╭──────────────────────────────────────────────────────────────────────────────────────────────────────╮</span>
+<span style="color:#3A3A3A">│</span><span style=""> </span><span style="color:#8AADD4">› </span><span style="color:#99978E">Próxima tarefa…</span><span style="color:#3A3A3A">│</span><span style="color:#3A3A3A">                                                                                    </span>
+<span style="color:#3A3A3A">╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯</span>
+<span style="color:#BCB9AF;font-weight:bold">Auto</span><span style="color:#99978E"> · </span><span style="color:#BCB9AF">GPT-5.6 Sol</span><span style="color:#99978E"> (high)</span><span style="color:#99978E"> · ctx </span><span style="color:#BCB9AF">▰▰▱▱▱</span><span style="color:#99978E"> 8%</span><span style="color:#99978E">                            </span><span style="color:#99978E">ctrl+p comandos · ctrl+g diagnóstico</span>
+<span style="color:#99978E">/ comandos · ⇥ modo · ↵ enviar · ctrl+c sair</span></pre>
+  <p class="note">O topo deixa de ser uma linha solta: marca, título da sessão e workspace à esquerda; provedor, modelo e medidor de contexto à direita, sob uma régua que separa chrome de transcript. A barra de estado ganha hierarquia: estado na primeira linha, dicas contextuais na segunda.</p>
+</section>
+<section class="frame">
+  <header><h2>Sessão em execução</h2><p>rail do turno, régua de abertura, trabalho agrupado e presença do passo vivo</p></header>
+  <pre style="width:104ch"><span style="color:#E8E5DB;font-weight:bold"> SLIM</span><span style="color:#99978E"> · Corrigir CRLF no parser</span><span style="color:#99978E">     </span><span style="color:#BCB9AF">C:\Projects\demo</span><span style="color:#99978E">  ·  </span><span style="color:#72CC91">●</span><span style="color:#99978E"> Anthropic · GPT-5.6 Sol (high) · ctx </span><span style="color:#BCB9AF">▰▰▱▱▱</span><span style="color:#99978E"> 8%</span>
+<span style="color:#3A3A3A">────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+
+<span style="color:#BCB9AF;font-weight:bold">▌ Você</span><span style="color:#BCB9AF;font-weight:bold">                                                                                             </span><span style="color:#99978E;background:#141414">14:32</span>
+<span style="color:#BCB9AF;font-weight:bold">▌ </span><span style="color:#E8E5DB;background:#141414">O parser quebra com CRLF e a lista de erros sai duplicada. Corrija os dois problemas</span><span style="background:#141414">                  </span>
+<span style="color:#BCB9AF;font-weight:bold">▌ </span><span style="color:#E8E5DB;background:#141414">e cubra com testes.</span><span style="background:#141414">                                                                                   </span>
+<span style="background:#141414">                                                                                                        </span>
+
+<span style="color:#72CC91">▌ </span><span style="color:#72CC91;font-weight:bold">Slim</span><span style="color:#99978E"> · GPT-5.6 Sol</span><span style="color:#99978E">                                                                                 </span><span style="color:#99978E">12s</span>
+<span style="color:#3A3A3A">────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#A99FD6">▌ </span><span style="color:#A99FD6">⠹ Pensou · 3.2s</span><span style="color:#99978E">  Dois sintomas, possivelmente uma causa só…</span>
+<span style="color:#99978E">▌ </span><span style="color:#BCB9AF">▾ Trabalhou 12s · 3 leituras, 1 busca, 2 edições, 2 comandos</span><span style="color:#BCB9AF">                                   </span><span style="color:#99978E">↵ abrir</span>
+<span style="color:#99978E">▌   </span><span style="color:#72CC91">✓</span><span style="color:#BCB9AF"> Leu src/parser.rs</span><span style="color:#99978E"> · 3 linhas · 1.2s</span>
+<span style="color:#99978E">▌   </span><span style="color:#72CC91">✓</span><span style="color:#BCB9AF"> Leu src/errors.rs</span><span style="color:#99978E"> · 2 linhas · 0.9s</span>
+<span style="color:#99978E">▌   </span><span style="color:#72CC91">✓</span><span style="color:#BCB9AF"> Buscou split(</span><span style="color:#99978E"> · 3 ocorrências · 0.4s</span>
+<span style="color:#99978E">▌   </span><span style="color:#E87973">✕</span><span style="color:#BCB9AF"> $ cargo test parser</span><span style="color:#99978E"> · exit 101 · depois passou</span>
+<span style="color:#8AADD4">▌ </span><span style="color:#8AADD4">⠋</span><span style="color:#BCB9AF"> $ cargo clippy --all-targets</span><span style="color:#99978E"> · 5s · limit 600s · Checking slim-tui…</span>
+
+<span style="color:#E8E5DB;font-weight:bold">Resultado</span>
+<span style="color:#99978E">─────────</span>
+<span style="color:#BCB9AF">Os dois problemas tinham a mesma origem e estão corrigidos.</span>
+
+<span style="color:#99978E">TODO</span><span style="color:#BCB9AF"> ▰▰▱▱</span><span style="color:#99978E"> 1/4 · 1 bloqueada</span><span style="color:#99978E"> · em curso · </span><span style="color:#BCB9AF">Validar a publicação</span>
+<span style="color:#8AADD4;opacity:.55">╭──────────────────────────────────────────────────────────────────────────────────────────────────────╮</span>
+<span style="color:#8AADD4;opacity:.55">│</span><span style=""> </span><span style="color:#8AADD4">› </span><span style="color:#99978E">Próxima mensagem (vai para a fila)…</span><span style="color:#8AADD4;opacity:.55">│</span><span style="color:#8AADD4;opacity:.55">                                                                </span>
+<span style="color:#8AADD4;opacity:.55">╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯</span>
+<span style="color:#BCB9AF;font-weight:bold">Auto</span><span style="color:#99978E"> · </span><span style="color:#BCB9AF">GPT-5.6 Sol</span><span style="color:#99978E"> (high)</span><span style="color:#99978E"> · ctx </span><span style="color:#BCB9AF">▰▰▱▱▱</span><span style="color:#99978E"> 8% · turno 12s</span><span style="color:#99978E">                                  </span><span style="color:#99978E">ctrl+g diagnóstico</span>
+<span style="color:#8AADD4">⠋ execução 12s</span><span style="color:#99978E"> · esc parar · ↑↓ rolar · / comandos</span></pre>
+  <p class="note">Cada turno abre com o rail de identidade (▌) e uma régua. O rail continua descendo pelo turno, então o trabalho do agente lê como uma pilha indentada. O passo em execução usa o spinner, o relógio e a cauda de saída que já existem; o medidor do TODO substitui a contagem seca.</p>
+</section>
+<section class="frame">
+  <header><h2>Modal /model</h2><p>painel de largura total no idioma do Devin CLI: cabeçalho, filtro, réguas, lista e bloco de detalhe</p></header>
+  <pre style="width:104ch"><span style="color:#8AADD4;font-weight:bold">›</span><span style="color:#E8E5DB;font-weight:bold"> /model</span><span style="color:#E8E5DB;font-weight:bold">                                                                                     </span><span style="color:#99978E">119 modelos</span>
+<span style="color:#3A3A3A">────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#99978E">/</span><span style="color:#E8E5DB">▏</span><span style="color:#99978E"> filtrar por nome ou provedor</span>
+<span style="color:#3A3A3A">────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#99978E">↑ mais acima</span>
+<span style="color:#99978E">  ▾ </span><span style="color:#BCB9AF">OpenAI Codex</span><span style="color:#99978E"> ─────────────────────────────────────────────────── </span><span style="color:#99978E">4</span>
+<span style="color:#99978E">·</span><span style="color:#E8E5DB"> GPT-5.6 Sol</span><span style="color:#99978E">      ✱</span><span style="color:#99978E">  ▰▰▰▰▱</span><span style="color:#99978E"> High</span><span style="color:#99978E">                                                                </span><span style="color:#72CC91">● em uso</span>
+<span style="color:#99978E">·</span><span style="color:#E8E5DB"> GPT-5.6 Terra</span><span style="color:#99978E">        ▰▰▰▱▱</span><span style="color:#99978E"> High</span>
+<span style="color:#99978E">·</span><span style="color:#E8E5DB"> GPT-5.6 Luna</span><span style="color:#99978E">         ▰▰▰▱▱</span><span style="color:#99978E"> High</span>
+<span style="color:#99978E">·</span><span style="color:#E8E5DB"> GPT-6 Astra</span><span style="color:#99978E">          ▰▰▰▱▱</span><span style="color:#99978E"> High</span>
+<span style="color:#99978E">  ▾ </span><span style="color:#BCB9AF">OpenCode Go</span><span style="color:#99978E"> ─────────────────────────────────────────────────── </span><span style="color:#99978E">25</span>
+<span style="color:#8AADD4;font-weight:bold">› </span><span style="color:#8AADD4;font-weight:bold">Muse Spark 1.3</span><span style="color:#8AADD4;background:#2A2A2A">    </span><span style="color:#8AADD4;background:#2A2A2A">← ▰▰▰▱▱ →</span><span style="color:#E8E5DB;background:#2A2A2A;font-weight:bold"> High</span><span style="background:#2A2A2A">                                                                      </span>
+<span style="color:#99978E">·</span><span style="color:#E8E5DB"> Muse Spark 1.2</span><span style="color:#99978E">       ▰▰▰▱▱</span><span style="color:#99978E"> High</span>
+<span style="color:#99978E">  ▾ </span><span style="color:#BCB9AF">ClinePass</span><span style="color:#99978E"> ─────────────────────────────────────────────────────── </span><span style="color:#99978E">13</span>
+<span style="color:#99978E">  ▾ </span><span style="color:#BCB9AF">Command Code</span><span style="color:#99978E"> ─────────────────────────────────────────────────── </span><span style="color:#99978E">69</span>
+<span style="color:#99978E">  ▾ </span><span style="color:#BCB9AF">OpenCode Zen</span><span style="color:#99978E"> ─────────────────────────────────────────────────── </span><span style="color:#99978E">8</span>
+<span style="color:#99978E">↓ mais abaixo</span>
+<span style="color:#3A3A3A">────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#99978E"> OpenCode Go · Muse Spark 1.3</span><span style="color:#99978E">                                     </span><span style="color:#99978E">contexto 128k tokens · só nesta sessão</span>
+<span style="color:#99978E"> esforço low · medium · high · xhigh</span><span style="color:#99978E">                                       </span><span style="color:#99978E">velocidade Normal (⇥ alterna)</span>
+<span style="color:#72CC91"> ● em uso</span><span style="color:#99978E">      </span><span style="color:#8AADD4">✱ padrão da sessão</span>
+<span style="color:#3A3A3A">────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#99978E">↑↓ navegar · ←→ esforço · ⇥ velocidade · ↵ aplicar · esc fechar</span></pre>
+  <p class="note">Sem caixa central: o modal passa a ser um painel de largura total com réguas. O foco é uma barra com o nome no azul de navegação e o medidor de esforço ao lado das setas que o ajustam; à direita fica o que muda por linha (em uso, velocidade). Abaixo da régua, o detalhe do modelo focado e a legenda dos selos.</p>
+</section>
+<section class="frame">
+  <header><h2>Modal /effort</h2><p>mesma anatomia, versão compacta: o medidor diz onde o nível está</p></header>
+  <pre style="width:76ch"><span style="color:#8AADD4;font-weight:bold">›</span><span style="color:#E8E5DB;font-weight:bold"> /effort</span><span style="color:#E8E5DB;font-weight:bold">                                                        </span><span style="color:#99978E">GPT-5.6 Sol</span>
+<span style="color:#3A3A3A">────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#8AADD4;font-weight:bold">› </span><span style="color:#8AADD4;font-weight:bold">Low</span><span style="color:#8AADD4;background:#2A2A2A">      ▰▱▱▱   </span><span style="color:#99978E;background:#2A2A2A">Respostas rápidas, pouco raciocínio</span><span style="background:#2A2A2A">                       </span>
+<span style="color:#99978E">· </span><span style="color:#E8E5DB">Medium</span><span style="color:#99978E">   ▰▰▱▱   Equilíbrio entre tempo e profundidade</span>
+<span style="color:#99978E">· </span><span style="color:#E8E5DB">High</span><span style="color:#99978E">     ▰▰▰▱   Raciocínio estendido</span>
+<span style="color:#99978E">· </span><span style="color:#E8E5DB">xHigh</span><span style="color:#99978E">    ▰▰▰▰   Máximo esforço, mais tempo e tokens</span>
+<span style="color:#3A3A3A">────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#72CC91">●</span><span style="color:#99978E"> em uso </span><span style="color:#BCB9AF">High</span><span style="color:#99978E">  ·  velocidade </span><span style="color:#BCB9AF">Normal</span><span style="color:#99978E"> (⇥ alterna)</span>
+<span style="color:#3A3A3A">────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#99978E">↑↓ navegar · ←→ ajustar · ⇥ velocidade · ↵ aplicar · esc fechar</span></pre>
+  <p class="note">O esforço deixa de ser uma caixa com duas linhas de ar entre itens: cada nível mostra sua posição no medidor, a descrição fica na mesma linha e o rodapé diz o que está em uso e o que o Tab alterna.</p>
+</section>
+<section class="frame">
+  <header><h2>Turno concluído</h2><p>trabalho recolhido, resposta com hierarquia, recibo e rodapé de estado</p></header>
+  <pre style="width:96ch"><span style="color:#E8E5DB;font-weight:bold"> SLIM</span><span style="color:#99978E"> · Corrigir CRLF no parser</span><span style="color:#99978E">                                </span><span style="color:#BCB9AF">C:\Projects\demo</span><span style="color:#99978E">  ·  </span><span style="color:#99978E">ctx </span><span style="color:#BCB9AF">▰▰▱▱▱</span><span style="color:#99978E"> 8%</span>
+<span style="color:#3A3A3A">────────────────────────────────────────────────────────────────────────────────────────────────</span>
+
+<span style="color:#BCB9AF;font-weight:bold">▌ Você</span><span style="color:#BCB9AF;font-weight:bold">                                                                                     </span><span style="color:#99978E;background:#141414">14:32</span>
+<span style="color:#BCB9AF;font-weight:bold">▌ </span><span style="color:#E8E5DB;background:#141414">Rode a suíte e corrija o que falhar.</span><span style="background:#141414">                                                          </span>
+<span style="background:#141414">                                                                                                </span>
+
+<span style="color:#72CC91">▌ </span><span style="color:#72CC91;font-weight:bold">Slim</span><span style="color:#99978E"> · GPT-5.6 Sol</span><span style="color:#99978E">                                                                         </span><span style="color:#99978E">12s</span>
+<span style="color:#3A3A3A">────────────────────────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#99978E">▌ </span><span style="color:#BCB9AF">▸ Trabalhou</span><span style="color:#99978E"> · 4 leituras, 1 busca, 2 edições, 2 comandos</span><span style="color:#99978E">                               </span><span style="color:#99978E">↵ abrir</span>
+
+<span style="color:#E8E5DB;font-weight:bold">Resultado</span>
+<span style="color:#99978E">─────────</span>
+<span style="color:#BCB9AF">Os dois problemas tinham a mesma origem e estão corrigidos.</span>
+
+<span style="color:#BCB9AF">• cargo test: passou</span><span style=""> </span><span style=""> </span><span style=""> </span><span style="color:#BCB9AF">• casos novos: CRLF e erro duplicado</span>
+
+<span style="color:#68665A">│ </span><span style="color:#99978E">rust</span>
+<span style="">│ fn split(t: &amp;str) -&gt; Lines&lt;&#x27;_&gt; {{~K</span>
+<span style="">│     t.lines()</span><span style="background:#141414">                                                                                 </span>
+<span style="">│ }</span><span style="background:#141414">                                                                                             </span>
+
+<span style="color:#99978E">▌ </span><span style="color:#BCB9AF">✓ 2 arquivos · +2 −1 · 2 comandos, 1 falhou · 12s</span><span style="color:#BCB9AF">                            </span><span style="color:#99978E">ctrl+d alterações</span>
+<span style="color:#3A3A3A">╭──────────────────────────────────────────────────────────────────────────────────────────────╮</span>
+<span style="color:#3A3A3A">│</span><span style=""> </span><span style="color:#8AADD4">› </span><span style="color:#99978E">Próxima tarefa…</span><span style="color:#3A3A3A">│</span><span style="color:#3A3A3A">                                                                            </span>
+<span style="color:#3A3A3A">╰──────────────────────────────────────────────────────────────────────────────────────────────╯</span>
+<span style="color:#BCB9AF;font-weight:bold">Auto</span><span style="color:#99978E"> · </span><span style="color:#BCB9AF">GPT-5.6 Sol</span><span style="color:#99978E"> (high)</span><span style="color:#99978E"> · ctx </span><span style="color:#BCB9AF">▰▰▱▱▱</span><span style="color:#99978E"> 8%</span><span style="color:#99978E">                                      </span><span style="color:#99978E">ctrl+g diagnóstico</span>
+<span style="color:#99978E">↑↓ rolar · ↵ abrir · / comandos · ⇥ modo</span>
+
+</pre>
+  <p class="note">O turno fechado mantém a régua de abertura, recolhe o trabalho em uma linha e deixa a resposta respirar: título, régua curta, prosa, código com a tag da linguagem e o recibo do que mudou, alinhado ao rail.</p>
+</section>
+<section class="frame">
+  <header><h2>Paleta de comandos</h2><p>descrição sob o item focado, como no seletor do Devin CLI</p></header>
+  <pre style="width:96ch"><span style="color:#8AADD4;font-weight:bold">›</span><span style="color:#E8E5DB;font-weight:bold"> /mod</span><span style="color:#E8E5DB;font-weight:bold">                                                                                   </span><span style="color:#99978E">3 de 19</span>
+<span style="color:#3A3A3A">────────────────────────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#8AADD4;font-weight:bold">› </span><span style="color:#8AADD4;font-weight:bold">/model</span><span style="background:#2A2A2A">                                                                                        </span>
+<span style="color:#99978E">   modelo, esforço e velocidade desta sessão</span>
+<span style="color:#99978E">· </span><span style="color:#E8E5DB">/mode</span><span style="color:#99978E">      alternar modo (auto · leitura · plano)</span>
+<span style="color:#99978E">· </span><span style="color:#E8E5DB">/model --default</span><span style="color:#99978E">   salvar o modelo atual como padrão</span>
+<span style="color:#99978E">· </span><span style="color:#E8E5DB">/resume</span><span style="color:#99978E">    retomar uma sessão anterior</span>
+<span style="color:#99978E">· </span><span style="color:#E8E5DB">/rename</span><span style="color:#99978E">    nomear esta sessão</span>
+<span style="color:#99978E">· </span><span style="color:#E8E5DB">/compact</span><span style="color:#99978E">   resumir o contexto</span>
+<span style="color:#99978E">· </span><span style="color:#E8E5DB">/queue</span><span style="color:#99978E">     gerenciar prompts pendentes</span>
+<span style="color:#99978E">· </span><span style="color:#E8E5DB">/retry</span><span style="color:#99978E">     retomar uma conexão pausada</span>
+<span style="color:#99978E">· </span><span style="color:#E8E5DB">/login</span><span style="color:#99978E">     conectar provedor</span>
+<span style="color:#3A3A3A">────────────────────────────────────────────────────────────────────────────────────────────────</span>
+<span style="color:#99978E">↑↓ navegar · ↵ executar · esc fechar</span></pre>
+  <p class="note">A descrição do comando focado ganha linha própria, indentada sob o rótulo; os demais ficam em uma linha. O cabeçalho mostra o que já foi digitado e o filtro não consome linha extra.</p>
+</section>
+<section class="frame">
+  <header><h2>Janela estreita</h2><p>a mesma gramática degrada: sem coluna direita, dicas mínimas, TODO recolhido</p></header>
+  <pre style="width:60ch"><span style="color:#E8E5DB;font-weight:bold"> SLIM</span><span style="color:#99978E"> · Corrigir…</span><span style="color:#99978E">                                          </span><span style="color:#72CC91">●</span>
+<span style="color:#3A3A3A">────────────────────────────────────────────────────────────</span>
+
+<span style="color:#BCB9AF;font-weight:bold">▌ Você</span><span style="color:#BCB9AF;font-weight:bold">                                                 </span><span style="color:#99978E;background:#141414">14:32</span>
+<span style="color:#BCB9AF;font-weight:bold">▌ </span><span style="color:#E8E5DB;background:#141414">O parser quebra com CRLF e a lista de</span><span style="background:#141414">                     </span>
+<span style="color:#BCB9AF;font-weight:bold">▌ </span><span style="color:#E8E5DB;background:#141414">erros sai duplicada.</span><span style="background:#141414">                                      </span>
+<span style="background:#141414">                                                            </span>
+
+<span style="color:#72CC91">▌ </span><span style="color:#72CC91;font-weight:bold">Slim</span><span style="color:#99978E"> · GPT-5.6 Sol</span><span style="color:#99978E">                                     </span><span style="color:#99978E">12s</span>
+<span style="color:#3A3A3A">────────────────────────────────────────────────────────────</span>
+<span style="color:#A99FD6">▌ </span><span style="color:#A99FD6">⠹ Pensou · 3.2s</span><span style="color:#99978E">  Dois sintomas, possivel…</span>
+<span style="color:#99978E">▌ </span><span style="color:#BCB9AF">▾ Trabalhou · 3 leituras, 1 busca…</span><span style="color:#BCB9AF">                 </span><span style="color:#99978E">↵ abrir</span>
+<span style="color:#99978E">▌   </span><span style="color:#E87973">✕</span><span style="color:#BCB9AF"> $ cargo test parser</span><span style="color:#99978E"> · exit 101</span>
+<span style="color:#8AADD4">▌ </span><span style="color:#8AADD4">⠋</span><span style="color:#BCB9AF"> $ cargo clippy</span><span style="color:#99978E"> · 5s · limit 600s</span>
+
+<span style="color:#8AADD4;opacity:.55">╭──────────────────────────────────────────────────────────╮</span>
+<span style="color:#8AADD4;opacity:.55">│</span><span style=""> </span><span style="color:#8AADD4">› </span><span style="color:#99978E">Próxima mensagem…</span><span style="color:#8AADD4;opacity:.55">│</span><span style="color:#8AADD4;opacity:.55">                                      </span>
+<span style="color:#8AADD4;opacity:.55">╰──────────────────────────────────────────────────────────╯</span>
+<span style="color:#BCB9AF;font-weight:bold">Auto</span><span style="color:#99978E"> · </span><span style="color:#BCB9AF">GPT-5.6 Sol</span><span style="color:#99978E"> · ctx </span><span style="color:#BCB9AF">▰▰▱▱▱</span><span style="color:#99978E"> 8%</span>
+<span style="color:#8AADD4">⠋ execução 12s</span><span style="color:#99978E"> · esc parar</span></pre>
+  <p class="note">Em 60 colunas o chrome perde a coluna da direita, o rail continua sendo o que organiza o turno e a barra de estado mantém estado + uma dica. Nada de novo aparece; o que sobra é cortado em palavras, com reticências.</p>
+</section>
+</div></body>

@@ -86,6 +86,12 @@ fn truecolor_error() -> Color {
     Color::Rgb(theme.error.0, theme.error.1, theme.error.2)
 }
 
+/// Column (in cells) where `needle` starts in `row`.
+fn column_of(row: &str, needle: &str) -> Option<usize> {
+    row.find(needle)
+        .map(|byte| unicode_width::UnicodeWidthStr::width(&row[..byte]))
+}
+
 #[test]
 fn restored_tools_are_neutral_history_in_both_inspectors() {
     use slim_tui::api::{SessionId, ToolBatchId, ToolCallId, TranscriptMessage, TranscriptRole};
@@ -367,7 +373,7 @@ fn wide_transcript_uses_terminal_width_without_automatic_inspector() {
         "automatic inspector must stay absent\n{wide}"
     );
     assert!(
-        wide.lines().any(|row| row.trim_end() == "  ● Slim"),
+        wide.lines().any(|row| row.trim_end() == "▌ ● Slim"),
         "assistant must retain its explicit role label\n{wide}"
     );
     assert!(wide.contains("assistant-tail-marker"), "{wide}");
@@ -377,7 +383,7 @@ fn wide_transcript_uses_terminal_width_without_automatic_inspector() {
         .find(|line| line.contains("● Você"))
         .expect("user prompt");
     assert_eq!(
-        user_line.find("●"),
+        column_of(user_line, "●"),
         Some(2),
         "140-column transcript starts at the terminal inset\n{wide}"
     );
@@ -394,12 +400,12 @@ fn below_default_breakpoint_uses_full_width_single_column_without_run_inspector(
             .find(|line| line.contains("● Você"))
             .expect("user prompt");
         assert_eq!(
-            user_line.find("●"),
+            column_of(user_line, "●"),
             Some(2),
             "width {width} transcript should use the full terminal width\n{narrow}"
         );
         assert!(
-            narrow.lines().any(|row| row.trim_end() == "  ● Slim"),
+            narrow.lines().any(|row| row.trim_end() == "▌ ● Slim"),
             "assistant role must remain visible at width {width}\n{narrow}"
         );
         assert!(

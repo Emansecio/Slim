@@ -166,3 +166,47 @@ fn very_short_welcome_removes_spacing_before_content() {
     assert!(one_row.contains("SLIM"));
     assert!(one_row.contains("Não conectado"));
 }
+
+#[test]
+fn roomy_welcome_draws_the_wordmark_above_the_name_and_a_tip_below() {
+    let frame = text(&render(
+        &AppState::new(),
+        120,
+        30,
+        caps(ColorDepth::TrueColor, false),
+    ));
+    let lines: Vec<&str> = frame.lines().collect();
+    let mark = lines
+        .iter()
+        .position(|line| line.contains('\u{2588}'))
+        .expect("wordmark rendered");
+    let name = lines
+        .iter()
+        .position(|line| line.contains("SLIM"))
+        .expect("name rendered");
+    let tip = lines
+        .iter()
+        .position(|line| line.contains("Dica"))
+        .expect("tip rendered");
+    assert!(mark < name && name < tip, "{frame}");
+    // Centered: the name sits away from the left edge.
+    assert!(lines[name].find("SLIM").expect("name") > 40, "{frame}");
+}
+
+#[test]
+fn no_color_welcome_keeps_the_wordmark_and_every_row() {
+    let plain = text(&render(
+        &AppState::new(),
+        120,
+        30,
+        caps(ColorDepth::None, false),
+    ));
+    let colored = text(&render(
+        &AppState::new(),
+        120,
+        30,
+        caps(ColorDepth::TrueColor, false),
+    ));
+    assert!(plain.contains('\u{2588}'), "{plain}");
+    assert_eq!(plain, colored);
+}

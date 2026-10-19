@@ -49,6 +49,8 @@ pub struct FileConfig {
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     #[serde(default)]
+    pub time_budget_secs: Option<u64>,
+    #[serde(default)]
     pub max_result_bytes: Option<usize>,
     #[serde(default)]
     pub compaction: Option<FileCompactionConfig>,
@@ -534,6 +536,7 @@ pub struct LayeredConfig {
     pub max_turns: Option<usize>,
     pub max_output_tokens: Option<u32>,
     pub timeout_secs: Option<u64>,
+    pub time_budget_secs: Option<u64>,
     pub max_result_bytes: Option<usize>,
     pub compaction: FileCompactionConfig,
     pub shell_jobs: slim_core::runtime::ShellJobLimits,
@@ -1064,6 +1067,7 @@ fn load_layered_with_project(project: PathBuf) -> Result<LayeredConfig, String> 
     config.max_turns = file_default(config.max_turns, "SLIM_MAX_TURNS");
     config.max_output_tokens = file_default(config.max_output_tokens, "SLIM_MAX_OUTPUT_TOKENS");
     config.timeout_secs = file_default(config.timeout_secs, "SLIM_TIMEOUT_SECS");
+    config.time_budget_secs = file_default(config.time_budget_secs, "SLIM_TIME_BUDGET_SECS");
     config.max_result_bytes = file_default(config.max_result_bytes, "SLIM_MAX_RESULT_BYTES");
     config.mcp.validate()?;
     Ok(config)
@@ -1221,6 +1225,9 @@ pub(crate) fn merge_layer_as(target: &mut LayeredConfig, source: FileConfig, ori
     }
     if source.timeout_secs.is_some() {
         target.timeout_secs = source.timeout_secs;
+    }
+    if source.time_budget_secs.is_some() {
+        target.time_budget_secs = source.time_budget_secs;
     }
     if source.max_result_bytes.is_some() {
         target.max_result_bytes = source.max_result_bytes;
@@ -1409,7 +1416,7 @@ mod tests {
     #[test]
     fn parse_reads_tool_budget_keys() {
         let config = FileConfig::parse(
-            "max_mutating_tool_calls = 48\nmax_read_tool_calls = 120\nmax_turns = 64\nmax_output_tokens = 8192\ntimeout_secs = 180\nmax_result_bytes = 32768\n",
+            "max_mutating_tool_calls = 48\nmax_read_tool_calls = 120\nmax_turns = 64\nmax_output_tokens = 8192\ntimeout_secs = 180\ntime_budget_secs = 1500\nmax_result_bytes = 32768\n",
         )
         .expect("valid config parses");
         assert_eq!(config.max_mutating_tool_calls, Some(48));
@@ -1417,6 +1424,7 @@ mod tests {
         assert_eq!(config.max_turns, Some(64));
         assert_eq!(config.max_output_tokens, Some(8192));
         assert_eq!(config.timeout_secs, Some(180));
+        assert_eq!(config.time_budget_secs, Some(1500));
         assert_eq!(config.max_result_bytes, Some(32768));
     }
 

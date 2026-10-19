@@ -375,9 +375,11 @@ pub(crate) fn assistant_text_width(width: u16) -> u16 {
 fn block_height(block: &Block, width: u16, cache: &mut WrapCache) -> usize {
     let content_rows = match block.kind() {
         BlockKind::User(text) => {
+            // Header row, the prompt's rows, the air that closes the band, and
+            // the agent's header while the prompt waits for its first output.
             prose_row_count(text, user_prompt_text_width(width) as usize)
                 + 2
-                + usize::from(block.awaiting_agent())
+                + usize::from(block.awaiting_agent()) * crate::block::ResponseHeader::PENDING.rows()
         }
         BlockKind::Assistant(text) => {
             // The measured projection is shared with the render pass, so the

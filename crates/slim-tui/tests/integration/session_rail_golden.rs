@@ -118,7 +118,14 @@ fn the_home_reads_as_a_tilde_and_the_project_folder_is_the_one_in_text_tone() {
     let Some(home) = home() else { return };
     let cwd = format!(r"{home}\Projects\Slim");
     let row = rail(&state(&cwd, None), 100, ColorDepth::TrueColor);
-    assert_eq!(row.line(), r"SLIM · ~\Projects\Slim");
+    assert!(
+        row.line().starts_with(r"SLIM · ~\Projects\Slim"),
+        "{}",
+        row.line()
+    );
+    // The right edge says who the session is talking to.
+    assert!(row.line().ends_with("● Anthropic"), "{}", row.line());
+    assert_eq!(row.fg("Anthropic"), MUTED);
     // The brand a step above the quiet path, the folder in the text tone.
     assert_eq!(row.fg("SLIM"), SECONDARY);
     assert_eq!(row.fg("~"), MUTED);
@@ -127,17 +134,21 @@ fn the_home_reads_as_a_tilde_and_the_project_folder_is_the_one_in_text_tone() {
     assert_eq!(row.fg("Slim"), TEXT);
     // Lower-case spelling of the same home is the same directory.
     let lower = format!(r"{}\Projects\Slim", home.to_lowercase());
-    assert_eq!(
-        rail(&state(&lower, None), 100, ColorDepth::TrueColor).line(),
-        r"SLIM · ~\Projects\Slim"
-    );
+    assert!(rail(&state(&lower, None), 100, ColorDepth::TrueColor)
+        .line()
+        .starts_with(r"SLIM · ~\Projects\Slim"));
     // The session title still leads and keeps the text tone too.
     let row = rail(
         &state(&cwd, Some("Corrigir CRLF")),
         100,
         ColorDepth::TrueColor,
     );
-    assert_eq!(row.line(), r"SLIM · Corrigir CRLF · ~\Projects\Slim");
+    assert!(
+        row.line()
+            .starts_with(r"SLIM · Corrigir CRLF · ~\Projects\Slim"),
+        "{}",
+        row.line()
+    );
     assert_eq!(row.fg("Corrigir"), TEXT);
     assert_eq!(row.fg("Projects"), MUTED);
     assert_eq!(row.fg("Slim"), TEXT);
@@ -146,7 +157,11 @@ fn the_home_reads_as_a_tilde_and_the_project_folder_is_the_one_in_text_tone() {
 #[test]
 fn a_path_outside_the_home_is_shown_as_it_is_with_the_same_emphasis() {
     let row = rail(&state(r"D:\Work\Slim", None), 100, ColorDepth::TrueColor);
-    assert_eq!(row.line(), r"SLIM · D:\Work\Slim");
+    assert!(
+        row.line().starts_with(r"SLIM · D:\Work\Slim"),
+        "{}",
+        row.line()
+    );
     assert_eq!(row.fg("Work"), MUTED);
     assert_eq!(row.fg(r"\Slim"), MUTED);
     assert_eq!(row.fg("Slim"), TEXT);
@@ -174,7 +189,14 @@ fn without_color_the_folder_is_told_apart_by_weight_alone() {
     let Some(home) = home() else { return };
     let cwd = format!(r"{home}\Projects\Slim");
     let row = rail(&state(&cwd, Some("Corrigir CRLF")), 100, ColorDepth::None);
-    assert_eq!(row.line(), r"SLIM · Corrigir CRLF · ~\Projects\Slim");
+    assert!(
+        row.line()
+            .starts_with(r"SLIM · Corrigir CRLF · ~\Projects\Slim"),
+        "{}",
+        row.line()
+    );
+    // Without color the chip's dot is ASCII.
+    assert!(row.line().ends_with("* Anthropic"), "{}", row.line());
     // No tone at all: every cell keeps the terminal's own color...
     assert!(row.foreground.iter().all(|fg| *fg == Color::Reset));
     // ...and only the project folder is bold.

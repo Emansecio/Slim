@@ -127,12 +127,12 @@ impl ReasoningEffort {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Low => "Fast responses with lighter reasoning",
-            Self::Medium => "Balances speed and reasoning depth for everyday tasks",
-            Self::High => "Greater reasoning depth for complex problems",
-            Self::XHigh => "Extra high reasoning depth for complex problems",
-            Self::Max => "Maximum reasoning depth for the hardest problems",
-            Self::Ultra => "Maximum reasoning with automatic task delegation",
+            Self::Low => "Respostas rápidas, raciocínio leve",
+            Self::Medium => "Equilíbrio entre velocidade e profundidade",
+            Self::High => "Raciocínio estendido para problemas complexos",
+            Self::XHigh => "Raciocínio extra para os problemas difíceis",
+            Self::Max => "Profundidade máxima de raciocínio",
+            Self::Ultra => "Raciocínio máximo com delegação automática",
         }
     }
 

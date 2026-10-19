@@ -292,11 +292,15 @@ impl Runtime {
                     repeated_failure_in_batch = false;
                 }
             }
-            let output = if duplicate_in_active_context {
+            let mut output = if duplicate_in_active_context {
                 pointer
             } else {
                 full_output
             };
+            if let Some(note) = self.run_guards.settle(&call.id, result.success) {
+                output.push('\n');
+                output.push_str(&note);
+            }
             if duplicate_in_active_context {
                 push_runtime_event(
                     &mut self.app,
@@ -431,6 +435,9 @@ impl Runtime {
             .into_iter()
             .map(|index| {
                 let mut prepared = prepared[index].clone();
+                if self.tuning_closed && prepared.error.is_none() && prepared.is_tuning_patch() {
+                    prepared.reject(TUNING_CLOSED_ERROR);
+                }
                 if shell_may_run {
                     if let Some(spec) = prepared.spec.as_mut() {
                         spec.cacheability = crate::tools::ToolCacheability::None;
@@ -555,9 +562,12 @@ impl Runtime {
         calls: &[ProviderToolCall],
         next_seq: &mut u64,
     ) -> Result<Vec<Arc<PreparedToolInvocation>>, ProviderError> {
-        let prepared = self
+        let mut prepared = self
             .prepare_provider_tool_invocations(mode, cwd, calls)
             .await?;
+        for (call, prepared) in calls.iter().zip(prepared.iter_mut()) {
+            self.run_guards.admit(&call.id, prepared);
+        }
         for call in calls {
             push_runtime_event(
                 &mut self.app,

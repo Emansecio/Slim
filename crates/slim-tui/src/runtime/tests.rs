@@ -35,15 +35,34 @@ fn caps() -> Capabilities {
 }
 
 #[test]
-fn grouped_commands_keep_a_gap_after_a_truncated_name() {
+fn palette_rows_keep_the_description_a_reading_measure_from_the_name() {
     let palette = Palette::of(caps());
-    let line = super::palette_command_line("/model --default", false, 32, &palette);
-    let text: String = line
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect();
-    assert!(text.contains("… salvar"), "{text}");
+    let text = |line: &ratatui::text::Line<'_>| -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    };
+    // Wide enough: the name keeps its column and the description follows it.
+    let wide = text(&super::palette_command_line(
+        "/model --default",
+        false,
+        64,
+        &palette,
+        true,
+    ));
+    assert!(wide.starts_with("· /model --default"), "{wide}");
+    assert!(wide.contains("salvar modelo atual"), "{wide}");
+    // Too narrow to read a description: it is dropped, never a stub glued to
+    // the name.
+    let narrow = text(&super::palette_command_line(
+        "/model --default",
+        false,
+        32,
+        &palette,
+        true,
+    ));
+    assert_eq!(narrow.trim_end(), "· /model --default", "{narrow}");
 }
 
 fn transition_deadline(state: &AppState, now_ms: u64, capabilities: Capabilities) -> Option<u64> {
@@ -676,7 +695,7 @@ fn slash_skills_with_a_shared_prefix_remain_distinct_at_minimum_size() {
 
     let frame = render_to_string(&state, 40, 8);
     assert!(frame.contains("/typescript-symbols"), "{frame}");
-    assert!(frame.contains("> /typescript-refs"), "{frame}");
+    assert!(frame.contains("› /typescript-refs"), "{frame}");
 
     reduce(
         &mut state,
@@ -1441,7 +1460,7 @@ fn microtransition_settles_in_steps_expires_at_249ms_and_reduced_motion_is_immed
 #[test]
 fn palette_focus_flash_expires_once_and_reduced_motion_keeps_the_stable_row() {
     let mut state = AppState::new();
-    state.palette_query = Some("model".into());
+    state.palette_query = Some("mo".into());
     state.menu_focus_at_ms = Some(0);
     let selected_bg = |state: &AppState, capabilities: Capabilities| {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
@@ -1449,18 +1468,16 @@ fn palette_focus_flash_expires_once_and_reduced_motion_keeps_the_stable_row() {
             .draw(|frame| render_frame(frame, state, capabilities, &mut WrapCache::default()))
             .expect("draw");
         let buffer = terminal.backend().buffer();
-        let row = (0..buffer.area.height)
-            .find(|&y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-                    .contains("/model")
+        // Row 0 is the panel's own header, which starts the same way.
+        let (x, y) = (1..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                buffer[(x, y)].symbol() == "›"
+                    && buffer[(x + 1, y)].symbol() == " "
+                    && buffer[(x + 2, y)].symbol() == "/"
             })
-            .expect("model command row");
-        (0..buffer.area.width)
-            .find(|&x| buffer[(x, row)].symbol() == ">")
-            .map(|x| buffer[(x, row)].bg)
-            .expect("selected row marker")
+            .expect("selected row marker");
+        buffer[(x, y)].bg
     };
     assert_eq!(
         transition_deadline(&state, 0, caps()),
@@ -2278,18 +2295,19 @@ fn modal_backdrop_settles_in_two_steps_while_the_modal_is_never_delayed() {
         super::next_transition_visual_deadline_ms(&state, 1_000, caps(), &mut cache),
         None
     );
-    state.palette_query = Some(String::new());
+    state.jobs_overlay = Some(crate::app::JobsOverlay::default());
     state.clock.elapsed_ms = 1_040;
     let first = paint_with(&state, caps(), &mut cache);
     assert_eq!(backdrop_fg(&first), step_fg(0));
-    // The modal itself is at full contrast from the first frame.
-    let modal_fg = (0..first.area.height)
+    // The dialog itself is at full contrast from the first frame: its own
+    // muted text is painted over the receded transcript.
+    let dialog_fg = (0..first.area.height)
         .flat_map(|y| (0..first.area.width).map(move |x| (x, y)))
-        .find(|&(x, y)| first[(x, y)].symbol() == ">")
         .map(|(x, y)| first[(x, y)].fg)
-        .expect("selected row marker");
-    assert_ne!(modal_fg, step_fg(0));
-    assert_ne!(modal_fg, resting);
+        .find(|fg| Some(*fg) == palette.muted.fg)
+        .expect("dialog text");
+    assert_ne!(dialog_fg, step_fg(0));
+    assert_ne!(dialog_fg, resting);
 
     // The loop is handed each step boundary even though motion is paused.
     let mut now = 1_040;
@@ -2314,8 +2332,8 @@ fn modal_backdrop_settles_in_two_steps_while_the_modal_is_never_delayed() {
     assert_eq!(seen, vec![1_040 + 83, 1_040 + 166]);
     assert!(!super::motion_needed(&state, caps(), &mut cache));
 
-    // Switching modals later does not replay the entrance.
-    state.palette_query = None;
+    // Switching dialogs later does not replay the entrance.
+    state.jobs_overlay = None;
     state.mcp_overlay = Some(McpOverlay::default());
     state.clock.elapsed_ms = 2_000;
     assert_eq!(
@@ -2331,13 +2349,13 @@ fn modal_backdrop_settles_in_two_steps_while_the_modal_is_never_delayed() {
     state.mcp_overlay = None;
     state.clock.elapsed_ms = 3_000;
     paint_with(&state, caps(), &mut cache);
-    state.palette_query = Some(String::new());
+    state.jobs_overlay = Some(crate::app::JobsOverlay::default());
     state.clock.elapsed_ms = 3_010;
     assert_eq!(
         backdrop_fg(&paint_with(&state, caps(), &mut cache)),
         step_fg(0)
     );
-    state.palette_query = None;
+    state.jobs_overlay = None;
     state.mcp_overlay = Some(McpOverlay::default());
     state.clock.elapsed_ms = 3_100;
     assert_eq!(
@@ -2366,7 +2384,7 @@ fn modal_backdrop_entrance_is_off_for_reduced_motion_and_shadeless_depths_and_fi
         if warm_up {
             paint_with(&state, capabilities, &mut cache);
         }
-        state.palette_query = Some(String::new());
+        state.jobs_overlay = Some(crate::app::JobsOverlay::default());
         state.clock.elapsed_ms = 10;
         let fg = backdrop_fg(&paint_with(&state, capabilities, &mut cache));
         let deadline =
@@ -2395,7 +2413,7 @@ fn modal_backdrop_entrance_is_off_for_reduced_motion_and_shadeless_depths_and_fi
 }
 
 #[test]
-fn composer_dropdowns_focus_with_bold_text_not_accent() {
+fn composer_dropdowns_focus_with_the_accent_label_on_the_selection_bar() {
     let mut state = AppState::new();
     state.slash_suggestions = Some(SlashSuggestions {
         query: String::new(),
@@ -2406,15 +2424,14 @@ fn composer_dropdowns_focus_with_bold_text_not_accent() {
     let marker = (0..buffer.area.height)
         .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
         .find(|&(x, y)| {
-            buffer[(x, y)].symbol() == ">"
+            buffer[(x, y)].symbol() == "›"
                 && buffer[(x + 1, y)].symbol() == " "
                 && buffer[(x + 2, y)].symbol() == "/"
         })
         .expect("focused slash row");
     for x in [marker.0, marker.0 + 2] {
         let cell = &buffer[(x, marker.1)];
-        assert_eq!(Some(cell.fg), palette.text.fg, "x={x}");
-        assert_ne!(Some(cell.fg), palette.accent.fg, "x={x}");
+        assert_eq!(Some(cell.fg), palette.accent.fg, "x={x}");
         assert!(cell.modifier.contains(Modifier::BOLD), "x={x}");
         assert_eq!(Some(cell.bg), palette.menu_selected.bg, "x={x}");
     }

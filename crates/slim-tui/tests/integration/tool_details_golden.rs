@@ -680,7 +680,7 @@ fn projected_patch_and_shell_rows_read_as_verb_target_and_outcome() {
         .find(|line| line.contains("✕ $"))
         .unwrap_or_else(|| panic!("failure row\n{collapsed}"));
     assert!(
-        failure.starts_with("    ✕ $ cargo test · exit 101"),
+        failure.starts_with("▌   ✕ $ cargo test · exit 101"),
         "the failure sits one step in from the header\n{collapsed}"
     );
 
@@ -793,7 +793,7 @@ fn expanded_patch_shows_its_applied_diff_before_the_receipt() {
         .collect::<Vec<_>>();
     let row_of = |needle: &str| {
         rows.iter()
-            .position(|row| row.trim_end() == format!("    {needle}"))
+            .position(|row| row.trim_end() == format!("▌   {needle}"))
             .unwrap_or_else(|| panic!("missing {needle:?}\n{}", rows.join("\n")))
     };
     let header = row_of("@@ src/lib.rs:2");

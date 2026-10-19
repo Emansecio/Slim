@@ -123,8 +123,8 @@ fn codex_alias_filters_and_adjusts_effort_inline() {
 
     let frame_text = render_to_string(&state);
     assert!(
-        frame_text.contains("Modelo · lu"),
-        "filter is visible in the title"
+        frame_text.contains("/ lu"),
+        "filter is visible on its own row"
     );
     assert!(frame_text.contains("Luna"), "match stays visible");
     assert!(
@@ -190,7 +190,7 @@ fn astra_picker_selects_reasoning_and_speed_and_cancel_does_not_apply_speed() {
     reduce(&mut state, Action::Key(press(KeyCode::Tab)));
     let fast = render_to_string(&state);
     assert!(fast.contains("velocidade Rápida"));
-    assert!(fast.contains("Tab velocidade"), "{fast}");
+    assert!(fast.contains("⇥ velocidade"), "{fast}");
     reduce(&mut state, Action::Key(press(KeyCode::Esc)));
     assert!(
         !state.codex_fast,
@@ -267,9 +267,10 @@ fn catalog_effort_is_inline_without_codex_speed() {
     // The focused row carries its effort as a meter over the offered levels.
     let focused = frame
         .lines()
-        .find(|line| line.contains('>') && line.contains("High"))
+        .find(|line| line.contains('›') && line.contains("High"))
         .unwrap_or_else(|| panic!("effort control is rendered:\n{frame}"));
-    assert!(focused.contains("▰▰▰▱ High"), "{focused}");
+    assert!(focused.contains("← ▰▰▰▱ →"), "{focused}");
+    assert!(focused.contains("High"), "{focused}");
     // Context and output read as compact token counts in the detail pane.
     assert!(frame.contains("contexto 1M · saída 131k"), "{frame}");
     assert!(
@@ -278,7 +279,7 @@ fn catalog_effort_is_inline_without_codex_speed() {
     );
     reduce(&mut state, Action::Key(press(KeyCode::Left)));
     assert!(
-        render_to_string(&state).contains("▰▰▱▱ Medium"),
+        render_to_string(&state).contains("← ▰▰▱▱ →"),
         "the meter follows the arrows"
     );
     let effects = reduce(&mut state, Action::Key(press(KeyCode::Enter)));
@@ -438,7 +439,8 @@ fn active_model_identity_includes_the_provider_when_catalog_ids_overlap() {
     );
     assert!(matches!(rows[overlay.selected], ModelRow::Catalog(0)));
     let frame = render_to_string(&state);
-    assert!(frame.contains("● Catalog Sol"), "{frame}");
+    assert!(frame.contains("Catalog Sol"), "{frame}");
+    assert!(frame.contains("● em uso"), "{frame}");
 }
 
 #[test]
@@ -451,7 +453,7 @@ fn selected_model_stays_visible_in_a_hundred_row_catalog() {
     let frame = render_at(&state, 80, 24);
 
     assert!(
-        frame.contains(">     Model 080"),
+        frame.contains("›   Model 080"),
         "selected model must remain visible in the picker viewport:\n{frame}"
     );
     assert!(frame.contains('/'), "picker must expose position feedback");
@@ -500,8 +502,9 @@ fn groups_are_headings_and_models_sit_under_them() {
         "models sit one step in under their heading\n{frame}"
     );
     // The cursor starts on the active model, the first of four models.
-    assert!(frame.contains("1/4 · "), "{frame}");
-    assert!(frame.contains("gpt-5.6-sol · OpenAI Codex"), "{frame}");
+    assert!(frame.contains("1/4 modelos"), "{frame}");
+    assert!(frame.contains("OpenAI Codex · GPT-5.6 Sol"), "{frame}");
+    assert!(frame.contains("gpt-5.6-sol"), "{frame}");
     assert!(frame.contains("só nesta sessão"), "{frame}");
 
     // On a heading, the pane describes the group.
@@ -512,7 +515,7 @@ fn groups_are_headings_and_models_sit_under_them() {
         "{on_heading}"
     );
     assert!(on_heading.contains("Enter recolhe o grupo"), "{on_heading}");
-    assert!(on_heading.contains("4 modelos · "), "{on_heading}");
+    assert!(on_heading.contains("4 modelos"), "{on_heading}");
 }
 
 /// Filtering does not move the panel or its search cursor.
@@ -523,26 +526,29 @@ fn overlay_geometry_is_stable_while_filtering() {
     let lines: Vec<&str> = frame.lines().collect();
     let top = lines
         .iter()
-        .position(|line| line.contains("╭ Modelo ·"))
-        .unwrap_or_else(|| panic!("rounded title row missing:\n{frame}"));
-    let bottom = top
-        + lines[top..]
-            .iter()
-            .position(|line| line.contains('╰'))
-            .expect("bottom border");
+        .position(|line| line.starts_with("› /model"))
+        .unwrap_or_else(|| panic!("header row missing:\n{frame}"));
+    let bottom = lines
+        .iter()
+        .position(|line| line.contains("↵ aplicar"))
+        .expect("hint bar");
+    assert_eq!(top, 0, "the panel owns the first row:\n{frame}");
     assert!(
-        !frame.contains('┌'),
-        "square corners must be gone:\n{frame}"
+        !frame.contains('╭'),
+        "a picker is rules, not a box:\n{frame}"
     );
     assert!(
-        lines[bottom - 1].contains("Enter aplicar"),
-        "footer must sit on the last inner row:\n{frame}"
+        lines[bottom].contains("esforço"),
+        "the hint bar names what the picker offers:\n{frame}"
     );
     type_text(&mut state, "astra");
     let filtered = render_to_string(&state);
     let filtered_lines: Vec<&str> = filtered.lines().collect();
-    assert!(filtered_lines[top].contains("╭ Modelo · astra"));
-    assert!(filtered_lines[bottom].contains('╰'));
+    assert!(filtered_lines[top].starts_with("› /model"));
+    assert!(
+        filtered_lines[bottom].contains("↵ aplicar"),
+        "the panel keeps its geometry while filtering:\n{filtered}"
+    );
 }
 
 fn render_to_string(state: &AppState) -> String {

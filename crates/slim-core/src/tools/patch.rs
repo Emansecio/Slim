@@ -10,6 +10,62 @@ use super::{digest_bytes, DependencyObservation, FastStamp, ToolError, ToolExecu
 
 pub(super) const MAX_PATCH_EDITS: usize = 64;
 
+/// The edit keeps every character outside numeric literals and hex colours,
+/// and changes at least one of them: a retune, not a structural change.
+pub(super) fn tuning_only_edit(expected: &str, replacement: &str) -> bool {
+    let (before, old) = numeric_skeleton(expected);
+    let (after, new) = numeric_skeleton(replacement);
+    before == after && old != new
+}
+
+/// `text` with each numeric literal replaced by a NUL marker, and the
+/// literals in order. A literal starts at a digit, `.digit` or `#hex` that
+/// does not continue an identifier, and spans suffixes (`0xFF`, `1e-3`,
+/// `10px`, `1.5f`).
+fn numeric_skeleton(text: &str) -> (String, Vec<&str>) {
+    fn word(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+    let bytes = text.as_bytes();
+    let digit_at = |index: usize| bytes.get(index).is_some_and(u8::is_ascii_digit);
+    let mut skeleton = String::with_capacity(text.len());
+    let mut literals = Vec::new();
+    let mut copied = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let starts = (index == 0 || !word(bytes[index - 1]))
+            && match bytes[index] {
+                b'0'..=b'9' => true,
+                b'.' => digit_at(index + 1),
+                b'#' => bytes.get(index + 1).is_some_and(u8::is_ascii_hexdigit),
+                _ => false,
+            };
+        if !starts {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 1;
+        while let Some(&byte) = bytes.get(end) {
+            let exponent_sign = matches!(byte, b'+' | b'-')
+                && matches!(bytes[end - 1], b'e' | b'E')
+                && bytes[index] != b'#'
+                && digit_at(end + 1);
+            if word(byte) || (byte == b'.' && digit_at(end + 1)) || exponent_sign {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        skeleton.push_str(&text[copied..index]);
+        skeleton.push('\0');
+        literals.push(&text[index..end]);
+        copied = end;
+        index = end;
+    }
+    skeleton.push_str(&text[copied..]);
+    (skeleton, literals)
+}
+
 /// Replaces one unique exact occurrence. LF excerpts may
 /// match a uniformly CRLF file; that case preserves CRLF in the replacement.
 pub fn apply_exact_patch(
@@ -769,5 +825,29 @@ mod diff_tests {
             .map(|hunk| hunk.removed.len() + hunk.added.len())
             .sum();
         assert_eq!(kept, super::MAX_EDIT_DIFF_LINES);
+    }
+}
+
+#[cfg(test)]
+mod tuning_tests {
+    use super::tuning_only_edit;
+
+    #[test]
+    fn numeric_and_colour_retunes_are_tuning() {
+        assert!(tuning_only_edit("k = 0.0085;", "k = 0.0042;"));
+        assert!(tuning_only_edit("color: #ff8800;", "color: #ffaa00;"));
+        assert!(tuning_only_edit("glow(1e-3, 10px)", "glow(2.5e-3, 12px)"));
+        assert!(tuning_only_edit("let n = 0xFF;", "let n = 0x7F;"));
+        assert!(tuning_only_edit("w = .5", "w = .75"));
+    }
+
+    #[test]
+    fn structural_or_identical_edits_are_not_tuning() {
+        assert!(!tuning_only_edit("k = 0.5;", "k = 0.5;"));
+        assert!(!tuning_only_edit("max(lf, 0)", "abs(lf)"));
+        assert!(!tuning_only_edit("vec3(1.0)", "vec4(1.0)"));
+        assert!(!tuning_only_edit("x = 1.0.max(y)", "x = 1.0.min(y)"));
+        assert!(!tuning_only_edit("a = 1", "a  = 1"));
+        assert!(!tuning_only_edit("x - 0.5", "x + 0.5"));
     }
 }

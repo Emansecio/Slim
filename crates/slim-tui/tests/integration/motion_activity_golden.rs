@@ -45,6 +45,20 @@ fn render_state_at(
         .collect()
 }
 
+/// Whether a frame closes a line with the streaming caret. The rail of a turn
+/// is the same glyph and stands in the first cell of its rows.
+fn has_caret(frame: &str) -> bool {
+    frame.lines().any(|row| {
+        let text = row.trim_end();
+        text.ends_with('▌')
+            && !text
+                .trim_start_matches(['▌', ' '])
+                .trim_end_matches('▌')
+                .trim()
+                .is_empty()
+    })
+}
+
 #[test]
 fn cancelled_answer_keeps_its_partial_label_after_toast_expiry_and_late_delta() {
     let mut state = AppState::new();
@@ -67,7 +81,7 @@ fn cancelled_answer_keeps_its_partial_label_after_toast_expiry_and_late_delta() 
     let frame = render_state(&state, caps(false)).join("\n");
     assert!(frame.contains("Slim · interrompido · parcial"), "{frame}");
     assert!(frame.contains("partial answer tail"), "{frame}");
-    assert!(!frame.contains('▌'), "{frame}");
+    assert!(!has_caret(&frame), "{frame}");
     assert!(!state.working);
     assert!(state.activity.is_none());
     assert_eq!(
@@ -899,8 +913,8 @@ fn reduced_motion_removes_caret_without_reflow() {
     let moving = render_state(&state, caps(false));
     let reduced = render_state(&state, caps(true));
 
-    assert!(moving.join("\n").contains('▌'));
-    assert!(!reduced.join("\n").contains('▌'));
+    assert!(has_caret(&moving.join("\n")));
+    assert!(!has_caret(&reduced.join("\n")));
     assert_eq!(moving.len(), reduced.len());
     assert_eq!(
         moving

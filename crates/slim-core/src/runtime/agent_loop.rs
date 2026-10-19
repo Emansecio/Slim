@@ -64,6 +64,10 @@ pub(super) struct LoopState<'m> {
     pub(super) recovery: RecoveryBudget,
     /// Where the channel overlay goes in every request of this run.
     pub(super) channel: mode::ChannelFrame,
+    /// When the run started, for `time_budget`.
+    started: Instant,
+    /// The time budget's finalize phase began and the model was told.
+    finalize_steered: bool,
 }
 
 impl<'m> LoopState<'m> {
@@ -92,7 +96,15 @@ impl<'m> LoopState<'m> {
             awaiting_response: false,
             recovery: RecoveryBudget::new(config.context_reserve_tokens),
             channel,
+            started: Instant::now(),
+            finalize_steered: false,
         }
+    }
+
+    fn time_budget_spent(&self) -> bool {
+        self.config
+            .time_budget
+            .is_some_and(|budget| self.started.elapsed() >= budget)
     }
 }
 
@@ -128,6 +140,9 @@ struct BatchReport {
     budget_cut: ToolBudgetCut,
     suppressed: Vec<ProviderToolCall>,
     repeated_failure: bool,
+    /// `then_run.final` of a batch whose every call succeeded and whose
+    /// fused check passed: the run may end with it, without another turn.
+    concluded: Option<String>,
 }
 
 /// How the loop leaves a turn early. Phases return it as their `Err` so `?`
@@ -769,6 +784,10 @@ impl Runtime {
         // Transport retries resend the current turn: they are bounded by their
         // own recovery budgets and do not advance `turn`.
         while st.turn < st.config.max_turns {
+            if st.time_budget_spent() {
+                st.stop = AgentLoopStop::TimeLimit;
+                break;
+            }
             proceed!(st, self.begin_turn(ctx, &mut st).await);
             let prepared = proceed!(st, self.prepare_request(ctx, &mut st).await);
             let mut active = proceed!(st, self.call_provider(ctx, &mut st, prepared).await);
@@ -835,6 +854,8 @@ impl Runtime {
             )?;
         }
         self.edited = EditedFiles::default();
+        self.tuning_closed = false;
+        self.run_guards = run_guards::RunGuards::default();
         // An elision changed what the last response's usage described.
         let anchor = if seed_elision.elided > 0 {
             if let Some(handle) = &self.compaction_handle {
@@ -893,6 +914,8 @@ impl Runtime {
                     request = Some(*applied);
                     st.compaction_applied = true;
                     st.guard = LoopGuard::default();
+                    // What the guards remember was read is now a summary.
+                    self.run_guards = run_guards::RunGuards::default();
                 }
                 Ok(CompactionOutcome::Skipped) => {}
                 Ok(CompactionOutcome::Cancelled) => {
@@ -1364,11 +1387,13 @@ impl Runtime {
         st.reserved_tool_slots = st
             .reserved_tool_slots
             .saturating_add(self.codemode.used_calls);
+        let concluded = then_run_final_answer(&batch.calls, &batch.results);
         let repeated_failure = self.record_batch(ctx, st, active, batch).await?;
         Ok(BatchReport {
             budget_cut,
             suppressed,
             repeated_failure,
+            concluded,
         })
     }
 
@@ -1541,6 +1566,7 @@ impl Runtime {
         report: &BatchReport,
     ) -> Result<Option<AgentLoopStop>, ProviderError> {
         let suppressed_calls = report.budget_cut.suppressed;
+        let messages_before = st.messages.len();
         if suppressed_calls > 0
             && should_stop_after_tool_budget_cut(report.budget_cut, st.turn, st.config.max_turns)
         {
@@ -1559,6 +1585,12 @@ impl Runtime {
         if st.governor.stop_requested() {
             self.app.discard_projected_payloads();
             return Ok(Some(AgentLoopStop::NoProgress));
+        }
+        // A passing `then_run.final` concludes the run: no steer may hold it.
+        if report.concluded.is_none() && active.more_turns && !self.is_cancelled() {
+            if let Some(steer) = self.enter_finalize_phase(st) {
+                self.append_conversation_message(st.messages, ProviderMessage::user(steer))?;
+            }
         }
         if ctx.mode == crate::OperatingMode::Auto
             && active.more_turns
@@ -1587,7 +1619,67 @@ impl Runtime {
                 self.append_conversation_message(st.messages, ProviderMessage::user(note))?;
             }
         }
+        // Conclusion on success: the model already wrote its closing answer
+        // into `then_run.final`, so a passing check ends the run here instead
+        // of paying a turn that would only restate it. Anything the harness
+        // still has to tell the model (diagnostics, steers, reviews, jobs)
+        // keeps the loop going.
+        if let Some(answer) = report.concluded.as_deref() {
+            if suppressed_calls == 0
+                && st.messages.len() == messages_before
+                && !self.shell_jobs.running()
+                && !self.is_cancelled()
+            {
+                self.conclude_with_answer(st, answer)?;
+                return Ok(Some(AgentLoopStop::ProviderCompleted));
+            }
+        }
         Ok(None)
+    }
+
+    /// From three quarters of the time budget on, tuning-only patches are
+    /// refused; the model is told once, with the numbers, to finish.
+    fn enter_finalize_phase(&mut self, st: &mut LoopState<'_>) -> Option<String> {
+        let budget = st.config.time_budget?;
+        let elapsed = st.started.elapsed();
+        if st.finalize_steered || elapsed < budget.mul_f64(0.75) || elapsed >= budget {
+            return None;
+        }
+        st.finalize_steered = true;
+        self.tuning_closed = true;
+        Some(format!(
+            "[Time budget] {} of {} used. Finalize now: start nothing new; tuning-only patches (numbers or colours) are refused from here on. Fix only what fails the task's own check, run the final validation and answer. The run stops when the budget is spent.",
+            budget_clock(elapsed),
+            budget_clock(budget),
+        ))
+    }
+
+    /// Ends the run with `answer` as the assistant's final text, recorded as
+    /// a provider turn would record it.
+    fn conclude_with_answer(
+        &mut self,
+        st: &mut LoopState<'_>,
+        answer: &str,
+    ) -> Result<(), ProviderError> {
+        push_runtime_event(
+            &mut self.app,
+            &mut st.next_seq,
+            crate::EventKind::AssistantTextDelta {
+                text: answer.to_owned(),
+            },
+        )?;
+        push_runtime_event(
+            &mut self.app,
+            &mut st.next_seq,
+            crate::EventKind::AssistantEnded {
+                reason: "then_run_passed".into(),
+            },
+        )?;
+        self.append_conversation_message(
+            st.messages,
+            ProviderMessage::assistant(answer.to_owned(), Vec::new()),
+        )?;
+        Ok(())
     }
 
     /// Everything after the turn loop: settles shell jobs, asks for a final
@@ -1607,6 +1699,7 @@ impl Runtime {
             st.stop,
             AgentLoopStop::TurnLimit
                 | AgentLoopStop::ToolLimit
+                | AgentLoopStop::TimeLimit
                 | AgentLoopStop::NoProgress
                 | AgentLoopStop::RepeatedFailedTool
         ) && !self.is_cancelled()
@@ -1676,13 +1769,12 @@ impl Runtime {
     ) -> Result<(), ProviderError> {
         let finalize_event_start = self.app.events().len();
         self.uncommitted_event_start = Some(finalize_event_start);
-        let closing_prompt = if matches!(
-            st.stop,
-            AgentLoopStop::NoProgress | AgentLoopStop::RepeatedFailedTool
-        ) {
-            NO_PROGRESS_FINALIZE_PROMPT
-        } else {
-            BUDGET_FINALIZE_PROMPT
+        let closing_prompt = match st.stop {
+            AgentLoopStop::NoProgress if st.governor.tuning_stop() => TUNING_FINALIZE_PROMPT,
+            AgentLoopStop::NoProgress | AgentLoopStop::RepeatedFailedTool => {
+                NO_PROGRESS_FINALIZE_PROMPT
+            }
+            _ => BUDGET_FINALIZE_PROMPT,
         };
         let closing_tools: Arc<[Value]> = if ctx.client.finalization_keeps_tools() {
             self.workspace_tool_definitions(ctx.mode, ctx.cwd)
@@ -1889,20 +1981,32 @@ impl Runtime {
 }
 
 /// The steer for a batch whose tool repeated evidence without a state change.
+/// Seconds under a minute, tenths of a minute above.
+fn budget_clock(duration: std::time::Duration) -> String {
+    let secs = duration.as_secs_f64();
+    if secs < 60.0 {
+        format!("{secs:.0} s")
+    } else {
+        format!("{:.1} min", secs / 60.0)
+    }
+}
+
 fn causal_reuse_steer(events: &[crate::SessionEvent]) -> Option<String> {
-    events.iter().find_map(|event| {
-        if let crate::EventKind::CausalAnomalyDetected {
+    events.iter().find_map(|event| match &event.kind {
+        crate::EventKind::CausalAnomalyDetected {
+            kind: crate::CausalAnomalyKind::TuningLoop,
+            occurrence,
+            action: crate::CausalShadowAction::WouldWarn,
+            ..
+        } => Some(format!("{occurrence} consecutive turns only retuned numbers or colours. Check the result against the task's own criterion: if it passes, finish now with the current values; if it fails, make a structural fix instead of another retune. More tuning-only turns end the run.")),
+        crate::EventKind::CausalAnomalyDetected {
             tool_name,
             call_id,
             confidence: crate::CausalConfidence::High,
             action: crate::CausalShadowAction::WouldReuse | crate::CausalShadowAction::WouldWarn,
             ..
-        } = &event.kind
-        {
-            Some(format!("Tool {tool_name} call {call_id} repeated evidence without a relevant state change. Use the existing result or change the approach. Retry only after the dependency changes or if the needed content is no longer available; otherwise finish with the known outcome and blocker."))
-        } else {
-            None
-        }
+        } => Some(format!("Tool {tool_name} call {call_id} repeated evidence without a relevant state change. Use the existing result or change the approach. Retry only after the dependency changes or if the needed content is no longer available; otherwise finish with the known outcome and blocker.")),
+        _ => None,
     })
 }
 
@@ -1926,4 +2030,23 @@ fn retain_own_reasoning<A: ProviderAdapter>(adapter: &A, messages: &mut [Provide
             message.chat_reasoning = None;
         }
     }
+}
+
+/// `then_run.final` when every call of the batch succeeded and the
+/// write/patch carrying it reported a passing fused check; the last one wins.
+fn then_run_final_answer(calls: &[ProviderToolCall], results: &[ToolResult]) -> Option<String> {
+    if calls.len() != results.len() || results.iter().any(|result| !result.success) {
+        return None;
+    }
+    calls
+        .iter()
+        .zip(results)
+        .rev()
+        .filter(|(call, _)| matches!(call.name.as_str(), "write" | "patch"))
+        .filter(|(_, result)| result.output.contains(crate::tools::THEN_RUN_PASSED))
+        .find_map(|(call, _)| {
+            let arguments = serde_json::from_str::<Value>(&call.arguments).ok()?;
+            let answer = arguments.get("then_run")?.get("final")?.as_str()?.trim();
+            (!answer.is_empty()).then(|| answer.to_owned())
+        })
 }

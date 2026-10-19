@@ -749,6 +749,72 @@ real, com degradação explícita e testes golden (G340–G341).
 
 ### 1.2 Direção visual revisada
 
+**Revisão de 18/10/2026 (estrutura do transcript e painéis de largura total):** a
+paleta não muda — nenhum token de cor entra ou sai. O que muda é onde cada tom
+trabalha: o turno ganha um rail contínuo, o cabeçalho do agente ganha uma régua,
+e os seletores deixam de ser caixas centradas para virar painéis que ocupam o
+terminal, no idioma do seletor do Devin CLI. Nenhum timer novo: o movimento
+continua sendo o que já existia (spinner, sweep, brilho de chegada, settle).
+
+- **Rail do turno.** A primeira célula de cada row de um turno carrega `▌` no tom
+  do dono: marfim no lado do usuário, verde de identidade no do agente, violeta
+  no pensamento, o azul de indicador vivo numa chamada em execução e o cinza
+  quieto no trabalho assentado e no recibo. O rail é pintado depois das rows do
+  bloco, sobre as superfícies que já estão lá (a banda do prompt, um diff, um
+  bloco de código), e começa no rótulo que abre o turno: a row em branco acima
+  dele, a régua abaixo, as rows de respiro entre blocos e a row em branco que
+  separa dois turnos ficam sem rail. Uma row sob o cursor do teclado mantém o
+  `>` no lugar do rail. Sem cor o rail é `|`. A área de cópia da seleção começa
+  na coluna 2, então o rail nunca entra no texto copiado. Substitui, em §15.2, o
+  gutter vazio de duas células em todas as rows.
+- **Régua de abertura do turno.** O cabeçalho `● Slim` passa a fechar com uma
+  régua de largura total, então cada turno abre como uma seção e o trabalho do
+  agente lê sob a própria borda. `ResponseHeader::rows()` sobe de 1 para 2 (e de
+  2 para 3 com `lead_blank`); a altura medida e a pintura continuam vindo da
+  mesma derivação, e o cabeçalho pendente do prompt espera com as mesmas rows.
+  Substitui, em §15.2.1 e §21.4, o cabeçalho de uma row só.
+- **Ar na banda do prompt.** A banda do prompt fecha com uma row de ar própria,
+  em vez de uma row em branco fora dela, para o turno seguinte nunca encostar no
+  texto. Nenhuma row nova: a que existia mudou de fundo.
+- **Seletores de largura total.** `/model`, `/effort`, `/resume`, `/rewind` e a
+  paleta de comandos (`/` ou Ctrl+P) deixam de ser caixas arredondadas centradas
+  e passam a ser um painel que ocupa o terminal, com réguas em vez de borda:
+  cabeçalho `› /model` com o contador à direita, linha de filtro `/ ▏…` com o
+  caret, a lista, o bloco de detalhe do item focado sob uma régua e a barra de
+  dicas fechando o painel. A linha de filtro cede antes da lista e o bloco de
+  detalhe cede primeiro, então um terminal curto continua mostrando o que
+  importa. Substitui, em §15.7 e §15.8, a caixa central com título, o filtro no
+  título e o rodapé `n/total · dicas`.
+- **Foco e colunas do seletor.** A row focada é uma barra de largura total com
+  `›` no azul de navegação, o rótulo no mesmo azul em negrito e a linha em
+  `MENU_SELECTION_BG`; as demais rows usam `·` mudo e o tom de texto. No
+  `/model`, o esforço vira um campo de coluna fixa (`← ▰▰▰▱ →` onde o cursor
+  está, o medidor em repouso nas outras rows) seguido do nível, com a coluna do
+  nome limitada a 32 células e o restante no espaço antes da coluna da direita,
+  que diz o que muda por row (`● em uso`, `⇥ velocidade Normal`). O cabeçalho de
+  grupo põe o caret de dobra no gutter e o título um passo fora dos modelos, que
+  seguem indentados sob ele. No `/effort`, cada nível mostra sua posição na
+  escada, a descrição na mesma row e o `● em uso` na row do nível ativo; a
+  descrição de cada nível passa a ser em pt-BR, como o resto do chrome.
+  Substitui, em §21.4, o foco em tom de texto e o medidor na coluna da direita.
+- **Dicas com glifos.** As barras de dica dos seletores usam `↵`, `⇥`, `↑↓` e
+  `←→` no lugar das palavras (`Enter`, `Tab`), com `Enter`/`Tab`/`Esc` por
+  extenso quando não há cor. A paleta descreve o comando focado em uma row
+  própria, indentada sob o rótulo, como o seletor do Devin CLI; a lista do
+  composer (uma row por sugestão) mantém a descrição ao lado.
+- **Diálogos continuam caixas.** Login, jobs, MCP, inspetor e o cartão de
+  aprovação seguem centrados com borda e fundo rebaixado; só eles recedem o
+  transcript atrás (`dimmed_modal_open`). Um seletor de largura total não tem o
+  que receder: ele pinta por cima.
+- **Chip do provedor no rail.** A ponta direita do rail de sessão passa a dizer
+  com quem a sessão está falando (`● Anthropic`), quando há largura para isso e
+  uma sessão autenticada. O modelo, o esforço e o contexto continuam só no
+  rodapé, que é quem os possui (§14.1).
+
+Esta revisão substitui as prescrições conflitantes de §15.2, §15.2.1, §15.7,
+§15.8 e §21.4, citadas em cada item; os registros históricos de §1.1 e §30
+continuam descrevendo o passado.
+
 **Revisão de 05/10/2026 (roda do mouse e identidade do workspace):** a roda do
 mouse deixa de se comportar como seta, e a rail do topo passa a dizer onde o
 Slim roda sem exigir leitura. Nenhuma row, timer, token de paleta ou fonte de

@@ -542,8 +542,18 @@ pub struct ResponseHeader {
 }
 
 impl ResponseHeader {
+    /// The header a prompt shows while it waits for the agent's first output:
+    /// the label and its rule, with no blank row above.
+    pub const PENDING: Self = Self {
+        cancelled: false,
+        failed: false,
+        lead_blank: false,
+    };
+
+    /// Label row plus the rule that closes the header, and the blank row a
+    /// notice before it asks for.
     pub fn rows(self) -> usize {
-        1 + usize::from(self.lead_blank)
+        2 + usize::from(self.lead_blank)
     }
 
     pub fn cache_tag(self) -> u64 {
@@ -1131,13 +1141,15 @@ mod turn_layout_tests {
     #[test]
     fn the_header_adds_a_blank_row_only_when_the_prompt_is_not_directly_above() {
         let below_prompt = [user(), tool()];
-        assert_eq!(leading_rows(&below_prompt, 1), 1);
+        let header = response_header(&below_prompt, 1).expect("header");
+        assert!(!header.lead_blank);
+        assert_eq!(leading_rows(&below_prompt, 1), header.rows());
 
         let after_notice = [user(), system(), tool()];
         let header = response_header(&after_notice, 2).expect("header");
         assert!(header.lead_blank);
-        assert_eq!(header.rows(), 2);
-        assert_eq!(leading_rows(&after_notice, 2), 2);
+        assert_eq!(header.rows(), 3);
+        assert_eq!(leading_rows(&after_notice, 2), 3);
         assert!(
             response_header(&after_notice, 1).is_none(),
             "notices do not open a turn"
@@ -1153,7 +1165,8 @@ mod turn_layout_tests {
             tool(),
             prose(BlockLifecycle::Complete),
         ];
-        assert_eq!(leading_rows(&blocks, 1), 1, "header only");
+        let opener = response_header(&blocks, 1).expect("header");
+        assert_eq!(leading_rows(&blocks, 1), opener.rows(), "header only");
         assert!(!transition_gap(&blocks, 1));
         assert_eq!(leading_rows(&blocks, 2), 1, "breathing row before prose");
         assert!(transition_gap(&blocks, 2));
@@ -1161,7 +1174,12 @@ mod turn_layout_tests {
         assert!(transition_gap(&blocks, 4), "prose after work");
 
         let text_first = [user(), prose(BlockLifecycle::Complete), tool()];
-        assert_eq!(leading_rows(&text_first, 1), 1, "header only, no extra gap");
+        let opener = response_header(&text_first, 1).expect("header");
+        assert_eq!(
+            leading_rows(&text_first, 1),
+            opener.rows(),
+            "header only, no extra gap"
+        );
         assert!(!transition_gap(&text_first, 1));
         assert_eq!(leading_rows(&text_first, 2), 1, "work after prose");
     }

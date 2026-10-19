@@ -265,6 +265,13 @@ fn scenes() -> Vec<(&'static str, AppState, u16, u16)> {
             KeyModifiers::NONE,
         );
     }
+    // The effort step of a Codex alias, with the speed toggle it owns.
+    let mut effort = connected();
+    effort.effort_overlay = Some(slim_tui::app::EffortOverlay::for_alias(
+        slim_tui::api::ModelAlias::ALL[0],
+        slim_tui::api::ReasoningEffort::High,
+        false,
+    ));
     let mut read_only = session(false);
     read_only.mode = OperatingMode::ReadOnly;
     let mut plan = session(false);
@@ -598,6 +605,7 @@ fn scenes() -> Vec<(&'static str, AppState, u16, u16)> {
         ("palette-narrow", palette_narrow, 44, 20),
         ("slash", slash, 120, 40),
         ("model", model, 120, 40),
+        ("effort", effort, 120, 40),
         ("model-narrow", model_narrow, 80, 24),
         ("model-search", model_search, 120, 40),
         ("mention", mention, 120, 40),

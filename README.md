@@ -1,8 +1,10 @@
 # Slim
 
-**Visual das mensagens, 20/09/2026:** cabeçalho `● Você` em linha própria,
-corpo alinhado ao rótulo e fundo igual ao histórico. Apenas o marcador verde
-recebe realce breve ao enviar; com movimento reduzido, permanece estático.
+**Visual do transcript, 18/10/2026:** cada turno abre com o rail `▌` na primeira
+coluna — marfim no prompt, verde no agente — e o cabeçalho `● Slim` fecha com uma
+régua. O cabeçalho `● Você` fica em linha própria, corpo alinhado ao rótulo e
+fundo igual ao histórico. Apenas o marcador do prompt recebe realce breve ao
+enviar; com movimento reduzido, permanece estático.
 
 Harness de coding agent em Rust para Windows x64/MSVC e macOS (arm64). O
 projeto reúne CLI headless, TUI fullscreen, providers, ferramentas nativas,

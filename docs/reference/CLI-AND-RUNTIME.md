@@ -61,6 +61,7 @@ max_mutating_tool_calls = 32
 max_read_tool_calls = 96
 max_output_tokens = 4096
 timeout_secs = 120
+time_budget_secs = 1500   # opcional; sem a chave não há orçamento de tempo
 max_result_bytes = 16384
 
 [compaction]
@@ -95,7 +96,8 @@ próprios contadores de recuperação.
   seção [MCP](#mcp).
 
 Tuning de velocidade (env vence o TOML): SLIM_MAX_TURNS, SLIM_MAX_MUTATING_TOOL_CALLS,
-SLIM_MAX_READ_TOOL_CALLS, SLIM_MAX_OUTPUT_TOKENS, SLIM_TIMEOUT_SECS, SLIM_MAX_RESULT_BYTES.
+SLIM_MAX_READ_TOOL_CALLS, SLIM_MAX_OUTPUT_TOKENS, SLIM_TIMEOUT_SECS, SLIM_TIME_BUDGET_SECS,
+SLIM_MAX_RESULT_BYTES.
 Defaults: turns 128, mutating 32/turno, read 96/turno, output pelo catálogo do modelo (4096 se desconhecido; reserva limitada à metade da janela), timeout 120s, result 16 KiB (read completo até 64 KiB).
 
 O timeout de inatividade do stream mede progresso semântico durante toda a
@@ -1401,7 +1403,7 @@ deltas OpenAI e os IDs de `content_block` Anthropic; somente chamadas legadas
 sem ID recebem identificador interno. JSON de tool malformado ou incompleto é
 rejeitado.
 
-O runtime aplica budgets separados read-only vs mutating por run (`max_read_tool_calls` default 96, `max_mutating_tool_calls` default 32; env `SLIM_MAX_READ_TOOL_CALLS` / `SLIM_MAX_MUTATING_TOOL_CALLS` e chaves `slim.toml`); esgotamento → `tool_limit` (exit 22). O teto de turns por run é 128 (`SLIM_MAX_TURNS` / `max_turns` em `slim.toml`, cap 1024); esgotamento → `turn_limit` (exit 12) com mensagem `Turn limit reached (N/N)`. Quando o teto por turno corta calls de um batch, a mensagem seguinte ao modelo lista cada call não executada (nome e argumentos abreviados) para que só elas sejam repetidas. A tool `search` respeita `.gitignore`, ignora árvores de build, cap default 200 hits e paginação `offset`/`max_hits`. Emite `ToolStarted`, mantém pares assistant/tool através da compactação (veja "Compactação de contexto" abaixo).
+O runtime aplica budgets separados read-only vs mutating por run (`max_read_tool_calls` default 96, `max_mutating_tool_calls` default 32; env `SLIM_MAX_READ_TOOL_CALLS` / `SLIM_MAX_MUTATING_TOOL_CALLS` e chaves `slim.toml`); esgotamento → `tool_limit` (exit 22). O teto de turns por run é 128 (`SLIM_MAX_TURNS` / `max_turns` em `slim.toml`, cap 1024); esgotamento → `turn_limit` (exit 12) com mensagem `Turn limit reached (N/N)`. O orçamento de tempo por run (`time_budget_secs` / `SLIM_TIME_BUDGET_SECS`, desligado por padrão, zero é recusado) conta do início do run: a partir de 3/4 o modelo recebe uma vez o tempo usado e o total, e patches que só alteram números ou cores (literais numéricos e cores hex, com o restante do texto idêntico) são recusados antes de executar; esgotado, o run para em `time_limit` (exit 12) e pede a resposta final sem tools. Independente do orçamento, o ledger causal conta turnos seguidos cujas edições só reajustaram números ou cores: no terceiro avisa o modelo, no sexto para em `no_progress` (anomalia `tuning_loop`) com resposta final própria; uma edição estrutural zera a contagem e turnos sem edição (render, leitura) a mantêm. Três guards nativos seguram uma chamada desperdiçada uma vez por run, e repetir a mesma chamada logo em seguida a executa: uma leitura simples pelo `shell` (`cat`, `sed -n 'A,Bp'`, `head`, `tail`, `Get-Content`, sem pipe, redirecionamento ou variável) de um arquivo sem mudança desde a mesma leitura; um `write` que reescreve por inteiro um arquivo existente de 2 KiB ou mais (o primeiro do run passa com uma nota sugerindo `patch`, os seguintes são segurados); e um comando de `shell` que já falhou duas vezes seguidas. A memória dos guards zera a cada run e a cada compactação. O `read` nativo dispensa guard: saída idêntica ainda no contexto já vira ponteiro. Quando o teto por turno corta calls de um batch, a mensagem seguinte ao modelo lista cada call não executada (nome e argumentos abreviados) para que só elas sejam repetidas. A tool `search` respeita `.gitignore`, ignora árvores de build, cap default 200 hits e paginação `offset`/`max_hits`. Emite `ToolStarted`, mantém pares assistant/tool através da compactação (veja "Compactação de contexto" abaixo).
 
 Cada valor de API key fornecido é redigido exatamente antes
 de tool output, follow-up ao provider, renderização e sessão; isso não promete
@@ -1626,7 +1628,8 @@ originais idênticos e revalida o recibo no histórico atual. Entradas maiores q
 o teto seguem pelo caminho sem cache; o payload enviado permanece igual.
 
 No headless, text e JSONL expõem `stop`: `provider_completed` (exit `0`),
-`turn_limit` e `repeated_failed_tool` (exit `12`) ou `tool_limit` (exit `22`).
+`turn_limit`, `time_limit`, `no_progress` e `repeated_failed_tool` (exit `12`) ou
+`tool_limit` (exit `22`).
 O provider/model/IDs informados são preservados; não há troca silenciosa de
 provider.
 

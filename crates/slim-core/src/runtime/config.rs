@@ -17,6 +17,9 @@ pub struct AgentLoopConfig {
     /// First automatic provider-recovery delay; it doubles per attempt (at most 16x).
     /// A provider's retry-after still wins when it is longer.
     pub provider_recovery_backoff: std::time::Duration,
+    /// Wall-clock budget of one run. From three quarters on, tuning-only
+    /// patches are refused; once spent, the run asks for its final answer.
+    pub time_budget: Option<std::time::Duration>,
 }
 
 impl AgentLoopConfig {
@@ -45,6 +48,7 @@ impl Default for AgentLoopConfig {
             context_reserve_tokens: 4_096,
             context_compaction_enabled: true,
             provider_recovery_backoff: Self::DEFAULT_PROVIDER_RECOVERY_BACKOFF,
+            time_budget: None,
         }
     }
 }
@@ -56,6 +60,8 @@ pub enum AgentLoopStop {
     ProviderFiltered,
     TurnLimit,
     ToolLimit,
+    /// `time_budget` elapsed.
+    TimeLimit,
     RepeatedFailedTool,
     /// The causal ledger asked to stop (repeated evidence / stagnant turns):
     /// continuing would only burn turns without progress.

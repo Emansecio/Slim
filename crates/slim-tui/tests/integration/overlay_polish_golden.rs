@@ -77,22 +77,34 @@ fn conversation() -> AppState {
 }
 
 #[test]
-fn centered_modal_recedes_the_transcript_behind_it() {
+fn a_dialog_recedes_the_transcript_behind_it() {
     let mut state = conversation();
     let before = draw(&state);
     let (x, y) = find(&rows(&before), "resposta");
     assert_ne!(before[(x, y)].fg, Color::Rgb(0x4A, 0x4A, 0x4A));
 
-    key(&mut state, KeyCode::Char('p'), KeyModifiers::CONTROL);
+    state.jobs_overlay = Some(slim_tui::app::JobsOverlay::default());
     let after = draw(&state);
     let text = rows(&after);
     let (x, y) = find(&text, "resposta");
     assert_eq!(after[(x, y)].fg, Color::Rgb(0x4A, 0x4A, 0x4A), "backdrop");
     assert!(!after[(x, y)].modifier.contains(Modifier::BOLD));
-    // The modal itself keeps its own styling.
-    let (x, y) = find(&text, "Comandos");
+    // The dialog itself keeps its own styling.
+    let (x, y) = find(&text, "Jobs da sessão");
     assert_ne!(after[(x, y)].fg, Color::Rgb(0x4A, 0x4A, 0x4A));
-    // Group headings carry a rule to the modal edge.
+}
+
+#[test]
+fn a_picker_owns_the_terminal_and_keeps_the_rail_behind_it() {
+    let mut state = conversation();
+    key(&mut state, KeyCode::Char('p'), KeyModifiers::CONTROL);
+    let after = draw(&state);
+    let text = rows(&after);
+    let screen = text.join("\n");
+    // No dimmed transcript is left: the panel paints over it.
+    assert!(!text.iter().any(|row| row.contains("resposta")), "{screen}");
+    // The header names the command, and the headings rule to the panel edge.
+    assert!(screen.contains("› /"), "{screen}");
     let heading = text
         .iter()
         .find(|row| row.contains("conversa"))
@@ -235,12 +247,9 @@ fn resume_picker_lists_sessions_with_titles_ages_and_states() {
     let text = rows(&buffer);
     let screen = text.join("\n");
 
-    assert!(screen.contains("Retomar sessão"), "{screen}");
-    // The filter sits in the title; empty, it invites typing.
-    assert!(
-        screen.contains("Retomar sessão · digite para filtrar"),
-        "{screen}"
-    );
+    assert!(screen.contains("› /resume"), "{screen}");
+    // The filter has a row of its own; empty, it invites typing.
+    assert!(screen.contains("/ ▏filtrar por nome ou prompt"), "{screen}");
     // Title leads, the first prompt follows it.
     let login = text
         .iter()
@@ -264,15 +273,18 @@ fn resume_picker_lists_sessions_with_titles_ages_and_states() {
     assert!(open.contains("atual"), "{open}");
     let busy = text.iter().find(|row| row.contains("Migração")).unwrap();
     assert!(busy.contains("em uso"), "{busy}");
+    // The header also starts with the chevron; the focused row is a session.
     let focused = text
         .iter()
-        .find(|row| row.contains("> "))
+        .find(|row| row.starts_with("› ") && !row.starts_with("› /"))
         .expect("focus marker");
     assert!(focused.contains("Refatorar login"), "{focused}");
-    // Detail line names the focused session; footer counts rows.
+    // The detail line names the focused session, the header counts the rows
+    // and the hint bar closes the panel.
     assert!(screen.contains("tui-login"), "{screen}");
+    assert!(screen.contains("3/4"), "{screen}");
     assert!(
-        screen.contains("3/4 · ↑↓ navegar · Enter retomar · Esc fechar"),
+        screen.contains("↑↓ navegar · ↵ retomar · esc fechar"),
         "{screen}"
     );
 }
@@ -285,7 +297,7 @@ fn resume_picker_filters_and_shows_the_filtered_count() {
         key(&mut state, KeyCode::Char(character), KeyModifiers::NONE);
     }
     let screen = rows(&draw(&state)).join("\n");
-    assert!(screen.contains("Retomar sessão · api"), "{screen}");
+    assert!(screen.contains("/ api"), "{screen}");
     assert!(
         screen.contains("escrever a documentação da API"),
         "{screen}"
@@ -342,7 +354,7 @@ fn rewind_picker_lists_turns_newest_first_with_the_conversation_only_note() {
     });
     let text = rows(&draw(&state));
     let screen = text.join("\n");
-    assert!(screen.contains("Voltar a um turno"), "{screen}");
+    assert!(screen.contains("› /rewind"), "{screen}");
     let newest = text
         .iter()
         .position(|row| row.contains("#3 pedido número 2"))
@@ -353,7 +365,7 @@ fn rewind_picker_lists_turns_newest_first_with_the_conversation_only_note() {
         .expect("oldest");
     assert!(newest < oldest, "{screen}");
     assert!(
-        text[newest].contains("> "),
+        text[newest].starts_with("› "),
         "newest is focused: {}",
         text[newest]
     );
@@ -363,8 +375,9 @@ fn rewind_picker_lists_turns_newest_first_with_the_conversation_only_note() {
         screen.contains("Só a conversa volta; arquivos alterados ficam como estão"),
         "{screen}"
     );
+    assert!(screen.contains("1/3"), "{screen}");
     assert!(
-        screen.contains("1/3 · ↑↓ navegar · Enter voltar · Esc fechar"),
+        screen.contains("↑↓ navegar · ↵ voltar · esc fechar"),
         "{screen}"
     );
 }
@@ -435,7 +448,7 @@ fn slash_popup_groups_commands_and_keeps_each_command_visible() {
     for command in slash_matches("") {
         let (text, _) = draw_sized(&state, WIDTH, 14);
         assert!(
-            text.iter().any(|row| row.contains(&format!("> {command}"))),
+            text.iter().any(|row| row.contains(&format!("› {command}"))),
             "{command} must stay visible despite the headings:\n{}",
             text.join("\n")
         );
@@ -475,28 +488,20 @@ fn command_palette_is_a_bordered_modal_like_the_pickers() {
     let (text, _) = draw_sized(&state, WIDTH, HEIGHT);
     let screen = text.join("\n");
 
-    // The title lives in the rounded border, not in a content row.
+    // The panel owns the terminal: header, rules, list and hint bar.
+    assert!(text.iter().any(|row| row.starts_with("› /")), "{screen}");
     assert!(
         text.iter()
-            .any(|row| row.contains("╭") && row.contains(" Comandos ")),
+            .any(|row| row.trim_matches('─').trim().is_empty()),
         "{screen}"
     );
-    assert!(
-        text.iter()
-            .any(|row| row.contains('╰') && row.contains('╯')),
-        "{screen}"
-    );
-    // Same filter-in-title as the model and session pickers.
-    assert!(
-        screen.contains("Comandos · digite para filtrar"),
-        "{screen}"
-    );
+    // Empty, the header invites typing where the cursor rests.
+    assert!(screen.contains("› /▏digite um comando"), "{screen}");
     assert!(!screen.contains("Buscar:"), "{screen}");
-    // Same `n/total · hints` footer, closing with `Esc fechar`.
+    // The counter and the keys that act on the list close the panel.
+    assert!(screen.contains(&format!("1/{total}")), "{screen}");
     assert!(
-        screen.contains(&format!(
-            "1/{total} · ↑↓ navegar · Enter executar · Esc fechar"
-        )),
+        screen.contains("↑↓ navegar · ↵ executar · esc fechar"),
         "{screen}"
     );
 
@@ -507,13 +512,13 @@ fn command_palette_is_a_bordered_modal_like_the_pickers() {
     let matching = palette_matches("mod").len();
     let (text, cursor) = draw_sized(&state, WIDTH, HEIGHT);
     let screen = text.join("\n");
-    let (x, y) = find(&text, "Comandos · mod");
+    let (x, y) = find(&text, "› /mod");
     assert_eq!(
         cursor,
-        Position::new(x + "Comandos · mod".chars().count() as u16, y),
+        Position::new(x + "› /mod".chars().count() as u16, y),
         "{screen}"
     );
-    assert!(screen.contains(&format!("1/{matching} · ")), "{screen}");
+    assert!(screen.contains(&format!("1/{matching}")), "{screen}");
 }
 
 #[test]
@@ -526,11 +531,11 @@ fn command_palette_keeps_the_focused_command_visible_past_its_capacity() {
         let (text, _) = draw_sized(&state, WIDTH, 14);
         let screen = text.join("\n");
         assert!(
-            text.iter().any(|row| row.contains(&format!("> {command}"))),
+            text.iter().any(|row| row.contains(&format!("› {command}"))),
             "{command} must stay visible:\n{screen}"
         );
         assert!(
-            screen.contains(&format!("{}/{} · ", index + 1, commands.len())),
+            screen.contains(&format!("{}/{}", index + 1, commands.len())),
             "{screen}"
         );
         key(&mut state, KeyCode::Down, KeyModifiers::NONE);

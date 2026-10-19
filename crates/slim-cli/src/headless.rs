@@ -230,6 +230,8 @@ pub struct ProviderRunOptions {
     pub reasoning_effort: Option<String>,
     pub codex_fast: bool,
     pub max_turns: Option<usize>,
+    /// Wall-clock budget of one run, in seconds.
+    pub time_budget_secs: Option<u64>,
     /// Mutating-tool budget (write/patch/shell/todo/skill/ask_question).
     pub max_tool_calls: Option<usize>,
     pub max_read_tool_calls: Option<usize>,
@@ -310,6 +312,11 @@ impl ProviderRunOptions {
 
     pub fn with_max_turns(mut self, turns: usize) -> Self {
         self.max_turns = Some(turns);
+        self
+    }
+
+    pub fn with_time_budget_secs(mut self, secs: u64) -> Self {
+        self.time_budget_secs = Some(secs);
         self
     }
 
@@ -1935,6 +1942,7 @@ pub(crate) async fn execute_provider_turn_async(
     let max_read_tool_calls = resolve_max_read_tool_calls(&options)?;
     let max_total_tool_calls = resolve_max_total_tool_calls(&options)?;
     let max_turns = resolve_max_turns(&options)?;
+    let time_budget = resolve_time_budget(&options)?;
     let max_result_bytes = resolve_max_result_bytes(options.max_result_bytes)?;
     let artifact_root = options
         .artifact_root
@@ -2014,6 +2022,7 @@ pub(crate) async fn execute_provider_turn_async(
         ..AgentLoopConfig::default()
     };
     loop_config.max_turns = max_turns;
+    loop_config.time_budget = time_budget;
     loop_config.max_mutating_tool_calls = max_mutating_tool_calls;
     loop_config.max_read_tool_calls = max_read_tool_calls;
     loop_config.max_total_tool_calls = max_total_tool_calls;
@@ -2294,6 +2303,8 @@ pub(crate) async fn execute_provider_turn_async(
             } else {
                 failure.to_owned()
             }
+        } else if stop == "no_progress" && tuning_loop_stopped(&events) {
+            "Stopped: consecutive turns only retuned numbers or colours. Send a follow-up to continue.".into()
         } else {
             format_run_stop_message(&stop, &tool_results, tool_limits)
         };
@@ -3408,6 +3419,23 @@ pub(crate) fn resolve_max_turns(options: &ProviderRunOptions) -> Result<usize, P
         })
 }
 
+/// Off unless set; zero from the options or the environment is refused.
+fn resolve_time_budget(
+    options: &ProviderRunOptions,
+) -> Result<Option<std::time::Duration>, ProviderError> {
+    let secs = match options.time_budget_secs {
+        Some(0) => {
+            return Err(ProviderError::InvalidResponse {
+                message: "time_budget_secs must be a positive integer".into(),
+            })
+        }
+        Some(secs) => Some(secs),
+        None => parse_positive_env_u64("SLIM_TIME_BUDGET_SECS")
+            .map_err(|message| ProviderError::InvalidResponse { message })?,
+    };
+    Ok(secs.map(std::time::Duration::from_secs))
+}
+
 fn parse_positive_env_u64(name: &str) -> Result<Option<u64>, String> {
     let Some(value) = std::env::var_os(name) else {
         return Ok(None);
@@ -3615,6 +3643,7 @@ pub(crate) fn format_run_stop_message(
             "Turn limit reached ({n}/{n}). Send a follow-up to continue.",
             n = limits.max_turns
         ),
+        "time_limit" => "Time budget spent. Send a follow-up to continue.".into(),
         "provider_truncated" => format!(
             "Output truncated (initial max_output_tokens={}). Automatic recovery is bounded by retry, turn, model and context limits. Progress is preserved. Increase max_output_tokens within the model limit or request a smaller next step before continuing.",
             limits.max_output_tokens
@@ -3626,6 +3655,20 @@ pub(crate) fn format_run_stop_message(
         }
         other => format!("Run stopped ({other})."),
     }
+}
+
+/// The causal ledger stopped the run for a tuning loop.
+fn tuning_loop_stopped(events: &[SessionEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event.kind,
+            EventKind::CausalAnomalyDetected {
+                kind: slim_core::CausalAnomalyKind::TuningLoop,
+                action: slim_core::CausalShadowAction::WouldStop,
+                ..
+            }
+        )
+    })
 }
 
 fn count_tool_results_by_bucket(tool_results: &[slim_core::tools::ToolResult]) -> (usize, usize) {
@@ -3659,6 +3702,7 @@ fn stop_name(stop: AgentLoopStop) -> &'static str {
         AgentLoopStop::ProviderTruncated => "provider_truncated",
         AgentLoopStop::ProviderFiltered => "provider_filtered",
         AgentLoopStop::TurnLimit => "turn_limit",
+        AgentLoopStop::TimeLimit => "time_limit",
         AgentLoopStop::ToolLimit => "tool_limit",
         AgentLoopStop::RepeatedFailedTool => "repeated_failed_tool",
         AgentLoopStop::NoProgress => "no_progress",
@@ -3671,6 +3715,7 @@ fn exit_code_for_stop(stop: AgentLoopStop) -> ExitCode {
         AgentLoopStop::ProviderCompleted => ExitCode::Success,
         AgentLoopStop::ProviderTruncated | AgentLoopStop::ProviderFiltered => ExitCode::Provider,
         AgentLoopStop::TurnLimit
+        | AgentLoopStop::TimeLimit
         | AgentLoopStop::RepeatedFailedTool
         | AgentLoopStop::NoProgress => ExitCode::Blocked,
         AgentLoopStop::ToolLimit => ExitCode::Tool,

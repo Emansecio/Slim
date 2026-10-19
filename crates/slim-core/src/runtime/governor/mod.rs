@@ -28,11 +28,16 @@ pub(super) use observation::{GovernorObservation, PendingCall};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 const MAX_OBSERVED_DEPENDENCIES: usize = 256;
+/// Consecutive tuning-only turns that warn, and that stop the run.
+const TUNING_WARN_TURNS: u32 = 3;
+const TUNING_STOP_TURNS: u32 = 6;
 
 #[derive(Default)]
 pub(super) struct CausalGovernor {
     ledger: ProgressLedger,
     stop_requested: bool,
+    /// The stop came from a tuning loop, not from missing progress.
+    tuning_stop: bool,
     pending_post_compaction_reacquisitions: HashSet<String>,
 }
 
@@ -48,6 +53,8 @@ struct ProgressLedger {
     seen_evidence: HashSet<String>,
     validations: HashMap<String, ValidationResult>,
     stagnant_turns: u32,
+    /// Consecutive turns that edited only to retune numbers or colours.
+    tuning_turns: u32,
     turn: TurnState,
     compacted_fingerprints: HashSet<String>,
 }
@@ -70,6 +77,10 @@ struct TurnState {
     made_progress: bool,
     /// An uncertain effect or unclassifiable call happened this turn.
     boundary: bool,
+    /// A tuning-only patch applied or was refused this turn.
+    tuning_edits: bool,
+    /// Another workspace change applied this turn.
+    structural_edits: bool,
     confidence: CausalConfidence,
     last_batch_id: String,
     last_call_id: String,
@@ -83,6 +94,8 @@ impl Default for TurnState {
             has_calls: false,
             made_progress: false,
             boundary: false,
+            tuning_edits: false,
+            structural_edits: false,
             confidence: CausalConfidence::High,
             last_batch_id: String::new(),
             last_call_id: String::new(),
@@ -143,6 +156,10 @@ impl CausalGovernor {
         self.stop_requested
     }
 
+    pub(super) fn tuning_stop(&self) -> bool {
+        self.tuning_stop
+    }
+
     pub(super) fn validations_satisfied(&self) -> bool {
         let validations = &self.ledger.validations;
         validations.values().all(|result| result.success)
@@ -196,6 +213,7 @@ impl CausalGovernor {
             confidence,
             admission_prefix: crate::tools::admission_output_prefix(&prepared.admission_notes),
             structural_rejection: true,
+            tuning: prepared.is_tuning_patch(),
             ..PendingCall::new(
                 ids,
                 prepared.canonical_fingerprint.clone(),
@@ -234,6 +252,7 @@ impl CausalGovernor {
             confidence,
             diagnostics: prepared.name == "code_intel" && prepared.arguments.is_diagnostics(),
             admission_prefix: crate::tools::admission_output_prefix(&prepared.admission_notes),
+            tuning: prepared.is_tuning_patch(),
             ..PendingCall::new(
                 ids,
                 prepared.canonical_fingerprint.clone(),
@@ -250,6 +269,8 @@ impl CausalGovernor {
         receipt: &ToolExecutionReceipt,
     ) -> Vec<GovernorObservation> {
         if pending.structural_rejection {
+            // A refused retune still shows the turn was spent on tuning.
+            self.ledger.turn.tuning_edits |= pending.tuning;
             return self.observe_evidence(pending, result, EvidenceOutcome::Failure);
         }
         let source_revision = self.sync_revision(receipt);
@@ -410,8 +431,9 @@ impl CausalGovernor {
         if turn.made_progress || turn.boundary {
             self.stop_requested = false;
             self.ledger.stagnant_turns = 0;
-            return Vec::new();
+            return self.tuning_anomaly(&turn).into_iter().collect();
         }
+        let tuning = self.tuning_anomaly(&turn);
         self.ledger.stagnant_turns = self.ledger.stagnant_turns.saturating_add(1);
         let occurrence = self.ledger.stagnant_turns;
         let kind = if occurrence == 1 {
@@ -426,7 +448,7 @@ impl CausalGovernor {
             _ => CausalShadowAction::WouldWarn,
         };
         self.note_stop(action);
-        vec![GovernorObservation::Anomaly {
+        let mut observations = vec![GovernorObservation::Anomaly {
             batch_id: turn.last_batch_id,
             call_id: turn.last_call_id,
             kind,
@@ -437,7 +459,49 @@ impl CausalGovernor {
             occurrence,
             confidence: turn.confidence,
             action,
-        }]
+        }];
+        observations.extend(tuning);
+        observations
+    }
+
+    /// Counts consecutive turns whose edits only retuned numbers or colours.
+    /// A structural edit resets the count; a turn without edits (a render, a
+    /// look at the output) leaves it as it is. Progress does not excuse a
+    /// tuning loop: every retune changes the workspace.
+    fn tuning_anomaly(&mut self, turn: &TurnState) -> Option<GovernorObservation> {
+        if turn.structural_edits {
+            self.ledger.tuning_turns = 0;
+            return None;
+        }
+        if !turn.tuning_edits {
+            return None;
+        }
+        self.ledger.tuning_turns = self.ledger.tuning_turns.saturating_add(1);
+        let occurrence = self.ledger.tuning_turns;
+        if occurrence < TUNING_WARN_TURNS {
+            return None;
+        }
+        let action = if occurrence >= TUNING_STOP_TURNS {
+            self.tuning_stop = true;
+            CausalShadowAction::WouldStop
+        } else {
+            CausalShadowAction::WouldWarn
+        };
+        self.note_stop(action);
+        Some(GovernorObservation::Anomaly {
+            batch_id: turn.last_batch_id.clone(),
+            call_id: turn.last_call_id.clone(),
+            kind: CausalAnomalyKind::TuningLoop,
+            tool_name: turn.last_tool_name.clone(),
+            call_fingerprint: turn.last_call_fingerprint.clone(),
+            evidence_id: String::new(),
+            workspace_revision: self.ledger.workspace_revision,
+            occurrence,
+            // The classification is lexical: it does not depend on how
+            // stable the tools of the turn are.
+            confidence: CausalConfidence::High,
+            action,
+        })
     }
 
     fn observe_snapshot(
@@ -501,6 +565,11 @@ impl CausalGovernor {
             return Vec::new();
         }
         self.mark_progress();
+        if pending.tuning {
+            self.ledger.turn.tuning_edits = true;
+        } else {
+            self.ledger.turn.structural_edits = true;
+        }
         vec![pending.progress(
             CausalProgressKind::WorkspaceChanged,
             mutations_digest(receipt),
