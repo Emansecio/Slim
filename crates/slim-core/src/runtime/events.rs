@@ -6,10 +6,22 @@ pub(super) fn push_runtime_event(
     kind: crate::EventKind,
 ) -> Result<(), ProviderError> {
     let persistence = if let Some(journal) = &app.run_journal {
-        journal
-            .lock()
-            .map_err(|_| journal_error("durable run lock poisoned"))
-            .and_then(|mut journal| journal.record_event(&kind).map_err(journal_error))
+        let record = || {
+            journal
+                .lock()
+                .map_err(|_| journal_error("durable run lock poisoned"))
+                .and_then(|mut journal| journal.record_event(&kind).map_err(journal_error))
+        };
+        // An append the journal syncs to disk stalls the thread for the
+        // fsync. On a multi-thread runtime that thread is one of few workers
+        // (the provider stream and MCP share them), so it hands its tasks
+        // over for the duration instead of holding them.
+        if crate::session::ManualRunJournal::event_reaches_disk(&kind) && on_multi_thread_runtime()
+        {
+            tokio::task::block_in_place(record)
+        } else {
+            record()
+        }
     } else {
         Ok(())
     };
@@ -20,6 +32,13 @@ pub(super) fn push_runtime_event(
     *next_seq = checked_next_seq(*next_seq)?;
     persistence?;
     Ok(())
+}
+
+/// Whether blocking here would block other tasks of a multi-thread Tokio
+/// runtime; `block_in_place` panics on a current-thread one (tests).
+fn on_multi_thread_runtime() -> bool {
+    tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
 }
 
 pub(super) fn push_tool_started_notice(

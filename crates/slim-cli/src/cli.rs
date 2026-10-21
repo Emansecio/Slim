@@ -316,10 +316,11 @@ where
             "clinepass" | "cline-pass" | "cp" => ProviderKind::ClinePass,
             "command-code" | "commandcode" | "cmd" => ProviderKind::CommandCode,
             "xai" | "grok" => ProviderKind::Xai,
+            "open-design" | "opendesign" | "od" => ProviderKind::OpenDesign,
             _ => {
                 return failure(
                     ExitCode::Provider,
-                    "unsupported provider; use openai-compatible, openai-codex, anthropic, opencode-go, opencode-zen, clinepass, command-code, or xai\n",
+                    "unsupported provider; use openai-compatible, openai-codex, anthropic, opencode-go, opencode-zen, clinepass, command-code, xai, or open-design\n",
                 )
             }
         };
@@ -675,6 +676,7 @@ pub(crate) fn default_provider_endpoint(kind: ProviderKind) -> &'static str {
         ProviderKind::ClinePass => slim_core::provider::CLINEPASS_BASE_URL,
         ProviderKind::CommandCode => slim_core::provider::COMMANDCODE_BASE_URL,
         ProviderKind::Xai => slim_core::provider::XAI_BASE_URL,
+        ProviderKind::OpenDesign => slim_core::provider::OPEN_DESIGN_BASE_URL,
     }
 }
 
@@ -688,6 +690,7 @@ pub(crate) fn default_provider_model(kind: ProviderKind) -> &'static str {
         ProviderKind::ClinePass => slim_core::provider::CLINEPASS_DEFAULT_MODEL,
         ProviderKind::CommandCode => slim_core::provider::COMMANDCODE_DEFAULT_MODEL,
         ProviderKind::Xai => slim_core::provider::XAI_DEFAULT_MODEL,
+        ProviderKind::OpenDesign => slim_core::provider::OPEN_DESIGN_DEFAULT_MODEL,
     }
 }
 

@@ -141,6 +141,23 @@ struct CompactionHandleState {
     commits: Vec<CompactionCommit>,
     usage_anchor: Option<StoredUsageAnchor>,
     compacted: Option<CompactedHistory>,
+    channel_anchors: Vec<StoredChannelAnchor>,
+}
+
+/// Most run anchors remembered; a history that long has compacted (which
+/// forgets them) many times over.
+const MAX_CHANNEL_ANCHORS: usize = 256;
+
+/// A user message the runtime's channel overlay was anchored on by an earlier
+/// run of the session, and the exact text it appended there. Later runs keep
+/// it so the provider still finds the prefix it cached. The message is
+/// identified by position and content, like the usage anchor.
+#[derive(Clone, Debug)]
+struct StoredChannelAnchor {
+    message_index: usize,
+    message_fingerprint: String,
+    mode: crate::OperatingMode,
+    text: String,
 }
 
 /// The usage of the last valid response, kept between runs: Pi reads it from
@@ -199,7 +216,67 @@ impl CompactionHandle {
             commits: Vec::new(),
             usage_anchor: None,
             compacted: None,
+            channel_anchors: Vec::new(),
         })))
+    }
+
+    /// Remembers that a run anchored its channel overlay on
+    /// `messages[index]`, appending `text`, for the runs that follow.
+    pub fn record_channel_anchor(
+        &self,
+        messages: &[ProviderMessage],
+        index: usize,
+        mode: crate::OperatingMode,
+        text: String,
+    ) {
+        let Some(message) = messages.get(index) else {
+            return;
+        };
+        let stored = StoredChannelAnchor {
+            message_index: index,
+            message_fingerprint: compaction_prefix_fingerprint(std::slice::from_ref(message)),
+            mode,
+            text,
+        };
+        self.with_state_mut(|state| {
+            state
+                .channel_anchors
+                .retain(|anchor| anchor.message_index != index);
+            if state.channel_anchors.len() >= MAX_CHANNEL_ANCHORS {
+                state.channel_anchors.remove(0);
+            }
+            state.channel_anchors.push(stored);
+        });
+    }
+
+    /// The remembered anchors (message index, appended text) that still
+    /// describe `messages`: the same user message at the same position. A
+    /// run in another `mode` advertises other tools, which already changes
+    /// the cached prefix, so it starts over without them.
+    pub fn channel_anchors(
+        &self,
+        messages: &[ProviderMessage],
+        mode: crate::OperatingMode,
+    ) -> Vec<(usize, String)> {
+        self.with_state_mut(|state| {
+            state.channel_anchors.retain(|anchor| {
+                anchor.mode == mode
+                    && messages.get(anchor.message_index).is_some_and(|message| {
+                        message.role == "user"
+                            && compaction_prefix_fingerprint(std::slice::from_ref(message))
+                                == anchor.message_fingerprint
+                    })
+            });
+            state
+                .channel_anchors
+                .iter()
+                .map(|anchor| (anchor.message_index, anchor.text.clone()))
+                .collect()
+        })
+    }
+
+    pub fn clear_channel_anchors(&self) {
+        self.with_state_mut(|state| state.channel_anchors.clear());
     }
 
     pub fn policy(&self) -> CompactionPolicy {
@@ -554,6 +631,43 @@ mod tests {
             content: text.into(),
             details: Vec::new(),
         }
+    }
+
+    #[test]
+    fn channel_anchors_outlive_a_run_while_their_message_and_mode_hold() {
+        use crate::OperatingMode;
+        let handle = CompactionHandle::new(CompactionPolicy::default());
+        let mut messages = vec![
+            ProviderMessage::user("first"),
+            ProviderMessage::assistant("done", Vec::new()),
+        ];
+        handle.record_channel_anchor(&messages, 0, OperatingMode::Auto, "stanza A".into());
+        messages.push(ProviderMessage::user("second"));
+        handle.record_channel_anchor(&messages, 2, OperatingMode::Auto, "stanza B".into());
+        assert_eq!(
+            handle.channel_anchors(&messages, OperatingMode::Auto),
+            vec![(0, "stanza A".to_owned()), (2, "stanza B".to_owned())]
+        );
+        // Recording the same index again replaces the text.
+        handle.record_channel_anchor(&messages, 2, OperatingMode::Auto, "stanza B2".into());
+        assert_eq!(
+            handle.channel_anchors(&messages, OperatingMode::Auto)[1],
+            (2, "stanza B2".to_owned())
+        );
+        // Another mode starts over; a message that changed is forgotten.
+        assert!(handle
+            .channel_anchors(&messages, OperatingMode::Plan)
+            .is_empty());
+        handle.record_channel_anchor(&messages, 0, OperatingMode::Auto, "stanza A".into());
+        messages[0].content = "edited".into();
+        assert!(handle
+            .channel_anchors(&messages, OperatingMode::Auto)
+            .is_empty());
+        handle.record_channel_anchor(&messages, 0, OperatingMode::Auto, "stanza A".into());
+        handle.clear_channel_anchors();
+        assert!(handle
+            .channel_anchors(&messages, OperatingMode::Auto)
+            .is_empty());
     }
 
     // The journal records none of the live-only state, so the live history at

@@ -23,7 +23,7 @@ use crate::app::{
 };
 use crate::block::{
     question_option_marker, wrap_words, Block, BlockKind, BlockLifecycle, DiffRowKind, FoldState,
-    InteractionRequestKind, InteractionRequestState,
+    InteractionRequestKind, InteractionRequestState, ToolPageNote,
 };
 use crate::fullscreen::FullscreenBackend;
 use crate::input::{DecodedEvent, PasteStreamDecoder};
@@ -48,8 +48,8 @@ const MENU_FOCUS_FLASH_MS: u64 = 166;
 use crate::view_model::{
     activity_elapsed, activity_label, activity_phase_label, assistant_label, budget_near_limit,
     completed_tool_phrase, display_cwd, format_context, is_trivial_cwd, run_status_label,
-    session_rail_projection, tool_effect, tool_target, tool_title, truncate_display_width,
-    ToolEffect,
+    session_rail_projection, tool_budget_label, tool_effect, tool_target, tool_title,
+    truncate_display_width, ToolEffect,
 };
 
 /// Composer prompt is ASCII on purpose (G264): `›` (U+203A) is East-Asian
@@ -145,6 +145,9 @@ fn run_loop(
     let mut paste_decoder = PasteStreamDecoder::default();
     let mut coalescer = EventCoalescer::new(1024, Duration::from_millis(16));
     let mut visible_stream_started = false;
+    // A drag-resize delivers a size per pixel step; the transcript is measured
+    // and wrapped once, at the size that holds.
+    let mut resize_settles_at: Option<Duration> = None;
     let (clipboard_tx, clipboard_rx) = std::sync::mpsc::channel::<ClipboardOutcome>();
     let mut control_prefetched = Vec::new();
     let mut stream_prefetched = Vec::new();
@@ -250,7 +253,10 @@ fn run_loop(
         if state.shutdown {
             return Ok(());
         }
-        if dirty {
+        if resize_settles_at.is_some_and(|at| started.elapsed() >= at) {
+            resize_settles_at = None;
+        }
+        if dirty && resize_settles_at.is_none() {
             if let Some(accessible) =
                 approval_content_accessible(&state, (size.width, size.height), &mut render_cache)
             {
@@ -296,7 +302,8 @@ fn run_loop(
             &mut render_cache,
         );
         let next_welcome_deadline_ms = welcome_motion(&state, capabilities, &regions)
-            .then(|| next_welcome_sweep_ms(runtime_clock(elapsed).elapsed_ms));
+            .then(|| next_welcome_sweep_ms(runtime_clock(elapsed).elapsed_ms))
+            .flatten();
         let next_expiry_ms = [
             next_toast_deadline_ms,
             next_transition_deadline_ms,
@@ -313,10 +320,14 @@ fn run_loop(
             status_visible,
             next_expiry_ms,
         );
-        let deadline = [visual_deadline, coalescer.time_until_flush()]
-            .into_iter()
-            .flatten()
-            .min();
+        let deadline = [
+            visual_deadline,
+            coalescer.time_until_flush(),
+            resize_settles_at.map(|at| at.saturating_sub(elapsed)),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         // Arming before the probes closes the race between the last drain and
         // the wait: producers only signal while a waiter is armed, so the
         // prefetch/`poll(0)` checks are the single place that decides.
@@ -343,6 +354,7 @@ fn run_loop(
                     input_pending = crossterm::event::poll(Duration::ZERO)?;
                     if let Event::Resize(width, height) = event {
                         size = ratatui::layout::Size { width, height };
+                        resize_settles_at = Some(started.elapsed() + RESIZE_SETTLE);
                     }
                     // Input is drained in batches. A drag and copy can arrive
                     // before the next normal draw, so materialize the latest
@@ -425,6 +437,10 @@ fn run_loop(
         }
     }
 }
+
+/// How long after the last resize event the frame waits before measuring
+/// the transcript at the new size.
+const RESIZE_SETTLE: Duration = Duration::from_millis(50);
 
 fn control_requires_data_barrier(events: &[crate::api::UiEvent]) -> bool {
     events.iter().any(|event| {
@@ -699,6 +715,8 @@ pub fn terminal_action(
             }
             Some(Action::Resize)
         }
+        Event::FocusGained => Some(Action::TerminalFocus(true)),
+        Event::FocusLost => Some(Action::TerminalFocus(false)),
         Event::Mouse(mouse) => mouse_action(mouse, state, size, cache),
         _ => None,
     }
@@ -1554,6 +1572,7 @@ pub fn render_frame(
             &state.cline_pass_models,
             &state.command_code_models,
             &state.zen_models,
+            &state.open_design_models,
             state.catalog_revision,
         );
         render_model_overlay(
@@ -1566,6 +1585,7 @@ pub fn render_frame(
             &state.cline_pass_models,
             &state.command_code_models,
             &state.zen_models,
+            &state.open_design_models,
             &rows,
             &palette,
             capabilities,
@@ -1809,14 +1829,30 @@ fn next_transition_visual_deadline_ms(
 /// inspectors leave the animated surfaces readable, so they keep moving.
 fn motion_needed(state: &AppState, capabilities: Capabilities, cache: &mut WrapCache) -> bool {
     if capabilities.reduced_motion
+        || !state.terminal_focused
         || welcome_visible(state)
         || blocking_modal_open(state)
         || state.cancellation.is_some()
         || state.retry.is_some()
+        || activity_stalled(state)
     {
         return false;
     }
     state.working || cache.has_streaming_block(state.blocks(), state.revisions.content)
+}
+
+/// Silence after which the run is shown waiting rather than busy: the
+/// footer names it (`sem novo conteúdo há …`), the spinner slows to the
+/// one-second status tick and the motion clock stops.
+const ACTIVITY_STALL_MS: u64 = 5_000;
+
+/// Neither the provider nor a tool has produced anything for
+/// [`ACTIVITY_STALL_MS`] while the run is still working.
+fn activity_stalled(state: &AppState) -> bool {
+    state.working
+        && state.cancellation.is_none()
+        && state.retry.is_none()
+        && last_useful_update_age_ms(state).is_some_and(|age| age >= ACTIVITY_STALL_MS)
 }
 
 /// Motion is worth a repaint only when something animated is on screen: the
@@ -2141,11 +2177,10 @@ fn render_scrollback(
         // Key on everything the produced lines depend on: each member's
         // generation/lifecycle/fold/timing folded together, selection and the
         // enter hint on the leader, and the wrap width.  The animated Thinking
-        // glyph is patched into the visible header after these static lines
-        // are painted.  Only a member that is still running contributes the
-        // current second (its clock), and only the message being written
-        // contributes its caret phase, so ordinary clock ticks never
-        // invalidate the rest of the transcript cache.
+        // glyph and the streaming caret are patched into the painted rows
+        // after these static lines.  Only a member that is still running
+        // contributes the current second (its clock), so ordinary clock ticks
+        // never invalidate the rest of the transcript cache.
         let mut member_state = 0u64;
         for member in members {
             member_state = member_state
@@ -2165,11 +2200,6 @@ fn render_scrollback(
                 member_state = member_state
                     .wrapping_mul(31)
                     .wrapping_add(state.clock.elapsed_ms / 1_000);
-            }
-            if matches!(member.kind(), BlockKind::Assistant(_))
-                && member.lifecycle == BlockLifecycle::Streaming
-            {
-                member_state = member_state.wrapping_mul(31).wrapping_add(ctx.caret.tag());
             }
             if matches!(member.kind(), BlockKind::Tool(_)) {
                 member_state =
@@ -2213,7 +2243,13 @@ fn render_scrollback(
             u8::from(is_selected) | u8::from(show_enter_hint) << 1 | u8::from(transition_gap) << 2,
             content_width,
         );
-        let block_lines = cache.get_block_lines(&key).unwrap_or_else(|| {
+        // A block still being written gets a new key every generation; it
+        // keeps its own slot instead of walking through the stable LRU.
+        let streaming_entry = members
+            .iter()
+            .any(|member| member.lifecycle == BlockLifecycle::Streaming);
+        let cached_lines = cache.get_block_lines(&key, streaming_entry);
+        let block_lines = cached_lines.unwrap_or_else(|| {
             // Cache only the stable projection.  In particular, never retain
             // a frame-specific spinner glyph in the body/header memo.
             let static_ctx = BlockRender {
@@ -2265,7 +2301,7 @@ fn render_scrollback(
                 lines.append(&mut built);
                 built = lines;
             }
-            cache.store_block_lines(key, built)
+            cache.store_block_lines(key, built, streaming_entry)
         });
         let search_match = !matched_ids.is_empty()
             && (matched_ids.contains(&block.id)
@@ -2287,12 +2323,34 @@ fn render_scrollback(
             buf.set_line(text_area.x, y, line, content_width);
             y += 1;
         }
+        // The streaming caret fills the cell reserved at the end of the answer
+        // being written: a one-cell patch, so blinking never rebuilds lines.
+        if members.len() == 1
+            && matches!(block.kind(), BlockKind::Assistant(_))
+            && block.lifecycle == BlockLifecycle::Streaming
+            && written > 0
+            && skip + written == block_lines.len()
+        {
+            let caret_style = match ctx.caret {
+                CaretPhase::On => Some(palette.assistant),
+                CaretPhase::Stalled => Some(palette.muted),
+                CaretPhase::Off | CaretPhase::Hidden => None,
+            };
+            if let Some((style, last)) = caret_style.zip(block_lines.last()) {
+                let x = text_area
+                    .x
+                    .saturating_add(last.width().saturating_sub(1) as u16);
+                if x < text_area.right() {
+                    buf[(x, y - 1)].set_char('\u{258f}').set_style(style);
+                }
+            }
+        }
         if let Some(tone) = rail_tone(block, palette) {
             // The turn's edge: one cell of tone down the gutter of every row
             // the block painted, over the surfaces already there (the prompt
             // band, a diff, a code block). The header's rule and the breathing
             // rows between blocks keep their own row.
-            let rail = glyph(capabilities, '\u{258c}', '|');
+            let rail = glyph(capabilities, '\u{258f}', '|');
             let header_rows = response_header.map_or(0, crate::block::ResponseHeader::rows);
             // The rail starts at the label that opens the turn: the blank row
             // above it, the rule under it and the breathing rows between blocks
@@ -2354,6 +2412,21 @@ fn render_scrollback(
         }
         if live_tool_candidate && skip <= lead_rows && skip.saturating_add(written) > lead_rows {
             live_tool_visible = true;
+        }
+        if header_written
+            && !ctx.animate_thinking
+            && activity_stalled(state)
+            && !capabilities.reduced_motion
+        {
+            // The motion clock is off while the run stalls; the marker steps
+            // once a second with the footer's indicator.
+            let glyph_x = text_area.x.saturating_add(2);
+            let glyph_y =
+                block_start_y.saturating_add((thinking_header_index.saturating_sub(skip)) as u16);
+            if glyph_x < text_area.right() && glyph_y < text_area.bottom() {
+                buf[(glyph_x, glyph_y)]
+                    .set_char(slow_spinner_glyph(state.clock.elapsed_ms, capabilities));
+            }
         }
         if ctx.animate_thinking && header_written {
             let glyph_x = text_area.x.saturating_add(2);
@@ -2460,9 +2533,19 @@ fn render_scrollback(
         // `Vec<Line>` for a Paragraph costs ~3 allocations per visible row
         // on every frame the scrollbar is painted.
         let bar_x = area.x + area.width.saturating_sub(1);
+        // Where shades are fine enough, color alone sets the thumb apart and
+        // it stays a hairline; coarser depths keep the heavier stroke.
+        let thumb_glyph = if matches!(
+            capabilities.color_depth,
+            ColorDepth::TrueColor | ColorDepth::Ansi256
+        ) {
+            "│"
+        } else {
+            "┃"
+        };
         for row in 0..track {
             let (glyph, style) = if row >= thumb_top && row < thumb_top.saturating_add(thumb) {
-                ("┃", palette.scrollbar_thumb)
+                (thumb_glyph, palette.scrollbar_thumb)
             } else {
                 ("│", palette.scrollbar_track)
             };
@@ -2740,6 +2823,10 @@ fn activity_spans(
                 if retry.is_some() { '~' } else { '!' },
             )
         }
+    } else if motion_allowed && activity_stalled(state) {
+        // Waiting, not working: one step per second says the run is alive
+        // without a busy spinner over a stalled phase.
+        slow_spinner_glyph(state.clock.elapsed_ms, capabilities)
     } else {
         spinner_glyph(state.clock.frame, capabilities)
     };
@@ -2776,7 +2863,7 @@ fn activity_spans(
         spans
     };
     if let Some(age) = last_useful_update_age_ms(state) {
-        if age >= 5_000 && cancellation.is_none() && retry.is_none() {
+        if age >= ACTIVITY_STALL_MS && cancellation.is_none() && retry.is_none() {
             let stale_label = if tool_activity_is_active(state) {
                 "sem progresso"
             } else {
@@ -2942,18 +3029,13 @@ fn welcome_sections(state: &AppState, area: ratatui::layout::Rect) -> WelcomeSec
 /// between passes.
 fn welcome_sweep_progress(elapsed_ms: u64) -> Option<f32> {
     let since = elapsed_ms.checked_sub(WELCOME_SWEEP_DELAY_MS)?;
-    let into = since % WELCOME_SWEEP_PERIOD_MS;
-    (into < WELCOME_SWEEP_MS).then(|| into as f32 / WELCOME_SWEEP_MS as f32)
+    (since < WELCOME_SWEEP_MS).then(|| since as f32 / WELCOME_SWEEP_MS as f32)
 }
 
-/// When the next sheen starts.
-fn next_welcome_sweep_ms(elapsed_ms: u64) -> u64 {
-    match elapsed_ms.checked_sub(WELCOME_SWEEP_DELAY_MS) {
-        None => WELCOME_SWEEP_DELAY_MS,
-        Some(since) => {
-            WELCOME_SWEEP_DELAY_MS + (since / WELCOME_SWEEP_PERIOD_MS + 1) * WELCOME_SWEEP_PERIOD_MS
-        }
-    }
+/// When the sheen starts, if it has not yet: it passes once after launch and
+/// the welcome is still afterwards, so an idle screen schedules nothing.
+fn next_welcome_sweep_ms(elapsed_ms: u64) -> Option<u64> {
+    (elapsed_ms < WELCOME_SWEEP_DELAY_MS).then_some(WELCOME_SWEEP_DELAY_MS)
 }
 
 /// Whether the welcome mark is on screen and allowed to move.
@@ -2963,6 +3045,7 @@ fn welcome_motion(
     regions: &crate::layout::LayoutRegions,
 ) -> bool {
     !capabilities.reduced_motion
+        && state.terminal_focused
         && capabilities.color_depth != ColorDepth::None
         && welcome_visible(state)
         && !blocking_modal_open(state)
@@ -3923,6 +4006,14 @@ fn tool_member_lines(
     }
     let occupied = UnicodeWidthStr::width(marker) + UnicodeWidthStr::width(glyph_text.as_str());
     let available = (width as usize).saturating_sub(occupied);
+    // The selected row says what Enter does to it, on the right, and only
+    // when the row keeps enough room for its own words.
+    let hint = state
+        .enter_hint(block.fold)
+        .filter(|_| selected)
+        .filter(|hint| available >= TOOL_HINT_MIN_DETAIL_CELLS + 2 + hint.len());
+    let hint_reserve = hint.map_or(0, |hint| hint.len() + 2);
+    let available = available.saturating_sub(hint_reserve);
     let detail = fit_tool_detail(parts, available);
     let mut header_spans = vec![
         Span::styled(marker.to_owned(), palette.muted),
@@ -3940,9 +4031,21 @@ fn tool_member_lines(
             header_spans.push(Span::styled(crate::thought::fit(&tail, room), palette.tail));
         }
     }
+    if let Some(hint) = hint {
+        let used: usize = header_spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum();
+        let gap = (width as usize).saturating_sub(used + hint.len());
+        if gap >= 2 {
+            header_spans.push(Span::raw(" ".repeat(gap)));
+            header_spans.push(Span::styled(hint, palette.secondary));
+        }
+    }
     let mut lines = vec![Line::from(header_spans)];
     if block.fold == FoldState::Expanded && state.has_expanded_body() {
         let body_width = width.saturating_sub(4).max(1);
+        let rail = palette.code_rail.patch(palette.code_block);
         lines.extend(cache.wrapped_body(
             block,
             BodyKind::ToolOutput,
@@ -3957,19 +4060,23 @@ fn tool_member_lines(
                     .split('\n')
                     .enumerate()
                     .flat_map(|(index, source)| {
+                        // The details sit on the same surface as a code
+                        // block: a rail on the left and the block's
+                        // background behind every row.
                         let style = match diff_rows.get(index).map(|(kind, _)| kind) {
                             Some(DiffRowKind::Added) => palette.diff_add.patch(palette.diff_add_bg),
                             Some(DiffRowKind::Removed) => {
                                 palette.diff_remove.patch(palette.diff_remove_bg)
                             }
-                            Some(DiffRowKind::Header) => palette.muted,
-                            None => palette.secondary,
+                            Some(DiffRowKind::Header) => palette.muted.patch(palette.code_block),
+                            None => palette.secondary.patch(palette.code_block),
                         };
                         render_plain(source, body_width)
                             .into_iter()
                             .map(move |row| {
                                 Line::from(vec![
-                                    Span::raw("    "),
+                                    Span::raw("  "),
+                                    Span::styled(TOOL_BODY_RAIL, rail),
                                     Span::styled(pad_cells(&row, body_width as usize), style),
                                 ])
                             })
@@ -3979,8 +4086,30 @@ fn tool_member_lines(
             cached_lines_bytes,
         ));
     }
+    if block.fold == FoldState::Expanded {
+        if let Some(note) = state.page_note() {
+            let text = match note {
+                ToolPageNote::Loading => "carregando\u{2026}".to_owned(),
+                ToolPageNote::MorePages => {
+                    format!("{} Enter para mais", glyph(capabilities, '\u{22ef}', '.'))
+                }
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(TOOL_BODY_RAIL, palette.code_rail),
+                Span::styled(text, palette.muted),
+            ]));
+        }
+    }
     lines
 }
+
+/// The rail that frames an open call's details, like a code block's.
+const TOOL_BODY_RAIL: &str = "\u{2502} ";
+
+/// Fewest cells a selected call's own detail keeps before the Enter hint
+/// gives way.
+const TOOL_HINT_MIN_DETAIL_CELLS: usize = 24;
 
 /// Narrowest tail worth showing; below it the row would only show a stub.
 const LIVE_TAIL_MIN_CELLS: usize = 8;
@@ -4859,10 +4988,7 @@ fn block_lines(block: &Block, ctx: &BlockRender<'_>, cache: &mut WrapCache) -> V
                 question_block_lines(state, ctx, block_transition_phase(block, ctx))
             }
         }
-        BlockKind::System(text) => vec![Line::from(Span::styled(
-            format!("  sistema · {}", sanitize_terminal_text(text)),
-            ctx.palette.muted,
-        ))],
+        BlockKind::System(text) => note_lines(text, "  sistema · ", SYSTEM_NOTE_PREFIX_CELLS, ctx),
         BlockKind::Error(text) => render_plain(text, ctx.width.saturating_sub(4).max(1))
             .into_iter()
             .enumerate()
@@ -4878,10 +5004,7 @@ fn block_lines(block: &Block, ctx: &BlockRender<'_>, cache: &mut WrapCache) -> V
                 ])
             })
             .collect(),
-        BlockKind::Activity(text) => vec![Line::from(Span::styled(
-            format!("  · {}", sanitize_terminal_text(text)),
-            ctx.palette.muted,
-        ))],
+        BlockKind::Activity(text) => note_lines(text, "  · ", ACTIVITY_NOTE_PREFIX_CELLS, ctx),
         BlockKind::QueuedUser(_) => {
             grouped_queued_user_lines(block, std::slice::from_ref(block), ctx.selected, ctx)
         }
@@ -5048,6 +5171,35 @@ fn receipt_line(receipt: &crate::receipt::ReceiptState, ctx: &BlockRender<'_>) -
     Line::from(spans)
 }
 
+/// Cells the `  sistema · ` prefix of a system note takes.
+pub(crate) const SYSTEM_NOTE_PREFIX_CELLS: u16 = 12;
+/// Cells the `  · ` prefix of an activity note takes.
+pub(crate) const ACTIVITY_NOTE_PREFIX_CELLS: u16 = 4;
+
+/// A quiet one-line note that wraps under its own prefix when the terminal
+/// is narrower than it; the continuation rows keep the prefix's indent so
+/// the note still reads as one.
+fn note_lines(
+    text: &str,
+    prefix: &str,
+    prefix_cells: u16,
+    ctx: &BlockRender<'_>,
+) -> Vec<Line<'static>> {
+    let body_width = ctx.width.saturating_sub(prefix_cells).max(1);
+    render_plain(text, body_width)
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let lead = if index == 0 {
+                prefix.to_owned()
+            } else {
+                " ".repeat(prefix_cells as usize)
+            };
+            Line::from(Span::styled(format!("{lead}{row}"), ctx.palette.muted))
+        })
+        .collect()
+}
+
 fn assistant_body(
     text: &str,
     ctx: &BlockRender<'_>,
@@ -5060,7 +5212,7 @@ fn assistant_body(
         text: ctx.palette.text,
         h1: ctx.palette.h1,
         h2: ctx.palette.heading,
-        h3: ctx.palette.thinking,
+        h3: ctx.palette.thinking.add_modifier(Modifier::BOLD),
         link: ctx.palette.link,
         code: ctx.palette.inline_code,
         code_block: ctx.palette.code_block,
@@ -5072,38 +5224,46 @@ fn assistant_body(
         diff_remove_bg: ctx.palette.diff_remove_bg,
         quote: ctx.palette.quote,
     };
-    // One markdown parse per block generation feeds both the height probe and
-    // this render: stable bodies wrap once into the LRU, the streaming tail
-    // wraps once into the scratch slot. The caret/indent stay dynamic.
-    let projection = cache.markdown_projection(block, text, text_width);
-    let mut lines = cache.wrapped_body(
-        block,
-        BodyKind::Assistant,
-        ctx.width,
-        !streaming,
-        || crate::markdown::render_projected(&projection, text_width, styles),
-        cached_lines_bytes,
+    let indent = Span::styled(
+        " ".repeat(crate::render::ASSISTANT_PREFIX_COLS as usize),
+        ctx.palette.surface,
     );
-    // The reserved cell always exists; only what fills it changes.
-    let (caret, caret_style) = match (streaming, ctx.caret) {
-        (true, CaretPhase::On) => ("▌", ctx.palette.assistant),
-        (true, CaretPhase::Stalled) => ("▌", ctx.palette.muted),
-        _ => (" ", ctx.palette.assistant),
-    };
-    if let Some(last) = lines.last_mut() {
-        last.spans.push(Span::styled(caret, caret_style));
+    // One markdown parse per block generation feeds both the height probe and
+    // this render: a stable body wraps once into the LRU, indent included;
+    // the body being written keeps its prefix wrapped and wraps its tail.
+    let mut lines = if streaming {
+        cache.streaming_body(block, text, text_width, styles, indent.clone())
     } else {
-        lines.push(Line::from(Span::styled(caret, caret_style)));
+        let projection = cache.markdown_projection(block, text, text_width);
+        cache.wrapped_body(
+            block,
+            BodyKind::Assistant,
+            ctx.width,
+            true,
+            || {
+                crate::markdown::render_projected(&projection, text_width, styles)
+                    .into_iter()
+                    .map(|mut line| {
+                        let mut spans = Vec::with_capacity(line.spans.len() + 1);
+                        spans.push(indent.clone());
+                        spans.append(&mut line.spans);
+                        Line::from(spans)
+                    })
+                    .collect()
+            },
+            cached_lines_bytes,
+        )
+    };
+    // The cell reserved for the streaming caret always exists and is cached
+    // blank; the caret itself is painted into it after the lines (see
+    // `render_scrollback`), so its blinking never rebuilds the block.
+    let reserved = Span::styled(" ", ctx.palette.assistant);
+    if let Some(last) = lines.last_mut() {
+        last.spans.push(reserved);
+    } else {
+        lines.push(Line::from(vec![indent, reserved]));
     }
-    let indent = " ".repeat(crate::render::ASSISTANT_PREFIX_COLS as usize);
     lines
-        .into_iter()
-        .map(|mut line| {
-            let mut spans = vec![Span::styled(indent.clone(), ctx.palette.surface)];
-            spans.append(&mut line.spans);
-            Line::from(spans)
-        })
-        .collect()
 }
 
 fn safe_block_lines(
@@ -6898,11 +7058,12 @@ pub(crate) fn inspector_lines(
                 (
                     "ferramentas",
                     format!(
-                        "leituras {}/{} · alterações {}/{}",
-                        state.tools_used_read,
-                        state.max_read_tool_calls,
-                        state.tools_used_mutating,
-                        state.max_mutating_tool_calls
+                        "leituras {} · alterações {}",
+                        tool_budget_label(state.tools_used_read, state.max_read_tool_calls),
+                        tool_budget_label(
+                            state.tools_used_mutating,
+                            state.max_mutating_tool_calls
+                        ),
                     ),
                 ),
                 (
@@ -7018,7 +7179,8 @@ fn model_group_title(index: usize) -> &'static str {
         1 => "OpenCode Go",
         2 => "ClinePass",
         3 => "Command Code",
-        _ => "OpenCode Zen",
+        4 => "OpenCode Zen",
+        _ => "Open Design",
     }
 }
 
@@ -7029,6 +7191,7 @@ fn model_group_of(provider: LoginProvider) -> usize {
         LoginProvider::ClinePass => 2,
         LoginProvider::CommandCode => 3,
         LoginProvider::OpenCodeZen => 4,
+        LoginProvider::OpenDesign => 5,
     }
 }
 
@@ -7301,6 +7464,7 @@ fn render_model_overlay(
     clinepass: &[crate::api::OpenCodeModelView],
     command_code: &[crate::api::OpenCodeModelView],
     zen: &[crate::api::OpenCodeModelView],
+    open_design: &[crate::api::OpenCodeModelView],
     rows: &[ModelRow],
     palette: &Palette,
     capabilities: Capabilities,
@@ -7316,7 +7480,8 @@ fn render_model_overlay(
         1 => opencode.len(),
         2 => clinepass.len(),
         3 => command_code.len(),
-        _ => zen.len(),
+        4 => zen.len(),
+        _ => open_design.len(),
     };
     let detail_rows = match area.height {
         14.. => 2,
@@ -7426,7 +7591,7 @@ fn render_model_overlay(
                 Span::styled(format!(" {count}"), palette.muted),
             ]
         } else {
-            let choice = row.choice(opencode, clinepass, command_code, zen);
+            let choice = row.choice(opencode, clinepass, command_code, zen, open_design);
             let active = choice.as_ref().is_some_and(|choice| {
                 choice.id == active_model
                     && active_provider.is_none_or(|provider| choice.target.provider() == provider)
@@ -7514,8 +7679,8 @@ fn render_model_overlay(
     if let Some(detail) = regions.detail {
         lines.push(picker_rule(width, palette));
         let focused_row = rows.get(overlay.selected);
-        let focused =
-            focused_row.and_then(|row| row.choice(opencode, clinepass, command_code, zen));
+        let focused = focused_row
+            .and_then(|row| row.choice(opencode, clinepass, command_code, zen, open_design));
         let (title, facts): (Vec<Span>, String) = if overlay.selection_lost {
             (
                 vec![Span::styled(
@@ -7624,7 +7789,7 @@ fn render_model_overlay(
         .is_some_and(|row| matches!(row, ModelRow::Alias(_)));
     let effort_hint = rows
         .get(overlay.selected)
-        .and_then(|row| row.choice(opencode, clinepass, command_code, zen))
+        .and_then(|row| row.choice(opencode, clinepass, command_code, zen, open_design))
         .is_some_and(|choice| !choice.levels.is_empty());
     let hints: Vec<String> = if !effort_hint {
         vec![
@@ -8119,6 +8284,7 @@ fn render_login_overlay(
             LoginProvider::Anthropic => " Anthropic API key ",
             LoginProvider::OpenAiCodex => " OpenAI Codex API key ",
             LoginProvider::Xai => " xAI API key ",
+            LoginProvider::OpenDesign => " Open Design API key ",
         };
         let area = centered(frame.area(), 58, 8);
         let inner = ratatui::layout::Rect {
@@ -8205,6 +8371,7 @@ fn render_login_overlay(
         LoginProvider::CommandCode,
         LoginProvider::Xai,
         LoginProvider::OpenCodeZen,
+        LoginProvider::OpenDesign,
     ];
     let frame_area = frame.area();
     let status = if let Some(code) = &overlay.user_code {
@@ -8555,24 +8722,23 @@ const AGENT_NAME_CELLS: usize = 4;
 const SHIMMER_HALO: usize = 2;
 const SHIMMER_REST: usize = 2;
 /// A burst of thought lights the edge of the newest row for this long,
-/// fading out, and this many cells deep.
-const GLOW_MS: u64 = 450;
+/// fading out, and this many cells deep. Six motion frames: the fade lands
+/// on a frame boundary, like the caret's blink.
+const GLOW_MS: u64 = 6 * MOTION_INTERVAL_MS;
 const GLOW_CELLS: u16 = 14;
 
+/// The sweep's peak crosses one cell every two motion frames, on every label.
+const SWEEP_MS_PER_CELL: u64 = 2 * MOTION_INTERVAL_MS;
+
 /// Strength (0.0 resting, 1.0 peak) of cell `index` in a label `width` cells
-/// wide while a highlight sweeps across it at `elapsed_ms`. The peak crosses
-/// a cell every two motion frames on short labels and every frame on long
-/// ones, so a full pass takes about two seconds either way, then rests before
-/// the next. Its position is continuous and its edge eases out, so the light
-/// slides between frames instead of jumping a cell.
+/// wide while a highlight sweeps across it at `elapsed_ms`. The peak moves at
+/// one speed whatever the label's length ([`SWEEP_MS_PER_CELL`]), so a pass
+/// takes about two seconds on a short label, then rests before the next. Its
+/// position is continuous and its edge eases out, so the light slides between
+/// frames (half a cell per frame) instead of jumping a cell.
 fn sweep_strength(index: usize, width: usize, elapsed_ms: u64) -> f32 {
-    let ms_per_cell = if width <= 10 {
-        2 * MOTION_INTERVAL_MS
-    } else {
-        MOTION_INTERVAL_MS
-    };
     let travel = (width + 2 * SHIMMER_HALO + SHIMMER_REST) as u64;
-    let peak = (elapsed_ms % (travel * ms_per_cell)) as f32 / ms_per_cell as f32;
+    let peak = (elapsed_ms % (travel * SWEEP_MS_PER_CELL)) as f32 / SWEEP_MS_PER_CELL as f32;
     // The peak starts outside the label on the left and leaves on the right.
     let distance = ((index + SHIMMER_HALO) as f32 - peak).abs();
     let reach = 1.0 - distance / (SHIMMER_HALO + 1) as f32;
@@ -8627,7 +8793,7 @@ fn apply_frontier_glow(
     // The caret rides after the last word and keeps its own color.
     let Some(end) = (first..=last).rev().find(|x| {
         let symbol = buf[(*x, y)].symbol();
-        !symbol.trim().is_empty() && !(caret_visible && symbol == "▌")
+        !symbol.trim().is_empty() && !(caret_visible && symbol == "▏")
     }) else {
         return;
     };

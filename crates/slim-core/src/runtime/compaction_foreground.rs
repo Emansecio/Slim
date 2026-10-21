@@ -574,7 +574,7 @@ impl Runtime {
             canonical_prefix_fingerprint(&st.messages[..first_kept_index]);
         let mut compacted = apply_compaction(st.messages, first_kept_index, &fitted.summary);
         // The rewritten history is a new prefix: the overlay is anchored again.
-        let channel = mode::ChannelFrame::rebuilt_for(&compacted, self.mcp_awareness(ctx.mode));
+        let channel = self.rebuilt_channel_frame(ctx.mode, &compacted);
         let request =
             self.prepare_loop_request(ctx.client, &mut compacted, tools, ctx.mode, &channel)?;
         let tokens_after = estimate_context_tokens(

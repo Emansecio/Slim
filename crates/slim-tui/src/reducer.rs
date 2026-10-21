@@ -73,6 +73,9 @@ pub enum Action {
     /// Clears a mouse selection after runtime verifies that its painted
     /// geometry no longer maps to the frozen text snapshot.
     ClearScreenSelection,
+    /// The terminal window gained or lost focus: motion pauses while the
+    /// window is in the background.
+    TerminalFocus(bool),
     /// Synchronizes event timestamps without scheduling a frame.
     SyncClock(FrameClock),
     /// Motion clock (§10.3): the loop sends ticks only while animating.
@@ -230,7 +233,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                 state.composer.clear();
             }
             state.composer.insert_text(prompt);
-            state.revisions.content += 1;
+            state.revisions.composer += 1;
             submit_composer(state)
         }
         Action::Key(key) => {
@@ -299,7 +302,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             }
             match state.composer.try_paste(payload) {
                 Ok(_) => {
-                    state.revisions.content += 1;
+                    state.revisions.composer += 1;
                     sync_slash_suggestions(state);
                 }
                 Err(ComposerError::DraftTooLarge) => {
@@ -344,6 +347,10 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
         }
         Action::Resize => {
             clear_screen_selection(state);
+            vec![Effect::RequestRender]
+        }
+        Action::TerminalFocus(focused) => {
+            state.terminal_focused = focused;
             vec![Effect::RequestRender]
         }
         Action::HistoryRecall { older } => {
@@ -756,7 +763,7 @@ fn complete_mention(state: &mut AppState) {
         if tail_is_space {
             state.composer.move_right();
         }
-        state.revisions.content += 1;
+        state.revisions.composer += 1;
     }
 }
 
@@ -819,7 +826,7 @@ fn reduce_slash_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> 
                 replace_slash_token(state, command);
                 state.slash_suggestions = None;
                 state.mention_suggestions = None;
-                state.revisions.content += 1;
+                state.revisions.composer += 1;
             }
             vec![Effect::RequestRender]
         }
@@ -1238,7 +1245,7 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         EnterIntent::Steer => return enqueue_queued(state),
         EnterIntent::Newline => {
             state.composer.insert_text("\n");
-            state.revisions.content += 1;
+            state.revisions.composer += 1;
             sync_slash_suggestions(state);
             return vec![Effect::RequestRender];
         }
@@ -1255,7 +1262,7 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 state.composer.undo()
             };
             if changed {
-                state.revisions.content += 1;
+                state.revisions.composer += 1;
                 sync_slash_suggestions(state);
             }
         }
@@ -1273,7 +1280,7 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 && !key.modifiers.contains(KeyModifiers::ALT) =>
         {
             if state.composer.delete_word(key.code == KeyCode::Delete) {
-                state.revisions.content += 1;
+                state.revisions.composer += 1;
                 sync_slash_suggestions(state);
             }
         }
@@ -1294,15 +1301,15 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 );
                 state.revisions.status += 1;
             }
-            state.revisions.content += 1;
+            state.revisions.composer += 1;
             sync_slash_suggestions(state);
         }
         KeyCode::Backspace if state.composer.backspace() => {
-            state.revisions.content += 1;
+            state.revisions.composer += 1;
             sync_slash_suggestions(state);
         }
         KeyCode::Delete if state.composer.delete() => {
-            state.revisions.content += 1;
+            state.revisions.composer += 1;
             sync_slash_suggestions(state);
         }
         KeyCode::Left if state.composer.move_left() => {
@@ -1717,6 +1724,7 @@ fn open_model_overlay(state: &mut AppState) -> Vec<Effect> {
         &state.cline_pass_models,
         &state.command_code_models,
         &state.zen_models,
+        &state.open_design_models,
     );
     overlay.pending_fast = state.codex_fast;
     state.model_overlay = Some(overlay);
@@ -1727,6 +1735,7 @@ fn open_model_overlay(state: &mut AppState) -> Vec<Effect> {
         Effect::Send(UiCommand::RefreshClinePassModels),
         Effect::Send(UiCommand::RefreshCommandCodeModels),
         Effect::Send(UiCommand::RefreshZenModels),
+        Effect::Send(UiCommand::RefreshOpenDesignModels),
     ]
 }
 
@@ -2151,6 +2160,14 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
             });
             state.revisions.status += 1;
         }
+        "/login open-design" | "/login opendesign" | "/login od" => {
+            state.login_overlay = Some(LoginOverlay {
+                selected: 7,
+                stage: LoginStage::ApiKey(Default::default()),
+                ..LoginOverlay::default()
+            });
+            state.revisions.status += 1;
+        }
         "/login xai" | "/login grok" => {
             state.login_overlay = Some(LoginOverlay {
                 selected: 5,
@@ -2426,6 +2443,31 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                         keep_draft = true;
                     }
                 }
+                Some(LoginProvider::OpenDesign) => {
+                    if let Some(model) = state
+                        .open_design_models
+                        .iter()
+                        .find(|model| model.id == value)
+                    {
+                        if model.reasoning_levels.is_empty() {
+                            effects.push(Effect::Send(UiCommand::SetOpenDesignModel {
+                                model: model.id.clone(),
+                                effort: state.effort,
+                            }));
+                        } else {
+                            state.effort_overlay = Some(EffortOverlay::for_catalog(
+                                EffortTarget::OpenDesign(model.id.clone()),
+                                model.reasoning_levels.clone(),
+                                state.effort,
+                            ));
+                        }
+                    } else {
+                        state.push_notification(
+                            "Modelo Open Design desconhecido. Use /models.".into(),
+                        );
+                        keep_draft = true;
+                    }
+                }
                 Some(LoginProvider::Xai) => {
                     if slim_core::provider::is_xai_model_id(value) {
                         let levels = slim_core::provider::gateway_reasoning_levels(
@@ -2450,7 +2492,7 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                 }
                 _ => {
                     state.push_notification(
-                        "Conecte OpenAI Codex, OpenCode Go, ClinePass, Command Code ou xAI antes de selecionar um modelo."
+                        "Conecte OpenAI Codex, OpenCode Go, ClinePass, Command Code, xAI ou Open Design antes de selecionar um modelo."
                             .into(),
                     );
                     keep_draft = true;
@@ -2620,7 +2662,7 @@ fn reduce_queue_command(state: &mut AppState, command: &str, effects: &mut Vec<E
             state.composer.clear();
             state.composer.insert_text(prompt);
             sync_slash_suggestions(state);
-            state.revisions.content += 1;
+            state.revisions.composer += 1;
             true
         }
         _ => {
@@ -2656,6 +2698,7 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         &state.cline_pass_models,
         &state.command_code_models,
         &state.zen_models,
+        &state.open_design_models,
     );
     match key.code {
         KeyCode::Esc => {
@@ -2685,6 +2728,7 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                     &state.cline_pass_models,
                     &state.command_code_models,
                     &state.zen_models,
+                    &state.open_design_models,
                 )
             }) else {
                 return vec![];
@@ -2730,6 +2774,7 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                     &state.cline_pass_models,
                     &state.command_code_models,
                     &state.zen_models,
+                    &state.open_design_models,
                 );
                 overlay.selected = first_model_row(&filtered);
                 overlay.viewport_start = 0;
@@ -2743,6 +2788,7 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                     &state.cline_pass_models,
                     &state.command_code_models,
                     &state.zen_models,
+                    &state.open_design_models,
                 );
                 overlay.selected = first_model_row(&filtered);
                 overlay.viewport_start = 0;
@@ -2759,6 +2805,7 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 &state.cline_pass_models,
                 &state.command_code_models,
                 &state.zen_models,
+                &state.open_design_models,
             );
             overlay.selected = first_model_row(&filtered);
             overlay.viewport_start = 0;
@@ -2785,6 +2832,7 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 &state.cline_pass_models,
                 &state.command_code_models,
                 &state.zen_models,
+                &state.open_design_models,
             ) else {
                 return vec![Effect::RequestRender];
             };
@@ -2810,6 +2858,7 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                     UiCommand::SetCommandCodeModel { model, effort }
                 }
                 EffortTarget::Xai(model) => UiCommand::SetXaiModel { model, effort },
+                EffortTarget::OpenDesign(model) => UiCommand::SetOpenDesignModel { model, effort },
             };
             state.model_overlay = None;
             return vec![Effect::Send(command), Effect::RequestRender];
@@ -2821,6 +2870,7 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         &state.cline_pass_models,
         &state.command_code_models,
         &state.zen_models,
+        &state.open_design_models,
     );
     overlay.viewport_start = ensure_visible_start(
         overlay.viewport_start,
@@ -3195,6 +3245,7 @@ fn reduce_effort_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                     UiCommand::SetCommandCodeModel { model, effort }
                 }
                 EffortTarget::Xai(model) => UiCommand::SetXaiModel { model, effort },
+                EffortTarget::OpenDesign(model) => UiCommand::SetOpenDesignModel { model, effort },
             };
             return vec![Effect::Send(command), Effect::RequestRender];
         }
@@ -3282,7 +3333,7 @@ fn reduce_login_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         KeyCode::Down => {
             if let Some(current) = state.login_overlay.as_mut() {
-                current.selected = (current.selected + 1).min(6);
+                current.selected = (current.selected + 1).min(7);
             }
         }
         KeyCode::Home => {
@@ -3292,14 +3343,15 @@ fn reduce_login_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         KeyCode::End => {
             if let Some(current) = state.login_overlay.as_mut() {
-                current.selected = 6;
+                current.selected = 7;
             }
         }
         KeyCode::Enter
             if overlay.provider() == LoginProvider::OpenCodeGo
                 || overlay.provider() == LoginProvider::OpenCodeZen
                 || overlay.provider() == LoginProvider::ClinePass
-                || overlay.provider() == LoginProvider::CommandCode =>
+                || overlay.provider() == LoginProvider::CommandCode
+                || overlay.provider() == LoginProvider::OpenDesign =>
         {
             if let Some(current) = state.login_overlay.as_mut() {
                 current.stage = LoginStage::ApiKey(Default::default());

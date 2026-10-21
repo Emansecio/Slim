@@ -168,7 +168,8 @@ fn spawn_image_fixture(kind: ProviderKind, image_count: usize) -> (String, threa
             | ProviderKind::OpenCodeZen
             | ProviderKind::ClinePass
             | ProviderKind::CommandCode
-            | ProviderKind::Xai => {
+            | ProviderKind::Xai
+            | ProviderKind::OpenDesign => {
                 unreachable!("image fixture does not use this provider")
             }
         }
@@ -196,7 +197,8 @@ fn spawn_image_fixture(kind: ProviderKind, image_count: usize) -> (String, threa
             | ProviderKind::OpenCodeZen
             | ProviderKind::ClinePass
             | ProviderKind::CommandCode
-            | ProviderKind::Xai => {
+            | ProviderKind::Xai
+            | ProviderKind::OpenDesign => {
                 unreachable!("image fixture does not use this provider")
             }
         }
@@ -208,7 +210,7 @@ fn spawn_image_fixture(kind: ProviderKind, image_count: usize) -> (String, threa
         let events = match kind {
             ProviderKind::OpenAiCompatible => b"data: {\"choices\":[{\"delta\":{\"content\":\"image ok\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".as_slice(),
             ProviderKind::Anthropic => b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"image ok\"}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: [DONE]\n\n".as_slice(),
-            ProviderKind::OpenAiCodex | ProviderKind::OpenCodeGo | ProviderKind::OpenCodeZen | ProviderKind::ClinePass | ProviderKind::CommandCode | ProviderKind::Xai => {
+            ProviderKind::OpenAiCodex | ProviderKind::OpenCodeGo | ProviderKind::OpenCodeZen | ProviderKind::ClinePass | ProviderKind::CommandCode | ProviderKind::Xai | ProviderKind::OpenDesign => {
                 unreachable!("image fixture does not use this provider")
             }
         };
@@ -295,6 +297,110 @@ data: [DONE]
         ProviderRunOptions::default()
             .with_context_window_tokens(32_000)
             .with_max_output_tokens(1234),
+    )
+    .expect("provider");
+    server.join().expect("server");
+
+    assert_eq!(result.code, ExitCode::Success);
+    assert_eq!(result.text, "hello from fixture");
+    assert_eq!(render_provider_text(&result), "hello from fixture\n");
+    let jsonl = render_provider_jsonl(&result).expect("jsonl");
+    assert!(jsonl.contains("hello from fixture"));
+    assert!(!jsonl.contains("fixture-secret"));
+    let recovered = preflight_session(&session_path).expect("session");
+    assert!(
+        recovered
+            .records
+            .iter()
+            .any(|record| matches!(record, DurableRecord::Entry { entry, .. }
+            if entry.role == DurableEntryRole::Assistant && entry.content == "hello from fixture"))
+    );
+    assert!(!std::fs::read_to_string(&session_path)
+        .expect("session text")
+        .contains("fixture-secret"));
+    let _ = std::fs::remove_file(session_path);
+}
+
+#[test]
+fn open_design_headless_provider_streams_reasoning_effort_without_leaking_key() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        // Read until the declared Content-Length is satisfied: the native
+        // system prompt makes the request body larger than a single read.
+        let mut raw = Vec::new();
+        let mut chunk = [0_u8; 64 * 1024];
+        let expected = loop {
+            let size = stream.read(&mut chunk).expect("request");
+            if size == 0 {
+                panic!("fixture: connection closed before full request");
+            }
+            raw.extend_from_slice(&chunk[..size]);
+            let text = String::from_utf8_lossy(&raw);
+            if let Some(length) = text
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("Content-Length:")
+                        .or_else(|| line.strip_prefix("content-length:"))
+                })
+                .and_then(|value| value.trim().parse::<usize>().ok())
+            {
+                let header_end = text.find("\r\n\r\n").expect("header terminator") + 4;
+                if raw.len() >= header_end + length {
+                    break (header_end, length);
+                }
+            }
+        };
+        let body: serde_json::Value =
+            serde_json::from_slice(&raw[expected.0..expected.0 + expected.1]).expect("body");
+        assert_eq!(body["max_tokens"], 1234);
+        assert_eq!(body["model"], "deepseek-v4.1-flash");
+        assert_eq!(body["reasoning_effort"], "high");
+        let request = String::from_utf8_lossy(&raw).into_owned();
+        assert!(request.contains("Bearer fixture-secret"));
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .expect("headers");
+        stream
+            .write_all(
+                br#"data: {"choices":[{"delta":{"content":"hello from fixture"}}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#,
+            )
+            .expect("events");
+    });
+
+    let session_path = std::env::temp_dir().join(format!(
+        "slim-open-design-session-{}-{}.jsonl",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let result = run_provider_headless_with_session_and_options(
+        ProviderRequest {
+            prompt: "hello".into(),
+            mode: OperatingMode::Auto,
+            kind: ProviderKind::OpenDesign,
+            endpoint: format!("http://{address}/v1/chat/completions"),
+            model: "deepseek-v4.1-flash".into(),
+            api_key: "fixture-secret".into(),
+            account_id: None,
+            timeout: Duration::from_secs(2),
+        },
+        &session_path,
+        ProviderRunOptions::default()
+            .with_context_window_tokens(32_000)
+            .with_max_output_tokens(1234)
+            .with_reasoning_effort("high"),
     )
     .expect("provider");
     server.join().expect("server");

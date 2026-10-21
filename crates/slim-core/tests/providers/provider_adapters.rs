@@ -1621,7 +1621,7 @@ fn valid_unicode_tool_arguments_round_trip_and_anthropic_unchecked_fallback_pres
 }
 
 #[test]
-fn anthropic_request_marks_last_tool_with_cache_control() {
+fn anthropic_request_marks_the_system_prompt_not_the_tools_with_cache_control() {
     let tool = |name: &str| {
         json!({
             "name": name,
@@ -1654,11 +1654,10 @@ fn anthropic_request_marks_last_tool_with_cache_control() {
     assert_eq!(body["tools"].as_array().expect("tools").len(), 2);
     assert_eq!(body["cache_control"]["type"], "ephemeral");
     assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
-    assert_eq!(
-        body["tools"][1]["cache_control"]["type"], "ephemeral",
-        "last tool must be the cache breakpoint"
-    );
+    // The system breakpoint covers the tools before it; the slot it would
+    // have taken marks the previous request's tail instead.
     assert!(body["tools"][0].get("cache_control").is_none());
+    assert!(body["tools"][1].get("cache_control").is_none());
 }
 
 #[test]

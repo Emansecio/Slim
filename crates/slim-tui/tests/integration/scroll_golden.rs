@@ -115,7 +115,7 @@ fn live_edge_uses_physical_rows_inside_wrapped_user_block() {
         .iter()
         .map(|row| {
             row.trim_end_matches(['│', '┃'])
-                .trim_start_matches('▌')
+                .trim_start_matches('▏')
                 .trim()
         })
         .collect();
@@ -212,7 +212,7 @@ fn latest_short_turn_page_fills_from_its_prompt_after_long_history() {
     );
     assert_eq!(
         transcript[0].trim_end_matches(['│', '┃']).trim(),
-        "▌ ● Você"
+        "▏ ● Você"
     );
     assert!(frame.contains("LATEST_ANSWER"));
     assert!(
@@ -379,8 +379,9 @@ fn scrollbar_appears_only_with_overflow() {
             .filter_map(|line| line.chars().nth(79))
             .collect::<String>()
     };
-    assert!(!right_column(&short_frame).contains('┃'));
-    assert!(right_column(&long_frame).contains('┃'));
+    let has_bar = |column: String| column.contains(['│', '┃']);
+    assert!(!has_bar(right_column(&short_frame)));
+    assert!(has_bar(right_column(&long_frame)));
 }
 
 #[test]

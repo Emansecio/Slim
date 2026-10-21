@@ -9,7 +9,7 @@ use crate::cache::{BoundedCache, WeightedCache};
 use crate::composer::{Composer, DisplaySnapshot};
 use crate::inspector::{InspectorKind, SearchFilter};
 use crate::layout;
-use crate::markdown::LogicalLine;
+use crate::markdown::{LogicalLine, MarkdownStyles};
 use crate::view_model::{Frame, ViewModel};
 use ratatui::style::Style;
 use ratatui::text::Line as RatatuiLine;
@@ -407,19 +407,26 @@ fn block_height(block: &Block, width: u16, cache: &mut WrapCache) -> usize {
         // prompt preserve their full multiline payload behind a four-cell role
         // prefix, using the same physical-row contract as materialization.
         BlockKind::Tool(state) => {
-            if block.fold == crate::block::FoldState::Expanded && state.has_expanded_body() {
-                1 + cache.cached_body_rows(
-                    block,
-                    BodyKind::ToolOutput,
-                    width,
-                    block.lifecycle != crate::block::BlockLifecycle::Streaming,
-                    || {
-                        wrapped_row_count(
-                            &state.expanded_body(),
-                            width.saturating_sub(4).max(1) as usize,
-                        )
-                    },
-                )
+            if block.fold == crate::block::FoldState::Expanded {
+                let body = if state.has_expanded_body() {
+                    cache.cached_body_rows(
+                        block,
+                        BodyKind::ToolOutput,
+                        width,
+                        block.lifecycle != crate::block::BlockLifecycle::Streaming,
+                        || {
+                            wrapped_row_count(
+                                &state.expanded_body(),
+                                width.saturating_sub(4).max(1) as usize,
+                            )
+                        },
+                    )
+                } else {
+                    0
+                };
+                // The footer that says a page is loading or waiting sits
+                // under the body, outside its cache.
+                1 + body + usize::from(state.page_note().is_some())
             } else {
                 1
             }
@@ -441,10 +448,20 @@ fn block_height(block: &Block, width: u16, cache: &mut WrapCache) -> usize {
                 )
             }
         }
-        BlockKind::System(_)
-        | BlockKind::Activity(_)
-        | BlockKind::Receipt(_)
-        | BlockKind::Work(_) => 1,
+        // Short notes wrap under their own prefix instead of being cut.
+        BlockKind::System(text) => crate::markdown::plain_row_count(
+            text,
+            width
+                .saturating_sub(crate::runtime::SYSTEM_NOTE_PREFIX_CELLS)
+                .max(1),
+        ),
+        BlockKind::Activity(text) => crate::markdown::plain_row_count(
+            text,
+            width
+                .saturating_sub(crate::runtime::ACTIVITY_NOTE_PREFIX_CELLS)
+                .max(1),
+        ),
+        BlockKind::Receipt(_) | BlockKind::Work(_) => 1,
         BlockKind::Error(text) | BlockKind::QueuedUser(text) => {
             crate::markdown::plain_row_count(text, width.saturating_sub(4).max(1))
         }
@@ -1104,7 +1121,9 @@ pub struct WrapCache {
     /// Shared markdown projections keyed by (identity, generation, body width):
     /// one pulldown-cmark parse feeds both row counting and body rendering.
     #[allow(clippy::type_complexity)]
-    projections: Vec<((u64, u64, u16), Arc<Vec<LogicalLine>>)>,
+    projections: Vec<((u64, u64, u16, u8), Arc<Vec<LogicalLine>>)>,
+    /// The projected stable prefix of the body being streamed.
+    streaming_prefix: Option<StreamingPrefix>,
     /// Built height indexes keyed by (content rev, fold rev, width, tool-hold
     /// epoch). The epoch stays put across motion frames and changes only when
     /// a just-finished tool joins or leaves its group.
@@ -1131,7 +1150,7 @@ pub struct WrapCache {
     slash_memo: Option<((String, u64), Arc<Vec<String>>)>,
     /// Model overlay flattened rows keyed by (filter, collapsed, catalog rev).
     #[allow(clippy::type_complexity)]
-    model_rows_memo: Option<((String, [bool; 5], u64), Arc<Vec<ModelRow>>)>,
+    model_rows_memo: Option<((String, [bool; 6], u64), Arc<Vec<ModelRow>>)>,
     /// Inspector panel lines keyed by (kind, content, status, second, width,
     /// palette). The row count is retained independently of the palette so a
     /// keyboard-only probe can reuse it without rebuilding styled lines.
@@ -1143,6 +1162,11 @@ pub struct WrapCache {
     streaming_blocks_memo: Option<(u64, bool)>,
     /// Timestamps of block transitions that can still be inside their window.
     transition_stamps_memo: Option<TransitionStamps>,
+    /// Finished tools whose group hold can still be open; see `tool_hold_epoch`.
+    hold_candidates_memo: Option<HoldCandidates>,
+    /// Lines of the blocks still being written: one key per content generation,
+    /// so they never pass through (and empty) the stable block LRU.
+    streaming_line_memos: Vec<(BlockLinesKey, Arc<Vec<RatatuiLine<'static>>>)>,
     /// Paint-side edge of the modal backdrop entrance: whether a frame was
     /// ever painted, whether the last one had a blocking modal, and the clock
     /// at which the open modal first appeared (`None` when it was already
@@ -1199,12 +1223,53 @@ struct FooterKey {
     activity_visible: bool,
 }
 
+/// See `WrapCache::streaming_projection`.
+struct StreamingPrefix {
+    identity: u64,
+    width: u16,
+    /// Bytes of the body the lines cover.
+    len: usize,
+    lines: Vec<LogicalLine>,
+    /// Rows the prefix wraps into, summed without the one-row floor.
+    rows: usize,
+    /// The prefix rendered once, with the styles it was rendered in.
+    wrapped: Option<(MarkdownStyles, Vec<RatatuiLine<'static>>)>,
+}
+
+/// Settled tools whose hold window was open when `blocks` were scanned.
+/// Later clocks only narrow the set, so the scan is per content revision.
+struct HoldCandidates {
+    content_rev: u64,
+    now_ms: u64,
+    candidates: Vec<(u64, u64)>,
+}
+
 const SCRATCH_BODY_SLOTS: usize = 4;
+/// Line memos of blocks being written: the answer, a thought, a tool row
+/// whose clock advances. One generation at a time per block.
+const STREAMING_LINE_SLOTS: usize = 3;
 const SCRATCH_PROJECTION_SLOTS: usize = 4;
 const MAX_HEIGHT_INDEX_MEMOS: usize = 4;
 const MAX_BLOCK_LINE_MEMOS: usize = 256;
 const MAX_BLOCK_LINE_MEMO_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CACHED_BLOCK_LINES_BYTES: usize = 256 * 1024;
+
+fn markdown_styles_equal(a: &MarkdownStyles, b: &MarkdownStyles) -> bool {
+    a.text == b.text
+        && a.h1 == b.h1
+        && a.h2 == b.h2
+        && a.h3 == b.h3
+        && a.link == b.link
+        && a.code == b.code
+        && a.code_block == b.code_block
+        && a.code_rail == b.code_rail
+        && a.code_label == b.code_label
+        && a.diff_add == b.diff_add
+        && a.diff_remove == b.diff_remove
+        && a.diff_add_bg == b.diff_add_bg
+        && a.diff_remove_bg == b.diff_remove_bg
+        && a.quote == b.quote
+}
 
 /// Single-slot memo: recomputes only when `key` changes. Every consumer is a
 /// pure derivation of state, so a kept value can never be semantically stale.
@@ -1239,7 +1304,12 @@ impl WrapCache {
         width: u16,
     ) -> HeightIndex<'a> {
         let epoch = if self.present_tool_hold {
-            crate::block::tool_hold_epoch(blocks, self.present_now_ms, self.present_reduced_motion)
+            self.tool_hold_epoch(
+                blocks,
+                content_rev,
+                self.present_now_ms,
+                self.present_reduced_motion,
+            )
         } else {
             0
         };
@@ -1259,6 +1329,54 @@ impl WrapCache {
         }
         self.height_indexes.insert(key, Arc::clone(&index.memo));
         index
+    }
+
+    /// [`crate::block::tool_hold_epoch`] without the per-frame scan: the
+    /// tools that can still be inside the hold are collected once per content
+    /// revision (a tool finishing bumps it) and only re-tested against the
+    /// clock, which can only drop them.
+    pub(crate) fn tool_hold_epoch(
+        &mut self,
+        blocks: &[Block],
+        content_rev: u64,
+        now_ms: u64,
+        reduced_motion: bool,
+    ) -> u64 {
+        if reduced_motion {
+            return 0;
+        }
+        let holding = |ended: u64| ended.saturating_add(crate::block::TOOL_GROUP_HOLD_MS) > now_ms;
+        match &mut self.hold_candidates_memo {
+            Some(memo) if memo.content_rev == content_rev && memo.now_ms <= now_ms => {
+                memo.candidates.retain(|(_, ended)| holding(*ended));
+                memo.now_ms = now_ms;
+            }
+            slot => {
+                let candidates = blocks
+                    .iter()
+                    .filter(|block| crate::block::tool_hold_pending(block, now_ms, false))
+                    .map(|block| {
+                        (
+                            block.cache_identity(),
+                            block.ended_ms.expect("a held tool has ended"),
+                        )
+                    })
+                    .collect();
+                *slot = Some(HoldCandidates {
+                    content_rev,
+                    now_ms,
+                    candidates,
+                });
+            }
+        }
+        self.hold_candidates_memo
+            .as_ref()
+            .expect("hold candidates populated")
+            .candidates
+            .iter()
+            .fold(0u64, |epoch, (identity, _)| {
+                epoch.wrapping_mul(31).wrapping_add(*identity)
+            })
     }
 
     pub(crate) fn has_streaming_block(&mut self, blocks: &[Block], content_rev: u64) -> bool {
@@ -1337,7 +1455,83 @@ impl WrapCache {
     /// the same content generation (the streaming tail's hot path).
     pub(crate) fn markdown_rows(&mut self, block: &Block, text: &str, width: u16) -> usize {
         let projection = self.markdown_projection(block, text, width);
-        crate::markdown::projected_row_count(&projection, width)
+        if block.lifecycle != crate::block::BlockLifecycle::Streaming {
+            return crate::markdown::projected_row_count(&projection, width);
+        }
+        // The prefix keeps its row count; only the tail is counted again.
+        let (prefix_rows, gap) = self
+            .streaming_prefix
+            .as_ref()
+            .filter(|prefix| prefix.identity == block.cache_identity() && prefix.width == width)
+            .map_or((0, 0), |prefix| {
+                let gap = usize::from(
+                    !projection.is_empty()
+                        && crate::markdown::projection_ends_with_text(&prefix.lines),
+                );
+                (prefix.rows, gap)
+            });
+        (prefix_rows + gap + crate::markdown::projected_rows_sum(&projection, width)).max(1)
+    }
+
+    /// The wrapped body of the answer being written: the stable prefix is
+    /// wrapped once per advance and reused, the tail is wrapped per
+    /// generation. `indent` opens every row (the prose column).
+    pub(crate) fn streaming_body(
+        &mut self,
+        block: &Block,
+        text: &str,
+        width: u16,
+        styles: MarkdownStyles,
+        indent: ratatui::text::Span<'static>,
+    ) -> Vec<RatatuiLine<'static>> {
+        let tail = self.markdown_projection(block, text, width);
+        let indent_rows = |rows: Vec<RatatuiLine<'static>>| -> Vec<RatatuiLine<'static>> {
+            rows.into_iter()
+                .map(|mut line| {
+                    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+                    spans.push(indent.clone());
+                    spans.append(&mut line.spans);
+                    RatatuiLine::from(spans)
+                })
+                .collect()
+        };
+        let Some(prefix) = self
+            .streaming_prefix
+            .as_mut()
+            .filter(|prefix| prefix.identity == block.cache_identity() && prefix.width == width)
+            .filter(|prefix| !prefix.lines.is_empty())
+        else {
+            return indent_rows(crate::markdown::render_projected(&tail, width, styles));
+        };
+        if prefix
+            .wrapped
+            .as_ref()
+            .is_none_or(|(rendered, _)| !markdown_styles_equal(rendered, &styles))
+        {
+            prefix.wrapped = Some((
+                styles,
+                indent_rows(crate::markdown::render_projected(
+                    &prefix.lines,
+                    width,
+                    styles,
+                )),
+            ));
+        }
+        let mut lines = prefix
+            .wrapped
+            .as_ref()
+            .map(|(_, lines)| lines.clone())
+            .expect("prefix wrapped");
+        if tail.is_empty() {
+            return lines;
+        }
+        if crate::markdown::projection_ends_with_text(&prefix.lines) {
+            lines.push(RatatuiLine::from(vec![indent.clone()]));
+        }
+        lines.extend(indent_rows(crate::markdown::render_projected(
+            &tail, width, styles,
+        )));
+        lines
     }
 
     /// The shared parse result for a markdown body, deduplicated across the
@@ -1349,16 +1543,64 @@ impl WrapCache {
         text: &str,
         width: u16,
     ) -> Arc<Vec<LogicalLine>> {
-        let key = (block.cache_identity(), block.content_generation(), width);
+        let key = (
+            block.cache_identity(),
+            block.content_generation(),
+            width,
+            block.lifecycle_tag(),
+        );
         if let Some((_, projection)) = self.projections.iter().find(|(stored, _)| *stored == key) {
             return projection.clone();
         }
-        let projection = Arc::new(crate::markdown::project_markdown(text, width));
+        let projection = if block.lifecycle == crate::block::BlockLifecycle::Streaming {
+            self.streaming_projection(block.cache_identity(), text, width)
+        } else {
+            crate::markdown::project_markdown(text, width)
+        };
+        let projection = Arc::new(projection);
         if self.projections.len() >= SCRATCH_PROJECTION_SLOTS {
             self.projections.remove(0);
         }
         self.projections.push((key, projection.clone()));
         projection
+    }
+
+    /// The projection of the tail of a body still streaming: the stable
+    /// prefix (see `markdown::stable_prefix_len`) stays projected from one
+    /// flush to the next and only the growing tail is parsed again, so a long
+    /// reply costs its tail per frame, not its whole length. The prefix is
+    /// kept in `streaming_prefix`; `markdown_rows` and `streaming_body` join
+    /// the two. The complete body is projected whole once its lifecycle
+    /// changes.
+    fn streaming_projection(&mut self, identity: u64, text: &str, width: u16) -> Vec<LogicalLine> {
+        let kept = self.streaming_prefix.take().filter(|prefix| {
+            prefix.identity == identity
+                && prefix.width == width
+                && prefix.len <= text.len()
+                && text.is_char_boundary(prefix.len)
+        });
+        let mut prefix = kept.unwrap_or_else(|| StreamingPrefix {
+            identity,
+            width,
+            len: 0,
+            lines: Vec::new(),
+            rows: 0,
+            wrapped: None,
+        });
+        let advance = crate::markdown::stable_prefix_len(&text[prefix.len..]);
+        if advance > 0 {
+            let start = prefix.len;
+            crate::markdown::append_projection(
+                &mut prefix.lines,
+                crate::markdown::project_markdown(&text[start..start + advance], width),
+            );
+            prefix.len += advance;
+            prefix.rows = crate::markdown::projected_rows_sum(&prefix.lines, width);
+            prefix.wrapped = None;
+        }
+        let tail = crate::markdown::project_markdown(&text[prefix.len..], width);
+        self.streaming_prefix = Some(prefix);
+        tail
     }
 
     /// Row count reusing whichever body store applies: a hit returns the
@@ -1436,7 +1678,7 @@ impl WrapCache {
         now_ms: u64,
         reduced_motion: bool,
     ) -> Option<BlockId> {
-        let epoch = crate::block::tool_hold_epoch(blocks, now_ms, reduced_motion);
+        let epoch = self.tool_hold_epoch(blocks, content_rev, now_ms, reduced_motion);
         memoized(
             &mut self.tool_leader_memo,
             (content_rev, fold_rev, epoch),
@@ -1480,12 +1722,13 @@ impl WrapCache {
         clinepass: &[crate::api::OpenCodeModelView],
         command_code: &[crate::api::OpenCodeModelView],
         zen: &[crate::api::OpenCodeModelView],
+        open_design: &[crate::api::OpenCodeModelView],
         catalog_rev: u64,
     ) -> Arc<Vec<ModelRow>> {
         memoized(
             &mut self.model_rows_memo,
             (overlay.filter.clone(), overlay.collapsed, catalog_rev),
-            || Arc::new(overlay.rows(opencode, clinepass, command_code, zen)),
+            || Arc::new(overlay.rows(opencode, clinepass, command_code, zen, open_design)),
         )
         .clone()
     }
@@ -1557,7 +1800,15 @@ impl WrapCache {
     pub(crate) fn get_block_lines(
         &mut self,
         key: &BlockLinesKey,
+        streaming: bool,
     ) -> Option<Arc<Vec<RatatuiLine<'static>>>> {
+        if streaming {
+            return self
+                .streaming_line_memos
+                .iter()
+                .find(|(stored, _)| stored == key)
+                .map(|(_, lines)| Arc::clone(lines));
+        }
         self.block_line_memos.get(key).cloned()
     }
 
@@ -1567,9 +1818,20 @@ impl WrapCache {
         &mut self,
         key: BlockLinesKey,
         lines: Vec<RatatuiLine<'static>>,
+        streaming: bool,
     ) -> Arc<Vec<RatatuiLine<'static>>> {
-        let bytes = cached_lines_bytes(&lines);
         let lines = Arc::new(lines);
+        if streaming {
+            // A block being written replaces its own previous generation.
+            self.streaming_line_memos
+                .retain(|(stored, _)| stored.0 != key.0);
+            if self.streaming_line_memos.len() >= STREAMING_LINE_SLOTS {
+                self.streaming_line_memos.remove(0);
+            }
+            self.streaming_line_memos.push((key, Arc::clone(&lines)));
+            return lines;
+        }
+        let bytes = cached_lines_bytes(&lines);
         if bytes <= MAX_CACHED_BLOCK_LINES_BYTES {
             self.block_line_memos.insert(key, lines.clone(), bytes);
         }
@@ -1777,6 +2039,7 @@ impl Default for WrapCache {
             bodies: WeightedCache::new(MAX_BODY_CACHE_ENTRIES, MAX_BODY_CACHE_BYTES),
             scratch_bodies: Vec::new(),
             projections: Vec::new(),
+            streaming_prefix: None,
             height_indexes: HashMap::new(),
             search_memo: None,
             selected_memo: None,
@@ -1790,6 +2053,8 @@ impl Default for WrapCache {
             palette_memo: None,
             streaming_blocks_memo: None,
             transition_stamps_memo: None,
+            hold_candidates_memo: None,
+            streaming_line_memos: Vec::new(),
             frame_painted: false,
             modal_was_open: false,
             modal_opened_ms: None,
@@ -1808,6 +2073,76 @@ impl Default for WrapCache {
 mod height_cache_tests {
     use super::*;
     use crate::block::{Block, BlockKind, BlockLifecycle};
+
+    #[test]
+    fn streaming_body_matches_the_whole_body_at_every_length() {
+        use ratatui::style::Style;
+        use ratatui::text::Span;
+        let text = "# Título\n\nPrimeiro parágrafo com várias palavras para quebrar na largura.\n\n```rust\nfn main() {}\n```\n\n- item um\n- item dois com texto\n\n> citação\n\nParágrafo final.";
+        let styles = MarkdownStyles {
+            text: Style::default(),
+            h1: Style::default(),
+            h2: Style::default(),
+            h3: Style::default(),
+            link: Style::default(),
+            code: Style::default(),
+            code_block: Style::default(),
+            code_rail: Style::default(),
+            code_label: Style::default(),
+            diff_add: Style::default(),
+            diff_remove: Style::default(),
+            diff_add_bg: Style::default(),
+            diff_remove_bg: Style::default(),
+            quote: Style::default(),
+        };
+        let indent = Span::styled("    ", Style::default());
+        let width = 24;
+        let mut cache = WrapCache::default();
+        let mut block = Block::new(
+            "a".to_owned(),
+            BlockKind::Assistant(String::new()),
+            BlockLifecycle::Streaming,
+        );
+        let mut written = 0;
+        for end in (1..=text.len()).filter(|end| text.is_char_boundary(*end)) {
+            block.append_text(&text[written..end]);
+            written = end;
+            let slice = &text[..end];
+            let rows = cache.markdown_rows(&block, slice, width);
+            let lines = cache.streaming_body(&block, slice, width, styles, indent.clone());
+            let whole = crate::markdown::project_markdown(slice, width);
+            let expected: Vec<String> = crate::markdown::render_projected(&whole, width, styles)
+                .into_iter()
+                .map(|line| {
+                    let mut spans = vec![indent.clone()];
+                    spans.extend(line.spans);
+                    format!("{:?}", RatatuiLine::from(spans))
+                })
+                .collect();
+            let produced: Vec<String> = lines.iter().map(|line| format!("{line:?}")).collect();
+            // A block that just opened (a fence with nothing after it yet)
+            // projects a gap row in the whole that the split has not seen; it
+            // settles on the next flush, so trailing blank rows are not compared.
+            let settled = |rows: &[String]| -> Vec<String> {
+                let blank = format!("{:?}", RatatuiLine::from(vec![indent.clone()]));
+                let mut rows = rows.to_vec();
+                while rows.last().is_some_and(|row| *row == blank) {
+                    rows.pop();
+                }
+                rows
+            };
+            assert_eq!(
+                settled(&produced),
+                settled(&expected),
+                "body of {end} bytes"
+            );
+            assert_eq!(lines.len(), rows, "measured vs painted rows of {end} bytes");
+            assert!(
+                rows.abs_diff(crate::markdown::projected_row_count(&whole, width)) <= 1,
+                "rows of {end} bytes"
+            );
+        }
+    }
 
     #[test]
     fn grouped_thinking_heights_reuse_and_invalidate_per_member() {

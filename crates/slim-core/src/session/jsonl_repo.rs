@@ -385,10 +385,13 @@ fn encode_line<T: serde::Serialize>(value: &T) -> io::Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(io::Error::other)
 }
 
+/// One write per record: the file is unbuffered, so the separator written on
+/// its own would be a second system call per line.
 fn write_line(file: &mut File, bytes: &[u8]) -> io::Result<()> {
-    file.write_all(bytes)?;
-    file.write_all(b"\n")?;
-    Ok(())
+    let mut line = Vec::with_capacity(bytes.len() + 1);
+    line.extend_from_slice(bytes);
+    line.push(b'\n');
+    file.write_all(&line)
 }
 
 fn sync_append_data(file: &File) -> io::Result<()> {

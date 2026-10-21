@@ -1,7 +1,9 @@
 use std::io::{self, Stdout, Write};
 
 use crossterm::cursor::{SetCursorStyle, Show};
-use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EndSynchronizedUpdate, EnterAlternateScreen,
@@ -204,7 +206,8 @@ fn restore_surface<W: Write>(stdout: &mut W, mouse_capture: bool) -> io::Result<
         SetCursorStyle::DefaultUserShape,
         Show,
         LeaveAlternateScreen,
-        DisableBracketedPaste
+        DisableBracketedPaste,
+        DisableFocusChange
     )?;
     if mouse_capture {
         execute!(stdout, DisableMouseCapture)?;

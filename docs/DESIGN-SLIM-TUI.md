@@ -431,8 +431,8 @@ milestone correspondente passou seu gate.
 - paradas por budget (`tool_limit` / `turn_limit`): mensagem humanizada em bloco
   `System` colapsado (não toast efêmero); `turn_limit` inclui o teto `(N/N)`
   (default 128, `SLIM_MAX_TURNS` / `max_turns` em `slim.toml`, cap 1024);
-  `max_read_tool_calls` (96) e `max_mutating_tool_calls` (32) são caps **por
-  turn** (batch), não acumulados no run — exploração 1-tool/turn encontra
+  `max_read_tool_calls` e `max_mutating_tool_calls` (sem limite por padrão) são
+  caps **por turn** (batch) quando configurados, não acumulados no run — exploração 1-tool/turn encontra
   `max_turns` primeiro; um batch paralelo acima do cap ainda aborta em
   `tool_limit`; ActivityRail mostra `turn N/M · reads n/m · edits n/m` quando
   largura ≥ 72, omite contadores zerados e inclui somente os que cabem
@@ -458,6 +458,8 @@ milestone correspondente passou seu gate.
   e ClinePass (`--provider clinepass`) detectam modelos via `GET …/models`
   (catálogo ao vivo como fonte da verdade; bundle só como fallback offline);
   Claude no Command Code usa `/messages`, o restante `/chat/completions`;
+- Open Design (`--provider open-design`, env `OPEN_DESIGN_API_KEY`) lê o
+  catálogo autenticado `GET /v1/models` com budgets de contexto/saída (§7.8);
 - Slim Durable Harness v2, Etapas 7–10 concluídas: queue bounded/FIFO/dedup,
   cancelamento durável, resume headless/TUI com fence/`PendingRun`, snapshot/
   watch/hooks/telemetria bounded e capability bridge durável para Skill/MCP
@@ -730,8 +732,12 @@ leve, salvo prova de que são o menor caminho para o loop pedir input.
    `RuntimeCapabilityBridge` persistem operações tipadas; falta projetar
    `TodoChanged`/`PlanChanged`/`GoalChanged` no runtime/TUI e fechar os fluxos
    visuais de aprovação/input de Plan/Goal/Input.
-4. **P1 — ParseCache e LayoutCache dedicados.** O WrapCache cobre alturas;
-   faltam os caches de Markdown parse e LayoutPlan das chaves §12.3.
+4. **P1 — ParseCache e LayoutCache dedicados.** O WrapCache cobre alturas e,
+   para o corpo em streaming, guarda o prefixo estável já projetado (termina em
+   linha em branco fora de fence, seguida de um bloco que se parseia igual
+   sozinho), de modo que cada flush reparseia só a cauda; o corpo completo é
+   projetado inteiro ao mudar de lifecycle. Faltam o cache geral de Markdown
+   parse e o LayoutPlan das chaves §12.3.
 5. **P2 — métricas §26.** Contadores de latência/cache/lane existem nos testes
    e no bench, mas não são exportados como telemetry de runtime.
 
@@ -748,6 +754,50 @@ real, com degradação explícita e testes golden (G340–G341).
   arquivos ou testes unitários isolados não basta.
 
 ### 1.2 Direção visual revisada
+
+**Revisão de 20/10/2026 (recálculo, movimento e estrutura da resposta):** três
+frentes, nenhuma cor nova e nenhum timer novo. O que o olho vê muda pouco; o que
+a TUI deixa de refazer a cada quadro muda muito.
+
+- **Menos recálculo.** Editar o rascunho avança `revisions.composer`, não
+  `content`: o transcript não é remedido por tecla. Um pedido de interação
+  pendente é procurado uma vez por revisão de conteúdo. A janela de retenção
+  das ferramentas (`tool_hold_epoch`) é memorizada por revisão e relógio, e
+  `height_index` e o líder do grupo a consultam em vez de varrer os blocos. Na
+  resposta em streaming só a cauda (o último bloco lógico) é reembrulhada a
+  cada geração; o prefixo já estável é embrulhado uma vez por largura. O caret
+  é pintado como remendo de uma célula depois do cache, então piscar não
+  invalida linha alguma. Um redimensionamento espera 50 ms de calma antes de
+  redesenhar. A fila persistente de prompts não copia o composer em
+  `SyncClock`, `Tick` e `StatusTick`.
+- **Movimento que para quando não há o que mostrar.** O clock de 83 ms não
+  roda com o terminal sem foco (`FocusGained`/`FocusLost`) nem depois de 5 s
+  sem conteúdo útil do provider: o spinner do rodapé e do cabeçalho `Pensando`
+  passam ao quadro lento de 1 Hz até o conteúdo voltar. O brilho de chegada
+  dura seis ticks (498 ms), o mesmo período do caret. A varredura tem uma
+  velocidade só, uma célula a cada dois ticks, para qualquer rótulo, em vez de
+  um período fixo que corria mais depressa nos rótulos longos. A luz
+  do `SLIM` da welcome passa uma vez depois do lançamento e a tela fica parada;
+  a welcome continua sem redraw periódico. No macOS, "Reduzir movimento"
+  (`com.apple.universalaccess reduceMotion`) vale como a opção do Windows.
+- **Resposta mais estruturada.** A régua `---` do Markdown é uma linha `┄` de
+  largura total no tom da citação. Itens de lista quebram com recuo pendurado:
+  a continuação alinha ao texto do item, não ao marcador. `####` e abaixo
+  rendem como H3; H3 é negrito no violeta do raciocínio. O cabeçalho de tabela
+  é negrito no tom do texto. `~~tachado~~` risca, `- [x]` e `- [ ]` viram
+  caixas e uma imagem vira `[imagem: alt]`. Os detalhes de uma ferramenta
+  aberta ficam na mesma superfície de um bloco de código, com a régua `│` e o
+  fundo `code_bg`; sob eles, `carregando…` enquanto uma página está a caminho e
+  `⋯ Enter para mais` quando há outra página. A row de uma ferramenta
+  selecionada diz à direita o que Enter faz nela (`Enter detalhes`,
+  `Enter recolher`, `Enter mais`), como o cabeçalho de um grupo. Notas de
+  sistema e de atividade quebram sob o próprio prefixo em vez de serem
+  cortadas.
+
+Fica como está, por contrato já testado: a URL de um link não aparece (só o
+texto), a manchete da prosa intermediária não entra na row `Trabalhou`, a
+linha de ferramenta ao entrar num grupo chega já no tom de repouso, e a
+ferramenta recém-concluída segue com os oito degraus de assentamento.
 
 **Revisão de 18/10/2026 (estrutura do transcript e painéis de largura total):** a
 paleta não muda — nenhum token de cor entra ou sai. O que muda é onde cada tom
@@ -2171,6 +2221,21 @@ geral Cline, que não equivale à assinatura ClinePass. O limite de 256 modelos
 aplica-se ao subconjunto elegível, preservando o limite bruto de 1 MiB.
 Credenciais: `SLIM_API_KEY` → `CLINEPASS_API_KEY` → `auth.json`.
 Aliases CLI: `clinepass`, `cline-pass`, `cp`.
+
+### 7.8 Provider Open Design
+
+`ProviderKind::OpenDesign` fala Chat Completions em
+`https://amr-link.open-design.ai/v1/chat/completions`. O modelo padrão é
+`deepseek-v4.1-flash`. `GET /v1/models` exige Bearer e é a fonte da verdade:
+modelos `enabled: false` são ignorados, `context_budget` (senão
+`context_limit`) vira janela de contexto e `output_budget` o teto de saída;
+imagens vêm de `input_modalities`. O bundle estático é fallback offline. Cache
+em `%USERPROFILE%\.slim\open-design-models.json` (override
+`SLIM_OPEN_DESIGN_MODELS_FILE`); com `--endpoint`/`SLIM_ENDPOINT` customizado a
+chave nunca é enviada ao catálogo. Na TUI o grupo **Open Design** é o 5 do
+`/models`; `/login open-design` abre o campo mascarado.
+Credenciais: `SLIM_API_KEY` → `OPEN_DESIGN_API_KEY` → `auth.json` (`open-design`).
+Aliases CLI: `open-design`, `opendesign`, `od`.
 
 ## 8. Estado da aplicação
 

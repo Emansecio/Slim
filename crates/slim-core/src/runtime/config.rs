@@ -12,7 +12,14 @@ pub struct AgentLoopConfig {
     pub max_total_tool_calls: usize,
     pub max_result_bytes: usize,
     pub context_window_tokens: u64,
+    /// What the context gate keeps free for the answer: the request's output
+    /// limit when the wire carries one.
     pub context_reserve_tokens: u64,
+    /// When positive, a request's reserve (and its output limit) shrinks to
+    /// the room left in the window, never below this floor, instead of
+    /// compacting while that room is still ample. Zero keeps the reserve
+    /// fixed; a truncation recovery's raised limit also does.
+    pub context_reserve_floor_tokens: u64,
     pub context_compaction_enabled: bool,
     /// First automatic provider-recovery delay; it doubles per attempt (at most 16x).
     /// A provider's retry-after still wins when it is longer.
@@ -24,9 +31,11 @@ pub struct AgentLoopConfig {
 
 impl AgentLoopConfig {
     pub const DEFAULT_MAX_TURNS: usize = 128;
-    pub const DEFAULT_MAX_MUTATING_TOOL_CALLS: usize = 32;
-    pub const DEFAULT_MAX_READ_TOOL_CALLS: usize = 96;
-    pub const DEFAULT_MAX_TOTAL_TOOL_CALLS: usize = 256;
+    /// Tool calls are not capped unless configured: the turn limit, the time
+    /// budget and the no-progress guards end a run that stops advancing.
+    pub const DEFAULT_MAX_MUTATING_TOOL_CALLS: usize = usize::MAX;
+    pub const DEFAULT_MAX_READ_TOOL_CALLS: usize = usize::MAX;
+    pub const DEFAULT_MAX_TOTAL_TOOL_CALLS: usize = usize::MAX;
     /// What the results of one tool batch may present in total, before the
     /// window squeeze: the results share it in proportion to their own caps.
     /// A cap above this (`max_result_bytes`, the read presentation size) keeps
@@ -46,6 +55,7 @@ impl Default for AgentLoopConfig {
             max_result_bytes: 16 * 1024,
             context_window_tokens: 32_000,
             context_reserve_tokens: 4_096,
+            context_reserve_floor_tokens: 0,
             context_compaction_enabled: true,
             provider_recovery_backoff: Self::DEFAULT_PROVIDER_RECOVERY_BACKOFF,
             time_budget: None,

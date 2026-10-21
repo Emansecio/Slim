@@ -30,6 +30,14 @@ impl PersistentQueue {
     }
 
     pub fn reduce(&mut self, state: &mut AppState, action: Action) -> io::Result<Vec<Effect>> {
+        // Clock actions arrive on every wake of the loop and never touch the
+        // queue: they skip the draft snapshot and the journal comparison.
+        if matches!(
+            action,
+            Action::SyncClock(_) | Action::Tick(_) | Action::StatusTick(_)
+        ) {
+            return Ok(reduce(state, action));
+        }
         let session_restored = matches!(
             &action,
             Action::UiEventReceived(UiEvent::SessionRestored { .. })
@@ -41,9 +49,29 @@ impl PersistentQueue {
                 | Action::ClipboardPull { .. }
                 | Action::SubmitInitialPrompt(_)
         );
-        let composer_before = state.composer.payload();
+        // The draft is copied only when the action can edit it or a
+        // preparation outcome may hand it back.
+        let composer_before = (explicit_edit
+            || matches!(
+                &action,
+                Action::UiEventReceived(
+                    UiEvent::PromptPreparationCancelled { .. }
+                        | UiEvent::PromptPreparationFailed { .. }
+                )
+            ))
+        .then(|| state.composer.payload())
+        .unwrap_or_default();
+        let ui_event = matches!(&action, Action::UiEventReceived(_));
+        let session_event = matches!(
+            &action,
+            Action::UiEventReceived(
+                UiEvent::SessionSnapshot { .. } | UiEvent::SessionRestored { .. }
+            )
+        );
+        // Only the events the queue reads below are kept; a streamed delta or
+        // a restored session is not copied.
         let prompt_event = match &action {
-            Action::UiEventReceived(event) => Some(event.clone()),
+            Action::UiEventReceived(event) if queue_reads(event) => Some(event.clone()),
             _ => None,
         };
         let was_working = state.working;
@@ -95,12 +123,7 @@ impl PersistentQueue {
             self.identity = Some(identity);
         }
 
-        if self.initial_prompt.is_some()
-            && matches!(
-                prompt_event.as_ref(),
-                Some(UiEvent::SessionSnapshot { .. } | UiEvent::SessionRestored { .. })
-            )
-        {
+        if self.initial_prompt.is_some() && session_event {
             let prompt = self.initial_prompt.take().expect("initial prompt present");
             effects.extend(reduce(state, Action::SubmitInitialPrompt(prompt)));
         }
@@ -266,13 +289,33 @@ impl PersistentQueue {
 
         // A legacy RunStarted can arrive on a later event after the command was
         // accepted. Its matching terminal is the only event that clears it.
-        if was_working && !state.working && self.active.is_some() && prompt_event.is_none() {
+        if was_working && !state.working && self.active.is_some() && !ui_event {
             snapshot.in_flight.clone_from(&journal.snapshot().in_flight);
         }
         snapshot.pending = state.queued_prompts.iter().cloned().collect();
         journal.save(snapshot)?;
         Ok(effects)
     }
+}
+
+/// The events `PersistentQueue::reduce` inspects after the reducer ran.
+fn queue_reads(event: &UiEvent) -> bool {
+    matches!(
+        event,
+        UiEvent::PromptPreparationCancelled { .. }
+            | UiEvent::PromptPreparationFailed { .. }
+            | UiEvent::PromptPreparationHandled { .. }
+            | UiEvent::PromptRunStarted { .. }
+            | UiEvent::PromptRunCompleted { .. }
+            | UiEvent::PromptRunStopped { .. }
+            | UiEvent::PromptRunCancelled { .. }
+            | UiEvent::PromptRunFailed { .. }
+            | UiEvent::RunStarted { .. }
+            | UiEvent::RunCompleted { .. }
+            | UiEvent::RunStopped { .. }
+            | UiEvent::RunCancelled { .. }
+            | UiEvent::RunFailed { .. }
+    )
 }
 
 #[cfg(test)]

@@ -2646,6 +2646,70 @@ fn sole_prompt_above_threshold_but_within_window_is_sent_unchanged() {
 }
 
 #[test]
+fn a_tool_result_beyond_the_window_is_cut_down_instead_of_failing_the_run() {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let (mut stream, request) = accept_request(&listener);
+        write_sse(&mut stream, &text_response("done"));
+        request
+    });
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(5));
+    let tools = Runtime::new().advertised_tool_definitions(OperatingMode::Auto);
+    let fixed_tokens = slim_core::context::estimate_text_tokens_from_chars(
+        client
+            .adapter()
+            .build_messages_request_with_tools_checked(&[], &tools)
+            .expect("fixed request")
+            .body
+            .chars()
+            .count() as u64,
+    );
+    let huge = (0..20_000)
+        .map(|line| format!("line {line} of a very large tool result\n"))
+        .collect::<String>();
+    let messages = vec![
+        ProviderMessage::user("read the big file"),
+        ProviderMessage::assistant(
+            "",
+            vec![ProviderToolCall {
+                id: "call-big".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"big.txt"}"#.into(),
+            }],
+        ),
+        ProviderMessage::tool("read", "call-big", huge.clone()),
+    ];
+    let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let mut runtime = Runtime::new();
+    let result = tokio_runtime
+        .block_on(runtime.run_agent_loop_with_messages(
+            &client,
+            &messages,
+            OperatingMode::Auto,
+            std::env::temp_dir(),
+            1,
+            AgentLoopConfig {
+                max_turns: 1,
+                context_window_tokens: fixed_tokens + 20_000,
+                context_reserve_tokens: 0,
+                context_compaction_enabled: false,
+                ..test_loop_config()
+            },
+        ))
+        .expect("the trimmed history fits");
+    let request = server.join().expect("server");
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert!(request.contains("[truncated]"));
+    assert!(!request.contains("line 19999 of"));
+    assert!(runtime
+        .app
+        .events()
+        .iter()
+        .any(|event| event.kind.context_trim_notice().is_some()));
+}
+
+#[test]
 fn sole_prompt_beyond_window_fails_without_a_provider_call() {
     let (listener, address) = bind_listener();
     let client = fixture_client(format!("http://{address}"), Duration::from_millis(200));

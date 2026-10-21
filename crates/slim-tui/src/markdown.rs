@@ -66,16 +66,19 @@ enum LineKind {
     DiffRemove,
     DiffHeader,
     DiffContext,
+    /// A thematic break (`---`): one dashed row, apart from the solid rule
+    /// that closes a turn's header.
+    Rule,
 }
 
 impl LineKind {
     fn is_code(self) -> bool {
-        !matches!(self, Self::Text | Self::Quote)
+        !matches!(self, Self::Text | Self::Quote | Self::Rule)
     }
 
     /// Cells taken by the rail that precedes every row of this kind.
     fn rail_width(self) -> usize {
-        if matches!(self, Self::Text) {
+        if matches!(self, Self::Text | Self::Rule) {
             0
         } else {
             2
@@ -83,10 +86,45 @@ impl LineKind {
     }
 }
 
-#[derive(Default)]
+/// The glyph of a thematic break: dashed, like the quote rail, so it never
+/// reads as the solid rule under `● Slim`.
+const RULE_GLYPH: &str = "┄";
+
+#[derive(Clone, Default)]
 pub(crate) struct LogicalLine {
     pieces: Vec<Piece>,
     kind: LineKind,
+    /// Cells left blank before the first row (a paragraph inside a list
+    /// item, under its marker).
+    indent: usize,
+    /// Cells left blank before every row after the first: a wrapped list
+    /// item continues under its text, not under its marker.
+    hang: usize,
+}
+
+/// Cells of a row of a logical line: the first row and the ones after it
+/// may have different room, under an indent or a hanging marker.
+#[derive(Clone, Copy)]
+struct RowWidth {
+    first: usize,
+    rest: usize,
+}
+
+impl RowWidth {
+    fn of(line: &LogicalLine, width: usize) -> Self {
+        Self {
+            first: width.saturating_sub(line.indent).max(1),
+            rest: width.saturating_sub(line.hang).max(1),
+        }
+    }
+
+    fn at(self, row: usize) -> usize {
+        if row == 0 {
+            self.first
+        } else {
+            self.rest
+        }
+    }
 }
 
 impl LogicalLine {
@@ -129,10 +167,14 @@ struct Projection {
     block_tone: BlockTone,
     strong_depth: usize,
     emphasis_depth: usize,
+    strike_depth: usize,
     link_depth: usize,
     code_depth: usize,
     list_stack: Vec<Option<u64>>,
     item_depth: usize,
+    /// Cells the text of the innermost open list item starts at, past its
+    /// indent and marker: what its later rows and paragraphs hang under.
+    item_hang: usize,
     /// Open block quotes, and whether the innermost one already holds text.
     quote_depth: usize,
     quote_has_text: bool,
@@ -155,10 +197,12 @@ impl Default for Projection {
             block_tone: BlockTone::Text,
             strong_depth: 0,
             emphasis_depth: 0,
+            strike_depth: 0,
             link_depth: 0,
             code_depth: 0,
             list_stack: Vec::new(),
             item_depth: 0,
+            item_hang: 0,
             quote_depth: 0,
             quote_has_text: false,
             width: 1,
@@ -177,8 +221,9 @@ impl Projection {
             match self.block_tone {
                 BlockTone::Heading(HeadingLevel::H1) => Tone::H1,
                 BlockTone::Heading(HeadingLevel::H2) => Tone::H2,
-                BlockTone::Heading(HeadingLevel::H3) => Tone::H3,
-                BlockTone::Heading(_) => Tone::H2,
+                // Levels below the third keep the third's weight: a deeper
+                // heading is never heavier than the one above it.
+                BlockTone::Heading(_) => Tone::H3,
                 BlockTone::Quote => Tone::Quote,
                 BlockTone::Code { .. } => Tone::CodeBlock,
                 BlockTone::Text => Tone::Text,
@@ -193,6 +238,9 @@ impl Projection {
         }
         if self.emphasis_depth > 0 {
             modifiers.insert(Modifier::ITALIC);
+        }
+        if self.strike_depth > 0 {
+            modifiers.insert(Modifier::CROSSED_OUT);
         }
         modifiers
     }
@@ -236,8 +284,19 @@ impl Projection {
                     marker
                 },
             );
-        self.current
-            .push(format!("{indent}{marker}"), Tone::Quote, Modifier::empty());
+        let lead = format!("{indent}{marker}");
+        self.item_hang = UnicodeWidthStr::width(lead.as_str());
+        self.current.hang = self.item_hang;
+        self.current.push(lead, Tone::Quote, Modifier::empty());
+    }
+
+    /// A row of the open list item that does not carry its marker (a later
+    /// paragraph, a line after a hard break) starts under the item's text.
+    fn continue_item(&mut self) {
+        if self.item_depth > 0 && self.current.is_empty() {
+            self.current.indent = self.item_hang;
+            self.current.hang = self.item_hang;
+        }
     }
 
     fn at_root(&self) -> bool {
@@ -318,8 +377,13 @@ impl Projection {
                 let cell = row.get(index).map(String::as_str).unwrap_or("");
                 line.push_str(&pad_cells(cell, *width));
             }
-            let tone = if row_index == 0 { Tone::H3 } else { Tone::Text };
-            self.current.push(line, tone, Modifier::empty());
+            // The header row is the table's title: the text tone, in weight.
+            let modifiers = if row_index == 0 {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            };
+            self.current.push(line, Tone::Text, modifiers);
             self.finish_line(false);
             if row_index == 0 {
                 let mut rule = String::new();
@@ -365,7 +429,7 @@ impl Projection {
 
     fn push_table_field(&mut self, header: &str, value: &str) {
         self.current
-            .push(format!("{header}: "), Tone::H3, Modifier::empty());
+            .push(format!("{header}: "), Tone::Text, Modifier::BOLD);
         self.current.push(value, Tone::Text, Modifier::empty());
         self.finish_line(false);
     }
@@ -407,13 +471,77 @@ pub(crate) fn project_markdown(source: &str, width: u16) -> Vec<LogicalLine> {
     project(source, width.max(1) as usize)
 }
 
+/// Byte length of the longest prefix of `source` a streaming body can keep
+/// projected while its tail grows: it ends at a blank line outside any
+/// fenced code block, and the line after it opens a block that parses the
+/// same on its own (it starts in column 0 with a letter, a `#` heading or a
+/// fence). Projecting such a prefix and the rest separately gives the
+/// projection of the whole, except for reference links and HTML blocks that
+/// span blank lines; the full projection of the complete body restores those.
+pub(crate) fn stable_prefix_len(source: &str) -> usize {
+    let mut fence: Option<(u8, usize)> = None;
+    let mut stable = 0;
+    let mut previous_blank = false;
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        let run = trimmed
+            .bytes()
+            .next()
+            .filter(|byte| matches!(byte, b'`' | b'~'))
+            .map(|byte| (byte, trimmed.bytes().take_while(|b| *b == byte).count()))
+            .filter(|(_, length)| *length >= 3);
+        if fence.is_none() && previous_blank {
+            let opens_block = run.is_some()
+                || line
+                    .chars()
+                    .next()
+                    .is_some_and(|first| first.is_alphabetic() || first == '#');
+            if opens_block {
+                stable = offset;
+            }
+        }
+        match (fence, run) {
+            (Some((open, length)), Some((byte, count)))
+                if byte == open && count >= length && trimmed[count..].trim().is_empty() =>
+            {
+                fence = None;
+            }
+            (None, Some(opened)) => fence = Some(opened),
+            _ => {}
+        }
+        previous_blank = fence.is_none() && line.trim().is_empty();
+        offset += line.len();
+    }
+    stable
+}
+
+/// Appends `tail`, projected on its own, after `lines` the way the whole
+/// projection would: a gap row separates the two blocks.
+pub(crate) fn append_projection(lines: &mut Vec<LogicalLine>, tail: Vec<LogicalLine>) {
+    if !tail.is_empty() && lines.last().is_some_and(|line| !line.is_empty()) {
+        lines.push(LogicalLine::default());
+    }
+    lines.extend(tail);
+}
+
 pub(crate) fn projected_row_count(lines: &[LogicalLine], width: u16) -> usize {
+    projected_rows_sum(lines, width).max(1)
+}
+
+/// Rows the lines wrap into, without the one-row floor of an empty body, so
+/// the counts of two halves of a body add up to the count of the whole.
+pub(crate) fn projected_rows_sum(lines: &[LogicalLine], width: u16) -> usize {
     let width = width.max(1) as usize;
     lines
         .iter()
         .map(|line| wrapped_line_count(line, width))
         .sum::<usize>()
-        .max(1)
+}
+
+/// Whether `append_projection` would put a gap row after these lines.
+pub(crate) fn projection_ends_with_text(lines: &[LogicalLine]) -> bool {
+    lines.last().is_some_and(|line| !line.is_empty())
 }
 
 pub(crate) fn render_projected(
@@ -584,6 +712,8 @@ fn project(source: &str, width: usize) -> Vec<LogicalLine> {
     let safe = sanitize_terminal_text_cow(source);
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
     let mut projection = Projection {
         width: width.max(1),
         ..Projection::default()
@@ -611,6 +741,7 @@ fn project(source: &str, width: usize) -> Vec<LogicalLine> {
             }
             Event::Start(Tag::Paragraph) => {
                 projection.gap_before_block();
+                projection.continue_item();
             }
             Event::End(TagEnd::Paragraph) => {
                 projection.finish_line(false);
@@ -689,6 +820,14 @@ fn project(source: &str, width: usize) -> Vec<LogicalLine> {
             Event::End(TagEnd::Strong) => {
                 projection.strong_depth = projection.strong_depth.saturating_sub(1);
             }
+            Event::Start(Tag::Strikethrough) => projection.strike_depth += 1,
+            Event::End(TagEnd::Strikethrough) => {
+                projection.strike_depth = projection.strike_depth.saturating_sub(1);
+            }
+            // An image cannot be shown; its alternative text is, marked as
+            // what it stands for.
+            Event::Start(Tag::Image { .. }) => projection.push_in_scope("[imagem: "),
+            Event::End(TagEnd::Image) => projection.push_in_scope("]"),
             Event::Start(Tag::Emphasis) => projection.emphasis_depth += 1,
             Event::End(TagEnd::Emphasis) => {
                 projection.emphasis_depth = projection.emphasis_depth.saturating_sub(1);
@@ -715,14 +854,15 @@ fn project(source: &str, width: usize) -> Vec<LogicalLine> {
                     projection.push_in_scope(" ");
                 } else {
                     projection.finish_line(true);
+                    projection.continue_item();
                 }
             }
             Event::Rule => {
                 projection.gap_before_block();
-                projection
-                    .current
-                    .push("────", Tone::Quote, Modifier::empty());
-                projection.finish_line(false);
+                projection.lines.push(LogicalLine {
+                    kind: LineKind::Rule,
+                    ..LogicalLine::default()
+                });
             }
             Event::TaskListMarker(checked) => projection.current.push(
                 if checked { "[✓] " } else { "[ ] " },
@@ -747,10 +887,11 @@ fn wrapped_line_count(line: &LogicalLine, width: usize) -> usize {
     } else {
         width.saturating_sub(rail).max(1)
     };
+    let widths = RowWidth::of(line, width);
     let count = if line.kind.is_code() {
-        count_hard_wrapped(&line.pieces, width)
+        count_hard_wrapped(&line.pieces, widths)
     } else {
-        count_prose_lines(&line.pieces, width)
+        count_prose_lines(&line.pieces, widths)
     };
     #[cfg(test)]
     {
@@ -763,11 +904,12 @@ fn wrapped_line_count(line: &LogicalLine, width: usize) -> usize {
     count
 }
 
-fn count_hard_wrapped(pieces: &[Piece], width: usize) -> usize {
+fn count_hard_wrapped(pieces: &[Piece], widths: RowWidth) -> usize {
     let mut rows = 1usize;
     let mut used = 0usize;
     for piece in pieces {
         for grapheme in piece.text.graphemes(true) {
+            let width = widths.at(rows - 1);
             let (_, cells) = normalized_grapheme(grapheme, width);
             if starts_new_row(used, cells, width) {
                 rows += 1;
@@ -785,11 +927,14 @@ struct MetricToken<'a> {
     whitespace: bool,
 }
 
-fn count_prose_lines(pieces: &[Piece], width: usize) -> usize {
+fn count_prose_lines(pieces: &[Piece], widths: RowWidth) -> usize {
+    // Tokens are measured at the narrowest row: a grapheme wider than any
+    // row is replaced the same way `wrap_tokens` replaces it.
+    let narrowest = widths.first.min(widths.rest);
     let mut tokens: Vec<MetricToken> = Vec::new();
     for piece in pieces {
         for grapheme in piece.text.graphemes(true) {
-            let (display, cells) = normalized_grapheme(grapheme, width);
+            let (display, cells) = normalized_grapheme(grapheme, narrowest);
             let whitespace = display.chars().all(char::is_whitespace);
             if tokens.last().is_none_or(|t| t.whitespace != whitespace) {
                 tokens.push(MetricToken {
@@ -817,7 +962,7 @@ fn count_prose_lines(pieces: &[Piece], width: usize) -> usize {
         if token.whitespace {
             if used == 0 && rows == 1 && !row_has_word {
                 for &(_, cells) in &token.slices {
-                    if starts_new_row(used, cells, width) {
+                    if starts_new_row(used, cells, widths.at(rows - 1)) {
                         rows += 1;
                         used = 0;
                     }
@@ -834,7 +979,7 @@ fn count_prose_lines(pieces: &[Piece], width: usize) -> usize {
             && used
                 .saturating_add(pending_width)
                 .saturating_add(token.width)
-                > width
+                > widths.at(rows - 1)
         {
             rows += 1;
             used = 0;
@@ -843,7 +988,7 @@ fn count_prose_lines(pieces: &[Piece], width: usize) -> usize {
 
         if let Some(space) = pending_space.take() {
             for &(_, cells) in &space.slices {
-                if starts_new_row(used, cells, width) {
+                if starts_new_row(used, cells, widths.at(rows - 1)) {
                     rows += 1;
                     used = 0;
                 }
@@ -851,7 +996,7 @@ fn count_prose_lines(pieces: &[Piece], width: usize) -> usize {
             }
         }
         for &(_, cells) in &token.slices {
-            if starts_new_row(used, cells, width) {
+            if starts_new_row(used, cells, widths.at(rows - 1)) {
                 rows += 1;
                 used = 0;
             }
@@ -867,7 +1012,7 @@ fn wrap(logical: &[LogicalLine], width: usize, styles: MarkdownStyles) -> Vec<Li
     for line in logical {
         if is_horizontal_rule(line) {
             lines.push(Line::from(Span::styled(
-                "─".repeat(width.max(1)),
+                RULE_GLYPH.repeat(width.max(1)),
                 styles.quote,
             )));
             continue;
@@ -879,10 +1024,14 @@ fn wrap(logical: &[LogicalLine], width: usize, styles: MarkdownStyles) -> Vec<Li
         } else {
             width.saturating_sub(rail).max(1)
         };
-        for row in wrap_pieces(line, content_width) {
+        for (index, row) in wrap_pieces(line, content_width).into_iter().enumerate() {
             let mut spans = Vec::new();
             if kind == LineKind::Quote {
                 spans.push(Span::styled(QUOTE_RAIL, styles.quote));
+            }
+            let lead = if index == 0 { line.indent } else { line.hang };
+            if lead > 0 {
+                spans.push(Span::styled(" ".repeat(lead), styles.text));
             }
             for piece in row {
                 let style = style_for(piece.tone, piece.modifiers, styles);
@@ -904,10 +1053,11 @@ struct WrapToken {
 }
 
 fn wrap_pieces(line: &LogicalLine, width: usize) -> Vec<Vec<Piece>> {
+    let widths = RowWidth::of(line, width);
     if line.kind.is_code() {
-        return hard_wrap_pieces(&line.pieces, width);
+        return hard_wrap_pieces(&line.pieces, widths);
     }
-    let tokens = wrap_tokens(&line.pieces, width);
+    let tokens = wrap_tokens(&line.pieces, widths.first.min(widths.rest));
     if tokens.is_empty() {
         return vec![Vec::new()];
     }
@@ -920,7 +1070,7 @@ fn wrap_pieces(line: &LogicalLine, width: usize) -> Vec<Vec<Piece>> {
     for token in tokens {
         if token.whitespace {
             if used == 0 && rows.is_empty() {
-                append_hard_wrapped(&token.pieces, width, &mut rows, &mut row, &mut used);
+                append_hard_wrapped(&token.pieces, widths, &mut rows, &mut row, &mut used);
             } else {
                 pending_space = Some(token);
             }
@@ -932,7 +1082,7 @@ fn wrap_pieces(line: &LogicalLine, width: usize) -> Vec<Vec<Piece>> {
             && used
                 .saturating_add(pending_width)
                 .saturating_add(token.width)
-                > width
+                > widths.at(rows.len())
         {
             rows.push(std::mem::take(&mut row));
             used = 0;
@@ -940,33 +1090,34 @@ fn wrap_pieces(line: &LogicalLine, width: usize) -> Vec<Vec<Piece>> {
         }
 
         if let Some(space) = pending_space.take() {
-            append_hard_wrapped(&space.pieces, width, &mut rows, &mut row, &mut used);
+            append_hard_wrapped(&space.pieces, widths, &mut rows, &mut row, &mut used);
         }
-        append_hard_wrapped(&token.pieces, width, &mut rows, &mut row, &mut used);
+        append_hard_wrapped(&token.pieces, widths, &mut rows, &mut row, &mut used);
         row_has_word = true;
     }
     rows.push(row);
     rows
 }
 
-fn hard_wrap_pieces(pieces: &[Piece], width: usize) -> Vec<Vec<Piece>> {
+fn hard_wrap_pieces(pieces: &[Piece], widths: RowWidth) -> Vec<Vec<Piece>> {
     let mut rows = Vec::new();
     let mut row = Vec::new();
     let mut used = 0usize;
-    append_hard_wrapped(pieces, width, &mut rows, &mut row, &mut used);
+    append_hard_wrapped(pieces, widths, &mut rows, &mut row, &mut used);
     rows.push(row);
     rows
 }
 
 fn append_hard_wrapped(
     pieces: &[Piece],
-    width: usize,
+    widths: RowWidth,
     rows: &mut Vec<Vec<Piece>>,
     row: &mut Vec<Piece>,
     used: &mut usize,
 ) {
     for piece in pieces {
         for grapheme in piece.text.graphemes(true) {
+            let width = widths.at(rows.len());
             let (display, cells) = normalized_grapheme(grapheme, width);
             if starts_new_row(*used, cells, width) {
                 rows.push(std::mem::take(row));
@@ -1019,11 +1170,7 @@ fn push_piece(pieces: &mut Vec<Piece>, text: &str, tone: Tone, modifiers: Modifi
 }
 
 fn is_horizontal_rule(line: &LogicalLine) -> bool {
-    !line.pieces.is_empty()
-        && line
-            .pieces
-            .iter()
-            .all(|piece| !piece.text.is_empty() && piece.text.chars().all(|glyph| glyph == '─'))
+    line.kind == LineKind::Rule
 }
 
 pub(crate) fn normalized_grapheme(grapheme: &str, width: usize) -> (&str, usize) {
@@ -1093,7 +1240,7 @@ fn decorate_code_row(
         LineKind::Code | LineKind::CodeLabel | LineKind::DiffHeader | LineKind::DiffContext => {
             styles.code_block
         }
-        LineKind::Text | LineKind::Quote => Style::default(),
+        LineKind::Text | LineKind::Quote | LineKind::Rule => Style::default(),
     };
     for span in &mut spans {
         span.style = if kind == LineKind::CodeLabel {
@@ -1315,6 +1462,64 @@ mod tests {
         render_prose, sanitize_terminal_text, sanitize_terminal_text_with_offsets, MarkdownStyles,
     };
     use unicode_width::UnicodeWidthStr;
+
+    const STREAMED_SAMPLE: &str = "# Title\n\nFirst paragraph with `code` and **bold**.\n\n- item one\n- item two\n\n  continued item\n\n```rust\nfn main() {\n\n    println!(\"hi\");\n}\n```\n\n> quoted\n> more\n\nSecond paragraph.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n1. one\n2. two\n\nÚltimo parágrafo acentuado.\n\n~~~\nplain\n\nfence\n~~~\n\nTail text";
+
+    #[test]
+    fn stable_prefix_ends_at_a_blank_line_before_a_root_block_outside_fences() {
+        use super::stable_prefix_len;
+        assert_eq!(stable_prefix_len(""), 0);
+        assert_eq!(stable_prefix_len("para\n\n"), 0);
+        assert_eq!(stable_prefix_len("para\n\nnext"), 6);
+        assert_eq!(stable_prefix_len("para\n\n# head"), 6);
+        assert_eq!(stable_prefix_len("para\n\n```\ncode"), 6);
+        // A list item's continuation, a quote, a table row or a marker do not
+        // open a block on their own.
+        assert_eq!(stable_prefix_len("- a\n\n  b"), 0);
+        assert_eq!(stable_prefix_len("para\n\n> q"), 0);
+        assert_eq!(stable_prefix_len("para\n\n| a |"), 0);
+        assert_eq!(stable_prefix_len("para\n\n- b"), 0);
+        assert_eq!(stable_prefix_len("para\n\n2. b"), 0);
+        // Blank lines inside a fence are not boundaries; its close is.
+        assert_eq!(stable_prefix_len("```\na\n\nb\n```\n\nafter"), 14);
+        assert_eq!(stable_prefix_len("  ```\na\n\nb\n  ```\n\nafter"), 18);
+        assert_eq!(stable_prefix_len("```\na\n\nb"), 0);
+        assert_eq!(stable_prefix_len("a\n\nb\n\nc"), 6);
+    }
+
+    #[test]
+    fn a_streamed_body_projects_like_the_whole_at_every_length() {
+        use super::{append_projection, project_markdown, render_projected, stable_prefix_len};
+        let width = 24;
+        for end in (0..=STREAMED_SAMPLE.len()).filter(|end| STREAMED_SAMPLE.is_char_boundary(*end))
+        {
+            let text = &STREAMED_SAMPLE[..end];
+            let split = stable_prefix_len(text);
+            let mut split_projection = project_markdown(&text[..split], width);
+            append_projection(
+                &mut split_projection,
+                project_markdown(&text[split..], width),
+            );
+            // A block just opened and still empty (a bare fence line) leaves
+            // the whole projection a trailing gap the split one has not; the
+            // next bytes settle it either way.
+            let settled = |mut lines: Vec<Line<'static>>| {
+                while lines.last().is_some_and(|line| line.spans.is_empty()) {
+                    lines.pop();
+                }
+                lines
+            };
+            assert_eq!(
+                settled(render_projected(&split_projection, width, styles())),
+                settled(render_projected(
+                    &project_markdown(text, width),
+                    width,
+                    styles()
+                )),
+                "prefix of {end} bytes split at {split}"
+            );
+        }
+    }
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans

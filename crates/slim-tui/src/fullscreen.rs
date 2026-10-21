@@ -1,7 +1,7 @@
-use std::io::{self, Stdout};
+use std::io::{self, BufWriter, Stdout};
 
 use crossterm::cursor::{Hide, SetCursorStyle};
-use crossterm::event::EnableBracketedPaste;
+use crossterm::event::{EnableBracketedPaste, EnableFocusChange};
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use crossterm::{execute, queue};
 use ratatui::backend::CrosstermBackend;
@@ -10,8 +10,15 @@ use ratatui::Terminal;
 use crate::terminal::TerminalGuard;
 use crate::theme::{env_flag_enabled, Capabilities};
 
+/// A frame of a large styled transcript is tens of kilobytes of escape
+/// sequences. `Stdout` itself is line-buffered in 1 KiB, so each frame would
+/// be dozens of `write` calls under its lock; this buffer makes it about one.
+const FRAME_BUFFER_BYTES: usize = 128 * 1024;
+
+type FrameWriter = BufWriter<Stdout>;
+
 pub struct FullscreenBackend {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: Terminal<CrosstermBackend<FrameWriter>>,
     guard: TerminalGuard,
     /// DEC 2026 synchronized output; `SLIM_SYNC_OUTPUT=0` turns it off.
     synchronized: bool,
@@ -24,7 +31,9 @@ impl FullscreenBackend {
     pub fn start(capabilities: Capabilities) -> io::Result<Self> {
         let mut stdout = io::stdout();
         let mut guard = TerminalGuard::enter(&mut stdout)?;
-        if let Err(error) = execute!(stdout, EnableBracketedPaste) {
+        // Focus events let motion pause while the window is in the background;
+        // terminals without them simply never send one.
+        if let Err(error) = execute!(stdout, EnableBracketedPaste, EnableFocusChange) {
             drop(guard);
             return Err(error);
         }
@@ -35,7 +44,8 @@ impl FullscreenBackend {
             }
         }
         let _ = execute!(stdout, SetCursorStyle::BlinkingBar, Hide);
-        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+        let writer = BufWriter::with_capacity(FRAME_BUFFER_BYTES, stdout);
+        let terminal = Terminal::new(CrosstermBackend::new(writer))?;
         Ok(Self {
             terminal,
             guard,
@@ -43,7 +53,7 @@ impl FullscreenBackend {
         })
     }
 
-    pub fn terminal(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
+    pub fn terminal(&mut self) -> &mut Terminal<CrosstermBackend<FrameWriter>> {
         &mut self.terminal
     }
 

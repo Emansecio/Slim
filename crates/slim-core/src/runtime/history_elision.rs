@@ -141,7 +141,8 @@ pub(super) fn elide_superseded_tool_outputs(messages: &mut [ProviderMessage]) ->
 /// Rewriting a message changes the request from there on, so the rewrite is
 /// made only when the bytes it saves are at least those of the messages after
 /// the first one it rewrites (what the cache would have to take in again).
-/// Otherwise nothing changes now: the next run's seed pass elides it.
+/// Otherwise nothing changes now: a later pass that pays, or the compaction
+/// that rewrites the history anyway, elides it.
 pub(super) fn elide_superseded_tool_outputs_if_it_pays(
     messages: &mut [ProviderMessage],
 ) -> ElisionStats {
@@ -362,6 +363,83 @@ pub(super) fn truncate_result(output: &str, max_bytes: usize) -> String {
     format!("{}{marker}", &output[..end])
 }
 
+/// The tool-result sizes a history that still exceeds the window after
+/// compaction is cut to, one step at a time.
+const FIT_TOOL_RESULT_BYTES: [usize; 4] = [16 * 1024, 4 * 1024, 1024, 256];
+
+/// One step towards a history that fits the context window: first the
+/// reasoning of every assistant message but the last (whose opaque state a
+/// live continuation needs), then tool results cut to ever smaller sizes.
+/// `step` advances past steps that change nothing; `None` once none is left.
+/// The journal keeps each original (`recorded_content`).
+pub(super) fn shrink_history_to_fit(
+    messages: &mut [ProviderMessage],
+    step: &mut usize,
+) -> Option<ElisionStats> {
+    while *step <= FIT_TOOL_RESULT_BYTES.len() {
+        let current = *step;
+        *step += 1;
+        let stats = if current == 0 {
+            drop_earlier_reasoning(messages)
+        } else {
+            cap_tool_results(messages, FIT_TOOL_RESULT_BYTES[current - 1])
+        };
+        if stats.elided > 0 {
+            return Some(stats);
+        }
+    }
+    None
+}
+
+fn drop_earlier_reasoning(messages: &mut [ProviderMessage]) -> ElisionStats {
+    let last_assistant = messages.iter().rposition(|message| message.role == "assistant");
+    let mut stats = ElisionStats::default();
+    for (index, message) in messages.iter_mut().enumerate() {
+        if message.role != "assistant" || Some(index) == last_assistant {
+            continue;
+        }
+        let bytes = message
+            .responses_reasoning
+            .iter()
+            .map(|reasoning| reasoning.item.to_string().len())
+            .sum::<usize>()
+            + message.chat_reasoning.as_ref().map_or(0, |reasoning| {
+                reasoning.content.len()
+                    + reasoning
+                        .details
+                        .iter()
+                        .map(|detail| detail.to_string().len())
+                        .sum::<usize>()
+            });
+        if bytes == 0 {
+            continue;
+        }
+        message.responses_reasoning.clear();
+        message.chat_reasoning = None;
+        stats.elided += 1;
+        stats.original_bytes += bytes as u64;
+    }
+    stats
+}
+
+fn cap_tool_results(messages: &mut [ProviderMessage], max_bytes: usize) -> ElisionStats {
+    let mut stats = ElisionStats::default();
+    for message in messages
+        .iter_mut()
+        .filter(|message| message.role == "tool" && message.content.len() > max_bytes)
+    {
+        let cut = truncate_result(&message.content, max_bytes);
+        stats.elided += 1;
+        stats.original_bytes += message.content.len() as u64;
+        stats.emitted_bytes += cut.len() as u64;
+        message
+            .recorded_content
+            .get_or_insert_with(|| std::sync::Arc::from(message.content.as_str()));
+        message.content = cut;
+    }
+    stats
+}
+
 pub(super) fn write_output_is_recovery(output: &str) -> bool {
     output.contains("Current file is below")
         || output.contains("Current file edges are below")
@@ -473,5 +551,45 @@ mod tests {
         assert_eq!(messages, original);
         // The unconditional pass (the seed of the next run) still elides it.
         assert_eq!(elide_superseded_tool_outputs(&mut messages).elided, 1);
+    }
+
+    #[test]
+    fn a_history_is_shrunk_reasoning_first_and_keeps_the_last_answers_state() {
+        let reasoning = || {
+            Some(crate::provider::ChatReasoning {
+                scope_id: 1,
+                model: "m".into(),
+                content: "thinking".into(),
+                details: Vec::new(),
+            })
+        };
+        let mut earlier = ProviderMessage::assistant("earlier", Vec::new());
+        earlier.chat_reasoning = reasoning();
+        let mut last = ProviderMessage::assistant("last", Vec::new());
+        last.chat_reasoning = reasoning();
+        let big = "x".repeat(20 * 1024);
+        let mut messages = vec![
+            ProviderMessage::user("go"),
+            earlier,
+            ProviderMessage::tool("read", "call-1", big.clone()),
+            last,
+        ];
+        let mut step = 0;
+
+        let first = shrink_history_to_fit(&mut messages, &mut step).expect("reasoning");
+        assert_eq!((first.elided, first.emitted_bytes), (1, 0));
+        assert!(messages[1].chat_reasoning.is_none());
+        assert!(messages[3].chat_reasoning.is_some());
+        assert_eq!(messages[2].content, big);
+
+        let second = shrink_history_to_fit(&mut messages, &mut step).expect("tool cut");
+        assert_eq!(second.elided, 1);
+        assert_eq!(messages[2].content.len(), 16 * 1024);
+        assert_eq!(messages[2].recorded_content.as_deref(), Some(big.as_str()));
+
+        while shrink_history_to_fit(&mut messages, &mut step).is_some() {}
+        assert_eq!(messages[2].content.len(), 256);
+        assert_eq!(messages[2].recorded_content.as_deref(), Some(big.as_str()));
+        assert!(shrink_history_to_fit(&mut messages, &mut step).is_none());
     }
 }

@@ -240,6 +240,123 @@ fn complete_tool(state: &mut AppState, batch: &str, call: &str, name: &str, dura
 }
 
 #[test]
+fn a_stalled_run_stops_the_motion_clock_until_content_arrives() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::run_started(1));
+    state.apply_event(UiEvent::AssistantDelta {
+        text: "primeiras palavras".into(),
+    });
+    let mut cache = WrapCache::default();
+    let arrived = state.last_provider_content_ms.expect("content stamped");
+    state.clock.elapsed_ms = arrived + super::ACTIVITY_STALL_MS - 1;
+    assert!(super::motion_needed(&state, caps(), &mut cache));
+    assert!(!super::activity_stalled(&state));
+    state.clock.elapsed_ms = arrived + super::ACTIVITY_STALL_MS;
+    assert!(super::activity_stalled(&state));
+    assert!(
+        !super::motion_needed(&state, caps(), &mut cache),
+        "five silent seconds stop the motion clock"
+    );
+    // The footer's marker then steps with the status tick, not a still glyph.
+    let frame = render_to_string(&state, 80, 24);
+    let slow = super::slow_spinner_glyph(state.clock.elapsed_ms, caps());
+    assert!(frame.contains(slow), "{frame}");
+    state.apply_event(UiEvent::AssistantDelta {
+        text: " e mais".into(),
+    });
+    assert!(super::motion_needed(&state, caps(), &mut cache));
+    // A wait that is not the run's (a retry) keeps its own marker.
+    state.retry = Some(crate::app::RetryState {
+        attempt: 1,
+        limit: 3,
+        wait_ms: 1_000,
+        scheduled_ms: state.clock.elapsed_ms,
+        reason: None,
+    });
+    assert!(!super::activity_stalled(&state));
+}
+
+#[test]
+fn an_unfocused_terminal_pauses_motion_until_focus_returns() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::run_started(1));
+    let mut cache = WrapCache::default();
+    assert!(super::motion_needed(&state, caps(), &mut cache));
+    reduce(&mut state, Action::TerminalFocus(false));
+    assert!(!super::motion_needed(&state, caps(), &mut cache));
+    assert_eq!(
+        super::terminal_action(Event::FocusGained, &state, (80, 24), &mut cache),
+        Some(Action::TerminalFocus(true))
+    );
+    reduce(&mut state, Action::TerminalFocus(true));
+    assert!(super::motion_needed(&state, caps(), &mut cache));
+}
+
+#[test]
+fn the_welcome_sheen_passes_once_after_launch() {
+    assert_eq!(
+        super::next_welcome_sweep_ms(0),
+        Some(super::WELCOME_SWEEP_DELAY_MS)
+    );
+    assert!(super::welcome_sweep_progress(super::WELCOME_SWEEP_DELAY_MS + 900).is_some());
+    let over = super::WELCOME_SWEEP_DELAY_MS + super::WELCOME_SWEEP_MS;
+    assert_eq!(super::welcome_sweep_progress(over), None);
+    assert_eq!(super::next_welcome_sweep_ms(over), None);
+    assert_eq!(super::welcome_sweep_progress(over + 60_000), None);
+}
+
+#[test]
+fn tool_hold_epoch_memo_matches_the_scan_as_the_clock_moves() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::run_started(1));
+    state.clock = FrameClock {
+        frame: 120,
+        elapsed_ms: 10_000,
+    };
+    complete_tool(&mut state, "b1", "c1", "read", 3);
+    let mut cache = WrapCache::default();
+    let scan = |state: &AppState, now_ms: u64| {
+        crate::block::tool_hold_epoch(state.blocks(), now_ms, false)
+    };
+    let rev = state.revisions.content;
+    let held = cache.tool_hold_epoch(state.blocks(), rev, 10_050, false);
+    assert_eq!(held, scan(&state, 10_050));
+    assert_ne!(held, 0, "a tool that just finished is held");
+    assert_eq!(
+        cache.tool_hold_epoch(state.blocks(), rev, 10_300, false),
+        scan(&state, 10_300)
+    );
+    assert_eq!(cache.tool_hold_epoch(state.blocks(), rev, 10_300, false), 0);
+    // A second tool finishing moves the revision and is seen at once.
+    state.clock = FrameClock {
+        frame: 125,
+        elapsed_ms: 10_400,
+    };
+    complete_tool(&mut state, "b1", "c2", "read", 3);
+    let rev = state.revisions.content;
+    assert_eq!(
+        cache.tool_hold_epoch(state.blocks(), rev, 10_450, false),
+        scan(&state, 10_450)
+    );
+    assert_ne!(cache.tool_hold_epoch(state.blocks(), rev, 10_450, false), 0);
+    assert_eq!(cache.tool_hold_epoch(state.blocks(), rev, 10_450, true), 0);
+}
+
+#[test]
+fn pending_interaction_is_found_after_a_request_at_a_new_revision() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::run_started(1));
+    assert!(state.pending_interaction().is_none());
+    assert!(state.pending_interaction().is_none());
+    state.apply_event(UiEvent::ApprovalRequired {
+        request_id: crate::api::InteractionRequestId("r1".into()),
+        summary: "rm -rf build".into(),
+        persisted: false,
+    });
+    assert!(state.pending_interaction().is_some());
+}
+
+#[test]
 fn assistant_prose_breathes_before_tools_while_thinking_stays_flush() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::UserMessageAdded {

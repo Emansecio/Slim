@@ -50,10 +50,10 @@ fn render_state_at(
 fn has_caret(frame: &str) -> bool {
     frame.lines().any(|row| {
         let text = row.trim_end();
-        text.ends_with('▌')
+        text.ends_with('▏')
             && !text
-                .trim_start_matches(['▌', ' '])
-                .trim_end_matches('▌')
+                .trim_start_matches(['▏', ' '])
+                .trim_end_matches('▏')
                 .trim()
                 .is_empty()
     })

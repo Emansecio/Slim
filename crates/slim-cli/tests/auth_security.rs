@@ -447,6 +447,38 @@ fn opencode_key_save_is_atomic_and_preserves_sibling_provider() {
 }
 
 #[test]
+fn open_design_key_persists_under_its_own_slot() {
+    let temp = TempDir::new("save-open-design");
+    let path = auth_file(
+        &temp,
+        r#"{"version":1,"providers":{"command-code":{"api_key":"fixture-cmd"}}}"#,
+    );
+
+    save_api_key_file(&path, ProviderKind::OpenDesign, "fixture-open-design")
+        .expect("save Open Design key");
+
+    assert_eq!(
+        load_auth_file(&path, ProviderKind::OpenDesign)
+            .expect("Open Design key")
+            .as_deref(),
+        Some("fixture-open-design")
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("auth file")).expect("json");
+    assert_eq!(document["active_provider"], "open-design");
+    assert_eq!(
+        document["providers"]["open-design"]["api_key"],
+        "fixture-open-design"
+    );
+    assert_eq!(
+        load_auth_file(&path, ProviderKind::CommandCode)
+            .expect("sibling key")
+            .as_deref(),
+        Some("fixture-cmd")
+    );
+}
+
+#[test]
 fn opencode_logout_deletes_only_its_persisted_key() {
     let temp = TempDir::new("delete-opencode");
     let path = auth_file(

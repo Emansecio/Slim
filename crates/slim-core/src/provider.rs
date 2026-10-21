@@ -17,6 +17,7 @@ mod clinepass;
 mod codex;
 mod command_code;
 pub(crate) mod image_limits;
+mod open_design;
 mod opencode_go;
 mod opencode_zen;
 #[cfg(test)]
@@ -37,6 +38,11 @@ pub use command_code::{
     parse_command_code_catalog, CommandCodeAdapter, CommandCodeApi, CommandCodeCatalogEntry,
     CommandCodeModel, COMMANDCODE_BASE_URL, COMMANDCODE_DEFAULT_MODEL, COMMANDCODE_MODELS_URL,
 };
+pub use open_design::{
+    fetch_open_design_catalog, is_open_design_model_id, open_design_model, open_design_models,
+    parse_open_design_catalog, OpenDesignAdapter, OpenDesignCatalogEntry, OpenDesignModel,
+    OPEN_DESIGN_BASE_URL, OPEN_DESIGN_DEFAULT_MODEL, OPEN_DESIGN_MODELS_URL,
+};
 pub use opencode_go::{
     open_code_model, open_code_models, OpenCodeApi, OpenCodeGoAdapter, OpenCodeModel,
     OPENCODE_GO_BASE_URL, OPENCODE_GO_DEFAULT_MODEL, OPENCODE_GO_MODELS_URL,
@@ -49,6 +55,54 @@ pub use xai::{
     is_xai_model_id, xai_model, xai_models, XaiAdapter, XaiModel, XAI_BASE_URL, XAI_DEFAULT_MODEL,
 };
 
+/// The generation of a Claude model ID (`claude-opus-4-6`, `claude-sonnet-5-5`,
+/// `claude-haiku-4-5-20251001`, `claude-3-7-sonnet-20250219`): its family word
+/// and `(major, minor)`, read from the first version numbers of the ID so a
+/// date suffix is not mistaken for a version.
+fn claude_generation(model: &str) -> Option<(&str, u32, u32)> {
+    let slug = model.rsplit('/').next().unwrap_or(model);
+    let slug = slug.strip_prefix("anthropic.").unwrap_or(slug);
+    let rest = slug.strip_prefix("claude-")?;
+    let mut family = "";
+    let mut version = Vec::new();
+    for part in rest.split('-') {
+        match part.parse::<u32>() {
+            Ok(number) if number < 100 && version.len() < 2 => version.push(number),
+            Ok(_) => break,
+            Err(_) if family.is_empty() => family = part,
+            Err(_) => {}
+        }
+    }
+    let major = *version.first()?;
+    Some((family, major, version.get(1).copied().unwrap_or(0)))
+}
+
+/// Synchronous Messages API output ceiling of a Claude model, from the
+/// documented limits per generation: 128k from the 4.6 generation on, 64k for
+/// the 4.5 generation (and Sonnet 4, Sonnet 3.7), 32k for Opus 4/4.1.
+/// Unknown IDs, and older generations, resolve to nothing.
+pub fn claude_max_output_tokens(model: &str) -> Option<u32> {
+    let (family, major, minor) = claude_generation(model)?;
+    match (major, minor) {
+        (5.., _) | (4, 6..) => Some(128_000),
+        (4, 5) => Some(64_000),
+        (4, _) if family == "sonnet" => Some(64_000),
+        (4, _) if family == "opus" => Some(32_000),
+        (3, 7) => Some(64_000),
+        _ => None,
+    }
+}
+
+/// Context window of a Claude model by generation: 1M from the 4.6 generation
+/// on, 200k for 4.5 and earlier.
+pub fn claude_context_window(model: &str) -> Option<u64> {
+    let (_, major, minor) = claude_generation(model)?;
+    Some(match (major, minor) {
+        (5.., _) | (4, 6..) => 1_000_000,
+        _ => 200_000,
+    })
+}
+
 /// Documented effort controls for catalog gateways without capability metadata.
 /// Empty means no confirmed effort knob, not that the model cannot reason.
 /// Sources: DeepSeek thinking_mode; Claude effort; xAI text/reasoning.
@@ -56,26 +110,28 @@ pub fn gateway_reasoning_levels(kind: ProviderKind, model: &str) -> &'static [&'
     let slug = model.rsplit('/').next().unwrap_or(model);
     match kind {
         ProviderKind::Xai => xai_model(model).map_or(&[], |m| m.reasoning_levels),
-        ProviderKind::ClinePass | ProviderKind::CommandCode => match slug {
-            "deepseek-v4.1-flash" => &["low", "high", "max"],
-            "deepseek-v4-pro"
-            | "deepseek-v4-flash"
-            | "deepseek-v4-flash-fast"
-            | "deepseek-v4-flash-vision-exp" => &["high", "max"],
-            "claude-opus-5" | "claude-opus-4-8" | "claude-opus-4-7" | "claude-sonnet-5"
-            | "claude-fable-5" | "claude-fable-5-1"
-                if kind == ProviderKind::CommandCode =>
-            {
-                &["low", "medium", "high", "xhigh", "max"]
+        ProviderKind::ClinePass | ProviderKind::CommandCode | ProviderKind::OpenDesign => {
+            match slug {
+                "deepseek-v4.1-flash" => &["low", "high", "max"],
+                "deepseek-v4-pro"
+                | "deepseek-v4-flash"
+                | "deepseek-v4-flash-fast"
+                | "deepseek-v4-flash-vision-exp" => &["high", "max"],
+                "claude-opus-5" | "claude-opus-4-8" | "claude-opus-4-7" | "claude-sonnet-5"
+                | "claude-fable-5" | "claude-fable-5-1"
+                    if kind == ProviderKind::CommandCode =>
+                {
+                    &["low", "medium", "high", "xhigh", "max"]
+                }
+                "claude-sonnet-4-6" | "claude-opus-4-6" if kind == ProviderKind::CommandCode => {
+                    &["low", "medium", "high", "max"]
+                }
+                _ if kind == ProviderKind::CommandCode => {
+                    xai_model(slug).map_or(&[], |m| m.reasoning_levels)
+                }
+                _ => &[],
             }
-            "claude-sonnet-4-6" | "claude-opus-4-6" if kind == ProviderKind::CommandCode => {
-                &["low", "medium", "high", "max"]
-            }
-            _ if kind == ProviderKind::CommandCode => {
-                xai_model(slug).map_or(&[], |m| m.reasoning_levels)
-            }
-            _ => &[],
-        },
+        }
         _ => &[],
     }
 }
@@ -296,6 +352,8 @@ impl ProviderErrorMetadata {
                     | "rate_limit_exceeded"
                     | "too_many_requests"
                     | "slow_down"
+                    // Open Design: the upstream connection dropped mid-stream.
+                    | "upstream_stream_interrupted"
             )
         );
         let recognized_status = self.status.is_none_or(is_transient_http_status);
@@ -569,6 +627,7 @@ pub enum ProviderKind {
     ClinePass,
     CommandCode,
     Xai,
+    OpenDesign,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1470,6 +1529,48 @@ fn harden_compaction_request<A: ProviderAdapter + ?Sized>(
     Ok(request)
 }
 
+/// Puts a breakpoint where the previous request of the run ended: on the
+/// last block of the message before the latest assistant turn. The automatic
+/// top-level breakpoint only looks about twenty blocks back from the end of
+/// the request, so a turn of many parallel tool calls (its `tool_use` and
+/// `tool_result` blocks) would push the previous request's cache write out of
+/// reach and the whole history would be written to the cache again.
+fn mark_previous_request_tail(body: &mut Value, marker: Value) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let Some(last_assistant) = messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+    else {
+        return;
+    };
+    let Some(tail) = last_assistant
+        .checked_sub(1)
+        .and_then(|index| messages.get_mut(index))
+    else {
+        return;
+    };
+    if let Some(text) = tail
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    {
+        if text.is_empty() {
+            return;
+        }
+        tail["content"] = json!([{"type": "text", "text": text}]);
+    }
+    if let Some(block) = tail
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
+        .and_then(|blocks| blocks.last_mut())
+        .and_then(Value::as_object_mut)
+    {
+        block.insert("cache_control".into(), marker);
+    }
+}
+
 fn harden_compaction_body(body: &mut Value, anthropic_wire: bool) -> Result<(), ProviderError> {
     let object = body
         .as_object_mut()
@@ -1484,6 +1585,17 @@ fn harden_compaction_body(body: &mut Value, anthropic_wire: bool) -> Result<(), 
     // breakpoint over this transcript can never be read back by later turns.
     // Anthropic would still bill the cache write: strip the markers entirely.
     object.remove("cache_control");
+    if let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) {
+        for block in messages
+            .iter_mut()
+            .filter_map(|message| message.get_mut("content"))
+            .filter_map(Value::as_array_mut)
+            .flatten()
+            .filter_map(Value::as_object_mut)
+        {
+            block.remove("cache_control");
+        }
+    }
     // Preserve the adapter's effort. Compatible gateways may expose high-only
     // models; a generic compactor cannot infer that low is supported. The
     // output limit is the caller's: `HttpProviderClient::prepare_compaction_messages`.
@@ -2447,13 +2559,39 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         request: PreparedProviderRequest,
         limit: u64,
     ) -> Result<PreparedProviderRequest, ProviderError> {
+        self.with_output_limit(request, limit, true)
+    }
+
+    /// The request with its output limit lowered to `limit` where the wire
+    /// carries one; a limit already at or under it is kept.
+    pub(crate) fn with_output_limit_ceiling(
+        &self,
+        request: PreparedProviderRequest,
+        limit: u64,
+    ) -> Result<PreparedProviderRequest, ProviderError> {
+        self.with_output_limit(request, limit, false)
+    }
+
+    fn with_output_limit(
+        &self,
+        request: PreparedProviderRequest,
+        limit: u64,
+        raise: bool,
+    ) -> Result<PreparedProviderRequest, ProviderError> {
         let mut body: Value =
             serde_json::from_slice(&request.body).map_err(|_| ProviderError::InvalidResponse {
                 message: "recovery request body is invalid JSON".into(),
             })?;
         for key in ["max_tokens", "max_output_tokens", "max_completion_tokens"] {
             if let Some(value) = body.get_mut(key) {
-                if value.as_u64().is_some_and(|current| current < limit) {
+                let replace = value.as_u64().is_some_and(|current| {
+                    if raise {
+                        current < limit
+                    } else {
+                        current > limit
+                    }
+                });
+                if replace {
                     *value = Value::from(limit);
                 }
             }
@@ -2477,10 +2615,12 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         match self.adapter.kind() {
             ProviderKind::OpenAiCodex => codex_model(model).map(|m| m.max_output_tokens),
             ProviderKind::ClinePass => clinepass_model(model).map(|m| m.max_output_tokens),
+            ProviderKind::OpenDesign => open_design_model(model).map(|m| m.max_output_tokens),
             ProviderKind::OpenCodeGo => open_code_model(model).and_then(|m| m.max_output_tokens),
             ProviderKind::OpenCodeZen => zen_model(model).and_then(|m| m.max_output_tokens),
             ProviderKind::Xai => xai_model(model).map(|m| m.max_output_tokens),
-            _ => None,
+            ProviderKind::Anthropic | ProviderKind::CommandCode => claude_max_output_tokens(model),
+            ProviderKind::OpenAiCompatible => None,
         }
         .map(u64::from)
     }
@@ -2550,8 +2690,8 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         }
         // A closing request is the last of its run: on Anthropic wire the
         // automatic top-level breakpoint would bill a cache write nobody reads
-        // back. The system and tool breakpoints stay, and match the turns' when
-        // the tools are kept.
+        // back. The system breakpoint and the one on the previous request's
+        // tail stay: they are reads of what the turns cached.
         if adapter.wire_kind() == ProviderKind::Anthropic {
             if let Some(object) = body.as_object_mut() {
                 object.remove("cache_control");
@@ -2745,7 +2885,10 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         // other providers retain the strict one-terminal-usage contract.
         let coalesce_terminal_usage = matches!(
             self.adapter.kind(),
-            ProviderKind::OpenCodeGo | ProviderKind::OpenCodeZen | ProviderKind::CommandCode
+            ProviderKind::OpenCodeGo
+                | ProviderKind::OpenCodeZen
+                | ProviderKind::CommandCode
+                | ProviderKind::OpenDesign
         ) && self.adapter.wire_kind()
             == ProviderKind::OpenAiCompatible;
         let mut terminal_usage = None::<(u64, u64)>;
@@ -3627,6 +3770,7 @@ pub(crate) fn provider_kind_name(kind: ProviderKind) -> &'static str {
         ProviderKind::ClinePass => "cline-pass",
         ProviderKind::CommandCode => "command-code",
         ProviderKind::Xai => "xai",
+        ProviderKind::OpenDesign => "open-design",
     }
 }
 
@@ -5149,12 +5293,12 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
             .and_then(Value::as_array)
             .and_then(|items| items.first());
         if let Some(delta) = choice.and_then(|item| item.get("delta")) {
-            if let Some(reasoning) = delta
+            let plain_reasoning = delta
                 .get("reasoning_content")
                 .or_else(|| delta.get("reasoning"))
                 .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-            {
+                .filter(|text| !text.is_empty());
+            if let Some(reasoning) = plain_reasoning {
                 events.push(ProviderEvent::ReasoningDelta(reasoning.into()));
                 if self.uses_chat_thinking() {
                     events.push(ProviderEvent::ChatReasoning(ChatReasoning {
@@ -5169,7 +5313,8 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
             }
             // Unified gateway reasoning (e.g. OpenRouter's `reasoning_details`).
             // Presence alone proves the model reasoned, so emit an event even
-            // when no readable text is carried.
+            // when no readable text is carried. Gateways such as Open Design
+            // repeat the plain `reasoning` text here; it is shown only once.
             if let Some(details) = delta
                 .get("reasoning_details")
                 .and_then(Value::as_array)
@@ -5192,10 +5337,12 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                             .and_then(Value::as_str)
                     })
                     .collect::<String>();
-                if text.is_empty() {
-                    events.push(ProviderEvent::ReasoningStarted);
-                } else {
-                    events.push(ProviderEvent::ReasoningDelta(text));
+                if plain_reasoning.is_none() {
+                    events.push(if text.is_empty() {
+                        ProviderEvent::ReasoningStarted
+                    } else {
+                        ProviderEvent::ReasoningDelta(text)
+                    });
                 }
             }
             if let Some(text) = delta
@@ -5551,6 +5698,9 @@ impl ProviderAdapter for AnthropicAdapter {
         if !capabilities.supports_explicit_cache_breakpoints {
             return;
         }
+        // The cached prefix is tools, then system, then messages: the
+        // breakpoint on the (constant) system prompt covers the tools before
+        // it, so the tools carry none and the slot goes to the history.
         if let Some(system) = body
             .get("system")
             .and_then(Value::as_str)
@@ -5562,14 +5712,7 @@ impl ProviderAdapter for AnthropicAdapter {
                 "cache_control": Self::cache_control()
             }]);
         }
-        if let Some(tool) = body
-            .get_mut("tools")
-            .and_then(Value::as_array_mut)
-            .and_then(|tools| tools.last_mut())
-            .and_then(Value::as_object_mut)
-        {
-            tool.insert("cache_control".into(), Self::cache_control());
-        }
+        mark_previous_request_tail(body, Self::cache_control());
     }
 
     fn response_cache_scope_id(&self) -> Option<u64> {
@@ -6061,9 +6204,15 @@ mod finalization_tests {
             results[3],
             json!({"type": "text", "text": "[Todo progress review]"})
         );
+        // The message before the last assistant turn is where the previous
+        // request ended: it carries the breakpoint, as one text block.
         assert_eq!(
             official[3],
-            json!({"role": "user", "content": "second harness note"})
+            json!({"role": "user", "content": [{
+                "type": "text",
+                "text": "second harness note",
+                "cache_control": {"type": "ephemeral"}
+            }]})
         );
         // Gateways keep one user message per result and the harness text apart.
         let gateway = wire("https://gateway.example.com/v1/messages");
@@ -6071,6 +6220,120 @@ mod finalization_tests {
         assert!(gateway[2..5]
             .iter()
             .all(|message| message["content"].as_array().unwrap().len() == 1));
+    }
+
+    #[test]
+    fn anthropic_breakpoints_cover_the_system_prompt_and_the_previous_request_tail() {
+        let adapter = AnthropicAdapter::new(ProviderConfig::anthropic(
+            "https://api.anthropic.com/v1/messages",
+            "claude-sonnet-4-6",
+            "fixture-key",
+        ))
+        .expect("adapter");
+        let tools =
+            [json!({"name": "read", "description": "Read.", "input_schema": {"type": "object"}})];
+        let call = |id: &str| ProviderToolCall {
+            id: id.into(),
+            name: "read".into(),
+            arguments: r#"{"path":"a.rs"}"#.into(),
+        };
+        let body = |messages: &[ProviderMessage]| -> Value {
+            serde_json::from_str(
+                &adapter
+                    .build_messages_request_with_tools(messages, &tools)
+                    .body,
+            )
+            .expect("body")
+        };
+        // The first request of a run: nothing before the prompt to mark.
+        let first = body(&[ProviderMessage::user("inspect")]);
+        assert_eq!(first["cache_control"]["type"], "ephemeral");
+        assert_eq!(first["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(first["tools"][0].get("cache_control").is_none());
+        assert_eq!(first["messages"][0]["content"], "inspect");
+        // The second: the prompt was where the first request ended.
+        let second = body(&[
+            ProviderMessage::user("inspect"),
+            ProviderMessage::assistant("", vec![call("c1")]),
+            ProviderMessage::tool("read", "c1", "fn main() {}"),
+        ]);
+        assert_eq!(
+            second["messages"][0]["content"],
+            json!([{"type": "text", "text": "inspect", "cache_control": {"type": "ephemeral"}}])
+        );
+        assert!(second["messages"][2]["content"][0]
+            .get("cache_control")
+            .is_none());
+        // The third: the previous turn's tool results were.
+        let third = body(&[
+            ProviderMessage::user("inspect"),
+            ProviderMessage::assistant("", vec![call("c1")]),
+            ProviderMessage::tool("read", "c1", "fn main() {}"),
+            ProviderMessage::assistant("", vec![call("c2")]),
+            ProviderMessage::tool("read", "c2", "fn main() {}"),
+        ]);
+        assert_eq!(third["messages"][0]["content"], "inspect");
+        assert_eq!(
+            third["messages"][2]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert!(third["messages"][4]["content"][0]
+            .get("cache_control")
+            .is_none());
+        // A compaction request carries no breakpoint at all.
+        let client = HttpProviderClient::new(adapter, Duration::from_secs(1)).expect("client");
+        let compaction = client
+            .prepare_compaction_messages(
+                &[
+                    ProviderMessage::user("inspect"),
+                    ProviderMessage::assistant("step", Vec::new()),
+                    ProviderMessage::user("summarize"),
+                ],
+                1_024,
+            )
+            .expect("compaction");
+        let compaction: Value = serde_json::from_slice(&compaction.body).expect("body");
+        assert!(!compaction.to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn claude_generations_resolve_their_documented_limits() {
+        assert_eq!(claude_max_output_tokens("claude-fable-5-1"), Some(128_000));
+        assert_eq!(claude_max_output_tokens("claude-opus-5-5"), Some(128_000));
+        assert_eq!(claude_max_output_tokens("claude-sonnet-4-6"), Some(128_000));
+        assert_eq!(
+            claude_max_output_tokens("anthropic/claude-opus-4-7"),
+            Some(128_000)
+        );
+        assert_eq!(
+            claude_max_output_tokens("claude-haiku-4-5-20251001"),
+            Some(64_000)
+        );
+        assert_eq!(
+            claude_max_output_tokens("claude-sonnet-4-20250514"),
+            Some(64_000)
+        );
+        assert_eq!(
+            claude_max_output_tokens("claude-opus-4-1-20250805"),
+            Some(32_000)
+        );
+        assert_eq!(
+            claude_max_output_tokens("claude-3-7-sonnet-20250219"),
+            Some(64_000)
+        );
+        assert_eq!(claude_max_output_tokens("claude-3-5-haiku-20241022"), None);
+        assert_eq!(
+            claude_max_output_tokens("deepseek/deepseek-v4.1-flash"),
+            None
+        );
+        assert_eq!(claude_max_output_tokens("claude-test"), None);
+        assert_eq!(claude_context_window("claude-sonnet-5-5"), Some(1_000_000));
+        assert_eq!(claude_context_window("claude-opus-4-6"), Some(1_000_000));
+        assert_eq!(
+            claude_context_window("claude-haiku-4-5-20251001"),
+            Some(200_000)
+        );
+        assert_eq!(claude_context_window("gpt-5.6"), None);
     }
 
     #[test]
@@ -6195,6 +6458,20 @@ mod finalization_tests {
                 "authentication status must not be retried"
             );
         }
+        // Open Design reports a dropped upstream connection inside a 200
+        // stream, with no HTTP status of its own.
+        let interrupted = stream_provider_error(
+            &json!({"error":{
+                "code":"upstream_stream_interrupted",
+                "type":"upstream_stream_interrupted",
+                "message":"[code=upstream_stream_interrupted] Error reading stream: read: connection reset by peer"
+            }}),
+            &ProviderConfig::openai("http://localhost", "fixture", "secret"),
+        );
+        assert!(
+            interrupted.is_explicit_transient(),
+            "interrupted upstream stream must be retried: {interrupted:?}"
+        );
         for code in [
             "insufficient_quota",
             "organization_spend_limit_exceeded",
@@ -6524,6 +6801,28 @@ mod finalization_tests {
                 .any(|event| matches!(event, ProviderEvent::ReasoningStarted)),
             "opaque reasoning must still be observable"
         );
+        // Open Design sends the same text in both fields of one delta.
+        let both = adapter
+            .parse_event(&json!({"choices":[{"delta":{
+                "reasoning":"We",
+                "reasoning_details":[{"index":0,"type":"reasoning.text","text":"We"}]
+            }}]}))
+            .expect("events");
+        let shown: Vec<_> = both
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ReasoningDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown, ["We"], "the repeated text is shown once");
+        assert!(
+            both.iter().any(|event| matches!(
+                event,
+                ProviderEvent::ChatReasoning(reasoning) if !reasoning.details.is_empty()
+            )),
+            "details are still kept for replay"
+        );
     }
 
     #[test]
@@ -6585,9 +6884,10 @@ mod finalization_tests {
         assert_eq!(first_party["tools"][0]["name"], "read");
         // The prefix the turns cached stays; the closing write is not billed.
         assert_eq!(
-            first_party["tools"][0]["cache_control"]["type"],
+            first_party["system"][0]["cache_control"]["type"],
             "ephemeral"
         );
+        assert!(first_party["tools"][0].get("cache_control").is_none());
         assert!(first_party.get("cache_control").is_none());
         let gateway = anthropic("https://gateway.example.com/v1/messages");
         assert!(gateway.get("tools").is_none());

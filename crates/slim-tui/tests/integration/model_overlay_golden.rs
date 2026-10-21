@@ -246,6 +246,7 @@ fn select_row(state: &mut AppState, predicate: impl Fn(&ModelRow) -> bool) {
         &state.cline_pass_models,
         &state.command_code_models,
         &state.zen_models,
+        &state.open_design_models,
     );
     let index = rows.iter().position(predicate).expect("row in the picker");
     reduce(state, Action::Key(press(KeyCode::Home)));
@@ -381,6 +382,7 @@ fn catalog_refresh_keeps_model_identity_and_removed_focus_cannot_apply() {
         &state.cline_pass_models,
         &state.command_code_models,
         &state.zen_models,
+        &state.open_design_models,
     );
     assert!(matches!(rows[overlay.selected], ModelRow::Catalog(51)));
     assert!(!overlay.selection_lost);
@@ -436,6 +438,7 @@ fn active_model_identity_includes_the_provider_when_catalog_ids_overlap() {
         &state.cline_pass_models,
         &state.command_code_models,
         &state.zen_models,
+        &state.open_design_models,
     );
     assert!(matches!(rows[overlay.selected], ModelRow::Catalog(0)));
     let frame = render_to_string(&state);

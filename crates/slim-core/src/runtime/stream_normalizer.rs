@@ -449,8 +449,15 @@ impl ProviderStreamNormalizer {
                 });
             }
             previous.content.push_str(&state.content);
-            previous.details.extend(state.details);
+            for detail in state.details {
+                merge_reasoning_detail(&mut previous.details, detail);
+            }
         } else {
+            let mut state = state;
+            let details = std::mem::take(&mut state.details);
+            for detail in details {
+                merge_reasoning_detail(&mut state.details, detail);
+            }
             self.chat_reasoning = Some(state);
         }
         Ok(())
@@ -950,6 +957,46 @@ pub(super) fn push_malformed(
     calls.push(call);
 }
 
+/// Appends a streamed `reasoning_details` item. A gateway sends each text or
+/// summary item as deltas of the same `type` and `index`; they are one item,
+/// joined here, so the replayed history holds the reasoning once instead of
+/// one JSON object per token. Other fields (a closing `signature`) fill what
+/// the item lacks. Encrypted items and any other shape stay as received.
+fn merge_reasoning_detail(details: &mut Vec<Value>, detail: Value) {
+    let Value::Object(incoming) = detail else {
+        details.push(detail);
+        return;
+    };
+    let key = ["text", "summary"]
+        .into_iter()
+        .find(|key| incoming.get(*key).is_some_and(Value::is_string));
+    let last = details
+        .last_mut()
+        .and_then(Value::as_object_mut)
+        .filter(|last| {
+            key.is_some_and(|key| {
+                last.get("type") == incoming.get("type")
+                    && last.get("index") == incoming.get("index")
+                    && last.get(key).is_some_and(Value::is_string)
+            })
+        });
+    let (Some(last), Some(key)) = (last, key) else {
+        details.push(Value::Object(incoming));
+        return;
+    };
+    for (field, value) in incoming {
+        match (last.get_mut(&field), value) {
+            (Some(Value::String(joined)), Value::String(piece)) if field == key => {
+                joined.push_str(&piece);
+            }
+            (None | Some(Value::Null), value) => {
+                last.insert(field, value);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Sets an empty slot, or reports a conflict when both sides differ.
 pub(super) fn merge_field<T: PartialEq>(slot: &mut Option<T>, incoming: Option<T>) -> bool {
     match slot {
@@ -1128,5 +1175,36 @@ fn tool_progress_detail(name: Option<&str>, bytes: u64) -> String {
     match name.map(str::trim).filter(|name| !name.is_empty()) {
         Some(name) => format!("{name} · {size}"),
         None => size,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_reasoning_detail;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn streamed_reasoning_details_join_into_one_item_per_index() {
+        let mut details: Vec<Value> = Vec::new();
+        for detail in [
+            json!({"index":0,"type":"reasoning.text","text":"We"}),
+            json!({"index":0,"type":"reasoning.text","text":" need"}),
+            json!({"index":0,"type":"reasoning.text","text":"","signature":"sig"}),
+            json!({"index":1,"type":"reasoning.summary","summary":"a"}),
+            json!({"index":1,"type":"reasoning.summary","summary":"b"}),
+            json!({"index":2,"type":"reasoning.encrypted","data":"x"}),
+            json!({"index":2,"type":"reasoning.encrypted","data":"y"}),
+        ] {
+            merge_reasoning_detail(&mut details, detail);
+        }
+        assert_eq!(
+            details,
+            [
+                json!({"index":0,"type":"reasoning.text","text":"We need","signature":"sig"}),
+                json!({"index":1,"type":"reasoning.summary","summary":"ab"}),
+                json!({"index":2,"type":"reasoning.encrypted","data":"x"}),
+                json!({"index":2,"type":"reasoning.encrypted","data":"y"}),
+            ]
+        );
     }
 }

@@ -43,12 +43,12 @@ impl Rendered {
     /// being written, past the rail of the turn. `None` while it is off.
     fn caret_column(&self, row: usize) -> Option<usize> {
         let text = self.rows[row].trim_end();
-        if !text.ends_with('▌') {
+        if !text.ends_with('▏') {
             return None;
         }
         // A blank row of the turn carries only its rail, which is the same
         // glyph; the caret closes a line that has text on it.
-        let body = text.trim_start_matches(['▌', ' ']).trim_end_matches('▌');
+        let body = text.trim_start_matches(['▏', ' ']).trim_end_matches('▏');
         (!body.trim().is_empty()).then(|| unicode_width::UnicodeWidthStr::width(text) - 1)
     }
 
@@ -618,6 +618,10 @@ fn a_highlight_sweeps_the_thinking_label_and_leaves_the_clock_alone() {
     // The runtime clock: one motion frame every 83 ms.
     let sweep = |state: &mut AppState, elapsed_ms: u64, capabilities: Capabilities| {
         tick(state, elapsed_ms / 83, elapsed_ms);
+        // Words arrived a second ago: a thought silent for five seconds is
+        // shown waiting (slow marker, no sweep), and words just arrived glow
+        // at the edge; neither is what this measures.
+        state.last_provider_content_ms = Some(elapsed_ms.saturating_sub(1_000));
         let rendered = render_with(state, 80, capabilities);
         let row = rendered.row("Pensando");
         // "  ⠋ Pensando · 3s": the label fills columns 4..12, the clock follows.
@@ -788,7 +792,7 @@ fn prompt_sent() -> AppState {
 
 fn header_rows(rendered: &Rendered) -> Vec<usize> {
     (0..rendered.rows.len())
-        .filter(|row| rendered.rows[*row].trim_end() == "▌ ● Slim")
+        .filter(|row| rendered.rows[*row].trim_end() == "▏ ● Slim")
         .collect()
 }
 
@@ -908,7 +912,7 @@ fn the_pending_name_is_swept_in_green_and_still_when_motion_is_reduced() {
         let (name, marker, text) = cells(&mut state, frame, moving(ColorDepth::TrueColor));
         peaks.push((0..4).max_by_key(|index| luma(name[*index])).unwrap());
         assert_eq!(marker, GREEN, "the marker stays the identity green");
-        assert_eq!(text, "▌ ● Slim", "the sweep only restyles");
+        assert_eq!(text, "▏ ● Slim", "the sweep only restyles");
     }
     assert_eq!(peaks, [0, 1, 2, 3]);
     for frame in [0, 6, 12] {
@@ -962,7 +966,7 @@ fn receipt_row(rendered: &Rendered) -> Option<usize> {
     (0..rendered.rows.len()).rev().find(|row| {
         let text = rendered.rows[*row]
             .trim_start()
-            .trim_start_matches('▌')
+            .trim_start_matches('▏')
             .trim_start();
         ["✓ ", "✕ ", "■ "]
             .iter()
@@ -987,7 +991,7 @@ fn a_turn_that_changed_files_ends_with_a_receipt() {
     let row = receipt_row(&rendered).expect("receipt row");
     assert_eq!(
         rendered.rows[row].trim_end(),
-        "▌ ✓ 2 arquivos · +2 -4 · 1 comando · 6s   Ctrl+D"
+        "▏ ✓ 2 arquivos · +2 -4 · 1 comando · 6s   Ctrl+D"
     );
     // The receipt sits in the text column, set apart from the prose above it.
     assert!(
@@ -1013,7 +1017,7 @@ fn the_marker_follows_how_the_turn_ended() {
         let row = receipt_row(&rendered).expect("receipt row");
         let glyph = rendered.rows[row]
             .trim_start()
-            .trim_start_matches('▌')
+            .trim_start_matches('▏')
             .trim_start()
             .chars()
             .next()
@@ -1084,7 +1088,7 @@ fn a_narrow_receipt_drops_pieces_from_the_right_and_never_overflows() {
             unicode_width::UnicodeWidthStr::width(text) <= usize::from(width),
             "{width}: {text:?}"
         );
-        assert!(text.starts_with("▌ ✓ 1 arquivo"), "{width}: {text:?}");
+        assert!(text.starts_with("▏ ✓ 1 arquivo"), "{width}: {text:?}");
     }
     let wide = render_with(&state, 100, caps(ColorDepth::TrueColor));
     assert!(wide.rows[receipt_row(&wide).unwrap()].contains("Ctrl+D"));

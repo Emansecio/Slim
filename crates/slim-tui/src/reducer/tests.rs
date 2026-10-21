@@ -5,14 +5,35 @@ use crate::api::{
     LoginProvider, ModelAlias, OpenCodeCatalogSource, OpenCodeModelView, ReasoningEffort,
     UiCommand, UiEvent,
 };
-use crate::app::ModelRow;
 use crate::app::{
     ActivityPhase, AppState, CancellationPhase, ConfirmedSetting, FrameClock, LoginStage,
     NotificationPriority, RunOutcomeKind,
 };
+use crate::app::{EffortTarget, ModelOverlay, ModelRow};
 
 fn enter() -> KeyEvent {
     KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+}
+
+#[test]
+fn draft_edits_move_the_composer_revision_not_the_transcript() {
+    let mut state = AppState::new();
+    let content = state.revisions.content;
+    let composer = state.revisions.composer;
+    reduce(
+        &mut state,
+        Action::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+    );
+    reduce(
+        &mut state,
+        Action::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+    );
+    reduce(&mut state, Action::Paste("colado".into()));
+    assert_eq!(
+        state.revisions.content, content,
+        "typing must not invalidate the transcript memos"
+    );
+    assert!(state.revisions.composer > composer);
 }
 
 #[test]
@@ -371,6 +392,7 @@ fn opencode_models_refresh_and_select_dynamic_catalog() {
         &state.cline_pass_models,
         &state.command_code_models,
         &state.zen_models,
+        &state.open_design_models,
     );
     let target = rows
         .iter()
@@ -397,6 +419,7 @@ fn opencode_models_refresh_and_select_dynamic_catalog() {
             &state.cline_pass_models,
             &state.command_code_models,
             &state.zen_models,
+            &state.open_design_models,
         )
         .expect("catalog choice");
     assert_eq!(
@@ -429,6 +452,7 @@ fn select_model_row(state: &mut AppState, predicate: impl Fn(&ModelRow) -> bool)
         &state.cline_pass_models,
         &state.command_code_models,
         &state.zen_models,
+        &state.open_design_models,
     );
     let index = rows.iter().position(predicate).expect("row in the picker");
     reduce(
@@ -504,12 +528,14 @@ fn zen_model_with_levels_adjusts_effort_inline_before_sending() {
         &state.cline_pass_models,
         &state.command_code_models,
         &state.zen_models,
+        &state.open_design_models,
     )[state.model_overlay.as_ref().unwrap().selected]
         .choice(
             &state.open_code_models,
             &state.cline_pass_models,
             &state.command_code_models,
             &state.zen_models,
+            &state.open_design_models,
         )
         .unwrap();
     assert_eq!(
@@ -640,6 +666,83 @@ fn login_command_code_slash_opens_api_key_stage() {
     let overlay = state.login_overlay.expect("overlay");
     assert_eq!(overlay.provider(), LoginProvider::CommandCode);
     assert!(matches!(overlay.stage, LoginStage::ApiKey(_)));
+}
+
+#[test]
+fn login_open_design_slash_opens_api_key_stage() {
+    let mut state = AppState::new();
+    state.composer.insert_text("/login open-design");
+    reduce(&mut state, Action::Key(enter()));
+    let overlay = state.login_overlay.expect("overlay");
+    assert_eq!(overlay.provider(), LoginProvider::OpenDesign);
+    assert!(matches!(overlay.stage, LoginStage::ApiKey(_)));
+}
+
+#[test]
+fn textual_model_command_selects_open_design_model() {
+    let mut state = AppState::new();
+    state.auth_provider = Some(LoginProvider::OpenDesign);
+    state.authenticated = true;
+    state.composer.insert_text("/model deepseek-v4.1-flash");
+    let effects = reduce(&mut state, Action::Key(enter()));
+    assert!(!effects.iter().any(|e| matches!(e, Effect::Send(_))));
+    assert_eq!(
+        state.effort_overlay.as_ref().unwrap().levels(),
+        &[
+            ReasoningEffort::Low,
+            ReasoningEffort::High,
+            ReasoningEffort::Max
+        ]
+    );
+    reduce(
+        &mut state,
+        Action::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+    );
+    let effects = reduce(&mut state, Action::Key(enter()));
+    assert!(
+        effects.contains(&Effect::Send(UiCommand::SetOpenDesignModel {
+            model: "deepseek-v4.1-flash".into(),
+            effort: ReasoningEffort::Max,
+        }))
+    );
+}
+
+#[test]
+fn model_overlay_lists_open_design_as_its_own_group() {
+    let mut state = AppState::new();
+    state.auth_provider = Some(LoginProvider::OpenDesign);
+    state.model = "deepseek-v4.1-flash".into();
+    let overlay = ModelOverlay::for_current(
+        &state.model,
+        state.auth_provider,
+        &state.open_code_models,
+        &state.cline_pass_models,
+        &state.command_code_models,
+        &state.zen_models,
+        &state.open_design_models,
+    );
+    assert!(!overlay.collapsed[5]);
+    let rows = overlay.rows(
+        &state.open_code_models,
+        &state.cline_pass_models,
+        &state.command_code_models,
+        &state.zen_models,
+        &state.open_design_models,
+    );
+    assert!(rows.contains(&ModelRow::Header(5)));
+    let choice = rows[overlay.selected]
+        .choice(
+            &state.open_code_models,
+            &state.cline_pass_models,
+            &state.command_code_models,
+            &state.zen_models,
+            &state.open_design_models,
+        )
+        .expect("focused model");
+    assert_eq!(
+        choice.target,
+        EffortTarget::OpenDesign("deepseek-v4.1-flash".into())
+    );
 }
 
 #[test]

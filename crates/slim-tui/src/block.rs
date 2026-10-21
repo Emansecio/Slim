@@ -69,6 +69,36 @@ impl ToolState {
         self.edit_diff.is_some() || !self.materialized_output.is_empty()
     }
 
+    /// The row an open call keeps under its details while its output is not
+    /// all here: a page in flight, or another page it has not asked for yet.
+    pub fn page_note(&self) -> Option<ToolPageNote> {
+        if self.pending_page.is_some() {
+            Some(ToolPageNote::Loading)
+        } else if self.next_cursor.is_some() {
+            Some(ToolPageNote::MorePages)
+        } else {
+            None
+        }
+    }
+
+    /// What Enter does to this call right now, if anything.
+    pub fn enter_hint(&self, fold: FoldState) -> Option<&'static str> {
+        match fold {
+            FoldState::Expanded => match self.page_note() {
+                Some(ToolPageNote::Loading) => None,
+                Some(ToolPageNote::MorePages) => Some("Enter mais"),
+                None if self.has_expanded_body() => Some("Enter recolher"),
+                None => None,
+            },
+            FoldState::Collapsed | FoldState::Auto
+                if self.has_expanded_body() || self.content_handle.is_some() =>
+            {
+                Some("Enter detalhes")
+            }
+            FoldState::Collapsed | FoldState::Auto => None,
+        }
+    }
+
     /// Everything the expanded body shows: the diff, then the materialized
     /// output. Layout and rendering measure this same text.
     pub fn expanded_body(&self) -> String {
@@ -81,6 +111,13 @@ impl ToolState {
         }
         body
     }
+}
+
+/// The footer of an open call whose output is still arriving.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolPageNote {
+    Loading,
+    MorePages,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1027,6 +1064,14 @@ impl Block {
         state.pending_page = None;
         self.touch_content();
         true
+    }
+
+    /// A call whose details changed shape without new output: a page was
+    /// asked for, so its footer and hint read differently.
+    pub(crate) fn touch_tool_content(&mut self) {
+        if matches!(self.kind, BlockKind::Tool(_)) {
+            self.touch_content();
+        }
     }
 
     fn touch_content(&mut self) {

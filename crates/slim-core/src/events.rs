@@ -106,11 +106,38 @@ impl EventKind {
             _ => None,
         }
     }
+
+    /// A history that did not fit the window even after compaction was cut
+    /// down (`detail` says what), and the run went on with it.
+    pub fn context_trimmed(detail: &str) -> Self {
+        Self::ProviderPhase {
+            phase: ProviderPhase::Compacting,
+            elapsed_ms: 0,
+            detail: Some(format!("{CONTEXT_TRIMMED_PREFIX}{detail}")),
+        }
+    }
+
+    /// The message of a history cut down to fit the window, when this event
+    /// is one.
+    pub fn context_trim_notice(&self) -> Option<&str> {
+        match self {
+            Self::ProviderPhase {
+                phase: ProviderPhase::Compacting,
+                detail: Some(detail),
+                ..
+            } if detail.starts_with(CONTEXT_TRIMMED_PREFIX) => Some(detail),
+            _ => None,
+        }
+    }
 }
 
 /// Start of the `ProviderPhase::Compacting` detail that reports a failed
 /// automatic compaction.
 const AUTO_COMPACTION_FAILED_PREFIX: &str = "Auto-compaction failed: ";
+
+/// Start of the `ProviderPhase::Compacting` detail that reports a history cut
+/// down because it did not fit the window.
+const CONTEXT_TRIMMED_PREFIX: &str = "Context trimmed to fit the window: ";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type")]

@@ -8,11 +8,13 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use slim_core::context::{CompactionHandle, CompactionPolicy};
 use slim_core::provider::{
-    clinepass_model, codex_model, command_code_model, history_response_cache_scope,
-    open_code_model, xai_model, zen_model, AnthropicAdapter, ClinePassAdapter, CommandCodeAdapter,
+    claude_context_window, claude_max_output_tokens, clinepass_model, codex_model,
+    command_code_model, history_response_cache_scope, open_code_model, open_design_model,
+    xai_model, zen_model, AnthropicAdapter, ClinePassAdapter, CommandCodeAdapter,
     HttpProviderClient, OpenAiCodexAdapter, OpenAiCompatibleAdapter, OpenCodeGoAdapter,
-    OpenCodeZenAdapter, ProviderAdapter, ProviderConfig, ProviderContentBlock, ProviderError,
-    ProviderKind, ProviderPricing, ProviderTimeouts, XaiAdapter, DEFAULT_MAX_OUTPUT_TOKENS,
+    OpenCodeZenAdapter, OpenDesignAdapter, ProviderAdapter, ProviderConfig, ProviderContentBlock,
+    ProviderError, ProviderKind, ProviderPricing, ProviderTimeouts, XaiAdapter,
+    DEFAULT_MAX_OUTPUT_TOKENS,
 };
 use slim_core::runtime::{
     tool_call_is_read_only, AgentLoopConfig, AgentLoopResult, AgentLoopStop, CancellationToken,
@@ -31,6 +33,7 @@ use slim_core::{
 use crate::codex_catalog::{should_fetch_live_codex_catalog, CodexCatalog};
 use crate::command_code_catalog::CommandCodeCatalog;
 use crate::exit_codes::ExitCode;
+use crate::open_design_catalog::OpenDesignCatalog;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum OutputFormat {
@@ -1558,6 +1561,7 @@ fn provider_kind_name(provider: ProviderKind) -> &'static str {
         ProviderKind::ClinePass => "clinepass",
         ProviderKind::CommandCode => "command-code",
         ProviderKind::Xai => "xai",
+        ProviderKind::OpenDesign => "open-design",
     }
 }
 
@@ -1891,6 +1895,24 @@ pub(crate) async fn execute_provider_turn_async(
             });
         }
     }
+    // Open Design serves models its static table does not know; a model
+    // missing from the cached catalog waits for one live refresh so its
+    // budgets are known, otherwise the refresh only warms the next run. The
+    // key only goes to the catalog when requests go to the same gateway.
+    if request.kind == ProviderKind::OpenDesign
+        && request.endpoint == slim_core::provider::OPEN_DESIGN_BASE_URL
+    {
+        if let Ok(catalog) = OpenDesignCatalog::production() {
+            if catalog.load_or_fallback().find(&request.model).is_some() {
+                let api_key = request.api_key.clone();
+                tokio::spawn(async move {
+                    let _ = catalog.refresh(&api_key).await;
+                });
+            } else {
+                let _ = catalog.refresh(&request.api_key).await;
+            }
+        }
+    }
     let context_window_tokens = if catalog_override_absent {
         if let Some(model) = open_code_spec {
             require_model_context_window(model.context_window)?
@@ -2006,18 +2028,25 @@ pub(crate) async fn execute_provider_turn_async(
         runtime.set_mcp_manager(Some(mcp.manager().clone()));
     }
     let provider_timeouts = ProviderTimeouts::production(request.timeout);
+    let compaction_reserve_tokens = options
+        .compaction
+        .as_ref()
+        .map_or(CompactionPolicy::default().reserve_tokens, |handle| {
+            handle.policy().reserve_tokens
+        });
+    let output_limit_is_explicit = max_output_tokens_is_explicit(options.max_output_tokens);
     let mut loop_config = AgentLoopConfig {
         context_window_tokens,
         context_reserve_tokens: context_reserve_tokens(
             request.kind,
             max_output_tokens,
-            max_output_tokens_is_explicit(options.max_output_tokens),
-            options
-                .compaction
-                .as_ref()
-                .map_or(CompactionPolicy::default().reserve_tokens, |handle| {
-                    handle.policy().reserve_tokens
-                }),
+            output_limit_is_explicit,
+            compaction_reserve_tokens,
+        ),
+        context_reserve_floor_tokens: context_reserve_floor_tokens(
+            request.kind,
+            output_limit_is_explicit,
+            compaction_reserve_tokens,
         ),
         ..AgentLoopConfig::default()
     };
@@ -2244,6 +2273,27 @@ pub(crate) async fn execute_provider_turn_async(
             )
             .await?
         }
+        ProviderKind::OpenDesign => {
+            let adapter = OpenDesignAdapter::new(
+                &request.endpoint,
+                &request.model,
+                &api_key,
+                reasoning_effort.as_deref(),
+            )?
+            .with_max_output_tokens(max_output_tokens);
+            run_bound_agent_loop(
+                &mut runtime,
+                adapter,
+                OpenDesignAdapter::with_response_cache_scope_id,
+                &initial_messages,
+                request.mode,
+                &cwd,
+                loop_config,
+                provider_timeouts,
+                compact_only,
+            )
+            .await?
+        }
     }
     .map_err(|error| redact_provider_error(error, &api_key));
 
@@ -2335,11 +2385,17 @@ pub(crate) async fn execute_provider_turn_async(
     let tool_summary_lines = summarize_tool_events(&events);
     let tool_process_facts = collect_tool_process_facts(&events);
     let tool_job_outputs = collect_tool_job_outputs(&events);
-    // A failed automatic compaction does not fail the run, and its activity
-    // label is replaced by the request that follows: the interface keeps it.
+    // A failed automatic compaction or a history trimmed to fit does not fail
+    // the run, and its activity label is replaced by the request that
+    // follows: the interface keeps it.
     let warnings = events
         .iter()
-        .filter_map(|event| event.kind.auto_compaction_failure())
+        .filter_map(|event| {
+            event
+                .kind
+                .auto_compaction_failure()
+                .or_else(|| event.kind.context_trim_notice())
+        })
         .map(str::to_owned)
         .collect();
     Ok(ProviderExecution {
@@ -3171,6 +3227,26 @@ fn command_code_context_window(model: &str) -> Option<u64> {
     cached.or_else(|| command_code_model(model).map(|model| model.context_window))
 }
 
+/// Looks an Open Design model up in the catalog's disk cache, falling back to
+/// the static table. Never performs network I/O.
+fn open_design_entry(model: &str) -> Option<slim_core::provider::OpenDesignCatalogEntry> {
+    OpenDesignCatalog::production()
+        .ok()
+        .and_then(|catalog| catalog.load_or_fallback().find(model).cloned())
+}
+
+fn open_design_context_window(model: &str) -> Option<u64> {
+    open_design_entry(model)
+        .map(|entry| entry.context_window)
+        .or_else(|| open_design_model(model).map(|model| model.context_window))
+}
+
+fn open_design_max_output_tokens(model: &str) -> Option<u32> {
+    open_design_entry(model)
+        .map(|entry| entry.max_output_tokens)
+        .or_else(|| open_design_model(model).map(|model| model.max_output_tokens))
+}
+
 fn known_model_context_window(
     kind: ProviderKind,
     model: &str,
@@ -3184,7 +3260,10 @@ fn known_model_context_window(
         ProviderKind::ClinePass => clinepass_model(model).map(|model| model.context_window),
         ProviderKind::CommandCode => command_code_context_window(model),
         ProviderKind::Xai => xai_model(model).map(|model| model.context_window),
-        ProviderKind::Anthropic => command_code_model(model).map(|model| model.context_window),
+        ProviderKind::OpenDesign => open_design_context_window(model),
+        ProviderKind::Anthropic => command_code_model(model)
+            .map(|model| model.context_window)
+            .or_else(|| claude_context_window(model)),
         ProviderKind::OpenAiCompatible | ProviderKind::OpenCodeGo | ProviderKind::OpenCodeZen => {
             None
         }
@@ -3259,6 +3338,23 @@ fn context_reserve_tokens(
     }
 }
 
+/// The floor a catalog default reserve may shrink to as the window fills
+/// (`AgentLoopConfig::context_reserve_floor_tokens`): a 128k limit on the
+/// wire would otherwise compact a 200k window at about a third of it. An
+/// explicit limit keeps its meaning, and Codex reserves no more than the
+/// floor already.
+fn context_reserve_floor_tokens(
+    kind: ProviderKind,
+    explicit: bool,
+    compaction_reserve_tokens: u64,
+) -> u64 {
+    if explicit || kind == ProviderKind::OpenAiCodex {
+        0
+    } else {
+        compaction_reserve_tokens
+    }
+}
+
 fn catalog_default_max_output_tokens(kind: ProviderKind, model: &str) -> u32 {
     let Some(catalog) = known_model_max_output_tokens(kind, model) else {
         return DEFAULT_MAX_OUTPUT_TOKENS;
@@ -3290,9 +3386,11 @@ fn known_model_max_output_tokens(kind: ProviderKind, model: &str) -> Option<u32>
         }
         ProviderKind::OpenCodeZen => zen_model(model).and_then(|model| model.max_output_tokens),
         ProviderKind::Xai => xai_model(model).map(|model| model.max_output_tokens),
-        ProviderKind::Anthropic | ProviderKind::CommandCode | ProviderKind::OpenAiCompatible => {
-            None
-        }
+        ProviderKind::OpenDesign => open_design_max_output_tokens(model),
+        // Claude's documented limits; a Command Code model that is not Claude
+        // keeps the default.
+        ProviderKind::Anthropic | ProviderKind::CommandCode => claude_max_output_tokens(model),
+        ProviderKind::OpenAiCompatible => None,
     }
 }
 
@@ -3340,22 +3438,7 @@ fn parse_positive_env_usize(name: &str) -> Result<Option<usize>, String> {
     parse_positive_env_u64(name).map(|value| value.map(|value| value as usize))
 }
 
-const MAX_MUTATING_TOOL_CALLS_HARD_CAP: usize = 256;
-const MAX_READ_TOOL_CALLS_HARD_CAP: usize = 512;
-const MAX_TOTAL_TOOL_CALLS_HARD_CAP: usize = 2048;
 const MAX_TURNS_HARD_CAP: usize = 1024;
-
-fn clamp_mutating_tool_calls(value: usize) -> usize {
-    value.min(MAX_MUTATING_TOOL_CALLS_HARD_CAP)
-}
-
-fn clamp_read_tool_calls(value: usize) -> usize {
-    value.min(MAX_READ_TOOL_CALLS_HARD_CAP)
-}
-
-fn clamp_total_tool_calls(value: usize) -> usize {
-    value.min(MAX_TOTAL_TOOL_CALLS_HARD_CAP)
-}
 
 fn clamp_max_turns(value: usize) -> usize {
     value.min(MAX_TURNS_HARD_CAP)
@@ -3365,45 +3448,33 @@ pub(crate) fn resolve_max_mutating_tool_calls(
     options: &ProviderRunOptions,
 ) -> Result<usize, ProviderError> {
     if let Some(value) = options.max_tool_calls {
-        return Ok(clamp_mutating_tool_calls(value));
+        return Ok(value);
     }
     parse_positive_env_usize("SLIM_MAX_MUTATING_TOOL_CALLS")
         .map_err(|message| ProviderError::InvalidResponse { message })
-        .map(|value| {
-            value
-                .map(clamp_mutating_tool_calls)
-                .unwrap_or(AgentLoopConfig::DEFAULT_MAX_MUTATING_TOOL_CALLS)
-        })
+        .map(|value| value.unwrap_or(AgentLoopConfig::DEFAULT_MAX_MUTATING_TOOL_CALLS))
 }
 
 pub(crate) fn resolve_max_read_tool_calls(
     options: &ProviderRunOptions,
 ) -> Result<usize, ProviderError> {
     if let Some(value) = options.max_read_tool_calls {
-        return Ok(clamp_read_tool_calls(value));
+        return Ok(value);
     }
     parse_positive_env_usize("SLIM_MAX_READ_TOOL_CALLS")
         .map_err(|message| ProviderError::InvalidResponse { message })
-        .map(|value| {
-            value
-                .map(clamp_read_tool_calls)
-                .unwrap_or(AgentLoopConfig::DEFAULT_MAX_READ_TOOL_CALLS)
-        })
+        .map(|value| value.unwrap_or(AgentLoopConfig::DEFAULT_MAX_READ_TOOL_CALLS))
 }
 
 pub(crate) fn resolve_max_total_tool_calls(
     options: &ProviderRunOptions,
 ) -> Result<usize, ProviderError> {
     if let Some(value) = options.max_total_tool_calls {
-        return Ok(clamp_total_tool_calls(value));
+        return Ok(value);
     }
     parse_positive_env_usize("SLIM_MAX_TOTAL_TOOL_CALLS")
         .map_err(|message| ProviderError::InvalidResponse { message })
-        .map(|value| {
-            value
-                .map(clamp_total_tool_calls)
-                .unwrap_or(AgentLoopConfig::DEFAULT_MAX_TOTAL_TOOL_CALLS)
-        })
+        .map(|value| value.unwrap_or(AgentLoopConfig::DEFAULT_MAX_TOTAL_TOOL_CALLS))
 }
 
 pub(crate) fn resolve_max_turns(options: &ProviderRunOptions) -> Result<usize, ProviderError> {

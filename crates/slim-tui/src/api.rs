@@ -12,6 +12,7 @@ pub enum LoginProvider {
     ClinePass,
     CommandCode,
     Xai,
+    OpenDesign,
 }
 
 impl LoginProvider {
@@ -24,6 +25,7 @@ impl LoginProvider {
             Self::ClinePass => "ClinePass — API key",
             Self::CommandCode => "Command Code — API key",
             Self::Xai => "xAI — Grok/X subscription",
+            Self::OpenDesign => "Open Design — API key",
         }
     }
 }
@@ -343,6 +345,13 @@ pub enum ClinePassCatalogSource {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandCodeCatalogSource {
+    Live,
+    Cache,
+    Fallback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenDesignCatalogSource {
     Live,
     Cache,
     Fallback,
@@ -699,6 +708,10 @@ pub enum UiEvent {
         models: Vec<OpenCodeModelView>,
         source: CommandCodeCatalogSource,
     },
+    OpenDesignCatalogLoaded {
+        models: Vec<OpenCodeModelView>,
+        source: OpenDesignCatalogSource,
+    },
     ZenCatalogLoaded {
         models: Vec<OpenCodeModelView>,
         source: ZenCatalogSource,
@@ -770,8 +783,8 @@ pub enum UiEvent {
 }
 
 impl UiEvent {
-    pub const DEFAULT_MAX_MUTATING_TOOL_CALLS: usize = 32;
-    pub const DEFAULT_MAX_READ_TOOL_CALLS: usize = 96;
+    pub const DEFAULT_MAX_MUTATING_TOOL_CALLS: usize = usize::MAX;
+    pub const DEFAULT_MAX_READ_TOOL_CALLS: usize = usize::MAX;
     pub const DEFAULT_MAX_TURNS: usize = 128;
 
     pub fn run_started(run_id: u64) -> Self {
@@ -1355,6 +1368,7 @@ pub enum UiCommand {
     RefreshZenModels,
     RefreshClinePassModels,
     RefreshCommandCodeModels,
+    RefreshOpenDesignModels,
     SetOpenCodeModel {
         model: String,
         effort: ReasoningEffort,
@@ -1372,6 +1386,10 @@ pub enum UiCommand {
         effort: ReasoningEffort,
     },
     SetXaiModel {
+        model: String,
+        effort: ReasoningEffort,
+    },
+    SetOpenDesignModel {
         model: String,
         effort: ReasoningEffort,
     },

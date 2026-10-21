@@ -90,7 +90,7 @@ pub(crate) use events::{persist_provider_call, persist_provider_validation_failu
 use history_elision::ElisionStats;
 use history_elision::{
     duplicate_pointer, elide_superseded_tool_outputs, elide_superseded_tool_outputs_if_it_pays,
-    tool_output_already_in_context, truncate_result,
+    shrink_history_to_fit, tool_output_already_in_context, truncate_result,
 };
 use native_artifact::artifact_read_definition;
 use native_code_intel::{prepared_code_intel_request, run_code_intel_request, EditedFiles};

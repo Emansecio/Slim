@@ -46,7 +46,7 @@ impl Rendered {
 
 /// The rail every row of a turn carries in its first cell, and the column
 /// where the prompt, the prose and the tool markers start.
-const RAIL: char = '▌';
+const RAIL: char = '▏';
 const TEXT_COLUMN: usize = 4;
 
 /// A transcript row without its turn rail.
@@ -549,7 +549,7 @@ fn user_header_and_body_are_followed_by_one_blank_row() {
         .expect("answer");
     assert_eq!(question, you + 1, "user header precedes the body");
     assert!(
-        rendered.rows[you].starts_with("▌ ● Você"),
+        rendered.rows[you].starts_with("▏ ● Você"),
         "{}",
         rendered.text()
     );
@@ -559,7 +559,7 @@ fn user_header_and_body_are_followed_by_one_blank_row() {
     );
     assert!(body(&rendered.rows[question + 1]).trim().is_empty());
     // One breathing row, the same whether the agent opens with prose or work.
-    assert_eq!(rendered.rows[question + 2].trim_end(), "▌ ● Slim");
+    assert_eq!(rendered.rows[question + 2].trim_end(), "▏ ● Slim");
     assert!(is_rule(&rendered.rows[question + 3]), "{}", rendered.text());
     assert_eq!(answer, question + 4);
     assert_eq!(
@@ -853,7 +853,7 @@ fn user_wrapping_keeps_body_alignment_and_measured_height() {
         assert!(body.len() > 1);
         for row in &body {
             assert_eq!(
-                column_of(row, row.trim_start_matches(['▌', ' '])),
+                column_of(row, row.trim_start_matches(['▏', ' '])),
                 Some(TEXT_COLUMN),
                 "{row:?}"
             );

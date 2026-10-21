@@ -147,6 +147,18 @@ impl ManualRunJournal {
         Ok(())
     }
 
+    /// Whether [`Self::record_event`] may write `event` to disk (an entry,
+    /// a fact or an artifact); the other events only update memory.
+    pub fn event_reaches_disk(event: &EventKind) -> bool {
+        matches!(
+            event,
+            EventKind::ShellJobChanged { .. }
+                | EventKind::ToolOutput { .. }
+                | EventKind::ToolFinished { .. }
+                | EventKind::ToolProcessFinished { .. }
+        )
+    }
+
     pub fn record_event(&mut self, event: &EventKind) -> io::Result<()> {
         self.check()?;
         match event {

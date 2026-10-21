@@ -73,13 +73,27 @@ pub(super) struct ChannelFrame {
     /// The MCP awareness block as it was when the frame was made; its status
     /// labels change while servers connect.
     mcp_servers: Option<String>,
+    /// The anchors of the session's earlier runs, with the exact text each
+    /// carried then. They keep it so the provider still finds the prefix it
+    /// cached for those runs.
+    prior: Vec<(usize, String)>,
 }
 
 impl ChannelFrame {
     pub(super) fn new(messages: &[ProviderMessage], mcp_servers: Option<String>) -> Self {
+        Self::with_prior(messages, mcp_servers, Vec::new())
+    }
+
+    /// [`Self::new`] keeping `prior` anchors (message index, text) as they were.
+    pub(super) fn with_prior(
+        messages: &[ProviderMessage],
+        mcp_servers: Option<String>,
+        prior: Vec<(usize, String)>,
+    ) -> Self {
         Self {
             anchor: messages.iter().rposition(|message| message.role == "user"),
             mcp_servers,
+            prior,
         }
     }
 
@@ -89,13 +103,34 @@ impl ChannelFrame {
     pub(super) fn rebuilt_for(messages: &[ProviderMessage], mcp_servers: Option<String>) -> Self {
         Self::new(messages, mcp_servers)
     }
+
+    /// The user message this frame's own stanza goes on, over `messages`.
+    pub(super) fn current_anchor(&self, messages: &[ProviderMessage]) -> Option<usize> {
+        self.anchor
+            .filter(|index| messages.get(*index).is_some_and(|m| m.role == "user"))
+            .or_else(|| messages.iter().rposition(|message| message.role == "user"))
+    }
+
+    /// The exact text the overlay appends to this frame's anchor.
+    pub(super) fn applied_text(&self, mode: crate::OperatingMode, can_ask: bool) -> String {
+        let mut text = channel_stanza(mode, can_ask).to_owned();
+        if let Some(block) = self
+            .mcp_servers
+            .as_deref()
+            .filter(|_| mode.allows_mutation())
+        {
+            text.push_str("\n\n");
+            text.push_str(block);
+        }
+        text
+    }
 }
 
 /// Facts that match advertised tools: `ask_question` only when Auto has a route.
 pub(super) struct ChannelOverlay<'a> {
     messages: &'a mut [ProviderMessage],
-    /// The user message carrying the stanza and its length without it.
-    applied: Option<(usize, usize)>,
+    /// The user messages carrying a stanza and their lengths without it.
+    applied: Vec<(usize, usize)>,
     original_arguments: Vec<(usize, usize, String)>,
 }
 
@@ -120,25 +155,30 @@ impl<'a> ChannelOverlay<'a> {
         cache: Option<&mut WriteProjectionCache>,
         frame: &ChannelFrame,
     ) -> Self {
-        let mcp_servers = frame.mcp_servers.as_deref();
         let original_arguments = project_completed_writes(messages, cache);
-        let applied = frame
-            .anchor
-            .filter(|index| messages.get(*index).is_some_and(|m| m.role == "user"))
-            .or_else(|| messages.iter().rposition(|message| message.role == "user"))
-            .map(|index| {
-                let content = &mut messages[index].content;
-                if let Some(at) = content.find(CHANNEL_MARKER) {
-                    content.truncate(at);
-                }
-                let original_len = content.len();
-                content.push_str(channel_stanza(mode, can_ask));
-                if let Some(block) = mcp_servers.filter(|_| mode.allows_mutation()) {
-                    content.push_str("\n\n");
-                    content.push_str(block);
-                }
-                (index, original_len)
-            });
+        let current = frame.current_anchor(messages);
+        let targets = frame
+            .prior
+            .iter()
+            .filter(|(index, _)| {
+                Some(*index) != current && messages.get(*index).is_some_and(|m| m.role == "user")
+            })
+            .map(|(index, text)| (*index, text.as_str()))
+            .collect::<Vec<_>>();
+        let current_text = frame.applied_text(mode, can_ask);
+        let mut applied = Vec::with_capacity(targets.len() + 1);
+        for (index, text) in targets
+            .into_iter()
+            .chain(current.map(|index| (index, current_text.as_str())))
+        {
+            let content = &mut messages[index].content;
+            if let Some(at) = content.find(CHANNEL_MARKER) {
+                content.truncate(at);
+            }
+            let original_len = content.len();
+            content.push_str(text);
+            applied.push((index, original_len));
+        }
         Self {
             messages,
             applied,
@@ -156,7 +196,7 @@ impl Drop for ChannelOverlay<'_> {
         for (message, call, original) in self.original_arguments.drain(..) {
             self.messages[message].tool_calls[call].arguments = original;
         }
-        if let Some((index, original_len)) = self.applied {
+        for (index, original_len) in self.applied.drain(..) {
             self.messages[index].content.truncate(original_len);
         }
     }
@@ -632,6 +672,66 @@ mod tests {
         );
         assert_ne!(rebuilt.mcp_servers, frame.mcp_servers);
         assert_eq!(rebuilt.anchor, Some(3));
+    }
+
+    #[test]
+    fn later_runs_keep_the_earlier_anchors_as_they_were_serialized() {
+        use crate::provider::{
+            OpenAiCompatibleAdapter, ProviderAdapter, ProviderConfig, ProviderMessage,
+        };
+        let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+            "http://127.0.0.1:1",
+            "fixture",
+            "unused",
+        ))
+        .unwrap();
+        let serialized = |messages: &mut [ProviderMessage], frame: &super::ChannelFrame| {
+            let overlay = super::ChannelOverlay::apply_with_mcp(
+                messages,
+                OperatingMode::Auto,
+                true,
+                None,
+                frame,
+            );
+            let request = adapter
+                .build_messages_request_with_tools_checked(overlay.view(), &[])
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+            body["messages"].as_array().unwrap().clone()
+        };
+        let mut messages = vec![ProviderMessage::user("first prompt")];
+        let first_run = super::ChannelFrame::new(&messages, Some("MCP servers (1)\n- fs".into()));
+        let first = serialized(&mut messages, &first_run);
+        messages.push(ProviderMessage::assistant("done", Vec::new()));
+        // The second run: its own anchor is the new prompt, and the first
+        // prompt still carries exactly what the first run sent (the MCP
+        // labels of that time included), so the cached prefix is read back.
+        messages.push(ProviderMessage::user("second prompt"));
+        let prior = vec![(0, first_run.applied_text(OperatingMode::Auto, true))];
+        let second_run = super::ChannelFrame::with_prior(
+            &messages,
+            Some("MCP servers (1)\n- fs (ready)".into()),
+            prior,
+        );
+        assert_eq!(second_run.current_anchor(&messages), Some(2));
+        let second = serialized(&mut messages, &second_run);
+        // Index 0 is the system prompt of the chat wire.
+        assert_eq!(second[..first.len()], first[..]);
+        assert!(second[3].to_string().contains("fs (ready)"));
+        assert_eq!(
+            second
+                .iter()
+                .filter(|message| message.to_string().contains("Harness channel"))
+                .count(),
+            2
+        );
+        // Without the prior anchor the first prompt loses its stanza.
+        let forgetful = super::ChannelFrame::new(&messages, None);
+        let moved = serialized(&mut messages, &forgetful);
+        assert_ne!(moved[1], first[1]);
+        // The canonical history never holds a stanza.
+        assert_eq!(messages[0].content, "first prompt");
+        assert_eq!(messages[2].content, "second prompt");
     }
 
     #[test]

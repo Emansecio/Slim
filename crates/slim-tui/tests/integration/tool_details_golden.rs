@@ -680,7 +680,7 @@ fn projected_patch_and_shell_rows_read_as_verb_target_and_outcome() {
         .find(|line| line.contains("✕ $"))
         .unwrap_or_else(|| panic!("failure row\n{collapsed}"));
     assert!(
-        failure.starts_with("▌   ✕ $ cargo test · exit 101"),
+        failure.starts_with("▏   ✕ $ cargo test · exit 101"),
         "the failure sits one step in from the header\n{collapsed}"
     );
 
@@ -793,7 +793,8 @@ fn expanded_patch_shows_its_applied_diff_before_the_receipt() {
         .collect::<Vec<_>>();
     let row_of = |needle: &str| {
         rows.iter()
-            .position(|row| row.trim_end() == format!("▌   {needle}"))
+            // The details sit behind the same rail as a code block.
+            .position(|row| row.trim_end() == format!("▏ │ {needle}"))
             .unwrap_or_else(|| panic!("missing {needle:?}\n{}", rows.join("\n")))
     };
     let header = row_of("@@ src/lib.rs:2");
@@ -810,7 +811,122 @@ fn expanded_patch_shows_its_applied_diff_before_the_receipt() {
     let background = |row: usize, x| buffer[(x, row as u16)].bg;
     assert_ne!(background(removed, 4), background(added, 4));
     assert_ne!(background(header, 4), background(added, 4));
-    // The tint fills the code viewport, leaving its indentation neutral.
+    // The tint fills the code viewport; the rail keeps the block's surface,
+    // not the row's own tint.
     assert_eq!(background(added, 4), background(added, 90));
     assert_ne!(background(added, 3), background(added, 4));
+    assert_eq!(background(added, 3), background(header, 4));
+}
+
+#[test]
+fn an_open_call_frames_its_details_and_says_what_enter_does() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::ToolStarted {
+        batch_id: batch("batch-1"),
+        call_id: call("call-a"),
+        name: "read".into(),
+        arguments_summary: "path=notes.txt".into(),
+    });
+    state.apply_event(UiEvent::ToolProgress {
+        batch_id: batch("batch-1"),
+        call_id: call("call-a"),
+        name: "read".into(),
+        preview: "first line".into(),
+        content_handle: Some(handle("content-a")),
+    });
+    state.apply_event(UiEvent::ToolEnded {
+        batch_id: batch("batch-1"),
+        call_id: call("call-a"),
+        name: "read".into(),
+        success: true,
+        duration_ms: 7,
+    });
+    let block_id = state.blocks()[0].id.clone();
+    state.scroll.mode = FollowMode::Pinned(ScrollAnchor {
+        block_id,
+        row_offset: 0,
+    });
+    let collapsed = render_at(&state);
+    assert!(
+        collapsed.contains("Enter detalhes"),
+        "the selected row says Enter opens it\n{collapsed}"
+    );
+
+    reduce(&mut state, Action::Key(enter()));
+    assert_eq!(state.blocks()[0].fold, FoldState::Expanded);
+    let loading = render_at(&state);
+    assert!(
+        loading.contains("│ carregando…"),
+        "a page in flight shows under the row\n{loading}"
+    );
+    assert!(!loading.contains("Enter "), "{loading}");
+
+    state.apply_event(UiEvent::ContentPageLoaded {
+        handle: handle("content-a"),
+        request_id: ContentRequestId(1),
+        cursor: None,
+        text: "first line\nsecond line".into(),
+        next_cursor: Some(PageCursor(22)),
+    });
+    let paged = render_at(&state);
+    let rows: Vec<&str> = paged.lines().collect();
+    let first = rows
+        .iter()
+        .position(|row| row.contains("│ first line"))
+        .unwrap_or_else(|| panic!("details behind a rail\n{paged}"));
+    assert!(rows[first + 1].contains("│ second line"), "{paged}");
+    assert!(
+        rows[first + 2].contains("│ ⋯ Enter para mais"),
+        "another page waits under the body\n{paged}"
+    );
+    assert!(
+        rows[first - 1].trim_end().ends_with("Enter mais"),
+        "{paged}"
+    );
+
+    reduce(&mut state, Action::Key(enter()));
+    assert!(render_at(&state).contains("│ carregando…"));
+    state.apply_event(UiEvent::ContentPageLoaded {
+        handle: handle("content-a"),
+        request_id: ContentRequestId(2),
+        cursor: Some(PageCursor(22)),
+        text: "\nlast line".into(),
+        next_cursor: None,
+    });
+    let complete = render_at(&state);
+    assert!(complete.contains("│ last line"), "{complete}");
+    assert!(!complete.contains("Enter para mais"), "{complete}");
+    assert!(!complete.contains("carregando"), "{complete}");
+    assert!(
+        complete.contains("Enter recolher"),
+        "a fully loaded row says Enter closes it\n{complete}"
+    );
+}
+
+#[test]
+fn a_system_note_wraps_under_its_prefix_instead_of_being_cut() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::CompactionState {
+        state: slim_core::context::CompactionStatus::Applied,
+        reason: slim_core::context::CompactionReason::Manual,
+        tokens_before: 123_400,
+        tokens_after: 8_200,
+        duration_ms: 1_500,
+    });
+    state.apply_event(UiEvent::CompactionCompleted);
+    let narrow = render_at_width(&state, 40);
+    let rows: Vec<&str> = narrow.lines().collect();
+    let head = rows
+        .iter()
+        .position(|row| row.starts_with("  sistema · compactação concluída"))
+        .unwrap_or_else(|| panic!("note head\n{narrow}"));
+    assert!(
+        rows[head + 1].starts_with("            ") && rows[head + 1].contains("tokens"),
+        "the rest of the note continues under the prefix\n{narrow}"
+    );
+    let wide = render_at_width(&state, 80);
+    assert!(
+        wide.contains("  sistema · compactação concluída · 123k → 8.2k tokens"),
+        "{wide}"
+    );
 }

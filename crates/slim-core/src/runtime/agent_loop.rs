@@ -106,6 +106,24 @@ impl<'m> LoopState<'m> {
             .time_budget
             .is_some_and(|budget| self.started.elapsed() >= budget)
     }
+
+    /// The output reserve of a request whose input is estimated at
+    /// `input_tokens`: the configured reserve, or with a floor configured
+    /// the room left in the window down to that floor. The request's output
+    /// limit follows it. A truncation recovery's raised limit keeps its
+    /// reserve: the model needs the room.
+    fn output_reserve(&self, input_tokens: u64) -> u64 {
+        let configured = self.config.context_reserve_tokens;
+        let floor = self.config.context_reserve_floor_tokens;
+        if floor == 0 || self.recovery.recovery_output_limit.is_some() {
+            return configured;
+        }
+        let room = self
+            .config
+            .context_window_tokens
+            .saturating_sub(input_tokens);
+        configured.min(room.max(floor))
+    }
 }
 
 /// A turn's request, ready to send.
@@ -840,7 +858,9 @@ impl Runtime {
             config,
         );
         retain_own_reasoning(ctx.client.adapter(), &mut seeded);
-        let seed_elision = elide_superseded_tool_outputs(&mut seeded);
+        // The provider may still hold the previous run's prefix in its cache:
+        // an elision that would re-ingest more than it saves waits.
+        let seed_elision = elide_superseded_tool_outputs_if_it_pays(&mut seeded);
         *messages = seeded;
         if seed_elision.elided > 0 {
             push_runtime_event(
@@ -903,8 +923,6 @@ impl Runtime {
         ctx: &LoopCtx<'_, A>,
         st: &mut LoopState<'_>,
     ) -> Result<PreparedTurn, TurnExit> {
-        // Skills stay fixed for the run. A newly available code backend
-        // still needs to be advertised after a project marker is created.
         let tools = self.workspace_tool_definitions(ctx.mode, ctx.cwd);
         let (preflight_chars, preflight_tokens, mut request) =
             self.preflight_request(ctx, st.messages, &tools, &st.channel)?;
@@ -946,36 +964,72 @@ impl Runtime {
                 self.prepare_loop_request(ctx.client, st.messages, &tools, ctx.mode, &st.channel)?
             }
         };
-        if let Some(limit) = st.recovery.recovery_output_limit {
-            request = ctx.client.with_recovery_output_limit(request, limit)?;
-        }
-        let current_output_limit = request.output_token_limit();
-        // The estimate counts an image as a fixed figure, not as its base64.
-        let estimated_chars = request
-            .serialized_chars
-            .saturating_sub(image_payload_discount_chars(st.messages));
-        if !st.compaction_applied && st.recovery.recovery_output_limit.is_none() {
-            debug_assert!(estimated_chars <= preflight_chars);
-        }
-        let estimated_tokens =
-            self.token_estimator
-                .estimate(ctx.provider, ctx.model, estimated_chars);
-        request.estimated_tokens = estimated_tokens;
-        let budget = ContextBudget::new(
-            st.config.context_window_tokens,
-            estimated_tokens,
-            st.config.context_reserve_tokens,
-        );
-        if !budget.can_fit(st.config.context_reserve_tokens) {
-            return Err(ProviderError::InvalidResponse {
-                message: if st.compaction_applied {
-                    "context window still exceeded after compaction".into()
-                } else {
-                    "context window exceeded and compaction is unavailable".into()
-                },
+        // A history that still does not fit is cut down step by step (see
+        // `shrink_history_to_fit`) before the run gives up on it.
+        let mut shrink_step = 0;
+        let current_output_limit = loop {
+            if let Some(limit) = st.recovery.recovery_output_limit {
+                request = ctx.client.with_recovery_output_limit(request, limit)?;
             }
-            .into());
-        }
+            let mut current_output_limit = request.output_token_limit();
+            // The estimate counts an image as a fixed figure, not as its base64.
+            let estimated_chars = request
+                .serialized_chars
+                .saturating_sub(image_payload_discount_chars(st.messages));
+            if !st.compaction_applied && st.recovery.recovery_output_limit.is_none() {
+                debug_assert!(estimated_chars <= preflight_chars);
+            }
+            let estimated_tokens =
+                self.token_estimator
+                    .estimate(ctx.provider, ctx.model, estimated_chars);
+            // A window nearly full leaves the answer the room that is left
+            // instead of compacting for a limit the answer rarely reaches;
+            // the output limit on the wire follows the shrunk reserve.
+            let reserve = st.output_reserve(estimated_tokens);
+            if reserve < st.config.context_reserve_tokens
+                && current_output_limit.is_some_and(|limit| limit > reserve)
+            {
+                request = ctx.client.with_output_limit_ceiling(request, reserve)?;
+                current_output_limit = request.output_token_limit();
+            }
+            request.estimated_tokens = estimated_tokens;
+            let budget =
+                ContextBudget::new(st.config.context_window_tokens, estimated_tokens, reserve);
+            if budget.can_fit(reserve) {
+                break current_output_limit;
+            }
+            let Some(stats) = shrink_history_to_fit(st.messages, &mut shrink_step) else {
+                return Err(ProviderError::InvalidResponse {
+                    message: if st.compaction_applied {
+                        "context window still exceeded after compaction".into()
+                    } else {
+                        "context window exceeded and compaction is unavailable".into()
+                    },
+                }
+                .into());
+            };
+            // What the last response's usage described has changed.
+            st.usage_anchor = None;
+            if let Some(handle) = &self.compaction_handle {
+                handle.clear_usage_anchor();
+            }
+            let detail = if stats.emitted_bytes == 0 {
+                format!("dropped the reasoning of {} earlier answers", stats.elided)
+            } else {
+                format!(
+                    "cut {} tool results from {} to {} bytes",
+                    stats.elided, stats.original_bytes, stats.emitted_bytes
+                )
+            };
+            st.next_seq = self.observed_next_seq(st.next_seq);
+            push_runtime_event(
+                &mut self.app,
+                &mut st.next_seq,
+                crate::EventKind::context_trimmed(&detail),
+            )?;
+            request =
+                self.prepare_loop_request(ctx.client, st.messages, &tools, ctx.mode, &st.channel)?;
+        };
         Ok(PreparedTurn {
             request,
             tools,
@@ -1011,7 +1065,7 @@ impl Runtime {
         let usage = self.context_usage(ctx.client.adapter(), st, tools);
         // The request not fitting the gate is a hard need; Pi's line alone is
         // not.
-        let over_gate = preflight_tokens.saturating_add(st.config.context_reserve_tokens)
+        let over_gate = preflight_tokens.saturating_add(st.output_reserve(preflight_tokens))
             > st.config.context_window_tokens;
         let (reason, required) = if overflow && policy.enabled {
             (CompactionReason::Overflow, true)
@@ -1923,12 +1977,59 @@ impl Runtime {
     /// The channel frame of a run over `messages`. Auto only: which MCP
     /// servers exist, without touching the system prompt or the tool
     /// definitions (server-provided text, redacted).
+    ///
+    /// The anchors of the session's earlier runs keep the text they carried
+    /// (the compaction handle outlives a run): a prompt whose stanza moved
+    /// away would change the request from that message on, and the provider
+    /// would write the whole previous run to its cache again instead of
+    /// reading it.
     pub(super) fn channel_frame(
         &self,
         mode: crate::OperatingMode,
         messages: &[ProviderMessage],
     ) -> mode::ChannelFrame {
-        mode::ChannelFrame::new(messages, self.mcp_awareness(mode))
+        let prior = self
+            .compaction_handle
+            .as_ref()
+            .map(|handle| handle.channel_anchors(messages, mode))
+            .unwrap_or_default();
+        let frame = mode::ChannelFrame::with_prior(messages, self.mcp_awareness(mode), prior);
+        self.record_channel_anchor(mode, messages, &frame);
+        frame
+    }
+
+    /// [`Self::channel_frame`] for a history a compaction just rewrote: the
+    /// new prefix is cached from scratch, so earlier anchors are forgotten.
+    pub(super) fn rebuilt_channel_frame(
+        &self,
+        mode: crate::OperatingMode,
+        messages: &[ProviderMessage],
+    ) -> mode::ChannelFrame {
+        if let Some(handle) = &self.compaction_handle {
+            handle.clear_channel_anchors();
+        }
+        let frame = mode::ChannelFrame::rebuilt_for(messages, self.mcp_awareness(mode));
+        self.record_channel_anchor(mode, messages, &frame);
+        frame
+    }
+
+    fn record_channel_anchor(
+        &self,
+        mode: crate::OperatingMode,
+        messages: &[ProviderMessage],
+        frame: &mode::ChannelFrame,
+    ) {
+        let Some(handle) = &self.compaction_handle else {
+            return;
+        };
+        if let Some(index) = frame.current_anchor(messages) {
+            handle.record_channel_anchor(
+                messages,
+                index,
+                mode,
+                frame.applied_text(mode, self.can_ask(mode)),
+            );
+        }
     }
 
     /// The MCP server block of the overlay as it is now (Auto only).

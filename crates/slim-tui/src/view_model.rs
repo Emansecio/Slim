@@ -366,6 +366,15 @@ pub(crate) fn budget_near_limit(used: usize, limit: usize) -> bool {
     used > 0 && limit > 0 && used.saturating_mul(5) >= limit.saturating_mul(4)
 }
 
+/// `used/limit`, or only `used` when tool calls are not capped.
+pub(crate) fn tool_budget_label(used: usize, limit: usize) -> String {
+    if limit == usize::MAX {
+        used.to_string()
+    } else {
+        format!("{used}/{limit}")
+    }
+}
+
 pub(crate) fn assistant_label(lifecycle: BlockLifecycle) -> &'static str {
     if lifecycle == BlockLifecycle::Cancelled {
         "Slim · interrompido · parcial"

@@ -6,8 +6,9 @@ use slim_core::OperatingMode;
 use crate::api::{
     BlockId, ClinePassCatalogSource, CommandCodeCatalogSource, ContentRequestId,
     InteractionRequestId, LoginProvider, ModelAlias, OpenCodeCatalogSource, OpenCodeModelView,
-    PromptAdmission, PromptGeneration, PromptId, PromptOrigin, ReasoningEffort, SensitiveText,
-    SessionId, TranscriptMessage, TranscriptRole, UiCommand, UiEvent, ZenCatalogSource,
+    OpenDesignCatalogSource, PromptAdmission, PromptGeneration, PromptId, PromptOrigin,
+    ReasoningEffort, SensitiveText, SessionId, TranscriptMessage, TranscriptRole, UiCommand,
+    UiEvent, ZenCatalogSource,
 };
 use crate::block::{
     Block, BlockKind, BlockLifecycle, FoldState, InteractionRequestKind, InteractionRequestState,
@@ -78,6 +79,26 @@ fn default_command_code_models() -> Vec<OpenCodeModelView> {
         .collect()
 }
 
+fn default_open_design_models() -> Vec<OpenCodeModelView> {
+    slim_core::provider::open_design_models()
+        .iter()
+        .map(|m| OpenCodeModelView {
+            id: m.id.to_owned(),
+            name: m.name.to_owned(),
+            context_window_tokens: m.context_window,
+            max_output_tokens: u64::from(m.max_output_tokens),
+            reasoning_levels: slim_core::provider::gateway_reasoning_levels(
+                slim_core::provider::ProviderKind::OpenDesign,
+                m.id,
+            )
+            .iter()
+            .filter_map(|level| ReasoningEffort::parse(level))
+            .collect(),
+            accepts_images: m.accepts_images,
+        })
+        .collect()
+}
+
 fn default_zen_models() -> Vec<OpenCodeModelView> {
     slim_core::provider::zen_models()
         .iter()
@@ -98,7 +119,11 @@ fn default_zen_models() -> Vec<OpenCodeModelView> {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RevisionSet {
+    /// Transcript blocks: a draft edit is `composer`, not this.
     pub content: u64,
+    /// Composer draft text and cursor edits; memos over the transcript do
+    /// not depend on it.
+    pub composer: u64,
     pub fold: u64,
     pub theme: u64,
     pub viewport: u64,
@@ -359,8 +384,9 @@ impl LoginOverlay {
             4 => LoginProvider::CommandCode,
             5 => LoginProvider::Xai,
             6 => LoginProvider::OpenCodeZen,
-            // The provider list navigates 0..=6, so this arm is only a clamp.
-            _ => LoginProvider::OpenCodeZen,
+            7 => LoginProvider::OpenDesign,
+            // The provider list navigates 0..=7, so this arm is only a clamp.
+            _ => LoginProvider::OpenDesign,
         }
     }
 }
@@ -374,8 +400,8 @@ pub struct ModelOverlay {
     /// Case-insensitive substring filter typed by the user (§15.7-style).
     pub filter: String,
     /// Collapsed state per group: 0 = OpenAI Codex, 1 = OpenCode Go,
-    /// 2 = ClinePass, 3 = Command Code, 4 = OpenCode Zen.
-    pub collapsed: [bool; 5],
+    /// 2 = ClinePass, 3 = Command Code, 4 = OpenCode Zen, 5 = Open Design.
+    pub collapsed: [bool; 6],
     /// Edits made in the picker are local until Enter confirms the model.
     pub pending_efforts: Vec<(EffortTarget, ReasoningEffort)>,
     pub pending_fast: bool,
@@ -478,6 +504,9 @@ pub enum ModelRow {
     /// An OpenCode Zen free-tier model, carrying its index into
     /// `AppState::zen_models`.
     Zen(usize),
+    /// An Open Design model, carrying its index into
+    /// `AppState::open_design_models`.
+    OpenDesign(usize),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -498,6 +527,7 @@ impl ModelRow {
         clinepass: &[OpenCodeModelView],
         command_code: &[OpenCodeModelView],
         zen: &[OpenCodeModelView],
+        open_design: &[OpenCodeModelView],
     ) -> Option<ModelChoice> {
         let catalog_choice = |model: &OpenCodeModelView, target| ModelChoice {
             target,
@@ -532,6 +562,9 @@ impl ModelRow {
             Self::Zen(index) => zen
                 .get(*index)
                 .map(|model| catalog_choice(model, EffortTarget::Zen(model.id.clone()))),
+            Self::OpenDesign(index) => open_design
+                .get(*index)
+                .map(|model| catalog_choice(model, EffortTarget::OpenDesign(model.id.clone()))),
         }
     }
 }
@@ -547,6 +580,7 @@ impl ModelOverlay {
         clinepass_models: &[OpenCodeModelView],
         command_code_models: &[OpenCodeModelView],
         zen_models: &[OpenCodeModelView],
+        open_design_models: &[OpenCodeModelView],
     ) -> Vec<ModelRow> {
         let query = self.filter.to_lowercase();
         let mut out = Vec::new();
@@ -626,12 +660,24 @@ impl ModelOverlay {
                 .collect(),
         );
 
+        // Group 5: Open Design catalog
+        push_group(
+            &mut out,
+            5,
+            open_design_models
+                .iter()
+                .enumerate()
+                .filter(|(_, model)| keep(&model.id, &model.name))
+                .map(|(index, _)| ModelRow::OpenDesign(index))
+                .collect(),
+        );
+
         out
     }
 
     /// Toggles the collapsed state of a provider group.
     pub fn toggle_collapsed(&mut self, group: usize) {
-        if group < 5 {
+        if group < self.collapsed.len() {
             self.collapsed[group] = !self.collapsed[group];
         }
     }
@@ -680,6 +726,7 @@ impl ModelOverlay {
         clinepass_models: &[OpenCodeModelView],
         command_code_models: &[OpenCodeModelView],
         zen_models: &[OpenCodeModelView],
+        open_design_models: &[OpenCodeModelView],
     ) -> Self {
         let provider_group = active_provider.and_then(|provider| match provider {
             LoginProvider::OpenAiCodex if ModelAlias::parse(current_model).is_some() => Some(0),
@@ -709,6 +756,13 @@ impl ModelOverlay {
             {
                 Some(4)
             }
+            LoginProvider::OpenDesign
+                if open_design_models
+                    .iter()
+                    .any(|model| model.id == current_model) =>
+            {
+                Some(5)
+            }
             _ => None,
         });
         let active_group = if let Some(group) = provider_group {
@@ -732,6 +786,11 @@ impl ModelOverlay {
             3
         } else if zen_models.iter().any(|model| model.id == current_model) {
             4
+        } else if open_design_models
+            .iter()
+            .any(|model| model.id == current_model)
+        {
+            5
         } else {
             active_provider.map_or(0, |provider| match provider {
                 LoginProvider::OpenAiCodex | LoginProvider::Anthropic => 0,
@@ -739,12 +798,13 @@ impl ModelOverlay {
                 LoginProvider::ClinePass => 2,
                 LoginProvider::CommandCode => 3,
                 LoginProvider::OpenCodeZen => 4,
+                LoginProvider::OpenDesign => 5,
                 // xAI tem grupo próprio adiado no /models; cai no grupo 0.
                 LoginProvider::Xai => 0,
             })
         };
         let mut overlay = Self {
-            collapsed: [true; 5],
+            collapsed: [true; 6],
             ..Self::default()
         };
         overlay.collapsed[active_group] = false;
@@ -753,6 +813,7 @@ impl ModelOverlay {
             clinepass_models,
             command_code_models,
             zen_models,
+            open_design_models,
         );
         overlay.selected = rows
             .iter()
@@ -762,6 +823,7 @@ impl ModelOverlay {
                     clinepass_models,
                     command_code_models,
                     zen_models,
+                    open_design_models,
                 )
                 .is_some_and(|choice| {
                     choice.id == current_model
@@ -810,6 +872,7 @@ pub enum EffortTarget {
     ClinePass(String),
     CommandCode(String),
     Xai(String),
+    OpenDesign(String),
 }
 
 impl EffortTarget {
@@ -821,6 +884,7 @@ impl EffortTarget {
             Self::ClinePass(_) => LoginProvider::ClinePass,
             Self::CommandCode(_) => LoginProvider::CommandCode,
             Self::Xai(_) => LoginProvider::Xai,
+            Self::OpenDesign(_) => LoginProvider::OpenDesign,
         }
     }
 }
@@ -914,10 +978,12 @@ pub struct AppState {
     pub cline_pass_models: Vec<OpenCodeModelView>,
     pub command_code_models: Vec<OpenCodeModelView>,
     pub zen_models: Vec<OpenCodeModelView>,
+    pub open_design_models: Vec<OpenCodeModelView>,
     pub open_code_catalog_source: Option<OpenCodeCatalogSource>,
     pub cline_pass_catalog_source: Option<ClinePassCatalogSource>,
     pub command_code_catalog_source: Option<CommandCodeCatalogSource>,
     pub zen_catalog_source: Option<ZenCatalogSource>,
+    pub open_design_catalog_source: Option<OpenDesignCatalogSource>,
     /// Bumped whenever a model catalog Vec is replaced; render memos key on it
     /// because catalog swaps can otherwise reuse a stale row list.
     pub catalog_revision: u64,
@@ -998,6 +1064,9 @@ pub struct AppState {
     request_usage_overflowed: bool,
     request_estimate_open: bool,
     pub working: bool,
+    /// Whether the terminal window has focus (crossterm focus events; true
+    /// until the terminal says otherwise). Motion pauses without it.
+    pub terminal_focused: bool,
     prompt_preparation: Option<PromptPreparationState>,
     cancelling_preparation: Option<PromptPreparationState>,
     active_prompt_admission: Option<PromptAdmission>,
@@ -1064,6 +1133,8 @@ pub struct AppState {
     next_content_request_id: u64,
     pub shutdown: bool,
     pub revisions: RevisionSet,
+    /// Content revision at which `pending_interaction` last found nothing.
+    no_interaction_at: std::cell::Cell<Option<u64>>,
     /// Completed request throughput in tenths of tok/s, timed by the runtime.
     pub last_tok_per_sec: Option<u64>,
     pub last_tok_per_sec_estimated: bool,
@@ -1100,10 +1171,12 @@ impl Default for AppState {
             cline_pass_models: default_clinepass_models(),
             command_code_models: default_command_code_models(),
             zen_models: default_zen_models(),
+            open_design_models: default_open_design_models(),
             open_code_catalog_source: None,
             cline_pass_catalog_source: None,
             command_code_catalog_source: None,
             zen_catalog_source: None,
+            open_design_catalog_source: None,
             catalog_revision: 0,
             skill_names: Vec::new(),
             skills_revision: 0,
@@ -1162,6 +1235,7 @@ impl Default for AppState {
             request_usage_overflowed: false,
             request_estimate_open: false,
             working: false,
+            terminal_focused: true,
             prompt_preparation: None,
             cancelling_preparation: None,
             active_prompt_admission: None,
@@ -1209,6 +1283,7 @@ impl Default for AppState {
             next_content_request_id: 1,
             shutdown: false,
             revisions: RevisionSet::default(),
+            no_interaction_at: std::cell::Cell::new(None),
             last_tok_per_sec: None,
             last_tok_per_sec_estimated: false,
             selection: None,
@@ -1741,8 +1816,16 @@ impl AppState {
         &self.blocks
     }
 
+    /// The newest approval or question still waiting for the user. A
+    /// request is only created by `apply_interaction_request`, which bumps
+    /// the content revision, so a transcript found without one at the current
+    /// revision is not scanned again until the revision moves: the frame and
+    /// key paths that ask several times a frame pay one scan per change.
     pub fn pending_interaction(&self) -> Option<&InteractionRequestState> {
-        self.blocks.iter().rev().find_map(|block| {
+        if self.no_interaction_at.get() == Some(self.revisions.content) {
+            return None;
+        }
+        let found = self.blocks.iter().rev().find_map(|block| {
             (block.lifecycle == BlockLifecycle::Pending)
                 .then(|| match block.kind() {
                     BlockKind::InteractionRequest(state) if state.acknowledgement.is_none() => {
@@ -1751,7 +1834,11 @@ impl AppState {
                     _ => None,
                 })
                 .flatten()
-        })
+        });
+        if found.is_none() {
+            self.no_interaction_at.set(Some(self.revisions.content));
+        }
+        found
     }
 
     pub(crate) fn mark_interaction_response_pending(
@@ -2055,6 +2142,8 @@ impl AppState {
             .tool_state_mut()
             .expect("tool checked above");
         tool.pending_page = Some(PendingContentPage { request_id, cursor });
+        self.blocks[index].touch_tool_content();
+        self.revisions.content += 1;
         let command = UiCommand::RequestContentPage {
             handle: handle.expect("tool handle checked above"),
             request_id,
@@ -2708,6 +2797,7 @@ impl AppState {
                 &self.cline_pass_models,
                 &self.command_code_models,
                 &self.zen_models,
+                &self.open_design_models,
             )
             .get(overlay.selected)?
             .choice(
@@ -2715,6 +2805,7 @@ impl AppState {
                 &self.cline_pass_models,
                 &self.command_code_models,
                 &self.zen_models,
+                &self.open_design_models,
             )
             .map(|choice| choice.target)
     }
@@ -2728,6 +2819,7 @@ impl AppState {
             &self.cline_pass_models,
             &self.command_code_models,
             &self.zen_models,
+            &self.open_design_models,
         );
         if let Some(target) = focused {
             if let Some(index) = rows.iter().position(|row| {
@@ -2736,6 +2828,7 @@ impl AppState {
                     &self.cline_pass_models,
                     &self.command_code_models,
                     &self.zen_models,
+                    &self.open_design_models,
                 )
                 .is_some_and(|choice| choice.target == target)
             }) {
@@ -3630,6 +3723,14 @@ impl AppState {
                 let focused = self.focused_model_target();
                 self.command_code_models = models;
                 self.command_code_catalog_source = Some(source);
+                self.catalog_revision += 1;
+                self.restore_model_focus(focused);
+                self.revisions.status += 1;
+            }
+            UiEvent::OpenDesignCatalogLoaded { models, source } => {
+                let focused = self.focused_model_target();
+                self.open_design_models = models;
+                self.open_design_catalog_source = Some(source);
                 self.catalog_revision += 1;
                 self.restore_model_focus(focused);
                 self.revisions.status += 1;

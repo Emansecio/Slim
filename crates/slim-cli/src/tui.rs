@@ -10,10 +10,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use slim_core::mcp::{McpManager, McpServerStatus};
 use slim_core::provider::{
     clinepass_model, fetch_clinepass_catalog, is_clinepass_model_id, is_command_code_model_id,
-    is_xai_model_id, open_code_model, zen_model, ProviderKind, CLINEPASS_BASE_URL,
-    CLINEPASS_DEFAULT_MODEL, COMMANDCODE_BASE_URL, COMMANDCODE_DEFAULT_MODEL, OPENCODE_GO_BASE_URL,
-    OPENCODE_GO_DEFAULT_MODEL, OPENCODE_ZEN_BASE_URL, OPENCODE_ZEN_DEFAULT_MODEL,
-    OPENCODE_ZEN_PUBLIC_KEY, XAI_BASE_URL, XAI_DEFAULT_MODEL,
+    is_open_design_model_id, is_xai_model_id, open_code_model, zen_model, ProviderKind,
+    CLINEPASS_BASE_URL, CLINEPASS_DEFAULT_MODEL, COMMANDCODE_BASE_URL, COMMANDCODE_DEFAULT_MODEL,
+    OPENCODE_GO_BASE_URL, OPENCODE_GO_DEFAULT_MODEL, OPENCODE_ZEN_BASE_URL,
+    OPENCODE_ZEN_DEFAULT_MODEL, OPENCODE_ZEN_PUBLIC_KEY, OPEN_DESIGN_BASE_URL,
+    OPEN_DESIGN_DEFAULT_MODEL, XAI_BASE_URL, XAI_DEFAULT_MODEL,
 };
 use slim_core::runtime::CancellationToken;
 use slim_core::session::{DurableSessionHeader, JsonlRepo, SessionFormat, SessionPreflight};
@@ -24,9 +25,9 @@ use slim_core::{
 use slim_tui::api::{
     ClinePassCatalogSource, CommandCodeCatalogSource, ContentHandle, ContentRequestId,
     InteractionRequestId, LoginProvider, McpServerView, McpStatusView, ModelAlias,
-    OpenCodeCatalogSource, OpenCodeModelView, PageCursor, PromptAdmission, ReasoningEffort,
-    ToolBatchId, ToolCallId, TranscriptMessage, TranscriptRole, UiChannels, UiCommand, UiEvent,
-    WakeSignal, ZenCatalogSource, STREAM_EVENT_CAPACITY,
+    OpenCodeCatalogSource, OpenCodeModelView, OpenDesignCatalogSource, PageCursor, PromptAdmission,
+    ReasoningEffort, ToolBatchId, ToolCallId, TranscriptMessage, TranscriptRole, UiChannels,
+    UiCommand, UiEvent, WakeSignal, ZenCatalogSource, STREAM_EVENT_CAPACITY,
 };
 
 use crate::cli::parse_cli_args;
@@ -43,6 +44,7 @@ use crate::headless::{
 use crate::oauth::{
     FreshCredential, OAuthCredential, OAuthError, OAuthProgress, OAuthProvider, OAuthService,
 };
+use crate::open_design_catalog::OpenDesignCatalog;
 use crate::opencode_go_catalog::{CatalogSnapshot, CatalogSource, OpenCodeCatalog};
 use crate::opencode_zen_catalog::OpenCodeZenCatalog;
 use crate::{delete_api_key, load_local_images, resolve_provider_credential, save_api_key};
@@ -932,9 +934,10 @@ fn provider_kind(name: &str) -> Result<ProviderKind, TuiError> {
         "clinepass" | "cline-pass" | "cp" => Ok(ProviderKind::ClinePass),
         "command-code" | "commandcode" | "cmd" => Ok(ProviderKind::CommandCode),
         "xai" | "grok" => Ok(ProviderKind::Xai),
+        "open-design" | "opendesign" | "od" => Ok(ProviderKind::OpenDesign),
         _ => Err(TuiError::new(
             ExitCode::Provider,
-            "unsupported provider; use openai-compatible, openai-codex, anthropic, opencode-go, opencode-zen, clinepass, command-code, or xai",
+            "unsupported provider; use openai-compatible, openai-codex, anthropic, opencode-go, opencode-zen, clinepass, command-code, xai, or open-design",
         )),
     }
 }
@@ -2226,6 +2229,7 @@ fn run_worker(
                         ProviderKind::ClinePass => Some(LoginProvider::ClinePass),
                         ProviderKind::CommandCode => Some(LoginProvider::CommandCode),
                         ProviderKind::Xai => Some(LoginProvider::Xai),
+                        ProviderKind::OpenDesign => Some(LoginProvider::OpenDesign),
                         ProviderKind::OpenAiCodex => Some(LoginProvider::OpenAiCodex),
                         _ => None,
                     }
@@ -2266,6 +2270,7 @@ fn run_worker(
         let open_code_catalog = OpenCodeCatalog::production().ok();
         let zen_catalog = OpenCodeZenCatalog::production().ok();
         let command_code_catalog = CommandCodeCatalog::production().ok();
+        let open_design_catalog = OpenDesignCatalog::production().ok();
         let cline_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -2274,10 +2279,12 @@ fn run_worker(
         let zen_inflight = Arc::new(AtomicBool::new(false));
         let cline_inflight = Arc::new(AtomicBool::new(false));
         let command_code_inflight = Arc::new(AtomicBool::new(false));
+        let open_design_inflight = Arc::new(AtomicBool::new(false));
         let open_code_gen = Arc::new(AtomicU64::new(0));
         let zen_gen = Arc::new(AtomicU64::new(0));
         let cline_gen = Arc::new(AtomicU64::new(0));
         let command_code_gen = Arc::new(AtomicU64::new(0));
+        let open_design_gen = Arc::new(AtomicU64::new(0));
         // Project LSP launch overrides held back by trust are announced once;
         // the manager was built at startup, so trusting takes a restart.
         if let Ok(layered) = crate::config::load_layered() {
@@ -3334,6 +3341,54 @@ fn run_worker(
                                 }
                             }
                         }
+                        LoginProvider::OpenDesign => {
+                            let saved = tokio::task::spawn_blocking(move || {
+                                save_api_key(ProviderKind::OpenDesign, &key_to_save)
+                            })
+                            .await;
+                            match saved {
+                                Ok(Ok(())) => {
+                                    let model = startup
+                                        .model_override
+                                        .as_deref()
+                                        .filter(|m| is_open_design_model_id(m))
+                                        .unwrap_or(OPEN_DESIGN_DEFAULT_MODEL)
+                                        .to_owned();
+                                    startup.request = Some(ProviderRequest {
+                                        prompt: String::new(),
+                                        mode: startup.mode,
+                                        kind: ProviderKind::OpenDesign,
+                                        endpoint: startup
+                                            .endpoint_override
+                                            .clone()
+                                            .unwrap_or_else(|| OPEN_DESIGN_BASE_URL.into()),
+                                        model: model.clone(),
+                                        api_key: key,
+                                        account_id: None,
+                                        timeout: startup.timeout,
+                                    });
+                                    startup.oauth_session = None;
+                                    let _ = sink.send(UiEvent::AuthStateChanged {
+                                        provider: Some(LoginProvider::OpenDesign),
+                                        authenticated: true,
+                                    });
+                                    let _ = sink.send(UiEvent::ModelChanged { model });
+                                    let _ = sink.send(UiEvent::Notification {
+                                        message: "Connected: Open Design".into(),
+                                    });
+                                }
+                                Ok(Err(error)) => {
+                                    let _ = sink.send(UiEvent::LoginFailed {
+                                        message: error.to_string(),
+                                    });
+                                }
+                                Err(_) => {
+                                    let _ = sink.send(UiEvent::LoginFailed {
+                                        message: "Open Design key save task failed".into(),
+                                    });
+                                }
+                            }
+                        }
                         LoginProvider::Xai => {
                             let saved = tokio::task::spawn_blocking(move || {
                                 save_api_key(ProviderKind::Xai, &key_to_save)
@@ -3533,6 +3588,66 @@ fn run_worker(
                             (live, ClinePassCatalogSource::Live)
                         };
                         let _ = sink.send(UiEvent::ClinePassCatalogLoaded { models, source });
+                    });
+                }
+                UiCommand::RefreshOpenDesignModels => {
+                    let sink = sink.clone();
+                    let Some(catalog) = open_design_catalog.clone() else {
+                        let _ = sink.send(UiEvent::Notification {
+                            message: "Open Design catalog path is unavailable".into(),
+                        });
+                        continue;
+                    };
+                    let _ = sink.send(open_design_catalog_event(catalog.load_or_fallback()));
+                    // The gateway lists models only to an authenticated key:
+                    // the active request's, else the saved or environment one.
+                    // A custom endpoint is another gateway: the key stays off
+                    // the Open Design catalog.
+                    if startup.endpoint_override.is_some() {
+                        continue;
+                    }
+                    let api_key = match startup
+                        .request
+                        .as_ref()
+                        .filter(|request| request.kind == ProviderKind::OpenDesign)
+                    {
+                        Some(request) => Some(request.api_key.clone()),
+                        None => tokio::task::spawn_blocking(|| {
+                            crate::auth::resolve_api_key(ProviderKind::OpenDesign)
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .flatten(),
+                    };
+                    let Some(api_key) = api_key else {
+                        continue;
+                    };
+                    if open_design_inflight.swap(true, Ordering::AcqRel) {
+                        continue;
+                    }
+                    let generation = open_design_gen.fetch_add(1, Ordering::AcqRel) + 1;
+                    let inflight = open_design_inflight.clone();
+                    let gen_cell = open_design_gen.clone();
+                    tokio::spawn(async move {
+                        let result = catalog.refresh(&api_key).await;
+                        inflight.store(false, Ordering::Release);
+                        if gen_cell.load(Ordering::Acquire) != generation {
+                            return;
+                        }
+                        match result {
+                            Ok(snapshot) => {
+                                let _ = sink.send(open_design_catalog_event(snapshot));
+                            }
+                            Err(error) => {
+                                let _ = sink.send(UiEvent::Notification {
+                                    message: format!(
+                                        "Open Design live catalog unavailable; using cache/fallback: {}",
+                                        provider_error_message(error)
+                                    ),
+                                });
+                            }
+                        }
                     });
                 }
                 UiCommand::RefreshCommandCodeModels => {
@@ -3766,6 +3881,55 @@ fn run_worker(
                     let _ = sink.send(UiEvent::ModelChanged { model });
                     let _ = sink.send(UiEvent::EffortChanged { effort });
                 }
+                UiCommand::SetOpenDesignModel { model, effort } => {
+                    if !is_open_design_model_id(&model) {
+                        let _ = sink.send(UiEvent::Notification {
+                            message: "Unsupported Open Design model".into(),
+                        });
+                        continue;
+                    }
+                    let levels = slim_core::provider::gateway_reasoning_levels(ProviderKind::OpenDesign, &model);
+                    if !levels.is_empty() && !levels.contains(&effort.id()) {
+                        let _ = sink.send(UiEvent::Notification { message: "Unsupported reasoning effort for this model".into() });
+                        continue;
+                    }
+                    let switched = match activate_saved_api_key_provider(
+                        &mut startup,
+                        &oauth,
+                        ProviderKind::OpenDesign,
+                        "open-design",
+                        OPEN_DESIGN_BASE_URL,
+                        &model,
+                        "Open Design",
+                    ) {
+                        Ok(switched) => switched,
+                        Err(message) => {
+                            let _ = sink.send(UiEvent::Notification { message });
+                            continue;
+                        }
+                    };
+                    let Some(request) = startup.request.as_mut() else {
+                        continue;
+                    };
+                    request.model.clone_from(&model);
+                    if switched {
+                        let _ = sink.send(UiEvent::AuthStateChanged {
+                            provider: Some(LoginProvider::OpenDesign),
+                            authenticated: true,
+                        });
+                        let _ = sink.send(UiEvent::Notification {
+                            message: "Connected: Open Design".into(),
+                        });
+                    }
+                    startup.model_override = Some(model.clone());
+                    startup.effort = effort;
+                    startup.options.reasoning_effort = Some(effort.id().into());
+                    let _ = sink.send(UiEvent::Notification {
+                        message: "Modelo aplicado nesta sessão · /model --default para salvar o padrão".into(),
+                    });
+                    let _ = sink.send(UiEvent::ModelChanged { model });
+                    let _ = sink.send(UiEvent::EffortChanged { effort });
+                }
                 UiCommand::SetXaiModel { model, effort } => {
                     if !is_xai_model_id(&model) {
                         let _ = sink.send(UiEvent::Notification {
@@ -3851,6 +4015,7 @@ fn run_worker(
                                     | ProviderKind::ClinePass
                                     | ProviderKind::CommandCode
                                     | ProviderKind::Xai
+                                    | ProviderKind::OpenDesign
                             )
                         })
                     {
@@ -3863,6 +4028,9 @@ fn run_worker(
                                 "Command Code",
                             ),
                             ProviderKind::Xai => (&["SLIM_API_KEY", "XAI_API_KEY"], "xAI"),
+                            ProviderKind::OpenDesign => {
+                                (&["SLIM_API_KEY", "OPEN_DESIGN_API_KEY"], "Open Design")
+                            }
                             ProviderKind::OpenCodeZen => {
                                 (&["SLIM_API_KEY", "OPENCODE_API_KEY"], "OpenCode Zen")
                             }
@@ -5022,6 +5190,35 @@ fn command_code_catalog_event(snapshot: crate::command_code_catalog::CatalogSnap
     UiEvent::CommandCodeCatalogLoaded { models, source }
 }
 
+fn open_design_catalog_event(
+    snapshot: crate::open_design_catalog::OpenDesignCatalogSnapshot,
+) -> UiEvent {
+    let models = snapshot
+        .models
+        .into_iter()
+        .map(|model| OpenCodeModelView {
+            reasoning_levels: slim_core::provider::gateway_reasoning_levels(
+                ProviderKind::OpenDesign,
+                &model.id,
+            )
+            .iter()
+            .filter_map(|level| ReasoningEffort::parse(level))
+            .collect(),
+            id: model.id,
+            name: model.name,
+            context_window_tokens: model.context_window,
+            max_output_tokens: u64::from(model.max_output_tokens),
+            accepts_images: model.accepts_images,
+        })
+        .collect();
+    let source = match snapshot.source {
+        crate::command_code_catalog::CatalogSource::Live => OpenDesignCatalogSource::Live,
+        crate::command_code_catalog::CatalogSource::Cache => OpenDesignCatalogSource::Cache,
+        crate::command_code_catalog::CatalogSource::Fallback => OpenDesignCatalogSource::Fallback,
+    };
+    UiEvent::OpenDesignCatalogLoaded { models, source }
+}
+
 fn oauth_provider(provider: LoginProvider) -> Option<OAuthProvider> {
     match provider {
         LoginProvider::Anthropic => Some(OAuthProvider::Anthropic),
@@ -5030,7 +5227,8 @@ fn oauth_provider(provider: LoginProvider) -> Option<OAuthProvider> {
         LoginProvider::OpenCodeGo
         | LoginProvider::OpenCodeZen
         | LoginProvider::ClinePass
-        | LoginProvider::CommandCode => None,
+        | LoginProvider::CommandCode
+        | LoginProvider::OpenDesign => None,
     }
 }
 

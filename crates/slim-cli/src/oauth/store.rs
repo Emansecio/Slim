@@ -526,7 +526,7 @@ fn preferred_method(
 fn validate_api_key_provider(provider: &str) -> Result<(), OAuthError> {
     if matches!(
         provider,
-        "opencode-go" | "opencode-zen" | "clinepass" | "command-code" | "xai"
+        "opencode-go" | "opencode-zen" | "clinepass" | "command-code" | "xai" | "open-design"
     ) {
         Ok(())
     } else {

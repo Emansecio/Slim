@@ -9,6 +9,7 @@ mod headless;
 mod mcp;
 mod mcp_cli;
 pub mod oauth;
+pub mod open_design_catalog;
 pub mod opencode_go_catalog;
 pub mod opencode_zen_catalog;
 mod tui;
@@ -66,6 +67,7 @@ pub(crate) fn provider_compatible_model(
         ProviderKind::ClinePass => slim_core::provider::is_clinepass_model_id(model),
         ProviderKind::CommandCode => slim_core::provider::is_command_code_model_id(model),
         ProviderKind::Xai => slim_core::provider::is_xai_model_id(model),
+        ProviderKind::OpenDesign => slim_core::provider::is_open_design_model_id(model),
         ProviderKind::Anthropic | ProviderKind::OpenAiCompatible => true,
     }
 }
@@ -180,6 +182,22 @@ mod provider_model_tests {
         ));
         assert!(!provider_compatible_model(
             ProviderKind::CommandCode,
+            "bad id"
+        ));
+    }
+
+    #[test]
+    fn open_design_accepts_live_ids() {
+        assert!(provider_compatible_model(
+            ProviderKind::OpenDesign,
+            "deepseek-v4.1-flash"
+        ));
+        assert!(provider_compatible_model(
+            ProviderKind::OpenDesign,
+            "vendor/future-model"
+        ));
+        assert!(!provider_compatible_model(
+            ProviderKind::OpenDesign,
             "bad id"
         ));
     }

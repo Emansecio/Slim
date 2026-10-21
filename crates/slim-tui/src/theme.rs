@@ -143,7 +143,28 @@ fn os_animations_enabled() -> Option<bool> {
     (answered != 0).then_some(enabled != 0)
 }
 
-#[cfg(not(windows))]
+/// macOS "Reduce motion" (System Settings, Accessibility, Display), read
+/// from the preference domain the setting writes. `None` when the key was
+/// never set or `defaults` does not answer.
+#[cfg(target_os = "macos")]
+fn os_animations_enabled() -> Option<bool> {
+    let output = std::process::Command::new("defaults")
+        .args(["read", "com.apple.universalaccess", "reduceMotion"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "1" => Some(false),
+        "0" => Some(true),
+        _ => None,
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn os_animations_enabled() -> Option<bool> {
     None
 }

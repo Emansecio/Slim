@@ -10,11 +10,11 @@ mod sse;
 mod stdio;
 
 pub use catalog::McpCatalog;
+pub(crate) use client::skip_terminal_sequence;
 pub use client::{
     strip_terminal_controls, McpLog, McpProgress, McpProgressSink, McpServerHandshake,
     SUPPORTED_PROTOCOL_VERSIONS,
 };
-pub(crate) use client::skip_terminal_sequence;
 pub use exposure::{
     exposure_glob_matches, is_direct_tool_name, provider_input_schema, sanitized_provider_name,
     AwarenessServer, DirectNames, McpDirectTool, DIRECT_TOOL_PREFIX, MAX_AWARENESS_BYTES,

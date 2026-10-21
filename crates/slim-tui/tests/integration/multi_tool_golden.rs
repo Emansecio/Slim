@@ -400,9 +400,9 @@ fn same_batch_groups_different_names_and_expands_in_provider_order() {
         !expanded.contains("Enter detalhes"),
         "expanded header must not keep the collapse-competing hint\n{expanded}"
     );
-    let first = expanded.find("▌   ✓ Leu one").expect("first member");
+    let first = expanded.find("▏   ✓ Leu one").expect("first member");
     let second = expanded
-        .find("▌   ✓ Executou cmd=two")
+        .find("▏   ✓ Executou cmd=two")
         .expect("second member");
     assert!(first < second, "provider order changed\n{expanded}");
     // Call ids are internal identity, not something the reader acts on.
@@ -410,7 +410,7 @@ fn same_batch_groups_different_names_and_expands_in_provider_order() {
     assert!(!expanded.contains("call-2"), "{expanded}");
     let first_row = expanded
         .lines()
-        .find(|line| line.contains("▌   ✓ Leu one"))
+        .find(|line| line.contains("▏   ✓ Leu one"))
         .expect("first member row");
     assert!(
         !first_row.contains("cmd=two"),

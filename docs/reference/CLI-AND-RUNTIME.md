@@ -57,8 +57,8 @@ model = "gpt-4o-mini"
 endpoint = "https://api.openai.com/v1/chat/completions"
 effort = "high"   # low | medium | high (label TUI + reasoning_effort no provider)
 max_turns = 128
-max_mutating_tool_calls = 32
-max_read_tool_calls = 96
+max_mutating_tool_calls = 32   # opcional; sem a chave não há limite
+max_read_tool_calls = 96       # opcional; sem a chave não há limite
 max_output_tokens = 4096
 timeout_secs = 120
 time_budget_secs = 1500   # opcional; sem a chave não há orçamento de tempo
@@ -1047,7 +1047,13 @@ servers": uma linha por servidor habilitado, confiável e não oculto, `- <nome>
 contagem aparece com o servidor pronto; até 250 caracteres por linha e 4096 no
 bloco; "… N more servers" ao exceder), rotulado como texto não confiável do
 servidor, sem caracteres de controle e com redaction. O prompt de sistema e a
-definição da tool `mcp` não mudam (cache estável).
+definição da tool `mcp` não mudam (cache estável). O estanque e o bloco ficam
+na mensagem de usuário que iniciou o run; os runs seguintes da mesma sessão
+mantêm nas mensagens dos runs anteriores exatamente o texto que elas levaram
+(o handle de compactação guarda posição, impressão digital e texto de cada
+âncora), para que o prefixo que o provider cacheou continue sendo lido em vez
+de reescrito a cada prompt. Uma compactação ou uma troca de modo esquece as
+âncoras antigas, pois já reescreve o prefixo.
 
 <a id="mcp-gateway"></a>
 
@@ -1279,6 +1285,34 @@ sobrescritas.
 optando pela rotação zero-data-retention documentada — upstreams sem
 capacidade ZDR respondem 422 em vez de degradar para retenção.
 
+## Open Design
+
+O provider nativo `open-design` usa o gateway Open Design Cloud no formato
+OpenAI Chat Completions (`https://amr-link.open-design.ai/v1`). A chave é criada
+em Open Design Cloud → API keys.
+
+Na TUI:
+1. `/login open-design` — cole a chave `sk-amr-…` no campo mascarado.
+2. `/models` — escolha o modelo no grupo **Open Design** (ou
+   `/model deepseek-v4.1-flash` depois de conectar).
+
+```bash
+OPEN_DESIGN_API_KEY=… slim --headless --provider open-design --model deepseek-v4-pro --effort high --prompt "hello"
+```
+
+O modelo padrão é `deepseek-v4.1-flash`. O catálogo `GET /v1/models` exige a
+chave; Slim descarta modelos desabilitados e usa `context_budget`/`output_budget`
+do gateway como janela de contexto e teto de saída. O catálogo é salvo em
+`~/.slim/open-design-models.json` (override `SLIM_OPEN_DESIGN_MODELS_FILE`):
+o headless aguarda um refresh só quando o modelo pedido não está no cache e,
+caso contrário, atualiza em background para a próxima execução. Com
+`--endpoint`/`SLIM_ENDPOINT` customizado a chave não vai ao catálogo; use
+`SLIM_CONTEXT_WINDOW_TOKENS` para modelos fora do cache. Reasoning chega em
+`reasoning`/`reasoning_details` e `--effort` vira `reasoning_effort`.
+
+Credencial: `SLIM_API_KEY` > `OPEN_DESIGN_API_KEY` > chave salva pelo Slim
+(`auth.json`, slot `open-design`). Aliases: `open-design`, `opendesign`, `od`.
+
 ## OpenCode Go
 
 O provider `opencode-go` usa chave em `SLIM_API_KEY`, depois
@@ -1370,7 +1404,7 @@ e [TEST-SUITE-OPTIMIZATION.md](../../analysis_outputs/TEST-SUITE-OPTIMIZATION.md
 |---|---|
 | Headless/provider/tools/auth/compaction/usage/artifacts/anti-loop | `Slim --headless` usa caminhos integrados e exercitados offline; OpenAI-compatible/Anthropic SSE, read/list/search/write/patch/shell e filtragem de capabilities funcionam. |
 | TUI | `Slim` abre a interface normal mesmo deslogado. `/login` abre seletor OAuth nativo para Claude Pro/Max ou ChatGPT Plus/Pro; Anthropic Messages e Codex Responses usam o mesmo agent loop/tools Slim. Reducer único normativo (`Action → reduce → Effect`), scrollback virtualizado e navegável (pin/live-edge/unseen), paleta estratificada §21.3, ActivityRail por fase/tempo, SessionRail conversacional adaptativa com contexto único e footer Grok-style responsivo (box alinhado + atalhos/metrics), tool blocks tipados agregados, lanes bounded com coalescer no runtime real, command palette Ctrl+P, markdown-light, motion básico com reduced motion e welcome estática com nome, conexão e próxima ação. Fixtures localhost provam OAuth/callback/store, streaming, tool round-trip e cancelamento. PTY E2E físico pendente de console real (teste `#[ignore]`). |
-| Cache/HTTP | Replay local de respostas (`ProviderCache`) desligado no produto; transporte HTTP compartilhado reaproveita conexões, enquanto adapters e autenticação continuam isolados por request. |
+| Cache/HTTP | Replay local de respostas (`ProviderCache`) desligado no produto; transporte HTTP compartilhado reaproveita conexões, enquanto adapters e autenticação continuam isolados por request. No wire Anthropic, os breakpoints de cache ficam no prompt de sistema (que cobre as tools antes dele) e no último bloco da mensagem anterior ao último turno do assistant, onde a requisição anterior terminou, além do marcador automático no topo. |
 | Sessões | Writer/recovery/branch e `--session` escrevem JSONL novo; `--resume`/recovery explícitos existem headless e TUI; UX geral de seleção/fork continua limitada. |
 | Skills, MCP, subagentes | Tool `skill` lazy (`list` / `name`); roots `.slim/skills`, `.claude/skills`, `.agents/skills` e `.codex/skills` no projeto, `.slim/skills`, `.agents/skills` e `.codex/skills` no perfil (nesta ordem de prioridade; o projeto vence o perfil). Scripts chamados pelo modelo exigem trust explícito e são recusados sem grant; leitura de `SKILL.md` continua disponível. MCP stdio/Streamable HTTP com conexão em segundo plano, meta-tool `mcp`, tools `direct`, `codemode`, CLI `slim mcp` e overlay `/mcp` (ver [seção MCP](#mcp)). Sem child. |
 | Todo/Plan/Goal | Tool `todo` no loop Auto; `TodoChanged` abre o dock TUI. Plan/Goal sem UI; Plan headless continua abortando (N4). |
@@ -1403,7 +1437,7 @@ deltas OpenAI e os IDs de `content_block` Anthropic; somente chamadas legadas
 sem ID recebem identificador interno. JSON de tool malformado ou incompleto é
 rejeitado.
 
-O runtime aplica budgets separados read-only vs mutating por run (`max_read_tool_calls` default 96, `max_mutating_tool_calls` default 32; env `SLIM_MAX_READ_TOOL_CALLS` / `SLIM_MAX_MUTATING_TOOL_CALLS` e chaves `slim.toml`); esgotamento → `tool_limit` (exit 22). O teto de turns por run é 128 (`SLIM_MAX_TURNS` / `max_turns` em `slim.toml`, cap 1024); esgotamento → `turn_limit` (exit 12) com mensagem `Turn limit reached (N/N)`. O orçamento de tempo por run (`time_budget_secs` / `SLIM_TIME_BUDGET_SECS`, desligado por padrão, zero é recusado) conta do início do run: a partir de 3/4 o modelo recebe uma vez o tempo usado e o total, e patches que só alteram números ou cores (literais numéricos e cores hex, com o restante do texto idêntico) são recusados antes de executar; esgotado, o run para em `time_limit` (exit 12) e pede a resposta final sem tools. Independente do orçamento, o ledger causal conta turnos seguidos cujas edições só reajustaram números ou cores: no terceiro avisa o modelo, no sexto para em `no_progress` (anomalia `tuning_loop`) com resposta final própria; uma edição estrutural zera a contagem e turnos sem edição (render, leitura) a mantêm. Três guards nativos seguram uma chamada desperdiçada uma vez por run, e repetir a mesma chamada logo em seguida a executa: uma leitura simples pelo `shell` (`cat`, `sed -n 'A,Bp'`, `head`, `tail`, `Get-Content`, sem pipe, redirecionamento ou variável) de um arquivo sem mudança desde a mesma leitura; um `write` que reescreve por inteiro um arquivo existente de 2 KiB ou mais (o primeiro do run passa com uma nota sugerindo `patch`, os seguintes são segurados); e um comando de `shell` que já falhou duas vezes seguidas. A memória dos guards zera a cada run e a cada compactação. O `read` nativo dispensa guard: saída idêntica ainda no contexto já vira ponteiro. Quando o teto por turno corta calls de um batch, a mensagem seguinte ao modelo lista cada call não executada (nome e argumentos abreviados) para que só elas sejam repetidas. A tool `search` respeita `.gitignore`, ignora árvores de build, cap default 200 hits e paginação `offset`/`max_hits`. Emite `ToolStarted`, mantém pares assistant/tool através da compactação (veja "Compactação de contexto" abaixo).
+Tool calls não têm limite por padrão; budgets separados read-only vs mutating por turno e um total por run só valem quando configurados (`max_read_tool_calls`, `max_mutating_tool_calls`, `max_total_tool_calls`; env `SLIM_MAX_READ_TOOL_CALLS` / `SLIM_MAX_MUTATING_TOOL_CALLS` / `SLIM_MAX_TOTAL_TOOL_CALLS` e chaves `slim.toml`, sem teto); esgotamento → `tool_limit` (exit 22). O teto de turns por run é 128 (`SLIM_MAX_TURNS` / `max_turns` em `slim.toml`, cap 1024); esgotamento → `turn_limit` (exit 12) com mensagem `Turn limit reached (N/N)`. O orçamento de tempo por run (`time_budget_secs` / `SLIM_TIME_BUDGET_SECS`, desligado por padrão, zero é recusado) conta do início do run: a partir de 3/4 o modelo recebe uma vez o tempo usado e o total, e patches que só alteram números ou cores (literais numéricos e cores hex, com o restante do texto idêntico) são recusados antes de executar; esgotado, o run para em `time_limit` (exit 12) e pede a resposta final sem tools. Independente do orçamento, o ledger causal conta turnos seguidos cujas edições só reajustaram números ou cores: no terceiro avisa o modelo, no sexto para em `no_progress` (anomalia `tuning_loop`) com resposta final própria; uma edição estrutural zera a contagem e turnos sem edição (render, leitura) a mantêm. Três guards nativos seguram uma chamada desperdiçada uma vez por run, e repetir a mesma chamada logo em seguida a executa: uma leitura simples pelo `shell` (`cat`, `sed -n 'A,Bp'`, `head`, `tail`, `Get-Content`, sem pipe, redirecionamento ou variável) de um arquivo sem mudança desde a mesma leitura; um `write` que reescreve por inteiro um arquivo existente de 2 KiB ou mais (o primeiro do run passa com uma nota sugerindo `patch`, os seguintes são segurados); e um comando de `shell` que já falhou duas vezes seguidas. A memória dos guards zera a cada run e a cada compactação. O `read` nativo dispensa guard: saída idêntica ainda no contexto já vira ponteiro. Quando o teto por turno corta calls de um batch, a mensagem seguinte ao modelo lista cada call não executada (nome e argumentos abreviados) para que só elas sejam repetidas. A tool `search` respeita `.gitignore`, ignora árvores de build, cap default 200 hits e paginação `offset`/`max_hits`. Emite `ToolStarted`, mantém pares assistant/tool através da compactação (veja "Compactação de contexto" abaixo).
 
 Cada valor de API key fornecido é redigido exatamente antes
 de tool output, follow-up ao provider, renderização e sessão; isso não promete
@@ -1453,7 +1487,12 @@ O gatilho também dispara quando a requisição, estimada pelo estimador adaptat
 mais a reserva de saída (o limite de saída configurado, que a recuperação de
 truncamento pode elevar), não cabe na janela: é o critério do portão de contexto
 que vem a seguir, então uma requisição que o portão recusaria é compactada
-antes. Para uma janela pequena demais para
+antes. Quando o limite de saída veio do catálogo (não de `max_output_tokens`
+nem de `SLIM_MAX_OUTPUT_TOKENS`), a reserva encolhe até o espaço que resta na
+janela, nunca abaixo de `compaction.reserve_tokens`, e o `max_tokens` da
+requisição encolhe junto: um limite de 128k não compacta uma janela de 200k
+com um terço dela usado. A recuperação de truncamento mantém a reserva
+elevada. Para uma janela pequena demais para
 descer abaixo do gatilho, há uma única proteção contra laço: a compactação
 automática só roda de novo depois que ao menos uma resposta foi anexada à
 conversa. Compactação manual e por overflow ignoram essa espera.
@@ -1490,7 +1529,8 @@ resultados de tool são cortados em 2000 caracteres. O limite de saída é
 `min(0,8 × reserve_tokens, limite de saída da requisição)` para o histórico e
 `0,5 × reserve_tokens` para o prefixo; esse teto só baixa o limite de saída já
 configurado (o `max_output_tokens` por turno, 4096 por padrão em modelos sem
-catálogo). Um resumo que para por limite de saída é reenviado uma vez com o
+catálogo; os modelos Claude têm catálogo por geração, veja abaixo). Um resumo
+que para por limite de saída é reenviado uma vez com o
 limite dobrado, até o teto do orçamento, metade da janela e o máximo do modelo
 quando o catálogo o conhece; se ainda assim truncar, a compactação falha com a
 sugestão de subir `compaction.reserve_tokens` (o teto é 80% da reserva para o
@@ -1589,7 +1629,13 @@ erro explícito; não há redimensionamento automático nem decodificação de p
 `SLIM_CONTEXT_WINDOW_TOKENS` e
 `SLIM_MAX_OUTPUT_TOKENS` aceitam inteiros positivos e controlam janela/reserva
 de contexto e, quando suportado pelo wire, o teto de saída do provider (padrão:
-4096 tokens). No contrato Codex subscription, o valor permanece reserva local e
+o catálogo do modelo, limitado a `min(janela − 8192, janela/2)`, ou 4096
+tokens sem catálogo). Para IDs Claude em Anthropic e Command Code o catálogo
+vem da geração do ID: 128k de saída e janela de 1M da geração 4.6 em diante,
+64k e 200k na geração 4.5 (Sonnet 4 e Sonnet 3.7 também 64k; Opus 4/4.1 32k);
+a janela explícita de `command_code_model` prevalece quando existe. Sem
+catálogo, uma `write` grande trunca em 4096 tokens, a saída é descartada e a
+recuperação reenvia com 4× o limite. No contrato Codex subscription, o valor permanece reserva local e
 `max_output_tokens` não é serializado. A apresentação dos resultados usa um
 orçamento agregado calculado com o request serializado, a estimativa conservadora
 do preflight, os schemas, o histórico e a reserva de saída. Leituras completas
