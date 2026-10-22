@@ -755,6 +755,24 @@ real, com degradação explícita e testes golden (G340–G341).
 
 ### 1.2 Direção visual revisada
 
+**Revisão de 22/10/2026 (espaçamento da resposta):** nenhuma cor, row de
+chrome ou timer novo; muda só a projeção do Markdown.
+
+- **Lista sob o rótulo.** Uma lista na raiz que segue um parágrafo sem linha em
+  branco na fonte (`**O que mudou**` e logo abaixo `- item`) fica colada a ele,
+  em vez de a uma row vazia de distância: o rótulo agrupa com a sua lista, não
+  com a seção anterior. Com linha em branco na fonte, ou depois de um heading,
+  o gap continua. Substitui, para esse caso, a row vazia entre blocos raiz de
+  §15.2.
+- **Código dentro de item de lista.** O bloco cercado começa em row própria (antes
+  o texto do item e a primeira linha de código saíam emendados na mesma row,
+  com a régua antes do marcador) e recua sob o texto do item, inclusive o de um
+  item externo depois de uma lista aninhada; o recuo fica fora da superfície do
+  código, antes da régua `│`.
+- **Respiro depois da régua.** A régua `┄` e uma row vazia no fim de um bloco de
+  código contam como conteúdo, então o bloco seguinte mantém a row vazia de
+  §15.2 também depois delas.
+
 **Revisão de 20/10/2026 (recálculo, movimento e estrutura da resposta):** três
 frentes, nenhuma cor nova e nenhum timer novo. O que o olho vê muda pouco; o que
 a TUI deixa de refazer a cada quadro muda muito.
@@ -3150,8 +3168,12 @@ o `row_offset` dentro da nova altura.
   maiores usam `heading_accent`; links usam `link_accent`; prosa comum permanece
   em `text`;
 - blocos Markdown de nível raiz (heading, parágrafo, lista, código, quote,
-  tabela, hr) têm exatamente uma row vazia entre si; itens de lista não ganham
-  gap extra; tabelas GFM que cabem alinham colunas; as largas usam campos com wrap;
+  tabela, hr) têm exatamente uma row vazia entre si, exceto a lista que segue um
+  parágrafo sem linha em branco na fonte (`**O que mudou**` e logo abaixo
+  `- item`), que fica colada a ele como rótulo; itens de lista não ganham
+  gap extra; código dentro de um item começa em row própria, recuado sob o texto
+  do item, com a régua depois do recuo; tabelas GFM que cabem alinham colunas;
+  as largas usam campos com wrap;
 - texto longo quebra na borda direita; linhas de continuação alinham com o
   texto, nunca com um rail. A exceção são citações e código, cuja régua `│`
   acompanha toda row física;

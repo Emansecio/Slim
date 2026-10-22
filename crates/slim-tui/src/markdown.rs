@@ -171,13 +171,17 @@ struct Projection {
     link_depth: usize,
     code_depth: usize,
     list_stack: Vec<Option<u64>>,
-    item_depth: usize,
-    /// Cells the text of the innermost open list item starts at, past its
-    /// indent and marker: what its later rows and paragraphs hang under.
-    item_hang: usize,
+    /// One entry per open list item: the cells its text starts at, past its
+    /// indent and marker, which its later rows, paragraphs and code hang under.
+    item_hangs: Vec<usize>,
     /// Open block quotes, and whether the innermost one already holds text.
     quote_depth: usize,
     quote_has_text: bool,
+    /// Source offset of the open root paragraph.
+    paragraph_start: usize,
+    /// The root paragraph just closed: its source offset and the line count
+    /// it left, so a list that follows it with no blank line can tell.
+    root_paragraph: Option<(usize, usize)>,
     width: usize,
     table: Option<TableBuilder>,
 }
@@ -201,10 +205,11 @@ impl Default for Projection {
             link_depth: 0,
             code_depth: 0,
             list_stack: Vec::new(),
-            item_depth: 0,
-            item_hang: 0,
+            item_hangs: Vec::new(),
             quote_depth: 0,
             quote_has_text: false,
+            paragraph_start: 0,
+            root_paragraph: None,
             width: 1,
             table: None,
         }
@@ -259,6 +264,12 @@ impl Projection {
 
     fn finish_line(&mut self, keep_empty: bool) {
         if keep_empty || !self.current.is_empty() {
+            // Code inside a list item hangs under the item's text.
+            if let (BlockTone::Code { .. }, Some(&hang)) = (self.block_tone, self.item_hangs.last())
+            {
+                self.current.indent = hang;
+                self.current.hang = hang;
+            }
             self.current.kind = match self.block_tone {
                 BlockTone::Code { diff: false } => LineKind::Code,
                 BlockTone::Code { diff: true } => classify_diff_line(&self.current),
@@ -270,7 +281,6 @@ impl Projection {
     }
 
     fn start_item(&mut self) {
-        self.item_depth += 1;
         let indent = "  ".repeat(self.list_stack.len().saturating_sub(1));
         let marker = self
             .list_stack
@@ -285,22 +295,25 @@ impl Projection {
                 },
             );
         let lead = format!("{indent}{marker}");
-        self.item_hang = UnicodeWidthStr::width(lead.as_str());
-        self.current.hang = self.item_hang;
+        let hang = UnicodeWidthStr::width(lead.as_str());
+        self.item_hangs.push(hang);
+        self.current.hang = hang;
         self.current.push(lead, Tone::Quote, Modifier::empty());
     }
 
     /// A row of the open list item that does not carry its marker (a later
     /// paragraph, a line after a hard break) starts under the item's text.
     fn continue_item(&mut self) {
-        if self.item_depth > 0 && self.current.is_empty() {
-            self.current.indent = self.item_hang;
-            self.current.hang = self.item_hang;
+        if let Some(&hang) = self.item_hangs.last() {
+            if self.current.is_empty() {
+                self.current.indent = hang;
+                self.current.hang = hang;
+            }
         }
     }
 
     fn at_root(&self) -> bool {
-        self.item_depth == 0 && self.list_stack.is_empty()
+        self.item_hangs.is_empty() && self.list_stack.is_empty()
     }
 
     fn gap_before_block(&mut self) {
@@ -308,9 +321,27 @@ impl Projection {
             return;
         }
         self.finish_line(false);
-        if self.lines.last().is_some_and(|line| !line.is_empty()) {
+        if self.lines.last().is_some_and(|line| !is_gap(line)) {
             self.lines.push(LogicalLine::default());
         }
+    }
+
+    /// Whether a list starting at `list_start` follows the root paragraph
+    /// just closed with no blank line between them in the source, as in
+    /// `**O que mudou**\n- item`: the list then reads under its label.
+    fn list_follows_label(&mut self, source: &str, list_start: usize) -> bool {
+        let Some((start, lines)) = self.root_paragraph.take() else {
+            return false;
+        };
+        if lines != self.lines.len() || !self.current.is_empty() {
+            return false;
+        }
+        // Up to the line the list starts on: its own indent is not a blank.
+        let Some(between) = source.get(start..list_start) else {
+            return false;
+        };
+        let between = &between[..between.rfind('\n').map_or(0, |end| end + 1)];
+        !between.lines().any(|line| line.trim().is_empty())
     }
 
     fn push_in_scope(&mut self, text: &str) {
@@ -519,7 +550,7 @@ pub(crate) fn stable_prefix_len(source: &str) -> usize {
 /// Appends `tail`, projected on its own, after `lines` the way the whole
 /// projection would: a gap row separates the two blocks.
 pub(crate) fn append_projection(lines: &mut Vec<LogicalLine>, tail: Vec<LogicalLine>) {
-    if !tail.is_empty() && lines.last().is_some_and(|line| !line.is_empty()) {
+    if !tail.is_empty() && lines.last().is_some_and(|line| !is_gap(line)) {
         lines.push(LogicalLine::default());
     }
     lines.extend(tail);
@@ -541,7 +572,13 @@ pub(crate) fn projected_rows_sum(lines: &[LogicalLine], width: u16) -> usize {
 
 /// Whether `append_projection` would put a gap row after these lines.
 pub(crate) fn projection_ends_with_text(lines: &[LogicalLine]) -> bool {
-    lines.last().is_some_and(|line| !line.is_empty())
+    lines.last().is_some_and(|line| !is_gap(line))
+}
+
+/// A blank row between blocks. A rule or an empty line of code has no text
+/// either, but is content: the next block still keeps its distance from it.
+fn is_gap(line: &LogicalLine) -> bool {
+    line.kind == LineKind::Text && line.is_empty()
 }
 
 pub(crate) fn render_projected(
@@ -718,7 +755,7 @@ fn project(source: &str, width: usize) -> Vec<LogicalLine> {
         width: width.max(1),
         ..Projection::default()
     };
-    for event in Parser::new_ext(&safe, options) {
+    for (event, range) in Parser::new_ext(&safe, options).into_offset_iter() {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
                 projection.gap_before_block();
@@ -742,11 +779,15 @@ fn project(source: &str, width: usize) -> Vec<LogicalLine> {
             Event::Start(Tag::Paragraph) => {
                 projection.gap_before_block();
                 projection.continue_item();
+                projection.paragraph_start = range.start;
             }
             Event::End(TagEnd::Paragraph) => {
                 projection.finish_line(false);
                 if projection.quote_depth > 0 {
                     projection.quote_has_text = true;
+                } else if projection.at_root() {
+                    projection.root_paragraph =
+                        Some((projection.paragraph_start, projection.lines.len()));
                 }
             }
             Event::Start(Tag::BlockQuote(_)) => {
@@ -765,6 +806,9 @@ fn project(source: &str, width: usize) -> Vec<LogicalLine> {
                 }
             }
             Event::Start(Tag::CodeBlock(kind)) => {
+                // Inside a list item the code starts on a row of its own,
+                // apart from the item's text.
+                projection.finish_line(false);
                 projection.gap_before_block();
                 let diff = matches!(
                     kind,
@@ -772,8 +816,8 @@ fn project(source: &str, width: usize) -> Vec<LogicalLine> {
                         if matches!(label.trim().to_ascii_lowercase().as_str(), "diff" | "patch")
                 );
                 projection.block_tone = BlockTone::Code { diff };
-                // A list item shares its row with the code that starts in it,
-                // so only a block at the root gets the language row.
+                // Only a block at the root gets the language row; inside a
+                // list item the code hangs under the item's text.
                 if projection.at_root() {
                     if let CodeBlockKind::Fenced(info) = &kind {
                         if let Some(label) = code_label(info) {
@@ -793,7 +837,9 @@ fn project(source: &str, width: usize) -> Vec<LogicalLine> {
                 projection.block_tone = BlockTone::Text;
             }
             Event::Start(Tag::List(start)) => {
-                if projection.item_depth > 0 {
+                if !projection.item_hangs.is_empty()
+                    || (projection.at_root() && projection.list_follows_label(&safe, range.start))
+                {
                     projection.finish_line(false);
                 } else {
                     projection.gap_before_block();
@@ -806,7 +852,7 @@ fn project(source: &str, width: usize) -> Vec<LogicalLine> {
             Event::Start(Tag::Item) => projection.start_item(),
             Event::End(TagEnd::Item) => {
                 projection.finish_line(false);
-                projection.item_depth = projection.item_depth.saturating_sub(1);
+                projection.item_hangs.pop();
             }
             Event::Start(Tag::Table(_)) => {
                 projection.gap_before_block();
@@ -1030,14 +1076,15 @@ fn wrap(logical: &[LogicalLine], width: usize, styles: MarkdownStyles) -> Vec<Li
                 spans.push(Span::styled(QUOTE_RAIL, styles.quote));
             }
             let lead = if index == 0 { line.indent } else { line.hang };
-            if lead > 0 {
+            // Code puts its lead before the rail, outside its surface.
+            if lead > 0 && !kind.is_code() {
                 spans.push(Span::styled(" ".repeat(lead), styles.text));
             }
             for piece in row {
                 let style = style_for(piece.tone, piece.modifiers, styles);
                 push_span(&mut spans, &piece.text, style);
             }
-            lines.push(decorate_code_row(spans, kind, width, styles));
+            lines.push(decorate_code_row(spans, kind, width, lead, styles));
         }
     }
     if lines.is_empty() {
@@ -1229,6 +1276,7 @@ fn decorate_code_row(
     mut spans: Vec<Span<'static>>,
     kind: LineKind,
     width: usize,
+    lead: usize,
     styles: MarkdownStyles,
 ) -> Line<'static> {
     if !kind.is_code() {
@@ -1267,11 +1315,14 @@ fn decorate_code_row(
         .iter()
         .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
         .sum::<usize>();
-    let mut decorated = Vec::with_capacity(spans.len() + 2);
+    let mut decorated = Vec::with_capacity(spans.len() + 3);
+    if lead > 0 {
+        decorated.push(Span::styled(" ".repeat(lead), styles.text));
+    }
     decorated.push(Span::styled(CODE_RAIL, styles.code_rail.patch(background)));
     decorated.extend(spans);
     decorated.push(Span::styled(
-        " ".repeat(width.saturating_sub(2).saturating_sub(used)),
+        " ".repeat(width.saturating_sub(lead + 2).saturating_sub(used)),
         background,
     ));
     Line::from(decorated)
@@ -1463,7 +1514,7 @@ mod tests {
     };
     use unicode_width::UnicodeWidthStr;
 
-    const STREAMED_SAMPLE: &str = "# Title\n\nFirst paragraph with `code` and **bold**.\n\n- item one\n- item two\n\n  continued item\n\n```rust\nfn main() {\n\n    println!(\"hi\");\n}\n```\n\n> quoted\n> more\n\nSecond paragraph.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n1. one\n2. two\n\nÚltimo parágrafo acentuado.\n\n~~~\nplain\n\nfence\n~~~\n\nTail text";
+    const STREAMED_SAMPLE: &str = "# Title\n\nFirst paragraph with `code` and **bold**.\n\n- item one\n- item two\n\n  continued item\n\n```rust\nfn main() {\n\n    println!(\"hi\");\n}\n```\n\n> quoted\n> more\n\nSecond paragraph.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n1. one\n2. two\n\nÚltimo parágrafo acentuado.\n\n~~~\nplain\n\nfence\n~~~\n\n---\n- after a rule\n\n**Label**\n- under its label\n\n1. Run:\n   ```bash\n   cargo test\n   ```\n2. Then check.\n\nTail text";
 
     #[test]
     fn stable_prefix_ends_at_a_blank_line_before_a_root_block_outside_fences() {
@@ -1658,6 +1709,92 @@ mod tests {
         assert_eq!(body, Some(2));
         assert!(lines[1].trim().is_empty());
         assert_eq!(markdown_row_count("# Title\n\nBody paragraph.", 40), 3);
+    }
+
+    /// Rendered rows without trailing padding, after checking that the
+    /// measured height matches them and no row overflows.
+    fn rendered_rows(source: &str, width: u16) -> Vec<String> {
+        let rendered = render_markdown(source, width, styles());
+        assert_eq!(
+            markdown_row_count(source, width),
+            rendered.len(),
+            "{source:?}"
+        );
+        assert!(rendered.iter().all(|line| line.width() <= width as usize));
+        rendered
+            .iter()
+            .map(|line| line_text(line).trim_end().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn code_in_a_list_item_starts_its_own_row_under_the_item_text() {
+        assert_eq!(
+            rendered_rows(
+                "1. Rode:\n   ```bash\n   cargo test\n   ```\n2. Depois confira.",
+                40
+            ),
+            ["1. Rode:", "   │ cargo test", "2. Depois confira."]
+        );
+        // The code of an outer item hangs under that item, not under the
+        // nested list that closed before it.
+        assert_eq!(
+            rendered_rows("- a\n  - b\n\n  ```\n  x\n  ```", 40),
+            ["• a", "  • b", "  │ x"]
+        );
+        // An item that opens with code keeps its marker on a row of its own.
+        assert_eq!(rendered_rows("- ```\n  x\n  ```", 40), ["•", "  │ x"]);
+        // A long code row wraps under the item, inside the width.
+        assert_eq!(
+            rendered_rows("- a\n  ```\n  0123456789\n  ```", 10),
+            ["• a", "  │ 012345", "  │ 6789"]
+        );
+    }
+
+    #[test]
+    fn a_rule_or_a_trailing_blank_code_row_keeps_the_gap_before_the_next_block() {
+        assert_eq!(
+            rendered_rows("texto\n\n---\n- item", 12),
+            ["texto", "", "┄".repeat(12).as_str(), "", "• item"]
+        );
+        assert_eq!(
+            rendered_rows("```\nx\n\n```\ntexto", 12),
+            ["│ x", "│", "", "texto"]
+        );
+    }
+
+    #[test]
+    fn a_list_with_no_blank_line_after_its_label_reads_under_it() {
+        assert_eq!(
+            rendered_rows(
+                "**O que mudou**\n- a\n- b\n\nVerificação:\n\n- c\n\nTexto\n1. d",
+                40
+            ),
+            [
+                "O que mudou",
+                "• a",
+                "• b",
+                "",
+                "Verificação:",
+                "",
+                "• c",
+                "",
+                "Texto",
+                "1. d"
+            ]
+        );
+        // A label that wraps over source lines is still one paragraph.
+        assert_eq!(
+            rendered_rows("Antes de\ncomeçar:\n  - a", 40),
+            ["Antes de começar:", "• a"]
+        );
+        // Only a paragraph is a label: a heading keeps its gap.
+        assert_eq!(rendered_rows("## Seção\n- a", 40), ["Seção", "", "• a"]);
+        // A paragraph that is not the block right before the list is not one.
+        assert_eq!(
+            rendered_rows("Texto\n\n```\nx\n```\n- a", 40),
+            ["Texto", "", "│ x", "", "• a"]
+        );
     }
 
     #[test]
