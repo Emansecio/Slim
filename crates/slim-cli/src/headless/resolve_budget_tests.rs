@@ -225,7 +225,7 @@ fn max_output_options_and_env_beat_catalog() {
 }
 
 #[test]
-fn compatible_and_command_code_fall_back_to_default_max_output() {
+fn non_reasoning_compatible_models_fall_back_to_default_max_output() {
     with_env(&[("SLIM_MAX_OUTPUT_TOKENS", None)], || {
         assert_eq!(
             resolve_max_output_tokens(
@@ -236,16 +236,44 @@ fn compatible_and_command_code_fall_back_to_default_max_output() {
             .expect("compat"),
             slim_core::provider::DEFAULT_MAX_OUTPUT_TOKENS
         );
+    });
+}
+
+#[test]
+fn reasoning_chat_models_default_to_room_for_their_thinking() {
+    use slim_core::provider::ProviderKind::{CommandCode, OpenAiCompatible};
+    with_env(&[("SLIM_MAX_OUTPUT_TOKENS", None)], || {
+        // DeepSeek V4.1 Flash thinks: 4096 would cut most answers short.
         assert_eq!(
             resolve_max_output_tokens(
                 None,
-                slim_core::provider::ProviderKind::CommandCode,
-                slim_core::provider::COMMANDCODE_DEFAULT_MODEL,
+                CommandCode,
+                slim_core::provider::COMMANDCODE_DEFAULT_MODEL
             )
             .expect("command-code"),
-            slim_core::provider::DEFAULT_MAX_OUTPUT_TOKENS
+            32_768
+        );
+        // A compatible endpoint's window is unknown: the default stays within
+        // half of the assumed one, still well above 4096.
+        for model in ["deepseek-v4-pro", "kimi-k3", "gpt-5.6-sol"] {
+            let tokens = resolve_max_output_tokens(None, OpenAiCompatible, model).expect("default");
+            assert!(
+                tokens > slim_core::provider::DEFAULT_MAX_OUTPUT_TOKENS && tokens <= 32_768,
+                "{model}: {tokens}"
+            );
+        }
+        // Claude on Command Code keeps its documented limit.
+        assert_ne!(
+            resolve_max_output_tokens(None, CommandCode, "claude-sonnet-4-6").expect("claude"),
+            32_768
         );
     });
+    // A default, not metadata: an explicit limit above it stands.
+    assert_eq!(
+        resolve_max_output_tokens(Some(64_000), OpenAiCompatible, "deepseek-v4-pro")
+            .expect("explicit"),
+        64_000
+    );
 }
 
 #[test]

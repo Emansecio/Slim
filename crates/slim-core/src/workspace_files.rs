@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use ignore::WalkBuilder;
 
 use crate::runtime::CancellationToken;
-use crate::tools::{resolve_workspace_path_from_root, SKIP_DIR_NAMES};
+use crate::tools::{is_macos_metadata_file, resolve_workspace_path_from_root, SKIP_DIR_NAMES};
 
 /// Listing is a completion aid; it must never block the caller for long.
 const LIST_TIME_BUDGET: Duration = Duration::from_millis(1500);
@@ -24,22 +24,42 @@ const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 const MAX_MENTION_CANDIDATES: usize = 64;
 const MAX_MENTION_TOKEN_BYTES: usize = 1024;
 
+/// Files found by [`list_workspace_files`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WorkspaceListing {
+    /// Workspace-relative, forward-slash paths, shallower-first then lexicographic.
+    pub files: Vec<String>,
+    /// The time budget ran out before the walk finished, so `files` is a
+    /// partial listing even when it is shorter than the requested limit.
+    pub timed_out: bool,
+}
+
 /// Workspace-relative, forward-slash paths of regular files honoring
-/// `.gitignore`, skipping links, Windows junctions and the directories in
-/// `SKIP_DIR_NAMES`. Dotfiles are included. The result is bounded by `limit`
-/// and a time budget (partial output is returned when either is hit), sorted
-/// shallower-first then lexicographically. Cancellation yields
-/// `ErrorKind::Interrupted`.
+/// `.gitignore`, skipping links, Windows junctions, the directories in
+/// `SKIP_DIR_NAMES` and macOS litter (`.DS_Store`, `._*`). Dotfiles are
+/// included. The result is bounded by `limit` and a time budget (partial
+/// output is returned when either is hit; only the budget sets
+/// [`WorkspaceListing::timed_out`]), sorted shallower-first then
+/// lexicographically. Cancellation yields `ErrorKind::Interrupted`.
 pub fn list_workspace_files(
     root: &Path,
     limit: usize,
     cancel: Option<&CancellationToken>,
-) -> io::Result<Vec<String>> {
+) -> io::Result<WorkspaceListing> {
+    list_with_budget(root, limit, cancel, LIST_TIME_BUDGET)
+}
+
+fn list_with_budget(
+    root: &Path,
+    limit: usize,
+    cancel: Option<&CancellationToken>,
+    budget: Duration,
+) -> io::Result<WorkspaceListing> {
     let started = Instant::now();
     let cancelled = || cancel.is_some_and(CancellationToken::is_cancelled);
     let root = fs::canonicalize(root)?;
     if limit == 0 {
-        return Ok(Vec::new());
+        return Ok(WorkspaceListing::default());
     }
     let mut builder = WalkBuilder::new(&root);
     builder
@@ -67,10 +87,14 @@ pub fn list_workspace_files(
                 .is_some_and(|name| SKIP_DIR_NAMES.contains(&name))
                 && !is_reparse_point(entry.path());
         }
-        true
+        !entry
+            .file_name()
+            .to_str()
+            .is_some_and(is_macos_metadata_file)
     });
 
     let mut files = Vec::new();
+    let mut timed_out = false;
     for entry in builder.build() {
         if cancelled() {
             return Err(io::Error::new(
@@ -78,7 +102,11 @@ pub fn list_workspace_files(
                 "workspace listing cancelled",
             ));
         }
-        if started.elapsed() >= LIST_TIME_BUDGET || files.len() >= limit {
+        if files.len() >= limit {
+            break;
+        }
+        if started.elapsed() >= budget {
+            timed_out = true;
             break;
         }
         let Ok(entry) = entry else { continue };
@@ -93,7 +121,7 @@ pub fn list_workspace_files(
         let depth = |path: &str| path.bytes().filter(|byte| *byte == b'/').count();
         (depth(left), left).cmp(&(depth(right), right))
     });
-    Ok(files)
+    Ok(WorkspaceListing { files, timed_out })
 }
 
 /// Files enumerated when looking for a missing path's name elsewhere.
@@ -112,6 +140,7 @@ pub(crate) fn same_name_files_note(
     let name = missing.file_name()?.to_str()?;
     let found = list_workspace_files(root, SAME_NAME_SCAN_FILES, cancel)
         .ok()?
+        .files
         .into_iter()
         .filter(|path| {
             path.rsplit('/').next().is_some_and(|file| {
@@ -345,4 +374,22 @@ fn is_reparse_point(path: &Path) -> bool {
 #[cfg(not(windows))]
 fn is_reparse_point(_path: &Path) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_exhausted_time_budget_marks_the_listing_partial() {
+        let root = std::env::temp_dir().join(format!("slim-list-budget-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("root");
+        fs::write(root.join("a.txt"), "x").expect("file");
+        let cut = list_with_budget(&root, 10, None, Duration::ZERO).expect("list");
+        assert!(cut.timed_out);
+        let whole = list_with_budget(&root, 10, None, Duration::from_secs(60)).expect("list");
+        assert!(!whole.timed_out);
+        assert_eq!(whole.files, ["a.txt"]);
+        let _ = fs::remove_dir_all(&root);
+    }
 }

@@ -27,6 +27,12 @@ pub(crate) fn display_cwd(cwd: &str) -> String {
 }
 
 pub(crate) fn is_trivial_cwd(cwd: &str) -> bool {
+    is_trivial_cwd_in(cwd, home_dirs())
+}
+
+/// [`is_trivial_cwd`] against explicit home directories instead of the
+/// environment's.
+fn is_trivial_cwd_in(cwd: &str, homes: &[String]) -> bool {
     fn normalized(path: &str) -> String {
         display_cwd(path)
             .replace('\\', "/")
@@ -38,7 +44,7 @@ pub(crate) fn is_trivial_cwd(cwd: &str) -> bool {
     if cwd.is_empty() || cwd == "~" {
         return true;
     }
-    home_dirs().iter().any(|home| cwd == normalized(home))
+    homes.iter().any(|home| cwd == normalized(home))
 }
 
 /// The user's home directories as the environment names them.
@@ -366,8 +372,8 @@ pub(crate) fn budget_near_limit(used: usize, limit: usize) -> bool {
     used > 0 && limit > 0 && used.saturating_mul(5) >= limit.saturating_mul(4)
 }
 
-/// `used/limit`, or only `used` when tool calls are not capped.
-pub(crate) fn tool_budget_label(used: usize, limit: usize) -> String {
+/// `used/limit`, or only `used` when the budget is not capped.
+pub(crate) fn budget_label(used: usize, limit: usize) -> String {
     if limit == usize::MAX {
         used.to_string()
     } else {
@@ -498,7 +504,7 @@ fn session_rail_projection_with_homes(
 ) -> SessionRailProjection {
     let mut title_range = None;
     let mut folder_range = None;
-    let identity = if is_trivial_cwd(&state.cwd) {
+    let identity = if is_trivial_cwd_in(&state.cwd, homes) {
         truncate_display_width("SLIM", available)
     } else {
         let safe_cwd = abbreviate_home(&display_cwd(&state.cwd), homes);

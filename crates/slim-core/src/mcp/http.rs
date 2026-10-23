@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -16,11 +16,11 @@ use crate::mcp::client::{
 use crate::mcp::oauth::{AuthSendError, McpAuth};
 use crate::mcp::spec::{
     McpCancellation, McpCleanupStatus, McpConnection, McpError, McpInterruption, McpRequestOutcome,
-    MCP_PROTOCOL_VERSION,
+    MAX_MESSAGE_BYTES, MCP_PROTOCOL_VERSION,
 };
 use crate::mcp::sse::{SseDecoder, SseEvent};
+use crate::sync::lock_mutex;
 
-const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const SESSION_HEADER: &str = "mcp-session-id";
 /// Longest `mcp-session-id` accepted; it is echoed in every later request.
 const MAX_SESSION_ID_BYTES: usize = 1024;
@@ -91,12 +91,6 @@ fn is_idempotent(method: &str) -> bool {
     )
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 /// Display-safe form of a configured URL: query, fragment and userinfo can
 /// carry credentials, so they never appear in errors or status text.
 pub(crate) fn sanitized_url(raw: &str) -> String {
@@ -136,7 +130,7 @@ struct PendingGuard<'a> {
 
 impl Drop for PendingGuard<'_> {
     fn drop(&mut self) {
-        lock(&self.shared.pending).remove(&self.id);
+        lock_mutex(&self.shared.pending).remove(&self.id);
     }
 }
 
@@ -225,11 +219,11 @@ struct HttpShared {
 
 impl HttpShared {
     fn session(&self) -> Option<String> {
-        lock(&self.session).clone()
+        lock_mutex(&self.session).clone()
     }
 
     fn has_session(&self) -> bool {
-        lock(&self.session).is_some()
+        lock_mutex(&self.session).is_some()
     }
 
     fn is_closed(&self) -> bool {
@@ -240,7 +234,7 @@ impl HttpShared {
     /// (a stale stream must not condemn a freshly renewed session). The check
     /// and the flag happen under the session lock, which a renewal also takes.
     fn expire_session(&self, observed: &Option<String>) {
-        let session = lock(&self.session);
+        let session = lock_mutex(&self.session);
         if *session == *observed {
             self.expired.store(true, Ordering::Release);
         }
@@ -252,7 +246,7 @@ impl HttpShared {
 
     /// Protocol version, configured headers and session on every request.
     fn with_common_headers(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let protocol_version = lock(&self.protocol_version).clone();
+        let protocol_version = lock_mutex(&self.protocol_version).clone();
         request = request.header("MCP-Protocol-Version", protocol_version);
         for (name, value) in &self.headers {
             request = request.header(name, value);
@@ -292,7 +286,7 @@ impl HttpShared {
             .and_then(|value| value.to_str().ok())
             .filter(|value| value.len() <= MAX_SESSION_ID_BYTES)
         {
-            let mut session = lock(&self.session);
+            let mut session = lock_mutex(&self.session);
             if session.as_deref() != Some(value) {
                 *session = Some(value.to_owned());
                 self.session_ended.store(false, Ordering::Release);
@@ -363,7 +357,7 @@ impl HttpShared {
     }
 
     fn deliver_progress(&self, token: u64, update: McpProgress) {
-        let route = lock(&self.pending).get(&token).cloned();
+        let route = lock_mutex(&self.pending).get(&token).cloned();
         if let Some(route) = route {
             route.deliver(update);
         }
@@ -555,7 +549,7 @@ impl HttpShared {
                 let Some(message) = parse_message(&event)? else {
                     continue;
                 };
-                match classify_inbound(&message, Some(expected_id)) {
+                match classify_inbound(message, Some(expected_id)) {
                     Inbound::Response(result) => return Ok(StreamEnd::Response(result)),
                     other => self.dispatch_inbound(other).await,
                 }
@@ -622,7 +616,7 @@ impl HttpShared {
                 let Ok(Some(message)) = parse_message(&event) else {
                     continue;
                 };
-                let inbound = classify_inbound(&message, None);
+                let inbound = classify_inbound(message, None);
                 self.dispatch_inbound(inbound).await;
             }
         }
@@ -827,15 +821,15 @@ impl HttpConnection {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        *lock(&self.runtime) = Some(handle.clone());
+        *lock_mutex(&self.runtime) = Some(handle.clone());
         let task = handle.spawn(run_listener(Arc::clone(&self.shared)));
-        if let Some(previous) = lock(&self.listener).replace(task) {
+        if let Some(previous) = lock_mutex(&self.listener).replace(task) {
             previous.abort();
         }
     }
 
     fn stop_listener(&self) {
-        if let Some(task) = lock(&self.listener).take() {
+        if let Some(task) = lock_mutex(&self.listener).take() {
             task.abort();
         }
     }
@@ -845,7 +839,7 @@ impl HttpConnection {
         if !self.shared.has_session() || self.shared.session_ended.swap(true, Ordering::AcqRel) {
             return;
         }
-        let handle = lock(&self.runtime)
+        let handle = lock_mutex(&self.runtime)
             .clone()
             .or_else(|| tokio::runtime::Handle::try_current().ok());
         if let Some(handle) = handle {
@@ -876,13 +870,13 @@ impl HttpConnection {
     }
 
     async fn open_new_session(&self) -> Result<(), McpError> {
-        let Some(params) = lock(&self.init_params).clone() else {
+        let Some(params) = lock_mutex(&self.init_params).clone() else {
             return Err(McpError::SessionExpired);
         };
         self.stop_listener();
-        *lock(&self.shared.session) = None;
+        *lock_mutex(&self.shared.session) = None;
         self.shared.session_ended.store(true, Ordering::Release);
-        MCP_PROTOCOL_VERSION.clone_into(&mut lock(&self.shared.protocol_version));
+        MCP_PROTOCOL_VERSION.clone_into(&mut lock_mutex(&self.shared.protocol_version));
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let body = json!({"jsonrpc": "2.0", "id": id, "method": "initialize", "params": params});
         let mut deadline = Instant::now() + self.shared.timeout;
@@ -893,7 +887,7 @@ impl HttpConnection {
         let handshake = McpServerHandshake::from_initialize(&result)?;
         handshake
             .protocol_version
-            .clone_into(&mut lock(&self.shared.protocol_version));
+            .clone_into(&mut lock_mutex(&self.shared.protocol_version));
         self.shared
             .post_notification(&json!({
                 "jsonrpc": "2.0", "method": "notifications/initialized", "params": {},
@@ -928,7 +922,7 @@ impl HttpConnection {
             self.renew_session(epoch).await?;
         }
         if method == "initialize" {
-            *lock(&self.init_params) = Some(params.clone());
+            *lock_mutex(&self.init_params) = Some(params.clone());
         }
         let route = progress.map(|sink| {
             Arc::new(ProgressRoute {
@@ -950,7 +944,7 @@ impl HttpConnection {
         }
         let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let _registration = route.as_ref().map(|route| {
-            lock(&self.shared.pending).insert(id, Arc::clone(route));
+            lock_mutex(&self.shared.pending).insert(id, Arc::clone(route));
             PendingGuard {
                 shared: &self.shared,
                 id,
@@ -1036,10 +1030,7 @@ impl McpConnection for HttpConnection {
         progress: Option<McpProgressSink>,
     ) -> McpRequestOutcome<Value> {
         if cancellation.is_cancelled() {
-            return McpRequestOutcome::InterruptedBeforeSend {
-                interruption: McpInterruption::Cancelled,
-                cleanup: McpCleanupStatus::NotRequired,
-            };
+            return McpRequestOutcome::cancelled_before_send();
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         tokio::select! {
@@ -1078,7 +1069,7 @@ impl McpConnection for HttpConnection {
     }
 
     fn set_protocol_version(&self, version: &str) {
-        version.clone_into(&mut lock(&self.shared.protocol_version));
+        version.clone_into(&mut lock_mutex(&self.shared.protocol_version));
     }
 
     async fn notify(&self, method: &str, params: Value) {
@@ -1121,10 +1112,7 @@ impl McpConnection for HttpConnection {
             return McpRequestOutcome::Completed(Err(McpError::Closed));
         }
         if cancellation.is_cancelled() {
-            return McpRequestOutcome::InterruptedBeforeSend {
-                interruption: McpInterruption::Cancelled,
-                cleanup: McpCleanupStatus::NotRequired,
-            };
+            return McpRequestOutcome::cancelled_before_send();
         }
         let body = json!({"jsonrpc": "2.0", "method": method, "params": params});
         let session_sent = self.shared.has_session();
@@ -1201,7 +1189,7 @@ enum Inbound {
 
 /// `expected_id`: the request whose response is awaited. The standalone
 /// stream awaits none, so responses there are ignored.
-fn classify_inbound(message: &Value, expected_id: Option<u64>) -> Inbound {
+fn classify_inbound(message: Value, expected_id: Option<u64>) -> Inbound {
     let method = message.get("method").and_then(Value::as_str);
     if let Some(id) = message.get("id").cloned() {
         if message.get("method").is_some() {
@@ -1211,7 +1199,7 @@ fn classify_inbound(message: &Value, expected_id: Option<u64>) -> Inbound {
             };
         }
         if expected_id.is_some() && id.as_u64() == expected_id {
-            return Inbound::Response(extract_result(message.clone()));
+            return Inbound::Response(extract_result(message));
         }
         return Inbound::Other;
     }
@@ -1246,7 +1234,7 @@ fn parse_message(event: &SseEvent) -> Result<Option<Value>, McpError> {
         .map_err(|error| McpError::Protocol(format!("invalid SSE message: {error}")))
 }
 
-fn extract_result(message: Value) -> Result<Value, McpError> {
+fn extract_result(mut message: Value) -> Result<Value, McpError> {
     if let Some(error) = message.get("error").filter(|error| !error.is_null()) {
         return Err(McpError::Server {
             code: error.get("code").and_then(Value::as_i64).unwrap_or(0),
@@ -1258,8 +1246,8 @@ fn extract_result(message: Value) -> Result<Value, McpError> {
             ),
         });
     }
-    if let Some(result) = message.get("result") {
-        return Ok(result.clone());
+    if let Some(result) = message.get_mut("result") {
+        return Ok(result.take());
     }
     Err(McpError::Protocol(
         "response has neither result nor error".into(),

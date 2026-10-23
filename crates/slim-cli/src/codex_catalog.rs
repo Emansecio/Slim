@@ -61,8 +61,56 @@ struct MemoryCache {
     entries: Vec<CodexCatalogEntry>,
 }
 
+/// Whole catalog request, connection included.
+const CATALOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 static MEMORY_CACHE: Mutex<Option<MemoryCache>> = Mutex::new(None);
 static LAST_REFRESH: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+/// Slugs the account catalog advertised. The bundled list can only be as new as
+/// the last release; this is what the picker and the model-id check follow.
+static LIVE_SLUGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn remember_slugs(entries: &[CodexCatalogEntry]) {
+    if let Ok(mut slugs) = LIVE_SLUGS.lock() {
+        *slugs = entries.iter().map(|entry| entry.slug.clone()).collect();
+    }
+}
+
+/// Whether `model` is served by the signed-in account, either already fetched
+/// or listed in the cached catalog. Falls back to the bundled Codex list.
+pub(crate) fn known_codex_slug(model: &str, cache_path: &Path) -> bool {
+    let model = model.trim();
+    if slim_core::provider::codex_model(model).is_some() {
+        return true;
+    }
+    if LIVE_SLUGS
+        .lock()
+        .is_ok_and(|slugs| slugs.iter().any(|slug| slug == model))
+    {
+        return true;
+    }
+    cached_entries(cache_path)
+        .iter()
+        .any(|entry| entry.slug == model)
+}
+
+/// Every entry the cache file holds, whatever account/endpoint supplied it.
+/// An unreadable or foreign cache is a miss, never an error at this layer.
+fn cached_entries(cache_path: &Path) -> Vec<CodexCatalogEntry> {
+    let Ok(bytes) = fs::read(cache_path) else {
+        return Vec::new();
+    };
+    let Ok(document) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Vec::new();
+    };
+    let Some(entries) = document.get("entries").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let Ok(canonical) = serde_json::to_vec(&serde_json::json!({ "models": entries })) else {
+        return Vec::new();
+    };
+    parse_codex_catalog(&canonical).unwrap_or_default()
+}
 
 #[derive(Clone)]
 pub struct CodexCatalog {
@@ -70,32 +118,35 @@ pub struct CodexCatalog {
     client: reqwest::Client,
 }
 
+/// Where the account catalog is cached: `SLIM_CODEX_MODELS_FILE` or
+/// `~/.slim/codex-models.json`.
+pub(crate) fn codex_cache_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("SLIM_CODEX_MODELS_FILE") {
+        return (!path.is_empty()).then(|| PathBuf::from(path));
+    }
+    let profile = crate::auth::user_home_var()?;
+    (!profile.is_empty()).then(|| PathBuf::from(profile).join(".slim").join("codex-models.json"))
+}
+
+/// Whether the account catalog serves `model`, so a `--model`/`slim.toml` id
+/// newer than the bundled list still reaches the backend.
+pub(crate) fn known_codex_model(model: &str) -> bool {
+    codex_cache_path().is_some_and(|path| known_codex_slug(model, &path))
+}
+
 impl CodexCatalog {
     pub fn production() -> Result<Self, CodexCatalogError> {
-        let cache_path = if let Some(path) = std::env::var_os("SLIM_CODEX_MODELS_FILE") {
-            if path.is_empty() {
-                return Err(CodexCatalogError::UnsafeCache);
-            }
-            PathBuf::from(path)
-        } else {
-            let profile = crate::auth::user_home_var().ok_or(CodexCatalogError::UnsafeCache)?;
-            if profile.is_empty() {
-                return Err(CodexCatalogError::UnsafeCache);
-            }
-            PathBuf::from(profile)
-                .join(".slim")
-                .join("codex-models.json")
-        };
+        let cache_path = codex_cache_path().ok_or(CodexCatalogError::UnsafeCache)?;
         Self::at(cache_path)
     }
 
     pub fn at(cache_path: impl Into<PathBuf>) -> Result<Self, CodexCatalogError> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| CodexCatalogError::Network)?;
+        // The provider's own client: the catalog request opens the connection
+        // the first model request then reuses, instead of a handshake of its own.
+        let client = slim_core::provider::shared_http_client(
+            slim_core::provider::PRODUCTION_CONNECT_TIMEOUT,
+        )
+        .map_err(|_| CodexCatalogError::Network)?;
         Ok(Self {
             cache_path: cache_path.into(),
             client,
@@ -221,6 +272,7 @@ fn read_cache(
     if entries.is_empty() {
         return Err(CodexCatalogError::Empty);
     }
+    remember_slugs(&entries);
     Ok(Some(entries))
 }
 
@@ -240,12 +292,9 @@ pub async fn fetch_codex_catalog(
     account_id: &str,
     cache_path: &Path,
 ) -> Result<CodexCatalogSnapshot, CodexCatalogError> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| CodexCatalogError::Network)?;
+    let client =
+        slim_core::provider::shared_http_client(slim_core::provider::PRODUCTION_CONNECT_TIMEOUT)
+            .map_err(|_| CodexCatalogError::Network)?;
     fetch_with_client(endpoint, access_token, account_id, cache_path, &client).await
 }
 
@@ -264,6 +313,7 @@ async fn fetch_with_client(
         .header("originator", "slim")
         .header("User-Agent", "slim/0.1.0")
         .header("accept", "application/json")
+        .timeout(CATALOG_REQUEST_TIMEOUT)
         .send()
         .await
         .map_err(|_| CodexCatalogError::Network)?;
@@ -293,6 +343,7 @@ async fn fetch_with_client(
     if entries.is_empty() {
         return Err(CodexCatalogError::Empty);
     }
+    remember_slugs(&entries);
     let _ = write_cache(cache_path, &entries, &catalog_key(endpoint, account_id));
     if let Ok(mut guard) = MEMORY_CACHE.lock() {
         *guard = Some(MemoryCache {
@@ -318,6 +369,9 @@ fn write_cache(
             serde_json::json!({
                 "slug": entry.slug,
                 "context_window": entry.context_window,
+                "display_name": entry.display_name,
+                "supported_reasoning_levels": entry.reasoning_levels,
+                "visibility": if entry.visible { "list" } else { "hide" },
             })
         }).collect::<Vec<_>>(),
     });

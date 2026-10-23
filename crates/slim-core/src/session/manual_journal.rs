@@ -136,7 +136,9 @@ impl ManualRunJournal {
             .zip(&assistant.tool_calls)
             .map(|(original, redacted)| (original.id.clone(), redacted.id.clone()))
             .collect();
-        self.append(assistant)?;
+        // The only entry written ahead of external effects: it must reach
+        // stable storage (full sync), not just be ordered.
+        self.append_entry(assistant, true)?;
         self.batch_id = Some(batch_id.to_owned());
         self.pending = pending;
         for (original, redacted) in &call_ids {
@@ -191,7 +193,6 @@ impl ManualRunJournal {
                     return Err(io::Error::other("durable tool result has no pending call"));
                 }
                 let mut artifact_error = None;
-                let durable_output = output.clone();
                 if output.len() > self.max_result_bytes {
                     if let Some(store) = self.artifact_store.as_ref() {
                         if let Err(error) = store.put(&format!("tool-{name}"), output.as_bytes()) {
@@ -203,8 +204,8 @@ impl ManualRunJournal {
                 // Model-facing projection is selected later by the aggregate
                 // planner, so a cursor or head/tail preview can never become
                 // the replay source of truth.
-                let output = durable_output;
-                let entry_id = self.append(ProviderMessage::tool(name, &call_id, output))?;
+                let entry_id =
+                    self.append(ProviderMessage::tool(name, &call_id, output.clone()))?;
                 self.tool_entries.insert(call_id.clone(), entry_id);
                 self.pending.remove(&call_id);
                 if let Some(error) = artifact_error {
@@ -371,6 +372,9 @@ impl ManualRunJournal {
                     "output_tokens": usage.map(|usage| usage.output_tokens),
                     "cache_read_tokens": usage.and_then(|usage| usage.cache_read_tokens),
                     "cache_write_tokens": usage.and_then(|usage| usage.cache_write_tokens),
+                    "input_items": telemetry.input_items,
+                    "reused_input_items": telemetry.reused_input_items,
+                    "turn_state": telemetry.turn_state,
                 }),
             },
         });
@@ -606,6 +610,23 @@ impl ManualRunJournal {
         if !self.presentation_fact_keys.insert(entry_id.clone()) {
             return Ok(());
         }
+        // A projection identical to the raw entry adds nothing on replay; the
+        // key above is already marked so a repeat stays deduplicated.
+        let is_raw = self
+            .repo
+            .records()
+            .iter()
+            .rev()
+            .find_map(|record| match record {
+                DurableRecord::Entry { entry, .. } if entry.entry_id == entry_id => {
+                    Some(entry.content == message.content)
+                }
+                _ => None,
+            })
+            .unwrap_or(false);
+        if is_raw {
+            return Ok(());
+        }
         let seq = self.repo.next_seq()?;
         let fact = DurableFact {
             namespace: "tool.presentation.v1".into(),
@@ -621,6 +642,10 @@ impl ManualRunJournal {
     }
 
     fn append(&mut self, message: ProviderMessage) -> io::Result<String> {
+        self.append_entry(message, false)
+    }
+
+    fn append_entry(&mut self, message: ProviderMessage, full_sync: bool) -> io::Result<String> {
         self.check()?;
         let seq = self.repo.next_seq()?;
         let entry_id = format!("{}-message-{seq}", self.spec.operation_id);
@@ -631,7 +656,12 @@ impl ManualRunJournal {
             message,
         )
         .map_err(io::Error::other)?;
-        let result = self.repo.append(DurableRecord::Entry { seq, entry });
+        let record = DurableRecord::Entry { seq, entry };
+        let result = if full_sync {
+            self.repo.append_full_sync(record)
+        } else {
+            self.repo.append(record)
+        };
         self.remember_failure(result)?;
         self.parent = entry_id;
         self.entries_written += 1;
@@ -830,6 +860,9 @@ mod tests {
                 code: Some("header-secret".into()),
                 retry_after_ms: Some(2500),
                 usage: None,
+                input_items: 3,
+                reused_input_items: None,
+                turn_state: Some("captured"),
             })
             .unwrap();
         journal
@@ -849,6 +882,9 @@ mod tests {
                     cache_read_tokens: Some(1_024),
                     cache_write_tokens: Some(0),
                 }),
+                input_items: 5,
+                reused_input_items: Some(3),
+                turn_state: Some("replayed"),
             })
             .unwrap();
         drop(journal);
@@ -885,6 +921,14 @@ mod tests {
         assert_eq!(facts[1].value["output_tokens"], 40);
         assert_eq!(facts[1].value["cache_read_tokens"], 1_024);
         assert_eq!(facts[1].value["cache_write_tokens"], 0);
+        // Cache diagnosis: the run's prefix reuse and its routing token use,
+        // never the token itself.
+        assert_eq!(facts[0].value["input_items"], 3);
+        assert!(facts[0].value["reused_input_items"].is_null());
+        assert_eq!(facts[0].value["turn_state"], "captured");
+        assert_eq!(facts[1].value["input_items"], 5);
+        assert_eq!(facts[1].value["reused_input_items"], 3);
+        assert_eq!(facts[1].value["turn_state"], "replayed");
         let raw = fs::read_to_string(root.join("session.jsonl")).unwrap();
         assert!(!raw.contains("prompt-marker"));
         assert!(!raw.contains("body-marker"));
@@ -933,6 +977,9 @@ mod tests {
             code: None,
             retry_after_ms: None,
             usage: None,
+            input_items: 0,
+            reused_input_items: None,
+            turn_state: None,
         };
         let first = journal.record_provider_call(&telemetry).unwrap();
         let later = journal.record_provider_call(&telemetry).unwrap();
@@ -1526,6 +1573,87 @@ mod tests {
                 .count(),
             2
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_the_tool_call_batch_entry_uses_a_full_sync() {
+        use crate::session::jsonl_repo::take_append_full_sync_calls;
+
+        let (root, mut journal) = fixture();
+        let calls = vec![call("a")];
+        let _ = take_append_full_sync_calls();
+        journal
+            .begin_tools(
+                "batch",
+                ProviderMessage::assistant("first", calls.clone()),
+                &calls,
+            )
+            .unwrap();
+        assert_eq!(take_append_full_sync_calls(), 1);
+        journal.record_event(&output("a", "result")).unwrap();
+        journal
+            .record_message(ProviderMessage::assistant("done", Vec::new()))
+            .unwrap();
+        journal.finish(ProviderResponse::new("done", None)).unwrap();
+        assert_eq!(take_append_full_sync_calls(), 0);
+        drop(journal);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn presentation_identical_to_the_raw_entry_writes_no_fact() {
+        let (root, mut journal) = fixture();
+        let calls = vec![call("same")];
+        journal
+            .begin_tools(
+                "batch-1",
+                ProviderMessage::assistant("first", calls.clone()),
+                &calls,
+            )
+            .unwrap();
+        journal
+            .record_event(&EventKind::ToolOutput {
+                batch_id: "batch-1".into(),
+                call_id: "same".into(),
+                name: "read".into(),
+                output: "raw-same".into(),
+            })
+            .unwrap();
+        let presented = ProviderMessage::tool("read", "same", "raw-same");
+        journal.record_message(presented.clone()).unwrap();
+        journal.record_message(presented).unwrap();
+        journal
+            .record_message(ProviderMessage::assistant("done", Vec::new()))
+            .unwrap();
+        journal.finish(ProviderResponse::new("done", None)).unwrap();
+        drop(journal);
+
+        let report = preflight_session(root.join("session.jsonl")).unwrap();
+        assert_eq!(
+            report
+                .records
+                .iter()
+                .filter(|record| matches!(record, DurableRecord::Fact { fact, .. } if fact.namespace == "tool.presentation.v1"))
+                .count(),
+            0
+        );
+        let raw =
+            provider_messages_from_entries(report.records.iter().filter_map(
+                |record| match record {
+                    DurableRecord::Entry { entry, .. } => Some(entry),
+                    _ => None,
+                },
+            ))
+            .unwrap();
+        let projected = provider_messages_from_records(report.records.iter()).unwrap();
+        let contents = |messages: &[ProviderMessage]| {
+            messages
+                .iter()
+                .map(|message| message.content.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(contents(&projected), contents(&raw));
         fs::remove_dir_all(root).unwrap();
     }
 }

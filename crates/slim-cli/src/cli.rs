@@ -307,22 +307,9 @@ where
         let provider_name = provider
             .or(environment_provider)
             .unwrap_or_else(|| "openai-compatible".into());
-        let kind = match provider_name.to_ascii_lowercase().as_str() {
-            "openai" | "openai-compatible" | "openai_compatible" => ProviderKind::OpenAiCompatible,
-            "openai-codex" | "codex" => ProviderKind::OpenAiCodex,
-            "anthropic" | "claude" => ProviderKind::Anthropic,
-            "opencode-go" | "opencode_go" | "go" => ProviderKind::OpenCodeGo,
-            "opencode-zen" | "opencode_zen" | "zen" => ProviderKind::OpenCodeZen,
-            "clinepass" | "cline-pass" | "cp" => ProviderKind::ClinePass,
-            "command-code" | "commandcode" | "cmd" => ProviderKind::CommandCode,
-            "xai" | "grok" => ProviderKind::Xai,
-            "open-design" | "opendesign" | "od" => ProviderKind::OpenDesign,
-            _ => {
-                return failure(
-                    ExitCode::Provider,
-                    "unsupported provider; use openai-compatible, openai-codex, anthropic, opencode-go, opencode-zen, clinepass, command-code, xai, or open-design\n",
-                )
-            }
+        let kind = match parse_provider_kind(&provider_name) {
+            Ok(kind) => kind,
+            Err(message) => return failure(ExitCode::Provider, &format!("{message}\n")),
         };
         let default_endpoint = default_provider_endpoint(kind);
         if codex_fast.is_some() && kind != ProviderKind::OpenAiCodex {
@@ -331,11 +318,11 @@ where
                 "--fast/--normal require the openai-codex provider\n",
             );
         }
-        let default_model = default_provider_model(kind);
         let layered_config = match crate::config::load_layered() {
             Ok(config) => config,
             Err(error) => return failure(ExitCode::Internal, &format!("config error: {error}\n")),
         };
+        let run_limits = layered_config.run_limits();
         let compaction_policy = match layered_config.compaction_policy() {
             Ok(policy) => policy,
             Err(error) => return failure(ExitCode::Internal, &format!("config error: {error}\n")),
@@ -423,11 +410,8 @@ where
                 oauth_context,
             );
         }
-        let model = explicit_model
-            .or(layered_config.model)
-            .filter(|model| crate::provider_compatible_model(kind, model))
-            .unwrap_or_else(|| default_model.into());
-        let model = crate::canonical_provider_model(kind, &model);
+        let model =
+            resolve_provider_model(kind, explicit_model.or(layered_config.model).as_deref());
         let timeout = match resolve_timeout_secs(layered_config.timeout_secs) {
             Ok(timeout) => timeout,
             Err(error) => return finish_oauth_output(provider_failure(error), oauth_context),
@@ -452,9 +436,13 @@ where
             .or_else(|| std::env::var("SLIM_EFFORT").ok())
             .filter(|value| !value.is_empty())
             .or(layered_config.effort);
-        let mut options = ProviderRunOptions::default()
-            .with_content_blocks(content_blocks)
-            .with_compaction_handle(slim_core::context::CompactionHandle::new(compaction_policy));
+        let mut options = run_limits.apply(
+            ProviderRunOptions::default()
+                .with_content_blocks(content_blocks)
+                .with_compaction_handle(slim_core::context::CompactionHandle::new(
+                    compaction_policy,
+                )),
+        );
         options.shell_job_limits = layered_config.shell_jobs;
         if let Some(experiment_id) = experiment_id {
             options = options.with_experiment_id(experiment_id);
@@ -467,27 +455,6 @@ where
         }
         options.codex_fast = codex_fast;
         options.trust_project = trust_project;
-        if let Some(calls) = layered_config.max_mutating_tool_calls {
-            options = options.with_max_tool_calls(calls);
-        }
-        if let Some(calls) = layered_config.max_read_tool_calls {
-            options = options.with_max_read_tool_calls(calls);
-        }
-        if let Some(calls) = layered_config.max_total_tool_calls {
-            options = options.with_max_total_tool_calls(calls);
-        }
-        if let Some(turns) = layered_config.max_turns {
-            options = options.with_max_turns(turns);
-        }
-        if let Some(secs) = layered_config.time_budget_secs {
-            options = options.with_time_budget_secs(secs);
-        }
-        if let Some(tokens) = layered_config.max_output_tokens {
-            options = options.with_max_output_tokens(tokens);
-        }
-        if let Some(bytes) = layered_config.max_result_bytes {
-            options = options.with_max_result_bytes(bytes);
-        }
         let provider_result = match resume_preflight {
             Some(preflight) => {
                 crate::headless::run_provider_headless_with_resume_preflight_and_options(
@@ -664,6 +631,35 @@ fn finish_oauth_output(output: CliOutput, context: Option<HeadlessOAuthContext>)
         Some(context) => append_oauth_warnings(output, &context.shutdown()),
         None => output,
     }
+}
+
+const UNSUPPORTED_PROVIDER_MESSAGE: &str = "unsupported provider; use openai-compatible, openai-codex, anthropic, opencode-go, opencode-zen, clinepass, command-code, xai, or open-design";
+
+/// Maps a provider name (flag, `SLIM_PROVIDER`, stored key) to its kind; the
+/// error is the user-facing refusal shared by the headless and TUI entries.
+pub(crate) fn parse_provider_kind(name: &str) -> Result<ProviderKind, &'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "openai" | "openai-compatible" | "openai_compatible" => Ok(ProviderKind::OpenAiCompatible),
+        "openai-codex" | "codex" => Ok(ProviderKind::OpenAiCodex),
+        "anthropic" | "claude" => Ok(ProviderKind::Anthropic),
+        "opencode-go" | "opencode_go" | "go" => Ok(ProviderKind::OpenCodeGo),
+        "opencode-zen" | "opencode_zen" | "zen" => Ok(ProviderKind::OpenCodeZen),
+        "clinepass" | "cline-pass" | "cp" => Ok(ProviderKind::ClinePass),
+        "command-code" | "commandcode" | "cmd" => Ok(ProviderKind::CommandCode),
+        "xai" | "grok" => Ok(ProviderKind::Xai),
+        "open-design" | "opendesign" | "od" => Ok(ProviderKind::OpenDesign),
+        _ => Err(UNSUPPORTED_PROVIDER_MESSAGE),
+    }
+}
+
+/// G248: a configured model only applies when it validates against the
+/// provider kind; otherwise the provider default is used. Codex ids are
+/// canonicalised.
+pub(crate) fn resolve_provider_model(kind: ProviderKind, configured: Option<&str>) -> String {
+    let model = configured
+        .filter(|model| crate::provider_compatible_model(kind, model))
+        .unwrap_or_else(|| default_provider_model(kind));
+    crate::canonical_provider_model(kind, model)
 }
 
 pub(crate) fn default_provider_endpoint(kind: ProviderKind) -> &'static str {

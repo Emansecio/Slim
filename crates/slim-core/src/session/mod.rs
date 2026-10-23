@@ -27,10 +27,7 @@ pub use crate::context::CompactionReason;
 pub use attempts::{
     Attempt, AttemptErrorClass, AttemptLedger, AttemptLedgerError, RetryAttempt, RetryPlanError,
 };
-pub use branch_v2::{
-    branch_durable_v2, branch_v2, create_durable_branch, create_durable_branch_compacted,
-    DurableBranch,
-};
+pub use branch_v2::{branch_v2, create_durable_branch_compacted, DurableBranch};
 pub use capabilities::{
     AuthorizationGrant, AuthorizationRequirement, CapabilityCatalog, CapabilityDescriptor,
     CapabilityDispatch, CapabilityDispatcher, CapabilityExecutionState, CapabilityKind,
@@ -58,9 +55,9 @@ pub use recovery::{branch, recover, RecoveredSession};
 pub use reducer::{reduce, restore_records, DurableState, ReduceError};
 pub use repository::DurableRepo;
 pub use resume::{
-    open_resume_v2, preflight, preflight_session, recover_durable_v2, recover_v2, resume_plan,
-    resume_plan_from_path, resume_plan_from_preflight, PreflightStatus, ResumePlan,
-    ResumePlanError, SessionPreflight, SessionSummary,
+    open_resume_v2, preflight_session, recover_durable_v2, resume_plan_from_path,
+    resume_plan_from_preflight, PreflightStatus, ResumePlan, ResumePlanError, SessionPreflight,
+    SessionSummary,
 };
 pub use schema_v2::{
     CompactionCheckpoint, DurableEntry, DurableEntryRole, DurableErrorClass, DurableFact,

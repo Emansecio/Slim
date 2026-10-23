@@ -9,6 +9,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::runtime::CancellationToken;
+use crate::sync::lock_mutex;
 use serde::{Deserialize, Serialize};
 
 #[cfg(all(test, windows))]
@@ -73,11 +74,7 @@ impl ExecutableResolver {
         }
 
         let (path, path_ext) = self.environment_values();
-        let generation = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .generation;
+        let generation = lock_mutex(&self.inner).generation;
         let key = ResolverKey {
             generation,
             program: program.as_os_str().to_os_string(),
@@ -85,10 +82,7 @@ impl ExecutableResolver {
             path_ext: path_ext.clone(),
         };
         {
-            let mut state = self
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut state = lock_mutex(&self.inner);
             if let Some(cached) = state.cache.get(&key).cloned() {
                 if cached
                     .as_ref()
@@ -103,20 +97,14 @@ impl ExecutableResolver {
         }
 
         let resolved = search_path(program.as_os_str(), &path, &path_ext);
-        let mut state = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = lock_mutex(&self.inner);
         insert_bounded(&mut state, key, resolved.clone());
         Ok(resolved)
     }
 
     /// Clears positive and negative entries while retaining this shared instance.
     pub fn bump_generation(&self) {
-        let mut state = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = lock_mutex(&self.inner);
         state.generation = state.generation.wrapping_add(1);
         state.cache.clear();
         state.order.clear();
@@ -537,10 +525,10 @@ impl ProcessRunner {
                     #[cfg(windows)]
                     let tree_result = job.terminate();
                     #[cfg(unix)]
-                    let tree_result = terminate_process_tree(&self.resolver, pid);
+                    let tree_result = terminate_process_tree(pid);
                     if status.is_none() {
-                        // Retain the child handle: even a missing or failed tree
-                        // utility must not prevent terminating the direct child.
+                        // Retain the child handle: even a failed tree
+                        // termination must not prevent terminating the direct child.
                         let _ = child.kill();
                         status = wait_for_exit(&mut child, Duration::from_millis(500))?;
                     }
@@ -555,10 +543,7 @@ impl ProcessRunner {
                 }
                 let elapsed = started.elapsed();
                 if elapsed >= next_progress {
-                    let snapshot = progress
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .snapshot(elapsed);
+                    let snapshot = lock_mutex(&progress).snapshot(elapsed);
                     on_progress(snapshot);
                     next_progress = next_progress.saturating_add(Duration::from_secs(1));
                 }
@@ -657,13 +642,13 @@ impl Drop for UnixTree {
 /// `KILL_ON_JOB_CLOSE`.) Lock-free slots, because the signal handler may only
 /// use async-signal-safe operations.
 #[cfg(unix)]
-mod live_groups {
+pub(crate) mod live_groups {
     use std::sync::atomic::{AtomicI32, Ordering};
 
     const SLOTS: usize = 256;
     static GROUPS: [AtomicI32; SLOTS] = [const { AtomicI32::new(0) }; SLOTS];
 
-    pub(super) fn register(group: i32) {
+    pub(crate) fn register(group: i32) {
         // A full table only loses the cleanup on signal, never the child.
         let _ = GROUPS.iter().any(|slot| {
             slot.compare_exchange(0, group, Ordering::AcqRel, Ordering::Relaxed)
@@ -671,7 +656,7 @@ mod live_groups {
         });
     }
 
-    pub(super) fn unregister(group: i32) {
+    pub(crate) fn unregister(group: i32) {
         let _ = GROUPS.iter().any(|slot| {
             slot.compare_exchange(group, 0, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
@@ -986,9 +971,7 @@ fn read_pipe(
                 tail.extend(trailing);
             }
         }
-        let mut progress = progress
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut progress = lock_mutex(&progress);
         if let Some(observer) = &progress.observer {
             (observer.output)(
                 match kind {
@@ -1056,56 +1039,22 @@ fn join_pipe(reader: JoinHandle<io::Result<PipeCapture>>, stream: &str) -> io::R
         .map_err(|_| io::Error::other(format!("process {stream} reader panicked")))?
 }
 
-#[cfg(any(unix, test))]
-fn resolve_termination_program(resolver: &ExecutableResolver) -> io::Result<Option<PathBuf>> {
-    #[cfg(windows)]
-    let program = "taskkill.exe";
-    #[cfg(unix)]
-    let program = "kill";
-    resolver.resolve(program)
-}
-
+/// Kills the process group `pid` created by `process_group(0)`.
+///
+/// A group that no longer exists (ESRCH) is already terminated. macOS reports
+/// EPERM instead when the group holds only zombies (leader exited but not yet
+/// reaped), so it is also not a failure; callers still prove the death of the
+/// direct child with `try_wait`.
 #[cfg(unix)]
-pub(crate) fn terminate_process_tree(resolver: &ExecutableResolver, pid: u32) -> io::Result<()> {
-    let program = resolve_termination_program(resolver)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "process tree termination utility unavailable",
-        )
-    })?;
-    #[cfg(windows)]
-    let args = vec![
-        "/PID".to_owned(),
-        pid.to_string(),
-        "/T".to_owned(),
-        "/F".to_owned(),
-    ];
-    #[cfg(unix)]
-    let args = vec!["-KILL".to_owned(), "--".to_owned(), format!("-{pid}")];
-    let mut command = std::process::Command::new(program);
-    command
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+pub(crate) fn terminate_process_tree(pid: u32) -> io::Result<()> {
+    // SAFETY: only the group created for this child is targeted.
+    if unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } == 0 {
+        return Ok(());
     }
-    let mut child = command.spawn()?;
-    match wait_for_exit(&mut child, Duration::from_millis(500))? {
-        Some(status) if status.success() => Ok(()),
-        Some(status) => Err(io::Error::other(format!(
-            "termination utility exited with {status}"
-        ))),
-        None => {
-            let _ = child.kill();
-            let _ = wait_for_exit(&mut child, Duration::from_millis(100));
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "termination utility timed out",
-            ))
-        }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH | libc::EPERM) => Ok(()),
+        _ => Err(error),
     }
 }
 
@@ -1288,12 +1237,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn missing_termination_utility_does_not_block_cancellation() {
+    fn cancellation_terminates_process_group_without_blocking() {
         let runner = ProcessRunner::new(ExecutableResolver::with_environment("".into(), "".into()));
         let cancellation = CancellationToken::new();
         cancellation.cancel();
         let started = Instant::now();
-        let error = runner
+        let output = runner
             .run(ProcessRequest {
                 cwd: std::env::current_dir().unwrap(),
                 program: std::env::current_exe().unwrap(),
@@ -1309,48 +1258,61 @@ mod tests {
                 cancellation: Some(cancellation),
                 output_budget: ProcessOutputBudget::per_stream(1024),
             })
-            .expect_err("unconfirmed tree termination must be visible");
+            .expect("tree termination is a syscall and needs no external utility");
         assert!(started.elapsed() < Duration::from_secs(2));
-        assert!(
-            error.to_string().contains("termination unconfirmed"),
-            "{error}"
-        );
+        assert!(output.cancelled);
     }
 
+    #[cfg(unix)]
+    fn spawn_in_new_group(script: &str) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("sh")
+            .args(["-c", script])
+            .process_group(0)
+            .spawn()
+            .expect("spawn")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_process_tree_kills_a_live_group() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = spawn_in_new_group("sleep 30 & wait");
+        terminate_process_tree(child.id()).expect("kill live group");
+        let status = child.wait().expect("wait");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_process_tree_accepts_a_zombie_only_group() {
+        // The leader exits but is not reaped: macOS answers EPERM to kill(-pgid).
+        let mut child = spawn_in_new_group("exit 0");
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waits for this child's exit without reaping it.
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(waited, 0, "{}", io::Error::last_os_error());
+        terminate_process_tree(child.id()).expect("zombie-only group is already dead");
+        assert!(child.wait().expect("wait").success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_process_tree_accepts_a_missing_group() {
+        terminate_process_tree(i32::MAX as u32).expect("missing group is already dead");
+    }
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "slim-executable-resolver-{}-{name}",
             std::process::id()
         ))
-    }
-
-    #[test]
-    fn termination_utility_is_resolved_from_explicit_path_environment() {
-        let root = temp_root("termination");
-        fs::create_dir_all(&root).expect("root");
-        let name = if cfg!(windows) {
-            "taskkill.exe"
-        } else {
-            "kill"
-        };
-        let executable = root.join(name);
-        fs::write(&executable, b"fixture").expect("executable");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
-                .expect("executable mode");
-        }
-        let resolver = ExecutableResolver::with_environment(
-            std::env::join_paths([&root]).expect("PATH"),
-            OsString::from(if cfg!(windows) { ".EXE" } else { "" }),
-        );
-
-        assert_eq!(
-            resolve_termination_program(&resolver).expect("resolve"),
-            Some(executable)
-        );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

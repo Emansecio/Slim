@@ -2,12 +2,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::api::{
-    BlockId, LoginProvider, McpStatusView, ModelAlias, PromptOrigin, ReasoningEffort, UiCommand,
-    UiEvent,
+    BlockId, LoginProvider, McpStatusView, ModelAlias, OpenCodeModelView, PromptOrigin,
+    ReasoningEffort, UiCommand, UiEvent,
 };
 use crate::app::{
     AppState, EffortOverlay, EffortTarget, FollowMode, FrameClock, LoginOverlay, LoginStage,
-    McpConfirm, ModelOverlay, ModelRow, NotificationPriority, ScrollAnchor,
+    McpConfirm, ModelCatalogs, ModelOverlay, ModelRow, NotificationPriority, ScrollAnchor,
 };
 use crate::block::{BlockKind, InteractionRequestKind};
 use crate::composer::ComposerError;
@@ -1717,20 +1717,14 @@ fn open_model_overlay(state: &mut AppState) -> Vec<Effect> {
     // listed; selecting a model of a non-connected provider is
     // rejected by the CLI handler with a notification.
     state.effort_overlay = None;
-    let mut overlay = ModelOverlay::for_current(
-        &state.model,
-        state.auth_provider,
-        &state.open_code_models,
-        &state.cline_pass_models,
-        &state.command_code_models,
-        &state.zen_models,
-        &state.open_design_models,
-    );
+    let mut overlay =
+        ModelOverlay::for_current(&state.model, state.auth_provider, &state.model_catalogs());
     overlay.pending_fast = state.codex_fast;
     state.model_overlay = Some(overlay);
     state.menu_focus_at_ms = Some(state.clock.elapsed_ms);
     state.revisions.status += 1;
     vec![
+        Effect::Send(UiCommand::RefreshCodexModels),
         Effect::Send(UiCommand::RefreshOpenCodeModels),
         Effect::Send(UiCommand::RefreshClinePassModels),
         Effect::Send(UiCommand::RefreshCommandCodeModels),
@@ -2071,6 +2065,7 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
     // compaction) keeps the draft so the user can fix and resubmit it instead
     // of retyping after the 5 s toast expires.
     let mut keep_draft = false;
+    let shortcut = login_shortcut(&command);
     match command.as_str() {
         "" => {}
         "/jobs" => {
@@ -2115,75 +2110,25 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
             state.login_overlay = Some(LoginOverlay::default());
             state.revisions.status += 1;
         }
-        "/login anthropic" => {
-            state.login_overlay = Some(LoginOverlay {
-                in_progress: true,
-                ..LoginOverlay::default()
-            });
-            effects.push(Effect::Send(UiCommand::StartLogin(
-                LoginProvider::Anthropic,
-            )));
-            state.revisions.status += 1;
-        }
-        "/login codex" | "/login openai-codex" => {
-            state.login_overlay = Some(LoginOverlay {
-                selected: 1,
-                in_progress: true,
-                ..LoginOverlay::default()
-            });
-            effects.push(Effect::Send(UiCommand::StartLogin(
-                LoginProvider::OpenAiCodex,
-            )));
-            state.revisions.status += 1;
-        }
-        "/login opencode" | "/login opencode-go" => {
-            state.login_overlay = Some(LoginOverlay {
-                selected: 2,
-                stage: LoginStage::ApiKey(Default::default()),
-                ..LoginOverlay::default()
-            });
-            state.revisions.status += 1;
-        }
-        "/login clinepass" | "/login cline-pass" => {
-            state.login_overlay = Some(LoginOverlay {
-                selected: 3,
-                stage: LoginStage::ApiKey(Default::default()),
-                ..LoginOverlay::default()
-            });
-            state.revisions.status += 1;
-        }
-        "/login command-code" | "/login commandcode" | "/login cmd" => {
-            state.login_overlay = Some(LoginOverlay {
-                selected: 4,
-                stage: LoginStage::ApiKey(Default::default()),
-                ..LoginOverlay::default()
-            });
-            state.revisions.status += 1;
-        }
-        "/login open-design" | "/login opendesign" | "/login od" => {
-            state.login_overlay = Some(LoginOverlay {
-                selected: 7,
-                stage: LoginStage::ApiKey(Default::default()),
-                ..LoginOverlay::default()
-            });
-            state.revisions.status += 1;
-        }
-        "/login xai" | "/login grok" => {
-            state.login_overlay = Some(LoginOverlay {
-                selected: 5,
-                in_progress: true,
-                ..LoginOverlay::default()
-            });
-            effects.push(Effect::Send(UiCommand::StartLogin(LoginProvider::Xai)));
-            state.revisions.status += 1;
-        }
-        "/login opencode-zen" | "/login zen" => {
-            state.login_overlay = Some(LoginOverlay {
-                selected: 6,
-                stage: LoginStage::ApiKey(Default::default()),
-                ..LoginOverlay::default()
-            });
-            state.revisions.status += 1;
+        _ if shortcut.is_some() => {
+            if let Some(shortcut) = shortcut {
+                state.login_overlay = Some(match shortcut.flow {
+                    LoginFlow::Oauth(provider) => {
+                        effects.push(Effect::Send(UiCommand::StartLogin(provider)));
+                        LoginOverlay {
+                            selected: shortcut.selected,
+                            in_progress: true,
+                            ..LoginOverlay::default()
+                        }
+                    }
+                    LoginFlow::ApiKey => LoginOverlay {
+                        selected: shortcut.selected,
+                        stage: LoginStage::ApiKey(Default::default()),
+                        ..LoginOverlay::default()
+                    },
+                });
+                state.revisions.status += 1;
+            }
         }
         "/logout" => {
             if state.running_jobs() > 0 {
@@ -2267,13 +2212,12 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
             }
             state.revisions.status += 1;
         }
-        "/image" => {
-            state.push_notification("Uso: /image CAMINHO".into());
-            keep_draft = true;
-            state.revisions.status += 1;
-        }
-        _ if command.starts_with("/image ") => {
-            let path = command.trim_start_matches("/image ").trim();
+        _ if command == "/image" || command.starts_with("/image ") => {
+            let path = if command == "/image" {
+                ""
+            } else {
+                command.trim_start_matches("/image ").trim()
+            };
             if path.is_empty() {
                 state.push_notification("Uso: /image CAMINHO".into());
                 keep_draft = true;
@@ -2292,22 +2236,14 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
             state.inspector.toggle(kind);
             state.revisions.focus += 1;
         }
-        "/compact" => {
+        _ if command == "/compact" || command.starts_with("/compact ") => {
             if state.authenticated {
-                effects.push(Effect::Send(UiCommand::Compact {
-                    instructions: String::new(),
-                }));
-            } else {
-                state.push_notification("Nenhum provedor conectado. Use /login.".into());
-                keep_draft = true;
-            }
-            state.revisions.status += 1;
-        }
-        _ if command.starts_with("/compact ") => {
-            if state.authenticated {
-                effects.push(Effect::Send(UiCommand::Compact {
-                    instructions: command.trim_start_matches("/compact ").trim().to_owned(),
-                }));
+                let instructions = if command == "/compact" {
+                    String::new()
+                } else {
+                    command.trim_start_matches("/compact ").trim().to_owned()
+                };
+                effects.push(Effect::Send(UiCommand::Compact { instructions }));
             } else {
                 state.push_notification("Nenhum provedor conectado. Use /login.".into());
                 keep_draft = true;
@@ -2341,21 +2277,39 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
             let value = command.trim_start_matches("/model ").trim();
             match state.auth_provider {
                 Some(LoginProvider::OpenAiCodex) => {
-                    if let Some(alias) = ModelAlias::parse(value) {
-                        let effort = if ReasoningEffort::supported(alias).contains(&state.effort) {
-                            state.effort
-                        } else {
-                            ReasoningEffort::default_for(alias)
-                        };
+                    // `sol`/`terra`/`luna` stay shortcuts; every other value
+                    // must be a model of the account's Codex catalog.
+                    let model = ModelAlias::parse(value).map_or_else(
+                        || {
+                            state
+                                .codex_models
+                                .iter()
+                                .find(|model| model.id.eq_ignore_ascii_case(value))
+                                .cloned()
+                        },
+                        |alias| {
+                            state
+                                .codex_models
+                                .iter()
+                                .find(|model| model.id == alias.id())
+                                .cloned()
+                        },
+                    );
+                    if let Some(model) = model {
+                        let effort = state
+                            .codex_models
+                            .iter()
+                            .find(|candidate| candidate.id == model.id)
+                            .map_or(state.effort, |candidate| {
+                                catalog_effort(&candidate.reasoning_levels, state.effort)
+                            });
                         effects.push(Effect::Send(UiCommand::SetModel {
-                            model: alias,
+                            model: model.id,
                             effort,
                             fast: state.codex_fast,
                         }));
                     } else {
-                        state.push_notification(
-                            "Modelo desconhecido. Use sol, terra ou luna.".into(),
-                        );
+                        state.push_notification("Modelo Codex desconhecido. Use /models.".into());
                         keep_draft = true;
                     }
                 }
@@ -2394,79 +2348,40 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                 Some(LoginProvider::ClinePass) => {
                     // G249: textual `/model <id>` also works while ClinePass is
                     // connected; use the same effort step as the model picker.
-                    if let Some(model) = state
-                        .cline_pass_models
-                        .iter()
-                        .find(|model| model.id == value)
-                    {
-                        if model.reasoning_levels.is_empty() {
-                            effects.push(Effect::Send(UiCommand::SetClinePassModel {
-                                model: model.id.clone(),
-                                effort: state.effort,
-                            }));
-                        } else {
-                            state.effort_overlay = Some(EffortOverlay::for_catalog(
-                                EffortTarget::ClinePass(model.id.clone()),
-                                model.reasoning_levels.clone(),
-                                state.effort,
-                            ));
-                        }
-                    } else {
-                        state.push_notification(
-                            "Modelo ClinePass desconhecido. Use /models.".into(),
-                        );
-                        keep_draft = true;
-                    }
+                    let found = catalog_entry(&state.cline_pass_models, value);
+                    select_stepped_model(
+                        state,
+                        &mut effects,
+                        &mut keep_draft,
+                        found,
+                        "Modelo ClinePass desconhecido. Use /models.",
+                        EffortTarget::ClinePass,
+                        |model, effort| UiCommand::SetClinePassModel { model, effort },
+                    );
                 }
                 Some(LoginProvider::CommandCode) => {
-                    if let Some(model) = state
-                        .command_code_models
-                        .iter()
-                        .find(|model| model.id == value)
-                    {
-                        if model.reasoning_levels.is_empty() {
-                            effects.push(Effect::Send(UiCommand::SetCommandCodeModel {
-                                model: model.id.clone(),
-                                effort: state.effort,
-                            }));
-                        } else {
-                            state.effort_overlay = Some(EffortOverlay::for_catalog(
-                                EffortTarget::CommandCode(model.id.clone()),
-                                model.reasoning_levels.clone(),
-                                state.effort,
-                            ));
-                        }
-                    } else {
-                        state.push_notification(
-                            "Modelo Command Code desconhecido. Use /models.".into(),
-                        );
-                        keep_draft = true;
-                    }
+                    let found = catalog_entry(&state.command_code_models, value);
+                    select_stepped_model(
+                        state,
+                        &mut effects,
+                        &mut keep_draft,
+                        found,
+                        "Modelo Command Code desconhecido. Use /models.",
+                        EffortTarget::CommandCode,
+                        |model, effort| UiCommand::SetCommandCodeModel { model, effort },
+                    );
                 }
                 Some(LoginProvider::OpenDesign) => {
-                    if let Some(model) = state
-                        .open_design_models
-                        .iter()
-                        .find(|model| model.id == value)
-                    {
-                        if model.reasoning_levels.is_empty() {
-                            effects.push(Effect::Send(UiCommand::SetOpenDesignModel {
-                                model: model.id.clone(),
-                                effort: state.effort,
-                            }));
-                        } else {
-                            state.effort_overlay = Some(EffortOverlay::for_catalog(
-                                EffortTarget::OpenDesign(model.id.clone()),
-                                model.reasoning_levels.clone(),
-                                state.effort,
-                            ));
-                        }
-                    } else {
-                        state.push_notification(
-                            "Modelo Open Design desconhecido. Use /models.".into(),
-                        );
-                        keep_draft = true;
-                    }
+                    let found = catalog_entry(&state.open_design_models, value);
+                    select_stepped_model(
+                        state,
+                        &mut effects,
+                        &mut keep_draft,
+                        found,
+                        "Modelo Open Design desconhecido. Use /models.",
+                        EffortTarget::OpenDesign,
+                        |model, effort| UiCommand::SetOpenDesignModel { model, effort },
+                    );
                 }
                 Some(LoginProvider::Xai) => {
                     if slim_core::provider::is_xai_model_id(value) {
@@ -2527,15 +2442,7 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
         // Let the worker resolve dynamic skill commands. This also keeps
         // unknown slash commands fail-closed without losing the draft.
         _ if command.starts_with('/') => {
-            if let Some(effect) = prepare_prompt(state, prompt, PromptOrigin::Direct) {
-                effects.push(effect);
-            } else {
-                state.push_notification_with_priority(
-                    "Não foi possível admitir o prompt agora; tente novamente".into(),
-                    NotificationPriority::Warning,
-                );
-                keep_draft = true;
-            }
+            submit_direct_prompt(state, prompt, &mut effects, &mut keep_draft);
         }
         _ if !state.authenticated => {
             state.push_notification("Nenhum provedor conectado. Use /login.".into());
@@ -2550,15 +2457,7 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
             keep_draft = true;
         }
         _ => {
-            if let Some(effect) = prepare_prompt(state, prompt, PromptOrigin::Direct) {
-                effects.push(effect);
-            } else {
-                state.push_notification_with_priority(
-                    "Não foi possível admitir o prompt agora; tente novamente".into(),
-                    NotificationPriority::Warning,
-                );
-                keep_draft = true;
-            }
+            submit_direct_prompt(state, prompt, &mut effects, &mut keep_draft);
         }
     }
     // Draft is cleared on every accepted submission (slash command or send);
@@ -2575,6 +2474,93 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
     state.mention_suggestions = None;
     effects.push(Effect::RequestRender);
     effects
+}
+
+/// A `/login <provider>` shortcut: the provider row it selects and how it
+/// proceeds (browser/device flow started at once, or the API-key field).
+#[derive(Clone, Copy)]
+struct LoginShortcut {
+    selected: usize,
+    flow: LoginFlow,
+}
+
+#[derive(Clone, Copy)]
+enum LoginFlow {
+    Oauth(LoginProvider),
+    ApiKey,
+}
+
+/// `selected` matches `LoginOverlay::provider`'s row order.
+fn login_shortcut(command: &str) -> Option<LoginShortcut> {
+    let (selected, flow) = match command.strip_prefix("/login ")? {
+        "anthropic" => (0, LoginFlow::Oauth(LoginProvider::Anthropic)),
+        "codex" | "openai-codex" => (1, LoginFlow::Oauth(LoginProvider::OpenAiCodex)),
+        "opencode" | "opencode-go" => (2, LoginFlow::ApiKey),
+        "clinepass" | "cline-pass" => (3, LoginFlow::ApiKey),
+        "command-code" | "commandcode" | "cmd" => (4, LoginFlow::ApiKey),
+        "open-design" | "opendesign" | "od" => (7, LoginFlow::ApiKey),
+        "xai" | "grok" => (5, LoginFlow::Oauth(LoginProvider::Xai)),
+        "opencode-zen" | "zen" => (6, LoginFlow::ApiKey),
+        _ => return None,
+    };
+    Some(LoginShortcut { selected, flow })
+}
+
+/// The id and effort ladder of the catalog model named `id`, if listed.
+fn catalog_entry(models: &[OpenCodeModelView], id: &str) -> Option<(String, Vec<ReasoningEffort>)> {
+    models
+        .iter()
+        .find(|model| model.id == id)
+        .map(|model| (model.id.clone(), model.reasoning_levels.clone()))
+}
+
+/// Textual `/model <id>` for catalogs whose effort is stepped in the picker:
+/// a model without levels is set at the current effort, one with levels opens
+/// the effort overlay; an unknown id keeps the draft for correction.
+fn select_stepped_model(
+    state: &mut AppState,
+    effects: &mut Vec<Effect>,
+    keep_draft: &mut bool,
+    found: Option<(String, Vec<ReasoningEffort>)>,
+    unknown: &str,
+    target: fn(String) -> EffortTarget,
+    set: fn(String, ReasoningEffort) -> UiCommand,
+) {
+    match found {
+        Some((model, levels)) if levels.is_empty() => {
+            effects.push(Effect::Send(set(model, state.effort)));
+        }
+        Some((model, levels)) => {
+            state.effort_overlay = Some(EffortOverlay::for_catalog(
+                target(model),
+                levels,
+                state.effort,
+            ));
+        }
+        None => {
+            state.push_notification(unknown.into());
+            *keep_draft = true;
+        }
+    }
+}
+
+/// A plain or unknown-slash prompt sent as typed; when it cannot be admitted
+/// right now the draft stays so nothing the user wrote is lost.
+fn submit_direct_prompt(
+    state: &mut AppState,
+    prompt: String,
+    effects: &mut Vec<Effect>,
+    keep_draft: &mut bool,
+) {
+    if let Some(effect) = prepare_prompt(state, prompt, PromptOrigin::Direct) {
+        effects.push(effect);
+    } else {
+        state.push_notification_with_priority(
+            "Não foi possível admitir o prompt agora; tente novamente".into(),
+            NotificationPriority::Warning,
+        );
+        *keep_draft = true;
+    }
 }
 
 /// Handles local queue controls. Queue positions are intentionally parsed as
@@ -2693,13 +2679,7 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     let Some(mut overlay) = state.model_overlay.clone() else {
         return vec![];
     };
-    let rows = overlay.rows(
-        &state.open_code_models,
-        &state.cline_pass_models,
-        &state.command_code_models,
-        &state.zen_models,
-        &state.open_design_models,
-    );
+    let rows = overlay.rows(&state.model_catalogs());
     match key.code {
         KeyCode::Esc => {
             state.model_overlay = None;
@@ -2722,15 +2702,10 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             overlay.selection_lost = false;
         }
         KeyCode::Left | KeyCode::Right => {
-            let Some(choice) = rows.get(overlay.selected).and_then(|row| {
-                row.choice(
-                    &state.open_code_models,
-                    &state.cline_pass_models,
-                    &state.command_code_models,
-                    &state.zen_models,
-                    &state.open_design_models,
-                )
-            }) else {
+            let Some(choice) = rows
+                .get(overlay.selected)
+                .and_then(|row| row.choice(&state.model_catalogs()))
+            else {
                 return vec![];
             };
             if choice.levels.is_empty() {
@@ -2757,7 +2732,7 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Tab => {
             if rows
                 .get(overlay.selected)
-                .is_some_and(|row| matches!(row, ModelRow::Alias(_)))
+                .is_some_and(|row| matches!(row, ModelRow::Codex(_)))
             {
                 overlay.pending_fast = !overlay.pending_fast;
             } else {
@@ -2769,30 +2744,12 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 overlay.toggle_collapsed(*group);
             } else {
                 overlay.filter.push(' ');
-                let filtered = overlay.rows(
-                    &state.open_code_models,
-                    &state.cline_pass_models,
-                    &state.command_code_models,
-                    &state.zen_models,
-                    &state.open_design_models,
-                );
-                overlay.selected = first_model_row(&filtered);
-                overlay.viewport_start = 0;
-                overlay.selection_lost = false;
+                reset_model_filter_selection(&mut overlay, &state.model_catalogs());
             }
         }
         KeyCode::Backspace => {
             if overlay.filter.pop().is_some() {
-                let filtered = overlay.rows(
-                    &state.open_code_models,
-                    &state.cline_pass_models,
-                    &state.command_code_models,
-                    &state.zen_models,
-                    &state.open_design_models,
-                );
-                overlay.selected = first_model_row(&filtered);
-                overlay.viewport_start = 0;
-                overlay.selection_lost = false;
+                reset_model_filter_selection(&mut overlay, &state.model_catalogs());
             }
         }
         KeyCode::Char(character)
@@ -2800,16 +2757,7 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 || key.modifiers.contains(KeyModifiers::ALT) =>
         {
             overlay.filter.push(character);
-            let filtered = overlay.rows(
-                &state.open_code_models,
-                &state.cline_pass_models,
-                &state.command_code_models,
-                &state.zen_models,
-                &state.open_design_models,
-            );
-            overlay.selected = first_model_row(&filtered);
-            overlay.viewport_start = 0;
-            overlay.selection_lost = false;
+            reset_model_filter_selection(&mut overlay, &state.model_catalogs());
         }
         KeyCode::Enter => {
             if overlay.selection_lost {
@@ -2827,13 +2775,7 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 state.model_overlay = Some(overlay);
                 return vec![Effect::RequestRender];
             }
-            let Some(choice) = row.choice(
-                &state.open_code_models,
-                &state.cline_pass_models,
-                &state.command_code_models,
-                &state.zen_models,
-                &state.open_design_models,
-            ) else {
+            let Some(choice) = row.choice(&state.model_catalogs()) else {
                 return vec![Effect::RequestRender];
             };
             let effort = overlay.pending_effort(&choice, state.effort);
@@ -2846,7 +2788,7 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 return vec![Effect::RequestRender];
             }
             let command = match choice.target {
-                EffortTarget::Alias(model) => UiCommand::SetModel {
+                EffortTarget::Codex(model) => UiCommand::SetModel {
                     model,
                     effort,
                     fast: overlay.pending_fast,
@@ -2865,13 +2807,7 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         _ => return vec![],
     }
-    let updated_rows = overlay.rows(
-        &state.open_code_models,
-        &state.cline_pass_models,
-        &state.command_code_models,
-        &state.zen_models,
-        &state.open_design_models,
-    );
+    let updated_rows = overlay.rows(&state.model_catalogs());
     overlay.viewport_start = ensure_visible_start(
         overlay.viewport_start,
         overlay.selected,
@@ -2882,6 +2818,13 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     state.menu_focus_at_ms = Some(state.clock.elapsed_ms);
     state.revisions.status += 1;
     vec![Effect::RequestRender]
+}
+
+/// After a filter edit: reselect the first model row and reset the viewport.
+fn reset_model_filter_selection(overlay: &mut ModelOverlay, catalogs: &ModelCatalogs<'_>) {
+    overlay.selected = first_model_row(&overlay.rows(catalogs));
+    overlay.viewport_start = 0;
+    overlay.selection_lost = false;
 }
 
 fn first_model_row(rows: &[ModelRow]) -> usize {
@@ -3233,7 +3176,7 @@ fn reduce_effort_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
             let effort = overlay.effort();
             state.effort_overlay = None;
             let command = match overlay.target {
-                EffortTarget::Alias(model) => UiCommand::SetModel {
+                EffortTarget::Codex(model) => UiCommand::SetModel {
                     model,
                     effort,
                     fast: overlay.fast,

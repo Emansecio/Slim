@@ -679,6 +679,11 @@ impl ShellJobs {
             .map(|(key, job)| job.info(*key))
             .collect()
     }
+    /// One job's current state, by its `job_name`.
+    pub(super) fn info(&self, id: &str) -> Option<ShellJobInfo> {
+        let key = job_key(id)?;
+        self.jobs().get(&key).map(|job| job.info(key))
+    }
     pub(super) fn progress_summary(&self) -> String {
         format!(
             "Aguardando {} job(s) · {}",
@@ -836,7 +841,10 @@ impl ShellJobs {
         let (key, cancellation) = self.register(invocation)?;
         {
             let mut jobs = self.jobs();
-            let job = jobs.get_mut(&key).unwrap();
+            // `reset` may clear the registry between `register` and here.
+            let Some(job) = jobs.get_mut(&key) else {
+                return Err("Shell job was reset while starting".into());
+            };
             job.command = match &prepared.arguments {
                 PreparedToolArguments::Shell { command, .. } => {
                     crate::redaction::redact_credentials(&redact_values(
@@ -948,7 +956,7 @@ impl ShellJobs {
         let key = self
             .0
             .serial
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| "Shell job identity exhausted")?
             + 1;
         let cancellation = CancellationToken::new();
@@ -1247,6 +1255,17 @@ impl Runtime {
             _ => Err("action must be status, cancel, interrupt, output, wait or list".into()),
         }
     }
+    /// Records the job's current state; a job already evicted has none.
+    fn push_shell_job_changed(&mut self, id: &str, seq: &mut u64) -> Result<(), ProviderError> {
+        match self.shell_jobs.info(id) {
+            Some(job) => push_runtime_event(
+                &mut self.app,
+                seq,
+                crate::EventKind::ShellJobChanged { job },
+            ),
+            None => Ok(()),
+        }
+    }
     /// Starts the job and waits for it up to its `yield_ms`.
     async fn run_inline(
         &mut self,
@@ -1263,13 +1282,7 @@ impl Runtime {
             Ok(id) => id,
             Err(error) => return Ok(Managed::Immediate(Err(error))),
         };
-        if let Some(info) = self.shell_jobs.list().into_iter().find(|j| j.id == id) {
-            push_runtime_event(
-                &mut self.app,
-                seq,
-                crate::EventKind::ShellJobChanged { job: info },
-            )?;
-        }
+        self.push_shell_job_changed(&id, seq)?;
         let yield_ms = match prepared.arguments {
             PreparedToolArguments::Shell { yield_ms, .. } => yield_ms,
             _ => 0,
@@ -1277,13 +1290,7 @@ impl Runtime {
         let until = tokio::time::Instant::now() + Duration::from_millis(yield_ms);
         loop {
             if let Some(done) = self.shell_jobs.inline_ready(&id) {
-                if let Some(info) = self.shell_jobs.list().into_iter().find(|j| j.id == id) {
-                    push_runtime_event(
-                        &mut self.app,
-                        seq,
-                        crate::EventKind::ShellJobChanged { job: info },
-                    )?;
-                }
+                self.push_shell_job_changed(&id, seq)?;
                 push_tool_result_facts(
                     &mut self.app,
                     seq,
@@ -1320,13 +1327,7 @@ impl Runtime {
         } in ready
         {
             let name = job_name(id);
-            if let Some(info) = self.shell_jobs.list().into_iter().find(|j| j.id == name) {
-                push_runtime_event(
-                    &mut self.app,
-                    seq,
-                    crate::EventKind::ShellJobChanged { job: info },
-                )?;
-            }
+            self.push_shell_job_changed(&name, seq)?;
             let output = self.redact_sensitive(&result.output);
             self.record_existing_artifact(&result, seq)?;
             if id > self.shell_job_run_start && !batch_id.starts_with("user-shell-") {

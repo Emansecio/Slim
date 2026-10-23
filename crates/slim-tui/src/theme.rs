@@ -24,6 +24,20 @@ pub struct Capabilities {
     pub reduced_motion: bool,
 }
 
+impl Capabilities {
+    /// No color, mouse, clipboard, images or reduced motion: the palette used
+    /// to measure a surface without painting it.
+    pub(crate) const fn plain() -> Self {
+        Self {
+            color_depth: ColorDepth::None,
+            mouse: false,
+            clipboard: false,
+            images: false,
+            reduced_motion: false,
+        }
+    }
+}
+
 /// Semantic theme tokens (DESIGN-SLIM-TUI §21.1/§21.3).
 /// Values are normative truecolor RGB; `to_terminal_color` degrades per depth.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

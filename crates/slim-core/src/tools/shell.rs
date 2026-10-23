@@ -130,28 +130,10 @@ pub fn run_shell_timeout_cancellable_with_progress(
     cancellation: Option<&CancellationToken>,
     on_progress: impl FnMut(ShellProgress),
 ) -> Result<TimedShellOutput, ToolError> {
-    run_shell_timeout_cancellable_with_progress_and_runner(
+    run_shell_timeout_cancellable_with_progress_and_runner_with_budget(
         &ProcessRunner::default(),
         cwd,
         ShellInvocation::Script(command),
-        timeout,
-        cancellation,
-        on_progress,
-    )
-}
-
-pub(crate) fn run_shell_timeout_cancellable_with_progress_and_runner(
-    runner: &ProcessRunner,
-    cwd: impl AsRef<Path>,
-    invocation: ShellInvocation<'_>,
-    timeout: Duration,
-    cancellation: Option<&CancellationToken>,
-    on_progress: impl FnMut(ShellProgress),
-) -> Result<TimedShellOutput, ToolError> {
-    run_shell_timeout_cancellable_with_progress_and_runner_with_budget(
-        runner,
-        cwd,
-        invocation,
         timeout,
         cancellation,
         ProcessOutputBudget::per_stream(SHELL_CAPTURE_CAP_BYTES),

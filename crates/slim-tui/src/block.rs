@@ -399,12 +399,6 @@ pub fn is_complete_tool(block: &Block) -> bool {
         && matches!(block.kind(), BlockKind::Tool(tool) if !tool.historical)
 }
 
-pub fn is_collapsed_complete_thinking(block: &Block) -> bool {
-    block.lifecycle == BlockLifecycle::Complete
-        && matches!(block.kind(), BlockKind::Thinking(_))
-        && block.fold != FoldState::Expanded
-}
-
 fn is_tool_group_bridge(block: &Block) -> bool {
     is_complete_thinking(block)
 }

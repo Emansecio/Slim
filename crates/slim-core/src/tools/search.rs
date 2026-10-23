@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{File, Metadata};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -10,7 +9,10 @@ use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
 
 use super::execution::hex_digest;
-use super::{DependencyKind, DependencyObservation, FastStamp, ToolError, ToolExecutionError};
+use super::{
+    check_cancellation, lock_mutex, new_snapshot_id, parse_cursor, DependencyKind,
+    DependencyObservation, FastStamp, ToolError, ToolExecutionError,
+};
 use crate::runtime::CancellationToken;
 
 pub const DEFAULT_MAX_HITS: usize = 200;
@@ -31,6 +33,9 @@ const MAX_SEARCH_SNAPSHOTS: usize = 8;
 const SEARCH_SNAPSHOT_TTL: Duration = Duration::from_secs(120);
 const MAX_SEARCH_IO_EXAMPLES: usize = 3;
 const MAX_SEARCH_IO_EXAMPLE_BYTES: usize = 96;
+/// Scans are sequential line reads of whole files; the 8 KiB default means
+/// many more syscalls per file.
+const SEARCH_READ_BUFFER_BYTES: usize = 64 * 1024;
 
 pub(crate) const SKIP_DIR_NAMES: &[&str] = &[
     "node_modules",
@@ -46,8 +51,6 @@ const SEARCH_SKIP_FOOTER: &str =
     "[skipped: node_modules, target, dist, .git, .slim, .pi, .venv, *.lock/*.map/*.min.js files and .ignore'd files, plus .gitignore'd files inside a git repository, are not searched in directory scans — use read/list/shell to reach them]";
 const CASE_VARIANT_NOTE_CHARS: usize = 80;
 const HIT_WINDOW_CONTEXT_BYTES: usize = 256;
-
-static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchHit {
@@ -228,16 +231,9 @@ impl SearchBatchPage {
                 (next <= self.total).then(|| format!("{}:{next:x}", self.snapshot_id));
             format_search_batch_page(&page, display_root)
         };
-        let mut low = 0;
-        let mut high = self.hits.len();
-        while low < high {
-            let count = low + (high - low).div_ceil(2);
-            if render(count).len() <= max_bytes {
-                low = count;
-            } else {
-                high = count - 1;
-            }
-        }
+        let low = super::execution::fit_count(self.hits.len(), |count| {
+            render(count).len() <= max_bytes
+        });
         let mut text = render(low);
         if low == 0 {
             let omitted_hit = "[hit with context and continuation exceeds presentation budget; no hit delivered; narrow the query or use the continuation; not safe for patch.expected]\n";
@@ -410,7 +406,7 @@ impl SearchService {
                 cancellation,
             );
         }
-        check_cancelled(cancellation)?;
+        check_cancellation(cancellation)?;
         // Offset pagination without a cursor reuses the live snapshot for the
         // same (root, patterns, context_lines) instead of rescanning the workspace. Fresh
         // searches (offset == 1) always rescan so the governor still observes
@@ -446,7 +442,7 @@ impl SearchService {
             max_hits,
             context_lines,
         } = options;
-        let id = new_snapshot_id();
+        let id = new_snapshot_id("search");
         let patterns = Arc::new(patterns);
         let hits = Arc::new(scan.hits);
         let coverage = Arc::new(scan.coverage);
@@ -468,10 +464,7 @@ impl SearchService {
             last_used: now,
         };
         {
-            let mut cache = self
-                .snapshots
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut cache = lock_mutex(&self.snapshots);
             remove_expired(&mut cache, now);
             cache.snapshots.insert(id.clone(), snapshot.clone());
             evict_old_snapshots(&mut cache);
@@ -488,7 +481,7 @@ impl SearchService {
         cursor: &str,
         cancellation: Option<&CancellationToken>,
     ) -> Result<SearchBatchPage, ToolExecutionError> {
-        check_cancelled(cancellation)?;
+        check_cancellation(cancellation)?;
         let (id, offset) = parse_cursor(cursor).ok_or_else(expired_cursor_error)?;
         if !id.starts_with("search-") {
             return Err(expired_cursor_error().into());
@@ -496,10 +489,7 @@ impl SearchService {
         let canonical = root.to_path_buf();
         let now = Instant::now();
         let snapshot = {
-            let mut cache = self
-                .snapshots
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut cache = lock_mutex(&self.snapshots);
             remove_expired(&mut cache, now);
             let Some(snapshot) = cache.snapshots.get_mut(id) else {
                 return Err(expired_cursor_error().into());
@@ -529,10 +519,7 @@ impl SearchService {
     ) -> Option<(String, SearchSnapshot)> {
         let canonical = root.to_path_buf();
         let now = Instant::now();
-        let mut cache = self
-            .snapshots
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cache = lock_mutex(&self.snapshots);
         remove_expired(&mut cache, now);
         let id = cache
             .snapshots
@@ -1129,9 +1116,14 @@ fn walk_search_entries(root: &Path) -> impl Iterator<Item = Result<SearchWalkEnt
         .follow_links(false);
     // Links are neither followed nor opened: a file symlink would expose a
     // target outside the workspace that `read` rejects. On Windows std also
-    // reports junctions as symlinks.
+    // reports junctions as symlinks. Only directories and regular files pass:
+    // opening a FIFO with no writer blocks forever, and sockets/devices hold
+    // no searchable text.
     walker.filter_entry(|entry| {
-        !should_skip_entry(entry.path()) && !entry.file_type().is_some_and(|kind| kind.is_symlink())
+        !should_skip_entry(entry.path())
+            && entry
+                .file_type()
+                .is_some_and(|kind| !kind.is_symlink() && (kind.is_dir() || kind.is_file()))
     });
     walker
         .build()
@@ -1164,7 +1156,7 @@ fn open_search_file(
     let metadata = file.metadata().map_err(|_| SearchOpenFailure::Metadata)?;
     evidence.record_file(path, &file, &metadata);
     Ok(SearchOpenedFile {
-        reader: BufReader::new(file),
+        reader: BufReader::with_capacity(SEARCH_READ_BUFFER_BYTES, file),
         len: metadata.len(),
     })
 }
@@ -1208,7 +1200,7 @@ where
         .map(|pattern| pattern.as_bytes())
         .collect::<Vec<_>>();
     'walk: for entry in entries {
-        if let Err(error) = check_cancelled(cancellation) {
+        if let Err(error) = check_cancellation(cancellation) {
             return Err(evidence.error(error));
         }
         // Per-entry walk errors (permission, transient lock) skip the entry
@@ -1270,7 +1262,7 @@ where
         let file_hits_start = hits.len();
         let mut preceding = VecDeque::new();
         loop {
-            if let Err(error) = check_cancelled(cancellation) {
+            if let Err(error) = check_cancellation(cancellation) {
                 return Err(evidence.error(error));
             }
             line_bytes.clear();
@@ -1527,7 +1519,7 @@ fn find_case_variants(
     let mut lines_until_check = 0usize;
     let mut line_bytes = Vec::new();
     for entry in walk_search_entries(root) {
-        check_cancelled(cancellation)?;
+        check_cancellation(cancellation)?;
         let Ok(entry) = entry else {
             return Ok(Vec::new());
         };
@@ -1556,7 +1548,7 @@ fn find_case_variants(
         let mut line_number = 0usize;
         loop {
             if lines_until_check == 0 {
-                check_cancelled(cancellation)?;
+                check_cancellation(cancellation)?;
                 if started.elapsed() >= budget {
                     return Ok(Vec::new());
                 }
@@ -1751,6 +1743,12 @@ fn should_skip_file(path: &Path, root: &Path) -> bool {
         path.extension().and_then(|extension| extension.to_str()),
         Some("map" | "lock")
     ) || name.ends_with(".min.js")
+        || is_macos_metadata_file(name)
+}
+
+/// Finder and AppleDouble litter (`.DS_Store`, `._*`): never searchable text.
+pub(crate) fn is_macos_metadata_file(name: &str) -> bool {
+    name == ".DS_Store" || name.starts_with("._")
 }
 
 fn strip_line_ending_str(line: &str) -> &str {
@@ -1778,24 +1776,6 @@ fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
         offset = start + 1;
     }
     false
-}
-
-fn check_cancelled(cancellation: Option<&CancellationToken>) -> Result<(), ToolError> {
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return Err(ToolError::Cancelled);
-    }
-    Ok(())
-}
-
-fn new_snapshot_id() -> String {
-    let sequence = NEXT_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed);
-    format!("search-{:x}-{sequence:x}", std::process::id())
-}
-
-fn parse_cursor(cursor: &str) -> Option<(&str, usize)> {
-    let (id, offset) = cursor.rsplit_once(':')?;
-    let offset = usize::from_str_radix(offset, 16).ok()?;
-    (offset > 0 && !id.is_empty()).then_some((id, offset))
 }
 
 fn expired_cursor_error() -> ToolError {

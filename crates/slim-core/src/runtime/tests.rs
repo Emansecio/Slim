@@ -959,6 +959,124 @@ fn object_arguments_matches_the_multi_parse_normalization() {
     }
 }
 
+fn thinking_turn(fragments: Vec<(u32, crate::provider::ThinkingFragment)>) -> Vec<Value> {
+    let mut app = AppHandle::fake();
+    let mut normalizer = ProviderStreamNormalizer::new(ProviderKind::Anthropic, 1, vec![])
+        .with_thinking_scope(Some(7), "claude-sonnet-5", Some(42));
+    for (index, fragment) in fragments {
+        normalizer.push(&mut app, ProviderEvent::ThinkingBlock { index, fragment });
+    }
+    normalizer.push(&mut app, ProviderEvent::TextDelta("answer".into()));
+    normalizer.push(
+        &mut app,
+        ProviderEvent::Stopped {
+            reason: "end_turn".into(),
+        },
+    );
+    let turn = normalizer.finish(&mut app).expect("turn");
+    assert!(turn
+        .responses_reasoning
+        .iter()
+        .all(|state| state.binding == Some(42)));
+    turn.responses_reasoning
+        .into_iter()
+        .map(|state| state.item)
+        .collect()
+}
+
+#[test]
+fn anthropic_thinking_fragments_assemble_into_signed_leading_blocks() {
+    use crate::provider::ThinkingFragment::{Signature, Start, Thinking};
+    let blocks = thinking_turn(vec![
+        (
+            0,
+            Start {
+                redacted_data: None,
+            },
+        ),
+        (0, Thinking("step ".into())),
+        (0, Thinking("two".into())),
+        (0, Signature("si".into())),
+        (0, Signature("g".into())),
+        (
+            1,
+            Start {
+                redacted_data: Some("opaque".into()),
+            },
+        ),
+    ]);
+    assert_eq!(
+        blocks,
+        vec![
+            json!({"type": "thinking", "thinking": "step two", "signature": "sig"}),
+            json!({"type": "redacted_thinking", "data": "opaque"}),
+        ]
+    );
+    // Unsigned, not leading the message, repeated or orphaned: none of it.
+    for fragments in [
+        vec![
+            (
+                0,
+                Start {
+                    redacted_data: None,
+                },
+            ),
+            (0, Thinking("x".into())),
+        ],
+        vec![
+            (
+                1,
+                Start {
+                    redacted_data: None,
+                },
+            ),
+            (1, Signature("s".into())),
+        ],
+        vec![
+            (
+                0,
+                Start {
+                    redacted_data: None,
+                },
+            ),
+            (
+                0,
+                Start {
+                    redacted_data: None,
+                },
+            ),
+            (0, Signature("s".into())),
+        ],
+        vec![(0, Thinking("x".into()))],
+    ] {
+        assert!(thinking_turn(fragments.clone()).is_empty(), "{fragments:?}");
+    }
+    // Without a scope nothing is kept, as for a one-shot request.
+    let mut app = AppHandle::fake();
+    let mut normalizer = ProviderStreamNormalizer::new(ProviderKind::Anthropic, 1, vec![])
+        .with_thinking_scope(Some(7), "claude-sonnet-5", None);
+    normalizer.push(
+        &mut app,
+        ProviderEvent::ThinkingBlock {
+            index: 0,
+            fragment: Start {
+                redacted_data: Some("opaque".into()),
+            },
+        },
+    );
+    normalizer.push(
+        &mut app,
+        ProviderEvent::Stopped {
+            reason: "end_turn".into(),
+        },
+    );
+    assert!(normalizer
+        .finish(&mut app)
+        .unwrap()
+        .responses_reasoning
+        .is_empty());
+}
+
 #[test]
 fn anthropic_duplicate_completed_call_ids_reject_the_entire_batch() {
     for duplicate in [false, true] {
@@ -3029,6 +3147,41 @@ fn todo_tool_keeps_initial_status_and_updates_the_requested_id() {
     assert_eq!(items[0].status, crate::task::TodoStatus::Completed);
     assert_eq!(items[1].status, crate::task::TodoStatus::InProgress);
     assert_eq!(items[2].status, crate::task::TodoStatus::Pending);
+}
+
+#[test]
+fn todo_accepts_a_provider_call_id_reused_in_a_later_turn() {
+    // The idempotency ledger lives in the session; providers may number
+    // their calls from the same id in every turn.
+    let mut runtime = Runtime::new();
+    runtime
+        .prepare_loop_capabilities(&std::env::temp_dir())
+        .unwrap();
+    let mut seq = 1;
+    for (batch_id, title) in [("slim-batch-0-1", "first"), ("slim-batch-1-9", "second")] {
+        let (result, next) = runtime
+            .execute_todo(
+                crate::OperatingMode::Auto,
+                ToolInvocation {
+                    batch_id,
+                    call_id: "call_0",
+                    name: "todo",
+                    arguments: &json!({"todos":[{"title":title, "status":"pending"}]}).to_string(),
+                },
+                seq,
+            )
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        seq = next;
+    }
+    let items = runtime
+        .capability_bridge
+        .as_ref()
+        .unwrap()
+        .todo("session")
+        .unwrap()
+        .items();
+    assert_eq!(items.len(), 2);
 }
 
 #[test]

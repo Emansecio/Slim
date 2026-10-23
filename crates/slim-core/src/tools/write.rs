@@ -11,7 +11,8 @@ use crate::runtime::CancellationToken;
 use sha2::{Digest, Sha256};
 
 use super::{
-    digest_bytes, DependencyKind, DependencyObservation, FastStamp, ToolError, ToolExecutionError,
+    check_cancellation, digest_bytes, lock_mutex, DependencyKind, DependencyObservation, FastStamp,
+    ToolError, ToolExecutionError,
 };
 
 pub const MAX_MUTATING_FILE_BYTES: usize = 10 * 1024 * 1024;
@@ -150,10 +151,11 @@ pub(crate) fn write_file_with_receipt(
         let _ = fs::remove_file(&temp);
         return Err(error.into());
     }
-    if let Err(error) = replace_file(&temp, path, exists, None) {
+    if let Err(error) = publish_new(&temp, path) {
         let _ = fs::remove_file(&temp);
         return Err(error.into());
     }
+    let written_digest = content_sha256(content.as_bytes());
     Ok(WriteReceipt {
         recovery_note: None,
         syntax_diagnostic: json_syntax_diagnostic(path, None, &content),
@@ -161,26 +163,14 @@ pub(crate) fn write_file_with_receipt(
         dependency: None,
         after,
         bytes_read: 0,
-        written_digest: content_sha256(content.as_bytes()),
-        written_sha256_12: content_sha256_prefix(content.as_bytes()),
+        written_digest,
+        written_sha256_12: sha256_prefix(&written_digest),
     })
-}
-
-pub(super) fn check_cancellation(
-    cancellation: Option<&CancellationToken>,
-) -> Result<(), ToolError> {
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        Err(ToolError::Cancelled)
-    } else {
-        Ok(())
-    }
 }
 
 pub(super) fn mutation_lock_slot(path: &Path) -> Arc<Mutex<()>> {
     let key = super::path_identity(path);
-    let mut locks = PATH_LOCKS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut locks = lock_mutex(&PATH_LOCKS);
     if locks.len() > 64 {
         locks.retain(|_, slot| Arc::strong_count(slot) > 1);
     }
@@ -215,7 +205,7 @@ pub(super) fn replace_observed_file(
         observed,
         content,
         cancellation,
-        |temp, target, backup| replace_file(temp, target, true, Some(backup)),
+        publish_replacing,
     )
 }
 
@@ -248,6 +238,17 @@ fn replace_observed_file_with_publisher(
     }
     let (temp, file, after) =
         prepare_replacement(path, content).map_err(|failure| observed_failure(failure.error))?;
+    // Publication swaps in a new inode, so the replacement must carry the mode
+    // (for example the executable bit) of the file it displaces.
+    #[cfg(unix)]
+    if let Err(error) = observed
+        ._guard
+        .metadata()
+        .and_then(|metadata| file.set_permissions(metadata.permissions()))
+    {
+        let _ = fs::remove_file(&temp);
+        return Err(observed_failure(error.into()));
+    }
     let current_matches = current_file_matches(&observed._guard, &observed.dependency)
         .map_err(|error| observed_failure(error.into()))?;
     if !current_matches {
@@ -285,6 +286,7 @@ fn replace_observed_file_with_publisher(
     }
     let (recovery_note, verification_bytes) = cleanup_displaced_if_unchanged(&backup, &before);
     let syntax_diagnostic = json_syntax_diagnostic(path, Some(&before), content);
+    let written_digest = content_sha256(content.as_bytes());
     Ok(WriteReceipt {
         recovery_note,
         syntax_diagnostic,
@@ -292,8 +294,8 @@ fn replace_observed_file_with_publisher(
         dependency: Some(dependency),
         after,
         bytes_read: bytes_read.saturating_add(verification_bytes),
-        written_digest: content_sha256(content.as_bytes()),
-        written_sha256_12: content_sha256_prefix(content.as_bytes()),
+        written_digest,
+        written_sha256_12: sha256_prefix(&written_digest),
     })
 }
 
@@ -387,6 +389,7 @@ pub(super) fn read_existing_file_observed(
         }
         .into());
     }
+    super::read::ensure_not_special_file(path)?;
     let mut file = open_precondition_file(path)?;
     let mut reported_wait = false;
     loop {
@@ -535,8 +538,7 @@ pub(super) fn content_sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-pub(super) fn content_sha256_prefix(bytes: &[u8]) -> String {
-    let digest = content_sha256(bytes);
+pub(super) fn sha256_prefix(digest: &[u8; 32]) -> String {
     let mut output = String::with_capacity(12);
     for byte in &digest[..6] {
         use std::fmt::Write;
@@ -581,18 +583,17 @@ fn cleanup_displaced_if_unchanged(backup: &Path, before: &str) -> (Option<String
     }
 }
 
-fn replace_file(
-    temp: &Path,
-    target: &Path,
-    replace_existing: bool,
-    backup: Option<&Path>,
-) -> io::Result<()> {
-    if !replace_existing {
-        fs::hard_link(temp, target)?;
-        let _ = fs::remove_file(temp);
-        return Ok(());
-    }
+/// Publishes `temp` at a `target` that did not exist when the write began.
+/// The hard link fails, rather than overwrites, if a third writer created it.
+fn publish_new(temp: &Path, target: &Path) -> io::Result<()> {
+    fs::hard_link(temp, target)?;
+    let _ = fs::remove_file(temp);
+    Ok(())
+}
 
+/// Publishes `temp` over the existing `target`, leaving the displaced object
+/// at `backup`.
+fn publish_replacing(temp: &Path, target: &Path, backup: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
         use std::ffi::c_void;
@@ -619,19 +620,16 @@ fn replace_file(
             .encode_wide()
             .chain(Some(0))
             .collect::<Vec<_>>();
-        let backup = backup.map(|path| {
-            path.as_os_str()
-                .encode_wide()
-                .chain(Some(0))
-                .collect::<Vec<_>>()
-        });
+        let backup = backup
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
         let result = unsafe {
             ReplaceFileW(
                 replaced.as_ptr(),
                 replacement.as_ptr(),
-                backup
-                    .as_ref()
-                    .map_or(std::ptr::null(), |value| value.as_ptr()),
+                backup.as_ptr(),
                 0,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
@@ -645,15 +643,11 @@ fn replace_file(
 
     #[cfg(not(windows))]
     {
-        if let Some(backup) = backup {
-            // Preserve the object actually displaced. Publishing the new path
-            // must not overwrite a third writer that fills the resulting gap.
-            fs::rename(target, backup)?;
-            fs::hard_link(temp, target)?;
-            let _ = fs::remove_file(temp);
-        } else {
-            fs::rename(temp, target)?;
-        }
+        // Preserve the object actually displaced. Publishing the new path
+        // must not overwrite a third writer that fills the resulting gap.
+        fs::rename(target, backup)?;
+        fs::hard_link(temp, target)?;
+        let _ = fs::remove_file(temp);
         Ok(())
     }
 }
@@ -796,7 +790,7 @@ mod lock_tests {
                         fs::write(target, "external edit").unwrap();
                     }
                     displaced = Some(backup.to_owned());
-                    replace_file(temp, target, true, Some(backup))
+                    publish_replacing(temp, target, backup)
                 },
             )
             .unwrap();
@@ -809,6 +803,33 @@ mod lock_tests {
                 .recovery_note
                 .unwrap()
                 .contains("displaced version preserved"));
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_a_file_keeps_its_unix_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        for original in [0o755, 0o640] {
+            let root = publication_workspace();
+            let path = root.join("run.sh");
+            fs::write(&path, "echo before\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(original)).unwrap();
+
+            super::super::patch::apply_exact_patch(&path, "before", "patched").unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "echo patched\n");
+            assert_eq!(mode(&path), original, "patch");
+
+            write_file(
+                &path,
+                "echo written\n",
+                Some(FilePrecondition::ExactText("echo patched\n".into())),
+            )
+            .unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "echo written\n");
+            assert_eq!(mode(&path), original, "write");
             fs::remove_dir_all(root).unwrap();
         }
     }

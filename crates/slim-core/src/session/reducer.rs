@@ -143,7 +143,12 @@ where
         }
     }
     validate_record(state, record)?;
+    apply_record(state, record);
+    state.last_seq = Some(next_seq);
+    Ok(())
+}
 
+fn apply_record(state: &mut DurableState, record: &DurableRecord) {
     match record {
         DurableRecord::Entry { entry, .. } => {
             state.entries.insert(entry.entry_id.clone(), entry.clone());
@@ -177,11 +182,59 @@ where
             state.compaction_checkpoint = Some(checkpoint.clone());
         }
     }
-    state.last_seq = Some(next_seq);
-    Ok(())
 }
 
-fn validate_record(state: &DurableState, record: &DurableRecord) -> Result<(), ReduceError> {
+/// Entry lookup the identity/referential checks depend on: the full state
+/// answers from its entries, the append validator from a light index.
+pub(super) trait EntryLookup {
+    fn operation_of(&self, entry_id: &str) -> Option<&str>;
+}
+
+impl EntryLookup for DurableState {
+    fn operation_of(&self, entry_id: &str) -> Option<&str> {
+        self.entries
+            .get(entry_id)
+            .map(|entry| entry.operation_id.as_str())
+    }
+}
+
+/// `entry_id -> operation_id` plus the last sequence: everything the append
+/// validator needs from the reducer, without cloning entry payloads or facts.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct EntryIndex {
+    last_seq: Option<u64>,
+    entries: BTreeMap<String, String>,
+}
+
+impl EntryLookup for EntryIndex {
+    fn operation_of(&self, entry_id: &str) -> Option<&str> {
+        self.entries.get(entry_id).map(String::as_str)
+    }
+}
+
+impl EntryIndex {
+    /// Same checks and sequence rule as [`reduce`], recording only the index.
+    pub(super) fn apply(&mut self, record: &DurableRecord) -> Result<(), ReduceError> {
+        let next_seq = record.seq();
+        if let Some(previous) = self.last_seq {
+            if next_seq <= previous {
+                return Err(ReduceError::SequenceNotIncreasing {
+                    previous,
+                    next: next_seq,
+                });
+            }
+        }
+        validate_record(self, record)?;
+        if let DurableRecord::Entry { entry, .. } = record {
+            self.entries
+                .insert(entry.entry_id.clone(), entry.operation_id.clone());
+        }
+        self.last_seq = Some(next_seq);
+        Ok(())
+    }
+}
+
+fn validate_record(state: &impl EntryLookup, record: &DurableRecord) -> Result<(), ReduceError> {
     // Identity/referential checks live here; attempt/tool/terminal lifecycle rules
     // intentionally remain in Etapas 5/6.
     match record {
@@ -191,14 +244,14 @@ fn validate_record(state: &DurableState, record: &DurableRecord) -> Result<(), R
             if let Some(tool_call_id) = &entry.tool_call_id {
                 require_id(tool_call_id, "entry.tool_call_id")?;
             }
-            if state.entries.contains_key(&entry.entry_id) {
+            if state.operation_of(&entry.entry_id).is_some() {
                 return Err(ReduceError::DuplicateEntryId {
                     entry_id: entry.entry_id.clone(),
                 });
             }
             if let Some(parent_entry_id) = &entry.parent_entry_id {
                 require_id(parent_entry_id, "entry.parent_entry_id")?;
-                if !state.entries.contains_key(parent_entry_id) {
+                if state.operation_of(parent_entry_id).is_none() {
                     return Err(ReduceError::MissingParentEntry {
                         entry_id: entry.entry_id.clone(),
                         parent_entry_id: parent_entry_id.clone(),
@@ -217,17 +270,18 @@ fn validate_record(state: &DurableState, record: &DurableRecord) -> Result<(), R
                 super::schema_v2::DurableOperationKind::Claimed => {}
                 super::schema_v2::DurableOperationKind::Started { input_entry_id } => {
                     require_id(input_entry_id, "operation.input_entry_id")?;
-                    let input_entry = state.entries.get(input_entry_id).ok_or_else(|| {
-                        ReduceError::MissingInputEntry {
-                            operation_id: operation.operation_id.clone(),
-                            input_entry_id: input_entry_id.clone(),
-                        }
-                    })?;
-                    if input_entry.operation_id != operation.operation_id {
+                    let entry_operation_id =
+                        state.operation_of(input_entry_id).ok_or_else(|| {
+                            ReduceError::MissingInputEntry {
+                                operation_id: operation.operation_id.clone(),
+                                input_entry_id: input_entry_id.clone(),
+                            }
+                        })?;
+                    if entry_operation_id != operation.operation_id {
                         return Err(ReduceError::InputEntryOperationMismatch {
                             operation_id: operation.operation_id.clone(),
                             input_entry_id: input_entry_id.clone(),
-                            entry_operation_id: input_entry.operation_id.clone(),
+                            entry_operation_id: entry_operation_id.to_owned(),
                         });
                     }
                 }

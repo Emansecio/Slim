@@ -26,11 +26,27 @@ use super::schema_v2::{DurableRecord, DurableSessionHeader, MAX_DURABLE_SESSION_
 #[cfg(test)]
 thread_local! {
     static APPEND_SYNC_CALLS: Cell<u64> = const { Cell::new(0) };
+    static APPEND_FULL_SYNC_CALLS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How hard an append is pushed to storage. `Barrier` orders the write ahead
+/// of later ones (`F_BARRIERFSYNC` on macOS, `sync_data` elsewhere) and is
+/// enough for records replay can lose or rebuild. `Full` forces stable storage
+/// (`F_FULLFSYNC` on macOS) for a record that must survive power loss because
+/// a non-idempotent external effect follows it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppendSync {
+    None,
+    Barrier,
+    Full,
 }
 
 pub struct JsonlRepo {
     path: PathBuf,
     file: File,
+    /// Bytes in the data file. The session lock makes this handle the only
+    /// writer, so it is tracked here instead of a `metadata()` call per append.
+    len: u64,
     _lock: File,
     header: DurableSessionHeader,
     records: Vec<DurableRecord>,
@@ -72,7 +88,7 @@ impl JsonlRepo {
         }
 
         let (temp_path, mut file) = create_temp_file(&path)?;
-        let result = (|| {
+        let result = (|| -> io::Result<u64> {
             let encoded = encode_line(&header)?;
             ensure_line_fits(0, encoded.len())?;
             write_line(&mut file, &encoded)?;
@@ -90,18 +106,21 @@ impl JsonlRepo {
             if file_identity(&file)? != temp_identity {
                 return Err(invalid_data("durable session file identity changed"));
             }
-            file.seek(SeekFrom::End(0))?;
-            Ok(())
+            file.seek(SeekFrom::End(0))
         })();
-        if let Err(error) = result {
-            drop(file);
-            let _ = fs::remove_file(&temp_path);
-            return Err(error);
-        }
+        let len = match result {
+            Ok(len) => len,
+            Err(error) => {
+                drop(file);
+                let _ = fs::remove_file(&temp_path);
+                return Err(error);
+            }
+        };
 
         Ok(Self {
             path,
             file,
+            len,
             _lock: lock,
             header,
             records,
@@ -195,11 +214,12 @@ impl JsonlRepo {
             file.write_all(b"\n")?;
             file.sync_data()?;
         }
-        file.seek(SeekFrom::End(0))?;
+        let len = file.seek(SeekFrom::End(0))?;
 
         Ok(Self {
             path,
             file,
+            len,
             _lock: lock,
             header,
             records: parsed.records,
@@ -244,7 +264,7 @@ impl DurableRepo for JsonlRepo {
     }
 
     fn append_batch(&mut self, records: Vec<DurableRecord>) -> io::Result<()> {
-        self.append_records(records, true)
+        self.append_records(records, AppendSync::Barrier)
     }
 }
 
@@ -255,10 +275,17 @@ impl JsonlRepo {
     /// trailing line on crash is acceptable; torn-tail recovery bounds a
     /// partially flushed tail.
     pub(crate) fn append_unsynced(&mut self, record: DurableRecord) -> io::Result<()> {
-        self.append_records(vec![record], false)
+        self.append_records(vec![record], AppendSync::None)
     }
 
-    fn append_records(&mut self, records: Vec<DurableRecord>, sync: bool) -> io::Result<()> {
+    /// Appends a record and forces it to stable storage even where ordinary
+    /// appends only order it (see [`AppendSync`]). For records written before a
+    /// non-idempotent external effect.
+    pub(crate) fn append_full_sync(&mut self, record: DurableRecord) -> io::Result<()> {
+        self.append_records(vec![record], AppendSync::Full)
+    }
+
+    fn append_records(&mut self, records: Vec<DurableRecord>, sync: AppendSync) -> io::Result<()> {
         if self.poisoned {
             return Err(io::Error::other("durable session repository is poisoned"));
         }
@@ -266,21 +293,23 @@ impl JsonlRepo {
             return Ok(());
         }
         let prepared = self.validator.prepare_batch(&self.records, &records)?;
-        let mut encoded_records = Vec::with_capacity(records.len());
+        // One buffer for the whole batch: a single write instead of one per record.
+        let mut buffer = Vec::new();
+        let mut line_lens = Vec::with_capacity(records.len());
         for record in &records {
-            match encode_line(record) {
-                Ok(encoded) => encoded_records.push(encoded),
-                Err(error) => {
-                    self.poisoned = true;
-                    return Err(error);
-                }
+            let start = buffer.len();
+            if let Err(error) = serde_json::to_writer(&mut buffer, record) {
+                self.poisoned = true;
+                return Err(io::Error::other(error));
             }
+            line_lens.push(buffer.len() - start);
+            buffer.push(b'\n');
         }
-        let mut final_len = self.file.metadata()?.len();
-        for encoded in &encoded_records {
-            ensure_line_fits(final_len, encoded.len())?;
+        let mut final_len = self.len;
+        for line_len in &line_lens {
+            ensure_line_fits(final_len, *line_len)?;
             final_len = final_len
-                .checked_add(encoded.len() as u64)
+                .checked_add(*line_len as u64)
                 .and_then(|length| length.checked_add(1))
                 .ok_or_else(|| {
                     io::Error::new(
@@ -289,20 +318,15 @@ impl JsonlRepo {
                     )
                 })?;
         }
-        let write_result = encoded_records
-            .iter()
-            .try_for_each(|encoded| write_line(&mut self.file, encoded))
-            .and_then(|_| {
-                if sync {
-                    sync_append_data(&self.file)
-                } else {
-                    Ok(())
-                }
-            });
+        let write_result = self.file.write_all(&buffer).and_then(|_| match sync {
+            AppendSync::None => Ok(()),
+            mode => sync_append_data(&self.file, mode),
+        });
         if let Err(error) = write_result {
             self.poisoned = true;
             return Err(error);
         }
+        self.len = final_len;
         self.validator.commit(prepared);
         self.records.extend(records);
         Ok(())
@@ -394,10 +418,47 @@ fn write_line(file: &mut File, bytes: &[u8]) -> io::Result<()> {
     file.write_all(&line)
 }
 
-fn sync_append_data(file: &File) -> io::Result<()> {
+fn sync_append_data(file: &File, mode: AppendSync) -> io::Result<()> {
     #[cfg(test)]
-    APPEND_SYNC_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    {
+        APPEND_SYNC_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+        if mode == AppendSync::Full {
+            APPEND_FULL_SYNC_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+        }
+    }
+    if mode == AppendSync::Barrier {
+        return barrier_sync(file);
+    }
     file.sync_data()
+}
+
+/// macOS: `sync_data` is `F_FULLFSYNC` (about 8x slower than the barrier on
+/// APFS). `F_BARRIERFSYNC` keeps write order, which is all replay needs; it
+/// falls back to the full sync where the volume does not support it.
+#[cfg(target_os = "macos")]
+fn barrier_sync(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: the descriptor is valid for the duration of the borrow and
+    // F_BARRIERFSYNC takes no argument.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } == -1 {
+        return file.sync_data();
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn barrier_sync(file: &File) -> io::Result<()> {
+    file.sync_data()
+}
+
+#[cfg(test)]
+pub(crate) fn take_append_full_sync_calls() -> u64 {
+    APPEND_FULL_SYNC_CALLS.with(|calls| {
+        let value = calls.get();
+        calls.set(0);
+        value
+    })
 }
 
 #[cfg(test)]
@@ -785,6 +846,51 @@ mod tests {
     }
 
     #[test]
+    fn only_append_full_sync_requests_a_full_sync_and_len_tracks_the_file() {
+        let requested = test_path();
+        let mut repo = JsonlRepo::create(
+            &requested,
+            DurableSessionHeader::new("sync-mode", "now", "D:\\Slim", None, None),
+        )
+        .expect("create repo");
+        let fact = |seq: u64| DurableRecord::Fact {
+            seq,
+            fact: super::super::schema_v2::DurableFact {
+                namespace: "sync".into(),
+                key: format!("k-{seq}"),
+                value: serde_json::Value::Null,
+            },
+        };
+        take_append_sync_calls();
+        take_append_full_sync_calls();
+
+        repo.append(fact(0)).expect("ordinary append");
+        repo.append_unsynced(fact(1)).expect("unsynced append");
+        assert_eq!(take_append_sync_calls(), 1);
+        assert_eq!(take_append_full_sync_calls(), 0);
+
+        repo.append_full_sync(fact(2)).expect("full sync append");
+        assert_eq!(take_append_sync_calls(), 1);
+        assert_eq!(take_append_full_sync_calls(), 1);
+
+        repo.append_batch(vec![fact(3), fact(4)]).expect("batch");
+        assert_eq!(
+            repo.len,
+            repo.file.metadata().expect("metadata").len(),
+            "tracked length must match the file"
+        );
+        drop(repo);
+        let reopened = JsonlRepo::open(&requested).expect("reopen");
+        assert_eq!(reopened.records().len(), 5);
+        assert_eq!(
+            reopened.len,
+            fs::metadata(&requested).expect("metadata").len()
+        );
+        drop(reopened);
+        fs::remove_dir_all(requested.parent().expect("test directory")).expect("cleanup");
+    }
+
+    #[test]
     fn publish_does_not_replace_an_existing_destination() {
         let requested = test_path();
         let path = resolve_session_path(&requested).expect("resolve path");
@@ -820,7 +926,8 @@ mod tests {
         repo.file
             .set_len(MAX_DURABLE_SESSION_BYTES)
             .expect("make bounded-size file");
-        repo.file
+        repo.len = repo
+            .file
             .seek(SeekFrom::End(0))
             .expect("seek bounded-size file");
         let before_len = repo.file.metadata().expect("metadata").len();

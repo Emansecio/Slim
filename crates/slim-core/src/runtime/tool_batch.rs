@@ -149,15 +149,11 @@ async fn code_intel_outcome(
         run_code_intel_request(env.code_intel.clone(), request, env.cancellation.clone()).await;
     // Keep the same admission feedback contract as native tools, including
     // batch calls, cache aliases, and the model-facing prompt copy.
-    let prefix = crate::tools::admission_output_prefix(&prepared.admission_notes);
-    if let Some(prefix) = &prefix {
-        result.output.insert_str(0, prefix);
-    }
-    let presentation =
-        semantic_presentation.map(|presentation| ToolPresentationSource::CodeIntel {
-            prefix: prefix.unwrap_or_default(),
-            presentation,
-        });
+    let presentation = super::native_code_intel::admit_code_intel_output(
+        &mut result,
+        prepared,
+        semantic_presentation,
+    );
     ToolExecutionOutcome {
         result,
         receipt: ToolExecutionReceipt {
@@ -1039,25 +1035,23 @@ impl Runtime {
                 .execute_managed_shell(mode, invocation, prepared, next_seq)
                 .await;
         }
-        let special = if invocation.name == "ask_question" {
-            Some(self.execute_ask_question(invocation, next_seq).await?)
+        let (result, following) = if invocation.name == "ask_question" {
+            self.execute_ask_question(invocation, next_seq).await?
         } else if invocation.name == "artifact_read" {
-            Some(self.execute_artifact_read(invocation, next_seq)?)
+            self.execute_artifact_read(invocation, next_seq)?
         } else if invocation.name == "todo" {
-            Some(self.execute_todo(mode, invocation, next_seq)?)
+            self.execute_todo(mode, invocation, next_seq)?
         } else if invocation.name == "skill" {
-            Some(self.execute_skill(mode, cwd, invocation, next_seq).await?)
+            self.execute_skill(mode, cwd, invocation, next_seq).await?
         } else if invocation.name == "code_intel" {
-            Some(
-                self.execute_code_intel(invocation, prepared, next_seq)
-                    .await?,
-            )
+            self.execute_code_intel(invocation, prepared, next_seq)
+                .await?
         } else if invocation.name == "mcp"
             || super::native_mcp_direct::is_direct_mcp_call(invocation.name)
         {
-            Some(self.execute_mcp(mode, invocation, next_seq).await?)
+            self.execute_mcp(mode, invocation, next_seq).await?
         } else if invocation.name == "codemode" {
-            Some(self.execute_codemode(mode, invocation, next_seq).await?)
+            self.execute_codemode(mode, invocation, next_seq).await?
         } else {
             let (outcome, following) = self
                 .execute_tool_call_async(invocation, prepared, next_seq)
@@ -1068,7 +1062,6 @@ impl Runtime {
                 .await;
             return Ok((outcome, following));
         };
-        let (result, following) = special.expect("special tool branch returns a result");
         Ok((
             ToolExecutionOutcome {
                 result,
@@ -1169,17 +1162,15 @@ impl Runtime {
                         continue;
                     };
                     if progress_error.is_none() {
-                        let preview = self.redact_sensitive(&progress.preview);
-                        if let Err(error) = push_runtime_transient_event(
+                        if let Err(error) = push_tool_progress(
                             &mut self.app,
                             &mut following_seq,
-                            crate::EventKind::ToolProgress {
-                                batch_id: invocation.batch_id.into(),
-                                call_id: invocation.call_id.into(),
-                                name: invocation.name.into(),
-                                preview,
-                            },
+                            &self.sensitive_values.0,
+                            invocation,
+                            &progress.preview,
                         ) {
+                            // Only here, while the task still runs, does a
+                            // failed push stop the call.
                             if let Some(cancellation) = &self.cancellation {
                                 cancellation.cancel();
                             }
@@ -1193,16 +1184,12 @@ impl Runtime {
             if progress_error.is_some() {
                 break;
             }
-            let preview = self.redact_sensitive(&progress.preview);
-            if let Err(error) = push_runtime_transient_event(
+            if let Err(error) = push_tool_progress(
                 &mut self.app,
                 &mut following_seq,
-                crate::EventKind::ToolProgress {
-                    batch_id: invocation.batch_id.into(),
-                    call_id: invocation.call_id.into(),
-                    name: invocation.name.into(),
-                    preview,
-                },
+                &self.sensitive_values.0,
+                invocation,
+                &progress.preview,
             ) {
                 progress_error = Some(error);
             }
@@ -1245,16 +1232,12 @@ impl Runtime {
                 if progress_error.is_some() {
                     return;
                 }
-                let preview = redact_values(&self.sensitive_values.0, &progress.preview);
-                if let Err(error) = push_runtime_transient_event(
+                if let Err(error) = push_tool_progress(
                     &mut self.app,
                     &mut following_seq,
-                    crate::EventKind::ToolProgress {
-                        batch_id: invocation.batch_id.into(),
-                        call_id: invocation.call_id.into(),
-                        name: invocation.name.into(),
-                        preview,
-                    },
+                    &self.sensitive_values.0,
+                    invocation,
+                    &progress.preview,
                 ) {
                     progress_error = Some(error);
                 }

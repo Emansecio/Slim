@@ -13,7 +13,7 @@
 //! signed in) are adopted without refreshing.
 
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::Url;
@@ -29,6 +29,7 @@ use super::flow::{
 use super::types::{Challenge, DiscoveryState, McpOAuthState, OAuthClient, OAuthTokens};
 use super::{McpOAuthError, McpOAuthStore};
 use crate::mcp::spec::McpOAuthSpec;
+use crate::sync::lock_mutex;
 
 /// Access tokens this close to expiry are refreshed before they are sent.
 const REFRESH_SKEW_MS: u64 = 30_000;
@@ -43,12 +44,6 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0)
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Why a request could not be sent with authorization.
@@ -214,13 +209,13 @@ impl McpAuth {
         if !self.secure_server {
             return None;
         }
-        lock(&self.cache).token.clone()
+        lock_mutex(&self.cache).token.clone()
     }
 
     /// Tokens and client secrets currently held, for redaction and the
     /// model-to-server secret gate.
     pub fn sensitive_values(&self) -> Vec<String> {
-        lock(&self.cache).secrets.clone()
+        lock_mutex(&self.cache).secrets.clone()
     }
 
     fn sign_in_hint(&self) -> String {
@@ -259,7 +254,7 @@ impl McpAuth {
 
     /// Replaces the cache with what `state` holds.
     fn adopt(&self, state: Option<&McpOAuthState>) {
-        let mut cache = lock(&self.cache);
+        let mut cache = lock_mutex(&self.cache);
         let tokens = state.and_then(|state| state.tokens.as_ref());
         cache.token = tokens.map(|tokens| tokens.access_token.clone());
         cache.expires_at_ms = tokens.and_then(|tokens| tokens.expires_at_ms);
@@ -310,7 +305,7 @@ impl McpAuth {
             return;
         }
         let (token, expires_at_ms, refreshable, reload_due) = {
-            let mut cache = lock(&self.cache);
+            let mut cache = lock_mutex(&self.cache);
             let reload_due = cache.token.is_none()
                 && cache
                     .reload_after
@@ -402,7 +397,7 @@ impl McpAuth {
     /// the user has to sign in again.
     async fn step_up(self: &Arc<Self>, challenge: Challenge) -> String {
         let wanted = challenge.scope.clone();
-        *lock(&self.challenge) = Some(challenge);
+        *lock_mutex(&self.challenge) = Some(challenge);
         if wanted.is_some() {
             let wanted = wanted.clone();
             let _ = self
@@ -437,7 +432,7 @@ impl McpAuth {
         used: Option<String>,
         challenge: Challenge,
     ) -> Result<(), McpOAuthError> {
-        *lock(&self.challenge) = Some(challenge.clone());
+        *lock_mutex(&self.challenge) = Some(challenge.clone());
         if !self.secure_server {
             return Err(self.insecure_error());
         }
@@ -624,7 +619,7 @@ impl McpAuth {
             ));
         }
         let stored = self.blocking(Self::load_bound_state).await?;
-        let challenge = lock(&self.challenge).clone().unwrap_or_default();
+        let challenge = lock_mutex(&self.challenge).clone().unwrap_or_default();
         let discovery = discover(
             &self.http,
             &DiscoveryRequest {
@@ -751,7 +746,7 @@ impl McpAuth {
         }
         self.blocking_save(next.clone()).await?;
         self.adopt(Some(&next));
-        *lock(&self.challenge) = None;
+        *lock_mutex(&self.challenge) = None;
         Ok(summary)
     }
 
@@ -761,7 +756,7 @@ impl McpAuth {
             .blocking(|this| this.store.clear().map_err(McpOAuthError::Failed))
             .await?;
         self.adopt(None);
-        *lock(&self.challenge) = None;
+        *lock_mutex(&self.challenge) = None;
         Ok(removed)
     }
 }

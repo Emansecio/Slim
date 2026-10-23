@@ -140,8 +140,21 @@ impl Runtime {
             .as_ref()
             .and_then(CompactionHandle::manual_instructions)
             .filter(|text| !text.trim().is_empty());
-        let requests = preparation.summary_requests(instructions.as_deref());
-        let answers = self.run_summary_calls(ctx, st, requests).await;
+        let in_place = self
+            .summarize_in_place(ctx, st, tools, &preparation, instructions.as_deref())
+            .await;
+        let answers = match in_place {
+            Some(answer) => Ok(SummaryAnswers {
+                history: Some(answer.text),
+                turn_prefix: None,
+                usage: answer.usage,
+            }),
+            None if self.is_cancelled() => Err(ProviderError::Cancelled),
+            None => {
+                let requests = preparation.summary_requests(instructions.as_deref());
+                self.run_summary_calls(ctx, st, requests).await
+            }
+        };
         let result = if self.is_cancelled() {
             Ok(CompactionOutcome::Cancelled)
         } else {
@@ -171,6 +184,104 @@ impl Runtime {
             st.next_seq = self.observed_next_seq(st.next_seq);
         }
         result
+    }
+
+    /// The history summary asked for in place: the turn's own request (its
+    /// system prompt, tools and channel overlay over the history before the
+    /// cut, which the provider has just cached) followed by the summary
+    /// instruction, so that history is read from the cache instead of being
+    /// sent again as one serialized message. Only where Slim steers the
+    /// provider's prompt cache (a cache key or explicit breakpoints): there
+    /// the prefix is known to be cached. `None` when it does not apply, does
+    /// not fit or brings no usable summary (a tool call among them); the
+    /// serialized summary then runs as before.
+    async fn summarize_in_place<A: ProviderAdapter>(
+        &mut self,
+        ctx: &LoopCtx<'_, A>,
+        st: &mut LoopState<'_>,
+        tools: &[Value],
+        preparation: &CompactionPreparation,
+        instructions: Option<&str>,
+    ) -> Option<SummaryAnswer> {
+        let adapter = ctx.client.adapter();
+        let capabilities = adapter.capabilities();
+        if !(capabilities.supports_prompt_cache_key
+            || capabilities.supports_explicit_cache_breakpoints)
+        {
+            return None;
+        }
+        let (prompt, output_cap) = preparation.in_place_summary_prompt(instructions)?;
+        let mut messages = st.messages.get(..preparation.first_kept_index)?.to_vec();
+        messages.push(ProviderMessage::user(prompt));
+        let calibration_eligible = messages_are_text_only(&messages);
+        let request = self
+            .prepare_loop_request(ctx.client, &mut messages, tools, ctx.mode, &st.channel)
+            .and_then(|request| ctx.client.with_output_limit_ceiling(request, output_cap))
+            .ok()?;
+        let provider = crate::provider::provider_kind_name(adapter.kind());
+        let model = adapter.model();
+        let window = st.config.context_window_tokens;
+        let estimated_tokens =
+            self.token_estimator
+                .estimate(provider, model, request.serialized_chars);
+        let output_room = request.output_token_limit().unwrap_or(output_cap);
+        if estimated_tokens.saturating_add(output_room) > window {
+            return None;
+        }
+        let request = request
+            .with_estimated_tokens(estimated_tokens)
+            .with_turn_routing(&st.routing);
+        let ProviderRequestComponents {
+            system_bytes,
+            tool_schema_bytes,
+            history_bytes,
+            tool_result_bytes,
+            ..
+        } = request.components;
+        push_runtime_event(
+            &mut self.app,
+            &mut st.next_seq,
+            crate::EventKind::ContextSnapshot {
+                request_kind: crate::RequestKind::Compaction,
+                provider: provider.into(),
+                model: model.into(),
+                system_bytes,
+                tool_schema_bytes,
+                history_bytes,
+                tool_result_bytes,
+                serialized_chars: request.serialized_chars,
+                estimated_tokens,
+                context_window_tokens: window,
+            },
+        )
+        .ok()?;
+        let call = PreparedSummaryCall {
+            request,
+            estimated_tokens,
+        };
+        let result = self
+            .stream_summary_call(ctx.client, call, calibration_eligible, &mut st.next_seq)
+            .await;
+        st.next_seq = self.observed_next_seq(st.next_seq);
+        match result {
+            Ok(answer) => Some(answer),
+            Err(_) if self.is_cancelled() => None,
+            Err(error) => {
+                let _ = push_runtime_event(
+                    &mut self.app,
+                    &mut st.next_seq,
+                    crate::EventKind::ProviderPhase {
+                        phase: ProviderPhase::Compacting,
+                        elapsed_ms: 0,
+                        detail: Some(format!(
+                            "in-place summary unavailable ({}); summarizing the serialized history",
+                            provider_retry_reason(&error)
+                        )),
+                    },
+                );
+                None
+            }
+        }
     }
 
     /// The history summary, then the summary of a split turn's prefix.
@@ -317,6 +428,19 @@ impl Runtime {
     ) -> Result<SummaryAnswer, ProviderError> {
         let call = self.prepare_summary_call(client, request, limits, raised_limit, next_seq)?;
         *sent_limit = call.request.output_token_limit();
+        // A summarization request is a single text message.
+        self.stream_summary_call(client, call, true, next_seq).await
+    }
+
+    /// Streams a prepared summarization request and records every request
+    /// event. `calibration_eligible` lets its usage calibrate the estimator.
+    async fn stream_summary_call<A: ProviderAdapter>(
+        &mut self,
+        client: &HttpProviderClient<A>,
+        call: PreparedSummaryCall,
+        calibration_eligible: bool,
+        next_seq: &mut u64,
+    ) -> Result<SummaryAnswer, ProviderError> {
         let started = Instant::now();
         let cancellation = CancellationToken::cancelled_or_pending(self.cancellation.clone());
         let mut collected = CompactionSummary::default();
@@ -346,8 +470,7 @@ impl Runtime {
                 failed: request_failed,
             },
         )?;
-        // A summarization request is a single text message.
-        self.calibrate_latest_request(true);
+        self.calibrate_latest_request(calibration_eligible);
         if let Err(error) = stream_result {
             return Err(self.redact_provider_error(error));
         }

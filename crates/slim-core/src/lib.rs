@@ -14,6 +14,7 @@ pub mod runtime;
 pub mod session;
 pub mod skills;
 pub mod task;
+mod sync;
 pub mod tools;
 pub mod workspace_files;
 
@@ -48,5 +49,5 @@ pub use runtime::{
 };
 pub use workspace_files::{
     is_sensitive_file_name, list_workspace_files, load_mention_file, mention_paths_in_prompt,
-    MentionError, MentionFile,
+    MentionError, MentionFile, WorkspaceListing,
 };

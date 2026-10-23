@@ -4,6 +4,8 @@
 //! open ConPTY while conhost emits no bytes. Run it explicitly with:
 //!
 //! `cargo test -p slim-cli --test tui_pty -- --ignored --nocapture`
+// The capture helpers serve only the Windows-gated matrix below.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, ExitStatus, PtySize};
 use serde_json::json;

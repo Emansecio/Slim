@@ -1102,7 +1102,8 @@ fn keep_live_history(live: &[ProviderMessage], durable: &[ProviderMessage]) -> b
 /// Binds the history cache scope, builds the shared-transport client and runs
 /// the loop. The outer error is a client setup failure, which the caller
 /// returns before any loop result exists; the inner result is the loop outcome.
-/// The loop future is boxed: it is large, and the eight call sites would
+/// The loop future is boxed: it is large, and the nine provider arms of
+/// `execute_provider_turn_async` (one `run_loop!` expansion each) would
 /// otherwise each reserve a copy on the caller's (main-thread) stack.
 #[allow(clippy::too_many_arguments)]
 async fn run_bound_agent_loop<A: ProviderAdapter + Send + Sync + 'static>(
@@ -1850,6 +1851,11 @@ pub(crate) async fn execute_provider_turn_async(
         }));
     }
 
+    // TCP and TLS overlap catalog, MCP and workspace setup below.
+    slim_core::provider::prewarm_connection(
+        &request.endpoint,
+        ProviderTimeouts::production(request.timeout).connect,
+    );
     let open_code_spec =
         match request.kind {
             ProviderKind::OpenCodeGo => Some(open_code_model(&request.model).ok_or_else(|| {
@@ -1952,14 +1958,12 @@ pub(crate) async fn execute_provider_turn_async(
     let model = request.model.clone();
     let api_key = request.api_key.clone();
     let cancellation = options.cancellation.clone();
-    let cwd = options
-        .workspace_root
-        .clone()
-        .unwrap_or(
-            std::env::current_dir().map_err(|error| ProviderError::InvalidResponse {
-                message: format!("current directory: {error}"),
-            })?,
-        );
+    let cwd = match options.workspace_root.clone() {
+        Some(root) => root,
+        None => std::env::current_dir().map_err(|error| ProviderError::InvalidResponse {
+            message: format!("current directory: {error}"),
+        })?,
+    };
     let max_mutating_tool_calls = resolve_max_mutating_tool_calls(&options)?;
     let max_read_tool_calls = resolve_max_read_tool_calls(&options)?;
     let max_total_tool_calls = resolve_max_total_tool_calls(&options)?;
@@ -2080,6 +2084,38 @@ pub(crate) async fn execute_provider_turn_async(
         }
         initial_messages.push(message);
     }
+    // Every arm ends in the same bound-loop call; only the adapter and its
+    // cache-scope binder differ. Macros keep the large loop future out of a
+    // per-arm copy of the nine-argument call.
+    macro_rules! run_loop {
+        ($adapter:expr, $adapter_type:ident) => {
+            run_bound_agent_loop(
+                &mut runtime,
+                $adapter,
+                $adapter_type::with_response_cache_scope_id,
+                &initial_messages,
+                request.mode,
+                &cwd,
+                loop_config,
+                provider_timeouts,
+                compact_only,
+            )
+            .await?
+        };
+    }
+    // OpenCode Go and Zen share the provider session id and the up-front
+    // message validation.
+    macro_rules! session_bound {
+        ($adapter:expr) => {{
+            let adapter = $adapter;
+            let adapter = match options.provider_session_id.as_deref() {
+                Some(id) => adapter.with_session_id(id),
+                None => adapter,
+            };
+            adapter.validate_messages(&initial_messages)?;
+            adapter
+        }};
+    }
     let loop_result = match provider {
         ProviderKind::OpenAiCompatible => {
             let mut config =
@@ -2089,18 +2125,7 @@ pub(crate) async fn execute_provider_turn_async(
                 config = config.with_reasoning_effort(effort);
             }
             let adapter = OpenAiCompatibleAdapter::new(config)?;
-            run_bound_agent_loop(
-                &mut runtime,
-                adapter,
-                OpenAiCompatibleAdapter::with_response_cache_scope_id,
-                &initial_messages,
-                request.mode,
-                &cwd,
-                loop_config,
-                provider_timeouts,
-                compact_only,
-            )
-            .await?
+            run_loop!(adapter, OpenAiCompatibleAdapter)
         }
         ProviderKind::OpenAiCodex => {
             let account_id =
@@ -2121,18 +2146,7 @@ pub(crate) async fn execute_provider_turn_async(
                 config = config.with_reasoning_effort(effort);
             }
             let adapter = OpenAiCodexAdapter::new(config)?.with_fast_mode(options.codex_fast);
-            run_bound_agent_loop(
-                &mut runtime,
-                adapter,
-                OpenAiCodexAdapter::with_response_cache_scope_id,
-                &initial_messages,
-                request.mode,
-                &cwd,
-                loop_config,
-                provider_timeouts,
-                compact_only,
-            )
-            .await?
+            run_loop!(adapter, OpenAiCodexAdapter)
         }
         ProviderKind::Anthropic => {
             let mut config = if request.account_id.is_some() {
@@ -2144,18 +2158,7 @@ pub(crate) async fn execute_provider_turn_async(
                 config = config.with_reasoning_effort(effort);
             }
             let adapter = AnthropicAdapter::new(config.with_max_output_tokens(max_output_tokens))?;
-            run_bound_agent_loop(
-                &mut runtime,
-                adapter,
-                AnthropicAdapter::with_response_cache_scope_id,
-                &initial_messages,
-                request.mode,
-                &cwd,
-                loop_config,
-                provider_timeouts,
-                compact_only,
-            )
-            .await?
+            run_loop!(adapter, AnthropicAdapter)
         }
         ProviderKind::OpenCodeGo => {
             let adapter = OpenCodeGoAdapter::new(
@@ -2165,23 +2168,8 @@ pub(crate) async fn execute_provider_turn_async(
                 reasoning_effort.as_deref(),
             )?
             .with_max_output_tokens(max_output_tokens);
-            let adapter = match options.provider_session_id.as_deref() {
-                Some(id) => adapter.with_session_id(id),
-                None => adapter,
-            };
-            adapter.validate_messages(&initial_messages)?;
-            run_bound_agent_loop(
-                &mut runtime,
-                adapter,
-                OpenCodeGoAdapter::with_response_cache_scope_id,
-                &initial_messages,
-                request.mode,
-                &cwd,
-                loop_config,
-                provider_timeouts,
-                compact_only,
-            )
-            .await?
+            let adapter = session_bound!(adapter);
+            run_loop!(adapter, OpenCodeGoAdapter)
         }
         ProviderKind::OpenCodeZen => {
             let adapter = OpenCodeZenAdapter::new(
@@ -2191,23 +2179,8 @@ pub(crate) async fn execute_provider_turn_async(
                 reasoning_effort.as_deref(),
             )?
             .with_max_output_tokens(max_output_tokens);
-            let adapter = match options.provider_session_id.as_deref() {
-                Some(id) => adapter.with_session_id(id),
-                None => adapter,
-            };
-            adapter.validate_messages(&initial_messages)?;
-            run_bound_agent_loop(
-                &mut runtime,
-                adapter,
-                OpenCodeZenAdapter::with_response_cache_scope_id,
-                &initial_messages,
-                request.mode,
-                &cwd,
-                loop_config,
-                provider_timeouts,
-                compact_only,
-            )
-            .await?
+            let adapter = session_bound!(adapter);
+            run_loop!(adapter, OpenCodeZenAdapter)
         }
         ProviderKind::ClinePass => {
             let adapter = ClinePassAdapter::new(
@@ -2217,18 +2190,7 @@ pub(crate) async fn execute_provider_turn_async(
                 reasoning_effort.as_deref(),
             )?
             .with_max_output_tokens(max_output_tokens);
-            run_bound_agent_loop(
-                &mut runtime,
-                adapter,
-                ClinePassAdapter::with_response_cache_scope_id,
-                &initial_messages,
-                request.mode,
-                &cwd,
-                loop_config,
-                provider_timeouts,
-                compact_only,
-            )
-            .await?
+            run_loop!(adapter, ClinePassAdapter)
         }
         ProviderKind::CommandCode => {
             let adapter = CommandCodeAdapter::new(
@@ -2239,18 +2201,7 @@ pub(crate) async fn execute_provider_turn_async(
             )?
             .with_max_output_tokens(max_output_tokens)
             .with_zero_data_retention(command_code_zero_data_retention());
-            run_bound_agent_loop(
-                &mut runtime,
-                adapter,
-                CommandCodeAdapter::with_response_cache_scope_id,
-                &initial_messages,
-                request.mode,
-                &cwd,
-                loop_config,
-                provider_timeouts,
-                compact_only,
-            )
-            .await?
+            run_loop!(adapter, CommandCodeAdapter)
         }
         ProviderKind::Xai => {
             let adapter = XaiAdapter::new(
@@ -2260,18 +2211,11 @@ pub(crate) async fn execute_provider_turn_async(
                 reasoning_effort.as_deref(),
             )?
             .with_max_output_tokens(max_output_tokens);
-            run_bound_agent_loop(
-                &mut runtime,
-                adapter,
-                XaiAdapter::with_response_cache_scope_id,
-                &initial_messages,
-                request.mode,
-                &cwd,
-                loop_config,
-                provider_timeouts,
-                compact_only,
-            )
-            .await?
+            let adapter = match options.provider_session_id.as_deref() {
+                Some(id) => adapter.with_session_id(id),
+                None => adapter,
+            };
+            run_loop!(adapter, XaiAdapter)
         }
         ProviderKind::OpenDesign => {
             let adapter = OpenDesignAdapter::new(
@@ -2281,18 +2225,7 @@ pub(crate) async fn execute_provider_turn_async(
                 reasoning_effort.as_deref(),
             )?
             .with_max_output_tokens(max_output_tokens);
-            run_bound_agent_loop(
-                &mut runtime,
-                adapter,
-                OpenDesignAdapter::with_response_cache_scope_id,
-                &initial_messages,
-                request.mode,
-                &cwd,
-                loop_config,
-                provider_timeouts,
-                compact_only,
-            )
-            .await?
+            run_loop!(adapter, OpenDesignAdapter)
         }
     }
     .map_err(|error| redact_provider_error(error, &api_key));
@@ -3356,7 +3289,9 @@ fn context_reserve_floor_tokens(
 }
 
 fn catalog_default_max_output_tokens(kind: ProviderKind, model: &str) -> u32 {
-    let Some(catalog) = known_model_max_output_tokens(kind, model) else {
+    let Some(catalog) = known_model_max_output_tokens(kind, model)
+        .or_else(|| reasoning_chat_default_max_output_tokens(kind, model))
+    else {
         return DEFAULT_MAX_OUTPUT_TOKENS;
     };
     let window = match kind {
@@ -3392,6 +3327,24 @@ fn known_model_max_output_tokens(kind: ProviderKind, model: &str) -> Option<u32>
         ProviderKind::Anthropic | ProviderKind::CommandCode => claude_max_output_tokens(model),
         ProviderKind::OpenAiCompatible => None,
     }
+}
+
+/// Output room of a reasoning model without metadata. OpenAI advises leaving
+/// at least 25k tokens for reasoning and answer.
+const REASONING_DEFAULT_MAX_OUTPUT_TOKENS: u32 = 32_768;
+
+/// The default limit of a Chat Completions model without metadata (on a
+/// compatible endpoint, or a Command Code model that is not Claude) that
+/// reasons, the OpenAI GPT-5 line included: it spends the limit on thinking before the answer, so the 4096
+/// default would cut most answers short. A default, not metadata: an explicit
+/// limit is not checked against it, and the context reserve still shrinks to
+/// the compaction floor.
+fn reasoning_chat_default_max_output_tokens(kind: ProviderKind, model: &str) -> Option<u32> {
+    let chat = kind == ProviderKind::OpenAiCompatible
+        || (kind == ProviderKind::CommandCode && claude_max_output_tokens(model).is_none());
+    let reasons =
+        slim_core::provider::chat_model_reasons_by_default(model) || codex_model(model).is_some();
+    (chat && reasons).then_some(REASONING_DEFAULT_MAX_OUTPUT_TOKENS)
 }
 
 pub(crate) const DEFAULT_PROVIDER_TIMEOUT_SECS: u64 = 120;

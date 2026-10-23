@@ -84,7 +84,7 @@ Exemplo mínimo:
 
 ```toml
 model = "gpt-4o-mini"
-max_turns = 128
+max_turns = 128            # opcional; sem a chave não há teto de turnos
 timeout_secs = 120
 
 [compaction]

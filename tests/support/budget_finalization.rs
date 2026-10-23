@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
-/// Keep budget fixtures on localhost through the final, tool-free request.
+/// Keep budget fixtures on localhost through the final request.
 /// An explicit failure exercises the fallback without waiting for a refused
 /// connection after the fixture's first turn has closed its listener.
 pub fn reject_budget_finalization(listener: &TcpListener) {
@@ -49,7 +49,17 @@ pub fn reject_budget_finalization(listener: &TcpListener) {
                 .expect("finalization JSON");
         }
     };
-    assert!(body.get("tools").is_none(), "finalization must omit tools");
+    // The closing request leaves the cached prefix alone: the turn's tools
+    // stay and no `tool_choice` is forced. Only a model that still calls a
+    // tool gets a second request that forbids them.
+    assert!(
+        body.get("tools").is_some(),
+        "finalization keeps the turn's tools"
+    );
+    assert!(
+        body.get("tool_choice").is_none(),
+        "finalization forces no tool_choice"
+    );
     assert!(body.to_string().contains("Budget exhausted"));
     stream
         .write_all(

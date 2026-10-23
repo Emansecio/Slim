@@ -202,6 +202,87 @@ class MeasurementTests(unittest.TestCase):
             self.assertEqual(manifest['fixture_hash_kind'], 'materialized-bytes-v1')
             self.assertFalse(Path(manifest['workspace']).exists())
 
+    def test_runner_maps_pi_provider_and_diffs_final_workspaces(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            exe = root / 'fake-executable'; exe.write_bytes(b'fixture')
+            specs = {}
+            def process(spec_path, timing_path, stdout_path, stderr_path):
+                spec = json.loads(Path(spec_path).read_text(encoding='utf-8'))
+                specs[spec['agent']] = spec
+                (Path(spec['cwd']) / 'out.py').write_text('print(%r)\n' % spec['agent'], encoding='utf-8')
+                Path(timing_path).write_text(json.dumps(dict(exit_code=0, timed_out=False, total_ms=1)))
+                Path(stdout_path).write_text(''); Path(stderr_path).write_text('')
+            with patch.object(run, 'HERE', root), patch.object(run, 'resolve_pi', return_value=exe), \
+                 patch.object(run, 'resolve_slim', return_value=exe), \
+                 patch.object(run, 'version_of', return_value='test'), \
+                 patch.object(run, 'run_process', side_effect=process), patch('builtins.print'):
+                campaign = run.main(['pi', 'slim'], check="print('PASS')", audit=False)
+            pi_args = specs['pi']['arguments']
+            self.assertEqual(pi_args[pi_args.index('--provider') + 1], 'openai')
+            self.assertEqual(pi_args[pi_args.index('--model') + 1], run.MODEL)
+            slim_args = specs['slim']['arguments']
+            self.assertEqual(slim_args[slim_args.index('--provider') + 1], 'openai-codex')
+            manifest = json.loads((campaign / 'manifest.json').read_text(encoding='utf-8'))
+            self.assertEqual((manifest['provider'], manifest['pi_provider']), ('openai-codex', 'openai'))
+            diff = (campaign / 'code.diff').read_text(encoding='utf-8')
+            self.assertIn("-print('pi')", diff)
+            self.assertIn("+print('slim')", diff)
+
+    def test_scenario_timeout_applies_unless_overridden(self):
+        for argv, expected in ((['daily.py', '--rounds', '1'], 600),
+                               (['daily.py', '--rounds', '1', '--timeout', '90'], 90)):
+            with patch.object(daily, 'SCENARIOS', {'v': {'timeout_seconds': 600, 'visual': {'page': 'x'}}}), \
+                 patch('sys.argv', argv), \
+                 patch.object(run, 'main', return_value=Path('campaign')) as main, \
+                 patch('builtins.print'):
+                daily.main()
+            self.assertEqual(main.call_args.kwargs['timeout_seconds'], expected)
+            self.assertEqual(main.call_args.kwargs['visual'], {'page': 'x'})
+
+    def test_declared_then_run_final_is_not_an_unmetered_provider_turn(self):
+        with tempfile.TemporaryDirectory() as root:
+            for name, reply, complete in (('1-declared', 'Done.', True), ('2-extra', 'Unexpected.', False)):
+                cdir = write_campaign(root, name)
+                arguments = json.dumps({'path': 'a.py', 'then_run': {'command': 'python', 'final': 'Done.'}})
+                entries = [dict(type='entry', entry=dict(role='assistant', tool_calls=[
+                               dict(id='c1', name='patch', arguments=arguments)])),
+                           dict(type='entry', entry=dict(role='tool', tool_call_id='c1', content='ok')),
+                           dict(type='entry', entry=dict(role='assistant', content=reply)),
+                           dict(type='fact', fact=dict(namespace='tool.v1', key='c1',
+                                                       value=dict(success=True, duration_ms=3)))]
+                (cdir / 'slim.session.jsonl').write_text('\n'.join(json.dumps(x) for x in entries), encoding='utf-8')
+                summary = report.summarize_arm(cdir, 'slim')
+                self.assertEqual(summary['metrics_complete'], complete, name)
+                self.assertEqual(summary['model_calls'], 1)
+
+    def test_code_final_reply_and_visual_reach_the_report(self):
+        with tempfile.TemporaryDirectory() as root:
+            cdir = write_campaign(root, '20260101-000000Z-v')
+            audit = [json.loads(line) for line in (cdir / 'pi.audit.jsonl').read_text(encoding='utf-8').splitlines()]
+            audit[1]['message']['content'].append(dict(type='text', text='Pi done'))
+            (cdir / 'pi.audit.jsonl').write_text('\n'.join(json.dumps(x) for x in audit), encoding='utf-8')
+            with (cdir / 'slim.session.jsonl').open('a', encoding='utf-8') as session:
+                session.write('\n' + json.dumps(dict(type='entry', entry=dict(role='assistant', content='Slim done'))))
+            for arm in ('pi', 'slim'):
+                (cdir / f'{arm}.workspace').mkdir()
+                (cdir / f'{arm}.workspace' / 'index.html').write_text(arm + '\nline\n', encoding='utf-8')
+            run.write_code_diff(cdir, ['pi', 'slim'])
+            (cdir / 'visual').mkdir()
+            (cdir / 'visual' / 'slim.json').write_text(json.dumps(dict(exists=True, frames=[
+                dict(t=0, png_ok=True, faces=9, distinct_fills=6, **{'data-angle': '0'})])), encoding='utf-8')
+            (cdir / 'visual.html').write_text('', encoding='utf-8')
+            md, js = Path(root) / 'r.md', Path(root) / 'r.json'
+            with patch('sys.argv', ['report.py', str(cdir), '--output-md', str(md), '--output-json', str(js)]), \
+                 patch('builtins.print'):
+                report.main()
+            text = md.read_text(encoding='utf-8')
+            for expected in ('code.diff', '`index.html` | added | 2 |', 'Resposta final: Pi done',
+                             'Resposta final: Slim done', '| 0 | ok | 9 | 6 | 0 |', 'visual.html'):
+                self.assertIn(expected, text)
+            arms = {a['arm']: a for a in json.loads(js.read_text(encoding='utf-8'))['arms']}
+            self.assertEqual(arms['slim']['code'], [dict(path='index.html', change='added', bytes=10, lines=2)])
+
 
 class MeasurementHonestyTests(unittest.TestCase):
     def test_unproven_tool_outcome_is_unknown_not_failure_in_both_meters(self):
@@ -296,6 +377,57 @@ class MeasurementHonestyTests(unittest.TestCase):
             # o braco reprovado continua visivel, com o motivo explicito na tabela de campanhas
             self.assertIn('| exit=1 | aprovado |', text)
             self.assertIn('### `20260101-000001Z-b`', text.split('## Rastreabilidade')[1])
+
+    def test_cache_diagnosis_separates_provider_misses_from_prefix_changes(self):
+        def call(ordinal, cache_read, items, reused, outcome='success', state='replayed'):
+            return {'type': 'fact', 'fact': {'namespace': 'provider.call.v1', 'value': {
+                'ordinal': ordinal, 'cache_read_tokens': cache_read, 'input_items': items,
+                'reused_input_items': reused, 'outcome': outcome, 'turn_state': state}}}
+        recs = [
+            call(2, 900, 5, 3),                      # leu cache
+            call(1, 0, 3, None, state='captured'),   # primeiro: nada a reutilizar
+            call(3, 0, 7, 5),                        # repetiu tudo e nao leu: provider
+            call(4, 0, 9, 4),                        # mudou o item 5: Slim
+            call(5, 0, 9, 9, outcome='error'),       # falho: nao classificado
+            call(6, 0, 11, 9),
+            {'type': 'fact', 'fact': {'namespace': 'tool.v1', 'value': {}}},
+            {'type': 'fact', 'fact': {'namespace': 'provider.call.v1', 'value': {
+                'ordinal': 7, 'cache_read_tokens': 0, 'outcome': 'success'}}},  # bateria antiga
+        ]
+        diagnosis = report.slim_cache_diagnosis(recs)
+        self.assertEqual(diagnosis['calls'], 7)
+        self.assertEqual(diagnosis['hits'], 1)
+        self.assertEqual(diagnosis['miss_prefix_intact'], 2)
+        self.assertEqual(diagnosis['miss_prefix_changed'], 1)
+        self.assertEqual(diagnosis['miss_unknown'], 1)
+        self.assertEqual(diagnosis['turn_state'], {'captured': 1, 'replayed': 5, 'none': 1})
+        self.assertEqual(report.slim_cache_diagnosis([])['calls'], 0)
+
+    def test_effective_cost_discounts_cache_reads_and_is_paired(self):
+        with tempfile.TemporaryDirectory() as root:
+            cdir = write_campaign(root, '20260101-000000Z-a')
+            stdout = cdir / 'slim.stdout.jsonl'
+            payload = json.loads(stdout.read_text(encoding='utf-8'))
+            for request in payload['usage']['requests']:
+                request.update(uncached_input_tokens=4, cache_read_tokens=6, cache_write_tokens=1)
+            stdout.write_text(json.dumps(payload), encoding='utf-8')
+            for arm in ('slim', 'pi'):
+                summary = report.summarize_arm(cdir, arm)
+                self.assertEqual(summary['effective_tokens'],
+                                 summary['uncached'] + summary['cache_write'] + summary['output'], arm)
+            slim = report.summarize_arm(cdir, 'slim')
+            self.assertLess(slim['effective_tokens'], slim['total_tokens'])
+            md, js = Path(root) / 'r.md', Path(root) / 'r.json'
+            with patch('sys.argv', ['report.py', str(cdir), '--output-md', str(md),
+                                   '--output-json', str(js)]), patch('builtins.print'):
+                report.main()
+            stats = json.loads(js.read_text(encoding='utf-8'))['paired']['stats']
+            pi = report.summarize_arm(cdir, 'pi')
+            self.assertAlmostEqual(stats['median_effective_ratio'], slim['effective_tokens'] / pi['effective_tokens'])
+            self.assertEqual(stats['sign_test_effective']['trials'], 1)
+            text = md.read_text(encoding='utf-8')
+            self.assertIn('Custo efetivo (nao-cache + escrita cache + saida)', text)
+            self.assertIn('| Efetivo Slim | Efetivo Pi | Delta efetivo |', text)
 
     def test_sign_test_and_bootstrap_are_deterministic(self):
         self.assertAlmostEqual(report.sign_test_p(4, 4), 0.125, places=12)

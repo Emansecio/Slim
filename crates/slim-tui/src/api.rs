@@ -30,23 +30,23 @@ impl LoginProvider {
     }
 }
 
+/// Built-in Codex names. The picker lists the account's `/codex/models`
+/// catalog; these are the offline seed and the `/model sol` shortcuts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelAlias {
     Sol,
     Terra,
     Luna,
-    Astra,
 }
 
 impl ModelAlias {
-    pub const ALL: [Self; 4] = [Self::Sol, Self::Terra, Self::Luna, Self::Astra];
+    pub const ALL: [Self; 3] = [Self::Sol, Self::Terra, Self::Luna];
 
     pub fn id(self) -> &'static str {
         match self {
             Self::Sol => "gpt-5.6-sol",
             Self::Terra => "gpt-5.6-terra",
             Self::Luna => "gpt-5.6-luna",
-            Self::Astra => "gpt-6-astra",
         }
     }
 
@@ -55,7 +55,6 @@ impl ModelAlias {
             Self::Sol => "GPT-5.6 Sol",
             Self::Terra => "GPT-5.6 Terra",
             Self::Luna => "GPT-5.6 Luna",
-            Self::Astra => "GPT-6 Astra",
         }
     }
 
@@ -64,7 +63,6 @@ impl ModelAlias {
             "sol" | "gpt-5.6-sol" => Some(Self::Sol),
             "terra" | "gpt-5.6-terra" => Some(Self::Terra),
             "luna" | "gpt-5.6-luna" => Some(Self::Luna),
-            "astra" | "gpt-6-astra" => Some(Self::Astra),
             _ => None,
         }
     }
@@ -78,7 +76,6 @@ impl ModelAlias {
             Self::Sol => 0,
             Self::Terra => 1,
             Self::Luna => 2,
-            Self::Astra => 3,
         }
     }
 }
@@ -161,12 +158,12 @@ impl ReasoningEffort {
         Self::ALL[index.min(Self::ALL.len() - 1)]
     }
 
-    /// Request-level efforts supported by each built-in Codex model.
-    /// Astra Ultra requires Codex orchestration beyond this Responses client.
+    /// Request-level efforts supported by each built-in Codex model, matching
+    /// the catalog's `supported_reasoning_levels`.
     pub fn supported(model: ModelAlias) -> &'static [Self] {
         match model {
             ModelAlias::Sol | ModelAlias::Terra => &Self::ALL,
-            ModelAlias::Luna | ModelAlias::Astra => &Self::ALL[..Self::ALL.len() - 1],
+            ModelAlias::Luna => &Self::ALL[..Self::ALL.len() - 1],
         }
     }
 
@@ -332,6 +329,13 @@ pub struct TodoItemView {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OpenCodeCatalogSource {
+    Live,
+    Cache,
+    Fallback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodexCatalogSource {
     Live,
     Cache,
     Fallback,
@@ -700,6 +704,10 @@ pub enum UiEvent {
         models: Vec<OpenCodeModelView>,
         source: OpenCodeCatalogSource,
     },
+    CodexCatalogLoaded {
+        models: Vec<OpenCodeModelView>,
+        source: CodexCatalogSource,
+    },
     ClinePassCatalogLoaded {
         models: Vec<OpenCodeModelView>,
         source: ClinePassCatalogSource,
@@ -785,7 +793,7 @@ pub enum UiEvent {
 impl UiEvent {
     pub const DEFAULT_MAX_MUTATING_TOOL_CALLS: usize = usize::MAX;
     pub const DEFAULT_MAX_READ_TOOL_CALLS: usize = usize::MAX;
-    pub const DEFAULT_MAX_TURNS: usize = 128;
+    pub const DEFAULT_MAX_TURNS: usize = usize::MAX;
 
     pub fn run_started(run_id: u64) -> Self {
         Self::run_started_with_budget(
@@ -1359,11 +1367,14 @@ pub enum UiCommand {
     CancelLogin,
     Logout,
     SetMode(OperatingMode),
+    /// Applies a Codex model id; the picker's ids come from the account
+    /// catalog, so the command carries the slug rather than an alias.
     SetModel {
-        model: ModelAlias,
+        model: String,
         effort: ReasoningEffort,
         fast: bool,
     },
+    RefreshCodexModels,
     RefreshOpenCodeModels,
     RefreshZenModels,
     RefreshClinePassModels,
@@ -2329,12 +2340,8 @@ mod tests {
 
     #[test]
     fn gpt_56_efforts_match_codex_model_catalog() {
-        assert_eq!(
-            ReasoningEffort::supported(ModelAlias::Astra),
-            &ReasoningEffort::ALL[..5]
-        );
-        assert_eq!(ModelAlias::parse("astra"), Some(ModelAlias::Astra));
-        assert_eq!(ModelAlias::parse("gpt-6-astra"), Some(ModelAlias::Astra));
+        assert_eq!(ModelAlias::parse("astra"), None);
+        assert_eq!(ModelAlias::parse("gpt-6-astra"), None);
         assert_eq!(
             ReasoningEffort::supported(ModelAlias::Sol),
             &ReasoningEffort::ALL

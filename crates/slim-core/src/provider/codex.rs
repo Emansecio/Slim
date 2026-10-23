@@ -24,14 +24,16 @@ impl OpenAiCodexAdapter {
         if let Some(id) = normalize_codex_model_id(&config.model) {
             config.model = id.into();
         }
-        if config.model == "gpt-6-astra"
-            && config
-                .reasoning_effort()
-                .is_some_and(|effort| !["low", "medium", "high", "xhigh", "max"].contains(&effort))
+        // A live slug the bundled catalog does not know has no ladder to
+        // validate against; the backend answers for it.
+        if let (Some(model), Some(effort)) =
+            (codex_model(&config.model), config.reasoning_effort())
         {
-            return Err(ProviderError::InvalidResponse {
-                message: "Astra reasoning effort must be low, medium, high, xhigh, or max".into(),
-            });
+            if !model.reasoning_levels.contains(&effort) {
+                return Err(ProviderError::InvalidResponse {
+                    message: "unsupported Codex reasoning effort for this model".into(),
+                });
+            }
         }
         match config.auth() {
             ProviderAuth::OAuth {
@@ -85,26 +87,24 @@ impl OpenAiCodexAdapter {
         ]
     }
 
-    fn request(&self, messages: &[ProviderMessage], tools: &[Value]) -> HttpRequest {
-        self.request_with_transport(
-            codex_url(&self.config.endpoint),
-            self.headers(),
-            messages,
-            tools,
-        )
+    /// The Codex backend routes prompt-cache reuse by session: without
+    /// `session-id` it served no cached tokens even for byte-identical
+    /// prefixes. The prompt cache key already names that stable prefix.
+    fn headers_for(&self, body: &Value) -> Vec<(String, String)> {
+        let mut headers = self.headers();
+        if let Some(key) = body.get("prompt_cache_key").and_then(Value::as_str) {
+            headers.push(("session-id".into(), key.into()));
+            headers.push(("x-client-request-id".into(), key.into()));
+        }
+        headers
     }
 
-    pub(super) fn request_with_transport(
-        &self,
-        url: String,
-        headers: Vec<(String, String)>,
-        messages: &[ProviderMessage],
-        tools: &[Value],
-    ) -> HttpRequest {
+    fn request(&self, messages: &[ProviderMessage], tools: &[Value]) -> HttpRequest {
+        let body = self.request_body(messages, tools);
         HttpRequest {
-            url,
-            headers,
-            body: self.request_body(messages, tools).to_string(),
+            url: codex_url(&self.config.endpoint),
+            headers: self.headers_for(&body),
+            body: body.to_string(),
         }
     }
 
@@ -125,6 +125,7 @@ impl OpenAiCodexAdapter {
                     .iter()
                     .filter(|state| {
                         message.role == "assistant"
+                            && state.binding.is_none()
                             && state.scope_id == self.config.response_cache_scope_id()
                             && state.model == self.config.model
                     })
@@ -271,6 +272,12 @@ impl ProviderAdapter for OpenAiCodexAdapter {
         materialize_native_prompt_cache_key(self, body);
     }
 
+    /// The Codex backend pins a turn to the server that holds its cache with
+    /// this token, as the Codex CLI replays it within each turn.
+    fn turn_state_header(&self) -> Option<&'static str> {
+        Some("x-codex-turn-state")
+    }
+
     fn response_cache_scope_id(&self) -> Option<u64> {
         Some(self.config.response_cache_scope_id())
     }
@@ -312,7 +319,7 @@ impl ProviderAdapter for OpenAiCodexAdapter {
         let (body, stable_prefixes) = self.request_body_with_prefixes(messages, tools);
         PreparedProviderRequest::from_http_body_with_prefixes(
             codex_url(&self.config.endpoint),
-            self.headers(),
+            self.headers_for(&body),
             body,
             self,
             stable_prefixes,
@@ -329,7 +336,7 @@ impl ProviderAdapter for OpenAiCodexAdapter {
         let stable_prefixes = materialize_native_prompt_cache_key(self, &mut body);
         PreparedProviderRequest::from_http_body_with_prefixes(
             codex_url(&self.config.endpoint),
-            self.headers(),
+            self.headers_for(&body),
             body,
             self,
             stable_prefixes,
@@ -439,11 +446,13 @@ impl ProviderAdapter for OpenAiCodexAdapter {
                         .and_then(Value::as_str)
                         .is_some_and(|content| !content.is_empty())
                     {
-                        events.push(ProviderEvent::ResponsesReasoning(ResponsesReasoning {
-                            scope_id: self.config.response_cache_scope_id(),
-                            model: self.config.model.clone(),
-                            item: item.clone(),
-                        }));
+                        events.push(ProviderEvent::ResponsesReasoning(
+                            ResponsesReasoning::responses_item(
+                                self.config.response_cache_scope_id(),
+                                self.config.model.clone(),
+                                item.clone(),
+                            ),
+                        ));
                     }
                     events
                 } else {
@@ -574,6 +583,9 @@ fn optional_tool_index(value: Option<&Value>) -> Result<Option<u32>, ProviderErr
 /// default of 32_000 is unrelated and must not be used as model truth.
 pub const CODEX_BUNDLED_CONTEXT_WINDOW: u64 = 272_000;
 
+/// Output cap the Codex catalog advertises for every subscription model.
+pub const CODEX_MAX_OUTPUT_TOKENS: u32 = 128_000;
+
 /// `client_version` query the Codex backend requires. Slim's crate version is
 /// not a Codex CLI version and would yield an empty catalog.
 pub const CODEX_CATALOG_CLIENT_VERSION: &str = "0.149.0";
@@ -584,12 +596,22 @@ pub struct CodexModel {
     pub name: &'static str,
     pub context_window: u64,
     pub max_output_tokens: u32,
+    /// Efforts the backend advertises for this model (`supported_reasoning_levels`).
+    pub reasoning_levels: &'static [&'static str],
 }
 
+/// One row of the account's `/codex/models` catalog. The slug, display name and
+/// effort ladder are what the model picker shows, so a subscription that gains
+/// or retires a model never needs a Slim release.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexCatalogEntry {
     pub slug: String,
     pub context_window: u64,
+    pub display_name: Option<String>,
+    pub reasoning_levels: Vec<String>,
+    /// `visibility: hide` rows (`gpt-reserve`, `codex-auto-review`) are served
+    /// to internal clients but are not models the user picks.
+    pub visible: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -611,30 +633,30 @@ impl std::fmt::Display for CodexCatalogError {
 
 impl std::error::Error for CodexCatalogError {}
 
+/// Offline fallback for the picker. The live `/codex/models` catalog of the
+/// signed-in account replaces it, so this list only has to be right for a
+/// first launch without a network round trip.
 const CODEX_MODELS: &[CodexModel] = &[
-    CodexModel {
-        id: "gpt-6-astra",
-        name: "GPT-6 Astra",
-        context_window: CODEX_BUNDLED_CONTEXT_WINDOW,
-        max_output_tokens: 128_000,
-    },
     CodexModel {
         id: "gpt-5.6-sol",
         name: "GPT-5.6 Sol",
         context_window: CODEX_BUNDLED_CONTEXT_WINDOW,
-        max_output_tokens: 128_000,
+        max_output_tokens: CODEX_MAX_OUTPUT_TOKENS,
+        reasoning_levels: &["low", "medium", "high", "xhigh", "max", "ultra"],
     },
     CodexModel {
         id: "gpt-5.6-terra",
         name: "GPT-5.6 Terra",
         context_window: CODEX_BUNDLED_CONTEXT_WINDOW,
-        max_output_tokens: 128_000,
+        max_output_tokens: CODEX_MAX_OUTPUT_TOKENS,
+        reasoning_levels: &["low", "medium", "high", "xhigh", "max", "ultra"],
     },
     CodexModel {
         id: "gpt-5.6-luna",
         name: "GPT-5.6 Luna",
         context_window: CODEX_BUNDLED_CONTEXT_WINDOW,
-        max_output_tokens: 128_000,
+        max_output_tokens: CODEX_MAX_OUTPUT_TOKENS,
+        reasoning_levels: &["low", "medium", "high", "xhigh", "max"],
     },
 ];
 
@@ -648,13 +670,13 @@ pub fn codex_models() -> &'static [CodexModel] {
 
 pub fn normalize_codex_model_id(id: &str) -> Option<&'static str> {
     match id.trim().to_ascii_lowercase().as_str() {
-        "astra" | "gpt-6-astra" => Some("gpt-6-astra"),
         "sol" | "gpt-5.6-sol" => Some("gpt-5.6-sol"),
         "terra" | "gpt-5.6-terra" => Some("gpt-5.6-terra"),
         "luna" | "gpt-5.6-luna" => Some("gpt-5.6-luna"),
         _ => None,
     }
 }
+
 
 pub fn codex_model(id: &str) -> Option<&'static CodexModel> {
     let slug = normalize_codex_model_id(id)?;
@@ -698,20 +720,51 @@ pub fn parse_codex_catalog(bytes: &[u8]) -> Result<Vec<CodexCatalogEntry>, Codex
         if slug.is_empty() || slug.len() > MAX_SLUG_BYTES || !slug_is_safe(slug) {
             return Err(CodexCatalogError::InvalidSchema);
         }
+        // A model the backend serves without stating a window still belongs in
+        // the picker: fall back to the bundled coding-client figure.
         let context_window = model
             .get("context_window")
             .and_then(Value::as_u64)
             .or_else(|| model.get("max_context_window").and_then(Value::as_u64))
-            .filter(|window| *window > 0);
-        let Some(context_window) = context_window else {
-            continue;
-        };
+            .filter(|window| *window > 0)
+            .unwrap_or(CODEX_BUNDLED_CONTEXT_WINDOW);
         if !seen.insert(slug) {
             return Err(CodexCatalogError::DuplicateSlug);
         }
+        let display_name = model
+            .get("display_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && name.len() <= MAX_SLUG_BYTES)
+            .map(str::to_owned);
+        let visible = model
+            .get("visibility")
+            .and_then(Value::as_str)
+            .is_none_or(|visibility| !visibility.eq_ignore_ascii_case("hide"));
+        let mut reasoning_levels = Vec::new();
+        for level in model
+            .get("supported_reasoning_levels")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let effort = level
+                .as_str()
+                .or_else(|| level.get("effort").and_then(Value::as_str));
+            if let Some(effort) = effort.map(str::trim).filter(|effort| !effort.is_empty()) {
+                reasoning_levels.push(effort.to_ascii_lowercase());
+            }
+            if reasoning_levels.len() > MAX_CATALOG_ENTRIES {
+                return Err(CodexCatalogError::Oversized);
+            }
+        }
+        reasoning_levels.dedup();
         entries.push(CodexCatalogEntry {
             slug: slug.to_owned(),
             context_window,
+            display_name,
+            reasoning_levels,
+            visible,
         });
     }
     Ok(entries)

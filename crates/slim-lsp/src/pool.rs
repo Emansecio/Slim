@@ -80,6 +80,15 @@ impl Drop for ServerProcess {
     }
 }
 
+/// Asks the server to shut down, then reaps its process, force-killing it
+/// after the grace period.
+async fn stop_server(instance: &LspServerInstance, process: Option<ServerProcess>) {
+    instance.shutdown().await;
+    if let Some(process) = process {
+        process.wait_or_force_kill(PROCESS_EXIT_GRACE).await;
+    }
+}
+
 async fn terminate_process_tree(pid: Option<u32>) {
     let Some(pid) = pid.filter(|pid| *pid != 0) else {
         return;
@@ -443,16 +452,7 @@ impl LspProcessPool {
                     state.shutdowns_in_flight = state.shutdowns_in_flight.saturating_add(1);
                     drop(state);
                     let this = self.clone();
-                    tokio::spawn(async move {
-                        dead.instance.shutdown().await;
-                        if let Some(process) = dead.process.take() {
-                            process.wait_or_force_kill(PROCESS_EXIT_GRACE).await;
-                        }
-                        let mut state = this.state.lock().await;
-                        state.shutdowns_in_flight = state.shutdowns_in_flight.saturating_sub(1);
-                        drop(state);
-                        this.lifecycle.notify_waiters();
-                    });
+                    tokio::spawn(async move { this.finish_shutdown(dead).await });
                     continue;
                 }
                 if let Some(entry) = state.entries.get_mut(&key) {
@@ -497,16 +497,7 @@ impl LspProcessPool {
                         state.shutdowns_in_flight = state.shutdowns_in_flight.saturating_add(1);
                         drop(state);
                         let this = self.clone();
-                        tokio::spawn(async move {
-                            idle.instance.shutdown().await;
-                            if let Some(process) = idle.process.take() {
-                                process.wait_or_force_kill(PROCESS_EXIT_GRACE).await;
-                            }
-                            let mut state = this.state.lock().await;
-                            state.shutdowns_in_flight = state.shutdowns_in_flight.saturating_sub(1);
-                            drop(state);
-                            this.lifecycle.notify_waiters();
-                        });
+                        tokio::spawn(async move { this.finish_shutdown(idle).await });
                         continue;
                     }
                     let signal = Arc::new(Notify::new());
@@ -555,10 +546,7 @@ impl LspProcessPool {
                                 "server startup was superseded"
                             };
                             drop(state);
-                            instance.shutdown().await;
-                            if let Some(process) = process {
-                                process.wait_or_force_kill(PROCESS_EXIT_GRACE).await;
-                            }
+                            stop_server(&instance, process).await;
                             if owns_flight {
                                 let mut state = this.state.lock().await;
                                 if state
@@ -730,16 +718,7 @@ impl LspProcessPool {
             state.shutdowns_in_flight = state.shutdowns_in_flight.saturating_add(1);
             drop(state);
             let this = self.clone();
-            tokio::spawn(async move {
-                dead.instance.shutdown().await;
-                if let Some(process) = dead.process.take() {
-                    process.wait_or_force_kill(PROCESS_EXIT_GRACE).await;
-                }
-                let mut state = this.state.lock().await;
-                state.shutdowns_in_flight = state.shutdowns_in_flight.saturating_sub(1);
-                drop(state);
-                this.lifecycle.notify_waiters();
-            });
+            tokio::spawn(async move { this.finish_shutdown(dead).await });
             return None;
         }
         let entry = state.entries.get_mut(&key)?;
@@ -814,10 +793,15 @@ impl LspProcessPool {
         drop(entry.idle_task.take());
         state.shutdowns_in_flight = state.shutdowns_in_flight.saturating_add(1);
         drop(state);
-        entry.instance.shutdown().await;
-        if let Some(process) = entry.process.take() {
-            process.wait_or_force_kill(PROCESS_EXIT_GRACE).await;
-        }
+        self.finish_shutdown(entry).await;
+    }
+
+    /// Completes a shutdown of an entry already removed from the pool. The
+    /// caller must have incremented `shutdowns_in_flight` under the state
+    /// lock before releasing it, so `close_all` never observes a removed but
+    /// still-running server as finished.
+    async fn finish_shutdown(&self, mut entry: PoolEntry) {
+        stop_server(&entry.instance, entry.process.take()).await;
         let mut state = self.state.lock().await;
         state.shutdowns_in_flight = state.shutdowns_in_flight.saturating_sub(1);
         drop(state);
@@ -847,10 +831,7 @@ impl LspProcessPool {
                 if let Some(task) = entry.idle_task.take() {
                     task.abort();
                 }
-                entry.instance.shutdown().await;
-                if let Some(process) = entry.process.take() {
-                    process.wait_or_force_kill(PROCESS_EXIT_GRACE).await;
-                }
+                stop_server(&entry.instance, entry.process.take()).await;
             });
         }
         while join_set.join_next().await.is_some() {}
@@ -877,14 +858,14 @@ fn decrement_atomic(counter: &AtomicUsize, amount: usize) {
     if amount == 0 {
         return;
     }
-    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+    let _ = counter.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         Some(current.saturating_sub(amount))
     });
 }
 
 fn decrement_atomic_once(counter: &AtomicUsize) -> Option<usize> {
     counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             current.checked_sub(1)
         })
         .ok()

@@ -21,19 +21,8 @@ pub(super) fn validate_anthropic_images(messages: &[ProviderMessage]) -> Result<
         }
         let media_type = normalize_media_type(media_type)?;
         let encoded = normalize_base64(data)?;
-        let mut bytes = Vec::with_capacity(encoded.len() / 4 * 3);
-        for chunk in encoded.as_bytes().as_chunks::<4>().0 {
-            let value = chunk.iter().fold(0_u32, |value, byte| {
-                (value << 6) | u32::from(base64_value(*byte).unwrap_or(0))
-            });
-            bytes.push((value >> 16) as u8);
-            if chunk[2] != b'=' {
-                bytes.push((value >> 8) as u8);
-            }
-            if chunk[3] != b'=' {
-                bytes.push(value as u8);
-            }
-        }
+        let bytes = decode_base64(&encoded)
+            .ok_or_else(|| invalid("Anthropic image has invalid base64 data"))?;
         let (width, height) = dimensions(&media_type, &bytes)
             .filter(|(width, height)| *width > 0 && *height > 0)
             .ok_or_else(|| {

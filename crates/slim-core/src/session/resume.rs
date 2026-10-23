@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use super::attempts::{AttemptLedger, AttemptLedgerError};
-use super::jsonl_repo::parse;
+use super::jsonl_repo::{parse, ParsedJsonl};
 use super::queue::{DurableQueue, DurableQueueError, QueueItem};
 use super::reducer::{restore_records, DurableState, ReduceError};
 use super::repository::{validate_durable_records, DurableRepo};
@@ -244,50 +244,16 @@ pub fn preflight_session(path: impl AsRef<Path>) -> io::Result<SessionPreflight>
         }
     };
     if let Err(error) = restore_records(&parsed.records) {
-        return Ok(SessionPreflight {
-            path,
-            format: Some(SessionFormat::DurableV2),
-            session_id: Some(header.id.clone()),
-            header: Some(header),
-            status: PreflightStatus::Invalid {
-                message: error.to_string(),
-            },
-            last_seq: parsed.records.last().map(DurableRecord::seq),
-            next_seq: parsed
-                .records
-                .last()
-                .and_then(|record| record.seq().checked_add(1)),
-            sequence_overflow: parsed
-                .records
-                .last()
-                .is_some_and(|record| record.seq() == u64::MAX),
-            needs_separator: parsed.needs_separator,
-            summary: summarize(&parsed.records),
-            records: parsed.records,
-        });
+        let status = PreflightStatus::Invalid {
+            message: error.to_string(),
+        };
+        return Ok(v2_report(path, header, status, parsed));
     }
     if let Err(error) = validate_durable_records(&parsed.records) {
-        return Ok(SessionPreflight {
-            path,
-            format: Some(SessionFormat::DurableV2),
-            session_id: Some(header.id.clone()),
-            header: Some(header),
-            status: PreflightStatus::Invalid {
-                message: error.to_string(),
-            },
-            last_seq: parsed.records.last().map(DurableRecord::seq),
-            next_seq: parsed
-                .records
-                .last()
-                .and_then(|record| record.seq().checked_add(1)),
-            sequence_overflow: parsed
-                .records
-                .last()
-                .is_some_and(|record| record.seq() == u64::MAX),
-            needs_separator: parsed.needs_separator,
-            summary: summarize(&parsed.records),
-            records: parsed.records,
-        });
+        let status = PreflightStatus::Invalid {
+            message: error.to_string(),
+        };
+        return Ok(v2_report(path, header, status, parsed));
     }
 
     let status = parsed
@@ -298,31 +264,36 @@ pub fn preflight_session(path: impl AsRef<Path>) -> io::Result<SessionPreflight>
             tail_bytes: tail.len(),
         })
         .unwrap_or(PreflightStatus::Healthy);
+    let empty = parsed.records.is_empty();
+    let mut report = v2_report(path, header, status, parsed);
+    if empty {
+        report.next_seq = Some(0);
+    }
+    Ok(report)
+}
+
+/// Shared shape of every v2 report. An empty prefix has no `next_seq` here;
+/// the healthy path sets it to 0.
+fn v2_report(
+    path: PathBuf,
+    header: DurableSessionHeader,
+    status: PreflightStatus,
+    parsed: ParsedJsonl,
+) -> SessionPreflight {
     let last_seq = parsed.records.last().map(DurableRecord::seq);
-    let sequence_overflow = last_seq == Some(u64::MAX);
-    Ok(SessionPreflight {
+    SessionPreflight {
         path,
         format: Some(SessionFormat::DurableV2),
         session_id: Some(header.id.clone()),
         header: Some(header),
         status,
         last_seq,
-        next_seq: last_seq.and_then(|seq| seq.checked_add(1)).or_else(|| {
-            if last_seq.is_none() {
-                Some(0)
-            } else {
-                None
-            }
-        }),
-        sequence_overflow,
+        next_seq: last_seq.and_then(|seq| seq.checked_add(1)),
+        sequence_overflow: last_seq == Some(u64::MAX),
         needs_separator: parsed.needs_separator,
         summary: summarize(&parsed.records),
         records: parsed.records,
-    })
-}
-
-pub fn preflight(path: impl AsRef<Path>) -> io::Result<SessionPreflight> {
-    preflight_session(path)
+    }
 }
 
 /// Perform the only mutating recovery action for v2 JSONL. This delegates to
@@ -334,10 +305,6 @@ pub fn recover_durable_v2(path: impl AsRef<Path>) -> io::Result<JsonlRepo> {
     // only then performs the explicit repair. Avoiding a separate preflight
     // here closes the preflight->open TOCTOU window.
     JsonlRepo::open(path)
-}
-
-pub fn recover_v2(path: impl AsRef<Path>) -> io::Result<JsonlRepo> {
-    recover_durable_v2(path)
 }
 
 #[derive(Debug)]
@@ -502,10 +469,6 @@ pub fn resume_plan_from_path(path: impl AsRef<Path>) -> Result<ResumePlan, Resum
         },
     })?;
     resume_plan_from_preflight(&report)
-}
-
-pub fn resume_plan(records: &[DurableRecord]) -> Result<ResumePlan, ResumePlanError> {
-    ResumePlan::from_records(records)
 }
 
 fn summarize(records: &[DurableRecord]) -> SessionSummary {

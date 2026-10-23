@@ -45,7 +45,7 @@ pub use search::{
     format_search_page, search_bounded, search_literal, SearchHit, SearchOptions, SearchPage,
     DEFAULT_MAX_HITS, MAX_HITS_CAP,
 };
-pub(crate) use search::{MAX_SEARCH_PATTERNS, SKIP_DIR_NAMES};
+pub(crate) use search::{is_macos_metadata_file, SKIP_DIR_NAMES};
 pub use shell::{
     run_shell, run_shell_timeout, run_shell_timeout_cancellable,
     run_shell_timeout_cancellable_with_progress, ShellProgress, TimedShellOutput,
@@ -409,11 +409,36 @@ impl ToolServices {
     }
 }
 
-/// Locks, recovering the guard when a panicking holder poisoned the mutex.
-pub(crate) fn lock_mutex<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    value
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+pub(crate) use crate::sync::lock_mutex;
+
+pub(super) fn check_cancellation(cancellation: Option<&CancellationToken>) -> Result<(), ToolError> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        Err(ToolError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Process-unique id of a paged snapshot (`list`, `search`): `prefix-pid-seq`.
+pub(super) fn new_snapshot_id(prefix: &str) -> String {
+    let sequence = NEXT_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{:x}-{sequence:x}", std::process::id())
+}
+
+/// Splits a `<snapshot id>:<hex position>` cursor; the position is 1-based.
+pub(super) fn parse_cursor(cursor: &str) -> Option<(&str, usize)> {
+    let (id, offset) = cursor.rsplit_once(':')?;
+    let offset = usize::from_str_radix(offset, 16).ok()?;
+    (offset > 0 && !id.is_empty()).then_some((id, offset))
+}
+
+fn mismatched_arguments(tool: &str) -> ToolExecutionError {
+    ToolError::InvalidInput {
+        message: format!("prepared arguments do not match {tool}"),
+    }
+    .into()
 }
 
 fn evidence_reusable(prepared: &PreparedToolInvocation) -> bool {
@@ -1154,10 +1179,7 @@ impl ToolRegistry {
         cancellation: Option<&CancellationToken>,
     ) -> Result<ExecutedTool, ToolExecutionError> {
         let PreparedToolArguments::Read { offset, max_lines } = &prepared.arguments else {
-            return Err(ToolError::InvalidInput {
-                message: "prepared arguments do not match read".into(),
-            }
-            .into());
+            return Err(mismatched_arguments("read"));
         };
         let path = prepared_path(prepared)?;
         let page = self
@@ -1179,16 +1201,10 @@ impl ToolRegistry {
             next_offset: page.next_offset,
         });
         Ok(ExecutedTool {
-            success: true,
-            output: page.output,
-            artifact: None,
             dependencies: vec![page.dependency],
-            mutations: Vec::new(),
             bytes_read: page.bytes_read,
-            synced_text: None,
-            edit_diff: None,
-            process: None,
             presentation,
+            ..ExecutedTool::output(page.output, true)
         })
     }
 
@@ -1203,10 +1219,7 @@ impl ToolRegistry {
             cursor,
         } = &prepared.arguments
         else {
-            return Err(ToolError::InvalidInput {
-                message: "prepared arguments do not match list".into(),
-            }
-            .into());
+            return Err(mismatched_arguments("list"));
         };
         let path = prepared_path(prepared)?;
         let page = self.services.list.page(
@@ -1237,16 +1250,10 @@ impl ToolRegistry {
             ));
         }
         Ok(ExecutedTool {
-            success: true,
-            output,
-            artifact: None,
             dependencies: vec![page.dependency],
-            mutations: Vec::new(),
             bytes_read: page.bytes_read,
-            synced_text: None,
-            edit_diff: None,
-            process: None,
             presentation,
+            ..ExecutedTool::output(output, true)
         })
     }
 
@@ -1263,10 +1270,7 @@ impl ToolRegistry {
             cursor,
         } = &prepared.arguments
         else {
-            return Err(ToolError::InvalidInput {
-                message: "prepared arguments do not match search".into(),
-            }
-            .into());
+            return Err(mismatched_arguments("search"));
         };
         let path = prepared_path(prepared)?;
         let page = self.services.search.page(
@@ -1287,16 +1291,10 @@ impl ToolRegistry {
             display_root: prepared.canonical_workspace.clone(),
         });
         Ok(ExecutedTool {
-            success: true,
-            output,
-            artifact: None,
             dependencies: vec![page.dependency],
-            mutations: Vec::new(),
             bytes_read: page.bytes_read,
-            synced_text: None,
-            edit_diff: None,
-            process: None,
             presentation,
+            ..ExecutedTool::output(output, true)
         })
     }
 
@@ -1310,10 +1308,7 @@ impl ToolRegistry {
             content, expected, ..
         } = &prepared.arguments
         else {
-            return Err(ToolError::InvalidInput {
-                message: "prepared arguments do not match write".into(),
-            }
-            .into());
+            return Err(mismatched_arguments("write"));
         };
         let path = prepared_path(prepared)?;
         if expected.is_none()
@@ -1417,10 +1412,7 @@ impl ToolRegistry {
         on_progress: &mut impl FnMut(ToolExecutionProgress),
     ) -> Result<ExecutedTool, ToolExecutionError> {
         let PreparedToolArguments::Patch { edits, .. } = &prepared.arguments else {
-            return Err(ToolError::InvalidInput {
-                message: "prepared arguments do not match patch".into(),
-            }
-            .into());
+            return Err(mismatched_arguments("patch"));
         };
         let path = prepared_path(prepared)?;
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -1439,7 +1431,7 @@ impl ToolRegistry {
         )?;
         self.services
             .read
-            .remember_complete_digest(&path, write::content_sha256(content.text.as_bytes()));
+            .remember_complete_digest(&path, content.written_digest);
         let before_digest = content.before_digest;
         let edit_diff = (!content.hunks.is_empty()).then(|| crate::ToolEditDiff {
             path: workspace_display(&path, &prepared.canonical_workspace)
@@ -1487,10 +1479,7 @@ impl ToolRegistry {
             ..
         } = &prepared.arguments
         else {
-            return Err(ToolError::InvalidInput {
-                message: "prepared arguments do not match shell".into(),
-            }
-            .into());
+            return Err(mismatched_arguments("shell"));
         };
         let result = shell::run_shell_timeout_cancellable_with_progress_and_runner_with_budget(
             &self.services.process_runner,

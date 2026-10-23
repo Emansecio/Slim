@@ -13,15 +13,19 @@ use sha2::{Digest, Sha256};
 use crate::context::{AdaptiveTokenEstimator, SUMMARIZATION_SYSTEM_PROMPT};
 use crate::events::ReasoningClassification;
 
+mod catalog_fetch;
 mod clinepass;
 mod codex;
 mod command_code;
+mod endpoint;
 pub(crate) mod image_limits;
 mod open_design;
+mod opencode;
 mod opencode_go;
 mod opencode_zen;
 #[cfg(test)]
 mod performance;
+mod wire;
 mod xai;
 pub use clinepass::{
     clinepass_model, clinepass_models, fetch_clinepass_catalog, is_clinepass_model_id,
@@ -31,7 +35,7 @@ pub use clinepass::{
 pub use codex::{
     codex_model, codex_models, codex_models_url, parse_codex_catalog, resolve_codex_context_window,
     CodexCatalogEntry, CodexCatalogError, CodexModel, OpenAiCodexAdapter,
-    CODEX_BUNDLED_CONTEXT_WINDOW, CODEX_CATALOG_CLIENT_VERSION,
+    CODEX_BUNDLED_CONTEXT_WINDOW, CODEX_CATALOG_CLIENT_VERSION, CODEX_MAX_OUTPUT_TOKENS,
 };
 pub use command_code::{
     command_code_api, command_code_model, command_code_models, is_command_code_model_id,
@@ -161,6 +165,13 @@ pub enum ProviderEvent {
     ResponsesReasoning(ResponsesReasoning),
     /// Exact Chat continuation state; never rendered or included in summaries.
     ChatReasoning(ChatReasoning),
+    /// A fragment of an Anthropic thinking block as the wire carries it, for
+    /// the stream normalizer to assemble into the assistant's opaque reasoning
+    /// state; never display text (the display copy is `ReasoningDelta`).
+    ThinkingBlock {
+        index: u32,
+        fragment: ThinkingFragment,
+    },
     /// A streamed OpenAI-compatible tool-call fragment.
     ///
     /// Providers may omit `index`, `id`, and `name` on continuation
@@ -304,29 +315,6 @@ impl ProviderErrorMetadata {
         // These are the explicit terminal identities Slim currently knows how
         // to classify. Check every field: detail/code/type precedence must not
         // hide a permanent identity in a lower-priority field.
-        const PERMANENT_CODES: &[&str] = &[
-            "authentication_error",
-            "unauthorized",
-            "unauthorized_error",
-            "forbidden",
-            "permission_denied",
-            "invalid_api_key",
-            "invalid_token",
-            "expired_token",
-            "invalid_request",
-            "invalid_request_error",
-            "bad_request",
-            "invalid_argument",
-            "invalid_parameter",
-            "invalid_model",
-            "model_not_found",
-            "insufficient_quota",
-            "quota_exceeded",
-            "organization_spend_limit_exceeded",
-            "project_spend_limit_exceeded",
-            "credit_balance_exhausted",
-            "enforced_spend_limit_reached",
-        ];
         let has_permanent_code = [
             self.code.as_deref(),
             self.error_type.as_deref(),
@@ -417,6 +405,15 @@ pub(crate) struct ProviderCallTelemetry {
     pub retry_after_ms: Option<u64>,
     /// Usage the provider reported for this call, when it reported any.
     pub usage: Option<ProviderCallUsage>,
+    /// Conversation items the request carried (`input` or `messages`).
+    pub input_items: u64,
+    /// Leading items identical to the previous request of the same run; absent
+    /// for a run's first request. A cache miss with every previous item kept
+    /// is the backend's, not a prefix the client rewrote.
+    pub reused_input_items: Option<u64>,
+    /// The provider's sticky-routing token for this run: `"replayed"` when it
+    /// went out with the call, `"captured"` when the response handed it out.
+    pub turn_state: Option<&'static str>,
 }
 
 /// Token usage of one provider call, so prompt-cache behavior can be read per
@@ -519,53 +516,62 @@ impl ProviderError {
     }
 }
 
+/// Explicit terminal provider identities: never retried, and part of the
+/// telemetry allowlist ([`normalized_provider_code`]).
+const PERMANENT_CODES: &[&str] = &[
+    "authentication_error",
+    "unauthorized",
+    "unauthorized_error",
+    "forbidden",
+    "permission_denied",
+    "invalid_api_key",
+    "invalid_token",
+    "expired_token",
+    "invalid_request",
+    "invalid_request_error",
+    "bad_request",
+    "invalid_argument",
+    "invalid_parameter",
+    "invalid_model",
+    "model_not_found",
+    "insufficient_quota",
+    "quota_exceeded",
+    "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded",
+    "credit_balance_exhausted",
+    "enforced_spend_limit_reached",
+];
+
+/// Remaining codes safe to report in telemetry: retryable envelopes and the
+/// runtime's own error identities. Together with [`PERMANENT_CODES`] this is
+/// the complete allowlist.
+const OTHER_SAFE_CODES: &[&str] = &[
+    "server_error",
+    "service_unavailable_error",
+    "server_is_overloaded",
+    "api_error",
+    "overloaded_error",
+    "overloaded",
+    "rate_limit_error",
+    "rate_limit_exceeded",
+    "too_many_requests",
+    "slow_down",
+    "request_timeout",
+    "transport",
+    "cancelled",
+    "malformed_tool_call",
+    "transient_remote",
+    "remote",
+    "invalid_response",
+    "provider_error",
+];
+
 pub(crate) fn normalized_provider_code(value: &str) -> Option<String> {
     let value = value.trim().to_ascii_lowercase();
     if value.is_empty() || value.len() > 64 {
         return None;
     }
-    const SAFE_CODES: &[&str] = &[
-        "authentication_error",
-        "unauthorized",
-        "unauthorized_error",
-        "forbidden",
-        "permission_denied",
-        "invalid_api_key",
-        "invalid_token",
-        "expired_token",
-        "invalid_request",
-        "invalid_request_error",
-        "bad_request",
-        "invalid_argument",
-        "invalid_parameter",
-        "invalid_model",
-        "model_not_found",
-        "insufficient_quota",
-        "quota_exceeded",
-        "organization_spend_limit_exceeded",
-        "project_spend_limit_exceeded",
-        "credit_balance_exhausted",
-        "enforced_spend_limit_reached",
-        "server_error",
-        "service_unavailable_error",
-        "server_is_overloaded",
-        "api_error",
-        "overloaded_error",
-        "overloaded",
-        "rate_limit_error",
-        "rate_limit_exceeded",
-        "too_many_requests",
-        "slow_down",
-        "request_timeout",
-        "transport",
-        "cancelled",
-        "malformed_tool_call",
-        "transient_remote",
-        "remote",
-        "invalid_response",
-        "provider_error",
-    ];
-    if SAFE_CODES.contains(&value.as_str()) {
+    if PERMANENT_CODES.contains(&value.as_str()) || OTHER_SAFE_CODES.contains(&value.as_str()) {
         return Some(value);
     }
     if let Some(status) = value
@@ -673,18 +679,60 @@ impl std::fmt::Debug for ChatReasoning {
     }
 }
 
-/// Opaque Responses items are valid only for the adapter instance that issued
-/// them. A new model/account/transport must not inherit encrypted state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ThinkingFragment {
+    /// A block opens; a `redacted_thinking` block arrives whole as its data.
+    Start {
+        redacted_data: Option<String>,
+    },
+    Thinking(String),
+    Signature(String),
+}
+
+/// Opaque reasoning state: Responses reasoning items and Anthropic thinking
+/// blocks. It is valid only for the adapter instance that issued it; a new
+/// model/account/transport must not inherit encrypted state.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ResponsesReasoning {
     scope_id: u64,
     model: String,
     pub(crate) item: Value,
+    /// Anthropic binds a thinking block to the tools, system and messages
+    /// before it ([`thinking_binding_positions`]): the fingerprint of those
+    /// in the request that produced it. Absent for Responses items.
+    pub(crate) binding: Option<u64>,
 }
 
 impl ResponsesReasoning {
     pub(crate) fn belongs_to(&self, adapter: &impl ProviderAdapter) -> bool {
         adapter.response_cache_scope_id() == Some(self.scope_id) && adapter.model() == self.model
+    }
+
+    pub(crate) fn responses_item(scope_id: u64, model: String, item: Value) -> Self {
+        Self {
+            scope_id,
+            model,
+            item,
+            binding: None,
+        }
+    }
+
+    pub(crate) fn anthropic_thinking(
+        scope_id: u64,
+        model: String,
+        block: Value,
+        binding: u64,
+    ) -> Self {
+        Self {
+            scope_id,
+            model,
+            item: block,
+            binding: Some(binding),
+        }
+    }
+
+    fn is_anthropic_thinking(&self) -> bool {
+        self.binding.is_some()
     }
 }
 
@@ -959,22 +1007,32 @@ fn next_response_cache_scope_id() -> u64 {
 }
 
 impl ProviderConfig {
-    pub fn openai(
+    fn with_auth(
+        kind: ProviderKind,
         endpoint: impl Into<String>,
         model: impl Into<String>,
-        api_key: impl Into<String>,
+        auth: ProviderAuth,
     ) -> Self {
         Self {
-            kind: ProviderKind::OpenAiCompatible,
+            kind,
             endpoint: endpoint.into(),
             model: model.into(),
             reasoning_effort: None,
-            auth: ProviderAuth::ApiKey(api_key.into()),
+            auth,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             response_cache_scope_id: next_response_cache_scope_id(),
             system_prompt_override: None,
             extra_headers: Vec::new(),
         }
+    }
+
+    pub fn openai(
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Self {
+        let auth = ProviderAuth::ApiKey(api_key.into());
+        Self::with_auth(ProviderKind::OpenAiCompatible, endpoint, model, auth)
     }
 
     pub fn openai_codex(
@@ -983,20 +1041,11 @@ impl ProviderConfig {
         access_token: impl Into<String>,
         account_id: impl Into<String>,
     ) -> Self {
-        Self {
-            kind: ProviderKind::OpenAiCodex,
-            endpoint: endpoint.into(),
-            model: model.into(),
-            reasoning_effort: None,
-            auth: ProviderAuth::OAuth {
-                access_token: access_token.into(),
-                account_id: Some(account_id.into()),
-            },
-            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
-            response_cache_scope_id: next_response_cache_scope_id(),
-            system_prompt_override: None,
-            extra_headers: Vec::new(),
-        }
+        let auth = ProviderAuth::OAuth {
+            access_token: access_token.into(),
+            account_id: Some(account_id.into()),
+        };
+        Self::with_auth(ProviderKind::OpenAiCodex, endpoint, model, auth)
     }
 
     pub fn anthropic(
@@ -1004,17 +1053,8 @@ impl ProviderConfig {
         model: impl Into<String>,
         api_key: impl Into<String>,
     ) -> Self {
-        Self {
-            kind: ProviderKind::Anthropic,
-            endpoint: endpoint.into(),
-            model: model.into(),
-            reasoning_effort: None,
-            auth: ProviderAuth::ApiKey(api_key.into()),
-            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
-            response_cache_scope_id: next_response_cache_scope_id(),
-            system_prompt_override: None,
-            extra_headers: Vec::new(),
-        }
+        let auth = ProviderAuth::ApiKey(api_key.into());
+        Self::with_auth(ProviderKind::Anthropic, endpoint, model, auth)
     }
 
     pub fn anthropic_oauth(
@@ -1022,20 +1062,11 @@ impl ProviderConfig {
         model: impl Into<String>,
         access_token: impl Into<String>,
     ) -> Self {
-        Self {
-            kind: ProviderKind::Anthropic,
-            endpoint: endpoint.into(),
-            model: model.into(),
-            reasoning_effort: None,
-            auth: ProviderAuth::OAuth {
-                access_token: access_token.into(),
-                account_id: None,
-            },
-            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
-            response_cache_scope_id: next_response_cache_scope_id(),
-            system_prompt_override: None,
-            extra_headers: Vec::new(),
-        }
+        let auth = ProviderAuth::OAuth {
+            access_token: access_token.into(),
+            account_id: None,
+        };
+        Self::with_auth(ProviderKind::Anthropic, endpoint, model, auth)
     }
 
     fn anthropic_bearer(
@@ -1043,17 +1074,8 @@ impl ProviderConfig {
         model: impl Into<String>,
         access_token: impl Into<String>,
     ) -> Self {
-        Self {
-            kind: ProviderKind::Anthropic,
-            endpoint: endpoint.into(),
-            model: model.into(),
-            reasoning_effort: None,
-            auth: ProviderAuth::Bearer(access_token.into()),
-            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
-            response_cache_scope_id: next_response_cache_scope_id(),
-            system_prompt_override: None,
-            extra_headers: Vec::new(),
-        }
+        let auth = ProviderAuth::Bearer(access_token.into());
+        Self::with_auth(ProviderKind::Anthropic, endpoint, model, auth)
     }
 
     /// Sets the reasoning effort sent to providers that support it
@@ -1112,16 +1134,7 @@ pub struct HttpRequest {
 
 impl HttpRequest {
     pub fn redacted_headers(&self) -> Vec<(String, String)> {
-        self.headers
-            .iter()
-            .map(|(name, value)| {
-                if is_sensitive_header_name(name) {
-                    (name.clone(), "[REDACTED]".into())
-                } else {
-                    (name.clone(), value.clone())
-                }
-            })
-            .collect()
+        redacted_headers(&self.headers)
     }
 }
 
@@ -1137,7 +1150,6 @@ pub struct ProviderRequestComponents {
 pub struct ProviderRequestFingerprints {
     pub system: u64,
     pub tools: u64,
-    pub history: u64,
 }
 
 /// Provider-native prompt caching features supported by one adapter instance.
@@ -1155,6 +1167,67 @@ pub struct ProviderCapabilities {
     pub reports_cache_write_tokens: bool,
 }
 
+/// Transport state shared by the requests of one agent run: the sticky-routing
+/// token a provider hands out on the run's first response
+/// ([`ProviderAdapter::turn_state_header`]), replayed on every later request of
+/// the run and never into another, and the item fingerprints of the last
+/// request, so a cache miss can be told apart from a rewritten prefix.
+#[derive(Clone, Default)]
+pub struct TurnRouting(Arc<Mutex<TurnRoutingState>>);
+
+#[derive(Default)]
+struct TurnRoutingState {
+    turn_state: Option<String>,
+    previous_items: Option<Vec<u64>>,
+}
+
+impl std::fmt::Debug for TurnRouting {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.lock();
+        formatter
+            .debug_struct("TurnRouting")
+            .field("turn_state", &state.turn_state.as_ref().map(|_| "<set>"))
+            .finish()
+    }
+}
+
+impl TurnRouting {
+    fn lock(&self) -> std::sync::MutexGuard<'_, TurnRoutingState> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn turn_state(&self) -> Option<String> {
+        self.lock().turn_state.clone()
+    }
+
+    /// Keeps the first token the run received; later ones are ignored.
+    fn capture_turn_state(&self, value: &str) -> bool {
+        let mut state = self.lock();
+        if state.turn_state.is_some() || value.is_empty() {
+            return false;
+        }
+        state.turn_state = Some(value.to_owned());
+        true
+    }
+
+    /// Leading items `items` shares with the previous request of the run,
+    /// which `items` then replaces.
+    fn observe_items(&self, items: &[u64]) -> Option<u64> {
+        let mut state = self.lock();
+        let reused = state.previous_items.as_ref().map(|previous| {
+            previous
+                .iter()
+                .zip(items)
+                .take_while(|(left, right)| left == right)
+                .count() as u64
+        });
+        state.previous_items = Some(items.to_vec());
+        reused
+    }
+}
+
 /// Final provider payload shared by accounting, cache routing and transport.
 ///
 /// Its `Debug` representation intentionally omits request bytes and sensitive
@@ -1168,9 +1241,17 @@ pub struct PreparedProviderRequest {
     pub(crate) estimated_tokens: u64,
     pub(crate) stable_prefixes: ProviderRequestFingerprints,
     pub(crate) prompt_cache_routing_key: String,
+    /// Output limit read from the body once, when the request is built; the
+    /// body is immutable afterwards, so it cannot drift from it.
+    output_token_limit: Option<u64>,
     response_cache_scope_id: u128,
     sensitive_values: Vec<String>,
     response_cache_key: Option<String>,
+    /// One fingerprint per conversation item, in order.
+    input_item_hashes: Vec<u64>,
+    turn_routing: Option<TurnRouting>,
+    /// Anthropic wire: what a thinking block of the response is bound to.
+    thinking_binding: Option<u64>,
 }
 
 impl std::fmt::Debug for PreparedProviderRequest {
@@ -1245,18 +1326,11 @@ impl PreparedProviderRequest {
         let components = body_value
             .map(provider_request_components)
             .unwrap_or_default();
-        let stable_prefixes = match stable_prefixes {
-            Some(mut prefixes) => {
-                prefixes.history = body_value
-                    .and_then(|body| body.get("messages").or_else(|| body.get("input")))
-                    .map(json_value_fingerprint)
-                    .unwrap_or(0);
-                prefixes
-            }
-            None => body_value
+        let stable_prefixes = stable_prefixes.unwrap_or_else(|| {
+            body_value
                 .map(provider_request_fingerprints)
-                .unwrap_or_default(),
-        };
+                .unwrap_or_default()
+        });
         let response_cache_scope_id = adapter.response_cache_scope_id().map_or_else(
             || credential_scope_identity_for_parts(&request.url, &request.headers),
             u128::from,
@@ -1271,6 +1345,15 @@ impl PreparedProviderRequest {
             stable_prefixes,
         );
         let serialized_chars = request.body.chars().count() as u64;
+        let output_token_limit = body_value.and_then(body_output_token_limit);
+        let input_item_hashes = body_value
+            .and_then(|body| body.get("input").or_else(|| body.get("messages")))
+            .and_then(Value::as_array)
+            .map(|items| items.iter().map(json_value_fingerprint).collect())
+            .unwrap_or_default();
+        let thinking_binding = body_value
+            .filter(|_| adapter.wire_kind() == ProviderKind::Anthropic)
+            .map(thinking_binding_of_request);
         Self {
             url: request.url,
             headers: request.headers,
@@ -1280,14 +1363,24 @@ impl PreparedProviderRequest {
             estimated_tokens: 0,
             stable_prefixes,
             prompt_cache_routing_key,
+            output_token_limit,
             response_cache_scope_id,
             sensitive_values,
             response_cache_key: None,
+            input_item_hashes,
+            turn_routing: None,
+            thinking_binding,
         }
     }
 
     pub fn with_estimated_tokens(mut self, estimated_tokens: u64) -> Self {
         self.estimated_tokens = estimated_tokens;
+        self
+    }
+
+    /// Sends the request as part of the run `routing` belongs to.
+    pub fn with_turn_routing(mut self, routing: &TurnRouting) -> Self {
+        self.turn_routing = Some(routing.clone());
         self
     }
 
@@ -1303,15 +1396,16 @@ impl PreparedProviderRequest {
         &self.sensitive_values
     }
 
+    pub(crate) fn thinking_binding(&self) -> Option<u64> {
+        self.thinking_binding
+    }
+
     pub fn body(&self) -> &[u8] {
         &self.body
     }
 
     pub(crate) fn output_token_limit(&self) -> Option<u64> {
-        let body: Value = serde_json::from_slice(&self.body).ok()?;
-        ["max_tokens", "max_output_tokens", "max_completion_tokens"]
-            .iter()
-            .find_map(|key| body.get(key).and_then(Value::as_u64))
+        self.output_token_limit
     }
 
     pub fn components(&self) -> ProviderRequestComponents {
@@ -1324,10 +1418,6 @@ impl PreparedProviderRequest {
 
     pub fn estimated_tokens(&self) -> u64 {
         self.estimated_tokens
-    }
-
-    pub fn stable_prefixes(&self) -> ProviderRequestFingerprints {
-        self.stable_prefixes
     }
 
     pub fn prompt_cache_routing_key(&self) -> &str {
@@ -1375,6 +1465,12 @@ pub trait ProviderAdapter {
     /// The closing request then keeps the tool definitions and so the prefix
     /// the provider cached; `None` keeps it tool-free.
     fn closing_tool_choice(&self) -> Option<Value> {
+        None
+    }
+    /// Header a provider uses for sticky routing within one run: it hands the
+    /// token out on a response and expects it back, unchanged, on every later
+    /// request of that run ([`TurnRouting`]).
+    fn turn_state_header(&self) -> Option<&'static str> {
         None
     }
     fn materialize_prompt_cache_intent(&self, _body: &mut Value) {}
@@ -1502,6 +1598,30 @@ pub trait ProviderAdapter {
         Vec::new()
     }
     fn parse_event(&self, value: &Value) -> Result<Vec<ProviderEvent>, ProviderError>;
+}
+
+/// Wire fields that carry the output limit, by API family.
+const OUTPUT_LIMIT_KEYS: [&str; 3] = ["max_tokens", "max_output_tokens", "max_completion_tokens"];
+
+fn body_output_token_limit(body: &Value) -> Option<u64> {
+    OUTPUT_LIMIT_KEYS
+        .iter()
+        .find_map(|key| body.get(key).and_then(Value::as_u64))
+}
+
+/// Rewrites each numeric output-limit field `next` maps to a new value, never
+/// introducing a field the body lacks. Reports whether any field changed.
+fn rewrite_output_limits(body: &mut Value, next: impl Fn(u64) -> Option<u64>) -> bool {
+    let mut changed = false;
+    for key in OUTPUT_LIMIT_KEYS {
+        if let Some(value) = body.get_mut(key) {
+            if let Some(replacement) = value.as_u64().and_then(&next) {
+                *value = Value::from(replacement);
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 fn harden_compaction_request<A: ProviderAdapter + ?Sized>(
@@ -1839,11 +1959,6 @@ fn provider_request_fingerprints(value: &Value) -> ProviderRequestFingerprints {
     ProviderRequestFingerprints {
         system: provider_system_fingerprint(value),
         tools: value.get("tools").map(json_value_fingerprint).unwrap_or(0),
-        history: value
-            .get("messages")
-            .or_else(|| value.get("input"))
-            .map(json_value_fingerprint)
-            .unwrap_or(0),
     }
 }
 
@@ -1881,6 +1996,113 @@ fn json_value_fingerprint(value: &Value) -> u64 {
     hash.finish()
 }
 
+/// Anthropic keeps a thinking block valid only while the tools, the system
+/// prompt and every message before it are unchanged. This folds them, in
+/// wire order, into one value comparable across requests.
+struct ThinkingBinding(u64);
+
+impl ThinkingBinding {
+    fn start(body: &Value) -> Self {
+        let mut hash = Fnv1a64::new();
+        thinking_binding_hash(body.get("tools").unwrap_or(&Value::Null), &mut hash);
+        thinking_binding_hash_content(body.get("system").unwrap_or(&Value::Null), &mut hash);
+        Self(hash.finish())
+    }
+
+    fn push(&mut self, message: &Value) {
+        let mut hash = Fnv1a64::new();
+        hash.write(&self.0.to_le_bytes());
+        thinking_binding_hash(message, &mut hash);
+        self.0 = hash.finish();
+    }
+}
+
+fn thinking_binding_of_request(body: &Value) -> u64 {
+    let mut binding = ThinkingBinding::start(body);
+    for message in body
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        binding.push(message);
+    }
+    binding.0
+}
+
+/// The prompt as the binding sees it: cache breakpoints are not part of it,
+/// and a string content is the same as its one text block.
+fn thinking_binding_hash(value: &Value, hash: &mut Fnv1a64) {
+    match value {
+        Value::Array(values) => {
+            canonical_hash_push(hash, "[");
+            for value in values {
+                thinking_binding_hash(value, hash);
+            }
+            canonical_hash_push(hash, "]");
+        }
+        Value::Object(values) => {
+            canonical_hash_push(hash, "{");
+            let mut keys = values
+                .keys()
+                .filter(|key| key.as_str() != "cache_control")
+                .collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                canonical_hash_push(hash, key);
+                if key == "content" {
+                    thinking_binding_hash_content(&values[key], hash);
+                } else {
+                    thinking_binding_hash(&values[key], hash);
+                }
+            }
+            canonical_hash_push(hash, "}");
+        }
+        other => canonical_json_hash(other, hash),
+    }
+}
+
+fn thinking_binding_hash_content(content: &Value, hash: &mut Fnv1a64) {
+    match content {
+        // The canonical form of `[{"type": "text", "text": text}]`.
+        Value::String(text) => {
+            for part in ["[", "{", "text", text.as_str(), "type", "text", "}", "]"] {
+                canonical_hash_push(hash, part);
+            }
+        }
+        other => thinking_binding_hash(other, hash),
+    }
+}
+
+fn is_thinking_block(block: &Value) -> bool {
+    matches!(
+        block.get("type").and_then(Value::as_str),
+        Some("thinking" | "redacted_thinking")
+    )
+}
+
+/// Drops the thinking blocks whose binding no longer holds: the request that
+/// produced them had another prefix, and Anthropic would reject them. A
+/// dropped block changes the prefix of every later one, which the running
+/// binding then sees too.
+fn settle_thinking_blocks(body: &mut Value, bindings: &[Option<u64>]) {
+    if bindings.iter().all(Option::is_none) {
+        return;
+    }
+    let mut binding = ThinkingBinding::start(body);
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for (message, expected) in messages.iter_mut().zip(bindings) {
+        if expected.is_some_and(|expected| expected != binding.0) {
+            if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) {
+                content.retain(|block| !is_thinking_block(block));
+            }
+        }
+        binding.push(message);
+    }
+}
+
 fn prompt_cache_routing_key(
     kind: ProviderKind,
     wire_kind: ProviderKind,
@@ -1910,15 +2132,12 @@ fn prompt_cache_routing_key(
 /// responsibility; this key only improves request locality.
 #[cfg(test)]
 fn provider_native_prompt_cache_key(wire_kind: ProviderKind, model: &str, body: &Value) -> String {
-    // Affinity uses only the stable prefix. Hashing the growing history here
-    // duplicates request fingerprinting and its result is never used.
     provider_native_prompt_cache_key_for_prefixes(
         wire_kind,
         model,
         ProviderRequestFingerprints {
             system: provider_system_fingerprint(body),
             tools: body.get("tools").map(json_value_fingerprint).unwrap_or(0),
-            history: 0,
         },
     )
 }
@@ -1955,7 +2174,6 @@ fn materialize_native_prompt_cache_key<A: ProviderAdapter + ?Sized>(
     let prefixes = ProviderRequestFingerprints {
         system: provider_system_fingerprint(body),
         tools: body.get("tools").map(json_value_fingerprint).unwrap_or(0),
-        history: 0,
     };
     body["prompt_cache_key"] = Value::String(provider_native_prompt_cache_key_for_prefixes(
         adapter.wire_kind(),
@@ -2016,6 +2234,30 @@ fn is_kimi_thinking_toggle(model: &str) -> bool {
 /// Models whose documented wire OFF is the `thinking.type` toggle.
 fn uses_thinking_toggle(model: &str) -> bool {
     is_deepseek_model(model) || is_glm_thinking_toggle(model) || is_kimi_thinking_toggle(model)
+}
+
+/// Chat models that always think and need their reasoning back on every
+/// assistant message: Kimi K3 and K2.7 Code, and MiniMax, whose interleaved
+/// thinking must be kept whole.
+fn is_always_thinking_chat_model(model: &str) -> bool {
+    let name = model_name(model).to_ascii_lowercase();
+    name == "kimi-k3"
+        || name.starts_with("kimi-k3-")
+        || name == "kimi-k2.7-code"
+        || name.starts_with("minimax-")
+}
+
+/// Qwen streams its usage only when asked for it.
+fn is_qwen_model(model: &str) -> bool {
+    model_name(model)
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("qwen"))
+}
+
+/// Whether a Chat Completions model reasons unless told not to, and so
+/// spends its output limit on thinking before the answer.
+pub fn chat_model_reasons_by_default(model: &str) -> bool {
+    uses_thinking_toggle(model) || is_always_thinking_chat_model(model)
 }
 
 fn collect_request_sensitive_values(request: &HttpRequest, values: &mut Vec<String>) {
@@ -2339,12 +2581,13 @@ impl ProviderTimeouts {
         }
     }
 
-    /// Production policy: bound TCP+TLS by `connect` (at most 15s).
-    /// Upload/response headers consume idle and first-semantic budgets, not
-    /// the connection budget. An active stream can continue until `wall`.
+    /// Production policy: bound TCP+TLS by `connect` (at most
+    /// [`PRODUCTION_CONNECT_TIMEOUT`]). Upload/response headers consume idle
+    /// and first-semantic budgets, not the connection budget. An active stream
+    /// can continue until `wall`.
     pub fn production(idle: Duration) -> Self {
         Self {
-            connect: idle.min(Duration::from_secs(15)),
+            connect: idle.min(PRODUCTION_CONNECT_TIMEOUT),
             idle,
             first_semantic: idle,
             wall: idle.max(Duration::from_secs(600)),
@@ -2352,9 +2595,56 @@ impl ProviderTimeouts {
     }
 }
 
+/// The connect bound of [`ProviderTimeouts::production`].
+pub const PRODUCTION_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
 static SHARED_HTTP_CLIENTS: OnceLock<Mutex<VecDeque<(Duration, Client)>>> = OnceLock::new();
 
-fn shared_http_client(connect: Duration) -> Result<Client, ProviderError> {
+/// Opens the connection a provider's requests will reuse while the work
+/// before the first one runs, so TCP and TLS stay off its latency: a `HEAD`
+/// on the endpoint's origin with no credentials or body, whose answer is
+/// ignored. Once per origin and connect policy in a process; needs a Tokio
+/// runtime, and skips plain-HTTP (local) endpoints.
+pub fn prewarm_connection(endpoint: &str, connect: Duration) {
+    static WARMED: OnceLock<Mutex<Vec<(String, Duration)>>> = OnceLock::new();
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
+        return;
+    };
+    if url.scheme() != "https" {
+        return;
+    }
+    let origin = url.origin().ascii_serialization();
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    {
+        let mut warmed = WARMED
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if warmed
+            .iter()
+            .any(|(known, timeout)| *known == origin && *timeout == connect)
+        {
+            return;
+        }
+        warmed.push((origin.clone(), connect));
+    }
+    let Ok(client) = shared_http_client(connect) else {
+        return;
+    };
+    handle.spawn(async move {
+        let _ = client
+            .head(origin)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await;
+    });
+}
+
+/// The process-wide client for `connect`: catalog fetches on a provider's
+/// host share the connection its model requests then reuse.
+pub fn shared_http_client(connect: Duration) -> Result<Client, ProviderError> {
     // Connect timeouts belong to the transport. Reuse connections for the same
     // policy without silently imposing 15s on callers that requested less.
     let mut clients = SHARED_HTTP_CLIENTS
@@ -2371,7 +2661,11 @@ fn shared_http_client(connect: Duration) -> Result<Client, ProviderError> {
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(connect)
         .tcp_nodelay(true)
-        .pool_idle_timeout(Duration::from_secs(90))
+        // An HTTP/2 connection's idle clock restarts only when a request
+        // checks it out, so a long stream plus tool work, or a pause between
+        // messages, outlived 90s and paid a new handshake. Pings still detect
+        // a dead connection.
+        .pool_idle_timeout(Duration::from_secs(600))
         .http2_keep_alive_interval(Duration::from_secs(30))
         .http2_keep_alive_timeout(Duration::from_secs(10))
         .http2_keep_alive_while_idle(true)
@@ -2425,12 +2719,12 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         adapter: A,
         timeouts: ProviderTimeouts,
     ) -> Result<Self, ProviderError> {
-        Self::build_with_client(
+        Ok(Self::build_with_client(
             adapter,
             timeouts,
             None,
             shared_http_client(timeouts.connect)?,
-        )
+        ))
     }
 
     fn build(
@@ -2458,13 +2752,13 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         timeouts: ProviderTimeouts,
         cache: Option<Arc<ProviderCache>>,
         client: Client,
-    ) -> Result<Self, ProviderError> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             client,
             adapter: Arc::new(adapter),
             timeouts,
             cache,
-        })
+        }
     }
 
     pub fn adapter(&self) -> &A {
@@ -2525,21 +2819,14 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
             serde_json::from_slice(&request.body).map_err(|_| ProviderError::InvalidResponse {
                 message: "provider compaction request body is invalid JSON".into(),
             })?;
-        let mut changed = false;
-        for key in ["max_tokens", "max_output_tokens", "max_completion_tokens"] {
-            if let Some(value) = body.get_mut(key) {
-                let current = value.as_u64();
-                let replace = if raise {
-                    current.is_some_and(|current| current < output_tokens)
-                } else {
-                    current.is_some_and(|current| current > output_tokens)
-                };
-                if replace {
-                    *value = Value::from(output_tokens);
-                    changed = true;
-                }
-            }
-        }
+        let changed = rewrite_output_limits(&mut body, |current| {
+            let replace = if raise {
+                current < output_tokens
+            } else {
+                current > output_tokens
+            };
+            replace.then_some(output_tokens)
+        });
         if !changed {
             return Ok(request);
         }
@@ -2582,19 +2869,15 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
             serde_json::from_slice(&request.body).map_err(|_| ProviderError::InvalidResponse {
                 message: "recovery request body is invalid JSON".into(),
             })?;
-        for key in ["max_tokens", "max_output_tokens", "max_completion_tokens"] {
-            if let Some(value) = body.get_mut(key) {
-                let replace = value.as_u64().is_some_and(|current| {
-                    if raise {
-                        current < limit
-                    } else {
-                        current > limit
-                    }
-                });
-                if replace {
-                    *value = Value::from(limit);
-                }
-            }
+        if !rewrite_output_limits(&mut body, |current| {
+            let replace = if raise {
+                current < limit
+            } else {
+                current > limit
+            };
+            replace.then_some(limit)
+        }) {
+            return Ok(request);
         }
         let mut request = PreparedProviderRequest::from_http_body_with_prefixes(
             request.url,
@@ -2640,16 +2923,27 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         self.adapter.closing_tool_choice().is_some()
     }
 
-    /// The closing request: tool-free, or with `tools` kept and calls
-    /// forbidden where the wire allows it.
+    /// The closing request. Unless `forbid_tools`, it keeps `tools` and the
+    /// turns' tool choice, so the provider's cached prefix stays valid, and
+    /// the caller ignores any call in the answer. Forbidding keeps `tools` and
+    /// forbids calls where the wire allows it, and drops the tools elsewhere.
     pub(crate) fn prepare_finalization_messages(
         &self,
         messages: &[ProviderMessage],
         tools: &[Value],
+        forbid_tools: bool,
     ) -> Result<PreparedProviderRequest, ProviderError> {
         let adapter = self.adapter();
-        let tool_choice = adapter.closing_tool_choice().filter(|_| !tools.is_empty());
-        let kept_tools = if tool_choice.is_some() { tools } else { &[] };
+        let tool_choice = if forbid_tools {
+            adapter.closing_tool_choice().filter(|_| !tools.is_empty())
+        } else {
+            None
+        };
+        let kept_tools = if !forbid_tools || tool_choice.is_some() {
+            tools
+        } else {
+            &[]
+        };
         let request = adapter.build_messages_request_with_tools_checked(messages, kept_tools)?;
         let mut body: Value =
             serde_json::from_str(&request.body).map_err(|_| ProviderError::InvalidResponse {
@@ -2678,13 +2972,7 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
             }
         }
         // Never introduce a token-limit field the adapter did not emit.
-        for key in ["max_tokens", "max_output_tokens", "max_completion_tokens"] {
-            if let Some(limit) = body.get_mut(key) {
-                if let Some(tokens) = limit.as_u64() {
-                    *limit = Value::from(tokens.min(2_048));
-                }
-            }
-        }
+        rewrite_output_limits(&mut body, |tokens| Some(tokens.min(2_048)));
         if let Some(choice) = tool_choice {
             body["tool_choice"] = choice;
         }
@@ -2854,6 +3142,12 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
             if matches!(event, ProviderEvent::Stopped { .. }) {
                 saw_stopped = true;
             }
+            // Nothing is being retained (no cache, or the entry already
+            // overflowed): deliver without measuring the event.
+            if captured_events.is_none() {
+                on_event(event);
+                return;
+            }
             let event_bytes = provider_event_retained_bytes(&event);
             let next_bytes = captured_bytes.checked_add(event_bytes);
             let can_capture = captured_events.as_ref().is_some_and(|events| {
@@ -2880,17 +3174,21 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
             on_event(event);
         };
         // These Chat Completions gateways can publish more than one
-        // cumulative terminal usage snapshot for the same request. Keep a
-        // single conservative envelope and expose it only after the stream;
-        // other providers retain the strict one-terminal-usage contract.
-        let coalesce_terminal_usage = matches!(
+        // cumulative terminal usage snapshot for the same request, and
+        // Anthropic wire repeats the input figures of `message_start`,
+        // cumulatively, in `message_delta` (where some gateways report them
+        // first). Keep a single conservative envelope and expose it only
+        // after the stream; other providers retain the strict
+        // one-terminal-usage contract.
+        let coalesce_terminal_usage = (matches!(
             self.adapter.kind(),
             ProviderKind::OpenCodeGo
                 | ProviderKind::OpenCodeZen
                 | ProviderKind::CommandCode
                 | ProviderKind::OpenDesign
         ) && self.adapter.wire_kind()
-            == ProviderKind::OpenAiCompatible;
+            == ProviderKind::OpenAiCompatible)
+            || self.adapter.wire_kind() == ProviderKind::Anthropic;
         let mut terminal_usage = None::<(u64, u64)>;
         let mut terminal_breakdown = None::<UsageBreakdown>;
         // What the call reported, whichever way it is delivered, for the
@@ -2901,6 +3199,12 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         // deadline or cancellation does not discard usage already received.
         let mut call_started = false;
         let mut status = None;
+        let mut turn_state = None;
+        let input_items = request.input_item_hashes.len() as u64;
+        let reused_input_items = request
+            .turn_routing
+            .as_ref()
+            .and_then(|routing| routing.observe_items(&request.input_item_hashes));
         let provider = provider_kind_name(self.adapter.kind()).to_owned();
         let model = self.adapter.model().to_owned();
         let call_started_at = Instant::now();
@@ -2963,7 +3267,16 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
             let mut observe_status = |response_status| {
                 status = Some(response_status);
             };
-            let send = self.send_inner(request, &mut emit, &mut mark_started, &mut observe_status);
+            let mut observe_turn_state = |used| {
+                turn_state = Some(used);
+            };
+            let send = self.send_inner(
+                request,
+                &mut emit,
+                &mut mark_started,
+                &mut observe_status,
+                &mut observe_turn_state,
+            );
             tokio::select! {
                 biased;
                 _ = &mut cancellation => Err(ProviderError::Cancelled),
@@ -3018,6 +3331,9 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
                 code,
                 retry_after_ms,
                 usage: ProviderCallUsage::from_observed(observed_breakdown, observed_usage),
+                input_items,
+                reused_input_items,
+                turn_state,
             })?;
         }
         let _saw_done = result?;
@@ -3035,11 +3351,13 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         on_event: &mut F,
         on_started: &mut impl FnMut(),
         on_status: &mut impl FnMut(u16),
+        on_turn_state: &mut impl FnMut(&'static str),
     ) -> Result<bool, ProviderError>
     where
         F: FnMut(ProviderEvent),
     {
         let sensitive_values = request.sensitive_values;
+        let routing = self.adapter.turn_state_header().zip(request.turn_routing);
         let started = Instant::now();
         on_started();
         on_event(ProviderEvent::Phase {
@@ -3049,6 +3367,13 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         let mut builder = self.client.post(request.url);
         for (name, value) in request.headers {
             builder = builder.header(name, value);
+        }
+        if let Some((name, state)) = routing
+            .as_ref()
+            .and_then(|(name, routing)| Some((*name, routing.turn_state()?)))
+        {
+            builder = builder.header(name, state);
+            on_turn_state("replayed");
         }
         // Reqwest bounds TCP/TLS connection establishment. Once connected,
         // providers may queue generation before sending HTTP headers.
@@ -3071,6 +3396,16 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
             phase: ProviderPhase::HeadersReceived,
             elapsed_ms: elapsed_millis(started),
         });
+        if let Some((name, routing)) = &routing {
+            if response
+                .headers()
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| routing.capture_turn_state(value))
+            {
+                on_turn_state("captured");
+            }
+        }
         let status = response.status();
         on_status(status.as_u16());
         if !status.is_success() {
@@ -3132,27 +3467,11 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
                     .min(first_semantic_deadline.saturating_duration_since(Instant::now()))
             };
             if wait.is_zero() {
-                return Err(ProviderError::Transport {
-                    safe_to_retry: false,
-                    message: if saw_first_semantic {
-                        "provider stream idle timeout (no semantic progress)"
-                    } else {
-                        "timeout waiting for the first semantic provider event"
-                    }
-                    .into(),
-                });
+                return Err(stream_semantic_timeout(saw_first_semantic));
             }
             let next = tokio::time::timeout(wait, bytes.next())
                 .await
-                .map_err(|_| ProviderError::Transport {
-                    safe_to_retry: false,
-                    message: if saw_first_semantic {
-                        "provider stream idle timeout (no semantic progress)"
-                    } else {
-                        "timeout waiting for the first semantic provider event"
-                    }
-                    .into(),
-                })?;
+                .map_err(|_| stream_semantic_timeout(saw_first_semantic))?;
             let end_of_stream = next.is_none();
             if let Some(chunk) = next {
                 let chunk = chunk.map_err(|error| ProviderError::Transport {
@@ -3245,6 +3564,7 @@ fn provider_events_have_semantic_output(events: &[ProviderEvent]) -> bool {
         ProviderEvent::ChatReasoning(state) => {
             !state.content.is_empty() || !state.details.is_empty()
         }
+        ProviderEvent::ThinkingBlock { .. } => false,
         ProviderEvent::TextDelta(text) | ProviderEvent::ReasoningDelta(text) => !text.is_empty(),
         ProviderEvent::ToolCallDelta {
             id,
@@ -3611,28 +3931,6 @@ impl ProviderEventRedactor {
                 self.note_tool_progress(&event, &mut output);
                 self.tool_pending.push(event);
             }
-            ProviderEvent::Usage {
-                input_tokens,
-                output_tokens,
-            } => output.push(ProviderEvent::Usage {
-                input_tokens,
-                output_tokens,
-            }),
-            ProviderEvent::UsagePartial {
-                input_tokens,
-                output_tokens,
-                input_complete,
-                output_complete,
-            } => output.push(ProviderEvent::UsagePartial {
-                input_tokens,
-                output_tokens,
-                input_complete,
-                output_complete,
-            }),
-            ProviderEvent::UsageBreakdown { usage } => {
-                output.push(ProviderEvent::UsageBreakdown { usage })
-            }
-            ProviderEvent::ResponseCacheHit => output.push(ProviderEvent::ResponseCacheHit),
             ProviderEvent::Stopped { reason } => {
                 let pending = std::mem::take(&mut self.tool_pending);
                 if crate::runtime::tool_events_contain_sensitive_values(
@@ -3651,17 +3949,20 @@ impl ProviderEventRedactor {
                     reason: redact_values(&reason, &self.sensitive_values),
                 });
             }
-            ProviderEvent::Phase { .. }
+            ProviderEvent::Usage { .. }
+            | ProviderEvent::UsagePartial { .. }
+            | ProviderEvent::UsageBreakdown { .. }
+            | ProviderEvent::ResponseCacheHit
+            | ProviderEvent::Phase { .. }
             | ProviderEvent::ToolCallProgress { .. }
             | ProviderEvent::ResponsesReasoning(_)
-            | ProviderEvent::ChatReasoning(_) => output.push(event),
+            | ProviderEvent::ChatReasoning(_)
+            | ProviderEvent::ThinkingBlock { .. } => output.push(event),
         }
         output
     }
-}
 
-impl ProviderEventRedactor {
-    fn flush_textual(&mut self, output: &mut Vec<ProviderEvent>) {
+    fn flush_text(&mut self, output: &mut Vec<ProviderEvent>) {
         let ready = crate::runtime::take_redacted_stream_chunk(
             &mut self.text_pending,
             "",
@@ -3684,9 +3985,17 @@ impl ProviderEventRedactor {
             output.push(ProviderEvent::ReasoningDelta(ready));
         }
     }
+}
 
-    fn flush_text(&mut self, output: &mut Vec<ProviderEvent>) {
-        self.flush_textual(output);
+fn stream_semantic_timeout(saw_first_semantic: bool) -> ProviderError {
+    ProviderError::Transport {
+        safe_to_retry: false,
+        message: if saw_first_semantic {
+            "provider stream idle timeout (no semantic progress)"
+        } else {
+            "timeout waiting for the first semantic provider event"
+        }
+        .into(),
     }
 }
 
@@ -4303,10 +4612,23 @@ fn normalize_messages(messages: &[ProviderMessage]) -> Result<(), ProviderError>
             validate_tool_call_arguments(call, position)?;
         }
         for block in &message.content_blocks {
-            normalize_block(block)?;
+            validate_block(block)?;
         }
     }
     Ok(())
+}
+
+/// The errors [`normalize_block`] would report, without building its result.
+fn validate_block(block: &ProviderContentBlock) -> Result<(), ProviderError> {
+    match block {
+        ProviderContentBlock::Image { media_type, data }
+        | ProviderContentBlock::Audio { media_type, data }
+        | ProviderContentBlock::File { media_type, data } => {
+            normalize_media_type(media_type)?;
+            validate_base64(data)
+        }
+        ProviderContentBlock::Text(_) | ProviderContentBlock::Unsupported { .. } => Ok(()),
+    }
 }
 
 pub(crate) fn validate_tool_call_arguments(
@@ -4506,37 +4828,74 @@ fn normalize_media_type(media_type: &str) -> Result<String, ProviderError> {
     Ok(media_type)
 }
 
-fn normalize_base64(data: &str) -> Result<String, ProviderError> {
+fn invalid_base64() -> ProviderError {
+    ProviderError::InvalidResponse {
+        message: "invalid base64 multimodal payload".into(),
+    }
+}
+
+/// Rejects what [`normalize_base64`] rejects.
+fn validate_base64(data: &str) -> Result<(), ProviderError> {
     if data.is_empty() || !data.len().is_multiple_of(4) {
-        return Err(ProviderError::InvalidResponse {
-            message: "invalid base64 multimodal payload".into(),
-        });
+        return Err(invalid_base64());
     }
     let bytes = data.as_bytes();
     if !bytes
         .iter()
         .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'+' || *byte == b'/' || *byte == b'=')
     {
-        return Err(ProviderError::InvalidResponse {
-            message: "invalid base64 multimodal payload".into(),
-        });
+        return Err(invalid_base64());
     }
     if bytes.ends_with(b"==") && !matches!(bytes[bytes.len() - 3], b'A' | b'a' | b'Q' | b'g' | b'w')
     {
-        return Err(ProviderError::InvalidResponse {
-            message: "invalid base64 multimodal payload".into(),
-        });
+        return Err(invalid_base64());
     }
     if bytes.ends_with(b"=") && !bytes.ends_with(b"==") {
         let second_last = bytes[bytes.len() - 2];
         if second_last == b'=' || base64_value(second_last).is_none() {
-            return Err(ProviderError::InvalidResponse {
-                message: "invalid base64 multimodal payload".into(),
-            });
+            return Err(invalid_base64());
         }
     }
+    Ok(())
+}
+
+/// Whether already-validated base64 is exactly what re-encoding its decoded
+/// bytes would produce: padding only in the final quad, and zero spare bits
+/// in the last sextet that carries them.
+fn is_canonical_base64(data: &[u8]) -> bool {
+    let Some((last, body)) = data.as_chunks::<4>().0.split_last() else {
+        return false;
+    };
+    if body.iter().flatten().any(|byte| *byte == b'=') {
+        return false;
+    }
+    let canonical_sextet =
+        |byte: u8, spare_mask: u8| base64_value(byte).is_some_and(|value| value & spare_mask == 0);
+    match *last {
+        [a, b, c, d] if ![a, b, c, d].contains(&b'=') => true,
+        [a, b, b'=', b'='] => base64_value(a).is_some() && canonical_sextet(b, 0b1111),
+        [a, b, c, b'='] => {
+            base64_value(a).is_some() && base64_value(b).is_some() && canonical_sextet(c, 0b11)
+        }
+        _ => false,
+    }
+}
+
+fn normalize_base64(data: &str) -> Result<String, ProviderError> {
+    validate_base64(data)?;
+    // Canonical input is returned as it is: the decode and re-encode below
+    // would reproduce it byte for byte.
+    if is_canonical_base64(data.as_bytes()) {
+        return Ok(data.to_owned());
+    }
+    Ok(round_trip_base64(data))
+}
+
+/// Decodes `data` leniently (padding positions are zero-filled) and encodes
+/// the bytes canonically. Expects input accepted by [`validate_base64`].
+fn round_trip_base64(data: &str) -> String {
     let mut decoded = Vec::with_capacity(data.len() / 4 * 3);
-    for chunk in bytes.chunks(4) {
+    for chunk in data.as_bytes().chunks(4) {
         let mut value = 0u32;
         for (index, byte) in chunk.iter().enumerate() {
             value |= u32::from(base64_value(*byte).unwrap_or(0)) << (18 - 6 * index);
@@ -4549,7 +4908,7 @@ fn normalize_base64(data: &str) -> Result<String, ProviderError> {
             decoded.push(value as u8);
         }
     }
-    Ok(encode_standard_base64(&decoded))
+    encode_standard_base64(&decoded)
 }
 
 fn base64_value(byte: u8) -> Option<u8> {
@@ -4599,6 +4958,12 @@ fn provider_event_retained_bytes(event: &ProviderEvent) -> usize {
         | ProviderEvent::UsagePartial { .. }
         | ProviderEvent::ResponseCacheHit => 0,
         ProviderEvent::ResponsesReasoning(state) => state.item.to_string().len(),
+        ProviderEvent::ThinkingBlock { fragment, .. } => match fragment {
+            ThinkingFragment::Start { redacted_data } => {
+                redacted_data.as_ref().map_or(0, String::capacity)
+            }
+            ThinkingFragment::Thinking(text) | ThinkingFragment::Signature(text) => text.capacity(),
+        },
         ProviderEvent::ChatReasoning(state) => {
             state.content.capacity()
                 + state.model.capacity()
@@ -4698,6 +5063,7 @@ fn compact_provider_event(event: &mut ProviderEvent) {
         }
         ProviderEvent::ResponsesReasoning(_)
         | ProviderEvent::ChatReasoning(_)
+        | ProviderEvent::ThinkingBlock { .. }
         | ProviderEvent::Phase { .. }
         | ProviderEvent::ToolCallProgress { .. }
         | ProviderEvent::ReasoningStarted
@@ -4716,7 +5082,9 @@ fn prepare_cached_events(events: Vec<ProviderEvent>) -> Option<Vec<ProviderEvent
             is_tool_call_event(event)
                 || matches!(
                     event,
-                    ProviderEvent::ResponsesReasoning(_) | ProviderEvent::ChatReasoning(_)
+                    ProviderEvent::ResponsesReasoning(_)
+                        | ProviderEvent::ChatReasoning(_)
+                        | ProviderEvent::ThinkingBlock { .. }
                 )
         })
     {
@@ -5039,12 +5407,17 @@ pub struct OpenAiCompatibleAdapter {
 }
 
 impl OpenAiCompatibleAdapter {
+    /// Whether the reasoning travels back as `reasoning_content` on every
+    /// assistant message: DeepSeek V4 rejects a tool turn without it, and
+    /// Kimi and MiniMax lose the thread of their interleaved thinking.
     fn uses_chat_thinking(&self) -> bool {
-        is_deepseek_model(&self.config.model)
-            && self
-                .config
-                .reasoning_effort()
-                .is_some_and(|effort| effort != "none")
+        let model = &self.config.model;
+        if is_deepseek_model(model) || is_kimi_thinking_toggle(model) {
+            // Thinking is on unless switched off, an absent effort included.
+            self.config.reasoning_effort() != Some("none")
+        } else {
+            is_always_thinking_chat_model(model)
+        }
     }
 
     pub fn new(config: ProviderConfig) -> Result<Self, ProviderError> {
@@ -5155,9 +5528,13 @@ impl OpenAiCompatibleAdapter {
             body["thinking"] = json!({"type": "disabled"});
         } else if let Some(effort) = self.config.reasoning_effort() {
             body["reasoning_effort"] = Value::String(effort.into());
-            if self.uses_chat_thinking() {
+            // Kimi K3 refuses the field: only the toggle models take it.
+            if self.uses_chat_thinking() && uses_thinking_toggle(&self.config.model) {
                 body["thinking"] = json!({"type":"enabled"});
             }
+        }
+        if is_qwen_model(&self.config.model) {
+            body["stream_options"] = json!({"include_usage": true});
         }
         if !tools.is_empty() {
             body["tools"] = Value::Array(
@@ -5439,6 +5816,7 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                 .unwrap_or(0);
             let cache_write_tokens = usage
                 .pointer("/prompt_tokens_details/cache_write_tokens")
+                .or_else(|| usage.pointer("/prompt_tokens_details/cache_creation_input_tokens"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
             let reasoning_tokens = usage
@@ -5525,6 +5903,10 @@ fn malformed_openai_tool_delta() -> ProviderEvent {
     }
 }
 
+/// Identity block Claude Code's CLI opens its system prompt with. Anthropic
+/// serves a subscription (OAuth) token only to requests that carry it.
+const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
 pub struct AnthropicAdapter {
     config: ProviderConfig,
 }
@@ -5564,14 +5946,40 @@ impl AnthropicAdapter {
         json!({"type": "ephemeral"})
     }
 
+    fn requires_claude_code_identity(&self) -> bool {
+        self.config.auth.is_oauth() && is_official_anthropic_endpoint(&self.config.endpoint)
+    }
+
+    /// Prepends the Claude Code identity block that Anthropic requires before
+    /// Slim's own system prompt. Called after the cache intent is materialized
+    /// so the breakpoint stays on Slim's block and still covers tools, identity
+    /// and prompt.
+    fn prepend_oauth_identity(&self, body: &mut Value) {
+        if !self.requires_claude_code_identity() {
+            return;
+        }
+        let mut blocks = vec![json!({"type": "text", "text": CLAUDE_CODE_IDENTITY})];
+        match body.get_mut("system").map(Value::take) {
+            Some(Value::Array(items)) => blocks.extend(items),
+            Some(Value::String(text)) => blocks.push(json!({"type": "text", "text": text})),
+            Some(Value::Null) | None => {}
+            Some(other) => blocks.push(other),
+        }
+        body["system"] = Value::Array(blocks);
+    }
+
     /// The wire messages. On the first-party endpoint the results of one
     /// assistant turn travel as the `tool_result` blocks of a single user
     /// message (the API's contract for parallel tool use), and the harness
     /// user text that follows them joins it as trailing text blocks. Anthropic
     /// compatible gateways keep one user message per result.
-    fn wire_messages(&self, messages: &[ProviderMessage]) -> Vec<Value> {
+    ///
+    /// An assistant message leads with the thinking blocks it was answered
+    /// with; `bindings` holds, per wire message, what they are bound to.
+    fn wire_messages(&self, messages: &[ProviderMessage]) -> (Vec<Value>, Vec<Option<u64>>) {
         let coalesce = is_official_anthropic_endpoint(&self.config.endpoint);
         let mut wire: Vec<Value> = Vec::with_capacity(messages.len());
+        let mut bindings: Vec<Option<u64>> = Vec::with_capacity(messages.len());
         // The last wire message is a user message of tool results.
         let mut results_open = false;
         for message in messages {
@@ -5586,7 +5994,10 @@ impl AnthropicAdapter {
                     .and_then(|last| last["content"].as_array_mut())
                 {
                     Some(content) if coalesce && results_open => content.push(block),
-                    _ => wire.push(json!({"role": "user", "content": [block]})),
+                    _ => {
+                        wire.push(json!({"role": "user", "content": [block]}));
+                        bindings.push(None);
+                    }
                 }
                 results_open = true;
                 continue;
@@ -5602,9 +6013,12 @@ impl AnthropicAdapter {
                 }
             }
             results_open = false;
+            let (thinking, binding) = self.own_thinking(message);
+            bindings.push(binding);
             wire.push(
                 if message.role == "assistant" && !message.tool_calls.is_empty() {
-                    let mut content = anthropic_content_values(message);
+                    let mut content = thinking;
+                    content.extend(anthropic_content_values(message));
                     for call in &message.tool_calls {
                         let input = serde_json::from_str::<Value>(&call.arguments)
                             .unwrap_or_else(|_| Value::String(call.arguments.clone()));
@@ -5617,18 +6031,52 @@ impl AnthropicAdapter {
                     }
                     json!({"role": "assistant", "content": content})
                 } else {
-                    json!({
-                        "role": message.role,
-                        "content": anthropic_message_content(message)
-                    })
+                    // Thinking needs an answer after it in the same message.
+                    match (!thinking.is_empty())
+                        .then(|| anthropic_content_values(message))
+                        .filter(|values| !values.is_empty())
+                    {
+                        Some(values) => {
+                            let mut content = thinking;
+                            content.extend(values);
+                            json!({"role": "assistant", "content": content})
+                        }
+                        None => json!({
+                            "role": message.role,
+                            "content": anthropic_message_content(message)
+                        }),
+                    }
                 },
             );
         }
-        wire
+        (wire, bindings)
+    }
+
+    /// The thinking blocks this adapter produced for an assistant message,
+    /// and what they are bound to.
+    fn own_thinking(&self, message: &ProviderMessage) -> (Vec<Value>, Option<u64>) {
+        if message.role != "assistant" {
+            return (Vec::new(), None);
+        }
+        let mut binding = None;
+        let blocks = message
+            .responses_reasoning
+            .iter()
+            .filter(|state| {
+                state.is_anthropic_thinking()
+                    && state.scope_id == self.config.response_cache_scope_id()
+                    && state.model == self.config.model
+            })
+            .map(|state| {
+                binding = state.binding;
+                state.item.clone()
+            })
+            .collect::<Vec<_>>();
+        (blocks, binding)
     }
 
     fn messages_body(&self, messages: &[ProviderMessage], tools: &[Value]) -> Value {
-        let messages = self.wire_messages(messages);
+        let (messages, bindings) = self.wire_messages(messages);
         let mut body = json!({
             "model": self.config.model,
             "max_tokens": self.config.max_output_tokens,
@@ -5644,7 +6092,9 @@ impl AnthropicAdapter {
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.to_vec());
         }
+        settle_thinking_blocks(&mut body, &bindings);
         self.materialize_prompt_cache_intent(&mut body);
+        self.prepend_oauth_identity(&mut body);
         body
     }
 
@@ -5701,15 +6151,22 @@ impl ProviderAdapter for AnthropicAdapter {
         // The cached prefix is tools, then system, then messages: the
         // breakpoint on the (constant) system prompt covers the tools before
         // it, so the tools carry none and the slot goes to the history.
+        // First party, that prefix is kept for an hour: a pause between user
+        // turns outlasts the five-minute default. A one-hour entry must come
+        // before the five-minute ones, which this order guarantees.
         if let Some(system) = body
             .get("system")
             .and_then(Value::as_str)
             .map(str::to_owned)
         {
+            let mut marker = Self::cache_control();
+            if is_official_anthropic_endpoint(&self.config.endpoint) {
+                marker["ttl"] = json!("1h");
+            }
             body["system"] = json!([{
                 "type": "text",
                 "text": system,
-                "cache_control": Self::cache_control()
+                "cache_control": marker
             }]);
         }
         mark_previous_request_tail(body, Self::cache_control());
@@ -5765,6 +6222,7 @@ impl ProviderAdapter for AnthropicAdapter {
         normalize_messages(messages)?;
         let mut body = self.messages_body(messages, &[]);
         harden_compaction_body(&mut body, true)?;
+        self.prepend_oauth_identity(&mut body);
         image_limits::validate_anthropic_images(messages)?;
         PreparedProviderRequest::from_http_body(
             self.config.endpoint.clone(),
@@ -5779,6 +6237,12 @@ impl ProviderAdapter for AnthropicAdapter {
             return Err(stream_provider_error(value, &self.config));
         }
         let mut events = Vec::new();
+        let block_index = || {
+            value
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|index| u32::try_from(index).ok())
+        };
         match value.get("type").and_then(Value::as_str) {
             Some("message_start") => {
                 if let Some(usage) = value
@@ -5836,12 +6300,45 @@ impl ProviderAdapter for AnthropicAdapter {
                             }
                         }
                         Some("thinking") => {
-                            if let Some(text) = block
+                            let text = block
                                 .get("thinking")
                                 .and_then(Value::as_str)
-                                .filter(|text| !text.is_empty())
-                            {
+                                .filter(|text| !text.is_empty());
+                            if let Some(text) = text {
                                 events.push(ProviderEvent::ReasoningDelta(text.into()));
+                            }
+                            if let Some(index) = block_index() {
+                                events.push(ProviderEvent::ThinkingBlock {
+                                    index,
+                                    fragment: ThinkingFragment::Start {
+                                        redacted_data: None,
+                                    },
+                                });
+                                let signature = block
+                                    .get("signature")
+                                    .and_then(Value::as_str)
+                                    .filter(|signature| !signature.is_empty());
+                                for fragment in [
+                                    text.map(|text| ThinkingFragment::Thinking(text.into())),
+                                    signature.map(|text| ThinkingFragment::Signature(text.into())),
+                                ]
+                                .into_iter()
+                                .flatten()
+                                {
+                                    events.push(ProviderEvent::ThinkingBlock { index, fragment });
+                                }
+                            }
+                        }
+                        Some("redacted_thinking") => {
+                            if let (Some(index), Some(data)) =
+                                (block_index(), block.get("data").and_then(Value::as_str))
+                            {
+                                events.push(ProviderEvent::ThinkingBlock {
+                                    index,
+                                    fragment: ThinkingFragment::Start {
+                                        redacted_data: Some(data.into()),
+                                    },
+                                });
                             }
                         }
                         _ => {}
@@ -5888,6 +6385,20 @@ impl ProviderAdapter for AnthropicAdapter {
                     }
                     if let Some(thinking) = delta.get("thinking").and_then(Value::as_str) {
                         events.push(ProviderEvent::ReasoningDelta(thinking.into()));
+                        events.push(ProviderEvent::ThinkingBlock {
+                            index,
+                            fragment: ThinkingFragment::Thinking(thinking.into()),
+                        });
+                    }
+                    if let Some(signature) =
+                        delta.get("signature").and_then(Value::as_str).filter(|_| {
+                            delta.get("type").and_then(Value::as_str) == Some("signature_delta")
+                        })
+                    {
+                        events.push(ProviderEvent::ThinkingBlock {
+                            index,
+                            fragment: ThinkingFragment::Signature(signature.into()),
+                        });
                     }
                     if let Some(partial_json) = delta
                         .get("partial_json")
@@ -5923,12 +6434,28 @@ impl ProviderAdapter for AnthropicAdapter {
                         .pointer("/output_tokens_details/thinking_tokens")
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
-                    if output_tokens.is_some() || reasoning_tokens > 0 {
+                    // Cumulative input figures; the stream keeps the larger of
+                    // these and `message_start`'s, field by field.
+                    let input = |field: &str| usage.get(field).and_then(Value::as_u64);
+                    let input_fields = [
+                        input("input_tokens"),
+                        input("cache_creation_input_tokens"),
+                        input("cache_read_input_tokens"),
+                    ];
+                    if output_tokens.is_some()
+                        || reasoning_tokens > 0
+                        || input_fields.iter().any(Option::is_some)
+                    {
+                        let [uncached, cache_write, cache_read] =
+                            input_fields.map(|tokens| tokens.unwrap_or(0));
                         events.push(ProviderEvent::UsageBreakdown {
                             usage: UsageBreakdown {
+                                uncached_input_tokens: uncached,
+                                cache_write_tokens: cache_write,
+                                cache_read_tokens: cache_read,
                                 output_tokens: output_tokens.unwrap_or(0),
                                 reasoning_tokens,
-                                ..UsageBreakdown::default()
+                                usage_unknown: false,
                             },
                         });
                     }
@@ -6099,6 +6626,136 @@ mod finalization_tests {
         );
         assert!(normalized_provider_code(&"s".repeat(65)).is_none());
         assert!(normalized_provider_code(" ").is_none());
+    }
+
+    /// The previous `normalize_base64`: validate, always decode, re-encode.
+    fn legacy_normalize_base64(data: &str) -> Result<String, ProviderError> {
+        validate_base64(data)?;
+        Ok(round_trip_base64(data))
+    }
+
+    #[test]
+    fn base64_fast_path_matches_the_round_trip_for_every_input() {
+        // Canonical inputs: returned as they are, and the flag agrees.
+        for canonical in [
+            "QUJD",
+            "QUI=",
+            "QQ==",
+            "AAAA",
+            "AAA=",
+            "AA==",
+            "QUJDQUJDQQ==",
+        ] {
+            assert!(is_canonical_base64(canonical.as_bytes()), "{canonical}");
+            assert_eq!(normalize_base64(canonical).unwrap(), canonical);
+        }
+        // Non canonical but accepted: the round trip rewrites them.
+        for input in ["AB=C", "aa==", "QUJ=", "QQ==QUJD"] {
+            assert!(!is_canonical_base64(input.as_bytes()), "{input}");
+            let normalized = normalize_base64(input).unwrap();
+            assert_eq!(normalized, legacy_normalize_base64(input).unwrap());
+            assert_ne!(normalized, input);
+        }
+        // Rejected inputs stay rejected, including padding-only and whitespace.
+        for input in [
+            "", "A", "AAA", "QUJD ", " QUJD", "QU\nJD", "A===", "====", "QR==", "AB==\n", "é===",
+        ] {
+            assert!(normalize_base64(input).is_err(), "{input:?}");
+            assert!(legacy_normalize_base64(input).is_err(), "{input:?}");
+        }
+        // Exhaustive over every quad built from characters that exercise each
+        // rule (zero and nonzero spare bits, padding anywhere, plain data).
+        let alphabet = *b"AQgwaB+=";
+        let mut quads = Vec::new();
+        for a in alphabet {
+            for b in alphabet {
+                for c in alphabet {
+                    for d in alphabet {
+                        quads.push([a, b, c, d]);
+                    }
+                }
+            }
+        }
+        let tails = ["QUJD", "QUI=", "QQ==", "AB=C", "aa==", "A==="];
+        for quad in &quads {
+            let head = std::str::from_utf8(quad).unwrap();
+            let mut inputs = vec![head.to_owned()];
+            inputs.extend(tails.iter().map(|tail| format!("{head}{tail}")));
+            inputs.extend(tails.iter().map(|tail| format!("{tail}{head}")));
+            for input in inputs {
+                let fast = normalize_base64(&input);
+                let legacy = legacy_normalize_base64(&input);
+                assert_eq!(fast.is_ok(), legacy.is_ok(), "{input}");
+                if let (Ok(fast), Ok(legacy)) = (fast, legacy) {
+                    assert_eq!(fast, legacy, "{input}");
+                    if is_canonical_base64(input.as_bytes()) {
+                        assert_eq!(input, legacy, "{input}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The telemetry allowlist is a closed set: splitting it into the
+    /// permanent and remaining halves must not add or drop a code.
+    #[test]
+    fn telemetry_code_allowlist_is_exactly_the_pinned_set() {
+        let mut pinned = vec![
+            "authentication_error",
+            "unauthorized",
+            "unauthorized_error",
+            "forbidden",
+            "permission_denied",
+            "invalid_api_key",
+            "invalid_token",
+            "expired_token",
+            "invalid_request",
+            "invalid_request_error",
+            "bad_request",
+            "invalid_argument",
+            "invalid_parameter",
+            "invalid_model",
+            "model_not_found",
+            "insufficient_quota",
+            "quota_exceeded",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded",
+            "credit_balance_exhausted",
+            "enforced_spend_limit_reached",
+            "server_error",
+            "service_unavailable_error",
+            "server_is_overloaded",
+            "api_error",
+            "overloaded_error",
+            "overloaded",
+            "rate_limit_error",
+            "rate_limit_exceeded",
+            "too_many_requests",
+            "slow_down",
+            "request_timeout",
+            "transport",
+            "cancelled",
+            "malformed_tool_call",
+            "transient_remote",
+            "remote",
+            "invalid_response",
+            "provider_error",
+        ];
+        let mut actual: Vec<&str> = PERMANENT_CODES
+            .iter()
+            .chain(OTHER_SAFE_CODES)
+            .copied()
+            .collect();
+        pinned.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, pinned);
+        for code in pinned {
+            assert_eq!(normalized_provider_code(code).as_deref(), Some(code));
+        }
+        assert_eq!(
+            normalized_provider_code("server_errors").as_deref(),
+            Some("provider_error")
+        );
     }
 
     #[test]
@@ -6838,7 +7495,7 @@ mod finalization_tests {
             .with_max_output_tokens(4096);
             let client = HttpProviderClient::new(adapter, Duration::from_secs(1)).expect("client");
             let request = client
-                .prepare_finalization_messages(&[ProviderMessage::user("finish")], &[])
+                .prepare_finalization_messages(&[ProviderMessage::user("finish")], &[], true)
                 .expect("request");
             serde_json::from_slice::<Value>(&request.body).expect("body")
         };
@@ -6875,7 +7532,7 @@ mod finalization_tests {
             .expect("adapter");
             let client = HttpProviderClient::new(adapter, Duration::from_secs(1)).expect("client");
             let request = client
-                .prepare_finalization_messages(&messages, &tools)
+                .prepare_finalization_messages(&messages, &tools, true)
                 .expect("request");
             serde_json::from_slice::<Value>(&request.body).expect("body")
         };
@@ -6902,7 +7559,7 @@ mod finalization_tests {
             .expect("adapter");
             let client = HttpProviderClient::new(adapter, Duration::from_secs(1)).expect("client");
             let request = client
-                .prepare_finalization_messages(&messages, tools)
+                .prepare_finalization_messages(&messages, tools, true)
                 .expect("request");
             serde_json::from_slice::<Value>(&request.body).expect("body")
         };
@@ -6920,6 +7577,437 @@ mod finalization_tests {
         let compatible = openai("https://gateway.example.com/v1/chat/completions", &function);
         assert!(compatible.get("tools").is_none());
         assert!(compatible.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn first_closing_request_keeps_the_turns_tools_and_tool_choice() {
+        let tools = [json!({
+            "name": "read",
+            "description": "Read a file.",
+            "input_schema": {"type": "object"}
+        })];
+        let messages = [ProviderMessage::user("finish")];
+        let adapter = AnthropicAdapter::new(ProviderConfig::anthropic(
+            "https://api.anthropic.com/v1/messages",
+            "claude-sonnet-4-6",
+            "fixture-key",
+        ))
+        .expect("adapter");
+        let client = HttpProviderClient::new(adapter, Duration::from_secs(1)).expect("client");
+        let body = |request: PreparedProviderRequest| {
+            serde_json::from_slice::<Value>(&request.body).expect("body")
+        };
+        let turn = body(
+            client
+                .prepare_messages_with_tools(&messages, &tools)
+                .unwrap(),
+        );
+        let closing = body(
+            client
+                .prepare_finalization_messages(&messages, &tools, false)
+                .unwrap(),
+        );
+        // Changing `tool_choice` or the tools invalidates the cached history.
+        assert!(closing.get("tool_choice").is_none());
+        assert_eq!(closing["tools"], turn["tools"]);
+        assert_eq!(closing["system"], turn["system"]);
+        assert_eq!(closing["messages"], turn["messages"]);
+        assert!(closing["max_tokens"].as_u64().unwrap() <= 2_048);
+        assert!(closing.get("cache_control").is_none());
+
+        let codex = OpenAiCodexAdapter::new(ProviderConfig::openai_codex(
+            "https://chatgpt.com/backend-api/codex",
+            "gpt-5.6-sol",
+            "fixture-token",
+            "fixture-account",
+        ))
+        .expect("adapter");
+        let client = HttpProviderClient::new(codex, Duration::from_secs(1)).expect("client");
+        let turn = body(
+            client
+                .prepare_messages_with_tools(&messages, &tools)
+                .unwrap(),
+        );
+        let closing = body(
+            client
+                .prepare_finalization_messages(&messages, &tools, false)
+                .unwrap(),
+        );
+        assert_eq!(closing["tools"], turn["tools"]);
+        assert_eq!(closing["tool_choice"], turn["tool_choice"]);
+        assert_eq!(closing["prompt_cache_key"], turn["prompt_cache_key"]);
+    }
+
+    fn claude_client(endpoint: &str) -> HttpProviderClient<AnthropicAdapter> {
+        let adapter = AnthropicAdapter::new(ProviderConfig::anthropic(
+            endpoint,
+            "claude-sonnet-5",
+            "fixture-key",
+        ))
+        .expect("adapter");
+        HttpProviderClient::new(adapter, Duration::from_secs(1)).expect("client")
+    }
+
+    fn read_tool() -> Value {
+        json!({"name": "read", "description": "Read a file.", "input_schema": {"type": "object"}})
+    }
+
+    /// An assistant turn as Anthropic answered `request`: a signed thinking
+    /// block bound to that request, then one tool call.
+    fn thinking_answer(
+        client: &HttpProviderClient<AnthropicAdapter>,
+        request: &PreparedProviderRequest,
+        call_id: &str,
+        thought: &str,
+    ) -> ProviderMessage {
+        let adapter = client.adapter();
+        let mut message = ProviderMessage::assistant(
+            "",
+            vec![ProviderToolCall {
+                id: call_id.into(),
+                name: "read".into(),
+                arguments: r#"{"path":"a"}"#.into(),
+            }],
+        );
+        message.responses_reasoning = vec![ResponsesReasoning::anthropic_thinking(
+            adapter.response_cache_scope_id().unwrap(),
+            adapter.model().into(),
+            json!({"type": "thinking", "thinking": thought, "signature": "sig"}),
+            request.thinking_binding().expect("Anthropic binding"),
+        )];
+        message
+    }
+
+    fn wire_body(request: PreparedProviderRequest) -> Value {
+        serde_json::from_slice(&request.body).expect("body")
+    }
+
+    #[test]
+    fn anthropic_thinking_goes_back_only_while_its_prefix_is_unchanged() {
+        let client = claude_client("https://api.anthropic.com/v1/messages");
+        let tools = [read_tool()];
+        let mut messages = vec![ProviderMessage::user("task")];
+        let first = client
+            .prepare_messages_with_tools(&messages, &tools)
+            .unwrap();
+        messages.push(thinking_answer(&client, &first, "call-1", "first"));
+        messages.push(ProviderMessage::tool("read", "call-1", "contents"));
+        let second = client
+            .prepare_messages_with_tools(&messages, &tools)
+            .unwrap();
+        messages.push(thinking_answer(&client, &second, "call-2", "second"));
+        messages.push(ProviderMessage::tool("read", "call-2", "more"));
+
+        // The cache markers and the string-to-block rewrite of the previous
+        // request's tail are not part of the binding.
+        let body = wire_body(
+            client
+                .prepare_messages_with_tools(&messages, &tools)
+                .unwrap(),
+        );
+        let wire = body["messages"].as_array().unwrap();
+        assert_eq!(wire[1]["content"][0]["thinking"], "first");
+        assert_eq!(wire[1]["content"][0]["signature"], "sig");
+        assert_eq!(wire[1]["content"][1]["type"], "tool_use");
+        assert_eq!(wire[3]["content"][0]["thinking"], "second");
+
+        // Other tools: every block is bound to them.
+        let body = wire_body(client.prepare_messages_with_tools(&messages, &[]).unwrap());
+        assert!(!body.to_string().contains("\"thinking\""), "{body}");
+
+        // An edited message drops the blocks after it, not those before.
+        let mut edited = messages.clone();
+        edited[2] = ProviderMessage::tool("read", "call-1", "edited");
+        let body = wire_body(client.prepare_messages_with_tools(&edited, &tools).unwrap());
+        let wire = body["messages"].as_array().unwrap();
+        assert_eq!(wire[1]["content"][0]["thinking"], "first");
+        assert_eq!(wire[3]["content"][0]["type"], "tool_use");
+
+        // A block dropped from the middle changes the prefix of the later one.
+        let mut stale = messages.clone();
+        stale[1].responses_reasoning[0].binding = Some(0);
+        let body = wire_body(client.prepare_messages_with_tools(&stale, &tools).unwrap());
+        assert!(!body.to_string().contains("\"thinking\""), "{body}");
+
+        // Another adapter's state never travels; Codex skips Anthropic blocks.
+        let other = claude_client("https://api.anthropic.com/v1/messages");
+        let body = wire_body(
+            other
+                .prepare_messages_with_tools(&messages, &tools)
+                .unwrap(),
+        );
+        assert!(!body.to_string().contains("\"thinking\""), "{body}");
+        let codex = HttpProviderClient::new(
+            OpenAiCodexAdapter::new(ProviderConfig::openai_codex(
+                "https://chatgpt.com/backend-api/codex",
+                "gpt-5.6-sol",
+                "fixture-token",
+                "fixture-account",
+            ))
+            .unwrap(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let body = wire_body(
+            codex
+                .prepare_messages_with_tools(&messages, &tools)
+                .unwrap(),
+        );
+        assert!(!body.to_string().contains("\"signature\""), "{body}");
+    }
+
+    #[test]
+    fn closing_without_tools_drops_the_bound_thinking() {
+        let client = claude_client("https://opencode.ai/zen/go/v1/messages");
+        let tools = [read_tool()];
+        let mut messages = vec![ProviderMessage::user("task")];
+        let first = client
+            .prepare_messages_with_tools(&messages, &tools)
+            .unwrap();
+        messages.push(thinking_answer(&client, &first, "call-1", "first"));
+        messages.push(ProviderMessage::tool("read", "call-1", "contents"));
+        let keeps = wire_body(
+            client
+                .prepare_finalization_messages(&messages, &tools, false)
+                .unwrap(),
+        );
+        assert_eq!(keeps["messages"][1]["content"][0]["thinking"], "first");
+        // A gateway has no `tool_choice: none`: forbidding tools removes them.
+        let forbids = wire_body(
+            client
+                .prepare_finalization_messages(&messages, &tools, true)
+                .unwrap(),
+        );
+        assert!(forbids.get("tools").is_none());
+        assert!(!forbids.to_string().contains("\"thinking\""), "{forbids}");
+    }
+
+    #[test]
+    fn anthropic_thinking_blocks_stream_as_fragments() {
+        let client = claude_client("https://api.anthropic.com/v1/messages");
+        let adapter = client.adapter();
+        let fragments = |event: Value| {
+            adapter
+                .parse_event(&event)
+                .unwrap()
+                .into_iter()
+                .filter_map(|event| match event {
+                    ProviderEvent::ThinkingBlock { index, fragment } => Some((index, fragment)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            fragments(
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}})
+            ),
+            vec![(
+                0,
+                ThinkingFragment::Start {
+                    redacted_data: None
+                }
+            )]
+        );
+        assert_eq!(
+            fragments(
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"step"}})
+            ),
+            vec![(0, ThinkingFragment::Thinking("step".into()))]
+        );
+        assert_eq!(
+            fragments(
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}})
+            ),
+            vec![(0, ThinkingFragment::Signature("sig".into()))]
+        );
+        assert_eq!(
+            fragments(
+                json!({"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"opaque"}})
+            ),
+            vec![(
+                1,
+                ThinkingFragment::Start {
+                    redacted_data: Some("opaque".into())
+                }
+            )]
+        );
+        assert!(fragments(json!({"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"hi"}})).is_empty());
+    }
+
+    #[test]
+    fn first_party_system_breakpoint_lasts_an_hour() {
+        let tools = [read_tool()];
+        let messages = [ProviderMessage::user("task")];
+        let official = wire_body(
+            claude_client("https://api.anthropic.com/v1/messages")
+                .prepare_messages_with_tools(&messages, &tools)
+                .unwrap(),
+        );
+        assert_eq!(
+            official["system"][0]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
+        // The automatic breakpoint stays at the default five minutes.
+        assert_eq!(official["cache_control"], json!({"type": "ephemeral"}));
+        let gateway = wire_body(
+            claude_client("https://opencode.ai/zen/go/v1/messages")
+                .prepare_messages_with_tools(&messages, &tools)
+                .unwrap(),
+        );
+        assert_eq!(
+            gateway["system"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn anthropic_message_delta_reports_cumulative_cache_usage() {
+        let client = claude_client("https://opencode.ai/zen/go/v1/messages");
+        let events = client
+            .adapter()
+            .parse_event(&json!({"type":"message_delta","usage":{
+                "input_tokens": 10,
+                "cache_creation_input_tokens": 20,
+                "cache_read_input_tokens": 300,
+                "output_tokens": 7
+            }}))
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::UsageBreakdown { usage } if *usage == UsageBreakdown {
+                uncached_input_tokens: 10,
+                cache_write_tokens: 20,
+                cache_read_tokens: 300,
+                output_tokens: 7,
+                reasoning_tokens: 0,
+                usage_unknown: false,
+            }
+        )));
+        // Input stays a single complete component: `message_start` owns it.
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::UsagePartial {
+                input_complete: true,
+                ..
+            }
+        )));
+    }
+
+    fn chat_body(model: &str, effort: Option<&str>, messages: &[ProviderMessage]) -> Value {
+        let mut config =
+            ProviderConfig::openai("https://gateway.test/v1/chat/completions", model, "k");
+        if let Some(effort) = effort {
+            config = config.with_reasoning_effort(effort);
+        }
+        let adapter = OpenAiCompatibleAdapter::new(config).unwrap();
+        let mut answered = messages.to_vec();
+        for message in &mut answered {
+            if message.role == "assistant" {
+                message.chat_reasoning = Some(ChatReasoning {
+                    scope_id: adapter.response_cache_scope_id().unwrap(),
+                    model: model.into(),
+                    content: "why".into(),
+                    details: Vec::new(),
+                });
+            }
+        }
+        adapter.messages_body(&answered, &[])
+    }
+
+    #[test]
+    fn thinking_chat_models_get_their_reasoning_back() {
+        let messages = [
+            ProviderMessage::user("task"),
+            ProviderMessage::assistant("done", Vec::new()),
+            ProviderMessage::user("next"),
+        ];
+        for (model, effort) in [
+            ("kimi-k3", Some("max")),
+            ("kimi-k2.7-code", None),
+            ("opencode-go/minimax-m3", None),
+            ("deepseek-v4-pro", None),
+            ("kimi-k2.6", Some("high")),
+        ] {
+            let body = chat_body(model, effort, &messages);
+            assert_eq!(body["messages"][2]["reasoning_content"], "why", "{model}");
+        }
+        // Kimi K3 thinks always and refuses the toggle.
+        assert!(chat_body("kimi-k3", Some("max"), &messages)
+            .get("thinking")
+            .is_none());
+        assert_eq!(
+            chat_body("kimi-k2.6", Some("high"), &messages)["thinking"],
+            json!({"type": "enabled"})
+        );
+        // Switched off, or a model that does not think: nothing goes back.
+        for (model, effort) in [("deepseek-v4-pro", Some("none")), ("glm-5.3", None)] {
+            let body = chat_body(model, effort, &messages);
+            assert!(
+                body["messages"][2].get("reasoning_content").is_none(),
+                "{model}"
+            );
+        }
+        assert!(chat_model_reasons_by_default("kimi-k3"));
+        assert!(chat_model_reasons_by_default("deepseek-flash"));
+        assert!(!chat_model_reasons_by_default("qwen3.7-max"));
+    }
+
+    #[test]
+    fn qwen_asks_for_streamed_usage_and_reports_cache_writes() {
+        let messages = [ProviderMessage::user("task")];
+        assert_eq!(
+            chat_body("qwen3.7-max", None, &messages)["stream_options"],
+            json!({"include_usage": true})
+        );
+        assert!(chat_body("glm-5.3", None, &messages)
+            .get("stream_options")
+            .is_none());
+        let adapter = OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+            "https://gateway.test/v1/chat/completions",
+            "qwen3.7-max",
+            "k",
+        ))
+        .unwrap();
+        let events = adapter
+            .parse_event(&json!({"choices": [], "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 5,
+                "prompt_tokens_details": {"cached_tokens": 600, "cache_creation_input_tokens": 300}
+            }}))
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::UsageBreakdown { usage }
+                if usage.cache_read_tokens == 600
+                    && usage.cache_write_tokens == 300
+                    && usage.uncached_input_tokens == 100
+        )));
+    }
+
+    #[test]
+    fn xai_cache_key_follows_the_conversation() {
+        let key = |adapter: XaiAdapter| {
+            let client = HttpProviderClient::new(adapter, Duration::from_secs(1)).unwrap();
+            wire_body(
+                client
+                    .prepare_messages_with_tools(&[ProviderMessage::user("task")], &[read_tool()])
+                    .unwrap(),
+            )["prompt_cache_key"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let adapter = || XaiAdapter::new(xai::XAI_BASE_URL, "grok-4.3", "k", None).unwrap();
+        assert_ne!(key(adapter()), key(adapter()));
+        assert_eq!(
+            key(adapter().with_session_id("session-a")),
+            key(adapter().with_session_id("session-a"))
+        );
+        assert_ne!(
+            key(adapter().with_session_id("session-a")),
+            key(adapter().with_session_id("session-b"))
+        );
+        assert!(XaiAdapter::new(xai::XAI_BASE_URL, "grok-4.3", "k", Some("none")).is_ok());
     }
 
     #[test]

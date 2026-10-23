@@ -1345,9 +1345,11 @@ fn stopping_batch_does_not_append_steers_before_the_final_answer() {
     let final_request = server.join().expect("server");
 
     assert_eq!(result.stop, AgentLoopStop::RepeatedFailedTool);
+    // The final-answer request keeps the turn's tools, unforced, so the
+    // cached prefix holds; no call from it runs.
     assert!(
-        !final_request.contains("\"tools\""),
-        "the last request must be the tool-free final answer"
+        final_request.contains("\"tools\"") && !final_request.contains("\"tool_choice\""),
+        "the last request must be the final answer over the cached prefix"
     );
     assert!(
         !final_request.contains("[Todo progress review]"),
@@ -2677,7 +2679,7 @@ fn a_tool_result_beyond_the_window_is_cut_down_instead_of_failing_the_run() {
                 arguments: r#"{"path":"big.txt"}"#.into(),
             }],
         ),
-        ProviderMessage::tool("read", "call-big", huge.clone()),
+        ProviderMessage::tool("read", "call-big", huge),
     ];
     let tokio_runtime = tokio::runtime::Runtime::new().expect("runtime");
     let mut runtime = Runtime::new();
@@ -3538,12 +3540,12 @@ fn default_max_result_bytes_is_sixteen_kib() {
 }
 
 #[test]
-fn default_max_turns_is_one_hundred_twenty_eight() {
+fn turns_are_uncapped_unless_configured() {
     assert_eq!(
         test_loop_config().max_turns,
         AgentLoopConfig::DEFAULT_MAX_TURNS
     );
-    assert_eq!(AgentLoopConfig::DEFAULT_MAX_TURNS, 128);
+    assert_eq!(AgentLoopConfig::DEFAULT_MAX_TURNS, usize::MAX);
 }
 
 #[test]
@@ -3729,6 +3731,143 @@ fn a_request_over_the_context_gate_compacts_instead_of_failing_without_trying() 
         "Pi's own line was not crossed: {}",
         commits[0].tokens_before
     );
+}
+
+/// An OpenAI-compatible adapter on a local fixture that, like the Codex and
+/// Anthropic wires, steers the provider's prompt cache.
+struct CacheSteeringAdapter(OpenAiCompatibleAdapter);
+
+impl ProviderAdapter for CacheSteeringAdapter {
+    fn kind(&self) -> slim_core::provider::ProviderKind {
+        self.0.kind()
+    }
+
+    fn model(&self) -> &str {
+        self.0.model()
+    }
+
+    fn capabilities(&self) -> slim_core::provider::ProviderCapabilities {
+        slim_core::provider::ProviderCapabilities {
+            supports_prompt_cache_key: true,
+            ..self.0.capabilities()
+        }
+    }
+
+    fn request_envelope_upper_bound_chars(&self) -> Option<u64> {
+        self.0.request_envelope_upper_bound_chars()
+    }
+
+    fn build_request(&self, prompt: &str) -> slim_core::provider::HttpRequest {
+        self.0.build_request(prompt)
+    }
+
+    fn build_messages_request_with_tools(
+        &self,
+        messages: &[ProviderMessage],
+        tools: &[Value],
+    ) -> slim_core::provider::HttpRequest {
+        self.0.build_messages_request_with_tools(messages, tools)
+    }
+
+    fn parse_event(
+        &self,
+        value: &Value,
+    ) -> Result<Vec<slim_core::provider::ProviderEvent>, ProviderError> {
+        self.0.parse_event(value)
+    }
+}
+
+const IN_PLACE_MARKER: &str = "Context checkpoint: stop the task here";
+
+/// Runs the gate test's compaction on a cache-steering provider; `serve`
+/// answers the requests and returns the summary the turn must carry.
+fn compact_on_a_cache_steering_provider(
+    serve: impl FnOnce(&TcpListener) -> &'static str + Send + 'static,
+) {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let summary = serve(&listener);
+        let (mut turn, turn_request) = accept_request(&listener);
+        assert!(turn_request.contains(COMPACTED_MARKER));
+        assert!(turn_request.contains(summary), "{summary}");
+        write_sse(&mut turn, &text_response("answer"));
+    });
+    let adapter = CacheSteeringAdapter(
+        OpenAiCompatibleAdapter::new(ProviderConfig::openai(
+            format!("http://{address}"),
+            "fixture-model",
+            "fixture-key",
+        ))
+        .expect("adapter"),
+    );
+    let client = HttpProviderClient::new(adapter, Duration::from_secs(5)).expect("client");
+    let handle = CompactionHandle::new(eager_policy());
+    let mut runtime = Runtime::new();
+    runtime.set_compaction_handle(handle.clone());
+    let result = run_loop_with_messages(
+        &mut runtime,
+        &client,
+        &gate_history(260_000),
+        OperatingMode::Auto,
+        std::env::temp_dir(),
+        1,
+        AgentLoopConfig {
+            max_turns: 1,
+            context_window_tokens: 100_000,
+            context_reserve_tokens: 32_000,
+            ..test_loop_config()
+        },
+    )
+    .expect("the gate compacts first");
+    server.join().expect("server");
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    assert_eq!(handle.take_commits().len(), 1);
+}
+
+#[test]
+fn a_cache_steering_provider_summarizes_the_history_in_place() {
+    compact_on_a_cache_steering_provider(|listener| {
+        let (mut summary, request) = accept_request(listener);
+        assert!(request.contains(IN_PLACE_MARKER));
+        assert!(!request.contains(SUMMARIZER_MARKER));
+        let body: Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).expect("body");
+        // The turn's own request: its tools, and the history before the cut
+        // as it was sent, then the instruction.
+        assert!(body.get("tools").is_some());
+        assert!(body.get("tool_choice").is_none());
+        let messages = body["messages"].as_array().expect("messages");
+        assert!(messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("literal root"));
+        assert!(!request.contains("recent request"));
+        assert!(messages.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(IN_PLACE_MARKER));
+        write_sse(&mut summary, &text_response("## Goal\nin place"));
+        "in place"
+    });
+}
+
+#[test]
+fn an_in_place_summary_that_calls_a_tool_falls_back_to_the_serialized_one() {
+    compact_on_a_cache_steering_provider(|listener| {
+        let (mut in_place, request) = accept_request(listener);
+        assert!(request.contains(IN_PLACE_MARKER));
+        write_sse(
+            &mut in_place,
+            &sse_tool_calls(json!({"choices": [{"delta": {"tool_calls": [{
+                "index": 0, "id": "read-1",
+                "function": {"name": "read", "arguments": "{\"path\":\"a\"}"}
+            }]}}]})),
+        );
+        let (mut serialized, request) = accept_request(listener);
+        assert!(request.contains(SUMMARIZER_MARKER));
+        write_sse(&mut serialized, &text_response("## Goal\nserialized"));
+        "serialized"
+    });
 }
 
 #[test]
@@ -6997,7 +7136,11 @@ fn failed_volatile_shell_keeps_its_side_effects_and_allows_continuation() {
             let (delta, reason) = if index == 2 {
                 (json!({"content":"partial changes recorded"}), "stop")
             } else {
-                let command = "Add-Content -LiteralPath 'progress.txt' -Value 'progressed'; exit 1";
+                let command = if cfg!(windows) {
+                    "Add-Content -LiteralPath 'progress.txt' -Value 'progressed'; exit 1"
+                } else {
+                    "echo progressed >> 'progress.txt'; exit 1"
+                };
                 (
                     json!({"tool_calls":[{"index":0,"id":format!("shell-{index}"),
                     "function":{"name":"shell","arguments":json!({"command":command}).to_string()}}]}),
@@ -8468,10 +8611,15 @@ fn managed_shell_job_allows_work_then_resumes_once_on_completion() {
     let server = thread::spawn(move || {
         for index in 0..4 {
             let (mut stream, request) = accept_request(&listener);
+            let job_command = if cfg!(windows) {
+                "Write-Output 'job-started'; while (!(Test-Path -LiteralPath 'release-job')) { Start-Sleep -Milliseconds 50 }; Write-Output 'job-done'"
+            } else {
+                "echo 'job-started'; while [ ! -e 'release-job' ]; do sleep 0.05; done; echo 'job-done'"
+            };
             let (delta, reason) = match index {
                 0 => (
                     json!({"tool_calls":[{"index":0,"id":"launch","function":{"name":"shell",
-                    "arguments":json!({"command":"Write-Output 'job-started'; while (!(Test-Path -LiteralPath 'release-job')) { Start-Sleep -Milliseconds 50 }; Write-Output 'job-done'","yield_ms":0,"timeout_ms":30000}).to_string()}}]}),
+                    "arguments":json!({"command":job_command,"yield_ms":0,"timeout_ms":30000}).to_string()}}]}),
                     "tool_calls",
                 ),
                 1 => {
@@ -9055,7 +9203,9 @@ fn a_closing_request_that_keeps_the_tools_is_sent_as_the_turns_are() {
     assert_eq!(result.stop, AgentLoopStop::TurnLimit);
     assert!(runtime.finalization_error().is_none());
 
-    assert_eq!(closing["tool_choice"], "none");
+    // Nothing the turns cached changes: the same tools and no forced
+    // `tool_choice`, which comes only if the model still calls a tool.
+    assert!(closing.get("tool_choice").is_none());
     assert_eq!(closing["tools"], first["tools"]);
     let messages = closing["messages"].as_array().expect("messages");
     let first_messages = first["messages"].as_array().expect("messages");
@@ -9237,7 +9387,10 @@ fn a_tuning_loop_is_warned_then_stopped_with_its_own_final_prompt() {
         "the third retune warns the model"
     );
     assert!(requests[6].contains("Execution stopped because consecutive turns only retuned"));
-    assert!(!requests[6].contains("\"tools\""));
+    // The closing request keeps the turn's tools, unforced, so the cached
+    // prefix holds.
+    assert!(requests[6].contains("\"tools\""));
+    assert!(!requests[6].contains("\"tool_choice\""));
     assert_eq!(
         std::fs::read_to_string(root.join("scene.txt")).expect("scene"),
         "glow(0.16);\n"

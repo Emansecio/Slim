@@ -1,8 +1,8 @@
 use super::*;
 
-use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(windows)]
 use std::task::Poll;
 use std::thread;
 

@@ -1,27 +1,56 @@
 use slim_core::provider::{
     codex_model, codex_models, codex_models_url, parse_codex_catalog, resolve_codex_context_window,
-    CODEX_BUNDLED_CONTEXT_WINDOW, CODEX_CATALOG_CLIENT_VERSION,
+    CODEX_BUNDLED_CONTEXT_WINDOW, CODEX_CATALOG_CLIENT_VERSION, CODEX_MAX_OUTPUT_TOKENS,
 };
 
 #[test]
-fn bundled_gpt_56_aliases_use_codex_catalog_window_not_loop_default() {
-    for id in [
-        "gpt-5.6-sol",
-        "gpt-6-astra",
-        "astra",
-        "sol",
-        "gpt-5.6-terra",
-        "terra",
-        "gpt-5.6-luna",
-        "luna",
-    ] {
+fn bundled_codex_models_follow_the_account_catalog_and_its_windows() {
+    for id in ["gpt-5.6-sol", "sol", "gpt-5.6-terra", "terra", "gpt-5.6-luna", "luna"] {
         let model = codex_model(id).unwrap_or_else(|| panic!("missing Codex metadata for {id}"));
         assert_eq!(model.context_window, CODEX_BUNDLED_CONTEXT_WINDOW);
         assert!(model.context_window > 32_000);
-        assert_eq!(model.max_output_tokens, 128_000);
+        assert_eq!(model.max_output_tokens, CODEX_MAX_OUTPUT_TOKENS);
+        assert!(model.reasoning_levels.contains(&"high"));
     }
-    assert_eq!(codex_models().len(), 4);
+    // Retired subscription models must not survive in the fallback list.
+    assert!(codex_model("astra").is_none());
+    assert!(codex_model("gpt-6-astra").is_none());
+    assert!(codex_model("gpt-6.1-sol").is_none());
+    assert_eq!(codex_models().len(), 3);
     assert!(codex_model("deepseek-v4-flash").is_none());
+}
+
+#[test]
+fn catalog_rows_carry_display_name_levels_and_visibility() {
+    let live = parse_codex_catalog(
+        br#"{
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "display_name": "GPT-5.6-Sol",
+                    "context_window": 272000,
+                    "visibility": "list",
+                    "supported_reasoning_levels": [
+                        {"effort": "low"},
+                        {"effort": "ultra"}
+                    ]
+                },
+                {"slug": "gpt-reserve", "display_name": "GPT-Reserve", "visibility": "hide"},
+                {"slug": "codex-auto-review"}
+            ]
+        }"#,
+    )
+    .expect("catalog");
+
+    assert_eq!(live[0].display_name.as_deref(), Some("GPT-5.6-Sol"));
+    assert_eq!(live[0].reasoning_levels, vec!["low", "ultra"]);
+    assert!(live[0].visible);
+    assert!(!live[1].visible);
+    // A row without a declared window keeps the bundled figure, so the picker
+    // still lists it instead of dropping the model.
+    assert_eq!(live[2].context_window, CODEX_BUNDLED_CONTEXT_WINDOW);
+    assert!(live[2].visible);
+    assert!(live[2].reasoning_levels.is_empty());
 }
 
 #[test]

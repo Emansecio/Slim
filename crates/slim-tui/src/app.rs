@@ -4,11 +4,11 @@ use std::sync::Arc;
 use slim_core::OperatingMode;
 
 use crate::api::{
-    BlockId, ClinePassCatalogSource, CommandCodeCatalogSource, ContentRequestId,
-    InteractionRequestId, LoginProvider, ModelAlias, OpenCodeCatalogSource, OpenCodeModelView,
-    OpenDesignCatalogSource, PromptAdmission, PromptGeneration, PromptId, PromptOrigin,
-    ReasoningEffort, SensitiveText, SessionId, TranscriptMessage, TranscriptRole, UiCommand,
-    UiEvent, ZenCatalogSource,
+    BlockId, ClinePassCatalogSource, CodexCatalogSource, CommandCodeCatalogSource,
+    ContentRequestId, InteractionRequestId, LoginProvider, ModelAlias, OpenCodeCatalogSource,
+    OpenCodeModelView, OpenDesignCatalogSource, PromptAdmission, PromptGeneration, PromptId,
+    PromptOrigin, ReasoningEffort, SensitiveText, SessionId, ToolBatchId, ToolCallId,
+    TranscriptMessage, TranscriptRole, UiCommand, UiEvent, ZenCatalogSource,
 };
 use crate::block::{
     Block, BlockKind, BlockLifecycle, FoldState, InteractionRequestKind, InteractionRequestState,
@@ -95,6 +95,26 @@ fn default_open_design_models() -> Vec<OpenCodeModelView> {
             .filter_map(|level| ReasoningEffort::parse(level))
             .collect(),
             accepts_images: m.accepts_images,
+        })
+        .collect()
+}
+
+/// Offline Codex seed for the picker: the account's `/codex/models` catalog
+/// replaces it as soon as the TUI refreshes it.
+fn default_codex_models() -> Vec<OpenCodeModelView> {
+    slim_core::provider::codex_models()
+        .iter()
+        .map(|m| OpenCodeModelView {
+            id: m.id.to_owned(),
+            name: m.name.to_owned(),
+            context_window_tokens: m.context_window,
+            max_output_tokens: u64::from(m.max_output_tokens),
+            reasoning_levels: m
+                .reasoning_levels
+                .iter()
+                .filter_map(|level| ReasoningEffort::parse(level))
+                .collect(),
+            accepts_images: true,
         })
         .collect()
 }
@@ -491,8 +511,9 @@ pub struct McpOverlay {
 pub enum ModelRow {
     /// Collapsible group header, carrying the group index.
     Header(usize),
-    /// An OpenAI Codex alias (Astra/Sol/Terra/Luna).
-    Alias(ModelAlias),
+    /// An OpenAI Codex catalog model, carrying its index into
+    /// `AppState::codex_models`.
+    Codex(usize),
     /// An OpenCode Go catalog model, carrying its index into
     /// `AppState::open_code_models`.
     Catalog(usize),
@@ -520,15 +541,47 @@ pub struct ModelChoice {
     pub accepts_images: Option<bool>,
 }
 
+/// Borrowed view of the six provider catalogs shown in the model overlay.
+/// Built by `AppState::model_catalogs`; `groups()` is in group order.
+#[derive(Clone, Copy, Debug)]
+pub struct ModelCatalogs<'a> {
+    pub codex: &'a [OpenCodeModelView],
+    pub opencode: &'a [OpenCodeModelView],
+    pub clinepass: &'a [OpenCodeModelView],
+    pub command_code: &'a [OpenCodeModelView],
+    pub zen: &'a [OpenCodeModelView],
+    pub open_design: &'a [OpenCodeModelView],
+}
+
+impl<'a> ModelCatalogs<'a> {
+    /// The provider catalogs in overlay group order (groups 0..=5).
+    pub fn groups(&self) -> [&'a [OpenCodeModelView]; 6] {
+        [
+            self.codex,
+            self.opencode,
+            self.clinepass,
+            self.command_code,
+            self.zen,
+            self.open_design,
+        ]
+    }
+
+    /// Rows a group lists when unfiltered.
+    pub fn group_size(&self, group: usize) -> usize {
+        self.groups().get(group).map_or(0, |models| models.len())
+    }
+}
+
 impl ModelRow {
-    pub fn choice(
-        &self,
-        opencode: &[OpenCodeModelView],
-        clinepass: &[OpenCodeModelView],
-        command_code: &[OpenCodeModelView],
-        zen: &[OpenCodeModelView],
-        open_design: &[OpenCodeModelView],
-    ) -> Option<ModelChoice> {
+    pub fn choice(&self, catalogs: &ModelCatalogs<'_>) -> Option<ModelChoice> {
+        let ModelCatalogs {
+            codex,
+            opencode,
+            clinepass,
+            command_code,
+            zen,
+            open_design,
+        } = *catalogs;
         let catalog_choice = |model: &OpenCodeModelView, target| ModelChoice {
             target,
             name: model.name.clone(),
@@ -541,15 +594,9 @@ impl ModelRow {
         };
         match self {
             Self::Header(_) => None,
-            Self::Alias(alias) => Some(ModelChoice {
-                target: EffortTarget::Alias(*alias),
-                name: alias.label().to_owned(),
-                id: alias.id().to_owned(),
-                levels: ReasoningEffort::supported(*alias).to_vec(),
-                context_window_tokens: None,
-                max_output_tokens: None,
-                accepts_images: None,
-            }),
+            Self::Codex(index) => codex
+                .get(*index)
+                .map(|model| catalog_choice(model, EffortTarget::Codex(model.id.clone()))),
             Self::Catalog(index) => opencode
                 .get(*index)
                 .map(|model| catalog_choice(model, EffortTarget::OpenCodeGo(model.id.clone()))),
@@ -574,14 +621,15 @@ impl ModelOverlay {
     ///
     /// Groups left empty by the filter are dropped entirely; an empty result is
     /// the signal the overlay renders as "no model".
-    pub fn rows(
-        &self,
-        opencode_models: &[OpenCodeModelView],
-        clinepass_models: &[OpenCodeModelView],
-        command_code_models: &[OpenCodeModelView],
-        zen_models: &[OpenCodeModelView],
-        open_design_models: &[OpenCodeModelView],
-    ) -> Vec<ModelRow> {
+    pub fn rows(&self, catalogs: &ModelCatalogs<'_>) -> Vec<ModelRow> {
+        let ModelCatalogs {
+            codex: codex_models,
+            opencode: opencode_models,
+            clinepass: clinepass_models,
+            command_code: command_code_models,
+            zen: zen_models,
+            open_design: open_design_models,
+        } = *catalogs;
         let query = self.filter.to_lowercase();
         let mut out = Vec::new();
         let keep = |id: &str, name: &str| {
@@ -601,14 +649,15 @@ impl ModelOverlay {
             }
         };
 
-        // Group 0: OpenAI Codex built-in aliases
+        // Group 0: OpenAI Codex models of the signed-in account
         push_group(
             &mut out,
             0,
-            ModelAlias::ALL
+            codex_models
                 .iter()
-                .filter(|alias| keep(alias.id(), alias.label()))
-                .map(|alias| ModelRow::Alias(*alias))
+                .enumerate()
+                .filter(|(_, model)| keep(&model.id, &model.name))
+                .map(|(index, _)| ModelRow::Codex(index))
                 .collect(),
         );
 
@@ -696,8 +745,6 @@ impl ModelOverlay {
         }
         if choice.levels.contains(&current) {
             current
-        } else if let EffortTarget::Alias(alias) = choice.target {
-            ReasoningEffort::default_for(alias)
         } else {
             choice.levels.first().copied().unwrap_or(current)
         }
@@ -717,19 +764,25 @@ impl ModelOverlay {
 
     /// Returns a fresh overlay with the selection positioned at the currently
     /// active model, or the first non-header row as fallback.
-    /// The four catalogs stay explicit: bundling them into a struct would touch
-    /// every call site without changing behavior.
     pub fn for_current(
         current_model: &str,
         active_provider: Option<LoginProvider>,
-        opencode_models: &[OpenCodeModelView],
-        clinepass_models: &[OpenCodeModelView],
-        command_code_models: &[OpenCodeModelView],
-        zen_models: &[OpenCodeModelView],
-        open_design_models: &[OpenCodeModelView],
+        catalogs: &ModelCatalogs<'_>,
     ) -> Self {
+        let ModelCatalogs {
+            codex: codex_models,
+            opencode: opencode_models,
+            clinepass: clinepass_models,
+            command_code: command_code_models,
+            zen: zen_models,
+            open_design: open_design_models,
+        } = *catalogs;
         let provider_group = active_provider.and_then(|provider| match provider {
-            LoginProvider::OpenAiCodex if ModelAlias::parse(current_model).is_some() => Some(0),
+            LoginProvider::OpenAiCodex
+                if codex_models.iter().any(|model| model.id == current_model) =>
+            {
+                Some(0)
+            }
             LoginProvider::OpenCodeGo
                 if opencode_models
                     .iter()
@@ -767,7 +820,7 @@ impl ModelOverlay {
         });
         let active_group = if let Some(group) = provider_group {
             group
-        } else if ModelAlias::parse(current_model).is_some() {
+        } else if codex_models.iter().any(|model| model.id == current_model) {
             0
         } else if opencode_models
             .iter()
@@ -808,24 +861,11 @@ impl ModelOverlay {
             ..Self::default()
         };
         overlay.collapsed[active_group] = false;
-        let rows = overlay.rows(
-            opencode_models,
-            clinepass_models,
-            command_code_models,
-            zen_models,
-            open_design_models,
-        );
+        let rows = overlay.rows(catalogs);
         overlay.selected = rows
             .iter()
             .position(|row| {
-                row.choice(
-                    opencode_models,
-                    clinepass_models,
-                    command_code_models,
-                    zen_models,
-                    open_design_models,
-                )
-                .is_some_and(|choice| {
+                row.choice(catalogs).is_some_and(|choice| {
                     choice.id == current_model
                         && active_provider
                             .is_none_or(|provider| choice.target.provider() == provider)
@@ -864,7 +904,8 @@ pub struct MentionSuggestions {
 /// because speed is a Codex service tier.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EffortTarget {
-    Alias(ModelAlias),
+    /// Codex catalog model id (`UiCommand::SetModel`).
+    Codex(String),
     /// OpenCode Go catalog model (`UiCommand::SetOpenCodeModel`).
     OpenCodeGo(String),
     /// OpenCode Zen catalog model (`UiCommand::SetZenModel`).
@@ -878,7 +919,7 @@ pub enum EffortTarget {
 impl EffortTarget {
     pub fn provider(&self) -> LoginProvider {
         match self {
-            Self::Alias(_) => LoginProvider::OpenAiCodex,
+            Self::Codex(_) => LoginProvider::OpenAiCodex,
             Self::OpenCodeGo(_) => LoginProvider::OpenCodeGo,
             Self::Zen(_) => LoginProvider::OpenCodeZen,
             Self::ClinePass(_) => LoginProvider::ClinePass,
@@ -900,15 +941,15 @@ pub struct EffortOverlay {
 }
 
 impl EffortOverlay {
-    /// Step for a built-in Codex alias: Tab toggles Normal/Fast (G239: the
+    /// Step for a Codex catalog model: Tab toggles Normal/Fast (G239: the
     /// parent model overlay stays alive so Esc returns to it).
-    pub fn for_alias(model: ModelAlias, preferred: ReasoningEffort, fast: bool) -> Self {
-        Self::with_levels(
-            EffortTarget::Alias(model),
-            ReasoningEffort::supported(model).to_vec(),
-            preferred,
-            fast,
-        )
+    pub fn for_codex(
+        model: String,
+        levels: Vec<ReasoningEffort>,
+        preferred: ReasoningEffort,
+        fast: bool,
+    ) -> Self {
+        Self::with_levels(EffortTarget::Codex(model), levels, preferred, fast)
     }
 
     /// Step for a provider catalog model whose declared levels are not empty;
@@ -950,10 +991,10 @@ impl EffortOverlay {
             .unwrap_or(ReasoningEffort::High)
     }
 
-    /// Codex-only Normal/Fast toggle: catalog models have no service tier, so
-    /// the step must not offer Tab for them.
+    /// Codex-only Normal/Fast toggle: other providers' catalog models have no
+    /// service tier, so the step must not offer Tab for them.
     pub fn speed_toggle(&self) -> bool {
-        matches!(self.target, EffortTarget::Alias(_))
+        matches!(self.target, EffortTarget::Codex(_))
     }
 }
 
@@ -974,11 +1015,13 @@ pub struct AppState {
     pub authenticated: bool,
     pub login_overlay: Option<LoginOverlay>,
     pub model_overlay: Option<ModelOverlay>,
+    pub codex_models: Vec<OpenCodeModelView>,
     pub open_code_models: Vec<OpenCodeModelView>,
     pub cline_pass_models: Vec<OpenCodeModelView>,
     pub command_code_models: Vec<OpenCodeModelView>,
     pub zen_models: Vec<OpenCodeModelView>,
     pub open_design_models: Vec<OpenCodeModelView>,
+    pub codex_catalog_source: Option<CodexCatalogSource>,
     pub open_code_catalog_source: Option<OpenCodeCatalogSource>,
     pub cline_pass_catalog_source: Option<ClinePassCatalogSource>,
     pub command_code_catalog_source: Option<CommandCodeCatalogSource>,
@@ -1167,11 +1210,13 @@ impl Default for AppState {
             authenticated: false,
             login_overlay: None,
             model_overlay: None,
+            codex_models: default_codex_models(),
             open_code_models: default_open_code_models(),
             cline_pass_models: default_clinepass_models(),
             command_code_models: default_command_code_models(),
             zen_models: default_zen_models(),
             open_design_models: default_open_design_models(),
+            codex_catalog_source: None,
             open_code_catalog_source: None,
             cline_pass_catalog_source: None,
             command_code_catalog_source: None,
@@ -1745,20 +1790,21 @@ impl AppState {
     }
 
     fn maybe_warn_turn_budget(&mut self) {
-        if self.turn_budget_warned || self.max_turns == 0 {
+        // An uncapped run has no limit to be near: the guard covers it, like
+        // it does for the tool budgets.
+        if self.turn_budget_warned
+            || !crate::view_model::budget_near_limit(self.turns_used, self.max_turns)
+        {
             return;
         }
-        let threshold = ((self.max_turns as f64) * 0.8).ceil() as usize;
-        if self.turns_used >= threshold {
-            self.turn_budget_warned = true;
-            self.push_notification_with_priority(
-                format!(
-                    "Limite de turnos: {}/{} — perto do limite da execução",
-                    self.turns_used, self.max_turns
-                ),
-                NotificationPriority::Warning,
-            );
-        }
+        self.turn_budget_warned = true;
+        self.push_notification_with_priority(
+            format!(
+                "Limite de turnos: {}/{} — perto do limite da execução",
+                self.turns_used, self.max_turns
+            ),
+            NotificationPriority::Warning,
+        );
     }
 
     fn reset_this_turn_tool_budget(&mut self) {
@@ -2458,12 +2504,7 @@ impl AppState {
             if existing.same_request(&request) {
                 return;
             }
-            self.snapshot_resync_needed = true;
-            self.push_notification_with_priority(
-                "Identidade conflitante da solicitação de interação ignorada".into(),
-                NotificationPriority::Error,
-            );
-            self.revisions.status += 1;
+            self.lifecycle_anomaly("Identidade conflitante da solicitação de interação ignorada");
             return;
         }
 
@@ -2757,6 +2798,44 @@ impl AppState {
         }
     }
 
+    /// A lifecycle event that contradicts the transcript (orphan, duplicate or
+    /// conflicting identity): ignored, but flagged so the host resyncs.
+    fn lifecycle_anomaly(&mut self, message: &str) {
+        self.snapshot_resync_needed = true;
+        self.push_notification_with_priority(message.into(), NotificationPriority::Error);
+        self.revisions.status += 1;
+    }
+
+    /// Swaps in a freshly loaded provider catalog while the model overlay keeps
+    /// its cursor on the same model.
+    fn replace_model_catalog(&mut self, apply: impl FnOnce(&mut Self)) {
+        let focused = self.focused_model_target();
+        apply(self);
+        self.catalog_revision += 1;
+        self.restore_model_focus(focused);
+        self.revisions.status += 1;
+    }
+
+    /// The user asked to cancel this very run (as opposed to it ending by itself).
+    fn explicitly_cancelled(&self, run_id: u64) -> bool {
+        self.cancellation
+            .is_some_and(|cancellation| cancellation.run_id == run_id)
+    }
+
+    /// Tail shared by every run terminal: nothing is running anymore. An
+    /// explicit cancel also pauses the prompt queue. `thinking_open` is left to
+    /// the caller. Call after `finish_execution`, which reads `run_started_ms`.
+    fn clear_run_state(&mut self, explicitly_cancelled: bool) {
+        self.working = false;
+        self.run_started_ms = None;
+        self.activity = None;
+        self.cancellation = None;
+        self.retry = None;
+        if explicitly_cancelled {
+            self.queue_paused = true;
+        }
+    }
+
     fn accept_terminal(&mut self, run_id: u64, lifecycle: BlockLifecycle) -> bool {
         if self.active_run_id.is_some_and(|active| active != run_id) {
             return false;
@@ -2786,51 +2865,48 @@ impl AppState {
         }
     }
 
+    /// Borrowed view of the provider catalogs backing the model overlay.
+    pub fn model_catalogs(&self) -> ModelCatalogs<'_> {
+        ModelCatalogs {
+            codex: &self.codex_models,
+            opencode: &self.open_code_models,
+            clinepass: &self.cline_pass_models,
+            command_code: &self.command_code_models,
+            zen: &self.zen_models,
+            open_design: &self.open_design_models,
+        }
+    }
+
     fn focused_model_target(&self) -> Option<EffortTarget> {
         let overlay = self.model_overlay.as_ref()?;
         if overlay.selection_lost {
             return None;
         }
         overlay
-            .rows(
-                &self.open_code_models,
-                &self.cline_pass_models,
-                &self.command_code_models,
-                &self.zen_models,
-                &self.open_design_models,
-            )
+            .rows(&self.model_catalogs())
             .get(overlay.selected)?
-            .choice(
-                &self.open_code_models,
-                &self.cline_pass_models,
-                &self.command_code_models,
-                &self.zen_models,
-                &self.open_design_models,
-            )
+            .choice(&self.model_catalogs())
             .map(|choice| choice.target)
     }
 
     fn restore_model_focus(&mut self, focused: Option<EffortTarget>) {
+        // Field-level borrows: the overlay is mutated while the catalogs are read.
+        let catalogs = ModelCatalogs {
+            codex: &self.codex_models,
+            opencode: &self.open_code_models,
+            clinepass: &self.cline_pass_models,
+            command_code: &self.command_code_models,
+            zen: &self.zen_models,
+            open_design: &self.open_design_models,
+        };
         let Some(overlay) = self.model_overlay.as_mut() else {
             return;
         };
-        let rows = overlay.rows(
-            &self.open_code_models,
-            &self.cline_pass_models,
-            &self.command_code_models,
-            &self.zen_models,
-            &self.open_design_models,
-        );
+        let rows = overlay.rows(&catalogs);
         if let Some(target) = focused {
             if let Some(index) = rows.iter().position(|row| {
-                row.choice(
-                    &self.open_code_models,
-                    &self.cline_pass_models,
-                    &self.command_code_models,
-                    &self.zen_models,
-                    &self.open_design_models,
-                )
-                .is_some_and(|choice| choice.target == target)
+                row.choice(&catalogs)
+                    .is_some_and(|choice| choice.target == target)
             }) {
                 overlay.selected = index;
                 overlay.selection_lost = false;
@@ -3285,9 +3361,7 @@ impl AppState {
             }
             UiEvent::RunCompleted { run_id } => {
                 if self.accept_terminal(run_id, BlockLifecycle::Complete) {
-                    let explicitly_cancelled = self
-                        .cancellation
-                        .is_some_and(|cancellation| cancellation.run_id == run_id);
+                    let explicitly_cancelled = self.explicitly_cancelled(run_id);
                     self.terminalize_streaming(BlockLifecycle::Complete);
                     self.latest_run_assistant = None;
                     self.close_request_usage(true);
@@ -3310,15 +3384,8 @@ impl AppState {
                         ));
                         self.note_new_content();
                     }
-                    self.working = false;
                     self.thinking_open = false;
-                    self.run_started_ms = None;
-                    self.activity = None;
-                    self.cancellation = None;
-                    self.retry = None;
-                    if explicitly_cancelled {
-                        self.queue_paused = true;
-                    }
+                    self.clear_run_state(explicitly_cancelled);
                     self.request_estimate_open = false;
                     self.revisions.content += 1;
                     self.revisions.status += 1;
@@ -3326,23 +3393,14 @@ impl AppState {
             }
             UiEvent::RunStopped { run_id, message } => {
                 if self.accept_terminal(run_id, BlockLifecycle::Cancelled) {
-                    let explicitly_cancelled = self
-                        .cancellation
-                        .is_some_and(|cancellation| cancellation.run_id == run_id);
+                    let explicitly_cancelled = self.explicitly_cancelled(run_id);
                     self.terminalize_streaming(BlockLifecycle::Cancelled);
                     self.terminalize_latest_assistant(BlockLifecycle::Cancelled);
                     self.close_request_usage(false);
                     let pending_count = self.pending_todo_count();
                     self.finish_execution(run_id, RunOutcomeKind::Interrupted, pending_count);
-                    self.working = false;
                     self.thinking_open = false;
-                    self.run_started_ms = None;
-                    self.activity = None;
-                    self.cancellation = None;
-                    self.retry = None;
-                    if explicitly_cancelled {
-                        self.queue_paused = true;
-                    }
+                    self.clear_run_state(explicitly_cancelled);
                     self.request_estimate_open = false;
                     let id = self.fresh_id("stop");
                     let mut block =
@@ -3360,24 +3418,15 @@ impl AppState {
             }
             UiEvent::RunCancelled { run_id } => {
                 if self.accept_terminal(run_id, BlockLifecycle::Cancelled) {
-                    let explicitly_cancelled = self
-                        .cancellation
-                        .is_some_and(|cancellation| cancellation.run_id == run_id);
+                    let explicitly_cancelled = self.explicitly_cancelled(run_id);
                     let pending_count = self.pending_todo_count();
-                    self.working = false;
-                    self.thinking_open = false;
-                    self.activity = None;
                     self.terminalize_streaming(BlockLifecycle::Cancelled);
                     self.terminalize_latest_assistant(BlockLifecycle::Cancelled);
                     self.close_request_usage(false);
                     self.finish_execution(run_id, RunOutcomeKind::Interrupted, pending_count);
                     self.append_turn_receipt(crate::receipt::ReceiptOutcome::Interrupted);
-                    self.run_started_ms = None;
-                    self.cancellation = None;
-                    self.retry = None;
-                    if explicitly_cancelled {
-                        self.queue_paused = true;
-                    }
+                    self.thinking_open = false;
+                    self.clear_run_state(explicitly_cancelled);
                     self.push_notification("Execução cancelada".into());
                     self.revisions.content += 1;
                     self.revisions.status += 1;
@@ -3388,10 +3437,8 @@ impl AppState {
                 let accepted = terminal_run_id
                     .is_none_or(|run_id| self.accept_terminal(run_id, BlockLifecycle::Failed));
                 if accepted {
-                    let explicitly_cancelled = terminal_run_id.is_some_and(|run_id| {
-                        self.cancellation
-                            .is_some_and(|cancellation| cancellation.run_id == run_id)
-                    });
+                    let explicitly_cancelled =
+                        terminal_run_id.is_some_and(|run_id| self.explicitly_cancelled(run_id));
                     self.terminalize_streaming(BlockLifecycle::Failed);
                     self.terminalize_latest_assistant(BlockLifecycle::Failed);
                     self.close_request_usage(false);
@@ -3399,15 +3446,8 @@ impl AppState {
                         let pending_count = self.pending_todo_count();
                         self.finish_execution(run_id, RunOutcomeKind::Failed, pending_count);
                     }
-                    self.working = false;
                     self.thinking_open = false;
-                    self.run_started_ms = None;
-                    self.activity = None;
-                    self.cancellation = None;
-                    self.retry = None;
-                    if explicitly_cancelled {
-                        self.queue_paused = true;
-                    }
+                    self.clear_run_state(explicitly_cancelled);
                     let id = self.fresh_id("error");
                     let failure_message = if terminal_run_id.is_some() {
                         format_run_failure_message(&message)
@@ -3703,45 +3743,41 @@ impl AppState {
                 self.model_overlay = None;
                 self.revisions.status += 1;
             }
+            UiEvent::CodexCatalogLoaded { models, source } => {
+                self.replace_model_catalog(|state| {
+                    state.codex_models = models;
+                    state.codex_catalog_source = Some(source);
+                });
+            }
             UiEvent::OpenCodeCatalogLoaded { models, source } => {
-                let focused = self.focused_model_target();
-                self.open_code_models = models;
-                self.open_code_catalog_source = Some(source);
-                self.catalog_revision += 1;
-                self.restore_model_focus(focused);
-                self.revisions.status += 1;
+                self.replace_model_catalog(|state| {
+                    state.open_code_models = models;
+                    state.open_code_catalog_source = Some(source);
+                });
             }
             UiEvent::ClinePassCatalogLoaded { models, source } => {
-                let focused = self.focused_model_target();
-                self.cline_pass_models = models;
-                self.cline_pass_catalog_source = Some(source);
-                self.catalog_revision += 1;
-                self.restore_model_focus(focused);
-                self.revisions.status += 1;
+                self.replace_model_catalog(|state| {
+                    state.cline_pass_models = models;
+                    state.cline_pass_catalog_source = Some(source);
+                });
             }
             UiEvent::CommandCodeCatalogLoaded { models, source } => {
-                let focused = self.focused_model_target();
-                self.command_code_models = models;
-                self.command_code_catalog_source = Some(source);
-                self.catalog_revision += 1;
-                self.restore_model_focus(focused);
-                self.revisions.status += 1;
+                self.replace_model_catalog(|state| {
+                    state.command_code_models = models;
+                    state.command_code_catalog_source = Some(source);
+                });
             }
             UiEvent::OpenDesignCatalogLoaded { models, source } => {
-                let focused = self.focused_model_target();
-                self.open_design_models = models;
-                self.open_design_catalog_source = Some(source);
-                self.catalog_revision += 1;
-                self.restore_model_focus(focused);
-                self.revisions.status += 1;
+                self.replace_model_catalog(|state| {
+                    state.open_design_models = models;
+                    state.open_design_catalog_source = Some(source);
+                });
             }
             UiEvent::ZenCatalogLoaded { models, source } => {
-                let focused = self.focused_model_target();
-                self.zen_models = models;
-                self.zen_catalog_source = Some(source);
-                self.catalog_revision += 1;
-                self.restore_model_focus(focused);
-                self.revisions.status += 1;
+                self.replace_model_catalog(|state| {
+                    state.zen_models = models;
+                    state.zen_catalog_source = Some(source);
+                });
             }
             UiEvent::McpServersChanged { servers } => {
                 // Snapshots can reorder or drop entries (a server removed via
@@ -3840,16 +3876,10 @@ impl AppState {
                     .retain(|(active_batch, active_call, _)| {
                         active_batch != &batch_id || active_call != &call_id
                     });
-                if self.blocks.iter().any(|block| {
-                    matches!(block.kind(), BlockKind::Tool(state)
-                        if state.batch_id == batch_id && state.call_id == call_id)
-                }) {
-                    self.snapshot_resync_needed = true;
-                    self.push_notification_with_priority(
-                        "Identidade duplicada do ciclo de vida da ferramenta ignorada".into(),
-                        NotificationPriority::Error,
+                if tool_block_mut(&mut self.blocks, &batch_id, &call_id).is_some() {
+                    self.lifecycle_anomaly(
+                        "Identidade duplicada do ciclo de vida da ferramenta ignorada",
                     );
-                    self.revisions.status += 1;
                     return;
                 }
                 let id = self.fresh_id("tool");
@@ -3938,37 +3968,32 @@ impl AppState {
                 preview,
                 content_handle,
             } => {
-                let found = if let Some(block) = self.blocks.iter_mut().find(|block| {
-                    matches!(block.kind(), BlockKind::Tool(state)
-                        if state.batch_id == batch_id && state.call_id == call_id)
-                }) {
-                    block.set_tool_preview(preview);
-                    if let Some(state) = block.tool_state_mut() {
-                        // Process summaries are projected through the same
-                        // progress lane after ToolOutput. A missing handle
-                        // means "leave the existing inspector attachment";
-                        // only a newly supplied handle replaces it.
-                        if content_handle.is_some() {
-                            // A shell job can publish its final output through
-                            // the same handle as its launch acknowledgment.
-                            // Discard any page already loaded from that handle.
-                            state.materialized_output.clear();
-                            state.next_cursor = None;
-                            state.pending_page = None;
-                            state.content_handle = content_handle;
+                let found =
+                    if let Some(block) = tool_block_mut(&mut self.blocks, &batch_id, &call_id) {
+                        block.set_tool_preview(preview);
+                        if let Some(state) = block.tool_state_mut() {
+                            // Process summaries are projected through the same
+                            // progress lane after ToolOutput. A missing handle
+                            // means "leave the existing inspector attachment";
+                            // only a newly supplied handle replaces it.
+                            if content_handle.is_some() {
+                                // A shell job can publish its final output through
+                                // the same handle as its launch acknowledgment.
+                                // Discard any page already loaded from that handle.
+                                state.materialized_output.clear();
+                                state.next_cursor = None;
+                                state.pending_page = None;
+                                state.content_handle = content_handle;
+                            }
                         }
-                    }
-                    true
-                } else {
-                    false
-                };
+                        true
+                    } else {
+                        false
+                    };
                 if !found {
-                    self.snapshot_resync_needed = true;
-                    self.push_notification_with_priority(
-                        "Progresso órfão do ciclo de vida da ferramenta ignorado".into(),
-                        NotificationPriority::Error,
+                    self.lifecycle_anomaly(
+                        "Progresso órfão do ciclo de vida da ferramenta ignorado",
                     );
-                    self.revisions.status += 1;
                 } else {
                     self.last_tool_progress_ms = Some(self.clock.elapsed_ms);
                 }
@@ -3979,21 +4004,10 @@ impl AppState {
                 call_id,
                 diff,
             } => {
-                let found = self
-                    .blocks
-                    .iter_mut()
-                    .find(|block| {
-                        matches!(block.kind(), BlockKind::Tool(state)
-                            if state.batch_id == batch_id && state.call_id == call_id)
-                    })
+                let found = tool_block_mut(&mut self.blocks, &batch_id, &call_id)
                     .is_some_and(|block| block.set_tool_diff(diff));
                 if !found {
-                    self.snapshot_resync_needed = true;
-                    self.push_notification_with_priority(
-                        "Diff órfão do ciclo de vida da ferramenta ignorado".into(),
-                        NotificationPriority::Error,
-                    );
-                    self.revisions.status += 1;
+                    self.lifecycle_anomaly("Diff órfão do ciclo de vida da ferramenta ignorado");
                 }
                 self.revisions.content += 1;
             }
@@ -4009,43 +4023,35 @@ impl AppState {
                         active_batch != &batch_id || active_call != &call_id
                     });
                 let mut duplicate_terminal = false;
-                let ended = if let Some(block) = self.blocks.iter_mut().find(|block| {
-                    matches!(block.kind(), BlockKind::Tool(state)
-                        if state.batch_id == batch_id && state.call_id == call_id)
-                }) {
-                    let transitioned = block.lifecycle == BlockLifecycle::Streaming;
-                    if transitioned {
-                        block.lifecycle = if success {
-                            BlockLifecycle::Complete
-                        } else {
-                            BlockLifecycle::Failed
-                        };
-                        block.ended_ms = Some(self.clock.elapsed_ms);
-                    }
-                    if let Some(state) = block.tool_state_mut() {
-                        if state.duration_ms.is_none() {
-                            state.duration_ms = Some(duration_ms);
-                        } else {
-                            duplicate_terminal = true;
+                let ended =
+                    if let Some(block) = tool_block_mut(&mut self.blocks, &batch_id, &call_id) {
+                        let transitioned = block.lifecycle == BlockLifecycle::Streaming;
+                        if transitioned {
+                            block.lifecycle = if success {
+                                BlockLifecycle::Complete
+                            } else {
+                                BlockLifecycle::Failed
+                            };
+                            block.ended_ms = Some(self.clock.elapsed_ms);
                         }
-                    }
-                    transitioned
-                } else {
-                    self.snapshot_resync_needed = true;
-                    self.push_notification_with_priority(
-                        "Finalização órfã do ciclo de vida da ferramenta ignorada".into(),
-                        NotificationPriority::Error,
-                    );
-                    self.revisions.status += 1;
-                    false
-                };
+                        if let Some(state) = block.tool_state_mut() {
+                            if state.duration_ms.is_none() {
+                                state.duration_ms = Some(duration_ms);
+                            } else {
+                                duplicate_terminal = true;
+                            }
+                        }
+                        transitioned
+                    } else {
+                        self.lifecycle_anomaly(
+                            "Finalização órfã do ciclo de vida da ferramenta ignorada",
+                        );
+                        false
+                    };
                 if duplicate_terminal {
-                    self.snapshot_resync_needed = true;
-                    self.push_notification_with_priority(
-                        "Finalização duplicada do ciclo de vida da ferramenta ignorada".into(),
-                        NotificationPriority::Error,
+                    self.lifecycle_anomaly(
+                        "Finalização duplicada do ciclo de vida da ferramenta ignorada",
                     );
-                    self.revisions.status += 1;
                 }
                 if ended && self.working {
                     self.refresh_tool_activity();
@@ -4131,53 +4137,37 @@ impl AppState {
                 request_id,
                 summary,
                 persisted,
-            } => self.apply_interaction_request(InteractionRequestState {
+            } => self.apply_interaction_request(InteractionRequestState::new(
                 request_id,
-                kind: InteractionRequestKind::Approval { summary },
+                InteractionRequestKind::Approval { summary },
                 persisted,
-                response_pending: false,
-                acknowledgement: None,
-                selected_question_option: 0,
-                custom_question_answer: false,
-                answered: None,
-            }),
+            )),
             UiEvent::InputRequired {
                 request_id,
                 prompt,
                 options,
                 persisted,
-            } => self.apply_interaction_request(InteractionRequestState {
+            } => self.apply_interaction_request(InteractionRequestState::new(
                 request_id,
-                kind: InteractionRequestKind::Input { prompt, options },
+                InteractionRequestKind::Input { prompt, options },
                 persisted,
-                response_pending: false,
-                acknowledgement: None,
-                selected_question_option: 0,
-                custom_question_answer: false,
-                answered: None,
-            }),
+            )),
             UiEvent::QuestionRequired {
                 request_id,
                 question,
                 options,
                 persisted,
-            } => self.apply_interaction_request(InteractionRequestState {
+            } => self.apply_interaction_request(InteractionRequestState::new(
                 request_id,
-                kind: InteractionRequestKind::Question { question, options },
+                InteractionRequestKind::Question { question, options },
                 persisted,
-                response_pending: false,
-                acknowledgement: None,
-                selected_question_option: 0,
-                custom_question_answer: false,
-                answered: None,
-            }),
+            )),
             UiEvent::InteractionAcknowledged {
                 request_id,
                 accepted,
                 message,
             } => self.acknowledge_interaction(&request_id, accepted, message),
-            UiEvent::QueuedUserAdded { text, position } => {
-                let _ = position;
+            UiEvent::QueuedUserAdded { text, position: _ } => {
                 let id = self.fresh_id("queued");
                 let mut block = Block::new(
                     id,
@@ -4422,10 +4412,8 @@ impl AppState {
             UiEvent::CompactionState { .. } => {}
             UiEvent::FatalError { run_id, message } => {
                 let terminal_run_id = run_id.or(self.active_run_id);
-                let explicitly_cancelled = terminal_run_id.is_some_and(|run_id| {
-                    self.cancellation
-                        .is_some_and(|cancellation| cancellation.run_id == run_id)
-                });
+                let explicitly_cancelled =
+                    terminal_run_id.is_some_and(|run_id| self.explicitly_cancelled(run_id));
                 let accepted = terminal_run_id
                     .is_none_or(|run_id| self.accept_terminal(run_id, BlockLifecycle::Failed));
                 if accepted {
@@ -4436,14 +4424,9 @@ impl AppState {
                         let pending_count = self.pending_todo_count();
                         self.finish_execution(run_id, RunOutcomeKind::Failed, pending_count);
                     }
-                    self.working = false;
-                    self.run_started_ms = None;
-                    self.activity = None;
-                    self.cancellation = None;
-                    self.retry = None;
-                    if explicitly_cancelled {
-                        self.queue_paused = true;
-                    }
+                    // Unlike the run terminals, a fatal error has always left
+                    // `thinking_open` alone (RunStarted resets it).
+                    self.clear_run_state(explicitly_cancelled);
                     let id = self.fresh_id("error");
                     self.blocks.push(Block::new(
                         id,
@@ -4456,6 +4439,38 @@ impl AppState {
                 }
             }
             UiEvent::Shutdown => self.shutdown = true,
+        }
+    }
+}
+
+/// The tool block of one call, identified by (batch, call).
+fn tool_block_mut<'a>(
+    blocks: &'a mut [Block],
+    batch_id: &ToolBatchId,
+    call_id: &ToolCallId,
+) -> Option<&'a mut Block> {
+    blocks.iter_mut().find(|block| {
+        matches!(block.kind(), BlockKind::Tool(state)
+            if &state.batch_id == batch_id && &state.call_id == call_id)
+    })
+}
+
+impl InteractionRequestState {
+    /// A request that just arrived: nothing answered, nothing pending.
+    fn new(
+        request_id: InteractionRequestId,
+        kind: InteractionRequestKind,
+        persisted: bool,
+    ) -> Self {
+        Self {
+            request_id,
+            kind,
+            persisted,
+            response_pending: false,
+            acknowledgement: None,
+            selected_question_option: 0,
+            custom_question_answer: false,
+            answered: None,
         }
     }
 }

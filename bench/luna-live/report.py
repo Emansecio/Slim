@@ -301,6 +301,40 @@ def infer_new_failure(name, content):
     return (True, "")
 
 
+def slim_cache_diagnosis(recs):
+    """Por que um request Slim depois do primeiro nao leu cache.
+
+    Cada fato `provider.call.v1` registra quantos itens da conversa o request
+    enviou e quantos repetem, desde o inicio, os do request anterior. Sem
+    leitura de cache, prefixo intacto aponta o provider (roteamento, expiracao)
+    e prefixo alterado aponta o proprio Slim. Requests falhos nao sao
+    classificados; baterias anteriores aos campos contam como sem dado.
+    """
+    calls = []
+    for r in recs:
+        fact = (r.get("fact") or {}) if r.get("type") == "fact" else {}
+        if fact.get("namespace") == "provider.call.v1" and isinstance(fact.get("value"), dict):
+            calls.append(fact["value"])
+    calls.sort(key=lambda c: c.get("ordinal") or 0)
+    out = {"calls": len(calls), "hits": 0, "miss_prefix_intact": 0, "miss_prefix_changed": 0,
+           "miss_unknown": 0,
+           "turn_state": dict(Counter(c.get("turn_state") or "none" for c in calls))}
+    previous = None
+    for call in calls:
+        if previous is not None and call.get("outcome") == "success":
+            reused, sent_before = call.get("reused_input_items"), previous.get("input_items")
+            if (call.get("cache_read_tokens") or 0) > 0:
+                out["hits"] += 1
+            elif reused is None or sent_before is None:
+                out["miss_unknown"] += 1
+            elif reused >= sent_before:
+                out["miss_prefix_intact"] += 1
+            else:
+                out["miss_prefix_changed"] += 1
+        previous = call
+    return out
+
+
 def summarize_slim(cdir):
     session_path = cdir / "slim.session.jsonl"
     stdout_path = cdir / "slim.stdout.jsonl"
@@ -378,15 +412,28 @@ def summarize_slim(cdir):
                 "usage_complete": slim.get("usage_complete"), "usage_unknown": slim.get("usage_unknown")}
     calls, tool_outputs = [], {}
     turn = 0
+    declared_finals = set()
     for r in recs:
         if r.get("type") != "entry":
             continue
         entry = r.get("entry", {})
         if entry.get("role") == "assistant":
+            # `then_run.final` is emitted by Slim after a passing check, without a provider turn.
+            if not entry.get("tool_calls") and (entry.get("content") or "").strip() in declared_finals:
+                continue
             turn += 1
             for call in entry.get("tool_calls") or []:
                 calls.append({"turn": turn, "call_id": call.get("id"),
                               "name": call.get("name"), "arguments": call.get("arguments")})
+                arguments = call.get("arguments")
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except ValueError:
+                        arguments = None
+                final = ((arguments or {}).get("then_run") or {}).get("final") if isinstance(arguments, dict) else None
+                if isinstance(final, str) and final.strip():
+                    declared_finals.add(final.strip())
         elif entry.get("role") == "tool" and entry.get("tool_call_id"):
             tool_outputs[entry["tool_call_id"]] = entry.get("content", "")
     rows = []
@@ -439,6 +486,7 @@ def summarize_slim(cdir):
         })
     tool_ms = sum(u.get("tool_latency_ms", 0) or 0 for u in usage_requests)
     return {"rows": rows, "tools": tool_list, "tool_ms_sum": tool_ms,
+            "cache_diagnosis": slim_cache_diagnosis(recs),
             "identity": slim_usage_identity(usage_requests),
             "counters": slim_request_counters(usage_requests),
             "provider_turns": usage.get("provider_turns"),
@@ -489,6 +537,45 @@ def workspace_diff(cdir, arm, manifest):
     return {"modified": modified, "added": added, "deleted": sorted(set(expected) - seen)}
 
 
+def produced_code(cdir, arm, diff):
+    """Lines and bytes of each file the arm created or modified."""
+    ws = cdir / (arm + ".workspace")
+    files = []
+    for kind in ("added", "modified"):
+        for rel in (diff or {}).get(kind, []):
+            data = (ws / rel).read_bytes()
+            files.append({"path": rel, "change": kind, "bytes": len(data),
+                          "lines": data.count(b"\n") + (0 if data.endswith(b"\n") or not data else 1)})
+    return files
+
+
+def final_reply(cdir, arm):
+    """Last assistant text of the run: the summary each agent gave the user."""
+    text = None
+    if arm == "pi":
+        path = cdir / "pi.audit.jsonl"
+        for event in (records(path) if path.exists() else []):
+            message = event.get("message") or {}
+            if event.get("type") == "message_end" and message.get("role") == "assistant":
+                parts = [c.get("text", "") for c in message.get("content") or [] if c.get("type") == "text"]
+                text = "".join(parts).strip() or text
+    else:
+        path = cdir / "slim.session.jsonl"
+        for record in (records(path) if path.exists() else []):
+            entry = record.get("entry") or {}
+            if record.get("type") == "entry" and entry.get("role") == "assistant":
+                content = entry.get("content")
+                if isinstance(content, list):
+                    content = "".join(c.get("text", "") for c in content if isinstance(c, dict))
+                text = (content or "").strip() or text
+    return text
+
+
+def visual_record(cdir, arm):
+    path = cdir / "visual" / (arm + ".json")
+    return load(path) if path.exists() else None
+
+
 def summarize_arm(cdir, arm):
     timing_path = cdir / (arm + ".timing.json")
     validation_path = cdir / (arm + ".validation.json")
@@ -500,7 +587,7 @@ def summarize_arm(cdir, arm):
         return None
     rows, tool_list = detail["rows"], detail["tools"]
     totals = {}
-    for key in ("input", "uncached", "cache", "output", "reasoning", "provider_ms"):
+    for key in ("input", "uncached", "cache", "cache_write", "output", "reasoning", "provider_ms"):
         totals[key] = sum(r.get(key, 0) for r in rows)
     tool_ms = detail.get("tool_ms_sum")
     if tool_ms is None:
@@ -529,15 +616,20 @@ def summarize_arm(cdir, arm):
         "tool_inferred": sum(1 for t in tool_list if t.get("evidence") == "inferred"),
         "tool_ms_sum": tool_ms, "provider_ms_sum": totals.get("provider_ms", 0), "residual_ms": residual,
         "total_tokens": totals.get("input", 0) + totals.get("output", 0), **totals,
+        # Tokens the provider processes at full price: cache reads are discounted.
+        "effective_tokens": totals.get("uncached", 0) + totals.get("cache_write", 0) + totals.get("output", 0),
         "retries": counters.get("retries", 0), "cancelled_requests": counters.get("cancelled_requests", 0),
         "cache_hits": counters.get("cache_hits", 0), "unknown_requests": counters.get("unknown_requests", 0),
         "failed_requests": counters.get("failed_requests", 0), "ttfb_ms_sum": counters.get("ttfb_ms_sum", 0),
         "ttfs_ms_sum": counters.get("ttfs_ms_sum", 0),
         "estimation_error_tokens_sum": counters.get("estimation_error_tokens_sum", 0),
         "identity": identity,
+        "cache_diagnosis": detail.get("cache_diagnosis"),
         "error_breakdown": dict(Counter(t.get("error_kind", "") for t in failures if t.get("error_kind"))),
         "workspace_diff": workspace_diff(cdir, arm, manifest),
         "rows": rows, "tools": tool_list,
+        "final_reply": final_reply(cdir, arm),
+        "visual": visual_record(cdir, arm),
     }
 
 
@@ -559,7 +651,7 @@ def gate_ok(summary):
 
 SUMMARY_SUM_KEYS = ("wall_ms", "model_calls", "tool_calls", "tool_failures", "tool_unknown", "tool_succeeded",
                     "tool_inferred",
-                    "tool_ms_sum", "provider_ms_sum", "residual_ms", "total_tokens", "input", "uncached",
+                    "tool_ms_sum", "provider_ms_sum", "residual_ms", "total_tokens", "effective_tokens", "input", "uncached",
                     "cache", "cache_write", "output", "reasoning", "retries", "cancelled_requests",
                     "cache_hits", "unknown_requests", "failed_requests", "ttfb_ms_sum", "ttfs_ms_sum",
                     "estimation_error_tokens_sum")
@@ -631,6 +723,7 @@ def main():
                 problems.append(d.name + "/" + arm + ": registros de auditoria ausentes ou ilegiveis")
                 continue
             summary["scenario"] = manifest.get("scenario", "?")
+            summary["code"] = produced_code(d, arm, summary.get("workspace_diff"))
             summary["order"] = manifest.get("order")
             cells[(d.name, arm)] = summary
             pairs.append(summary)
@@ -685,6 +778,8 @@ def main():
         paired.append({"campaign": d.name, "scenario": s["scenario"],
                        "slim_tokens": s["total_tokens"], "pi_tokens": p["total_tokens"],
                        "token_ratio": s["total_tokens"] / p["total_tokens"] if p["total_tokens"] else None,
+                       "slim_effective": s["effective_tokens"], "pi_effective": p["effective_tokens"],
+                       "effective_ratio": s["effective_tokens"] / p["effective_tokens"] if p["effective_tokens"] else None,
                        "wall_ratio": s["wall_ms"] / p["wall_ms"] if p["wall_ms"] else None,
                        "slim_calls": s["model_calls"], "pi_calls": p["model_calls"],
                        "turns": turns})
@@ -692,21 +787,31 @@ def main():
     if paired:
         ratios = [x["token_ratio"] for x in paired if x["token_ratio"] is not None]
         wratios = [x["wall_ratio"] for x in paired if x["wall_ratio"] is not None]
+        eratios = [x["effective_ratio"] for x in paired if x["effective_ratio"] is not None]
         by_scenario = {}
         for x in paired:
-            agg = by_scenario.setdefault(x["scenario"], {"pairs": 0, "slim_tokens": 0, "pi_tokens": 0, "ratios": []})
+            agg = by_scenario.setdefault(x["scenario"], {"pairs": 0, "slim_tokens": 0, "pi_tokens": 0, "ratios": [],
+                                                         "slim_effective": 0, "pi_effective": 0})
             agg["pairs"] += 1
             agg["slim_tokens"] += x["slim_tokens"]
             agg["pi_tokens"] += x["pi_tokens"]
+            agg["slim_effective"] += x["slim_effective"]
+            agg["pi_effective"] += x["pi_effective"]
             if x["token_ratio"] is not None:
                 agg["ratios"].append(x["token_ratio"])
         token_wins = sum(1 for x in paired if x["token_ratio"] is not None and x["token_ratio"] < 1)
         wall_wins = sum(1 for x in paired if x["wall_ratio"] is not None and x["wall_ratio"] < 1)
+        effective_wins = sum(1 for ratio in eratios if ratio < 1)
         stats = {"pairs": len(paired),
                  "slim_token_wins": token_wins,
                  "slim_wall_wins": wall_wins,
                  "median_token_ratio": median(ratios) if ratios else None,
                  "median_wall_ratio": median(wratios) if wratios else None,
+                 "slim_effective_wins": effective_wins,
+                 "median_effective_ratio": median(eratios) if eratios else None,
+                 "sign_test_effective": {"wins": effective_wins, "trials": len(eratios),
+                                         "p_two_sided": sign_test_p(effective_wins, len(eratios))},
+                 "bootstrap_ci95_effective_ratio": bootstrap_median_ci(eratios),
                  "sign_test_tokens": {"wins": token_wins, "trials": len(ratios),
                                       "p_two_sided": sign_test_p(token_wins, len(ratios))},
                  "sign_test_wall": {"wins": wall_wins, "trials": len(wratios),
@@ -719,7 +824,9 @@ def main():
     lines = []
     lines.append("# Slim x Pi — comparativo rastreavel (" + generated + ")")
     lines.append("")
-    lines.append("Modelo: `" + "|".join(sorted(models)) + "`; provider: `" + "|".join(sorted(providers)) + "`; effort high.")
+    pi_providers = {m.get("pi_provider") or m.get("provider", "openai-codex") for m in manifests.values()}
+    lines.append("Modelo: `" + "|".join(sorted(models)) + "`; provider Slim: `" + "|".join(sorted(providers))
+                 + "`; provider Pi: `" + "|".join(sorted(pi_providers)) + "`; effort high.")
     lines.append("")
     lines.append("## Resumo (por escopo de gate; o denominador vai na propria tabela)")
     lines.append("")
@@ -745,6 +852,7 @@ def main():
         row("Falhas de ferramenta", "tool_failures")
         row("Ferramentas sem resultado comprovado", "tool_unknown")
         row("Tokens totais (in+out)", "total_tokens")
+        row("Custo efetivo (nao-cache + escrita cache + saida)", "effective_tokens")
         row("Entrada (inclui cache)", "input")
         row("Cache lido", "cache")
         row("Escrita em cache", "cache_write")
@@ -788,6 +896,21 @@ def main():
                      + " | " + counter("failed_requests") + " | " + counter("ttfb_ms_sum")
                      + " | " + counter("estimation_error_tokens_sum") + " |")
     lines.append("")
+    diagnosed = [cells[key] for key in sorted(cells) if cells[key].get("cache_diagnosis")]
+    if diagnosed:
+        lines.append("### Cache miss do Slim (requests depois do primeiro)")
+        lines.append("")
+        lines.append("Prefixo intacto: o request repetia todo o anterior e ainda assim nao leu cache (lado do provider). Prefixo alterado: o Slim mudou um item ja enviado.")
+        lines.append("")
+        lines.append("| Campanha | chamadas | leram cache | miss prefixo intacto | miss prefixo alterado | miss sem dado | turn-state |")
+        lines.append("|---|---:|---:|---:|---:|---:|---|")
+        for a in diagnosed:
+            d = a["cache_diagnosis"]
+            states = ", ".join(k + "=" + str(v) for k, v in sorted(d["turn_state"].items())) or "-"
+            lines.append("| `" + a["campaign"] + "` | " + str(d["calls"]) + " | " + str(d["hits"])
+                         + " | " + str(d["miss_prefix_intact"]) + " | " + str(d["miss_prefix_changed"])
+                         + " | " + str(d["miss_unknown"]) + " | " + states + " |")
+        lines.append("")
     if stats:
         lines.append("")
         lines.append("## Pareamento (somente pares com gate aprovado nos dois bracos)")
@@ -806,23 +929,30 @@ def main():
             lines.append("| Mediana razao tokens Slim/Pi | " + format(stats["median_token_ratio"], ".4f") + " |")
         if stats["median_wall_ratio"] is not None:
             lines.append("| Mediana razao wall Slim/Pi | " + format(stats["median_wall_ratio"], ".4f") + " |")
+        lines.append("| Slim com menor custo efetivo | " + str(stats["slim_effective_wins"]) + "/" + str(stats["sign_test_effective"]["trials"]) + " |")
+        if stats["median_effective_ratio"] is not None:
+            lines.append("| Mediana razao custo efetivo Slim/Pi | " + format(stats["median_effective_ratio"], ".4f") + " |")
         lines.append("| p bilateral (sinais, tokens) | " + ptext(stats["sign_test_tokens"]) + " |")
         lines.append("| p bilateral (sinais, wall) | " + ptext(stats["sign_test_wall"]) + " |")
         lines.append("| IC95 mediana razao tokens (bootstrap) | " + citext(stats["bootstrap_ci95_token_ratio"]) + " |")
         lines.append("| IC95 mediana razao wall (bootstrap) | " + citext(stats["bootstrap_ci95_wall_ratio"]) + " |")
+        lines.append("| p bilateral (sinais, custo efetivo) | " + ptext(stats["sign_test_effective"]) + " |")
+        lines.append("| IC95 mediana razao custo efetivo (bootstrap) | " + citext(stats["bootstrap_ci95_effective_ratio"]) + " |")
         if stats.get("advisory"):
             lines.append("| Aviso de amostra | " + stats["advisory"] + " |")
         lines.append("")
         lines.append("Teste de sinais bilateral exato sobre os pares (empates contam como nao-vitoria) e IC percentil bootstrap da mediana com semente fixa `" + str((stats["bootstrap_ci95_token_ratio"] or {}).get("seed", 20260915)) + "`, " + str((stats["bootstrap_ci95_token_ratio"] or {}).get("resamples", 10000)) + " reamostragens; quem nao domina intervalo nao deve reivindicar ganho.")
         lines.append("")
-        lines.append("| Cenario | Pares | Tokens Slim | Tokens Pi | Delta Slim | Razao min/med/max |")
-        lines.append("|---|---:|---:|---:|---:|---:|")
+        lines.append("| Cenario | Pares | Tokens Slim | Tokens Pi | Delta Slim | Razao min/med/max | Efetivo Slim | Efetivo Pi | Delta efetivo |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
         for scen, agg in sorted(stats["per_scenario"].items()):
             delta = (agg["slim_tokens"] - agg["pi_tokens"]) / agg["pi_tokens"] * 100 if agg["pi_tokens"] else 0
             spread = "-"
             if agg["ratios"]:
                 spread = format(min(agg["ratios"]), ".2f") + "/" + format(median(agg["ratios"]), ".2f") + "/" + format(max(agg["ratios"]), ".2f")
-            lines.append("| " + scen + " | " + str(agg["pairs"]) + " | " + str(agg["slim_tokens"]) + " | " + str(agg["pi_tokens"]) + " | " + format(delta, "+.2f") + "% | " + spread + " |")
+            edelta = (agg["slim_effective"] - agg["pi_effective"]) / agg["pi_effective"] * 100 if agg["pi_effective"] else 0
+            lines.append("| " + scen + " | " + str(agg["pairs"]) + " | " + str(agg["slim_tokens"]) + " | " + str(agg["pi_tokens"]) + " | " + format(delta, "+.2f") + "% | " + spread
+                         + " | " + str(agg["slim_effective"]) + " | " + str(agg["pi_effective"]) + " | " + format(edelta, "+.2f") + "% |")
         lines.append("")
         if args.baseline:
             try:
@@ -874,6 +1004,48 @@ def main():
             return "validacao externa"
         lines.append("| `" + d.name + "` | " + scen + " | " + gate(sm) + " | " + gate(pm) + " | " + cell(sm) + " | " + cell(pm) + " |")
     lines.append("")
+    lines.append("## Codigo, resposta final e visual (por campanha)")
+    lines.append("")
+    lines.append("Arquivos criados/modificados pelo braco com linhas e bytes; `code.diff` traz o diff unificado entre os workspaces finais (primeiro braco da ordem como base). Cenarios visuais trazem quadros em t fixo renderizados no Chrome headless e `visual.html` lado a lado.")
+    lines.append("")
+    for d in dirs:
+        lines.append("### `" + d.name + "` — " + str(manifests[d.name].get("scenario", "?")))
+        lines.append("")
+        if (d / "code.diff").exists():
+            changed = sum(1 for line in (d / "code.diff").read_text(encoding="utf-8").splitlines()
+                          if line[:1] in "+-" and not line.startswith(("+++", "---")))
+            lines.append("- diff entre bracos: [`code.diff`](" + (d / "code.diff").as_uri() + ") (" + str(changed) + " linhas divergentes)")
+        if (d / "visual.html").exists():
+            lines.append("- comparativo visual: [`visual.html`](" + (d / "visual.html").as_uri() + ")")
+        lines.append("")
+        for arm in ("slim", "pi"):
+            a = cells.get((d.name, arm))
+            if a is None:
+                continue
+            code = a.get("code") or []
+            total_lines = sum(f["lines"] for f in code)
+            lines.append("#### " + arm + " — " + str(len(code)) + " arquivo(s), " + str(total_lines) + " linhas")
+            lines.append("")
+            if code:
+                lines.append("| Arquivo | Mudanca | Linhas | Bytes |")
+                lines.append("|---|---|---:|---:|")
+                for f in code:
+                    lines.append("| `" + f["path"] + "` | " + f["change"] + " | " + str(f["lines"]) + " | " + str(f["bytes"]) + " |")
+                lines.append("")
+            vis = a.get("visual")
+            if vis:
+                lines.append("| t (s) | PNG | faces | tons distintos | data-angle |")
+                lines.append("|---:|---|---:|---:|---:|")
+                for frame in vis.get("frames", []):
+                    lines.append("| " + str(frame.get("t")) + " | " + ("ok" if frame.get("png_ok") else "falhou")
+                                 + " | " + str(frame.get("faces")) + " | " + str(frame.get("distinct_fills"))
+                                 + " | " + str(frame.get("data-angle")) + " |")
+                if not vis.get("frames"):
+                    lines.append("| - | " + ("pagina ausente" if not vis.get("exists") else "navegador ausente") + " | - | - | - |")
+                lines.append("")
+            reply = a.get("final_reply")
+            lines.append("Resposta final: " + (excerpt(reply, 600).replace("\n", " ") if reply else "_(nao registrada)_"))
+            lines.append("")
     lines.append("## Por ferramenta (uso agregado por braco, incluindo bracos reprovados)")
     lines.append("")
     lines.append("Formato: chamadas/falhas/incognitas/ms; incognita = sem resultado comprovado (`success` ausente), nunca somada a falhas.")
@@ -954,14 +1126,14 @@ def main():
             info = exes.get(arm, {})
             if info:
                 lines.append("- " + arm + ": `" + str(info.get("version")) + "` sha256 `" + str(info.get("sha256")) + "`")
-        lines.append("- arquivos: `manifest.json`, `prompt.txt`, `SPEC.md`, `check.py`, `pi.audit.jsonl`, `pi.session.jsonl`, `slim.session.jsonl`, `slim.stdout.jsonl`, `*.timing.json`, `*.validation.json`, `*.workspace/`.")
+        lines.append("- arquivos: `manifest.json`, `prompt.txt`, `SPEC.md`, `check.py`, `pi.audit.jsonl`, `pi.session.jsonl`, `slim.session.jsonl`, `slim.stdout.jsonl`, `*.timing.json`, `*.validation.json`, `*.workspace/`, `code.diff` e, em cenario visual, `visual.html` + `visual/`.")
         lines.append("- validacao externa: `check.py`/`SPEC.md` originais executados fora do workspace do modelo; `fixtures_unchanged` + exit 0 exigidos.")
         lines.append("")
     lines.append("## Reproducao")
     lines.append("")
-    lines.append("```powershell")
-    lines.append("python bench/luna-live/daily.py --rounds 1")
-    lines.append("python bench/luna-live/report.py <campanhas...> --output-md RELATORIO.md --output-json report.json")
+    lines.append("```bash")
+    lines.append("python3 bench/luna-live/daily.py --rounds 1")
+    lines.append("python3 bench/luna-live/report.py <campanhas...> --output-md RELATORIO.md --output-json report.json")
     lines.append("```")
     lines.append("")
     lines.append("## Limitacoes")

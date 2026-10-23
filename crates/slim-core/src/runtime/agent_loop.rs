@@ -38,6 +38,14 @@ impl<'a, A: ProviderAdapter> LoopCtx<'a, A> {
 }
 
 /// Mutable state carried from one turn of the loop to the next.
+/// A closing request ([`Runtime::request_final_answer`]): whether it forbids
+/// tool calls on the wire, and the run whose routing it shares.
+#[derive(Clone, Copy)]
+pub(super) struct Closing<'r> {
+    pub(super) forbid_tools: bool,
+    pub(super) routing: &'r crate::provider::TurnRouting,
+}
+
 pub(super) struct LoopState<'m> {
     pub(super) messages: &'m mut Vec<ProviderMessage>,
     pub(super) next_seq: u64,
@@ -68,6 +76,8 @@ pub(super) struct LoopState<'m> {
     started: Instant,
     /// The time budget's finalize phase began and the model was told.
     finalize_steered: bool,
+    /// Sticky routing and prefix diagnosis shared by this run's requests.
+    pub(super) routing: crate::provider::TurnRouting,
 }
 
 impl<'m> LoopState<'m> {
@@ -98,6 +108,7 @@ impl<'m> LoopState<'m> {
             channel,
             started: Instant::now(),
             finalize_steered: false,
+            routing: crate::provider::TurnRouting::default(),
         }
     }
 
@@ -215,23 +226,6 @@ macro_rules! proceed {
     };
 }
 
-pub(super) fn cancelled_agent_loop_result(
-    next_seq: u64,
-    turns: usize,
-    mut all_results: Vec<ToolResult>,
-    completed_batch_prefix: Vec<ToolResult>,
-    usage: UsageTotals,
-) -> AgentLoopResult {
-    all_results.extend(completed_batch_prefix);
-    AgentLoopResult {
-        next_seq,
-        turns,
-        stop: AgentLoopStop::Cancelled,
-        tool_results: all_results,
-        usage,
-    }
-}
-
 pub(super) fn runtime_goal_assurance(events: &[crate::SessionEvent]) -> bool {
     if events
         .iter()
@@ -274,19 +268,15 @@ impl Runtime {
         prompt: &str,
         next_seq: u64,
     ) -> Result<u64, ProviderError> {
-        self.run_provider_messages(client, &[ProviderMessage::user(prompt)], next_seq)
-            .await
-    }
-
-    pub async fn run_provider_messages<A: ProviderAdapter>(
-        &mut self,
-        client: &HttpProviderClient<A>,
-        messages: &[ProviderMessage],
-        next_seq: u64,
-    ) -> Result<u64, ProviderError> {
         self.ensure_not_cancelled()?;
         let result = self
-            .run_provider_messages_with_tools(client, messages, &[], next_seq, false)
+            .run_provider_messages_with_tools(
+                client,
+                &[ProviderMessage::user(prompt)],
+                &[],
+                next_seq,
+                None,
+            )
             .await;
         self.ensure_not_cancelled()?;
         let result = result?;
@@ -300,7 +290,7 @@ impl Runtime {
         messages: &[ProviderMessage],
         tools: &[Value],
         next_seq: u64,
-        finalize: bool,
+        closing: Option<Closing<'_>>,
     ) -> Result<ProviderTurnResult, ProviderError> {
         let redacted;
         let messages: &[ProviderMessage] = if self.sensitive_values.0.is_empty() {
@@ -309,10 +299,11 @@ impl Runtime {
             redacted = self.redact_messages(messages);
             redacted.as_slice()
         };
-        let mut request = if finalize {
-            client.prepare_finalization_messages(messages, tools)?
-        } else {
-            client.prepare_messages_with_tools(messages, tools)?
+        let mut request = match closing {
+            Some(closing) => client
+                .prepare_finalization_messages(messages, tools, closing.forbid_tools)?
+                .with_turn_routing(closing.routing),
+            None => client.prepare_messages_with_tools(messages, tools)?,
         };
         let serialized_chars = request.serialized_chars;
         let ProviderRequestComponents {
@@ -346,9 +337,7 @@ impl Runtime {
                     context_window_tokens: 0,
                 },
             ))
-            .map_err(|message| ProviderError::InvalidResponse {
-                message: message.into(),
-            })?;
+            .map_err(event_rejected)?;
         self.run_provider_messages_with_tools_after_snapshot(
             client,
             messages_are_text_only(messages),
@@ -371,9 +360,15 @@ impl Runtime {
         let mut sensitive_values = self.sensitive_values.0.clone();
         sensitive_values.extend_from_slice(request.sensitive_values());
         crate::provider::normalize_sensitive_values(&mut sensitive_values);
+        let adapter = client.adapter();
         let mut normalizer =
-            ProviderStreamNormalizer::new(client.adapter().wire_kind(), next_seq, sensitive_values)
-                .with_reasoning_classification(client.adapter().reasoning_classification());
+            ProviderStreamNormalizer::new(adapter.wire_kind(), next_seq, sensitive_values)
+                .with_reasoning_classification(adapter.reasoning_classification())
+                .with_thinking_scope(
+                    adapter.response_cache_scope_id(),
+                    adapter.model(),
+                    request.thinking_binding(),
+                );
         let output_start = self.app.events().len();
         let request_started = Instant::now();
         let cancellation = CancellationToken::cancelled_or_pending(self.cancellation.clone());
@@ -537,7 +532,7 @@ impl Runtime {
         self.cached_skill_discovery(cwd.as_ref());
         let tools = self.workspace_tool_definitions(mode, cwd.as_ref());
         let provider_result = self
-            .run_provider_messages_with_tools(client, messages, tools.as_ref(), next_seq, false)
+            .run_provider_messages_with_tools(client, messages, tools.as_ref(), next_seq, None)
             .await;
         self.ensure_not_cancelled()?;
         let provider_turn = provider_result?;
@@ -666,9 +661,7 @@ impl Runtime {
             drop(handle.take_commits());
         }
         if let Some(journal) = &self.app.run_journal {
-            journal
-                .lock()
-                .map_err(|_| journal_error("durable run lock poisoned"))?
+            lock_journal(journal)?
                 .configure_output(self.artifact_store.clone(), config.max_result_bytes);
         }
         self.shell_job_run_start = self.shell_jobs.last_id();
@@ -756,15 +749,7 @@ impl Runtime {
         // and no superseded tool output.
         retain_own_reasoning(ctx.client.adapter(), messages);
         let elision = elide_superseded_tool_outputs(messages);
-        // An elision changed what the last response's usage described.
-        let anchor = if elision.elided > 0 {
-            if let Some(handle) = &self.compaction_handle {
-                handle.clear_usage_anchor();
-            }
-            None
-        } else {
-            self.stored_usage_anchor(ctx, messages)
-        };
+        let anchor = self.seed_usage_anchor(ctx, messages, elision.elided);
         let channel = self.channel_frame(ctx.mode, messages);
         let mut st = LoopState::new(messages, next_seq, config, anchor, channel);
         let tools = self.workspace_tool_definitions(ctx.mode, ctx.cwd);
@@ -876,29 +861,29 @@ impl Runtime {
         self.edited = EditedFiles::default();
         self.tuning_closed = false;
         self.run_guards = run_guards::RunGuards::default();
-        // An elision changed what the last response's usage described.
-        let anchor = if seed_elision.elided > 0 {
-            if let Some(handle) = &self.compaction_handle {
-                handle.clear_usage_anchor();
-            }
-            None
-        } else {
-            self.stored_usage_anchor(ctx, messages)
-        };
+        let anchor = self.seed_usage_anchor(ctx, messages, seed_elision.elided);
         let channel = self.channel_frame(ctx.mode, messages);
         Ok(LoopState::new(messages, next_seq, config, anchor, channel))
     }
 
     /// The usage anchor the previous run left in the compaction handle, when
-    /// this run's history still has that response where it was.
-    fn stored_usage_anchor<A: ProviderAdapter>(
+    /// this run's history still has that response where it was. An elision
+    /// (`elided` outputs) changed what the last response's usage described,
+    /// so the anchor is dropped, in the handle too.
+    fn seed_usage_anchor<A: ProviderAdapter>(
         &self,
         ctx: &LoopCtx<'_, A>,
         messages: &[ProviderMessage],
+        elided: u32,
     ) -> Option<UsageAnchor> {
-        self.compaction_handle
-            .as_ref()?
-            .usage_anchor(Some(&usage_source(ctx.provider, ctx.model)), messages)
+        let handle = self.compaction_handle.as_ref();
+        if elided > 0 {
+            if let Some(handle) = handle {
+                handle.clear_usage_anchor();
+            }
+            return None;
+        }
+        handle?.usage_anchor(Some(&usage_source(ctx.provider, ctx.model)), messages)
     }
 
     /// Cancellation, shell-job delivery and turn bookkeeping.
@@ -1158,7 +1143,7 @@ impl Runtime {
             .run_provider_messages_with_tools_after_snapshot(
                 ctx.client,
                 messages_are_text_only(st.messages),
-                request,
+                request.with_turn_routing(&st.routing),
                 st.next_seq,
                 true,
             )
@@ -1262,11 +1247,7 @@ impl Runtime {
                 context_window_tokens: st.config.context_window_tokens,
             },
         );
-        self.app
-            .push_event(snapshot)
-            .map_err(|message| ProviderError::InvalidResponse {
-                message: message.into(),
-            })?;
+        self.app.push_event(snapshot).map_err(event_rejected)?;
         st.next_seq = request_next_seq;
         Ok(())
     }
@@ -1338,17 +1319,22 @@ impl Runtime {
                 detail: Some("Aguardando jobs de shell; conclusão automática".into()),
             },
         )?;
+        // The wait wakes every 100 ms; only a changed summary is news.
+        let mut last_detail = String::new();
         while self.shell_jobs.running() && !self.is_cancelled() {
             let detail = self.redact_sensitive(&self.shell_jobs.progress_summary());
-            push_runtime_transient_event(
-                &mut self.app,
-                &mut st.next_seq,
-                crate::EventKind::ProviderPhase {
-                    phase: ProviderPhase::PreparingTool,
-                    elapsed_ms: 0,
-                    detail: Some(detail),
-                },
-            )?;
+            if detail != last_detail {
+                push_runtime_transient_event(
+                    &mut self.app,
+                    &mut st.next_seq,
+                    crate::EventKind::ProviderPhase {
+                        phase: ProviderPhase::PreparingTool,
+                        elapsed_ms: 0,
+                        detail: Some(detail.clone()),
+                    },
+                )?;
+                last_detail = detail;
+            }
             self.shell_jobs.wait().await;
             if self.deliver_loop_shell_jobs(st)? {
                 break;
@@ -1470,13 +1456,11 @@ impl Runtime {
                 assistant_text.clone(),
                 calls.clone(),
             ));
-            journal
-                .lock()
-                .map_err(|_| journal_error("durable run lock poisoned"))?
+            lock_journal(journal)?
                 .begin_tools(&id, assistant, &calls)
                 .map_err(journal_error)?;
         }
-        let (mut results, following_seq) = match self
+        let (mut results, following_seq) = self
             .execute_provider_tool_batch(
                 ctx.mode,
                 ctx.cwd,
@@ -1485,23 +1469,15 @@ impl Runtime {
                 st.next_seq,
                 &mut st.governor,
             )
-            .await
-        {
-            Ok(result) => result,
-            Err(error) => return Err(error.into()),
-        };
+            .await?;
         st.next_seq = following_seq;
         let reacquisitions = st.governor.take_post_compaction_reacquisitions();
         if self.is_cancelled() {
             return Err(self.cancel_loop(ctx, st, results));
         }
-        st.next_seq = match self
+        st.next_seq = self
             .materialize_results(&mut results, st.config.max_result_bytes, None, st.next_seq)
-            .await
-        {
-            Ok(following_seq) => following_seq,
-            Err(error) => return Err(error.into()),
-        };
+            .await?;
         Ok(ToolBatch {
             id,
             calls,
@@ -1552,18 +1528,14 @@ impl Runtime {
             .map(|(result, presentation)| result.artifact.is_none() && !presentation.complete)
             .collect::<Vec<_>>();
         if force_artifacts.iter().any(|forced| *forced) {
-            st.next_seq = match self
+            st.next_seq = self
                 .materialize_results(
                     &mut results,
                     st.config.max_result_bytes,
                     Some(&force_artifacts),
                     st.next_seq,
                 )
-                .await
-            {
-                Ok(following_seq) => following_seq,
-                Err(error) => return Err(error),
-            };
+                .await?;
             presentations = self.plan_tool_presentations(
                 ctx,
                 st,
@@ -1788,13 +1760,15 @@ impl Runtime {
         st: &mut LoopState<'_>,
         completed_batch_prefix: Vec<ToolResult>,
     ) -> Box<AgentLoopResult> {
-        Box::new(cancelled_agent_loop_result(
-            st.next_seq,
-            st.turns,
-            std::mem::take(&mut st.all_results),
-            completed_batch_prefix,
-            usage_since(&self.app, ctx.loop_event_start),
-        ))
+        let mut tool_results = std::mem::take(&mut st.all_results);
+        tool_results.extend(completed_batch_prefix);
+        Box::new(AgentLoopResult {
+            next_seq: st.next_seq,
+            turns: st.turns,
+            stop: AgentLoopStop::Cancelled,
+            tool_results,
+            usage: usage_since(&self.app, ctx.loop_event_start),
+        })
     }
 
     /// Builds the cancelled result.
@@ -1811,18 +1785,19 @@ impl Runtime {
         self.deliver_shell_completions(st.messages, st.config.max_result_bytes, &mut st.next_seq)
     }
 
-    /// After a budget or no-progress stop, asks once for a final answer
-    /// without tool calls that fits the context window; failures are kept in
-    /// `finalization_error` instead of failing the run. Where the wire allows
-    /// it the request keeps the tool definitions and forbids calls, so it
-    /// shares the turns' cached prefix; elsewhere it carries no tools.
+    /// After a budget or no-progress stop, asks for a final answer without
+    /// tool calls that fits the context window; failures are kept in
+    /// `finalization_error` instead of failing the run. The first request is
+    /// shaped like the turns (same tools and tool choice, the closing prompt
+    /// appended), so it reads their cached prefix: forbidding calls on the wire
+    /// or dropping the tools invalidates the cached history. Tool calls in its
+    /// answer are never run; only when it brought no text does a second
+    /// request forbid them (or carry no tools, where the wire cannot).
     async fn request_final_answer<A: ProviderAdapter + Send + Sync + 'static>(
         &mut self,
         ctx: &LoopCtx<'_, A>,
         st: &mut LoopState<'_>,
     ) -> Result<(), ProviderError> {
-        let finalize_event_start = self.app.events().len();
-        self.uncommitted_event_start = Some(finalize_event_start);
         let closing_prompt = match st.stop {
             AgentLoopStop::NoProgress if st.governor.tuning_stop() => TUNING_FINALIZE_PROMPT,
             AgentLoopStop::NoProgress | AgentLoopStop::RepeatedFailedTool => {
@@ -1830,30 +1805,23 @@ impl Runtime {
             }
             _ => BUDGET_FINALIZE_PROMPT,
         };
-        let closing_tools: Arc<[Value]> = if ctx.client.finalization_keeps_tools() {
-            self.workspace_tool_definitions(ctx.mode, ctx.cwd)
-        } else {
-            Arc::from(Vec::new())
-        };
+        let turn_tools = self.workspace_tool_definitions(ctx.mode, ctx.cwd);
         let mut final_messages = st.messages.clone();
         final_messages.push(ProviderMessage::user(closing_prompt));
         // The closing call obeys the same context budget as loop turns:
         // compact the carried history first (Pi's compaction, like any turn)
         // and skip a request that still cannot fit instead of spending a
         // doomed provider round-trip.
-        if !self.finalization_fits_budget(ctx.client, &final_messages, &closing_tools, &st.config)
+        if !self.finalization_fits_budget(ctx.client, &final_messages, &turn_tools, &st.config)
             && st.config.context_compaction_enabled
             && self.compaction_policy().enabled
         {
             let trigger = CompactionTrigger {
                 reason: CompactionReason::Threshold,
                 required: true,
-                usage: self.context_usage(ctx.client.adapter(), st, &closing_tools),
+                usage: self.context_usage(ctx.client.adapter(), st, &turn_tools),
             };
-            match self
-                .compact_for_turn(ctx, st, &closing_tools, trigger)
-                .await
-            {
+            match self.compact_for_turn(ctx, st, &turn_tools, trigger).await {
                 Ok(CompactionOutcome::Applied(_)) => {
                     st.compaction_applied = true;
                     final_messages = st.messages.clone();
@@ -1868,62 +1836,114 @@ impl Runtime {
                 }
             }
         }
-        if !self.finalization_fits_budget(ctx.client, &final_messages, &closing_tools, &st.config) {
+        if !self.finalization_fits_budget(ctx.client, &final_messages, &turn_tools, &st.config) {
             self.finalization_error = Some(ProviderError::InvalidResponse {
                 message: "final response request exceeds the context window".into(),
             });
             st.next_seq = self.observed_next_seq(st.next_seq);
-        } else {
-            // With the tools kept the request shares the turns' cached prefix,
-            // so its messages are sent as theirs are: the channel overlay and
-            // the write projection. A tool-free request shares none.
-            let outcome = if closing_tools.is_empty() {
-                self.run_provider_messages_with_tools(
-                    ctx.client,
-                    &final_messages,
-                    &closing_tools,
-                    st.next_seq,
-                    true,
-                )
-                .await
-            } else {
-                let overlay = self.overlay_channel(&mut final_messages, ctx.mode, &st.channel);
-                self.run_provider_messages_with_tools(
-                    ctx.client,
-                    overlay.view(),
-                    &closing_tools,
-                    st.next_seq,
-                    true,
-                )
-                .await
-            };
-            match outcome {
-                Ok(mut turn) => {
-                    st.next_seq = turn.next_seq;
-                    let text = assistant_text_since(&self.app, finalize_event_start);
-                    if turn.stop != ProviderTurnStop::Normal || text.trim().is_empty() {
-                        self.finalization_error = Some(ProviderError::InvalidResponse {
-                            message: "final response was truncated, filtered, or empty".into(),
-                        });
-                    }
-                    if !text.trim().is_empty() {
-                        let text = if turn.stop == ProviderTurnStop::Normal {
-                            text
-                        } else {
-                            format!("[Incomplete final response]\n{text}")
-                        };
-                        let assistant = turn.take_assistant_message(text, Vec::new());
-                        self.append_conversation_message(st.messages, assistant)?;
-                    }
-                    self.uncommitted_event_start = None;
-                }
-                Err(error) => {
-                    self.finalization_error = Some(self.redact_provider_error(error));
-                    st.next_seq = self.observed_next_seq(st.next_seq);
-                }
-            }
+            return Ok(());
         }
+        if !self
+            .closing_attempt(ctx, st, &mut final_messages, &turn_tools, false)
+            .await?
+        {
+            return Ok(());
+        }
+        // The answer was tool calls only: ask again with calls forbidden.
+        let forbidding_tools: Arc<[Value]> = if ctx.client.finalization_keeps_tools() {
+            turn_tools
+        } else {
+            Arc::from(Vec::new())
+        };
+        self.closing_attempt(ctx, st, &mut final_messages, &forbidding_tools, true)
+            .await?;
         Ok(())
+    }
+
+    /// One closing request. Returns whether it should be asked again with
+    /// tool calls forbidden: its answer was tool calls and no text, which are
+    /// recorded as suppressed and never run.
+    async fn closing_attempt<A: ProviderAdapter + Send + Sync + 'static>(
+        &mut self,
+        ctx: &LoopCtx<'_, A>,
+        st: &mut LoopState<'_>,
+        final_messages: &mut [ProviderMessage],
+        tools: &Arc<[Value]>,
+        forbid_tools: bool,
+    ) -> Result<bool, ProviderError> {
+        let finalize_event_start = self.app.events().len();
+        self.uncommitted_event_start = Some(finalize_event_start);
+        let closing = Some(Closing {
+            forbid_tools,
+            routing: &st.routing,
+        });
+        // With the tools kept the request shares the turns' cached prefix,
+        // so its messages are sent as theirs are: the channel overlay and
+        // the write projection. A tool-free request shares none.
+        let outcome = if tools.is_empty() {
+            self.run_provider_messages_with_tools(
+                ctx.client,
+                final_messages,
+                tools,
+                st.next_seq,
+                closing,
+            )
+            .await
+        } else {
+            let overlay = self.overlay_channel(final_messages, ctx.mode, &st.channel);
+            self.run_provider_messages_with_tools(
+                ctx.client,
+                overlay.view(),
+                tools,
+                st.next_seq,
+                closing,
+            )
+            .await
+        };
+        let mut turn = match outcome {
+            Ok(turn) => turn,
+            Err(error) => {
+                self.finalization_error = Some(self.redact_provider_error(error));
+                st.next_seq = self.observed_next_seq(st.next_seq);
+                return Ok(false);
+            }
+        };
+        st.next_seq = turn.next_seq;
+        let text = assistant_text_since(&self.app, finalize_event_start);
+        let ignored_calls = tool_calls_since(&self.app, finalize_event_start).len();
+        if ignored_calls > 0 {
+            push_runtime_event(
+                &mut self.app,
+                &mut st.next_seq,
+                crate::EventKind::ToolCallsSuppressed {
+                    count: ignored_calls as u64,
+                },
+            )?;
+        }
+        if !forbid_tools
+            && ignored_calls > 0
+            && turn.stop == ProviderTurnStop::Normal
+            && text.trim().is_empty()
+        {
+            self.uncommitted_event_start = None;
+            return Ok(true);
+        }
+        if turn.stop != ProviderTurnStop::Normal || text.trim().is_empty() {
+            self.finalization_error = Some(ProviderError::InvalidResponse {
+                message: "final response was truncated, filtered, or empty".into(),
+            });
+        }
+        if !text.trim().is_empty() {
+            let text = if turn.stop == ProviderTurnStop::Normal {
+                text
+            } else {
+                format!("[Incomplete final response]\n{text}")
+            };
+            let assistant = turn.take_assistant_message(text, Vec::new());
+            self.append_conversation_message(st.messages, assistant)?;
+        }
+        self.uncommitted_event_start = None;
+        Ok(false)
     }
 
     pub(super) fn add_initial_workspace_context<A: ProviderAdapter>(
@@ -2081,7 +2101,6 @@ impl Runtime {
     }
 }
 
-/// The steer for a batch whose tool repeated evidence without a state change.
 /// Seconds under a minute, tenths of a minute above.
 fn budget_clock(duration: std::time::Duration) -> String {
     let secs = duration.as_secs_f64();
@@ -2092,6 +2111,7 @@ fn budget_clock(duration: std::time::Duration) -> String {
     }
 }
 
+/// The steer for a batch whose tool repeated evidence without a state change.
 fn causal_reuse_steer(events: &[crate::SessionEvent]) -> Option<String> {
     events.iter().find_map(|event| match &event.kind {
         crate::EventKind::CausalAnomalyDetected {

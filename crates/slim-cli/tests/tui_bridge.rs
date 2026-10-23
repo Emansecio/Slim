@@ -1109,7 +1109,7 @@ fn model_alias_updates_next_codex_request_without_restarting_tui() {
             let body: serde_json::Value =
                 serde_json::from_str(request.split_once("\r\n\r\n").expect("headers").1)
                     .expect("request JSON");
-            assert_eq!(body["model"], "gpt-6-astra");
+            assert_eq!(body["model"], "gpt-5.6-luna");
             assert_eq!(body["reasoning"]["effort"], "max");
             assert_eq!(body.get("service_tier"), fast.then_some(&json!("priority")));
             assert!(!body["tools"].as_array().expect("tools").is_empty());
@@ -1135,7 +1135,7 @@ fn model_alias_updates_next_codex_request_without_restarting_tui() {
         channels
             .commands
             .send(UiCommand::SetModel {
-                model: ModelAlias::Astra,
+                model: ModelAlias::Luna.id().into(),
                 effort: ReasoningEffort::Max,
                 fast,
             })
@@ -1146,7 +1146,7 @@ fn model_alias_updates_next_codex_request_without_restarting_tui() {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("model event")
                 == (UiEvent::ModelChanged {
-                    model: "gpt-6-astra".into(),
+                    model: "gpt-5.6-luna".into(),
                 })
             {
                 break;
@@ -1180,7 +1180,7 @@ fn model_alias_updates_next_codex_request_without_restarting_tui() {
             .expect("persisted config")
             .parse()
             .expect("config TOML");
-        assert_eq!(saved["model"].as_str(), Some("gpt-6-astra"));
+        assert_eq!(saved["model"].as_str(), Some("gpt-5.6-luna"));
         assert_eq!(saved["effort"].as_str(), Some("max"));
         assert_eq!(saved["codex_fast"].as_bool(), Some(fast));
         channels
@@ -1395,11 +1395,19 @@ fn cancel_active_shell_before_late_workspace_mutation(force: bool) {
     fs::create_dir_all(&root).expect("root");
     let marker = root.join("late.txt");
     let started = root.join("started.txt");
-    let command = format!(
-        "Set-Content -LiteralPath '{}' -Value started; Start-Sleep -Seconds 30; Set-Content -LiteralPath '{}' -Value late",
-        started.display(),
-        marker.display()
-    );
+    let command = if cfg!(windows) {
+        format!(
+            "Set-Content -LiteralPath '{}' -Value started; Start-Sleep -Seconds 30; Set-Content -LiteralPath '{}' -Value late",
+            started.display(),
+            marker.display()
+        )
+    } else {
+        format!(
+            "printf started > '{}'; sleep 30; printf late > '{}'",
+            started.display(),
+            marker.display()
+        )
+    };
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let address = listener.local_addr().expect("address");
     let server = thread::spawn(move || {

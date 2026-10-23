@@ -542,19 +542,6 @@ impl LspServerInstance {
         self.synchronize(path, content, None, false).await
     }
 
-    pub async fn notify_file_changed(&self, path: &Path, text: String) {
-        let content = DocumentContent::from_text(text, FileStamp::for_path(path));
-        self.notify_file_changed_content(path, content).await;
-    }
-
-    pub(crate) async fn notify_file_changed_content(
-        &self,
-        path: &Path,
-        content: Arc<DocumentContent>,
-    ) {
-        self.synchronize(path, content, None, true).await;
-    }
-
     pub(crate) async fn notify_file_updated_content(
         &self,
         path: &Path,
@@ -934,6 +921,7 @@ impl LspServerInstance {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub async fn document_version_async(&self, path: &Path) -> Option<i64> {
         let path = crate::path_policy::existing_workspace_path(&self.config.root, path)?;
         let _document_sync = self.document_lock(&path).lock_owned().await;

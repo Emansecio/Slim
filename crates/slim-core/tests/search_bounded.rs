@@ -421,3 +421,93 @@ fn lost_list_and_search_snapshots_require_explicit_restart() {
     assert!(restarted.output.contains("[f-2.txt]\n1: needle"));
     let _ = fs::remove_dir_all(root.parent().expect("parent"));
 }
+
+#[test]
+fn search_ignores_macos_finder_and_appledouble_litter() {
+    let root = temp_root("macos-litter");
+    fs::create_dir_all(&root).expect("root");
+    fs::write(root.join("real.txt"), "needle").expect("file");
+    fs::write(root.join(".DS_Store"), "needle").expect("ds store");
+    fs::write(root.join("._real.txt"), "needle").expect("appledouble");
+    let result = ToolRegistry::default().execute(
+        OperatingMode::ReadOnly,
+        &root,
+        "search",
+        r#"{"query":"needle","path":"."}"#,
+    );
+    assert!(result.success, "{}", result.output);
+    assert!(result.output.contains("[real.txt]"), "{}", result.output);
+    assert!(!result.output.contains(".DS_Store"), "{}", result.output);
+    assert!(!result.output.contains("._real.txt"), "{}", result.output);
+    let _ = fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+/// Runs `work` on its own thread so a call that blocks on a FIFO fails the test
+/// instead of hanging the suite.
+#[cfg(unix)]
+fn within_timeout<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the tool call blocked instead of refusing the FIFO")
+}
+
+#[cfg(unix)]
+fn make_fifo(path: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path");
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn search_skips_fifos_instead_of_blocking_on_them() {
+    let root = temp_root("fifo-search");
+    fs::create_dir_all(&root).expect("root");
+    fs::write(root.join("real.txt"), "needle").expect("file");
+    make_fifo(&root.join("pipe"));
+    let scan_root = root.clone();
+    let result = within_timeout(move || {
+        ToolRegistry::default().execute(
+            OperatingMode::ReadOnly,
+            &scan_root,
+            "search",
+            r#"{"query":"needle","path":"."}"#,
+        )
+    });
+    assert!(result.success, "{}", result.output);
+    assert!(result.output.contains("[real.txt]\n1: needle"));
+    let _ = fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[cfg(unix)]
+#[test]
+fn read_write_and_patch_refuse_fifos_instead_of_blocking_on_them() {
+    let root = temp_root("fifo-edit");
+    fs::create_dir_all(&root).expect("root");
+    make_fifo(&root.join("pipe"));
+    let calls: [(&str, &str); 3] = [
+        ("read", r#"{"path":"pipe"}"#),
+        ("write", r#"{"path":"pipe","content":"x"}"#),
+        (
+            "patch",
+            r#"{"path":"pipe","edits":[{"expected":"a","replacement":"b"}]}"#,
+        ),
+    ];
+    for (tool, arguments) in calls {
+        let cwd = root.clone();
+        let result = within_timeout(move || {
+            ToolRegistry::default().execute(OperatingMode::Auto, &cwd, tool, arguments)
+        });
+        assert!(!result.success, "{tool}: {}", result.output);
+        assert!(
+            result.output.contains("not a regular file"),
+            "{tool}: {}",
+            result.output
+        );
+    }
+    let _ = fs::remove_dir_all(root.parent().expect("parent"));
+}

@@ -42,7 +42,7 @@ hot reload da configuração do Slim, entrega tardia e mux entre aplicações.
 
 | Constatação | Decisão corrigida |
 |---|---|
-| O catálogo chama `supports_workspace(cwd)` antes de anunciar `code_intel` | A capacidade nativa deve continuar visível sem depender de marcadores ou de um servidor já iniciado |
+| O catálogo chama `supports_workspace(cwd)` antes de anunciar `code_intel` | Sem depender de servidor já iniciado, mas só onde ele responderia (revisto em 22/10/2026): Rust com raiz `Cargo.toml`; JS/TS com marcador ou arquivo-fonte, ignorando `node_modules`/`target`; nos dois, binário resolvível. Varredura ilegível ou acima do limite anuncia. Avaliado a cada prompt, sem mudar as tools de um loop em andamento. Motivo: ~330 tokens por turno em pastas sem essas linguagens |
 | `ServerInstanceConfig` já separa initialization options e settings, mas o pool duplica um único payload nos dois | Corrigir a passagem no pool; não criar outra camada de configuração na instância |
 | `PoolKey` contém raiz, ID e hash apenas do payload atual | A identidade efetiva também inclui comando, args e os dois objetos de configuração |
 | O transporte recebe um callback síncrono de pedidos server→client | Resolver folders/settings nesse callback; não convertê-lo em handler async para adicionar JS/TS |

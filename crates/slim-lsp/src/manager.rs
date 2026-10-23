@@ -41,8 +41,12 @@ pub const MAX_CONTEXT_LINE_CHARS: usize = 120;
 /// Hard bound on locations scanned for one references call. The frame cap
 /// already bounds the input, but a degenerate response could still hold
 /// ~100k entries; scanning is cheap per item yet unbounded work is unbounded.
+const FILE_NOT_SERVED: &str = "file is outside the workspace, too large, unreadable, or not served";
+const URI_CONVERSION_FAILED: &str = "failed to convert document path to URI";
 const MAX_REFERENCE_SCAN: usize = 65_536;
 const MAX_DISCOVERY_CACHE_ENTRIES: usize = 32;
+/// Entries the catalog check walks looking for a JS/TS source file.
+const MAX_CATALOG_SOURCE_SCAN: usize = 4_096;
 /// Edited files validated per batch; the rest is left to `code_intel`.
 const MAX_POST_EDIT_FILES: usize = 12;
 /// Workspace sources tried, shallowest first, to load a TypeScript project
@@ -237,6 +241,26 @@ impl LspCodeIntelligence {
             .servers
             .get(server)
             .is_some_and(|options| options.enabled)
+    }
+
+    /// The server could answer here: Rust needs its Cargo root, JS/TS a
+    /// project marker or a source file, and both a resolvable binary. The
+    /// catalog asks once per prompt, so a project created mid-session gains
+    /// the tool on the next prompt without changing a running loop's tools.
+    fn serves_workspace(&self, workspace: &Path, server: &str) -> bool {
+        if !self.enabled(server) {
+            return false;
+        }
+        if server == TYPESCRIPT_LANGUAGE_SERVER
+            && !["package.json", "tsconfig.json", "jsconfig.json"]
+                .iter()
+                .any(|marker| workspace.join(marker).is_file())
+            && !crate::workspace::has_source(workspace, server, MAX_CATALOG_SOURCE_SCAN)
+        {
+            return false;
+        }
+        let discovery = self.discover(workspace, server);
+        discovery.root.is_some() && discovery.spec.is_some() && !discovery.binary_missing
     }
 
     fn select_server(
@@ -923,11 +947,11 @@ fn parse_location(
 
 #[async_trait::async_trait]
 impl CodeIntelligence for LspCodeIntelligence {
-    fn supports_workspace(&self, _workspace: &Path) -> bool {
+    fn supports_workspace(&self, workspace: &Path) -> bool {
         !self.stopped.load(Ordering::Acquire)
             && [RUST_ANALYZER, TYPESCRIPT_LANGUAGE_SERVER]
                 .into_iter()
-                .any(|server| self.enabled(server))
+                .any(|server| self.serves_workspace(workspace, server))
     }
 
     async fn status(&self, workspace: &Path) -> CodeIntelOutcome {
@@ -1024,7 +1048,7 @@ impl CodeIntelligence for LspCodeIntelligence {
         else {
             return CodeIntelOutcome::unavailable(
                 &instance.spec().id,
-                "file is outside the workspace, too large, unreadable, or not served",
+                FILE_NOT_SERVED,
             );
         };
         let snapshot = instance.snapshot().await;
@@ -1052,7 +1076,7 @@ impl CodeIntelligence for LspCodeIntelligence {
                 .degraded_document(
                     &instance,
                     &document,
-                    "failed to convert document path to URI",
+                    URI_CONVERSION_FAILED,
                     started,
                 )
                 .await;
@@ -1188,7 +1212,7 @@ impl CodeIntelligence for LspCodeIntelligence {
         else {
             return CodeIntelOutcome::unavailable(
                 &instance.spec().id,
-                "file is outside the workspace, too large, unreadable, or not served",
+                FILE_NOT_SERVED,
             );
         };
         let snapshot = instance.snapshot().await;
@@ -1209,7 +1233,7 @@ impl CodeIntelligence for LspCodeIntelligence {
                 .degraded_document(
                     &instance,
                     &document,
-                    "failed to convert document path to URI",
+                    URI_CONVERSION_FAILED,
                     started,
                 )
                 .await;
@@ -1349,7 +1373,7 @@ impl CodeIntelligence for LspCodeIntelligence {
                 else {
                     return CodeIntelOutcome::unavailable(
                         &instance.spec().id,
-                        "file is outside the workspace, too large, unreadable, or not served",
+                        FILE_NOT_SERVED,
                     );
                 };
                 let snapshot = instance.snapshot().await;
@@ -1370,7 +1394,7 @@ impl CodeIntelligence for LspCodeIntelligence {
                         .degraded_document(
                             &instance,
                             &document,
-                            "failed to convert document path to URI",
+                            URI_CONVERSION_FAILED,
                             started,
                         )
                         .await;
@@ -1469,7 +1493,7 @@ impl CodeIntelligence for LspCodeIntelligence {
             else {
                 return CodeIntelOutcome::unavailable(
                     &instance.spec().id,
-                    "file is outside the workspace, too large, unreadable, or not served",
+                    FILE_NOT_SERVED,
                 );
             };
             let Some(uri) = crate::instance::file_uri(&document.path) else {
@@ -1477,7 +1501,7 @@ impl CodeIntelligence for LspCodeIntelligence {
                     .degraded_document(
                         &instance,
                         &document,
-                        "failed to convert document path to URI",
+                        URI_CONVERSION_FAILED,
                         started,
                     )
                     .await;
@@ -1876,7 +1900,7 @@ impl CodeIntelligence for LspCodeIntelligence {
                 else {
                     return CodeIntelOutcome::unavailable(
                         &instance.spec().id,
-                        "file is outside the workspace, too large, unreadable, or not served",
+                        FILE_NOT_SERVED,
                     );
                 };
                 if query
@@ -1898,7 +1922,7 @@ impl CodeIntelligence for LspCodeIntelligence {
                         .degraded_document(
                             &instance,
                             &document,
-                            "failed to convert document path to URI",
+                            URI_CONVERSION_FAILED,
                             started,
                         )
                         .await;
@@ -2486,6 +2510,56 @@ mod tests {
         assert_eq!(
             LspCodeIntelligence::human_position(encoding, &content, 0, 99),
             (1, 4)
+        );
+    }
+
+    #[test]
+    fn human_coordinates_are_one_based_and_bounded_to_line_end() {
+        let content = crate::document::DocumentContent::from_text(
+            "first\nsecond line\r\nthird".to_owned(),
+            None,
+        );
+        let enc = PositionEncoding::Utf16;
+        assert_eq!(
+            LspCodeIntelligence::human_to_lsp(enc, &content, 2, 1),
+            Some((1, 0))
+        );
+        assert_eq!(
+            LspCodeIntelligence::human_to_lsp(enc, &content, 2, 8),
+            Some((1, 7))
+        );
+        // One past the last char of the 11-char "second line" (CR excluded)
+        // addresses the line end; further is not a position.
+        assert_eq!(
+            LspCodeIntelligence::human_to_lsp(enc, &content, 2, 12),
+            Some((1, 11))
+        );
+        assert_eq!(
+            LspCodeIntelligence::human_to_lsp(enc, &content, 2, 13),
+            None
+        );
+        // 0-based inputs and lines beyond the file are rejected.
+        assert_eq!(LspCodeIntelligence::human_to_lsp(enc, &content, 0, 1), None);
+        assert_eq!(LspCodeIntelligence::human_to_lsp(enc, &content, 2, 0), None);
+        assert_eq!(LspCodeIntelligence::human_to_lsp(enc, &content, 4, 1), None);
+        assert_eq!(
+            LspCodeIntelligence::human_position(enc, &content, 1, 7),
+            (2, 8)
+        );
+    }
+
+    #[test]
+    fn human_columns_count_chars_in_utf8_encoding() {
+        // UTF-8: "\u{e9}x" is 2 + 1 bytes; scalars \u{e9}, x.
+        let content = crate::document::DocumentContent::from_text("\u{e9}x".to_owned(), None);
+        let utf8 = PositionEncoding::Utf8;
+        assert_eq!(
+            LspCodeIntelligence::human_to_lsp(utf8, &content, 1, 2),
+            Some((0, 2))
+        );
+        assert_eq!(
+            LspCodeIntelligence::human_position(utf8, &content, 0, 2),
+            (1, 2)
         );
     }
 

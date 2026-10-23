@@ -4,7 +4,6 @@ use super::{
     ToolCacheability, ToolDependencyScope, ToolEffectClass, ToolError, ToolOperationalSpec,
     ToolPresentation, ToolReplayPolicy, ToolResult, ToolVolatility, DEFAULT_MAX_ENTRIES,
     DEFAULT_MAX_HITS, MAX_ENTRIES_CAP, MAX_HITS_CAP, MAX_MUTATING_FILE_BYTES, MAX_READ_LINES_CAP,
-    MAX_SEARCH_PATTERNS,
 };
 use crate::codeintel::DEFAULT_CODE_INTEL_LIMIT;
 use crate::OperatingMode;
@@ -217,6 +216,22 @@ fn present_prefixed(
     result
 }
 
+/// Largest count in `0..=len` whose projection `fits`, by binary search: a
+/// longer prefix never renders shorter than a shorter one. Zero when none does.
+pub(super) fn fit_count(len: usize, fits: impl Fn(usize) -> bool) -> usize {
+    let mut low = 0;
+    let mut high = len;
+    while low < high {
+        let count = low + (high - low).div_ceil(2);
+        if fits(count) {
+            low = count;
+        } else {
+            high = count - 1;
+        }
+    }
+    low
+}
+
 fn present_read_records(
     first: usize,
     records: &[String],
@@ -250,16 +265,9 @@ fn present_read_records(
             oversized_record: false,
         };
     }
-    let mut low = 0usize;
-    let mut high = records.len();
-    while low < high {
-        let count = low + (high - low).div_ceil(2);
-        if render(count).len() <= budget.max_bytes {
-            low = count;
-        } else {
-            high = count - 1;
-        }
-    }
+    let low = fit_count(records.len(), |count| {
+        render(count).len() <= budget.max_bytes
+    });
     let mut text = render(low);
     if low == 0 {
         text.push_str(&format!(
@@ -317,27 +325,11 @@ impl CodeIntelPresentation {
         if self.full.len() <= budget.max_bytes {
             return ToolPresentation::complete(self.full.clone());
         }
-        let render = |count: usize| self.render(count);
-        let full = render(self.records.len());
-        if full.len() <= budget.max_bytes {
-            return ToolPresentation {
-                text: full,
-                delivered_records: self.records.len(),
-                complete: self.continuation.is_none(),
-                oversized_record: false,
-            };
-        }
-        let mut low = 0usize;
-        let mut high = self.records.len();
-        while low < high {
-            let count = low + (high - low).div_ceil(2);
-            if render(count).len() <= budget.max_bytes {
-                low = count;
-            } else {
-                high = count - 1;
-            }
-        }
-        let mut text = render(low);
+        // `full` is `render(records.len())` (see `sealed`) and did not fit above.
+        let low = fit_count(self.records.len(), |count| {
+            self.render(count).len() <= budget.max_bytes
+        });
+        let mut text = self.render(low);
         if low == 0 && self.records.is_empty() {
             text.push_str("\n[semantic item and metadata exceed presentation budget; no item delivered; request a narrower page; not safe for patch.expected]");
         }
@@ -1576,11 +1568,6 @@ fn typed_arguments(
                         .ok_or_else(|| "search patterns must contain non-empty strings".to_owned())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            if patterns.is_empty() || patterns.len() > MAX_SEARCH_PATTERNS {
-                return Err(format!(
-                    "search patterns must contain 1..={MAX_SEARCH_PATTERNS} strings"
-                ));
-            }
             super::search::validate_patterns(&patterns).map_err(super::tool_error_message)?;
             let offset = integer_argument(arguments, "offset")?;
             let max_hits = integer_argument(arguments, "max_hits")?;

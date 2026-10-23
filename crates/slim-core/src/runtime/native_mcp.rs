@@ -310,16 +310,12 @@ impl Runtime {
         update: &McpProgress,
         seq: &mut u64,
     ) -> Result<(), ProviderError> {
-        let preview = self.redact_sensitive(&progress_preview(update));
-        let pushed = push_runtime_transient_event(
+        let pushed = push_tool_progress(
             &mut self.app,
             seq,
-            crate::EventKind::ToolProgress {
-                batch_id: invocation.batch_id.into(),
-                call_id: invocation.call_id.into(),
-                name: invocation.name.into(),
-                preview,
-            },
+            &self.sensitive_values.0,
+            invocation,
+            &progress_preview(update),
         );
         if pushed.is_err() {
             if let Some(cancellation) = &self.cancellation {

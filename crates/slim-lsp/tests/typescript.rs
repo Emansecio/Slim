@@ -150,10 +150,28 @@ async fn warm(manager: &LspCodeIntelligence, workspace: &Workspace, path: &Path)
 }
 
 #[tokio::test]
-async fn automatic_defaults_advertise_the_tool_without_a_marker_or_spawn() {
+async fn javascript_sources_not_json_data_advertise_the_tool() {
+    let workspace = Workspace::new();
+    let manager = mock_manager(json!({}), json!({}));
+    workspace.write("config/settings.json", "{}");
+    workspace.write("node_modules/dep/index.js", "module.exports = 1;\n");
+    assert!(
+        !manager.supports_workspace(&workspace.0),
+        "JSON data and dependencies are not a JS/TS project"
+    );
+    workspace.write("web/app.js", "export const value = 1;\n");
+    assert!(manager.supports_workspace(&workspace.0));
+    std::fs::remove_file(workspace.0.join("web/app.js")).unwrap();
+    workspace.write("tsconfig.json", "{}");
+    assert!(manager.supports_workspace(&workspace.0));
+    assert_eq!(manager.pool().running_servers().await, 0);
+}
+
+#[tokio::test]
+async fn defaults_hide_the_tool_without_a_served_project_or_spawn() {
     let workspace = Workspace::new();
     let manager = LspCodeIntelligence::from_config(LspManagerConfig::default());
-    assert!(manager.supports_workspace(&workspace.0));
+    assert!(!manager.supports_workspace(&workspace.0));
     let _ = manager.status(&workspace.0).await;
     assert_eq!(manager.pool().running_servers().await, 0);
     let source = workspace.write("source.ts", "const value = 1;\n");
@@ -169,7 +187,7 @@ async fn automatic_defaults_advertise_the_tool_without_a_marker_or_spawn() {
         .collect(),
         ..Default::default()
     });
-    assert!(unavailable.supports_workspace(&workspace.0));
+    assert!(!unavailable.supports_workspace(&workspace.0));
     let outcome = unavailable.hover(&position(&workspace, &source)).await;
     assert_eq!(outcome.meta.server, TYPESCRIPT_LANGUAGE_SERVER);
     assert_eq!(outcome.meta.state, CodeIntelServerState::Unavailable);

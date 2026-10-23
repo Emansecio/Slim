@@ -120,3 +120,10 @@ fn missing_cache_uses_free_fallback() {
     );
     assert!(snapshot.model_ids.contains(&"big-pickle".to_owned()));
 }
+
+#[test]
+fn errors_name_the_zen_provider() {
+    let error = parse_catalog(b"{}").expect_err("schema");
+
+    assert_eq!(error.to_string(), "OpenCode Zen catalog schema is invalid");
+}

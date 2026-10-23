@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 
 use super::*;
+use crate::sync::{lock_mutex, read_lock};
 
 /// Pages fetched for one complete listing.
 const MAX_RESOURCE_PAGES: usize = 16;
@@ -154,9 +155,7 @@ pub(super) struct ResourceCache {
 
 impl ResourceCache {
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, CachedListings>> {
-        self.servers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        lock_mutex(&self.servers)
     }
 
     fn get(
@@ -223,34 +222,9 @@ struct Live {
     generation: u64,
 }
 
-/// Moves a non-`Ok` outcome to another payload type.
-fn passthrough<T, U>(outcome: McpRequestOutcome<T>) -> Result<T, McpRequestOutcome<U>> {
-    match outcome {
-        McpRequestOutcome::Completed(Ok(value)) => Ok(value),
-        McpRequestOutcome::Completed(Err(error)) => Err(McpRequestOutcome::Completed(Err(error))),
-        McpRequestOutcome::InterruptedBeforeSend {
-            interruption,
-            cleanup,
-        } => Err(McpRequestOutcome::InterruptedBeforeSend {
-            interruption,
-            cleanup,
-        }),
-        McpRequestOutcome::OutcomeUncertain {
-            interruption,
-            cleanup,
-        } => Err(McpRequestOutcome::OutcomeUncertain {
-            interruption,
-            cleanup,
-        }),
-    }
-}
-
 fn offers_resources(entry: &ServerEntry) -> bool {
     // Test hooks insert connections without a handshake: capability unknown.
-    entry
-        .handshake
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    read_lock(&entry.handshake)
         .as_ref()
         .is_none_or(|handshake| handshake.has_resources())
 }
@@ -472,14 +446,15 @@ impl McpManager {
                 "resource uri must contain 1-{MAX_URI_BYTES} bytes"
             ))));
         }
-        let live = match passthrough(self.live_connection(server, &cancellation).await) {
+        let live = match self.live_connection(server, &cancellation).await.pass() {
             Ok(live) => live,
             Err(outcome) => return outcome,
         };
-        let response = match passthrough(
-            self.live_request(&live, "resources/read", json!({"uri": uri}), cancellation)
-                .await,
-        ) {
+        let response = match self
+            .live_request(&live, "resources/read", json!({"uri": uri}), cancellation)
+            .await
+            .pass()
+        {
             Ok(response) => response,
             Err(outcome) => return outcome,
         };
@@ -530,9 +505,7 @@ impl McpManager {
         outcome
     }
 
-    /// One request on a live connection, with the transport clean-up every
-    /// manager request performs when the connection is lost or the request
-    /// was cancelled after it may have been sent.
+    /// One request on a live connection, settled like every manager request.
     async fn live_request(
         &self,
         live: &Live,
@@ -547,53 +520,8 @@ impl McpManager {
             .connection
             .request_cancellable(method, params, cancellation)
             .await;
-        match outcome {
-            McpRequestOutcome::OutcomeUncertain {
-                interruption,
-                cleanup,
-            } => {
-                let cleanup = merge_cleanup(cleanup, live.connection.close_for_cleanup().await);
-                self.disconnect_if_generation(&live.entry, live.generation, &live.connection)
-                    .await;
-                McpRequestOutcome::OutcomeUncertain {
-                    interruption,
-                    cleanup,
-                }
-            }
-            McpRequestOutcome::Completed(Err(error)) if live.connection.is_closed() => {
-                let _ = live.connection.close_for_cleanup().await;
-                self.disconnect_if_generation(&live.entry, live.generation, &live.connection)
-                    .await;
-                McpRequestOutcome::Completed(Err(error))
-            }
-            McpRequestOutcome::InterruptedBeforeSend {
-                interruption,
-                cleanup,
-            } if live.connection.is_closed() => {
-                let cleanup = merge_cleanup(cleanup, live.connection.close_for_cleanup().await);
-                self.disconnect_if_generation(&live.entry, live.generation, &live.connection)
-                    .await;
-                McpRequestOutcome::InterruptedBeforeSend {
-                    interruption,
-                    cleanup,
-                }
-            }
-            // The server needs a sign-in: show it and let the next use start a
-            // fresh connection (see `call_with_progress`).
-            McpRequestOutcome::Completed(Err(McpError::AuthRequired(reason))) => {
-                self.disconnect_if_generation(&live.entry, live.generation, &live.connection)
-                    .await;
-                Self::set_status(
-                    &live.entry,
-                    McpServerStatus::NeedsAuth {
-                        reason: reason.clone(),
-                    },
-                );
-                self.bump();
-                McpRequestOutcome::Completed(Err(McpError::AuthRequired(reason)))
-            }
-            outcome => outcome,
-        }
+        self.settle_request(&live.entry, live.generation, &live.connection, outcome)
+            .await
     }
 
     async fn listing_page(
@@ -608,7 +536,7 @@ impl McpManager {
                 "cursor must contain 1-{MAX_CURSOR_BYTES} bytes"
             ))));
         }
-        let live = match passthrough(self.live_connection(server, &cancellation).await) {
+        let live = match self.live_connection(server, &cancellation).await.pass() {
             Ok(live) => live,
             Err(outcome) => return outcome,
         };
@@ -616,10 +544,11 @@ impl McpManager {
             Some(cursor) => json!({"cursor": cursor}),
             None => json!({}),
         };
-        let response = match passthrough(
-            self.live_request(&live, kind.method(), params, cancellation)
-                .await,
-        ) {
+        let response = match self
+            .live_request(&live, kind.method(), params, cancellation)
+            .await
+            .pass()
+        {
             Ok(response) => response,
             Err(McpRequestOutcome::Completed(Err(McpError::Server {
                 code: METHOD_NOT_FOUND,
@@ -638,7 +567,7 @@ impl McpManager {
         kind: ListingKind,
         cancellation: McpCancellation,
     ) -> McpRequestOutcome<Arc<McpResourceListing>> {
-        let live = match passthrough(self.live_connection(server, &cancellation).await) {
+        let live = match self.live_connection(server, &cancellation).await.pass() {
             Ok(live) => live,
             Err(outcome) => return outcome,
         };
@@ -654,10 +583,11 @@ impl McpManager {
                 Some(cursor) => json!({"cursor": cursor}),
                 None => json!({}),
             };
-            let response = match passthrough(
-                self.live_request(&live, kind.method(), params, cancellation.clone())
-                    .await,
-            ) {
+            let response = match self
+                .live_request(&live, kind.method(), params, cancellation.clone())
+                .await
+                .pass()
+            {
                 Ok(response) => response,
                 Err(McpRequestOutcome::Completed(Err(McpError::Server {
                     code: METHOD_NOT_FOUND,

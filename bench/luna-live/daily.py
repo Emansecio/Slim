@@ -3,6 +3,7 @@ import argparse
 import json
 import random
 import run
+import visual
 
 SCENARIOS = {
     'merge_ranges': dict(),
@@ -227,21 +228,28 @@ print('PASS: migration across files, nested keys, zero/fractional values and cur
 ''',
 )
 
+# Visual workload: the code is checked in a browser and frames are captured per arm.
+SCENARIOS['svg_3d_scene'] = visual.SCENARIO
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--rounds', type=int, default=2)
     parser.add_argument('--start-round', type=int, default=1)
-    parser.add_argument('--scenario', choices=list(SCENARIOS))
+    parser.add_argument('--scenario', choices=list(SCENARIOS), action='append',
+                        help='repeatable; default runs every scenario')
     parser.add_argument('--provider', choices=['openai-codex', 'opencode-go'], default='openai-codex')
     parser.add_argument('--model', default=run.MODEL)
-    parser.add_argument('--timeout', type=int, default=240, help='seconds per arm process')
+    parser.add_argument('--pi-provider', default=None,
+                        help='Pi provider name for the same route (default: openai for openai-codex)')
+    parser.add_argument('--timeout', type=int, default=None,
+                        help='seconds per arm process (default: scenario timeout_seconds, else 240)')
     parser.add_argument('--no-audit', action='store_true', help='skip per-campaign summary.json audit')
     parser.add_argument('--shuffle-seed', type=int, default=None, help='reproducible scenario order; arm order remains balanced')
     args = parser.parse_args()
     if args.rounds < 1 or args.start_round < 1:
         parser.error('--rounds and --start-round must be positive')
-    selected = [args.scenario] if args.scenario else list(SCENARIOS)
+    selected = list(dict.fromkeys(args.scenario)) if args.scenario else list(SCENARIOS)
     campaigns = []
     failures = []
     rng = random.Random(args.shuffle_seed)
@@ -258,10 +266,13 @@ def main():
                       'provider': args.provider}), flush=True)
     for repeat, scenario, arms in schedule:
         try:
+            options = dict(SCENARIOS[scenario])
+            timeout = args.timeout or options.pop('timeout_seconds', 240)
+            options.pop('timeout_seconds', None)
             campaign = run.main(arms, scenario=scenario, provider=args.provider, model=args.model,
-                                timeout_seconds=args.timeout, audit=not args.no_audit,
-                                round_number=repeat + 1,
-                                **SCENARIOS[scenario])
+                                timeout_seconds=timeout, audit=not args.no_audit,
+                                round_number=repeat + 1, pi_provider=args.pi_provider,
+                                **options)
         except (Exception, SystemExit) as error:
             if getattr(error, 'campaign', None):
                 campaigns.append(str(error.campaign))

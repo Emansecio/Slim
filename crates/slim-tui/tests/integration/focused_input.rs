@@ -173,8 +173,9 @@ fn text_overlays_place_cursor_in_their_filter_field() {
 #[test]
 fn non_text_overlay_does_not_leave_a_cursor_on_a_list() {
     let mut state = AppState::new();
-    state.effort_overlay = Some(EffortOverlay::for_alias(
-        slim_tui::api::ModelAlias::Sol,
+    state.effort_overlay = Some(EffortOverlay::for_codex(
+        slim_tui::api::ModelAlias::Sol.id().into(),
+        slim_tui::api::ReasoningEffort::supported(slim_tui::api::ModelAlias::Sol).to_vec(),
         slim_tui::api::ReasoningEffort::High,
         false,
     ));
@@ -187,8 +188,9 @@ fn non_text_overlay_does_not_leave_a_cursor_on_a_list() {
 fn search_does_not_leave_a_cursor_under_a_non_text_modal() {
     let mut state = AppState::new();
     state.search = Some(SearchState::default());
-    state.effort_overlay = Some(EffortOverlay::for_alias(
-        slim_tui::api::ModelAlias::Sol,
+    state.effort_overlay = Some(EffortOverlay::for_codex(
+        slim_tui::api::ModelAlias::Sol.id().into(),
+        slim_tui::api::ReasoningEffort::supported(slim_tui::api::ModelAlias::Sol).to_vec(),
         slim_tui::api::ReasoningEffort::High,
         false,
     ));

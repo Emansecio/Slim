@@ -571,6 +571,13 @@ impl DurableQueue {
                     other => other,
                 })?;
             }
+            // ManualDrive suspends a non-queued turn when a tool effect stays
+            // uncertain (e.g. a background job still running at turn end). Its
+            // identity stays reserved, but there is no FIFO item to suspend,
+            // mirroring the Aborted case below.
+            DurableOperationKind::Suspended { .. }
+                if !self.entries.contains_key(operation_id)
+                    && self.operation_ids.contains(operation_id) => {}
             DurableOperationKind::Suspended { reason } => {
                 self.suspend(operation_id, reason.clone())
                     .map_err(|error| match error {

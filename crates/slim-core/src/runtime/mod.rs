@@ -81,9 +81,9 @@ use config::ProviderTurnResult;
 pub use config::{AgentLoopConfig, AgentLoopResult, AgentLoopStop};
 use events::{
     assistant_text_since, checked_next_seq, drain_tool_started_notices, duration_millis,
-    elapsed_micros, elapsed_millis, journal_error, push_runtime_event,
-    push_runtime_transient_event, push_tool_result_facts, push_tool_started_notice,
-    replace_admission_prefix, tool_calls_since, usage_since,
+    elapsed_micros, elapsed_millis, event_rejected, journal_error, lock_journal,
+    push_runtime_event, push_runtime_transient_event, push_tool_progress, push_tool_result_facts,
+    push_tool_started_notice, replace_admission_prefix, tool_calls_since, usage_since,
 };
 pub(crate) use events::{persist_provider_call, persist_provider_validation_failure};
 #[cfg(test)]
@@ -449,9 +449,7 @@ impl Runtime {
     ) -> Result<(), ProviderError> {
         let message = self.redact_message(message);
         if let Some(journal) = &self.app.run_journal {
-            journal
-                .lock()
-                .map_err(|_| journal_error("durable run lock poisoned"))?
+            lock_journal(journal)?
                 .record_message(message.clone())
                 .map_err(journal_error)?;
         }

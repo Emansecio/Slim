@@ -202,11 +202,47 @@ fn abort_of_entry_known_operation_is_a_silent_noop() {
     assert!(DurableQueue::from_records(4, &more).is_err());
 }
 
+/// A `Suspended` record for an operation only known via an entry is a silent
+/// no-op (manual-drive convention, mirroring Aborted): the id stays reserved
+/// but nothing is queued. A ManualDrive turn suspends itself when a tool
+/// effect is uncertain (e.g. a background job still running at turn end), and
+/// restore must not reject the session.
+#[test]
+fn suspend_of_entry_known_operation_is_a_silent_noop() {
+    let records = [
+        entry(0, "op-manual"),
+        operation(
+            1,
+            "op-manual",
+            DurableOperationKind::Suspended {
+                reason: "tool execution did not produce a known terminal result".into(),
+            },
+        ),
+    ];
+    let queue = DurableQueue::from_records(4, &records).expect("restore");
+    assert!(queue.pending().is_empty());
+    assert_eq!(queue.status("op-manual"), None);
+    // The identity is still reserved: a later intent for the same op fails.
+    let more = [
+        entry(0, "op-manual"),
+        operation(
+            1,
+            "op-manual",
+            DurableOperationKind::Suspended {
+                reason: "why".into(),
+            },
+        ),
+        intent(2, "op-manual"),
+    ];
+    assert!(DurableQueue::from_records(4, &more).is_err());
+}
+
 /// A `Finished` record for an operation never seen at all is accepted as a
 /// non-queue terminal marker and reserves the id — but a `Suspended` for an
-/// unknown operation is an error. The asymmetry is deliberate (Finished is a
-/// valid marker for non-queue work; Suspended is queue-only), pinned here so
-/// a future refactor can't silently change it.
+/// operation never seen at all is an error. The asymmetry is deliberate
+/// (Finished is a valid marker for any non-queue work; a bare Suspended with
+/// no prior record is not), pinned here so a future refactor can't silently
+/// change it. A Suspended whose id is known via an entry is handled above.
 #[test]
 fn finish_of_unknown_operation_reserves_id_but_suspend_rejects() {
     let records = [operation(

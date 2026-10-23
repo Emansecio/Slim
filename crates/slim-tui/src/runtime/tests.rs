@@ -1,7 +1,7 @@
 use super::{
-    control_requires_data_barrier, footer_line, measure_scrollback, menu_line, receive_batch,
-    terminal_action, toast_row_count, update_visible_stream_state, LaneDrain, Palette,
-    CONTROL_BATCH_LIMIT, STREAM_BATCH_LIMIT,
+    control_requires_data_barrier, footer_line, measure_scrollback, menu_line,
+    notification_toast_label, receive_batch, terminal_action, toast_row_count,
+    update_visible_stream_state, LaneDrain, Palette, CONTROL_BATCH_LIMIT, STREAM_BATCH_LIMIT,
 };
 use crate::api::{
     McpServerView, McpStatusView, TodoItemStatus, TodoItemView, ToolBatchId, ToolCallId, UiEvent,
@@ -505,7 +505,7 @@ fn left_drag_selects_and_right_click_copies_or_pastes() {
     terminal
         .draw(|frame| {
             render_frame(frame, &state, caps(), &mut cache);
-            copied = super::extract_visible_selection(frame, &state, &cache);
+            copied = super::extract_visible_selection(&state, &cache);
         })
         .unwrap();
     assert_eq!(copied, "hello");
@@ -568,7 +568,7 @@ fn selection_stays_in_transcript_when_dragged_over_composer() {
     terminal
         .draw(|frame| {
             render_frame(frame, &state, caps(), &mut cache);
-            copied = super::extract_visible_selection(frame, &state, &cache);
+            copied = super::extract_visible_selection(&state, &cache);
         })
         .unwrap();
     assert!(
@@ -634,7 +634,7 @@ fn transcript_selection_survives_unrelated_growth_without_following_tail() {
     terminal
         .draw(|frame| {
             render_frame(frame, &state, caps(), &mut cache);
-            selected = super::extract_visible_selection(frame, &state, &cache);
+            selected = super::extract_visible_selection(&state, &cache);
         })
         .unwrap();
     assert_eq!(selected, "alpha");
@@ -648,7 +648,7 @@ fn transcript_selection_survives_unrelated_growth_without_following_tail() {
     terminal
         .draw(|frame| {
             render_frame(frame, &state, caps(), &mut cache);
-            selected = super::extract_visible_selection(frame, &state, &cache);
+            selected = super::extract_visible_selection(&state, &cache);
         })
         .unwrap();
     assert_eq!(selected, "alpha");
@@ -680,7 +680,7 @@ fn changed_selected_cells_cannot_silently_retarget_copy() {
                 assert!(!super::validate_painted_selection(
                     frame, &state, &mut cache
                 ));
-                assert!(super::extract_visible_selection(frame, &state, &cache).is_empty());
+                assert!(super::extract_visible_selection(&state, &cache).is_empty());
             })
             .unwrap();
     }
@@ -753,7 +753,7 @@ fn selection_inside_inspector_excludes_border_and_transcript() {
     terminal
         .draw(|frame| {
             render_frame(frame, &state, caps(), &mut cache);
-            copied = super::extract_visible_selection(frame, &state, &cache);
+            copied = super::extract_visible_selection(&state, &cache);
         })
         .unwrap();
     assert!(copied.contains("Cronologia"), "{copied:?}");
@@ -2683,4 +2683,21 @@ fn completed_tool_marker_settles_through_the_block_cache_and_returns_to_rest() {
     assert!(rgb_brightness(fgs[2]) > rgb_brightness(rest.0));
     // The resting style is what a cold cache paints at that instant.
     assert_eq!(rest, marker_style(&state, &mut WrapCache::default()));
+}
+
+#[test]
+fn a_long_toast_ends_in_exactly_one_ellipsis_within_the_available_width() {
+    use unicode_width::UnicodeWidthStr;
+
+    let notice = crate::app::Notification::from(
+        "Fila recuperada: uma execução ficou sem confirmação, confira os efeitos",
+    );
+    for width in [2usize, 5, 12, 30] {
+        let label = notification_toast_label(&notice, 3, width);
+        assert_eq!(label.matches('…').count(), 1, "{label:?} at {width}");
+        assert!(label.ends_with('…'), "{label:?} at {width}");
+        assert!(label.width() <= width, "{label:?} at {width}");
+    }
+    let fits = notification_toast_label(&crate::app::Notification::from("curto"), 0, 30);
+    assert_eq!(fits, "curto");
 }

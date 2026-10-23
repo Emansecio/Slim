@@ -502,40 +502,7 @@ pub fn legacy_prefix_fingerprint(messages: &[ProviderMessage]) -> String {
             hasher.update([0xfe]);
         }
         for block in &message.content_blocks {
-            match block {
-                ProviderContentBlock::Text(text) => {
-                    hasher.update(b"text");
-                    hasher.update([0]);
-                    hasher.update(text.as_bytes());
-                }
-                ProviderContentBlock::Image { media_type, data } => {
-                    hasher.update(b"image");
-                    hasher.update([0]);
-                    hasher.update(media_type.as_bytes());
-                    hasher.update([0]);
-                    hasher.update(data.as_bytes());
-                }
-                ProviderContentBlock::Audio { media_type, data } => {
-                    hasher.update(b"audio");
-                    hasher.update([0]);
-                    hasher.update(media_type.as_bytes());
-                    hasher.update([0]);
-                    hasher.update(data.as_bytes());
-                }
-                ProviderContentBlock::File { media_type, data } => {
-                    hasher.update(b"file");
-                    hasher.update([0]);
-                    hasher.update(media_type.as_bytes());
-                    hasher.update([0]);
-                    hasher.update(data.as_bytes());
-                }
-                ProviderContentBlock::Unsupported { kind } => {
-                    hasher.update(b"unsupported");
-                    hasher.update([0]);
-                    hasher.update(kind.as_bytes());
-                }
-            }
-            hasher.update([0xfd]);
+            hash_content_block(&mut hasher, block, |text| text.into());
         }
         if let Some(state) = &message.chat_reasoning {
             hasher.update(b"chat-reasoning");
@@ -548,6 +515,45 @@ pub fn legacy_prefix_fingerprint(messages: &[ProviderMessage]) -> String {
         hasher.update([0xff]);
     }
     format!("{:x}", hasher.finalize())[..16].to_owned()
+}
+
+/// One content block of a message. Only `Text` goes through `text`: the
+/// legacy writer hashed it raw, the current one hashes its journaled form.
+fn hash_content_block<'a>(
+    hasher: &mut Sha256,
+    block: &'a ProviderContentBlock,
+    text: impl Fn(&'a str) -> std::borrow::Cow<'a, str>,
+) {
+    match block {
+        ProviderContentBlock::Text(value) => {
+            hasher.update(b"text");
+            hasher.update([0]);
+            hasher.update(text(value).as_bytes());
+        }
+        ProviderContentBlock::Image { media_type, data } => {
+            hash_media_block(hasher, b"image", media_type, data);
+        }
+        ProviderContentBlock::Audio { media_type, data } => {
+            hash_media_block(hasher, b"audio", media_type, data);
+        }
+        ProviderContentBlock::File { media_type, data } => {
+            hash_media_block(hasher, b"file", media_type, data);
+        }
+        ProviderContentBlock::Unsupported { kind } => {
+            hasher.update(b"unsupported");
+            hasher.update([0]);
+            hasher.update(kind.as_bytes());
+        }
+    }
+    hasher.update([0xfd]);
+}
+
+fn hash_media_block(hasher: &mut Sha256, tag: &[u8], media_type: &str, data: &str) {
+    hasher.update(tag);
+    hasher.update([0]);
+    hasher.update(media_type.as_bytes());
+    hasher.update([0]);
+    hasher.update(data.as_bytes());
 }
 
 fn fingerprint_messages<'a>(messages: impl Iterator<Item = &'a ProviderMessage>) -> String {
@@ -579,40 +585,7 @@ fn fingerprint_messages<'a>(messages: impl Iterator<Item = &'a ProviderMessage>)
             hasher.update([0xfe]);
         }
         for block in &message.content_blocks {
-            match block {
-                ProviderContentBlock::Text(text) => {
-                    hasher.update(b"text");
-                    hasher.update([0]);
-                    hasher.update(journaled_text(text).as_bytes());
-                }
-                ProviderContentBlock::Image { media_type, data } => {
-                    hasher.update(b"image");
-                    hasher.update([0]);
-                    hasher.update(media_type.as_bytes());
-                    hasher.update([0]);
-                    hasher.update(data.as_bytes());
-                }
-                ProviderContentBlock::Audio { media_type, data } => {
-                    hasher.update(b"audio");
-                    hasher.update([0]);
-                    hasher.update(media_type.as_bytes());
-                    hasher.update([0]);
-                    hasher.update(data.as_bytes());
-                }
-                ProviderContentBlock::File { media_type, data } => {
-                    hasher.update(b"file");
-                    hasher.update([0]);
-                    hasher.update(media_type.as_bytes());
-                    hasher.update([0]);
-                    hasher.update(data.as_bytes());
-                }
-                ProviderContentBlock::Unsupported { kind } => {
-                    hasher.update(b"unsupported");
-                    hasher.update([0]);
-                    hasher.update(kind.as_bytes());
-                }
-            }
-            hasher.update([0xfd]);
+            hash_content_block(&mut hasher, block, journaled_text);
         }
         hasher.update([0xff]);
     }
@@ -725,6 +698,46 @@ a.rs",
             compaction_prefix_fingerprint(&[ProviderMessage::user("Authorization: a")]),
             compaction_prefix_fingerprint(&[ProviderMessage::user("Authorisation: a")]),
         );
+    }
+
+    // Stored checkpoints verify against these hashes, so they must never drift:
+    // the values were recorded from the writers before the block-hashing helper
+    // was shared.
+    #[test]
+    fn fingerprint_hashes_are_pinned_for_every_block_kind() {
+        let mut tool_call_message = ProviderMessage::assistant(
+            "calling",
+            vec![crate::provider::ProviderToolCall {
+                id: "call-1".into(),
+                name: "shell".into(),
+                arguments: "{\"cmd\":\"curl -H 'Authorization: Bearer abc.def'\"}".into(),
+            }],
+        );
+        tool_call_message.chat_reasoning = Some(reasoning("private thoughts"));
+        let mut tool_result = ProviderMessage::tool("shell", "call-1", "ok");
+        tool_result.recorded_content = Some("recorded".into());
+        let messages = [
+            ProviderMessage::user("task\nAuthorization: Bearer abc.def").with_content_blocks(vec![
+                ProviderContentBlock::text("note\nSet-Cookie: sid=1"),
+                ProviderContentBlock::image("image/png", "aW1n"),
+                ProviderContentBlock::Audio {
+                    media_type: "audio/wav".into(),
+                    data: "YXVk".into(),
+                },
+                ProviderContentBlock::File {
+                    media_type: "application/pdf".into(),
+                    data: "ZmlsZQ==".into(),
+                },
+                ProviderContentBlock::Unsupported {
+                    kind: "video".into(),
+                },
+            ]),
+            tool_call_message,
+            tool_result,
+        ];
+        assert_eq!(compaction_prefix_fingerprint(&messages), "abe247d23b3e6f12");
+        assert_eq!(canonical_prefix_fingerprint(&messages), "abe247d23b3e6f12");
+        assert_eq!(legacy_prefix_fingerprint(&messages), "ae4accb00a4cf66e");
     }
 
     #[test]

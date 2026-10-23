@@ -34,6 +34,13 @@ fn codex_speed_flags_keep_stdin_prompt_mode() {
 }
 
 #[test]
+fn trust_project_flag_keeps_stdin_prompt_mode() {
+    let args = args(&["--headless", "--trust-project"]);
+    assert!(!has_positional_prompt(&args));
+    assert!(known_options_without_prompt(&args));
+}
+
+#[test]
 fn recover_with_abandon_pending_does_not_read_stdin() {
     let args = args(&["--headless", "--recover", "run.slim", "--abandon-pending"]);
     assert!(!has_positional_prompt(&args));

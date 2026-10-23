@@ -80,12 +80,17 @@ pub fn discover(roots: &[SkillRoot]) -> io::Result<DiscoveryResult> {
         if !root.path.exists() {
             continue;
         }
+        // read_dir order is filesystem-defined; sorting makes the active/shadowed
+        // choice between same-named skills in one root reproducible.
+        let mut directories = Vec::new();
         for entry in fs::read_dir(&root.path)? {
             let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
+            if entry.file_type()?.is_dir() {
+                directories.push(entry.path());
             }
-            let path = entry.path();
+        }
+        directories.sort();
+        for path in directories {
             let skill_file = path.join("SKILL.md");
             if !skill_file.is_file() {
                 continue;
@@ -166,6 +171,47 @@ mod tests {
     }
 
     use std::path::Path;
+
+    #[test]
+    fn same_named_skills_in_one_root_resolve_by_directory_name() {
+        use super::{discover, SkillRoot};
+
+        let root = std::env::temp_dir().join(format!(
+            "slim-skill-order-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let skills = root.join("skills");
+        for directory in ["c-dir", "a-dir", "b-dir"] {
+            let skill = skills.join(directory);
+            std::fs::create_dir_all(&skill).expect("skill directory");
+            std::fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: dup\ndescription: {directory}\n---\nbody\n"),
+            )
+            .expect("skill fixture");
+        }
+
+        let result = discover(&[SkillRoot::new(&skills, 0)]).expect("discover");
+        let folder = |entry: &super::SkillEntry| {
+            entry
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            result.active("dup").and_then(folder).as_deref(),
+            Some("a-dir")
+        );
+        let shadowed = result
+            .shadowed("dup")
+            .into_iter()
+            .map(|entry| folder(entry).expect("folder name"))
+            .collect::<Vec<_>>();
+        assert_eq!(shadowed, ["b-dir", "c-dir"]);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
 
     #[test]
     fn workspace_skills_override_global_skills_and_global_only_is_visible() {

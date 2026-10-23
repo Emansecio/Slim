@@ -185,18 +185,18 @@ fn anthropic_sends_effort_without_enabling_thinking() {
 }
 
 #[test]
-fn astra_preserves_reasoning_and_tools_in_normal_and_fast_requests() {
+fn sol_preserves_reasoning_and_tools_in_normal_and_fast_requests() {
     for effort in ["low", "medium", "high", "xhigh", "max"] {
         let mut adapter = OpenAiCodexAdapter::new(
             ProviderConfig::openai_codex(
                 "https://chatgpt.com/backend-api",
-                "astra",
+                "sol",
                 "fixture-token",
                 "fixture-account",
             )
             .with_reasoning_effort(effort),
         )
-        .expect("Astra");
+        .expect("Sol");
         let messages = [
             ProviderMessage::user("read file.txt"),
             ProviderMessage::assistant(
@@ -220,7 +220,7 @@ fn astra_preserves_reasoning_and_tools_in_normal_and_fast_requests() {
                 .prepare_messages_request_with_tools_checked(&messages, &tools)
                 .expect("prepared");
             let body: serde_json::Value = serde_json::from_slice(prepared.body()).expect("body");
-            assert_eq!(body["model"], "gpt-6-astra");
+            assert_eq!(body["model"], "gpt-5.6-sol");
             assert_eq!(
                 body["reasoning"],
                 json!({"effort": effort, "summary": "auto"})
@@ -235,21 +235,48 @@ fn astra_preserves_reasoning_and_tools_in_normal_and_fast_requests() {
             assert!(body.get("top_p").is_none());
         }
     }
-    for effort in ["none", "minimal", "ultra", "invalid"] {
+    // Luna's catalog ladder stops at `max`: the adapter rejects `ultra` for it.
+    for (model, effort) in [
+        ("luna", "none"),
+        ("luna", "minimal"),
+        ("luna", "ultra"),
+        ("gpt-5.6-luna", "invalid"),
+    ] {
         assert!(
             OpenAiCodexAdapter::new(
                 ProviderConfig::openai_codex(
                     "https://chatgpt.com/backend-api",
-                    "gpt-6-astra",
+                    model,
                     "fixture-token",
                     "fixture-account"
                 )
                 .with_reasoning_effort(effort)
             )
             .is_err(),
-            "unsupported Astra effort must fail before sending: {effort}"
+            "unsupported effort must fail before sending: {model}/{effort}"
         );
     }
+    assert!(OpenAiCodexAdapter::new(
+        ProviderConfig::openai_codex(
+            "https://chatgpt.com/backend-api",
+            "gpt-5.6-luna",
+            "fixture-token",
+            "fixture-account"
+        )
+        .with_reasoning_effort("max")
+    )
+    .is_ok());
+    // A slug only the account catalog knows has no bundled ladder to check.
+    assert!(OpenAiCodexAdapter::new(
+        ProviderConfig::openai_codex(
+            "https://chatgpt.com/backend-api",
+            "gpt-reserve",
+            "fixture-token",
+            "fixture-account"
+        )
+        .with_reasoning_effort("ultra")
+    )
+    .is_ok());
 }
 
 #[test]
@@ -342,6 +369,39 @@ fn responses_prompt_cache_key_tracks_only_the_stable_prefix() {
         changed_tool_body["prompt_cache_key"]
             .as_str()
             .expect("changed prompt cache key")
+    );
+}
+
+#[test]
+fn codex_requests_route_the_prompt_cache_by_session_header() {
+    let adapter = OpenAiCodexAdapter::new(ProviderConfig::openai_codex(
+        "https://chatgpt.com/backend-api",
+        "sol",
+        "oauth-token",
+        "account",
+    ))
+    .expect("adapter");
+    let messages = [ProviderMessage::user("hello")];
+    let header = |headers: &[(String, String)], name: &str| {
+        headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+    };
+    let built = adapter.build_messages_request_with_tools(&messages, &[]);
+    let body: serde_json::Value = serde_json::from_str(&built.body).expect("body");
+    let key = body["prompt_cache_key"].as_str().expect("prompt cache key");
+    assert_eq!(header(&built.headers, "session-id").as_deref(), Some(key));
+    assert_eq!(
+        header(&built.headers, "x-client-request-id").as_deref(),
+        Some(key)
+    );
+    let prepared = adapter
+        .prepare_messages_request_with_tools_checked(&messages, &[])
+        .expect("prepared");
+    assert_eq!(
+        header(prepared.headers(), "session-id").as_deref(),
+        Some(key)
     );
 }
 
@@ -769,6 +829,47 @@ fn provider_auth_debug_redacts_secrets_and_anthropic_oauth_uses_bearer() {
 }
 
 #[test]
+fn anthropic_oauth_requests_open_the_system_prompt_with_the_claude_code_identity() {
+    const IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+    let oauth = AnthropicAdapter::new(ProviderConfig::anthropic_oauth(
+        "https://api.anthropic.com/v1/messages",
+        "claude-test",
+        "oauth-secret",
+    ))
+    .expect("adapter");
+
+    let request = oauth
+        .prepare_messages_request_with_tools_checked(&[ProviderMessage::user("hello")], &[])
+        .expect("request");
+    let body: serde_json::Value = serde_json::from_slice(request.body()).expect("body");
+    let system = body["system"].as_array().expect("system blocks");
+    assert_eq!(system[0]["text"], IDENTITY);
+    assert!(system[1]["text"]
+        .as_str()
+        .is_some_and(|text| !text.is_empty()));
+    assert!(system[1]["cache_control"].is_object());
+
+    let compaction = oauth
+        .prepare_compaction_request_checked(&[ProviderMessage::user("hello")])
+        .expect("compaction request");
+    let body: serde_json::Value =
+        serde_json::from_slice(compaction.body()).expect("compaction body");
+    assert_eq!(body["system"][0]["text"], IDENTITY);
+
+    let api_key = AnthropicAdapter::new(ProviderConfig::anthropic(
+        "https://api.anthropic.com/v1/messages",
+        "claude-test",
+        "secret",
+    ))
+    .expect("adapter");
+    let request = api_key
+        .prepare_messages_request_with_tools_checked(&[ProviderMessage::user("hello")], &[])
+        .expect("request");
+    let body: serde_json::Value = serde_json::from_slice(request.body()).expect("body");
+    assert!(!body["system"].to_string().contains(IDENTITY));
+}
+
+#[test]
 fn anthropic_usage_normalizes_cache_input_and_cumulative_output() {
     let adapter = AnthropicAdapter::new(ProviderConfig::anthropic(
         "https://example.invalid/v1/messages",
@@ -1173,7 +1274,13 @@ fn anthropic_request_and_events_preserve_provider_model_without_fallback() {
         events,
         vec![
             ProviderEvent::TextDelta("hello".into()),
-            ProviderEvent::ReasoningDelta("reason".into())
+            ProviderEvent::ReasoningDelta("reason".into()),
+            // The same text, kept for the thinking block the next request
+            // sends back; never displayed.
+            ProviderEvent::ThinkingBlock {
+                index: 0,
+                fragment: slim_core::provider::ThinkingFragment::Thinking("reason".into()),
+            },
         ]
     );
     let tool_events = adapter

@@ -13,10 +13,11 @@ use tokio::sync::Notify;
 use crate::mcp::client::{parse_progress, ClientContext, McpProgress, McpProgressSink};
 use crate::mcp::spec::{
     McpCancellation, McpCleanupStatus, McpConnection, McpError, McpInterruption, McpRequestOutcome,
+    MAX_MESSAGE_BYTES,
 };
 use crate::process::ExecutableResolver;
+use crate::sync::lock_mutex;
 
-const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
 const OUTBOUND_QUEUE_CAPACITY: usize = 256;
 /// How long a cancellation waits for `notifications/cancelled` to reach the
@@ -154,10 +155,7 @@ impl RequestState {
     }
 
     fn deadline(&self) -> Instant {
-        *self
-            .deadline
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        *lock_mutex(&self.deadline)
     }
 
     /// A progress notification for this request: renews the timeout while the
@@ -167,19 +165,13 @@ impl RequestState {
             return;
         };
         let in_flight = matches!(
-            *self
-                .phase
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            *lock_mutex(&self.phase),
             RequestPhase::Sending | RequestPhase::Awaiting
         );
         if !in_flight {
             return;
         }
-        *self
-            .deadline
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now() + self.timeout;
+        *lock_mutex(&self.deadline) = Instant::now() + self.timeout;
         // Wake the waiter so it re-reads the moved deadline.
         self.notify.notify_one();
         sink(progress);
@@ -193,10 +185,7 @@ impl RequestState {
         closed: &AtomicBool,
     ) -> bool {
         let _admission = cancellation.lock_admission();
-        let mut phase = self
-            .phase
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut phase = lock_mutex(&self.phase);
         if !matches!(*phase, RequestPhase::Queued) {
             return false;
         }
@@ -223,10 +212,7 @@ impl RequestState {
     }
 
     fn mark_awaiting(&self) {
-        let mut phase = self
-            .phase
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut phase = lock_mutex(&self.phase);
         if matches!(*phase, RequestPhase::Sending) {
             *phase = RequestPhase::Awaiting;
         }
@@ -234,10 +220,7 @@ impl RequestState {
 
     fn complete(&self, result: Result<Value, McpError>) -> bool {
         let _admission = self.cancellation.lock_admission();
-        let mut phase = self
-            .phase
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut phase = lock_mutex(&self.phase);
         if !matches!(*phase, RequestPhase::Sending | RequestPhase::Awaiting) {
             return false;
         }
@@ -254,10 +237,7 @@ impl RequestState {
     }
 
     fn interrupt(&self, interruption: McpInterruption) -> InterruptedRequest {
-        let mut phase = self
-            .phase
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut phase = lock_mutex(&self.phase);
         match &mut *phase {
             RequestPhase::Queued => {
                 *phase = RequestPhase::InterruptedBeforeSend(interruption.clone());
@@ -285,10 +265,7 @@ impl RequestState {
     }
 
     fn abandon(&self) -> bool {
-        let mut phase = self
-            .phase
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut phase = lock_mutex(&self.phase);
         let close_transport = match *phase {
             RequestPhase::Queued => {
                 *phase = RequestPhase::InterruptedBeforeSend(McpInterruption::Cancelled);
@@ -309,10 +286,7 @@ impl RequestState {
     }
 
     fn take_terminal(&self) -> Option<McpRequestOutcome<Value>> {
-        let mut phase = self
-            .phase
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut phase = lock_mutex(&self.phase);
         match &mut *phase {
             RequestPhase::Completed(result) => {
                 let result = result.take().unwrap_or(Err(McpError::Closed));
@@ -343,8 +317,6 @@ impl RequestState {
 
 struct ProcessResources {
     child: Child,
-    #[cfg(unix)]
-    resolver: ExecutableResolver,
     #[cfg(unix)]
     pid: u32,
     #[cfg(windows)]
@@ -381,21 +353,12 @@ impl Drop for RequestGuard {
 impl CloseControl {
     fn close_once(self: &Arc<Self>) {
         let changed = {
-            let _admission = self
-                .admission_gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _admission = lock_mutex(&self.admission_gate);
             if self.closed.swap(true, Ordering::AcqRel) {
                 false
             } else {
-                *self
-                    .cleanup
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                *self
-                    .cleanup_started_at
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+                *lock_mutex(&self.cleanup) = None;
+                *lock_mutex(&self.cleanup_started_at) = Some(Instant::now());
                 true
             }
         };
@@ -403,24 +366,12 @@ impl CloseControl {
             return;
         }
         fail_pending(&self.pending);
-        let resources = self
-            .resources
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        let threads = std::mem::take(
-            &mut *self
-                .threads
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
+        let resources = lock_mutex(&self.resources).take();
+        let threads = std::mem::take(&mut *lock_mutex(&self.threads));
         let close = Arc::clone(self);
         std::thread::spawn(move || {
             let confirmed = reap_transport(resources, threads);
-            *close
-                .cleanup
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(if confirmed {
+            *lock_mutex(&close.cleanup) = Some(if confirmed {
                 McpCleanupStatus::Confirmed
             } else {
                 McpCleanupStatus::Unconfirmed
@@ -430,17 +381,10 @@ impl CloseControl {
     }
 
     async fn wait_cleanup(&self) -> McpCleanupStatus {
-        if let Some(status) = *self
-            .cleanup
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-        {
+        if let Some(status) = *lock_mutex(&self.cleanup) {
             return status;
         }
-        let remaining = self
-            .cleanup_started_at
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        let remaining = lock_mutex(&self.cleanup_started_at)
             .map(|started| CLOSE_WAIT_LIMIT.saturating_sub(started.elapsed()));
         let Some(remaining) = remaining else {
             return McpCleanupStatus::NotRequired;
@@ -453,11 +397,7 @@ impl CloseControl {
                 let notified = self.cleanup_notify.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                if let Some(status) = *self
-                    .cleanup
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                {
+                if let Some(status) = *lock_mutex(&self.cleanup) {
                     return status;
                 }
                 notified.await;
@@ -476,7 +416,7 @@ fn reap_transport(resources: Option<ProcessResources>, mut threads: Vec<JoinHand
             confirmed = false;
         }
         #[cfg(unix)]
-        if crate::process::terminate_process_tree(&resources.resolver, resources.pid).is_err() {
+        if crate::process::terminate_process_tree(resources.pid).is_err() {
             confirmed = false;
         }
 
@@ -494,6 +434,10 @@ fn reap_transport(resources: Option<ProcessResources>, mut threads: Vec<JoinHand
                     break;
                 }
             }
+        }
+        #[cfg(unix)]
+        if exited {
+            crate::process::live_groups::unregister(resources.pid as i32);
         }
         if !exited {
             let _ = resources.child.kill();
@@ -601,6 +545,10 @@ impl StdioConnection {
             ))
         })?;
 
+        // Like tool children, the server's group must not outlive Slim when a
+        // terminating signal skips destructors; the reaper unregisters it.
+        #[cfg(unix)]
+        crate::process::live_groups::register(pid as i32);
         let (outbound_tx, outbound_rx) =
             mpsc::sync_channel::<OutboundMessage>(OUTBOUND_QUEUE_CAPACITY);
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -610,8 +558,6 @@ impl StdioConnection {
             pending,
             resources: Mutex::new(Some(ProcessResources {
                 child,
-                #[cfg(unix)]
-                resolver: resolver.clone(),
                 #[cfg(unix)]
                 pid,
                 #[cfg(windows)]
@@ -638,10 +584,7 @@ impl StdioConnection {
             ),
             spawn_stderr_reader(stderr, Arc::clone(&stderr_tail), Arc::clone(&start)),
         ];
-        *close
-            .threads
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = threads;
+        *lock_mutex(&close.threads) = threads;
         start.wait();
 
         Ok(Arc::new(Self {
@@ -658,10 +601,7 @@ impl StdioConnection {
     /// Last bytes the child wrote to stderr; attached to transport errors so
     /// a server crash surfaces its own diagnostic instead of a bare "closed".
     fn stderr_tail_text(&self) -> String {
-        let tail = self
-            .stderr_tail
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tail = lock_mutex(&self.stderr_tail);
         String::from_utf8_lossy(&tail.iter().copied().collect::<Vec<_>>())
             .trim()
             .to_owned()
@@ -672,11 +612,7 @@ impl StdioConnection {
         if !tail.is_empty() {
             return McpError::Protocol(format!("connection closed; stderr: {tail}"));
         }
-        let noise = self
-            .stdout_noise
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let noise = lock_mutex(&self.stdout_noise).clone();
         if noise.is_empty() {
             McpError::Closed
         } else {
@@ -702,11 +638,7 @@ impl StdioConnection {
             RequestState::new(deadline, self.timeout, cancellation.clone()).with_progress(progress),
         );
         {
-            let mut pending = self
-                .close
-                .pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut pending = lock_mutex(&self.close.pending);
             if self.close.closed.load(Ordering::Acquire) {
                 return McpRequestOutcome::Completed(Err(self.closed_error()));
             }
@@ -957,10 +889,7 @@ fn spawn_writer(
             let (message, request) = match message {
                 OutboundMessage::Request(envelope) => {
                     let admitted = {
-                        let _admission = close
-                            .admission_gate
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let _admission = lock_mutex(&close.admission_gate);
                         envelope.state.admit_send(
                             envelope.deadline,
                             envelope.timeout,
@@ -1030,9 +959,7 @@ fn spawn_reader(
                         dispatch_inbound(message, &close.pending, &context, &outbound);
                     }
                     FramedLine::Noise(noise) => {
-                        *stdout_noise
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = noise;
+                        *lock_mutex(&stdout_noise) = noise;
                     }
                 }
             }
@@ -1057,7 +984,7 @@ fn attach_progress_token(params: &mut Value, token: u64) {
 }
 
 fn dispatch_inbound(
-    message: Value,
+    mut message: Value,
     pending: &PendingMap,
     context: &Arc<ClientContext>,
     outbound: &mpsc::SyncSender<OutboundMessage>,
@@ -1075,10 +1002,7 @@ fn dispatch_inbound(
         let Some(id) = id.as_u64() else {
             return;
         };
-        let state = pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&id);
+        let state = lock_mutex(pending).remove(&id);
         if let Some(state) = state {
             let result = if let Some(error) = message.get("error").filter(|error| !error.is_null())
             {
@@ -1091,8 +1015,8 @@ fn dispatch_inbound(
                             .unwrap_or("unknown server error"),
                     ),
                 })
-            } else if message.get("result").is_some() {
-                Ok(message["result"].clone())
+            } else if let Some(result) = message.get_mut("result") {
+                Ok(result.take())
             } else {
                 Err(McpError::Protocol(
                     "response has neither result nor error".into(),
@@ -1108,11 +1032,7 @@ fn dispatch_inbound(
     let params = message.get("params").unwrap_or(&Value::Null);
     if method == "notifications/progress" {
         if let Some((token, progress)) = parse_progress(params) {
-            let state = pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(&token)
-                .cloned();
+            let state = lock_mutex(pending).get(&token).cloned();
             if let Some(state) = state {
                 state.on_progress(progress);
             }
@@ -1134,7 +1054,7 @@ fn spawn_stderr_reader(
             if read == 0 {
                 break;
             }
-            let mut tail = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut tail = lock_mutex(&tail);
             tail.extend(&chunk[..read]);
             let excess = tail.len().saturating_sub(STDERR_TAIL_BYTES);
             if excess > 0 {
@@ -1147,20 +1067,14 @@ fn spawn_stderr_reader(
 /// Invalidates every waiter without retaining the pending-map lock while
 /// notifying request states. Sent requests become explicitly uncertain.
 fn fail_pending(pending: &PendingMap) {
-    let requests = std::mem::take(
-        &mut *pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-    );
+    let requests = std::mem::take(&mut *lock_mutex(pending));
     for request in requests.into_values() {
         request.interrupt(McpInterruption::ConnectionClosed);
     }
 }
 
 fn remove_pending(pending: &PendingMap, id: u64, expected: &Arc<RequestState>) {
-    let mut pending = pending
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut pending = lock_mutex(pending);
     if pending
         .get(&id)
         .is_some_and(|current| Arc::ptr_eq(current, expected))
@@ -1215,10 +1129,7 @@ mod tests {
 
     impl Write for RecordingWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .extend_from_slice(bytes);
+            lock_mutex(&self.0).extend_from_slice(bytes);
             Ok(bytes.len())
         }
 
@@ -1255,10 +1166,7 @@ mod tests {
                     )
                 })?;
             }
-            self.written
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .extend_from_slice(bytes);
+            lock_mutex(&self.written).extend_from_slice(bytes);
             Ok(bytes.len())
         }
 
@@ -1274,10 +1182,7 @@ mod tests {
         let cancellation = McpCancellation::new();
         let timeout = Duration::from_secs(10);
         let state = request_state(timeout, cancellation.clone());
-        pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(1, Arc::clone(&state));
+        lock_mutex(&pending).insert(1, Arc::clone(&state));
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let (outbound, receiver) = mpsc::sync_channel(1);
         let barrier = Arc::new(Barrier::new(2));
@@ -1303,14 +1208,8 @@ mod tests {
         drop(outbound);
         writer.join().expect("writer exits after queue disconnect");
 
-        assert!(bytes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty());
-        assert!(pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty());
+        assert!(lock_mutex(&bytes).is_empty());
+        assert!(lock_mutex(&pending).is_empty());
         assert!(matches!(
             state.take_terminal(),
             Some(McpRequestOutcome::InterruptedBeforeSend {
@@ -1328,10 +1227,7 @@ mod tests {
         let cancellation = McpCancellation::new();
         let deadline = Instant::now() + Duration::from_millis(200);
         let state = Arc::new(RequestState::new(deadline, timeout, cancellation.clone()));
-        pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(2, Arc::clone(&state));
+        lock_mutex(&pending).insert(2, Arc::clone(&state));
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
@@ -1385,16 +1281,11 @@ mod tests {
         let mut expected = expected;
         expected.push(b'\n');
         assert_eq!(
-            *bytes
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            *lock_mutex(&bytes),
             expected,
             "only the notification should reach the writer"
         );
-        assert!(pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty());
+        assert!(lock_mutex(&pending).is_empty());
         assert!(matches!(
             state.take_terminal(),
             Some(McpRequestOutcome::InterruptedBeforeSend {
@@ -1441,10 +1332,7 @@ mod tests {
             let cancellation = McpCancellation::new();
             let timeout = Duration::from_secs(10);
             let state = request_state(timeout, cancellation.clone());
-            pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(id, Arc::clone(&state));
+            lock_mutex(&pending).insert(id, Arc::clone(&state));
             outbound
                 .send(OutboundMessage::Request(RequestEnvelope {
                     id,
@@ -1457,13 +1345,7 @@ mod tests {
                 .expect("bounded queue has room for the fixed batch");
             requests.push((id, state, cancellation));
         }
-        assert_eq!(
-            pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .len(),
-            CANCELLED_REQUESTS
-        );
+        assert_eq!(lock_mutex(&pending).len(), CANCELLED_REQUESTS);
 
         for (id, state, cancellation) in &requests {
             cancellation.cancel();
@@ -1473,10 +1355,7 @@ mod tests {
             ));
             remove_pending(&pending, *id, state);
         }
-        assert!(pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty());
+        assert!(lock_mutex(&pending).is_empty());
 
         release_tx.send(()).expect("release notification write");
         drop(outbound);
@@ -1487,16 +1366,11 @@ mod tests {
         let mut expected = serde_json::to_vec(&notification).expect("serialize notification");
         expected.push(b'\n');
         assert_eq!(
-            *written
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            *lock_mutex(&written),
             expected,
             "cancelled requests must not be written"
         );
-        assert!(pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty());
+        assert!(lock_mutex(&pending).is_empty());
         for (_, state, _) in &requests {
             assert!(matches!(
                 state.take_terminal(),
@@ -1515,10 +1389,7 @@ mod tests {
         let cancellation = McpCancellation::new();
         let timeout = Duration::from_secs(10);
         let state = request_state(timeout, cancellation.clone());
-        pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(3, Arc::clone(&state));
+        lock_mutex(&pending).insert(3, Arc::clone(&state));
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         let (outbound, receiver) = mpsc::sync_channel(1);
@@ -1549,10 +1420,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("writer crossed admission and entered write");
 
-        let phase = state
-            .phase
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let phase = lock_mutex(&state.phase);
         assert!(matches!(&*phase, RequestPhase::Sending));
         drop(phase);
         cancellation.cancel();
@@ -1586,10 +1454,7 @@ mod tests {
             &AtomicBool::new(false),
         ));
         state.mark_awaiting();
-        pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(7, Arc::clone(&state));
+        lock_mutex(&pending).insert(7, Arc::clone(&state));
 
         dispatch_inbound(
             json!({"jsonrpc":"2.0","id":7,"result":{"ok":true}}),
@@ -1618,10 +1483,7 @@ mod tests {
             &AtomicBool::new(false),
         ));
         state.mark_awaiting();
-        pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(8, Arc::clone(&state));
+        lock_mutex(&pending).insert(8, Arc::clone(&state));
 
         cancellation.cancel();
         dispatch_inbound(
@@ -1631,10 +1493,7 @@ mod tests {
             &mpsc::sync_channel(1).0,
         );
 
-        assert!(pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty());
+        assert!(lock_mutex(&pending).is_empty());
         assert!(matches!(
             state.take_terminal(),
             Some(McpRequestOutcome::OutcomeUncertain {
@@ -1656,10 +1515,7 @@ mod tests {
             &AtomicBool::new(false),
         ));
         new_state.mark_awaiting();
-        pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(12, Arc::clone(&new_state));
+        lock_mutex(&pending).insert(12, Arc::clone(&new_state));
         let context = ClientContext::detached();
         let (outbound, _receiver) = mpsc::sync_channel(1);
 
@@ -1670,15 +1526,10 @@ mod tests {
             &outbound,
         );
 
-        let phase = new_state
-            .phase
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let phase = lock_mutex(&new_state.phase);
         assert!(matches!(&*phase, RequestPhase::Awaiting));
         drop(phase);
-        assert!(pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        assert!(lock_mutex(&pending)
             .get(&12)
             .is_some_and(|state| Arc::ptr_eq(state, &new_state)));
         assert!(new_state.take_terminal().is_none());
@@ -1707,20 +1558,14 @@ mod tests {
             &AtomicBool::new(false),
         ));
         state.mark_awaiting();
-        pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(9, Arc::clone(&state));
+        lock_mutex(&pending).insert(9, Arc::clone(&state));
         let close = close_control(Arc::clone(&pending));
 
         close.close_once();
         close.close_once();
 
         assert!(close.closed.load(Ordering::Acquire));
-        assert!(pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty());
+        assert!(lock_mutex(&pending).is_empty());
         assert!(matches!(
             state.take_terminal(),
             Some(McpRequestOutcome::OutcomeUncertain {
@@ -1743,10 +1588,7 @@ mod tests {
         let cancellation = McpCancellation::new();
         let timeout = Duration::from_secs(10);
         let state = request_state(timeout, cancellation.clone());
-        pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(21, Arc::clone(&state));
+        lock_mutex(&pending).insert(21, Arc::clone(&state));
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         let (outbound, receiver) = mpsc::sync_channel(1);
@@ -1776,24 +1618,14 @@ mod tests {
         entered_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("writer is blocked after admitting the request");
-        assert!(matches!(
-            &*state
-                .phase
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            RequestPhase::Sending
-        ));
+        assert!(matches!(&*lock_mutex(&state.phase), RequestPhase::Sending));
 
         let (writer_joined_tx, writer_joined_rx) = mpsc::sync_channel(1);
         let joiner = std::thread::spawn(move || {
             let joined = writer.join().is_ok();
             let _ = writer_joined_tx.send(joined);
         });
-        close
-            .threads
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(joiner);
+        lock_mutex(&close.threads).push(joiner);
 
         let (close_returned_tx, close_returned_rx) = mpsc::sync_channel(1);
         let close_for_thread = Arc::clone(&close);
@@ -1856,11 +1688,7 @@ mod tests {
         // close_control has no child resource, so status stays Unconfirmed
         // even though the writer JoinHandle was collected successfully.
         assert_eq!(cleanup.await, McpCleanupStatus::Unconfirmed);
-        assert!(close
-            .threads
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty());
+        assert!(lock_mutex(&close.threads).is_empty());
     }
 
     #[tokio::test]
@@ -1889,11 +1717,7 @@ mod tests {
             let joined = writer.join().is_ok();
             let _ = writer_joined_tx.send(joined);
         });
-        close
-            .threads
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(joiner);
+        lock_mutex(&close.threads).push(joiner);
 
         let connection = Arc::new(connection(
             outbound,
@@ -1920,19 +1744,11 @@ mod tests {
         .await
         .expect("writer-entry waiter exits");
 
-        let state = pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        let state = lock_mutex(&pending)
             .get(&1)
             .cloned()
             .expect("request_inner registered its pending state");
-        assert!(matches!(
-            &*state
-                .phase
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            RequestPhase::Sending
-        ));
+        assert!(matches!(&*lock_mutex(&state.phase), RequestPhase::Sending));
 
         request.abort();
         assert!(request
@@ -1942,10 +1758,7 @@ mod tests {
         drop(connection);
 
         assert!(close.closed.load(Ordering::Acquire));
-        assert!(pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty());
+        assert!(lock_mutex(&pending).is_empty());
         assert!(matches!(
             state.take_terminal(),
             Some(McpRequestOutcome::OutcomeUncertain {
@@ -1987,10 +1800,7 @@ mod tests {
             McpRequestOutcome::Completed(Err(McpError::Protocol(message)))
                 if message == "outbound queue full"
         ));
-        assert!(pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty());
+        assert!(lock_mutex(&pending).is_empty());
         assert!(!connection.is_closed());
         assert!(matches!(
             receiver.try_recv(),
@@ -2003,10 +1813,7 @@ mod tests {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let close = close_control(Arc::clone(&pending));
         let state = request_state(Duration::from_secs(10), McpCancellation::new());
-        pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(14, Arc::clone(&state));
+        lock_mutex(&pending).insert(14, Arc::clone(&state));
 
         drop(RequestGuard {
             id: 14,
@@ -2014,10 +1821,7 @@ mod tests {
             close: Arc::clone(&close),
         });
 
-        assert!(pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty());
+        assert!(lock_mutex(&pending).is_empty());
         assert!(!close.closed.load(Ordering::Acquire));
         assert!(matches!(
             state.take_terminal(),
@@ -2107,10 +1911,7 @@ mod tests {
             .await
             .expect_err("aborted queued request future")
             .is_cancelled());
-        assert!(pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty());
+        assert!(lock_mutex(&pending).is_empty());
         assert!(!connection.is_closed());
         assert!(!close.closed.load(Ordering::Acquire));
         assert!(matches!(
@@ -2171,10 +1972,7 @@ mod tests {
             expected,
             "aborted Queued request must not write tools/call"
         );
-        assert!(pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty());
+        assert!(lock_mutex(&pending).is_empty());
         assert!(close.closed.load(Ordering::Acquire));
     }
 
@@ -2196,10 +1994,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink_seen = Arc::clone(&seen);
         let sink: McpProgressSink = Arc::new(move |update| {
-            sink_seen
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(update.progress);
+            lock_mutex(&sink_seen).push(update.progress);
         });
         let timeout = Duration::from_secs(10);
         let cancellation = McpCancellation::new();
@@ -2260,13 +2055,7 @@ mod tests {
         connection
             .send_cancelled(41, &McpInterruption::TimedOut(Duration::from_secs(5)))
             .await;
-        let written = String::from_utf8(
-            bytes
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone(),
-        )
-        .unwrap();
+        let written = String::from_utf8(lock_mutex(&bytes).clone()).unwrap();
         let message: Value = serde_json::from_str(written.trim()).expect("one JSON line");
         assert_eq!(message["method"], "notifications/cancelled");
         assert_eq!(message["params"]["requestId"], 41);
@@ -2284,12 +2073,6 @@ mod tests {
             .send_cancelled(43, &McpInterruption::Cancelled)
             .await;
         writer.join().expect("writer exits once closed");
-        assert_eq!(
-            bytes
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .len(),
-            before
-        );
+        assert_eq!(lock_mutex(&bytes).len(), before);
     }
 }

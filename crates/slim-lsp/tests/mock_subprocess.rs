@@ -1209,14 +1209,14 @@ async fn status_after_shutdown_reports_stopped() {
 }
 
 #[test]
-fn enabled_workspace_support_is_independent_of_markers_and_binary_presence() {
+fn workspace_support_requires_a_cargo_root_and_a_binary() {
     let workspace = TestDir::new("catalog-availability");
     let factory = Arc::new(CountingFactory::default());
     let pool = LspProcessPool::new(PoolConfig {
         factory: factory.clone(),
         ..PoolConfig::default()
     });
-    let manager = LspCodeIntelligence::new(
+    let missing = LspCodeIntelligence::new(
         pool,
         LspManagerConfig {
             servers: [(
@@ -1231,11 +1231,19 @@ fn enabled_workspace_support_is_independent_of_markers_and_binary_presence() {
             ..LspManagerConfig::default()
         },
     );
-    assert!(manager.supports_workspace(workspace.path()));
+    assert!(!missing.supports_workspace(workspace.path()));
     write_workspace(workspace.path());
+    assert!(
+        !missing.supports_workspace(workspace.path()),
+        "a missing binary cannot answer"
+    );
+    let (_pool, manager) = manager_with_mock(workspace.path(), json!({}));
     assert!(manager.supports_workspace(workspace.path()));
     std::fs::remove_file(workspace.path().join("Cargo.toml")).expect("remove own marker");
-    assert!(manager.supports_workspace(workspace.path()));
+    assert!(
+        !manager.supports_workspace(workspace.path()),
+        "rust-analyzer needs a Cargo root"
+    );
     assert_eq!(factory.spawns.load(Ordering::Acquire), 0);
 }
 

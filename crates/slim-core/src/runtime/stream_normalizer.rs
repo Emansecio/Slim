@@ -47,6 +47,87 @@ impl Wire {
     }
 }
 
+/// The Anthropic thinking blocks of one response, assembled from their
+/// fragments into the opaque state the next request sends back.
+struct ThinkingAssembly {
+    scope_id: u64,
+    model: String,
+    binding: u64,
+    blocks: Vec<(u32, PendingThinking)>,
+    broken: bool,
+}
+
+#[derive(Default)]
+struct PendingThinking {
+    redacted_data: Option<String>,
+    thinking: String,
+    signature: String,
+}
+
+impl ThinkingAssembly {
+    fn push(&mut self, index: u32, fragment: crate::provider::ThinkingFragment) {
+        use crate::provider::ThinkingFragment;
+        if self.broken {
+            return;
+        }
+        if let ThinkingFragment::Start { redacted_data } = fragment {
+            if self.blocks.iter().any(|(open, _)| *open == index) {
+                self.broken = true;
+            } else {
+                self.blocks.push((
+                    index,
+                    PendingThinking {
+                        redacted_data,
+                        ..PendingThinking::default()
+                    },
+                ));
+            }
+            return;
+        }
+        let Some((_, block)) = self.blocks.iter_mut().find(|(open, _)| *open == index) else {
+            self.broken = true;
+            return;
+        };
+        match fragment {
+            ThinkingFragment::Thinking(text) => block.thinking.push_str(&text),
+            ThinkingFragment::Signature(text) => block.signature.push_str(&text),
+            ThinkingFragment::Start { .. } => {}
+        }
+    }
+
+    /// Only whole, signed blocks that open the message go back: anything
+    /// else would be rejected, and leaving thinking out stays valid.
+    fn into_reasoning(self) -> Vec<crate::provider::ResponsesReasoning> {
+        let leading = self
+            .blocks
+            .iter()
+            .enumerate()
+            .all(|(position, (index, _))| usize::try_from(*index).ok() == Some(position));
+        if self.broken || !leading {
+            return Vec::new();
+        }
+        let mut items = Vec::with_capacity(self.blocks.len());
+        for (_, block) in self.blocks {
+            let item = match block.redacted_data {
+                Some(data) => serde_json::json!({"type": "redacted_thinking", "data": data}),
+                None if !block.signature.is_empty() => serde_json::json!({
+                    "type": "thinking",
+                    "thinking": block.thinking,
+                    "signature": block.signature
+                }),
+                None => return Vec::new(),
+            };
+            items.push(crate::provider::ResponsesReasoning::anthropic_thinking(
+                self.scope_id,
+                self.model.clone(),
+                item,
+                self.binding,
+            ));
+        }
+        items
+    }
+}
+
 /// Converts the raw provider event stream into the runtime ledger, redacting
 /// secrets on the fly and buffering streamed tool calls per adapter style.
 pub(crate) struct ProviderStreamNormalizer {
@@ -62,6 +143,7 @@ pub(crate) struct ProviderStreamNormalizer {
     reasoning_classification: Option<crate::ReasoningClassification>,
     responses_reasoning: Vec<crate::provider::ResponsesReasoning>,
     chat_reasoning: Option<crate::provider::ChatReasoning>,
+    thinking: Option<ThinkingAssembly>,
     stopped: bool,
     pub(super) error: Option<ProviderError>,
     stop_reason: Option<String>,
@@ -86,6 +168,7 @@ impl ProviderStreamNormalizer {
             reasoning_classification: None,
             responses_reasoning: Vec::new(),
             chat_reasoning: None,
+            thinking: None,
             stopped: false,
             error: None,
             stop_reason: None,
@@ -101,6 +184,26 @@ impl ProviderStreamNormalizer {
         classification: Option<crate::ReasoningClassification>,
     ) -> Self {
         self.reasoning_classification = classification;
+        self
+    }
+
+    /// Keeps the response's thinking blocks for the next request of the
+    /// adapter `scope_id`/`model`, bound to the request that produced them.
+    pub(crate) fn with_thinking_scope(
+        mut self,
+        scope_id: Option<u64>,
+        model: &str,
+        binding: Option<u64>,
+    ) -> Self {
+        self.thinking = scope_id
+            .zip(binding)
+            .map(|(scope_id, binding)| ThinkingAssembly {
+                scope_id,
+                model: model.to_owned(),
+                binding,
+                blocks: Vec::new(),
+                broken: false,
+            });
         self
     }
 
@@ -265,11 +368,15 @@ impl ProviderStreamNormalizer {
         // Tool side effects of an aborted turn must not run: only a normal
         // stop lets the loop execute the buffered tool calls.
         let blocks_tools = !matches!(stop, ProviderTurnStop::Normal);
+        let mut responses_reasoning = self.responses_reasoning;
+        if let Some(thinking) = self.thinking {
+            responses_reasoning.extend(thinking.into_reasoning());
+        }
         Ok(ProviderTurnResult {
             next_seq: self.next_seq,
             blocks_tools,
             stop,
-            responses_reasoning: self.responses_reasoning,
+            responses_reasoning,
             chat_reasoning: self.chat_reasoning,
         })
     }
@@ -336,6 +443,12 @@ impl ProviderStreamNormalizer {
                 Ok(())
             }
             ProviderEvent::ChatReasoning(state) => self.on_chat_reasoning(state),
+            ProviderEvent::ThinkingBlock { index, fragment } => {
+                if let Some(thinking) = self.thinking.as_mut() {
+                    thinking.push(index, fragment);
+                }
+                Ok(())
+            }
             ProviderEvent::TextDelta(text) => self.emit_chunk(app, false, &text, false),
             ProviderEvent::ReasoningDelta(text) => {
                 self.open_reasoning(app)?;
@@ -1036,16 +1149,11 @@ pub(super) fn append_openai_delta(
     let position = if let Some(position) = by_index.or(by_id) {
         position
     } else if index.is_none() && id.is_none() {
-        let candidates = calls
-            .iter()
-            .enumerate()
-            .map(|(position, _)| position)
-            .collect::<Vec<_>>();
-        match candidates.as_slice() {
-            [position] => *position,
-            [] if name.is_some() => {
+        match calls.len() {
+            1 => 0,
+            0 if name.is_some() => {
                 calls.push(BufferedToolCall::new(index, id.clone(), name.clone()));
-                calls.len() - 1
+                0
             }
             _ => {
                 push_malformed(calls, index, id, name, arguments);
@@ -1102,12 +1210,10 @@ pub(super) fn attach_legacy_call(
     } else {
         matches
     };
-    let Some(position) = (match matches.as_slice() {
+    let position = match matches.as_slice() {
         [] => return Ok(false),
-        [position] => Some(*position),
+        [position] => *position,
         _ => return Err(ProviderError::MalformedToolCall),
-    }) else {
-        return Ok(false);
     };
     let call = &mut calls[position];
     if call.input_delta_seen {

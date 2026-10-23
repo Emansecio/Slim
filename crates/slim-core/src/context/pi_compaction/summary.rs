@@ -8,8 +8,9 @@
 
 use super::cut::CompactionPreparation;
 use super::prompts::{
-    COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, SUMMARIZATION_PROMPT,
-    SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT, UPDATE_SUMMARIZATION_PROMPT,
+    COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, IN_PLACE_SUMMARY_PREAMBLE,
+    SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT,
+    UPDATE_SUMMARIZATION_PROMPT,
 };
 use super::serialize::serialize_conversation;
 use crate::provider::ProviderMessage;
@@ -183,6 +184,37 @@ impl CompactionPreparation {
 
     /// The calls this compaction needs. A split turn also gets the turn-prefix
     /// call, and skips the history call when it has no history of its own.
+    /// The history summary asked for as the next message of the session's
+    /// own conversation, cut before `first_kept_index`: the provider then
+    /// reads that history from its prompt cache instead of a serialized copy.
+    /// The instruction and its output cap; `None` for a split turn, whose
+    /// prefix needs a call of its own.
+    pub fn in_place_summary_prompt(
+        &self,
+        custom_instructions: Option<&str>,
+    ) -> Option<(String, u64)> {
+        if self.summarizes_turn_prefix() || self.messages_to_summarize.is_empty() {
+            return None;
+        }
+        let previous_summary = self
+            .previous_summary
+            .as_deref()
+            .filter(|summary| !summary.is_empty());
+        let mut prompt = IN_PLACE_SUMMARY_PREAMBLE.to_owned();
+        if let Some(summary) = previous_summary {
+            prompt.push_str(&format!(
+                "<previous-summary>\n{summary}\n</previous-summary>\n\n"
+            ));
+            prompt.push_str(UPDATE_SUMMARIZATION_PROMPT);
+        } else {
+            prompt.push_str(SUMMARIZATION_PROMPT);
+        }
+        if let Some(instructions) = custom_instructions.filter(|text| !text.is_empty()) {
+            prompt.push_str(&format!("\n\nAdditional focus: {instructions}"));
+        }
+        Some((prompt, max_output_tokens(self.settings.reserve_tokens, 80)))
+    }
+
     pub fn summary_requests(&self, custom_instructions: Option<&str>) -> SummaryRequests {
         let reserve_tokens = self.settings.reserve_tokens;
         let history = |this: &Self| {
@@ -379,6 +411,43 @@ mod tests {
             request.messages(),
             vec![ProviderMessage::user(request.prompt.as_str())]
         );
+    }
+
+    #[test]
+    fn the_in_place_prompt_asks_for_the_summary_of_the_history_above() {
+        let messages = vec![ProviderMessage::user("work")];
+        let first = preparation(messages.clone(), Vec::new(), false, None, 1_000);
+        let (prompt, cap) = first.in_place_summary_prompt(None).unwrap();
+        assert_eq!(
+            prompt,
+            format!("{IN_PLACE_SUMMARY_PREAMBLE}{SUMMARIZATION_PROMPT}")
+        );
+        assert_eq!(cap, 800);
+        let update = preparation(
+            messages.clone(),
+            Vec::new(),
+            false,
+            Some("## Goal\nold"),
+            1_000,
+        );
+        let (prompt, _) = update.in_place_summary_prompt(Some("tests")).unwrap();
+        assert_eq!(
+            prompt,
+            format!(
+                "{IN_PLACE_SUMMARY_PREAMBLE}<previous-summary>\n## Goal\nold\n</previous-summary>\n\n{UPDATE_SUMMARIZATION_PROMPT}\n\nAdditional focus: tests"
+            )
+        );
+        // A split turn's prefix needs its own call; nothing to summarize, none.
+        let split = preparation(
+            messages,
+            vec![ProviderMessage::user("prefix")],
+            true,
+            None,
+            1_000,
+        );
+        assert!(split.in_place_summary_prompt(None).is_none());
+        let empty = preparation(Vec::new(), Vec::new(), false, None, 1_000);
+        assert!(empty.in_place_summary_prompt(None).is_none());
     }
 
     #[test]

@@ -613,12 +613,13 @@ fn list_blank_path_and_blank_cursor_list_workspace() {
 
 #[test]
 fn shell_timeout_terminates_long_running_processes() {
-    let result = run_shell_timeout(
-        std::env::temp_dir(),
-        "Start-Sleep -Milliseconds 250",
-        Duration::from_millis(25),
-    )
-    .expect("shell");
+    let command = if cfg!(windows) {
+        "Start-Sleep -Milliseconds 250"
+    } else {
+        "sleep 0.25"
+    };
+    let result =
+        run_shell_timeout(std::env::temp_dir(), command, Duration::from_millis(25)).expect("shell");
     assert!(result.timed_out);
 }
 
@@ -627,10 +628,15 @@ fn shell_reports_bounded_progress_before_completion() {
     let root = temp_path("shell-progress");
     fs::create_dir_all(&root).expect("mkdir");
     let release = root.join("release.txt");
-    let escaped_release = release.display().to_string().replace('\'', "''");
-    let command = format!(
-        "Write-Output 'working'; while (-not (Test-Path -LiteralPath '{escaped_release}')) {{ Start-Sleep -Milliseconds 10 }}"
-    );
+    let command = if cfg!(windows) {
+        let escaped_release = release.display().to_string().replace('\'', "''");
+        format!(
+            "Write-Output 'working'; while (-not (Test-Path -LiteralPath '{escaped_release}')) {{ Start-Sleep -Milliseconds 10 }}"
+        )
+    } else {
+        let escaped_release = release.display().to_string().replace('\'', "'\\''");
+        format!("echo working; while [ ! -e '{escaped_release}' ]; do sleep 0.01; done")
+    };
     let mut progress = Vec::new();
     let result = run_shell_timeout_cancellable_with_progress(
         &root,
@@ -658,11 +664,19 @@ fn shell_cancellation_kills_process_tree_before_late_mutation() {
     fs::create_dir_all(&root).expect("mkdir");
     let started_marker = root.join("started.txt");
     let marker = root.join("late.txt");
-    let command = format!(
-        "Set-Content -LiteralPath '{}' -Value started; Start-Sleep -Seconds 30; Set-Content -LiteralPath '{}' -Value late",
-        started_marker.display(),
-        marker.display(),
-    );
+    let command = if cfg!(windows) {
+        format!(
+            "Set-Content -LiteralPath '{}' -Value started; Start-Sleep -Seconds 30; Set-Content -LiteralPath '{}' -Value late",
+            started_marker.display(),
+            marker.display(),
+        )
+    } else {
+        format!(
+            "printf started > '{}'; sleep 30; printf late > '{}'",
+            started_marker.display(),
+            marker.display(),
+        )
+    };
     let cancellation = CancellationToken::new();
     let worker_cancellation = cancellation.clone();
     let worker_root = root.clone();
@@ -817,12 +831,13 @@ fn shell_caps_raw_streams_while_draining_the_remainder() {
     const STDERR_HEAD: &str = "STDERR_HEAD";
     const STDERR_MIDDLE: &str = "STDERR_MIDDLE";
     const STDERR_TAIL: &str = "STDERR_TAIL";
-    let result = run_shell_timeout(
-        std::env::temp_dir(),
-        "$size = 8196 * 1024; $oh = 'STDOUT_HEAD'; $om = 'STDOUT_MIDDLE'; $ot = 'STDOUT_TAIL'; $eh = 'STDERR_HEAD'; $em = 'STDERR_MIDDLE'; $et = 'STDERR_TAIL'; $ob = $size - $oh.Length - $om.Length - $ot.Length; $eb = $size - $eh.Length - $em.Length - $et.Length; $ol = [int]($ob / 2); $el = [int]($eb / 2); [Console]::Out.Write($oh + ('x' * $ol) + $om + ('x' * ($ob - $ol)) + $ot); [Console]::Error.Write($eh + ('y' * $el) + $em + ('y' * ($eb - $el)) + $et)",
-        Duration::from_secs(20),
-    )
-    .expect("shell");
+    let command = if cfg!(windows) {
+        "$size = 8196 * 1024; $oh = 'STDOUT_HEAD'; $om = 'STDOUT_MIDDLE'; $ot = 'STDOUT_TAIL'; $eh = 'STDERR_HEAD'; $em = 'STDERR_MIDDLE'; $et = 'STDERR_TAIL'; $ob = $size - $oh.Length - $om.Length - $ot.Length; $eb = $size - $eh.Length - $em.Length - $et.Length; $ol = [int]($ob / 2); $el = [int]($eb / 2); [Console]::Out.Write($oh + ('x' * $ol) + $om + ('x' * ($ob - $ol)) + $ot); [Console]::Error.Write($eh + ('y' * $el) + $em + ('y' * ($eb - $el)) + $et)"
+    } else {
+        "size=$((8196 * 1024)); ob=$((size - 35)); eb=$((size - 35)); ol=$((ob / 2)); el=$((eb / 2)); { printf STDOUT_HEAD; head -c $ol /dev/zero | LC_ALL=C tr '\\0' x; printf STDOUT_MIDDLE; head -c $((ob - ol)) /dev/zero | LC_ALL=C tr '\\0' x; printf STDOUT_TAIL; }; { printf STDERR_HEAD; head -c $el /dev/zero | LC_ALL=C tr '\\0' y; printf STDERR_MIDDLE; head -c $((eb - el)) /dev/zero | LC_ALL=C tr '\\0' y; printf STDERR_TAIL; } >&2"
+    };
+    let result =
+        run_shell_timeout(std::env::temp_dir(), command, Duration::from_secs(20)).expect("shell");
 
     assert!(!result.timed_out, "discarded bytes must still be drained");
     assert_eq!(
@@ -869,8 +884,13 @@ fn shell_marker_counts_raw_and_context_discarded_bytes() {
     const STDOUT_MIDDLE: &str = "STDOUT_MIDDLE";
     const STDOUT_TAIL: &str = "STDOUT_TAIL";
     let registry = ToolRegistry::default();
+    let command = if cfg!(windows) {
+        "$size = 8196 * 1024; $head = 'STDOUT_HEAD'; $middle = 'STDOUT_MIDDLE'; $tail = 'STDOUT_TAIL'; $body = $size - $head.Length - $middle.Length - $tail.Length; $left = [int]($body / 2); [Console]::Out.Write($head + ('x' * $left) + $middle + ('x' * ($body - $left)) + $tail)"
+    } else {
+        "size=$((8196 * 1024)); body=$((size - 35)); left=$((body / 2)); printf STDOUT_HEAD; head -c $left /dev/zero | LC_ALL=C tr '\\0' x; printf STDOUT_MIDDLE; head -c $((body - left)) /dev/zero | LC_ALL=C tr '\\0' x; printf STDOUT_TAIL"
+    };
     let arguments = serde_json::json!({
-        "command": "$size = 8196 * 1024; $head = 'STDOUT_HEAD'; $middle = 'STDOUT_MIDDLE'; $tail = 'STDOUT_TAIL'; $body = $size - $head.Length - $middle.Length - $tail.Length; $left = [int]($body / 2); [Console]::Out.Write($head + ('x' * $left) + $middle + ('x' * ($body - $left)) + $tail)",
+        "command": command,
         "timeout_ms": 20_000
     })
     .to_string();
@@ -905,12 +925,17 @@ fn shell_output_with_two_large_streams_fits_the_result_budget() {
     let budget = slim_core::runtime::AgentLoopConfig::default().max_result_bytes;
     let headroom = 512 + 256;
     let registry = ToolRegistry::default();
+    let command = if cfg!(windows) {
+        "1..3000 | ForEach-Object { [Console]::Out.WriteLine(\"stdout line $_ ...........\"); [Console]::Error.WriteLine(\"stderr line $_ ...........\") }; [Console]::Out.WriteLine('test result: FAILED. 1 passed; 1 failed')"
+    } else {
+        "for i in $(seq 1 3000); do echo \"stdout line $i ...........\"; echo \"stderr line $i ...........\" >&2; done; echo 'test result: FAILED. 1 passed; 1 failed'"
+    };
     let result = registry.execute(
         OperatingMode::Auto,
         std::env::temp_dir(),
         "shell",
         &serde_json::json!({
-            "command": "1..3000 | ForEach-Object { [Console]::Out.WriteLine(\"stdout line $_ ...........\"); [Console]::Error.WriteLine(\"stderr line $_ ...........\") }; [Console]::Out.WriteLine('test result: FAILED. 1 passed; 1 failed')",
+            "command": command,
             "timeout_ms": 60_000
         })
         .to_string(),
@@ -933,12 +958,17 @@ fn shell_output_with_two_large_streams_fits_the_result_budget() {
 #[test]
 fn shell_stream_labels_start_their_own_line() {
     let registry = ToolRegistry::default();
+    let command = if cfg!(windows) {
+        "[Console]::Out.Write('no newline'); [Console]::Error.Write('err')"
+    } else {
+        "printf 'no newline'; printf err >&2"
+    };
     let result = registry.execute(
         OperatingMode::Auto,
         std::env::temp_dir(),
         "shell",
         &serde_json::json!({
-            "command": "[Console]::Out.Write('no newline'); [Console]::Error.Write('err')",
+            "command": command,
             "timeout_ms": 20_000
         })
         .to_string(),
@@ -974,11 +1004,16 @@ fn shell_result_header_is_humanized_for_model_context() {
     assert!(result.output.starts_with("exit 0\nstdout:"));
     assert!(!result.output.contains("exit_code="));
     assert!(!result.output.contains("Some(0)"));
+    let failed_command = if cfg!(windows) {
+        "Write-Output 'failure-output'; exit 7"
+    } else {
+        "echo 'failure-output'; exit 7"
+    };
     let failed = registry.execute(
         OperatingMode::Auto,
         std::env::temp_dir(),
         "shell",
-        &serde_json::json!({"command":"Write-Output 'failure-output'; exit 7"}).to_string(),
+        &serde_json::json!({"command": failed_command}).to_string(),
     );
     assert!(
         !failed.success,
@@ -1025,11 +1060,16 @@ fn shell_nonzero_exit_with_quiet_stderr_is_annotated() {
     );
     assert!(!quiet.output.contains("not failure"), "{}", quiet.output);
 
+    let loud_command = if cfg!(windows) {
+        "[Console]::Error.Write('boom'); exit 7"
+    } else {
+        "printf boom >&2; exit 7"
+    };
     let loud = registry.execute(
         OperatingMode::Auto,
         std::env::temp_dir(),
         "shell",
-        &serde_json::json!({"command":"[Console]::Error.Write('boom'); exit 7"}).to_string(),
+        &serde_json::json!({"command": loud_command}).to_string(),
     );
     assert!(!loud.success);
     assert!(
@@ -1042,12 +1082,17 @@ fn shell_nonzero_exit_with_quiet_stderr_is_annotated() {
 #[test]
 fn shell_nonzero_exit_with_only_terminal_noise_on_stderr_is_annotated() {
     let registry = ToolRegistry::default();
+    let noisy_command = if cfg!(windows) {
+        "[Console]::Error.Write([string][char]27 + '[?25h' + \"`r\"); exit 7"
+    } else {
+        "printf '\\033[?25h\\r' >&2; exit 7"
+    };
     let noisy = registry.execute(
         OperatingMode::Auto,
         std::env::temp_dir(),
         "shell",
         &serde_json::json!({
-            "command": "[Console]::Error.Write([string][char]27 + '[?25h' + \"`r\"); exit 7"
+            "command": noisy_command
         })
         .to_string(),
     );

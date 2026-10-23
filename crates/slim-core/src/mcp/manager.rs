@@ -16,6 +16,7 @@ use crate::mcp::spec::{
 };
 use crate::mcp::stdio::StdioConnection;
 use crate::process::ExecutableResolver;
+use crate::sync::{lock_mutex, read_lock, write_lock};
 
 mod discovery;
 mod resources;
@@ -45,9 +46,7 @@ pub struct McpStartupWait {
 
 /// Header/env values, OAuth tokens and client secrets of every server.
 fn collect_sensitive_values(servers: &RwLock<BTreeMap<String, Arc<ServerEntry>>>) -> Vec<String> {
-    servers
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    read_lock(servers)
         .values()
         .flat_map(|entry| {
             let mut values: Vec<String> =
@@ -196,24 +195,16 @@ impl McpManager {
             startup_pending: AtomicBool::new(false),
             spec,
         });
-        self.servers
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(entry.spec.name.clone(), entry);
+        write_lock(&self.servers).insert(entry.spec.name.clone(), entry);
         self.bump();
     }
 
     pub fn is_empty(&self) -> bool {
-        self.servers
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty()
+        read_lock(&self.servers).is_empty()
     }
 
     pub fn has_enabled_servers(&self) -> bool {
-        self.servers
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        read_lock(&self.servers)
             .values()
             .any(|entry| entry.spec.enabled)
     }
@@ -257,10 +248,7 @@ impl McpManager {
             return 0;
         };
         let cancellation = {
-            let mut slot = self
-                .startup_cancel
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut slot = lock_mutex(&self.startup_cancel);
             match slot.as_ref() {
                 Some(existing) if !existing.is_cancelled() => existing.clone(),
                 _ => {
@@ -270,13 +258,7 @@ impl McpManager {
                 }
             }
         };
-        let entries: Vec<Arc<ServerEntry>> = self
-            .servers
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .cloned()
-            .collect();
+        let entries: Vec<Arc<ServerEntry>> = read_lock(&self.servers).values().cloned().collect();
         let mut started = 0;
         for entry in entries {
             if !entry.wants_startup_connect() || entry.startup_pending.swap(true, Ordering::AcqRel)
@@ -310,18 +292,14 @@ impl McpManager {
     /// from the moment its connect is scheduled, before the task has marked
     /// it `Connecting`, so this is the reliable "still settling" signal.
     pub fn startup_in_progress(&self) -> bool {
-        self.servers
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        read_lock(&self.servers)
             .values()
             .any(|entry| entry.startup_pending.load(Ordering::Acquire))
     }
 
     /// Direct-exposure servers whose background connect has not ended.
     fn pending_direct_servers(&self) -> Vec<String> {
-        self.servers
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        read_lock(&self.servers)
             .values()
             .filter(|entry| {
                 entry.spec.options.has_direct_tools()
@@ -362,9 +340,7 @@ impl McpManager {
     }
 
     fn entry(&self, name: &str) -> Result<Arc<ServerEntry>, McpError> {
-        self.servers
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        read_lock(&self.servers)
             .get(name)
             .cloned()
             .ok_or_else(|| McpError::UnknownServer(name.to_owned()))
@@ -372,34 +348,21 @@ impl McpManager {
 
     fn set_status(entry: &ServerEntry, status: McpServerStatus) {
         if let McpServerStatus::Ready { tools } = &status {
-            *entry
-                .last_tools
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(tools));
+            *write_lock(&entry.last_tools) = Some(Arc::clone(tools));
         }
         // What the server reported belongs to the live connection only.
         if !matches!(status, McpServerStatus::Ready { .. }) {
-            *entry
-                .handshake
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            *write_lock(&entry.handshake) = None;
         }
-        *entry
-            .status
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = status;
+        *write_lock(&entry.status) = status;
     }
 
     /// What the connected server reported in `initialize` (protocol version,
     /// identity, capabilities, instructions); `None` while not connected.
     pub fn handshake(&self, server: &str) -> Option<Arc<McpServerHandshake>> {
-        self.entry(server).ok().and_then(|entry| {
-            entry
-                .handshake
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone()
-        })
+        self.entry(server)
+            .ok()
+            .and_then(|entry| read_lock(&entry.handshake).clone())
     }
 
     /// True once after the server announced
@@ -423,10 +386,7 @@ impl McpManager {
     pub fn reconcile(&self, specs: BTreeMap<String, McpServerSpec>) {
         let mut replaced: Vec<Arc<ServerEntry>> = Vec::new();
         {
-            let mut servers = self
-                .servers
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut servers = write_lock(&self.servers);
             let current: Vec<String> = servers.keys().cloned().collect();
             for name in &current {
                 match specs.get(name) {
@@ -459,9 +419,7 @@ impl McpManager {
     }
 
     pub fn statuses(&self) -> Vec<McpServerInfo> {
-        self.servers
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        read_lock(&self.servers)
             .values()
             .map(|entry| McpServerInfo {
                 name: entry.spec.name.clone(),
@@ -470,16 +428,8 @@ impl McpManager {
                 enabled: entry.spec.enabled,
                 description: entry.spec.options.description.clone(),
                 exposure: entry.spec.options.exposure,
-                status: entry
-                    .status
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone(),
-                handshake: entry
-                    .handshake
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone(),
+                status: read_lock(&entry.status).clone(),
+                handshake: read_lock(&entry.handshake).clone(),
             })
             .collect()
     }
@@ -503,10 +453,7 @@ impl McpManager {
         cancellation: McpCancellation,
     ) -> McpRequestOutcome<Arc<Vec<McpToolSummary>>> {
         if cancellation.is_cancelled() {
-            return McpRequestOutcome::InterruptedBeforeSend {
-                interruption: McpInterruption::Cancelled,
-                cleanup: McpCleanupStatus::NotRequired,
-            };
+            return McpRequestOutcome::cancelled_before_send();
         }
         let entry = match self.entry(server) {
             Ok(entry) => entry,
@@ -515,36 +462,13 @@ impl McpManager {
         let (connection, generation) = match self
             .ensure_connected_cancellable(&entry, cancellation.clone())
             .await
+            .pass()
         {
-            McpRequestOutcome::Completed(Ok(connection)) => connection,
-            McpRequestOutcome::Completed(Err(error)) => {
-                return McpRequestOutcome::Completed(Err(error));
-            }
-            McpRequestOutcome::InterruptedBeforeSend {
-                interruption,
-                cleanup,
-            } => {
-                return McpRequestOutcome::InterruptedBeforeSend {
-                    interruption,
-                    cleanup,
-                };
-            }
-            McpRequestOutcome::OutcomeUncertain {
-                interruption,
-                cleanup,
-            } => {
-                return McpRequestOutcome::OutcomeUncertain {
-                    interruption,
-                    cleanup,
-                };
-            }
+            Ok(connected) => connected,
+            Err(outcome) => return outcome,
         };
         let stale = connection.take_tools_stale();
-        let cached = entry
-            .status
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let cached = read_lock(&entry.status).clone();
         if let McpServerStatus::Ready { tools } = &cached {
             if !stale {
                 return McpRequestOutcome::Completed(Ok(Arc::clone(tools)));
@@ -591,48 +515,28 @@ impl McpManager {
                 if cancellation.is_cancelled() {
                     return McpRequestOutcome::Completed(Err(error));
                 }
-                match self
+                let (reconnected, reconnected_generation) = match self
                     .ensure_connected_cancellable(&entry, cancellation)
                     .await
+                    .pass()
                 {
-                    McpRequestOutcome::Completed(Ok((reconnected, reconnected_generation))) => {
-                        let slot = entry.connection.lock().await;
-                        if entry.generation.load(Ordering::Acquire) == reconnected_generation
-                            && slot
-                                .as_ref()
-                                .is_some_and(|current| Arc::ptr_eq(current, &reconnected))
-                        {
-                            match &*entry
-                                .status
-                                .read()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            {
-                                McpServerStatus::Ready { tools } => {
-                                    McpRequestOutcome::Completed(Ok(Arc::clone(tools)))
-                                }
-                                _ => McpRequestOutcome::Completed(Err(McpError::Closed)),
-                            }
-                        } else {
-                            McpRequestOutcome::Completed(Err(McpError::Closed))
+                    Ok(reconnected) => reconnected,
+                    Err(outcome) => return outcome,
+                };
+                let slot = entry.connection.lock().await;
+                if entry.generation.load(Ordering::Acquire) == reconnected_generation
+                    && slot
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &reconnected))
+                {
+                    match &*read_lock(&entry.status) {
+                        McpServerStatus::Ready { tools } => {
+                            McpRequestOutcome::Completed(Ok(Arc::clone(tools)))
                         }
+                        _ => McpRequestOutcome::Completed(Err(McpError::Closed)),
                     }
-                    McpRequestOutcome::Completed(Err(reconnect_error)) => {
-                        McpRequestOutcome::Completed(Err(reconnect_error))
-                    }
-                    McpRequestOutcome::InterruptedBeforeSend {
-                        interruption,
-                        cleanup,
-                    } => McpRequestOutcome::InterruptedBeforeSend {
-                        interruption,
-                        cleanup,
-                    },
-                    McpRequestOutcome::OutcomeUncertain {
-                        interruption,
-                        cleanup,
-                    } => McpRequestOutcome::OutcomeUncertain {
-                        interruption,
-                        cleanup,
-                    },
+                } else {
+                    McpRequestOutcome::Completed(Err(McpError::Closed))
                 }
             }
             McpRequestOutcome::InterruptedBeforeSend {
@@ -647,23 +551,12 @@ impl McpManager {
                     cleanup,
                 }
             }
-            McpRequestOutcome::InterruptedBeforeSend {
-                interruption,
-                cleanup,
-            } => {
+            outcome @ (McpRequestOutcome::InterruptedBeforeSend { .. }
+            | McpRequestOutcome::Completed(Err(_))) => {
                 if stale {
                     connection.mark_tools_stale();
                 }
-                McpRequestOutcome::InterruptedBeforeSend {
-                    interruption,
-                    cleanup,
-                }
-            }
-            McpRequestOutcome::Completed(Err(error)) => {
-                if stale {
-                    connection.mark_tools_stale();
-                }
-                McpRequestOutcome::Completed(Err(error))
+                outcome
             }
         }
     }
@@ -729,29 +622,13 @@ impl McpManager {
         {
             return McpRequestOutcome::Completed(Err(error));
         }
-        let tools = match self.list_tools_cancellable(server, cancellation).await {
-            McpRequestOutcome::Completed(Ok(tools)) => tools,
-            McpRequestOutcome::Completed(Err(error)) => {
-                return McpRequestOutcome::Completed(Err(error));
-            }
-            McpRequestOutcome::InterruptedBeforeSend {
-                interruption,
-                cleanup,
-            } => {
-                return McpRequestOutcome::InterruptedBeforeSend {
-                    interruption,
-                    cleanup,
-                };
-            }
-            McpRequestOutcome::OutcomeUncertain {
-                interruption,
-                cleanup,
-            } => {
-                return McpRequestOutcome::OutcomeUncertain {
-                    interruption,
-                    cleanup,
-                };
-            }
+        let tools = match self
+            .list_tools_cancellable(server, cancellation)
+            .await
+            .pass()
+        {
+            Ok(tools) => tools,
+            Err(outcome) => return outcome,
         };
         let Some(tool) = tools.iter().find(|candidate| candidate.name == tool) else {
             return McpRequestOutcome::Completed(Err(McpError::Protocol(format!(
@@ -810,10 +687,7 @@ impl McpManager {
         progress: Option<McpProgressSink>,
     ) -> McpRequestOutcome<Value> {
         if cancellation.is_cancelled() {
-            return McpRequestOutcome::InterruptedBeforeSend {
-                interruption: McpInterruption::Cancelled,
-                cleanup: McpCleanupStatus::NotRequired,
-            };
+            return McpRequestOutcome::cancelled_before_send();
         }
         if !arguments.is_object() {
             return McpRequestOutcome::Completed(Err(McpError::Protocol(
@@ -832,19 +706,6 @@ impl McpManager {
             .ensure_connected_cancellable(&entry, cancellation.clone())
             .await
         {
-            McpRequestOutcome::Completed(Ok(connection)) => connection,
-            McpRequestOutcome::Completed(Err(error)) => {
-                return McpRequestOutcome::Completed(Err(error));
-            }
-            McpRequestOutcome::InterruptedBeforeSend {
-                interruption,
-                cleanup,
-            } => {
-                return McpRequestOutcome::InterruptedBeforeSend {
-                    interruption,
-                    cleanup,
-                };
-            }
             McpRequestOutcome::OutcomeUncertain {
                 interruption,
                 cleanup,
@@ -856,13 +717,14 @@ impl McpManager {
                     cleanup,
                 };
             }
+            connected => match connected.pass() {
+                Ok(connected) => connected,
+                Err(outcome) => return outcome,
+            },
         };
 
         if cancellation.is_cancelled() {
-            return McpRequestOutcome::InterruptedBeforeSend {
-                interruption: McpInterruption::Cancelled,
-                cleanup: McpCleanupStatus::NotRequired,
-            };
+            return McpRequestOutcome::cancelled_before_send();
         }
         let progress = progress.unwrap_or_else(|| Arc::new(|_| {}));
         let outcome = connection
@@ -873,13 +735,27 @@ impl McpManager {
                 Some(progress),
             )
             .await;
+        self.settle_request(&entry, generation, &connection, outcome)
+            .await
+    }
+
+    /// Transport clean-up every manager request performs once its outcome is
+    /// known: a connection that was lost, or a request cancelled after it may
+    /// have been sent, drops the connection so the next use starts a fresh one.
+    async fn settle_request(
+        &self,
+        entry: &Arc<ServerEntry>,
+        generation: u64,
+        connection: &Arc<dyn McpConnection>,
+        outcome: McpRequestOutcome<Value>,
+    ) -> McpRequestOutcome<Value> {
         match outcome {
             McpRequestOutcome::OutcomeUncertain {
                 interruption,
                 cleanup,
             } => {
                 let cleanup = merge_cleanup(cleanup, connection.close_for_cleanup().await);
-                self.disconnect_if_generation(&entry, generation, &connection)
+                self.disconnect_if_generation(entry, generation, connection)
                     .await;
                 McpRequestOutcome::OutcomeUncertain {
                     interruption,
@@ -888,7 +764,7 @@ impl McpManager {
             }
             McpRequestOutcome::Completed(Err(error)) if connection.is_closed() => {
                 let _ = connection.close_for_cleanup().await;
-                self.disconnect_if_generation(&entry, generation, &connection)
+                self.disconnect_if_generation(entry, generation, connection)
                     .await;
                 McpRequestOutcome::Completed(Err(error))
             }
@@ -897,7 +773,7 @@ impl McpManager {
                 cleanup,
             } if connection.is_closed() => {
                 let cleanup = merge_cleanup(cleanup, connection.close_for_cleanup().await);
-                self.disconnect_if_generation(&entry, generation, &connection)
+                self.disconnect_if_generation(entry, generation, connection)
                     .await;
                 McpRequestOutcome::InterruptedBeforeSend {
                     interruption,
@@ -908,10 +784,10 @@ impl McpManager {
             // has to sign in: the entry shows it and the next use starts a
             // fresh connection (which may find new credentials).
             McpRequestOutcome::Completed(Err(McpError::AuthRequired(reason))) => {
-                self.disconnect_if_generation(&entry, generation, &connection)
+                self.disconnect_if_generation(entry, generation, connection)
                     .await;
                 Self::set_status(
-                    &entry,
+                    entry,
                     McpServerStatus::NeedsAuth {
                         reason: reason.clone(),
                     },
@@ -950,11 +826,7 @@ impl McpManager {
     }
 
     pub fn remove(&self, name: &str) -> bool {
-        let removed = self
-            .servers
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(name);
+        let removed = write_lock(&self.servers).remove(name);
         if let Some(entry) = removed {
             entry.retire();
             drop_detached(entry);
@@ -970,10 +842,7 @@ impl McpManager {
     pub fn upsert(&self, spec: McpServerSpec) {
         let replaced;
         {
-            let mut servers = self
-                .servers
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut servers = write_lock(&self.servers);
             if servers
                 .get(&spec.name)
                 .is_some_and(|existing| existing.spec == spec)
@@ -995,21 +864,10 @@ impl McpManager {
     /// `ensure_connected` instead of publishing a connection.
     pub async fn disconnect_all(&self) {
         // Background connects of this session stop with it.
-        if let Some(cancellation) = self
-            .startup_cancel
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
+        if let Some(cancellation) = lock_mutex(&self.startup_cancel).take() {
             cancellation.cancel();
         }
-        let entries: Vec<Arc<ServerEntry>> = self
-            .servers
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .cloned()
-            .collect();
+        let entries: Vec<Arc<ServerEntry>> = read_lock(&self.servers).values().cloned().collect();
         let mut taken_connections = Vec::new();
         for entry in entries {
             entry.generation.fetch_add(1, Ordering::AcqRel);
@@ -1040,10 +898,7 @@ impl McpManager {
         cancellation: McpCancellation,
     ) -> McpRequestOutcome<(Arc<dyn McpConnection>, u64)> {
         if cancellation.is_cancelled() {
-            return McpRequestOutcome::InterruptedBeforeSend {
-                interruption: McpInterruption::Cancelled,
-                cleanup: McpCleanupStatus::NotRequired,
-            };
+            return McpRequestOutcome::cancelled_before_send();
         }
         if !entry.spec.enabled {
             Self::set_status(entry, McpServerStatus::Disabled);
@@ -1061,18 +916,12 @@ impl McpManager {
         let mut slot = tokio::select! {
             biased;
             _ = cancellation.cancelled() => {
-                return McpRequestOutcome::InterruptedBeforeSend {
-                    interruption: McpInterruption::Cancelled,
-                    cleanup: McpCleanupStatus::NotRequired,
-                };
+                return McpRequestOutcome::cancelled_before_send();
             }
             slot = entry.connection.lock() => slot,
         };
         if cancellation.is_cancelled() {
-            return McpRequestOutcome::InterruptedBeforeSend {
-                interruption: McpInterruption::Cancelled,
-                cleanup: McpCleanupStatus::NotRequired,
-            };
+            return McpRequestOutcome::cancelled_before_send();
         }
         let mut generation = entry.generation.load(Ordering::Acquire);
         if let Some(connection) = slot.as_ref() {
@@ -1114,10 +963,7 @@ impl McpManager {
                     };
                 }
                 Self::set_status(entry, McpServerStatus::Ready { tools });
-                *entry
-                    .handshake
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handshake);
+                *write_lock(&entry.handshake) = Some(handshake);
                 *slot = Some(Arc::clone(&connection));
                 self.bump();
                 McpRequestOutcome::Completed(Ok((connection, generation)))
@@ -1217,10 +1063,7 @@ impl Drop for McpManager {
     fn drop(&mut self) {
         // Dropping each entry drops its connection, whose Drop terminates the
         // child process tree; no async needed.
-        self.servers
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        write_lock(&self.servers).clear();
     }
 }
 
@@ -1243,13 +1086,7 @@ impl ServerEntry {
             && self.spec.options.block.is_none()
             && !self.spec.options.lazy
             && !self.spec.options.fully_hidden()
-            && matches!(
-                *self
-                    .status
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                McpServerStatus::Disconnected
-            )
+            && matches!(*read_lock(&self.status), McpServerStatus::Disconnected)
     }
 
     /// An entry that left the server set: a connect still in flight for it
@@ -1408,10 +1245,7 @@ async fn connect_cancellable(
         tokio::select! {
             biased;
             () = cancellation.cancelled() => {
-                return McpRequestOutcome::InterruptedBeforeSend {
-                    interruption: McpInterruption::Cancelled,
-                    cleanup: McpCleanupStatus::NotRequired,
-                };
+                return McpRequestOutcome::cancelled_before_send();
             }
             () = tokio::time::sleep(*delay) => {}
         }
@@ -1471,43 +1305,21 @@ async fn connect_once_cancellable(
             cancellation.clone(),
         )
         .await;
-    let handshake = match initialized {
-        McpRequestOutcome::Completed(Ok(result)) => {
-            match McpServerHandshake::from_initialize(&result) {
-                Ok(handshake) => Arc::new(handshake),
-                Err(error) => {
-                    let _ = connection.close_for_cleanup().await;
-                    return McpRequestOutcome::Completed(Err(error));
-                }
-            }
-        }
-        McpRequestOutcome::Completed(Err(error)) => {
+    let result = match close_after_connect_step(
+        connection.as_ref(),
+        initialized,
+        ConnectStep::Request,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(outcome) => return outcome,
+    };
+    let handshake = match McpServerHandshake::from_initialize(&result) {
+        Ok(handshake) => Arc::new(handshake),
+        Err(error) => {
             let _ = connection.close_for_cleanup().await;
             return McpRequestOutcome::Completed(Err(error));
-        }
-        McpRequestOutcome::InterruptedBeforeSend {
-            interruption,
-            cleanup,
-        } => {
-            let cleanup = merge_cleanup(cleanup, connection.close_for_cleanup().await);
-            return McpRequestOutcome::InterruptedBeforeSend {
-                interruption,
-                cleanup,
-            };
-        }
-        McpRequestOutcome::OutcomeUncertain {
-            interruption,
-            cleanup,
-        } => {
-            let closed = handshake_closed(connection.as_ref(), &interruption).await;
-            let cleanup = merge_cleanup(cleanup, connection.close_for_cleanup().await);
-            if let Some(error) = closed {
-                return McpRequestOutcome::Completed(Err(error));
-            }
-            return McpRequestOutcome::OutcomeUncertain {
-                interruption,
-                cleanup,
-            };
         }
     };
     // The negotiated revision is what later HTTP requests announce.
@@ -1519,35 +1331,13 @@ async fn connect_once_cancellable(
             cleanup,
         };
     }
-    match connection
+    let notified = connection
         .notify_cancellable("notifications/initialized", json!({}), cancellation.clone())
-        .await
+        .await;
+    if let Err(outcome) =
+        close_after_connect_step(connection.as_ref(), notified, ConnectStep::Notification).await
     {
-        McpRequestOutcome::Completed(Ok(())) => {}
-        McpRequestOutcome::Completed(Err(error)) => {
-            let _ = connection.close_for_cleanup().await;
-            return McpRequestOutcome::Completed(Err(error));
-        }
-        McpRequestOutcome::InterruptedBeforeSend {
-            interruption,
-            cleanup,
-        } => {
-            let cleanup = merge_cleanup(cleanup, connection.close_for_cleanup().await);
-            return McpRequestOutcome::InterruptedBeforeSend {
-                interruption,
-                cleanup,
-            };
-        }
-        McpRequestOutcome::OutcomeUncertain {
-            interruption,
-            cleanup,
-        } => {
-            let cleanup = merge_cleanup(cleanup, connection.close_for_cleanup().await);
-            return McpRequestOutcome::InterruptedBeforeSend {
-                interruption,
-                cleanup,
-            };
-        }
+        return outcome;
     }
     // A server that does not declare the tools capability does not answer
     // `tools/list`; skipping it keeps resource-only servers connectable.
@@ -1556,44 +1346,78 @@ async fn connect_once_cancellable(
     } else {
         McpRequestOutcome::Completed(Ok(Arc::new(Vec::new())))
     };
-    match tools {
-        McpRequestOutcome::Completed(Ok(_tools)) if cancellation.is_cancelled() => {
-            let cleanup = connection.close_for_cleanup().await;
-            McpRequestOutcome::InterruptedBeforeSend {
-                interruption: McpInterruption::Cancelled,
-                cleanup,
-            }
-        }
-        McpRequestOutcome::Completed(Ok(tools)) => {
-            McpRequestOutcome::Completed(Ok((connection, tools, handshake)))
-        }
+    let tools =
+        match close_after_connect_step(connection.as_ref(), tools, ConnectStep::Request).await {
+            Ok(tools) => tools,
+            Err(outcome) => return outcome,
+        };
+    if cancellation.is_cancelled() {
+        let cleanup = connection.close_for_cleanup().await;
+        return McpRequestOutcome::InterruptedBeforeSend {
+            interruption: McpInterruption::Cancelled,
+            cleanup,
+        };
+    }
+    McpRequestOutcome::Completed(Ok((connection, tools, handshake)))
+}
+
+/// Where in the connect handshake an outcome came from; it decides how an
+/// uncertain outcome is classified.
+#[derive(Clone, Copy)]
+enum ConnectStep {
+    /// `initialize` and `tools/list`: a server closing the connection mid-request
+    /// is a failed connect, and any other cut-short request stays uncertain.
+    Request,
+    /// `notifications/initialized`: the tool the user asked for was not
+    /// admitted yet, so an uncertain outcome counts as interrupted before send.
+    Notification,
+}
+
+/// The value of a handshake step, or the connect outcome after closing the
+/// connection when the step failed or was interrupted.
+async fn close_after_connect_step<T, U>(
+    connection: &dyn McpConnection,
+    outcome: McpRequestOutcome<T>,
+    step: ConnectStep,
+) -> Result<T, McpRequestOutcome<U>> {
+    match outcome {
+        McpRequestOutcome::Completed(Ok(value)) => Ok(value),
         McpRequestOutcome::Completed(Err(error)) => {
             let _ = connection.close_for_cleanup().await;
-            McpRequestOutcome::Completed(Err(error))
+            Err(McpRequestOutcome::Completed(Err(error)))
         }
         McpRequestOutcome::InterruptedBeforeSend {
             interruption,
             cleanup,
         } => {
             let cleanup = merge_cleanup(cleanup, connection.close_for_cleanup().await);
-            McpRequestOutcome::InterruptedBeforeSend {
+            Err(McpRequestOutcome::InterruptedBeforeSend {
                 interruption,
                 cleanup,
-            }
+            })
         }
         McpRequestOutcome::OutcomeUncertain {
             interruption,
             cleanup,
         } => {
-            let closed = handshake_closed(connection.as_ref(), &interruption).await;
+            let closed = match step {
+                ConnectStep::Request => handshake_closed(connection, &interruption).await,
+                ConnectStep::Notification => None,
+            };
             let cleanup = merge_cleanup(cleanup, connection.close_for_cleanup().await);
             if let Some(error) = closed {
-                return McpRequestOutcome::Completed(Err(error));
+                return Err(McpRequestOutcome::Completed(Err(error)));
             }
-            McpRequestOutcome::OutcomeUncertain {
-                interruption,
-                cleanup,
-            }
+            Err(match step {
+                ConnectStep::Request => McpRequestOutcome::OutcomeUncertain {
+                    interruption,
+                    cleanup,
+                },
+                ConnectStep::Notification => McpRequestOutcome::InterruptedBeforeSend {
+                    interruption,
+                    cleanup,
+                },
+            })
         }
     }
 }
@@ -1625,10 +1449,7 @@ async fn fetch_tools_pages_cancellable(
     let mut seen_cursors = std::collections::HashSet::new();
     for _ in 0..MAX_TOOLS_PAGES {
         if cancellation.is_cancelled() {
-            return McpRequestOutcome::InterruptedBeforeSend {
-                interruption: McpInterruption::Cancelled,
-                cleanup: McpCleanupStatus::NotRequired,
-            };
+            return McpRequestOutcome::cancelled_before_send();
         }
         let params = if cursor.is_null() {
             json!({})
@@ -1638,29 +1459,10 @@ async fn fetch_tools_pages_cancellable(
         let response = match connection
             .request_cancellable("tools/list", params, cancellation.clone())
             .await
+            .pass()
         {
-            McpRequestOutcome::Completed(Ok(response)) => response,
-            McpRequestOutcome::Completed(Err(error)) => {
-                return McpRequestOutcome::Completed(Err(error));
-            }
-            McpRequestOutcome::InterruptedBeforeSend {
-                interruption,
-                cleanup,
-            } => {
-                return McpRequestOutcome::InterruptedBeforeSend {
-                    interruption,
-                    cleanup,
-                };
-            }
-            McpRequestOutcome::OutcomeUncertain {
-                interruption,
-                cleanup,
-            } => {
-                return McpRequestOutcome::OutcomeUncertain {
-                    interruption,
-                    cleanup,
-                };
-            }
+            Ok(response) => response,
+            Err(outcome) => return outcome,
         };
         let Some(tools) = response.get("tools").and_then(Value::as_array) else {
             return McpRequestOutcome::Completed(Err(McpError::Protocol(

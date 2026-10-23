@@ -8,6 +8,7 @@ mod exit_codes;
 mod headless;
 mod mcp;
 mod mcp_cli;
+mod opencode_catalog;
 pub mod oauth;
 pub mod open_design_catalog;
 pub mod opencode_go_catalog;
@@ -58,10 +59,13 @@ pub(crate) fn provider_compatible_model(
     kind: slim_core::provider::ProviderKind,
     model: &str,
 ) -> bool {
-    use slim_core::provider::{open_code_model, zen_model, ProviderKind};
-    use slim_tui::api::ModelAlias;
+    use slim_core::provider::{codex_model, open_code_model, zen_model, ProviderKind};
     match kind {
-        ProviderKind::OpenAiCodex => ModelAlias::parse(model).is_some(),
+        // The bundled Codex list plus the account's fetched catalog: a model
+        // newer than this release must not be rejected as foreign.
+        ProviderKind::OpenAiCodex => {
+            codex_model(model).is_some() || crate::codex_catalog::known_codex_model(model)
+        }
         ProviderKind::OpenCodeGo => open_code_model(model).is_some(),
         ProviderKind::OpenCodeZen => zen_model(model).is_some(),
         ProviderKind::ClinePass => slim_core::provider::is_clinepass_model_id(model),
@@ -108,20 +112,25 @@ mod provider_model_tests {
     }
 
     #[test]
-    fn codex_accepts_aliases_only() {
-        assert!(provider_compatible_model(
-            ProviderKind::OpenAiCodex,
-            "astra"
-        ));
-        assert!(provider_compatible_model(
-            ProviderKind::OpenAiCodex,
-            "gpt-6-astra"
-        ));
+    fn codex_accepts_bundled_and_account_catalog_ids() {
         assert!(provider_compatible_model(ProviderKind::OpenAiCodex, "luna"));
         assert!(provider_compatible_model(
             ProviderKind::OpenAiCodex,
             "gpt-5.6-terra"
         ));
+        // Retired subscription models are rejected instead of sent.
+        assert!(!provider_compatible_model(
+            ProviderKind::OpenAiCodex,
+            "astra"
+        ));
+        assert!(!provider_compatible_model(
+            ProviderKind::OpenAiCodex,
+            "gpt-6.1-sol"
+        ));
+        assert_eq!(
+            crate::canonical_provider_model(ProviderKind::OpenAiCodex, "SOL"),
+            "gpt-5.6-sol"
+        );
         assert!(!provider_compatible_model(
             ProviderKind::OpenAiCodex,
             "deepseek-v4-flash"

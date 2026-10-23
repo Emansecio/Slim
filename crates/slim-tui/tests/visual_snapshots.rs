@@ -265,10 +265,12 @@ fn scenes() -> Vec<(&'static str, AppState, u16, u16)> {
             KeyModifiers::NONE,
         );
     }
-    // The effort step of a Codex alias, with the speed toggle it owns.
+    // The effort step of a Codex model, with the speed toggle it owns.
     let mut effort = connected();
-    effort.effort_overlay = Some(slim_tui::app::EffortOverlay::for_alias(
-        slim_tui::api::ModelAlias::ALL[0],
+    let alias = slim_tui::api::ModelAlias::ALL[0];
+    effort.effort_overlay = Some(slim_tui::app::EffortOverlay::for_codex(
+        alias.id().into(),
+        slim_tui::api::ReasoningEffort::supported(alias).to_vec(),
         slim_tui::api::ReasoningEffort::High,
         false,
     ));

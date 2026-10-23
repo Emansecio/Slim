@@ -127,14 +127,28 @@ pub(crate) fn wait_for_runtime_signal(
 ) -> io::Result<WaitOutcome> {
     use std::os::fd::AsRawFd;
 
+    wait_for_fds(Some(std::io::stdin().as_raw_fd()), wake, timeout)
+}
+
+/// Polls `input` (when present) and the wake pipe. Takes the input fd as a
+/// parameter, like `wait_for_handles` on Windows, so a test can wait on the
+/// wake pipe alone without depending on the process's stdin.
+#[cfg(unix)]
+fn wait_for_fds(
+    input: Option<std::os::fd::RawFd>,
+    wake: &WakeSignal,
+    timeout: Option<Duration>,
+) -> io::Result<WaitOutcome> {
     // Keep the legacy 60 s cap as a defensive backstop even though callers
     // armed the signal and probed the lanes before entering.
     let timeout_ms = timeout.map_or(60_000, |value| {
         i32::try_from(value.as_millis()).unwrap_or(i32::MAX).max(0)
     });
+    // `poll` ignores negative descriptors (revents stays 0), so an absent
+    // input keeps the wake fd at index 1 without a second code path.
     let mut fds = [
         libc::pollfd {
-            fd: std::io::stdin().as_raw_fd(),
+            fd: input.unwrap_or(-1),
             events: libc::POLLIN,
             revents: 0,
         },
@@ -297,7 +311,7 @@ mod tests {
         });
 
         let started = std::time::Instant::now();
-        let outcome = wait_for_runtime_signal(&wake, Some(Duration::from_secs(2))).expect("wait");
+        let outcome = wait_for_fds(None, &wake, Some(Duration::from_secs(2))).expect("wait");
         thread.join().expect("notifier");
 
         assert_eq!(outcome, WaitOutcome::Wake);

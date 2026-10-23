@@ -1003,6 +1003,23 @@ fn new_session_reopens_in_another_process_with_tools_and_fresh_file_guards() {
     let other = Workspace::new();
     fs::write(root.0.join("state.txt"), "initial\n").unwrap();
     let session = root.0.join("session.jsonl");
+    let first_check = if cfg!(windows) {
+        "if ((Get-Content state.txt -Raw).Trim() -ne 'first') { throw 'bad state' }; Add-Content run-count.txt first"
+    } else {
+        "[ \"$(cat state.txt)\" = first ] || { echo 'bad state' >&2; exit 1; }; echo first >> run-count.txt"
+    };
+    let second_check = if cfg!(windows) {
+        "if ((Get-Content state.txt -Raw).Trim() -ne 'second') { throw 'bad state' }"
+    } else {
+        "[ \"$(cat state.txt)\" = second ] || { echo 'bad state' >&2; exit 1; }"
+    };
+    // A word of `first_check` that the folded TUI frame must not show and the
+    // expanded call must.
+    let first_check_token = if cfg!(windows) {
+        "Add-Content"
+    } else {
+        "run-count.txt"
+    };
     let (endpoint, server) = spawn_turn(vec![
         Some(tool("first-read", "read", json!({"path":"state.txt"}))),
         Some(tool(
@@ -1013,7 +1030,7 @@ fn new_session_reopens_in_another_process_with_tools_and_fresh_file_guards() {
         Some(tool(
             "first-check",
             "shell",
-            json!({"command":"if ((Get-Content state.txt -Raw).Trim() -ne 'first') { throw 'bad state' }; Add-Content run-count.txt first","yield_ms":10000}),
+            json!({"command":first_check,"yield_ms":10000}),
         )),
         None,
     ]);
@@ -1054,7 +1071,7 @@ fn new_session_reopens_in_another_process_with_tools_and_fresh_file_guards() {
         Some(tool(
             "second-check",
             "shell",
-            json!({"command":"if ((Get-Content state.txt -Raw).Trim() -ne 'second') { throw 'bad state' }","yield_ms":10000}),
+            json!({"command":second_check,"yield_ms":10000}),
         )),
         None,
     ]);
@@ -1170,7 +1187,7 @@ fn new_session_reopens_in_another_process_with_tools_and_fresh_file_guards() {
         2,
         "both final answers must remain visible alongside the restored tools: {frame}"
     );
-    assert!(!frame.contains("Add-Content"));
+    assert!(!frame.contains(first_check_token));
     // A restored turn folds its calls under one row, which reaches them: the
     // first activation of a folded call opens the row, the next one opens the
     // call itself.
@@ -1193,7 +1210,7 @@ fn new_session_reopens_in_another_process_with_tools_and_fresh_file_guards() {
     let frame = slim_tui::render::render(&app, 140, 100).lines.join("\n");
     assert!(
         frame.contains("Arguments:")
-            && frame.contains("Add-Content")
+            && frame.contains(first_check_token)
             && frame.contains("Result (saved):"),
         "{frame}"
     );
@@ -1308,10 +1325,15 @@ fn interrupted_process_after_side_effect_cannot_resume_or_replay_it() {
             };
             let request = read_request(&mut stream);
             if turn == 0 {
+                let command = if cfg!(windows) {
+                    "Add-Content crash-marker.txt completed; Write-Output 'durable-receipt-42'"
+                } else {
+                    "echo completed >> crash-marker.txt; echo 'durable-receipt-42'"
+                };
                 let mut call = tool(
                     "side-effect",
                     "shell",
-                    json!({"command":"Add-Content crash-marker.txt completed; Write-Output 'durable-receipt-42'","yield_ms":10000}),
+                    json!({"command":command,"yield_ms":10000}),
                 );
                 call["index"] = json!(0);
                 let chunk = json!({"choices":[{"delta":{"tool_calls":[call]},"finish_reason":"tool_calls"}]});

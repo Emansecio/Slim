@@ -516,6 +516,11 @@ fn cancellation_during_tool_closes_the_tool_lifecycle_and_preserves_next_seq() {
         let mut stream = accept_with_deadline(&listener);
         let mut request = [0_u8; 16 * 1024];
         let _ = stream.read(&mut request).expect("request");
+        let command = if cfg!(windows) {
+            "Start-Sleep -Milliseconds 5000"
+        } else {
+            "sleep 5"
+        };
         let tool = json!({
             "choices": [{
                 "delta": {
@@ -524,7 +529,7 @@ fn cancellation_during_tool_closes_the_tool_lifecycle_and_preserves_next_seq() {
                         "id": "slow-shell-1",
                         "function": {
                             "name": "shell",
-                            "arguments": json!({"command": "Start-Sleep -Milliseconds 5000"}).to_string()
+                            "arguments": json!({"command": command}).to_string()
                         }
                     }]
                 }

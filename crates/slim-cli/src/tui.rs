@@ -1,6 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -24,7 +25,7 @@ use slim_core::{
 };
 use slim_tui::api::{
     ClinePassCatalogSource, CommandCodeCatalogSource, ContentHandle, ContentRequestId,
-    InteractionRequestId, LoginProvider, McpServerView, McpStatusView, ModelAlias,
+    CodexCatalogSource, InteractionRequestId, LoginProvider, McpServerView, McpStatusView, ModelAlias,
     OpenCodeCatalogSource, OpenCodeModelView, OpenDesignCatalogSource, PageCursor, PromptAdmission,
     ReasoningEffort, ToolBatchId, ToolCallId, TranscriptMessage, TranscriptRole, UiChannels,
     UiCommand, UiEvent, WakeSignal, ZenCatalogSource, STREAM_EVENT_CAPACITY,
@@ -80,6 +81,51 @@ impl fmt::Display for TuiError {
 }
 
 impl std::error::Error for TuiError {}
+
+/// Single-flight guard for one catalog's live refresh. A stamp taken when a
+/// refresh starts lets a superseded result be dropped instead of delivered.
+#[derive(Clone, Default)]
+struct RefreshGate {
+    inflight: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+}
+
+impl RefreshGate {
+    /// Runs `work` in the background unless a refresh is already in flight,
+    /// then hands its output to `deliver` if no newer refresh started meanwhile.
+    fn spawn<T: Send + 'static>(
+        &self,
+        work: impl Future<Output = T> + Send + 'static,
+        deliver: impl FnOnce(T) + Send + 'static,
+    ) {
+        if self.inflight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let gate = self.clone();
+        tokio::spawn(async move {
+            let result = work.await;
+            gate.inflight.store(false, Ordering::Release);
+            if gate.generation.load(Ordering::Acquire) != generation {
+                return;
+            }
+            deliver(result);
+        });
+    }
+}
+
+fn live_catalog_unavailable(label: &str, detail: impl fmt::Display) -> UiEvent {
+    UiEvent::Notification {
+        message: format!("{label} live catalog unavailable; using cache/fallback: {detail}"),
+    }
+}
+
+fn clinepass_reasoning_levels(model: &str) -> Vec<ReasoningEffort> {
+    slim_core::provider::gateway_reasoning_levels(ProviderKind::ClinePass, model)
+        .iter()
+        .filter_map(|level| ReasoningEffort::parse(level))
+        .collect()
+}
 
 struct TuiStartup {
     request: Option<ProviderRequest>,
@@ -336,16 +382,30 @@ fn system_time_nanos(time: SystemTime) -> u128 {
         .map_or(0, |duration| duration.as_nanos())
 }
 
+/// Resume gate every durable session open shares. `label` prefixes the
+/// refusal reason for the caller's audience.
+fn validate_resume_preflight(preflight: &SessionPreflight, label: &str) -> Result<(), String> {
+    super::headless::ensure_resume_preflight(preflight)
+        .map_err(|error| format!("{label}: {error}"))?;
+    slim_core::session::resume_plan_from_preflight(preflight)
+        .map_err(|error| format!("{label}: {error}"))?;
+    Ok(())
+}
+
+/// Preflight plus the resume gate for an explicit `--resume`/session path.
+fn durable_resume_preflight(path: impl AsRef<Path>) -> Result<SessionPreflight, String> {
+    let preflight = slim_core::session::preflight_session(path)
+        .map_err(|error| format!("durable resume: {error}"))?;
+    validate_resume_preflight(&preflight, "durable resume")?;
+    Ok(preflight)
+}
+
 /// Validation chain every session switch shares (automatic, by id and rewind).
-/// `label` prefixes the refusal reason for the caller's audience.
 fn selected_from_preflight(
     preflight: SessionPreflight,
     label: &str,
 ) -> Result<SelectedTuiSession, String> {
-    super::headless::ensure_resume_preflight(&preflight)
-        .map_err(|error| format!("{label}: {error}"))?;
-    slim_core::session::resume_plan_from_preflight(&preflight)
-        .map_err(|error| format!("{label}: {error}"))?;
+    validate_resume_preflight(&preflight, label)?;
     let history = resume_messages_from_preflight(&preflight).map_err(provider_error_message)?;
     Ok(SelectedTuiSession { preflight, history })
 }
@@ -640,15 +700,8 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
                 "resume requires an explicit --prompt",
             ));
         }
-        let preflight = slim_core::session::preflight_session(path).map_err(|error| {
-            TuiError::new(ExitCode::Blocked, format!("durable resume: {error}"))
-        })?;
-        super::headless::ensure_resume_preflight(&preflight).map_err(|error| {
-            TuiError::new(ExitCode::Blocked, format!("durable resume: {error}"))
-        })?;
-        slim_core::session::resume_plan_from_preflight(&preflight).map_err(|error| {
-            TuiError::new(ExitCode::Blocked, format!("durable resume: {error}"))
-        })?;
+        let preflight = durable_resume_preflight(path)
+            .map_err(|message| TuiError::new(ExitCode::Blocked, message))?;
         (Some(preflight.path.clone()), Some(preflight))
     } else {
         (None, None)
@@ -676,6 +729,7 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
             },
         )
     })?;
+    let run_limits = layered_config.run_limits();
     let compaction_policy = layered_config
         .compaction_policy()
         .map_err(|error| TuiError::new(ExitCode::Internal, format!("config error: {error}")))?;
@@ -707,30 +761,13 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
 
     let (mut request, oauth_session) = if let Some(provider_name) = explicit_provider {
         let kind = provider_kind(&provider_name)?;
-        let api_request = api_key_request(
+        request_for_kind(
             kind,
             parsed.mode,
             endpoint_override.as_deref(),
             model_override.as_deref(),
-        )?;
-        if api_request.is_some() {
-            (api_request, None)
-        } else if let Some((provider, credential)) = oauth
-            .active()
-            .map_err(tui_auth_error)?
-            .filter(|(provider, _)| provider_kind_for_oauth(*provider) == kind)
-        {
-            let request = oauth_request(
-                provider,
-                &credential,
-                parsed.mode,
-                endpoint_override.as_deref(),
-                model_override.as_deref(),
-            )?;
-            (Some(request), Some((provider, credential)))
-        } else {
-            (None, None)
-        }
+            || oauth.active().map_err(tui_auth_error),
+        )?
     } else if let Some(request) = api_key_request(
         ProviderKind::OpenAiCompatible,
         parsed.mode,
@@ -743,28 +780,13 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
         let active_oauth = oauth.active().map_err(tui_auth_error)?;
         if let Some(provider_name) = active_provider {
             let kind = provider_kind(&provider_name)?;
-            let api_request = api_key_request(
+            request_for_kind(
                 kind,
                 parsed.mode,
                 endpoint_override.as_deref(),
                 model_override.as_deref(),
-            )?;
-            if api_request.is_some() {
-                (api_request, None)
-            } else if let Some((provider, credential)) =
-                active_oauth.filter(|(provider, _)| provider_kind_for_oauth(*provider) == kind)
-            {
-                let request = oauth_request(
-                    provider,
-                    &credential,
-                    parsed.mode,
-                    endpoint_override.as_deref(),
-                    model_override.as_deref(),
-                )?;
-                (Some(request), Some((provider, credential)))
-            } else {
-                (None, None)
-            }
+                || Ok(active_oauth),
+            )?
         } else if let Some((provider, credential)) = active_oauth {
             let request = oauth_request(
                 provider,
@@ -785,15 +807,14 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
                 "--fast/--normal require the openai-codex provider",
             ));
         }
-        if request.kind == ProviderKind::OpenAiCodex {
-            if let Some(alias) = ModelAlias::parse(&request.model) {
-                if !ReasoningEffort::supported(alias).contains(&effort) {
-                    return Err(TuiError::new(
-                        ExitCode::InputRequired,
-                        "configured effort is unsupported by the Codex model",
-                    ));
-                }
-            }
+        if request.kind == ProviderKind::OpenAiCodex
+            && slim_core::provider::codex_model(&request.model)
+                .is_some_and(|model| !model.reasoning_levels.contains(&effort.id()))
+        {
+            return Err(TuiError::new(
+                ExitCode::InputRequired,
+                "configured effort is unsupported by the Codex model",
+            ));
         }
         if explicit_model
             .as_deref()
@@ -812,19 +833,12 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
         .filter(|request| request.kind == ProviderKind::OpenCodeGo)
         .and_then(|request| open_code_model(&request.model))
     {
-        if !model.reasoning_levels.contains(&effort.id()) {
-            if configured_effort.is_some() {
-                return Err(TuiError::new(
-                    ExitCode::InputRequired,
-                    "configured effort is unsupported by the OpenCode Go model",
-                ));
-            }
-            effort = model
-                .reasoning_levels
-                .iter()
-                .find_map(|level| ReasoningEffort::parse(level))
-                .unwrap_or(ReasoningEffort::High);
-        }
+        fit_effort_to_levels(
+            &mut effort,
+            model.reasoning_levels,
+            configured_effort.is_some(),
+            "OpenCode Go",
+        )?;
     }
     if let Some(model) = request
         .as_ref()
@@ -833,18 +847,13 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
     {
         // Models without reasoning levels expose no effort knob; a globally
         // configured effort is left unsent by the adapter, not an error.
-        if !model.reasoning_levels.is_empty() && !model.reasoning_levels.contains(&effort.id()) {
-            if configured_effort.is_some() {
-                return Err(TuiError::new(
-                    ExitCode::InputRequired,
-                    "configured effort is unsupported by the OpenCode Zen model",
-                ));
-            }
-            effort = model
-                .reasoning_levels
-                .iter()
-                .find_map(|level| ReasoningEffort::parse(level))
-                .unwrap_or(ReasoningEffort::High);
+        if !model.reasoning_levels.is_empty() {
+            fit_effort_to_levels(
+                &mut effort,
+                model.reasoning_levels,
+                configured_effort.is_some(),
+                "OpenCode Zen",
+            )?;
         }
     }
     let image_labels = parsed
@@ -860,9 +869,11 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
         .collect();
     let content_blocks = load_local_images(&parsed.image_paths)
         .map_err(|error| TuiError::new(ExitCode::InputRequired, format!("image: {error}")))?;
-    let mut options = ProviderRunOptions::default()
-        .with_content_blocks(content_blocks)
-        .with_compaction_handle(slim_core::context::CompactionHandle::new(compaction_policy));
+    let mut options = run_limits.apply(
+        ProviderRunOptions::default()
+            .with_content_blocks(content_blocks)
+            .with_compaction_handle(slim_core::context::CompactionHandle::new(compaction_policy)),
+    );
     options.shell_job_limits = layered_config.shell_jobs;
     options
         .shell_job_limits
@@ -876,27 +887,6 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
     }
     if let Some(manager) = application_code_intelligence {
         options = options.with_code_intelligence(manager);
-    }
-    if let Some(calls) = layered_config.max_mutating_tool_calls {
-        options = options.with_max_tool_calls(calls);
-    }
-    if let Some(calls) = layered_config.max_read_tool_calls {
-        options = options.with_max_read_tool_calls(calls);
-    }
-    if let Some(calls) = layered_config.max_total_tool_calls {
-        options = options.with_max_total_tool_calls(calls);
-    }
-    if let Some(turns) = layered_config.max_turns {
-        options = options.with_max_turns(turns);
-    }
-    if let Some(secs) = layered_config.time_budget_secs {
-        options = options.with_time_budget_secs(secs);
-    }
-    if let Some(tokens) = layered_config.max_output_tokens {
-        options = options.with_max_output_tokens(tokens);
-    }
-    if let Some(bytes) = layered_config.max_result_bytes {
-        options = options.with_max_result_bytes(bytes);
     }
     options.trust_project = parsed.trust_project;
     options.codex_fast = parsed
@@ -924,104 +914,396 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
     })
 }
 
-fn provider_kind(name: &str) -> Result<ProviderKind, TuiError> {
-    match name.to_ascii_lowercase().as_str() {
-        "openai" | "openai-compatible" | "openai_compatible" => Ok(ProviderKind::OpenAiCompatible),
-        "openai-codex" | "codex" => Ok(ProviderKind::OpenAiCodex),
-        "anthropic" | "claude" => Ok(ProviderKind::Anthropic),
-        "opencode-go" | "opencode_go" | "go" => Ok(ProviderKind::OpenCodeGo),
-        "opencode-zen" | "opencode_zen" | "zen" => Ok(ProviderKind::OpenCodeZen),
-        "clinepass" | "cline-pass" | "cp" => Ok(ProviderKind::ClinePass),
-        "command-code" | "commandcode" | "cmd" => Ok(ProviderKind::CommandCode),
-        "xai" | "grok" => Ok(ProviderKind::Xai),
-        "open-design" | "opendesign" | "od" => Ok(ProviderKind::OpenDesign),
-        _ => Err(TuiError::new(
-            ExitCode::Provider,
-            "unsupported provider; use openai-compatible, openai-codex, anthropic, opencode-go, opencode-zen, clinepass, command-code, xai, or open-design",
-        )),
+/// Keeps `effort` when the model supports it. An unsupported effort the user
+/// configured is refused; an inherited default moves to the model's first
+/// supported level.
+fn fit_effort_to_levels(
+    effort: &mut ReasoningEffort,
+    levels: &[&str],
+    configured: bool,
+    model_family: &str,
+) -> Result<(), TuiError> {
+    if levels.contains(&effort.id()) {
+        return Ok(());
     }
+    if configured {
+        return Err(TuiError::new(
+            ExitCode::InputRequired,
+            format!("configured effort is unsupported by the {model_family} model"),
+        ));
+    }
+    *effort = levels
+        .iter()
+        .find_map(|level| ReasoningEffort::parse(level))
+        .unwrap_or(ReasoningEffort::High);
+    Ok(())
+}
+
+fn provider_kind(name: &str) -> Result<ProviderKind, TuiError> {
+    crate::cli::parse_provider_kind(name)
+        .map_err(|message| TuiError::new(ExitCode::Provider, message))
 }
 
 #[cfg(test)]
 pub(crate) fn defaults_for_test(kind: ProviderKind) -> (&'static str, &'static str) {
-    defaults(kind)
-}
-
-fn defaults(kind: ProviderKind) -> (&'static str, &'static str) {
     (
         crate::cli::default_provider_endpoint(kind),
         crate::cli::default_provider_model(kind),
     )
 }
 
-fn activate_zen_provider(
+/// What differs between the API-key providers; `/login`, model switching and
+/// `/logout` are one flow parameterised by this.
+struct ApiKeyProviderSpec {
+    login: LoginProvider,
+    kind: ProviderKind,
+    /// Name the auth store tracks the provider under.
+    store_key: &'static str,
+    label: &'static str,
+    base_url: &'static str,
+    default_model: &'static str,
+    /// Bearer that works without a saved key (Zen's free tier).
+    public_key: Option<&'static str>,
+    /// Provider-specific variables that outrank a saved key (after `SLIM_API_KEY`).
+    env_keys: &'static [&'static str],
+    is_model: fn(&str) -> bool,
+}
+
+const API_KEY_UNAVAILABLE: &str = "API-key login is unavailable for this provider.";
+
+fn is_open_code_go_model(id: &str) -> bool {
+    open_code_model(id).is_some()
+}
+
+fn is_open_code_zen_model(id: &str) -> bool {
+    zen_model(id).is_some()
+}
+
+static API_KEY_PROVIDERS: [ApiKeyProviderSpec; 6] = [
+    ApiKeyProviderSpec {
+        login: LoginProvider::OpenCodeGo,
+        kind: ProviderKind::OpenCodeGo,
+        store_key: "opencode-go",
+        label: "OpenCode Go",
+        base_url: OPENCODE_GO_BASE_URL,
+        default_model: OPENCODE_GO_DEFAULT_MODEL,
+        public_key: None,
+        env_keys: &["OPENCODE_API_KEY"],
+        is_model: is_open_code_go_model,
+    },
+    ApiKeyProviderSpec {
+        login: LoginProvider::OpenCodeZen,
+        kind: ProviderKind::OpenCodeZen,
+        store_key: "opencode-zen",
+        label: "OpenCode Zen",
+        base_url: OPENCODE_ZEN_BASE_URL,
+        default_model: OPENCODE_ZEN_DEFAULT_MODEL,
+        public_key: Some(OPENCODE_ZEN_PUBLIC_KEY),
+        env_keys: &["OPENCODE_API_KEY"],
+        is_model: is_open_code_zen_model,
+    },
+    ApiKeyProviderSpec {
+        login: LoginProvider::ClinePass,
+        kind: ProviderKind::ClinePass,
+        store_key: "clinepass",
+        label: "ClinePass",
+        base_url: CLINEPASS_BASE_URL,
+        default_model: CLINEPASS_DEFAULT_MODEL,
+        public_key: None,
+        env_keys: &["CLINEPASS_API_KEY"],
+        is_model: is_clinepass_model_id,
+    },
+    ApiKeyProviderSpec {
+        login: LoginProvider::CommandCode,
+        kind: ProviderKind::CommandCode,
+        store_key: "command-code",
+        label: "Command Code",
+        base_url: COMMANDCODE_BASE_URL,
+        default_model: COMMANDCODE_DEFAULT_MODEL,
+        public_key: None,
+        env_keys: &["COMMANDCODE_API_KEY", "CMD_API_KEY"],
+        is_model: is_command_code_model_id,
+    },
+    ApiKeyProviderSpec {
+        login: LoginProvider::OpenDesign,
+        kind: ProviderKind::OpenDesign,
+        store_key: "open-design",
+        label: "Open Design",
+        base_url: OPEN_DESIGN_BASE_URL,
+        default_model: OPEN_DESIGN_DEFAULT_MODEL,
+        public_key: None,
+        env_keys: &["OPEN_DESIGN_API_KEY"],
+        is_model: is_open_design_model_id,
+    },
+    ApiKeyProviderSpec {
+        login: LoginProvider::Xai,
+        kind: ProviderKind::Xai,
+        store_key: "xai",
+        label: "xAI",
+        base_url: XAI_BASE_URL,
+        default_model: XAI_DEFAULT_MODEL,
+        public_key: None,
+        env_keys: &["XAI_API_KEY"],
+        is_model: is_xai_model_id,
+    },
+];
+
+fn api_key_spec(login: LoginProvider) -> Option<&'static ApiKeyProviderSpec> {
+    API_KEY_PROVIDERS.iter().find(|spec| spec.login == login)
+}
+
+fn api_key_spec_for_kind(kind: ProviderKind) -> Option<&'static ApiKeyProviderSpec> {
+    API_KEY_PROVIDERS.iter().find(|spec| spec.kind == kind)
+}
+
+/// Request for `spec` with `api_key`, on the session's endpoint override.
+fn api_key_provider_request(
+    startup: &TuiStartup,
+    spec: &ApiKeyProviderSpec,
+    api_key: String,
+    model: String,
+) -> ProviderRequest {
+    ProviderRequest {
+        prompt: String::new(),
+        mode: startup.mode,
+        kind: spec.kind,
+        endpoint: startup
+            .endpoint_override
+            .clone()
+            .unwrap_or_else(|| spec.base_url.into()),
+        model,
+        api_key,
+        account_id: None,
+        timeout: startup.timeout,
+    }
+}
+
+/// Saves the key typed in `/login` and, on success, makes `spec` the active
+/// provider (keeping the session's model when it belongs to it).
+async fn save_api_key_login(
+    spec: &ApiKeyProviderSpec,
+    startup: &mut TuiStartup,
+    sink: &EventSink,
+    key: String,
+) {
+    let kind = spec.kind;
+    let key_to_save = key.clone();
+    match tokio::task::spawn_blocking(move || save_api_key(kind, &key_to_save)).await {
+        Ok(Ok(())) => {
+            let model = startup
+                .model_override
+                .as_deref()
+                .filter(|model| (spec.is_model)(model))
+                .unwrap_or(spec.default_model)
+                .to_owned();
+            startup.request = Some(api_key_provider_request(startup, spec, key, model.clone()));
+            startup.oauth_session = None;
+            let _ = sink.send(UiEvent::AuthStateChanged {
+                provider: Some(spec.login),
+                authenticated: true,
+            });
+            let _ = sink.send(UiEvent::ModelChanged { model });
+            let _ = sink.send(UiEvent::Notification {
+                message: format!("Connected: {}", spec.label),
+            });
+        }
+        Ok(Err(error)) => {
+            let _ = sink.send(UiEvent::LoginFailed {
+                message: error.to_string(),
+            });
+        }
+        Err(_) => {
+            let _ = sink.send(UiEvent::LoginFailed {
+                message: format!("{} key save task failed", spec.label),
+            });
+        }
+    }
+}
+
+/// Why `model` at `effort` cannot be selected for `spec`, if it cannot.
+fn model_switch_rejection(
+    spec: &ApiKeyProviderSpec,
+    model: &str,
+    effort: ReasoningEffort,
+) -> Option<String> {
+    match spec.kind {
+        ProviderKind::OpenCodeGo => (!open_code_model(model)
+            .is_some_and(|model| model.reasoning_levels.contains(&effort.id())))
+        .then(|| format!("Unsupported {} model or reasoning effort", spec.label)),
+        // Models without reasoning levels take any effort (none is sent).
+        ProviderKind::OpenCodeZen => (!zen_model(model).is_some_and(|model| {
+            model.reasoning_levels.is_empty() || model.reasoning_levels.contains(&effort.id())
+        }))
+        .then(|| format!("Unsupported {} model or reasoning effort", spec.label)),
+        // Fail fast on an unknown id instead of deferring to the adapter
+        // (G249 TUI-side validation mirrored here). Live gateway slugs are
+        // valid even when absent from the bundled catalog.
+        kind => {
+            if !(spec.is_model)(model) {
+                return Some(format!("Unsupported {} model", spec.label));
+            }
+            let levels = slim_core::provider::gateway_reasoning_levels(kind, model);
+            (!levels.is_empty() && !levels.contains(&effort.id()))
+                .then(|| "Unsupported reasoning effort for this model".to_owned())
+        }
+    }
+}
+
+/// Reasoning effort a switched session sends; `None` for Zen models that
+/// expose no effort knob.
+fn switched_reasoning_effort(
+    spec: &ApiKeyProviderSpec,
+    model: &str,
+    effort: ReasoningEffort,
+) -> Option<String> {
+    let knobless = spec.kind == ProviderKind::OpenCodeZen
+        && zen_model(model).is_some_and(|model| model.reasoning_levels.is_empty());
+    (!knobless).then(|| effort.id().into())
+}
+
+/// `/model` pick on an API-key provider: activates its saved login when the
+/// session is on another provider, then applies model and effort.
+fn switch_api_key_model(
+    login: LoginProvider,
     startup: &mut TuiStartup,
     oauth: &OAuthService,
+    sink: &EventSink,
+    model: String,
+    effort: ReasoningEffort,
+) {
+    let Some(spec) = api_key_spec(login) else {
+        let _ = sink.send(UiEvent::Notification {
+            message: API_KEY_UNAVAILABLE.into(),
+        });
+        return;
+    };
+    if let Some(message) = model_switch_rejection(spec, &model, effort) {
+        let _ = sink.send(UiEvent::Notification { message });
+        return;
+    }
+    let switched = match activate_api_key_provider(startup, oauth, spec, &model) {
+        Ok(switched) => switched,
+        Err(message) => {
+            let _ = sink.send(UiEvent::Notification { message });
+            return;
+        }
+    };
+    let Some(request) = startup.request.as_mut() else {
+        return;
+    };
+    request.model.clone_from(&model);
+    if switched {
+        let _ = sink.send(UiEvent::AuthStateChanged {
+            provider: Some(spec.login),
+            authenticated: true,
+        });
+        let _ = sink.send(UiEvent::Notification {
+            message: format!("Connected: {}", spec.label),
+        });
+    }
+    startup.model_override = Some(model.clone());
+    startup.effort = effort;
+    startup.options.reasoning_effort = switched_reasoning_effort(spec, &model, effort);
+    let _ = sink.send(UiEvent::Notification {
+        message: "Modelo aplicado nesta sessão · /model --default para salvar o padrão".into(),
+    });
+    let _ = sink.send(UiEvent::ModelChanged { model });
+    let _ = sink.send(UiEvent::EffortChanged { effort });
+}
+
+/// Makes `spec` the active provider from its saved key (or its public key).
+/// `Ok(false)` when the session already runs on it.
+fn activate_api_key_provider(
+    startup: &mut TuiStartup,
+    oauth: &OAuthService,
+    spec: &ApiKeyProviderSpec,
     model: &str,
 ) -> Result<bool, String> {
     if startup
         .request
         .as_ref()
-        .is_some_and(|request| request.kind == ProviderKind::OpenCodeZen)
+        .is_some_and(|request| request.kind == spec.kind)
     {
         return Ok(false);
     }
     let api_key = oauth
-        .activate_api_key("opencode-zen")
+        .activate_api_key(spec.store_key)
         .map_err(|error| format!("Authentication: {error}"))?
-        .unwrap_or_else(|| OPENCODE_ZEN_PUBLIC_KEY.into());
-    startup.request = Some(ProviderRequest {
-        prompt: String::new(),
-        mode: startup.mode,
-        kind: ProviderKind::OpenCodeZen,
-        endpoint: startup
-            .endpoint_override
-            .clone()
-            .unwrap_or_else(|| OPENCODE_ZEN_BASE_URL.into()),
-        model: model.into(),
+        .or_else(|| spec.public_key.map(str::to_owned))
+        .ok_or_else(|| format!("{} login is not saved. Use /login.", spec.label))?;
+    startup.request = Some(api_key_provider_request(
+        startup,
+        spec,
         api_key,
-        account_id: None,
-        timeout: startup.timeout,
-    });
+        model.to_owned(),
+    ));
     startup.oauth_session = None;
     Ok(true)
 }
 
-fn activate_saved_api_key_provider(
+/// `/logout` on an API-key provider: drops the saved key and, when an
+/// environment key remains, says it still has precedence.
+async fn logout_api_key_provider(
+    spec: &ApiKeyProviderSpec,
     startup: &mut TuiStartup,
-    oauth: &OAuthService,
-    kind: ProviderKind,
-    provider_key: &str,
-    endpoint: &str,
-    model: &str,
-    label: &str,
-) -> Result<bool, String> {
-    if startup
-        .request
-        .as_ref()
-        .is_some_and(|request| request.kind == kind)
-    {
-        return Ok(false);
+    sink: &EventSink,
+) {
+    let kind = spec.kind;
+    let label = spec.label;
+    match tokio::task::spawn_blocking(move || delete_api_key(kind)).await {
+        Ok(Ok(())) => {
+            startup.request = None;
+            let _ = sink.send(UiEvent::AuthStateChanged {
+                provider: None,
+                authenticated: false,
+            });
+            if std::iter::once("SLIM_API_KEY")
+                .chain(spec.env_keys.iter().copied())
+                .any(|key| std::env::var_os(key).is_some())
+            {
+                let _ = sink.send(UiEvent::Notification {
+                    message: format!(
+                        "{label} disconnected; environment API key still has precedence"
+                    ),
+                });
+            }
+        }
+        Ok(Err(error)) => {
+            let _ = sink.send(UiEvent::RunFailed {
+                run_id: None,
+                message: error.to_string(),
+            });
+        }
+        Err(_) => {
+            let _ = sink.send(UiEvent::RunFailed {
+                run_id: None,
+                message: format!("{label} logout task failed"),
+            });
+        }
     }
-    let api_key = oauth
-        .activate_api_key(provider_key)
-        .map_err(|error| format!("Authentication: {error}"))?
-        .ok_or_else(|| format!("{label} login is not saved. Use /login."))?;
-    startup.request = Some(ProviderRequest {
-        prompt: String::new(),
-        mode: startup.mode,
-        kind,
-        endpoint: startup
-            .endpoint_override
-            .clone()
-            .unwrap_or_else(|| endpoint.into()),
-        model: model.into(),
-        api_key,
-        account_id: None,
-        timeout: startup.timeout,
-    });
-    startup.oauth_session = None;
-    Ok(true)
+}
+
+type OAuthSession = (OAuthProvider, OAuthCredential);
+
+/// Request for `kind`: its API key first, else the active OAuth login when it
+/// belongs to that kind. `active_oauth` is only consulted without an API key.
+fn request_for_kind(
+    kind: ProviderKind,
+    mode: slim_core::OperatingMode,
+    endpoint: Option<&str>,
+    model: Option<&str>,
+    active_oauth: impl FnOnce() -> Result<Option<OAuthSession>, TuiError>,
+) -> Result<(Option<ProviderRequest>, Option<OAuthSession>), TuiError> {
+    if let Some(request) = api_key_request(kind, mode, endpoint, model)? {
+        return Ok((Some(request), None));
+    }
+    let Some((provider, credential)) =
+        active_oauth()?.filter(|(provider, _)| provider_kind_for_oauth(*provider) == kind)
+    else {
+        return Ok((None, None));
+    };
+    let request = oauth_request(provider, &credential, mode, endpoint, model)?;
+    Ok((Some(request), Some((provider, credential))))
 }
 
 fn api_key_request(
@@ -1050,14 +1332,10 @@ fn api_key_request(
     } else {
         None
     };
-    let (default_endpoint, default_model) = defaults(kind);
+    let default_endpoint = crate::cli::default_provider_endpoint(kind);
     // G248: a configured model only applies when it belongs to this provider;
     // otherwise the provider default is used (no cross-kind leakage).
-    let model = model
-        .filter(|model| crate::provider_compatible_model(kind, model))
-        .map(str::to_owned)
-        .unwrap_or_else(|| default_model.to_owned());
-    let model = crate::canonical_provider_model(kind, &model);
+    let model = crate::cli::resolve_provider_model(kind, model);
     Ok(Some(ProviderRequest {
         prompt: String::new(),
         mode,
@@ -1082,13 +1360,9 @@ fn oauth_request(
     model: Option<&str>,
 ) -> Result<ProviderRequest, TuiError> {
     let kind = provider_kind_for_oauth(provider);
-    let (default_endpoint, default_model) = defaults(kind);
+    let default_endpoint = crate::cli::default_provider_endpoint(kind);
     // G248: a configured model only applies when it belongs to this provider.
-    let model = model
-        .filter(|model| crate::provider_compatible_model(kind, model))
-        .map(str::to_owned)
-        .unwrap_or_else(|| default_model.to_owned());
-    let model = crate::canonical_provider_model(kind, &model);
+    let model = crate::cli::resolve_provider_model(kind, model);
     let account_id =
         match provider {
             OAuthProvider::Anthropic => Some(String::new()),
@@ -1162,7 +1436,7 @@ fn project_sync_tui_events(
     core_events: Vec<SessionEvent>,
 ) -> Result<Vec<UiEvent>, ProviderError> {
     let run_id = NEXT_SYNC_TUI_RUN_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
         .map_err(|_| ProviderError::InvalidResponse {
@@ -1231,21 +1505,8 @@ pub fn spawn_tui_runtime_with_resume(
         .and_then(ReasoningEffort::parse)
         .unwrap_or(ReasoningEffort::High);
     let path = session_path.into();
-    let preflight = slim_core::session::preflight_session(&path).map_err(|error| {
-        ProviderError::InvalidResponse {
-            message: format!("durable resume: {error}"),
-        }
-    })?;
-    super::headless::ensure_resume_preflight(&preflight).map_err(|error| {
-        ProviderError::InvalidResponse {
-            message: format!("durable resume: {error}"),
-        }
-    })?;
-    slim_core::session::resume_plan_from_preflight(&preflight).map_err(|error| {
-        ProviderError::InvalidResponse {
-            message: format!("durable resume: {error}"),
-        }
-    })?;
+    let preflight = durable_resume_preflight(&path)
+        .map_err(|message| ProviderError::InvalidResponse { message })?;
     let timeout = request.timeout;
     spawn_tui_session(
         TuiStartup {
@@ -2121,6 +2382,13 @@ fn run_worker(
         }
     };
     let warnings = tokio_runtime.block_on(async move {
+        // The first message reuses a connection opened while the user types.
+        if let Some(request) = &startup.request {
+            slim_core::provider::prewarm_connection(
+                &request.endpoint,
+                slim_core::provider::ProviderTimeouts::production(startup.timeout).connect,
+            );
+        }
         let jobs = match slim_core::runtime::ShellJobs::new(startup.options.shell_job_limits.clone()) {
             Ok(jobs) => jobs,
             Err(message) => { sink.send(UiEvent::RunFailed { run_id: None, message }); return Vec::new(); }
@@ -2222,17 +2490,9 @@ fn run_worker(
             .or_else(|| {
                 // G241: API-key providers must report their identity on boot
                 // so the status bar reflects who is connected.
-                startup.request.as_ref().and_then(|request| {
-                    match request.kind {
-                        ProviderKind::OpenCodeGo => Some(LoginProvider::OpenCodeGo),
-                        ProviderKind::OpenCodeZen => Some(LoginProvider::OpenCodeZen),
-                        ProviderKind::ClinePass => Some(LoginProvider::ClinePass),
-                        ProviderKind::CommandCode => Some(LoginProvider::CommandCode),
-                        ProviderKind::Xai => Some(LoginProvider::Xai),
-                        ProviderKind::OpenDesign => Some(LoginProvider::OpenDesign),
-                        ProviderKind::OpenAiCodex => Some(LoginProvider::OpenAiCodex),
-                        _ => None,
-                    }
+                startup.request.as_ref().and_then(|request| match request.kind {
+                    ProviderKind::OpenAiCodex => Some(LoginProvider::OpenAiCodex),
+                    kind => api_key_spec_for_kind(kind).map(|spec| spec.login),
                 })
             });
         let _ = sink.send(UiEvent::AuthStateChanged {
@@ -2268,23 +2528,22 @@ fn run_worker(
         let mut next_run_id = 1_u64;
         let content_store = SharedContentStore::default();
         let open_code_catalog = OpenCodeCatalog::production().ok();
+        let codex_catalog = crate::codex_catalog::CodexCatalog::production().ok();
         let zen_catalog = OpenCodeZenCatalog::production().ok();
         let command_code_catalog = CommandCodeCatalog::production().ok();
         let open_design_catalog = OpenDesignCatalog::production().ok();
+        // A client that cannot be built disables the ClinePass live refresh
+        // (announced when requested), like a missing catalog path does.
         let cline_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
-            .expect("reqwest client");
-        let open_code_inflight = Arc::new(AtomicBool::new(false));
-        let zen_inflight = Arc::new(AtomicBool::new(false));
-        let cline_inflight = Arc::new(AtomicBool::new(false));
-        let command_code_inflight = Arc::new(AtomicBool::new(false));
-        let open_design_inflight = Arc::new(AtomicBool::new(false));
-        let open_code_gen = Arc::new(AtomicU64::new(0));
-        let zen_gen = Arc::new(AtomicU64::new(0));
-        let cline_gen = Arc::new(AtomicU64::new(0));
-        let command_code_gen = Arc::new(AtomicU64::new(0));
-        let open_design_gen = Arc::new(AtomicU64::new(0));
+            .ok();
+        let open_code_refresh = RefreshGate::default();
+        let codex_refresh = RefreshGate::default();
+        let zen_refresh = RefreshGate::default();
+        let cline_refresh = RefreshGate::default();
+        let command_code_refresh = RefreshGate::default();
+        let open_design_refresh = RefreshGate::default();
         // Project LSP launch overrides held back by trust are announced once;
         // the manager was built at startup, so trusting takes a restart.
         if let Ok(layered) = crate::config::load_layered() {
@@ -3146,308 +3405,54 @@ fn run_worker(
                     }
                 }
                 UiCommand::SaveApiKey { provider, api_key } => {
-                    let key = api_key.expose().to_owned();
-                    let key_to_save = key.clone();
-                    match provider {
-                        LoginProvider::OpenCodeGo => {
-                            let saved = tokio::task::spawn_blocking(move || {
-                                save_api_key(ProviderKind::OpenCodeGo, &key_to_save)
-                            })
-                            .await;
-                            match saved {
-                                Ok(Ok(())) => {
-                                    let model = startup
-                                        .model_override
-                                        .as_deref()
-                                        .filter(|model| open_code_model(model).is_some())
-                                        .unwrap_or(OPENCODE_GO_DEFAULT_MODEL)
-                                        .to_owned();
-                                    startup.request = Some(ProviderRequest {
-                                        prompt: String::new(),
-                                        mode: startup.mode,
-                                        kind: ProviderKind::OpenCodeGo,
-                                        endpoint: startup
-                                            .endpoint_override
-                                            .clone()
-                                            .unwrap_or_else(|| OPENCODE_GO_BASE_URL.into()),
-                                        model: model.clone(),
-                                        api_key: key,
-                                        account_id: None,
-                                        timeout: startup.timeout,
-                                    });
-                                    startup.oauth_session = None;
-                                    let _ = sink.send(UiEvent::AuthStateChanged {
-                                        provider: Some(LoginProvider::OpenCodeGo),
-                                        authenticated: true,
-                                    });
-                                    let _ = sink.send(UiEvent::ModelChanged { model });
-                                    let _ = sink.send(UiEvent::Notification {
-                                        message: "Connected: OpenCode Go".into(),
-                                    });
-                                }
-                                Ok(Err(error)) => {
-                                    let _ = sink.send(UiEvent::LoginFailed {
-                                        message: error.to_string(),
-                                    });
-                                }
-                                Err(_) => {
-                                    let _ = sink.send(UiEvent::LoginFailed {
-                                        message: "OpenCode Go key save task failed".into(),
-                                    });
-                                }
-                            }
+                    match api_key_spec(provider) {
+                        Some(spec) => {
+                            save_api_key_login(spec, &mut startup, &sink, api_key.expose().to_owned())
+                                .await;
                         }
-                        LoginProvider::OpenCodeZen => {
-                            let saved = tokio::task::spawn_blocking(move || {
-                                save_api_key(ProviderKind::OpenCodeZen, &key_to_save)
-                            })
-                            .await;
-                            match saved {
-                                Ok(Ok(())) => {
-                                    let model = startup
-                                        .model_override
-                                        .as_deref()
-                                        .filter(|model| zen_model(model).is_some())
-                                        .unwrap_or(OPENCODE_ZEN_DEFAULT_MODEL)
-                                        .to_owned();
-                                    startup.request = Some(ProviderRequest {
-                                        prompt: String::new(),
-                                        mode: startup.mode,
-                                        kind: ProviderKind::OpenCodeZen,
-                                        endpoint: startup
-                                            .endpoint_override
-                                            .clone()
-                                            .unwrap_or_else(|| OPENCODE_ZEN_BASE_URL.into()),
-                                        model: model.clone(),
-                                        api_key: key,
-                                        account_id: None,
-                                        timeout: startup.timeout,
-                                    });
-                                    startup.oauth_session = None;
-                                    let _ = sink.send(UiEvent::AuthStateChanged {
-                                        provider: Some(LoginProvider::OpenCodeZen),
-                                        authenticated: true,
-                                    });
-                                    let _ = sink.send(UiEvent::ModelChanged { model });
-                                    let _ = sink.send(UiEvent::Notification {
-                                        message: "Connected: OpenCode Zen".into(),
-                                    });
-                                }
-                                Ok(Err(error)) => {
-                                    let _ = sink.send(UiEvent::LoginFailed {
-                                        message: error.to_string(),
-                                    });
-                                }
-                                Err(_) => {
-                                    let _ = sink.send(UiEvent::LoginFailed {
-                                        message: "OpenCode Zen key save task failed".into(),
-                                    });
-                                }
-                            }
-                        }
-                        LoginProvider::ClinePass => {
-                            let saved = tokio::task::spawn_blocking(move || {
-                                save_api_key(ProviderKind::ClinePass, &key_to_save)
-                            })
-                            .await;
-                            match saved {
-                                Ok(Ok(())) => {
-                                    let model = startup
-                                        .model_override
-                                        .as_deref()
-                                        .filter(|m| is_clinepass_model_id(m))
-                                        .unwrap_or(CLINEPASS_DEFAULT_MODEL)
-                                        .to_owned();
-                                    startup.request = Some(ProviderRequest {
-                                        prompt: String::new(),
-                                        mode: startup.mode,
-                                        kind: ProviderKind::ClinePass,
-                                        endpoint: startup
-                                            .endpoint_override
-                                            .clone()
-                                            .unwrap_or_else(|| CLINEPASS_BASE_URL.into()),
-                                        model: model.clone(),
-                                        api_key: key,
-                                        account_id: None,
-                                        timeout: startup.timeout,
-                                    });
-                                    startup.oauth_session = None;
-                                    let _ = sink.send(UiEvent::AuthStateChanged {
-                                        provider: Some(LoginProvider::ClinePass),
-                                        authenticated: true,
-                                    });
-                                    let _ = sink.send(UiEvent::ModelChanged { model });
-                                    let _ = sink.send(UiEvent::Notification {
-                                        message: "Connected: ClinePass".into(),
-                                    });
-                                }
-                                Ok(Err(error)) => {
-                                    let _ = sink.send(UiEvent::LoginFailed {
-                                        message: error.to_string(),
-                                    });
-                                }
-                                Err(_) => {
-                                    let _ = sink.send(UiEvent::LoginFailed {
-                                        message: "ClinePass key save task failed".into(),
-                                    });
-                                }
-                            }
-                        }
-                        LoginProvider::CommandCode => {
-                            let saved = tokio::task::spawn_blocking(move || {
-                                save_api_key(ProviderKind::CommandCode, &key_to_save)
-                            })
-                            .await;
-                            match saved {
-                                Ok(Ok(())) => {
-                                    let model = startup
-                                        .model_override
-                                        .as_deref()
-                                        .filter(|m| is_command_code_model_id(m))
-                                        .unwrap_or(COMMANDCODE_DEFAULT_MODEL)
-                                        .to_owned();
-                                    startup.request = Some(ProviderRequest {
-                                        prompt: String::new(),
-                                        mode: startup.mode,
-                                        kind: ProviderKind::CommandCode,
-                                        endpoint: startup
-                                            .endpoint_override
-                                            .clone()
-                                            .unwrap_or_else(|| COMMANDCODE_BASE_URL.into()),
-                                        model: model.clone(),
-                                        api_key: key,
-                                        account_id: None,
-                                        timeout: startup.timeout,
-                                    });
-                                    startup.oauth_session = None;
-                                    let _ = sink.send(UiEvent::AuthStateChanged {
-                                        provider: Some(LoginProvider::CommandCode),
-                                        authenticated: true,
-                                    });
-                                    let _ = sink.send(UiEvent::ModelChanged { model });
-                                    let _ = sink.send(UiEvent::Notification {
-                                        message: "Connected: Command Code".into(),
-                                    });
-                                }
-                                Ok(Err(error)) => {
-                                    let _ = sink.send(UiEvent::LoginFailed {
-                                        message: error.to_string(),
-                                    });
-                                }
-                                Err(_) => {
-                                    let _ = sink.send(UiEvent::LoginFailed {
-                                        message: "Command Code key save task failed".into(),
-                                    });
-                                }
-                            }
-                        }
-                        LoginProvider::OpenDesign => {
-                            let saved = tokio::task::spawn_blocking(move || {
-                                save_api_key(ProviderKind::OpenDesign, &key_to_save)
-                            })
-                            .await;
-                            match saved {
-                                Ok(Ok(())) => {
-                                    let model = startup
-                                        .model_override
-                                        .as_deref()
-                                        .filter(|m| is_open_design_model_id(m))
-                                        .unwrap_or(OPEN_DESIGN_DEFAULT_MODEL)
-                                        .to_owned();
-                                    startup.request = Some(ProviderRequest {
-                                        prompt: String::new(),
-                                        mode: startup.mode,
-                                        kind: ProviderKind::OpenDesign,
-                                        endpoint: startup
-                                            .endpoint_override
-                                            .clone()
-                                            .unwrap_or_else(|| OPEN_DESIGN_BASE_URL.into()),
-                                        model: model.clone(),
-                                        api_key: key,
-                                        account_id: None,
-                                        timeout: startup.timeout,
-                                    });
-                                    startup.oauth_session = None;
-                                    let _ = sink.send(UiEvent::AuthStateChanged {
-                                        provider: Some(LoginProvider::OpenDesign),
-                                        authenticated: true,
-                                    });
-                                    let _ = sink.send(UiEvent::ModelChanged { model });
-                                    let _ = sink.send(UiEvent::Notification {
-                                        message: "Connected: Open Design".into(),
-                                    });
-                                }
-                                Ok(Err(error)) => {
-                                    let _ = sink.send(UiEvent::LoginFailed {
-                                        message: error.to_string(),
-                                    });
-                                }
-                                Err(_) => {
-                                    let _ = sink.send(UiEvent::LoginFailed {
-                                        message: "Open Design key save task failed".into(),
-                                    });
-                                }
-                            }
-                        }
-                        LoginProvider::Xai => {
-                            let saved = tokio::task::spawn_blocking(move || {
-                                save_api_key(ProviderKind::Xai, &key_to_save)
-                            })
-                            .await;
-                            match saved {
-                                Ok(Ok(())) => {
-                                    let model = startup
-                                        .model_override
-                                        .as_deref()
-                                        .filter(|m| is_xai_model_id(m))
-                                        .unwrap_or(XAI_DEFAULT_MODEL)
-                                        .to_owned();
-                                    startup.request = Some(ProviderRequest {
-                                        prompt: String::new(),
-                                        mode: startup.mode,
-                                        kind: ProviderKind::Xai,
-                                        endpoint: startup
-                                            .endpoint_override
-                                            .clone()
-                                            .unwrap_or_else(|| XAI_BASE_URL.into()),
-                                        model: model.clone(),
-                                        api_key: key,
-                                        account_id: None,
-                                        timeout: startup.timeout,
-                                    });
-                                    startup.oauth_session = None;
-                                    let _ = sink.send(UiEvent::AuthStateChanged {
-                                        provider: Some(LoginProvider::Xai),
-                                        authenticated: true,
-                                    });
-                                    let _ = sink.send(UiEvent::ModelChanged { model });
-                                    let _ = sink.send(UiEvent::Notification {
-                                        message: "Connected: xAI".into(),
-                                    });
-                                }
-                                Ok(Err(error)) => {
-                                    let _ = sink.send(UiEvent::LoginFailed {
-                                        message: error.to_string(),
-                                    });
-                                }
-                                Err(_) => {
-                                    let _ = sink.send(UiEvent::LoginFailed {
-                                        message: "xAI key save task failed".into(),
-                                    });
-                                }
-                            }
-                        }
-                        _ => {
+                        None => {
                             let _ = sink.send(UiEvent::LoginFailed {
-                                message: "API-key login is unavailable for this provider."
-                                    .into(),
+                                message: API_KEY_UNAVAILABLE.into(),
                             });
                         }
                     }
                 }
                 UiCommand::CancelLogin => {}
+                UiCommand::RefreshCodexModels => {
+                    let (Some(catalog), Some(request)) = (
+                        codex_catalog.clone(),
+                        startup
+                            .request
+                            .as_ref()
+                            .filter(|request| request.kind == ProviderKind::OpenAiCodex),
+                    ) else {
+                        // No Codex login: the bundled seed stays as the list.
+                        continue;
+                    };
+                    let endpoint = request.endpoint.clone();
+                    let token = request.api_key.clone();
+                    let Some(account_id) = request.account_id.clone() else {
+                        continue;
+                    };
+                    if let Ok(Some(snapshot)) = catalog.load_cached(&endpoint, &account_id) {
+                        let _ = sink
+                            .send(codex_catalog_event(snapshot.entries, CodexCatalogSource::Cache));
+                    }
+                    let sink_live = sink.clone();
+                    codex_refresh.spawn(
+                        async move { catalog.load(&endpoint, &token, &account_id).await },
+                        move |result| {
+                            let _ = sink_live.send(match result {
+                                Ok(snapshot) => codex_catalog_event(
+                                    snapshot.entries,
+                                    CodexCatalogSource::Live,
+                                ),
+                                Err(error) => live_catalog_unavailable("OpenAI Codex", error),
+                            });
+                        },
+                    );
+                }
                 UiCommand::RefreshOpenCodeModels => {
-                    let sink = sink.clone();
                     let Some(catalog) = open_code_catalog.clone() else {
                         let _ = sink.send(UiEvent::Notification {
                             message: "OpenCode Go catalog path is unavailable".into(),
@@ -3455,34 +3460,15 @@ fn run_worker(
                         continue;
                     };
                     let _ = sink.send(open_code_catalog_event(catalog.load_or_fallback()));
-                    if open_code_inflight.swap(true, Ordering::AcqRel) {
-                        continue;
-                    }
-                    let generation = open_code_gen.fetch_add(1, Ordering::AcqRel) + 1;
-                    let inflight = open_code_inflight.clone();
-                    let gen_cell = open_code_gen.clone();
-                    tokio::spawn(async move {
-                        let result = catalog.refresh().await;
-                        inflight.store(false, Ordering::Release);
-                        if gen_cell.load(Ordering::Acquire) != generation {
-                            return;
-                        }
-                        match result {
-                            Ok(snapshot) => {
-                                let _ = sink.send(open_code_catalog_event(snapshot));
-                            }
-                            Err(error) => {
-                                let _ = sink.send(UiEvent::Notification {
-                                    message: format!(
-                                        "OpenCode Go live catalog unavailable; using cache/fallback: {error}"
-                                    ),
-                                });
-                            }
-                        }
+                    let sink = sink.clone();
+                    open_code_refresh.spawn(async move { catalog.refresh().await }, move |result| {
+                        let _ = sink.send(match result {
+                            Ok(snapshot) => open_code_catalog_event(snapshot),
+                            Err(error) => live_catalog_unavailable("OpenCode Go", error),
+                        });
                     });
                 }
                 UiCommand::RefreshZenModels => {
-                    let sink = sink.clone();
                     let Some(catalog) = zen_catalog.clone() else {
                         let _ = sink.send(UiEvent::Notification {
                             message: "OpenCode Zen catalog path is unavailable".into(),
@@ -3490,34 +3476,21 @@ fn run_worker(
                         continue;
                     };
                     let _ = sink.send(zen_catalog_event(catalog.load_or_fallback()));
-                    if zen_inflight.swap(true, Ordering::AcqRel) {
-                        continue;
-                    }
-                    let generation = zen_gen.fetch_add(1, Ordering::AcqRel) + 1;
-                    let inflight = zen_inflight.clone();
-                    let gen_cell = zen_gen.clone();
-                    tokio::spawn(async move {
-                        let result = catalog.refresh().await;
-                        inflight.store(false, Ordering::Release);
-                        if gen_cell.load(Ordering::Acquire) != generation {
-                            return;
-                        }
-                        match result {
-                            Ok(snapshot) => {
-                                let _ = sink.send(zen_catalog_event(snapshot));
-                            }
-                            Err(error) => {
-                                let _ = sink.send(UiEvent::Notification {
-                                    message: format!(
-                                        "OpenCode Zen live catalog unavailable; using cache/fallback: {error}"
-                                    ),
-                                });
-                            }
-                        }
+                    let sink = sink.clone();
+                    zen_refresh.spawn(async move { catalog.refresh().await }, move |result| {
+                        let _ = sink.send(match result {
+                            Ok(snapshot) => zen_catalog_event(snapshot),
+                            Err(error) => live_catalog_unavailable("OpenCode Zen", error),
+                        });
                     });
                 }
                 UiCommand::RefreshClinePassModels => {
-                    let sink = sink.clone();
+                    let Some(client) = cline_client.clone() else {
+                        let _ = sink.send(UiEvent::Notification {
+                            message: "ClinePass catalog client is unavailable".into(),
+                        });
+                        continue;
+                    };
                     // G240: only the connected ClinePass credential may be
                     // used as bearer; keys belonging to other providers are not.
                     let api_key = startup
@@ -3530,25 +3503,24 @@ fn run_worker(
                         .endpoint_override
                         .clone()
                         .unwrap_or_else(|| CLINEPASS_BASE_URL.into());
-                    if cline_inflight.swap(true, Ordering::AcqRel) {
-                        continue;
-                    }
-                    let generation = cline_gen.fetch_add(1, Ordering::AcqRel) + 1;
-                    let inflight = cline_inflight.clone();
-                    let gen_cell = cline_gen.clone();
-                    let client = cline_client.clone();
-                    tokio::spawn(async move {
-                        let url = format!(
-                            "{}models",
-                            catalog_endpoint.trim_end_matches("chat/completions")
-                        );
-                        let live = match fetch_clinepass_catalog(&client, &url, &api_key).await {
-                            Ok(entries) => entries
+                    let authenticated = !api_key.is_empty();
+                    let sink = sink.clone();
+                    cline_refresh.spawn(
+                        async move {
+                            let url = format!(
+                                "{}models",
+                                catalog_endpoint.trim_end_matches("chat/completions")
+                            );
+                            fetch_clinepass_catalog(&client, &url, &api_key).await
+                        },
+                        move |result| {
+                            let live = match result {
+                                Ok(entries) => entries
                                     .into_iter()
                                     .map(|entry| {
                                         let bundled = clinepass_model(&entry.id);
                                         OpenCodeModelView {
-                                            reasoning_levels: slim_core::provider::gateway_reasoning_levels(ProviderKind::ClinePass, &entry.id).iter().filter_map(|level| ReasoningEffort::parse(level)).collect(),
+                                            reasoning_levels: clinepass_reasoning_levels(&entry.id),
                                             id: entry.id,
                                             name: entry.name,
                                             context_window_tokens: entry.context_window,
@@ -3561,37 +3533,43 @@ fn run_worker(
                                         }
                                     })
                                     .collect::<Vec<_>>(),
-                            _ => Vec::new(),
-                        };
-                        inflight.store(false, Ordering::Release);
-                        if gen_cell.load(Ordering::Acquire) != generation {
-                            return;
-                        }
-                        // G240: a 200 with a malformed/empty body must not wipe
-                        // the group — fall back to the built-in catalog instead.
-                        let (models, source) = if live.is_empty() {
-                            (
-                                slim_core::provider::clinepass_models()
-                                    .iter()
-                                    .map(|m| OpenCodeModelView {
-                                        id: m.id.to_owned(),
-                                        name: m.name.to_owned(),
-                                        context_window_tokens: m.context_window,
-                                        max_output_tokens: m.max_output_tokens as u64,
-                                        reasoning_levels: slim_core::provider::gateway_reasoning_levels(ProviderKind::ClinePass, m.id).iter().filter_map(|level| ReasoningEffort::parse(level)).collect(),
-                                        accepts_images: m.accepts_images,
-                                    })
-                                    .collect::<Vec<_>>(),
-                                ClinePassCatalogSource::Cache,
-                            )
-                        } else {
-                            (live, ClinePassCatalogSource::Live)
-                        };
-                        let _ = sink.send(UiEvent::ClinePassCatalogLoaded { models, source });
-                    });
+                                Err(error) => {
+                                    // Without a connected key the request is
+                                    // expected to fail; that is not news.
+                                    if authenticated {
+                                        let _ = sink.send(live_catalog_unavailable(
+                                            "ClinePass",
+                                            provider_error_message(error),
+                                        ));
+                                    }
+                                    Vec::new()
+                                }
+                            };
+                            // G240: a 200 with a malformed/empty body must not wipe
+                            // the group — fall back to the built-in catalog instead.
+                            let (models, source) = if live.is_empty() {
+                                (
+                                    slim_core::provider::clinepass_models()
+                                        .iter()
+                                        .map(|m| OpenCodeModelView {
+                                            id: m.id.to_owned(),
+                                            name: m.name.to_owned(),
+                                            context_window_tokens: m.context_window,
+                                            max_output_tokens: m.max_output_tokens as u64,
+                                            reasoning_levels: clinepass_reasoning_levels(m.id),
+                                            accepts_images: m.accepts_images,
+                                        })
+                                        .collect::<Vec<_>>(),
+                                    ClinePassCatalogSource::Cache,
+                                )
+                            } else {
+                                (live, ClinePassCatalogSource::Live)
+                            };
+                            let _ = sink.send(UiEvent::ClinePassCatalogLoaded { models, source });
+                        },
+                    );
                 }
                 UiCommand::RefreshOpenDesignModels => {
-                    let sink = sink.clone();
                     let Some(catalog) = open_design_catalog.clone() else {
                         let _ = sink.send(UiEvent::Notification {
                             message: "Open Design catalog path is unavailable".into(),
@@ -3623,35 +3601,21 @@ fn run_worker(
                     let Some(api_key) = api_key else {
                         continue;
                     };
-                    if open_design_inflight.swap(true, Ordering::AcqRel) {
-                        continue;
-                    }
-                    let generation = open_design_gen.fetch_add(1, Ordering::AcqRel) + 1;
-                    let inflight = open_design_inflight.clone();
-                    let gen_cell = open_design_gen.clone();
-                    tokio::spawn(async move {
-                        let result = catalog.refresh(&api_key).await;
-                        inflight.store(false, Ordering::Release);
-                        if gen_cell.load(Ordering::Acquire) != generation {
-                            return;
-                        }
-                        match result {
-                            Ok(snapshot) => {
-                                let _ = sink.send(open_design_catalog_event(snapshot));
-                            }
-                            Err(error) => {
-                                let _ = sink.send(UiEvent::Notification {
-                                    message: format!(
-                                        "Open Design live catalog unavailable; using cache/fallback: {}",
-                                        provider_error_message(error)
-                                    ),
-                                });
-                            }
-                        }
-                    });
+                    let sink = sink.clone();
+                    open_design_refresh.spawn(
+                        async move { catalog.refresh(&api_key).await },
+                        move |result| {
+                            let _ = sink.send(match result {
+                                Ok(snapshot) => open_design_catalog_event(snapshot),
+                                Err(error) => live_catalog_unavailable(
+                                    "Open Design",
+                                    provider_error_message(error),
+                                ),
+                            });
+                        },
+                    );
                 }
                 UiCommand::RefreshCommandCodeModels => {
-                    let sink = sink.clone();
                     let Some(catalog) = command_code_catalog.clone() else {
                         let _ = sink.send(UiEvent::Notification {
                             message: "Command Code catalog path is unavailable".into(),
@@ -3659,325 +3623,44 @@ fn run_worker(
                         continue;
                     };
                     let _ = sink.send(command_code_catalog_event(catalog.load_or_fallback()));
-                    if command_code_inflight.swap(true, Ordering::AcqRel) {
-                        continue;
-                    }
-                    let generation = command_code_gen.fetch_add(1, Ordering::AcqRel) + 1;
-                    let inflight = command_code_inflight.clone();
-                    let gen_cell = command_code_gen.clone();
-                    tokio::spawn(async move {
-                        let result = catalog.refresh().await;
-                        inflight.store(false, Ordering::Release);
-                        if gen_cell.load(Ordering::Acquire) != generation {
-                            return;
-                        }
-                        match result {
-                            Ok(snapshot) => {
-                                let _ = sink.send(command_code_catalog_event(snapshot));
-                            }
-                            Err(error) => {
-                                let detail = match error {
-                                    slim_core::ProviderError::InvalidResponse { message }
-                                    | slim_core::ProviderError::Api { message, .. }
-                                    | slim_core::ProviderError::TransientRemote { message } | slim_core::ProviderError::Remote { message } | slim_core::ProviderError::Http { message, .. } => message,
-                                    _ => "Command Code catalog request failed".into(),
-                                };
-                                let _ = sink.send(UiEvent::Notification {
-                                    message: format!(
-                                        "Command Code live catalog unavailable; using cache/fallback: {detail}"
-                                    ),
-                                });
-                            }
-                        }
-                    });
+                    let sink = sink.clone();
+                    command_code_refresh.spawn(
+                        async move { catalog.refresh().await },
+                        move |result| {
+                            let _ = sink.send(match result {
+                                Ok(snapshot) => command_code_catalog_event(snapshot),
+                                Err(error) => {
+                                    let detail = match error {
+                                        slim_core::ProviderError::InvalidResponse { message }
+                                        | slim_core::ProviderError::Api { message, .. }
+                                        | slim_core::ProviderError::TransientRemote { message }
+                                        | slim_core::ProviderError::Remote { message }
+                                        | slim_core::ProviderError::Http { message, .. } => message,
+                                        _ => "Command Code catalog request failed".into(),
+                                    };
+                                    live_catalog_unavailable("Command Code", detail)
+                                }
+                            });
+                        },
+                    );
                 }
                 UiCommand::SetOpenCodeModel { model, effort } => {
-                    let supported = open_code_model(&model)
-                        .is_some_and(|model| model.reasoning_levels.contains(&effort.id()));
-                    if !supported {
-                        let _ = sink.send(UiEvent::Notification {
-                            message: "Unsupported OpenCode Go model or reasoning effort".into(),
-                        });
-                        continue;
-                    }
-                    let switched = match activate_saved_api_key_provider(
-                        &mut startup,
-                        &oauth,
-                        ProviderKind::OpenCodeGo,
-                        "opencode-go",
-                        OPENCODE_GO_BASE_URL,
-                        &model,
-                        "OpenCode Go",
-                    ) {
-                        Ok(switched) => switched,
-                        Err(message) => {
-                            let _ = sink.send(UiEvent::Notification { message });
-                            continue;
-                        }
-                    };
-                    let Some(request) = startup.request.as_mut() else {
-                        continue;
-                    };
-                    request.model.clone_from(&model);
-                    if switched {
-                        let _ = sink.send(UiEvent::AuthStateChanged {
-                            provider: Some(LoginProvider::OpenCodeGo),
-                            authenticated: true,
-                        });
-                        let _ = sink.send(UiEvent::Notification {
-                            message: "Connected: OpenCode Go".into(),
-                        });
-                    }
-                    startup.model_override = Some(model.clone());
-                    startup.effort = effort;
-                    startup.options.reasoning_effort = Some(effort.id().into());
-                    let _ = sink.send(UiEvent::Notification {
-                        message: "Modelo aplicado nesta sessão · /model --default para salvar o padrão".into(),
-                    });
-                    let _ = sink.send(UiEvent::ModelChanged { model });
-                    let _ = sink.send(UiEvent::EffortChanged { effort });
+                    switch_api_key_model(LoginProvider::OpenCodeGo, &mut startup, &oauth, &sink, model, effort);
                 }
                 UiCommand::SetZenModel { model, effort } => {
-                    let supported = zen_model(&model).is_some_and(|model| {
-                        model.reasoning_levels.is_empty()
-                            || model.reasoning_levels.contains(&effort.id())
-                    });
-                    if !supported {
-                        let _ = sink.send(UiEvent::Notification {
-                            message: "Unsupported OpenCode Zen model or reasoning effort".into(),
-                        });
-                        continue;
-                    }
-                    let switched = match activate_zen_provider(&mut startup, &oauth, &model) {
-                        Ok(switched) => switched,
-                        Err(message) => {
-                            let _ = sink.send(UiEvent::Notification { message });
-                            continue;
-                        }
-                    };
-                    let Some(request) = startup.request.as_mut() else {
-                        continue;
-                    };
-                    request.model.clone_from(&model);
-                    if switched {
-                        let _ = sink.send(UiEvent::AuthStateChanged {
-                            provider: Some(LoginProvider::OpenCodeZen),
-                            authenticated: true,
-                        });
-                        let _ = sink.send(UiEvent::Notification {
-                            message: "Connected: OpenCode Zen".into(),
-                        });
-                    }
-                    startup.model_override = Some(model.clone());
-                    startup.effort = effort;
-                    startup.options.reasoning_effort = zen_model(&model)
-                        .filter(|model| model.reasoning_levels.is_empty())
-                        .map_or_else(|| Some(effort.id().into()), |_| None);
-                    let _ = sink.send(UiEvent::Notification {
-                        message: "Modelo aplicado nesta sessão · /model --default para salvar o padrão".into(),
-                    });
-                    let _ = sink.send(UiEvent::ModelChanged { model });
-                    let _ = sink.send(UiEvent::EffortChanged { effort });
+                    switch_api_key_model(LoginProvider::OpenCodeZen, &mut startup, &oauth, &sink, model, effort);
                 }
                 UiCommand::SetClinePassModel { model, effort } => {
-                    // Fail fast on an unknown id instead of deferring to the
-                    // adapter (G249 TUI-side validation mirrored here). Live
-                    // `cline-pass/*` slugs are valid even when absent from the
-                    // bundled catalog.
-                    if !is_clinepass_model_id(&model) {
-                        let _ = sink.send(UiEvent::Notification {
-                            message: "Unsupported ClinePass model".into(),
-                        });
-                        continue;
-                    }
-                    let levels = slim_core::provider::gateway_reasoning_levels(ProviderKind::ClinePass, &model);
-                    if !levels.is_empty() && !levels.contains(&effort.id()) {
-                        let _ = sink.send(UiEvent::Notification { message: "Unsupported reasoning effort for this model".into() });
-                        continue;
-                    }
-                    let switched = match activate_saved_api_key_provider(
-                        &mut startup,
-                        &oauth,
-                        ProviderKind::ClinePass,
-                        "clinepass",
-                        CLINEPASS_BASE_URL,
-                        &model,
-                        "ClinePass",
-                    ) {
-                        Ok(switched) => switched,
-                        Err(message) => {
-                            let _ = sink.send(UiEvent::Notification { message });
-                            continue;
-                        }
-                    };
-                    let Some(request) = startup.request.as_mut() else {
-                        continue;
-                    };
-                    request.model.clone_from(&model);
-                    if switched {
-                        let _ = sink.send(UiEvent::AuthStateChanged {
-                            provider: Some(LoginProvider::ClinePass),
-                            authenticated: true,
-                        });
-                        let _ = sink.send(UiEvent::Notification {
-                            message: "Connected: ClinePass".into(),
-                        });
-                    }
-                    startup.model_override = Some(model.clone());
-                    startup.effort = effort;
-                    startup.options.reasoning_effort = Some(effort.id().into());
-                    let _ = sink.send(UiEvent::Notification {
-                        message: "Modelo aplicado nesta sessão · /model --default para salvar o padrão".into(),
-                    });
-                    let _ = sink.send(UiEvent::ModelChanged { model });
-                    let _ = sink.send(UiEvent::EffortChanged { effort });
+                    switch_api_key_model(LoginProvider::ClinePass, &mut startup, &oauth, &sink, model, effort);
                 }
                 UiCommand::SetCommandCodeModel { model, effort } => {
-                    if !is_command_code_model_id(&model) {
-                        let _ = sink.send(UiEvent::Notification {
-                            message: "Unsupported Command Code model".into(),
-                        });
-                        continue;
-                    }
-                    let levels = slim_core::provider::gateway_reasoning_levels(ProviderKind::CommandCode, &model);
-                    if !levels.is_empty() && !levels.contains(&effort.id()) {
-                        let _ = sink.send(UiEvent::Notification { message: "Unsupported reasoning effort for this model".into() });
-                        continue;
-                    }
-                    let switched = match activate_saved_api_key_provider(
-                        &mut startup,
-                        &oauth,
-                        ProviderKind::CommandCode,
-                        "command-code",
-                        COMMANDCODE_BASE_URL,
-                        &model,
-                        "Command Code",
-                    ) {
-                        Ok(switched) => switched,
-                        Err(message) => {
-                            let _ = sink.send(UiEvent::Notification { message });
-                            continue;
-                        }
-                    };
-                    let Some(request) = startup.request.as_mut() else {
-                        continue;
-                    };
-                    request.model.clone_from(&model);
-                    if switched {
-                        let _ = sink.send(UiEvent::AuthStateChanged {
-                            provider: Some(LoginProvider::CommandCode),
-                            authenticated: true,
-                        });
-                        let _ = sink.send(UiEvent::Notification {
-                            message: "Connected: Command Code".into(),
-                        });
-                    }
-                    startup.model_override = Some(model.clone());
-                    startup.effort = effort;
-                    startup.options.reasoning_effort = Some(effort.id().into());
-                    let _ = sink.send(UiEvent::Notification {
-                        message: "Modelo aplicado nesta sessão · /model --default para salvar o padrão".into(),
-                    });
-                    let _ = sink.send(UiEvent::ModelChanged { model });
-                    let _ = sink.send(UiEvent::EffortChanged { effort });
+                    switch_api_key_model(LoginProvider::CommandCode, &mut startup, &oauth, &sink, model, effort);
                 }
                 UiCommand::SetOpenDesignModel { model, effort } => {
-                    if !is_open_design_model_id(&model) {
-                        let _ = sink.send(UiEvent::Notification {
-                            message: "Unsupported Open Design model".into(),
-                        });
-                        continue;
-                    }
-                    let levels = slim_core::provider::gateway_reasoning_levels(ProviderKind::OpenDesign, &model);
-                    if !levels.is_empty() && !levels.contains(&effort.id()) {
-                        let _ = sink.send(UiEvent::Notification { message: "Unsupported reasoning effort for this model".into() });
-                        continue;
-                    }
-                    let switched = match activate_saved_api_key_provider(
-                        &mut startup,
-                        &oauth,
-                        ProviderKind::OpenDesign,
-                        "open-design",
-                        OPEN_DESIGN_BASE_URL,
-                        &model,
-                        "Open Design",
-                    ) {
-                        Ok(switched) => switched,
-                        Err(message) => {
-                            let _ = sink.send(UiEvent::Notification { message });
-                            continue;
-                        }
-                    };
-                    let Some(request) = startup.request.as_mut() else {
-                        continue;
-                    };
-                    request.model.clone_from(&model);
-                    if switched {
-                        let _ = sink.send(UiEvent::AuthStateChanged {
-                            provider: Some(LoginProvider::OpenDesign),
-                            authenticated: true,
-                        });
-                        let _ = sink.send(UiEvent::Notification {
-                            message: "Connected: Open Design".into(),
-                        });
-                    }
-                    startup.model_override = Some(model.clone());
-                    startup.effort = effort;
-                    startup.options.reasoning_effort = Some(effort.id().into());
-                    let _ = sink.send(UiEvent::Notification {
-                        message: "Modelo aplicado nesta sessão · /model --default para salvar o padrão".into(),
-                    });
-                    let _ = sink.send(UiEvent::ModelChanged { model });
-                    let _ = sink.send(UiEvent::EffortChanged { effort });
+                    switch_api_key_model(LoginProvider::OpenDesign, &mut startup, &oauth, &sink, model, effort);
                 }
                 UiCommand::SetXaiModel { model, effort } => {
-                    if !is_xai_model_id(&model) {
-                        let _ = sink.send(UiEvent::Notification {
-                            message: "Unsupported xAI model".into(),
-                        });
-                        continue;
-                    }
-                    let levels = slim_core::provider::gateway_reasoning_levels(ProviderKind::Xai, &model);
-                    if !levels.is_empty() && !levels.contains(&effort.id()) {
-                        let _ = sink.send(UiEvent::Notification { message: "Unsupported reasoning effort for this model".into() });
-                        continue;
-                    }
-                    let switched = match activate_saved_api_key_provider(
-                        &mut startup,
-                        &oauth,
-                        ProviderKind::Xai,
-                        "xai",
-                        XAI_BASE_URL,
-                        &model,
-                        "xAI",
-                    ) {
-                        Ok(switched) => switched,
-                        Err(message) => {
-                            let _ = sink.send(UiEvent::Notification { message });
-                            continue;
-                        }
-                    };
-                    let Some(request) = startup.request.as_mut() else {
-                        continue;
-                    };
-                    request.model.clone_from(&model);
-                    if switched {
-                        let _ = sink.send(UiEvent::AuthStateChanged {
-                            provider: Some(LoginProvider::Xai),
-                            authenticated: true,
-                        });
-                        let _ = sink.send(UiEvent::Notification {
-                            message: "Connected: xAI".into(),
-                        });
-                    }
-                    startup.model_override = Some(model.clone());
-                    startup.effort = effort;
-                    startup.options.reasoning_effort = Some(effort.id().into());
-                    let _ = sink.send(UiEvent::Notification {
-                        message: "Modelo aplicado nesta sessão · /model --default para salvar o padrão".into(),
-                    });
-                    let _ = sink.send(UiEvent::ModelChanged { model });
-                    let _ = sink.send(UiEvent::EffortChanged { effort });
+                    switch_api_key_model(LoginProvider::Xai, &mut startup, &oauth, &sink, model, effort);
                 }
                 UiCommand::PersistJobs => { if let Err(message)=persist_job_metadata(&mut startup).await {sink.send(UiEvent::Notification{message});} job_persist_at=tokio::time::Instant::now()+Duration::from_secs(1); }
                 UiCommand::Logout => {
@@ -4003,70 +3686,12 @@ fn run_worker(
                                 });
                             }
                         }
-                    } else if let Some(kind) = startup
+                    } else if let Some(spec) = startup
                         .request
                         .as_ref()
-                        .map(|request| request.kind)
-                        .filter(|kind| {
-                            matches!(
-                                kind,
-                                ProviderKind::OpenCodeGo
-                                    | ProviderKind::OpenCodeZen
-                                    | ProviderKind::ClinePass
-                                    | ProviderKind::CommandCode
-                                    | ProviderKind::Xai
-                                    | ProviderKind::OpenDesign
-                            )
-                        })
+                        .and_then(|request| api_key_spec_for_kind(request.kind))
                     {
-                        let (environment_keys, label): (&[&str], &str) = match kind {
-                            ProviderKind::ClinePass => {
-                                (&["SLIM_API_KEY", "CLINEPASS_API_KEY"], "ClinePass")
-                            }
-                            ProviderKind::CommandCode => (
-                                &["SLIM_API_KEY", "COMMANDCODE_API_KEY", "CMD_API_KEY"],
-                                "Command Code",
-                            ),
-                            ProviderKind::Xai => (&["SLIM_API_KEY", "XAI_API_KEY"], "xAI"),
-                            ProviderKind::OpenDesign => {
-                                (&["SLIM_API_KEY", "OPEN_DESIGN_API_KEY"], "Open Design")
-                            }
-                            ProviderKind::OpenCodeZen => {
-                                (&["SLIM_API_KEY", "OPENCODE_API_KEY"], "OpenCode Zen")
-                            }
-                            _ => (&["SLIM_API_KEY", "OPENCODE_API_KEY"], "OpenCode Go"),
-                        };
-                        match tokio::task::spawn_blocking(move || delete_api_key(kind)).await {
-                            Ok(Ok(())) => {
-                                startup.request = None;
-                                let _ = sink.send(UiEvent::AuthStateChanged {
-                                    provider: None,
-                                    authenticated: false,
-                                });
-                                if environment_keys
-                                    .iter()
-                                    .any(|key| std::env::var_os(key).is_some())
-                                {
-                                    let _ = sink.send(UiEvent::Notification {
-                                        message: format!(
-                                            "{label} disconnected; environment API key still has precedence"
-                                        ),
-                                    });
-                                }
-                            }
-                            Ok(Err(error)) => {
-                                let _ = sink.send(UiEvent::RunFailed {
-                                    run_id: None,
-                                    message: error.to_string(),
-                                });
-                            }
-                            Err(_) => {
-                                let _ = sink.send(UiEvent::RunFailed {
-                                    run_id: None,
-                                    message: format!("{label} logout task failed"),
-                                });
-                            }
-                        }
+                        logout_api_key_provider(spec, &mut startup, &sink).await;
                     } else {
                         let _ = sink.send(UiEvent::Notification {
                             message: "No provider session is active".into(),
@@ -4380,11 +4005,15 @@ fn run_worker(
                     apply_mode_change(&mut startup, &sink, mode);
                 }
                 UiCommand::SetModel {
-                    model: alias,
+                    model,
                     effort,
                     fast,
                 } => {
-                    if !ReasoningEffort::supported(alias).contains(&effort) {
+                    // A slug the bundled list does not know is the account
+                    // catalog's: the effort ladder came from it too.
+                    if slim_core::provider::codex_model(&model)
+                        .is_some_and(|known| !known.reasoning_levels.contains(&effort.id()))
+                    {
                         let _ = sink.send(UiEvent::Notification {
                             message: "Unsupported reasoning effort for this Codex model".into(),
                         });
@@ -4394,7 +4023,6 @@ fn run_worker(
                         .request
                         .as_ref()
                         .is_some_and(|request| request.kind == ProviderKind::OpenAiCodex);
-                    let model = alias.id().to_owned();
                     if switching_provider {
                         let provider = OAuthProvider::OpenAiCodex;
                         let credential = match oauth.credential(provider) {
@@ -5111,6 +4739,58 @@ fn persist_model(sink: &EventSink, model: &str, effort: &str, codex_fast: Option
     }
 }
 
+/// The Codex group of the model picker: the signed-in account's catalog, with
+/// the bundled names of the same slugs and `max_output_tokens` filled in.
+fn codex_catalog_event(
+    entries: Vec<slim_core::provider::CodexCatalogEntry>,
+    source: CodexCatalogSource,
+) -> UiEvent {
+    let listed: Vec<_> = entries.iter().filter(|entry| entry.visible).collect();
+    // An account that hides everything still needs a pickable list.
+    let listed = if listed.is_empty() {
+        entries.iter().collect()
+    } else {
+        listed
+    };
+    let models = listed
+        .into_iter()
+        .map(|entry| {
+            let bundled = slim_core::provider::codex_model(&entry.slug);
+            let levels: Vec<&str> = if entry.reasoning_levels.is_empty() {
+                bundled
+                    .map(|model| model.reasoning_levels.to_vec())
+                    .unwrap_or_default()
+            } else {
+                entry
+                    .reasoning_levels
+                    .iter()
+                    .map(String::as_str)
+                    .collect()
+            };
+            OpenCodeModelView {
+                id: entry.slug.clone(),
+                name: entry
+                    .display_name
+                    .clone()
+                    .or_else(|| bundled.map(|model| model.name.to_owned()))
+                    .unwrap_or_else(|| entry.slug.clone()),
+                context_window_tokens: entry.context_window,
+                max_output_tokens: u64::from(
+                    bundled.map_or(slim_core::provider::CODEX_MAX_OUTPUT_TOKENS, |model| {
+                        model.max_output_tokens
+                    }),
+                ),
+                reasoning_levels: levels
+                    .iter()
+                    .filter_map(|level| ReasoningEffort::parse(level))
+                    .collect(),
+                accepts_images: true,
+            }
+        })
+        .collect();
+    UiEvent::CodexCatalogLoaded { models, source }
+}
+
 fn open_code_catalog_event(snapshot: CatalogSnapshot) -> UiEvent {
     let models = snapshot
         .model_ids
@@ -5671,13 +5351,15 @@ fn serve_workspace_files(root: Option<PathBuf>, sink: &EventSink, request_id: u6
                 }
                 None => Err("workspace directory is unavailable".to_owned()),
             };
-            let mut paths = listed.unwrap_or_else(|message| {
+            let listing = listed.unwrap_or_else(|message| {
                 let _ = answer.send(UiEvent::Notification {
                     message: format!("Não foi possível listar arquivos: {message}"),
                 });
-                Vec::new()
+                slim_core::WorkspaceListing::default()
             });
-            let truncated = paths.len() > WORKSPACE_FILE_LIMIT;
+            // A listing cut by the time budget is partial however few paths it holds.
+            let truncated = listing.timed_out || listing.files.len() > WORKSPACE_FILE_LIMIT;
+            let mut paths = listing.files;
             paths.truncate(WORKSPACE_FILE_LIMIT);
             let _ = answer.send(UiEvent::WorkspaceFiles {
                 request_id,

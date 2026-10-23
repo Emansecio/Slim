@@ -457,6 +457,15 @@ mod tests {
     }
 
     fn uri_for(path: &Path) -> Url {
+        // Fixtures use Windows drive paths; elsewhere map them to the
+        // equivalent absolute path so the file URL is valid on the platform.
+        #[cfg(windows)]
+        let path = path.to_path_buf();
+        #[cfg(not(windows))]
+        let path = {
+            let text = path.to_string_lossy().replace('\\', "/");
+            PathBuf::from(text.strip_prefix("D:").unwrap_or(&text))
+        };
         Url::from_file_path(path).expect("file url")
     }
 

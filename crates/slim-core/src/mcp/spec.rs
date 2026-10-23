@@ -9,6 +9,10 @@ use tokio::sync::Notify;
 
 use crate::mcp::client::{McpProgressSink, McpServerHandshake};
 use crate::mcp::oauth::McpAuthHandle;
+use crate::sync::lock_mutex;
+
+/// Largest single JSON-RPC message accepted from a server, on any transport.
+pub(crate) const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// MCP protocol revision negotiated during `initialize`.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -318,24 +322,42 @@ pub enum McpRequestOutcome<T> {
 }
 
 impl<T> McpRequestOutcome<T> {
-    pub fn map<U>(self, map: impl FnOnce(T) -> U) -> McpRequestOutcome<U> {
+    /// A request that was never admitted because the caller had already
+    /// cancelled it; nothing was sent and no clean-up is owed.
+    pub(crate) fn cancelled_before_send() -> Self {
+        Self::InterruptedBeforeSend {
+            interruption: McpInterruption::Cancelled,
+            cleanup: McpCleanupStatus::NotRequired,
+        }
+    }
+
+    /// The payload of a `Completed(Ok)`; any other outcome moves, unchanged,
+    /// to another payload type.
+    pub(crate) fn pass<U>(self) -> Result<T, McpRequestOutcome<U>> {
         match self {
-            Self::Completed(Ok(value)) => McpRequestOutcome::Completed(Ok(map(value))),
-            Self::Completed(Err(error)) => McpRequestOutcome::Completed(Err(error)),
+            Self::Completed(Ok(value)) => Ok(value),
+            Self::Completed(Err(error)) => Err(McpRequestOutcome::Completed(Err(error))),
             Self::InterruptedBeforeSend {
                 interruption,
                 cleanup,
-            } => McpRequestOutcome::InterruptedBeforeSend {
+            } => Err(McpRequestOutcome::InterruptedBeforeSend {
                 interruption,
                 cleanup,
-            },
+            }),
             Self::OutcomeUncertain {
                 interruption,
                 cleanup,
-            } => McpRequestOutcome::OutcomeUncertain {
+            } => Err(McpRequestOutcome::OutcomeUncertain {
                 interruption,
                 cleanup,
-            },
+            }),
+        }
+    }
+
+    pub fn map<U>(self, map: impl FnOnce(T) -> U) -> McpRequestOutcome<U> {
+        match self.pass() {
+            Ok(value) => McpRequestOutcome::Completed(Ok(map(value))),
+            Err(outcome) => outcome,
         }
     }
 
@@ -376,11 +398,7 @@ impl McpCancellation {
 
     pub fn cancel(&self) {
         let changed = {
-            let _gate = self
-                .0
-                .gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _gate = lock_mutex(&self.0.gate);
             !self.0.cancelled.swap(true, Ordering::AcqRel)
         };
         if changed {
@@ -393,10 +411,7 @@ impl McpCancellation {
     }
 
     pub(crate) fn lock_admission(&self) -> MutexGuard<'_, ()> {
-        self.0
-            .gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        lock_mutex(&self.0.gate)
     }
 
     pub async fn cancelled(&self) {
@@ -488,10 +503,7 @@ pub trait McpConnection: Send + Sync {
         cancellation: McpCancellation,
     ) -> McpRequestOutcome<Value> {
         if cancellation.is_cancelled() {
-            return McpRequestOutcome::InterruptedBeforeSend {
-                interruption: McpInterruption::Cancelled,
-                cleanup: McpCleanupStatus::NotRequired,
-            };
+            return McpRequestOutcome::cancelled_before_send();
         }
         tokio::select! {
             biased;
@@ -561,10 +573,7 @@ pub trait McpConnection: Send + Sync {
         cancellation: McpCancellation,
     ) -> McpRequestOutcome<()> {
         if cancellation.is_cancelled() {
-            return McpRequestOutcome::InterruptedBeforeSend {
-                interruption: McpInterruption::Cancelled,
-                cleanup: McpCleanupStatus::NotRequired,
-            };
+            return McpRequestOutcome::cancelled_before_send();
         }
         tokio::select! {
             biased;

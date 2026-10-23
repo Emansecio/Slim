@@ -387,13 +387,11 @@ fn opencode_models_refresh_and_select_dynamic_catalog() {
     // Group headers are rows, so counting Downs is not stable once other
     // groups also match the filter (ClinePass ships its own `glm-5.3`).
     // Position on the Go catalog row explicitly.
-    let rows = state.model_overlay.clone().expect("overlay").rows(
-        &state.open_code_models,
-        &state.cline_pass_models,
-        &state.command_code_models,
-        &state.zen_models,
-        &state.open_design_models,
-    );
+    let rows = state
+        .model_overlay
+        .clone()
+        .expect("overlay")
+        .rows(&state.model_catalogs());
     let target = rows
         .iter()
         .position(|row| {
@@ -414,13 +412,7 @@ fn opencode_models_refresh_and_select_dynamic_catalog() {
 
     // The catalog levels are visible and adjustable in the model picker.
     let choice = rows[target]
-        .choice(
-            &state.open_code_models,
-            &state.cline_pass_models,
-            &state.command_code_models,
-            &state.zen_models,
-            &state.open_design_models,
-        )
+        .choice(&state.model_catalogs())
         .expect("catalog choice");
     assert_eq!(
         choice.levels,
@@ -447,13 +439,11 @@ fn opencode_models_refresh_and_select_dynamic_catalog() {
 /// Positions the model overlay on the row matched by `predicate`, because
 /// group headers are rows and counting Downs is brittle.
 fn select_model_row(state: &mut AppState, predicate: impl Fn(&ModelRow) -> bool) {
-    let rows = state.model_overlay.clone().expect("model overlay").rows(
-        &state.open_code_models,
-        &state.cline_pass_models,
-        &state.command_code_models,
-        &state.zen_models,
-        &state.open_design_models,
-    );
+    let rows = state
+        .model_overlay
+        .clone()
+        .expect("model overlay")
+        .rows(&state.model_catalogs());
     let index = rows.iter().position(predicate).expect("row in the picker");
     reduce(
         state,
@@ -523,20 +513,12 @@ fn zen_model_with_levels_adjusts_effort_inline_before_sending() {
             Action::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
         );
     }
-    let choice = state.model_overlay.as_ref().unwrap().rows(
-        &state.open_code_models,
-        &state.cline_pass_models,
-        &state.command_code_models,
-        &state.zen_models,
-        &state.open_design_models,
-    )[state.model_overlay.as_ref().unwrap().selected]
-        .choice(
-            &state.open_code_models,
-            &state.cline_pass_models,
-            &state.command_code_models,
-            &state.zen_models,
-            &state.open_design_models,
-        )
+    let choice = state
+        .model_overlay
+        .as_ref()
+        .unwrap()
+        .rows(&state.model_catalogs())[state.model_overlay.as_ref().unwrap().selected]
+        .choice(&state.model_catalogs())
         .unwrap();
     assert_eq!(
         state
@@ -712,32 +694,13 @@ fn model_overlay_lists_open_design_as_its_own_group() {
     let mut state = AppState::new();
     state.auth_provider = Some(LoginProvider::OpenDesign);
     state.model = "deepseek-v4.1-flash".into();
-    let overlay = ModelOverlay::for_current(
-        &state.model,
-        state.auth_provider,
-        &state.open_code_models,
-        &state.cline_pass_models,
-        &state.command_code_models,
-        &state.zen_models,
-        &state.open_design_models,
-    );
+    let overlay =
+        ModelOverlay::for_current(&state.model, state.auth_provider, &state.model_catalogs());
     assert!(!overlay.collapsed[5]);
-    let rows = overlay.rows(
-        &state.open_code_models,
-        &state.cline_pass_models,
-        &state.command_code_models,
-        &state.zen_models,
-        &state.open_design_models,
-    );
+    let rows = overlay.rows(&state.model_catalogs());
     assert!(rows.contains(&ModelRow::Header(5)));
     let choice = rows[overlay.selected]
-        .choice(
-            &state.open_code_models,
-            &state.cline_pass_models,
-            &state.command_code_models,
-            &state.zen_models,
-            &state.open_design_models,
-        )
+        .choice(&state.model_catalogs())
         .expect("focused model");
     assert_eq!(
         choice.target,
@@ -946,7 +909,7 @@ fn model_command_confirms_model_and_effort_together() {
     );
     let effects = reduce(&mut state, Action::Key(enter()));
     assert!(effects.contains(&Effect::Send(UiCommand::SetModel {
-        model: ModelAlias::Terra,
+        model: ModelAlias::Terra.id().into(),
         effort: ReasoningEffort::High,
         fast: false,
     })));
@@ -1521,7 +1484,7 @@ fn mode_command_via_alias_sends_set_model() {
     state.composer.insert_text("/model luna");
     let effects = reduce(&mut state, Action::Key(enter()));
     assert!(effects.contains(&Effect::Send(UiCommand::SetModel {
-        model: ModelAlias::Luna,
+        model: ModelAlias::Luna.id().into(),
         effort: ReasoningEffort::High,
         fast: false,
     })));

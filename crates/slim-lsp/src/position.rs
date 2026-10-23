@@ -120,66 +120,6 @@ impl PositionCodec {
             }
         }
     }
-
-    /// Convert a human 1-based (line, column) into an LSP (line, character)
-    /// for the given encoding using the actual text of that line. The human
-    /// column counts Unicode scalar values (chars), not encoding units, so
-    /// multi-byte characters map correctly in every negotiated encoding.
-    pub fn human_to_lsp(
-        encoding: PositionEncoding,
-        physical_lines: &[String],
-        human_line: u32,
-        human_column: u32,
-    ) -> Option<(u32, u32)> {
-        if human_line == 0 {
-            return None;
-        }
-        let line_index = human_line.checked_sub(1)? as usize;
-        let text = physical_lines.get(line_index)?;
-        let char_index = human_column.checked_sub(1)? as usize;
-        let char_count = text.chars().count();
-        // A column one past the last char addresses the end of the line
-        // (editors do the same); anything further is invalid.
-        if char_index > char_count {
-            return None;
-        }
-        let byte = if char_index == char_count {
-            text.len()
-        } else {
-            text.char_indices().nth(char_index)?.0
-        };
-        let lsp_column = Self::byte_to_character(encoding, text, byte)?;
-        Some((line_index as u32, lsp_column))
-    }
-
-    /// Convert an LSP (line, character) into human 1-based (line, column),
-    /// plus the byte offset of the character inside its line for later reads.
-    /// The human column counts Unicode scalar values (chars), not encoding
-    /// units.
-    pub fn lsp_to_human(
-        encoding: PositionEncoding,
-        physical_lines: &[String],
-        lsp_line: u32,
-        lsp_character: u32,
-    ) -> Option<(u32, u32, usize)> {
-        let text = physical_lines.get(lsp_line as usize)?;
-        let byte = Self::character_to_byte(encoding, text, lsp_character)?;
-        let column = text.get(..byte)?.chars().count();
-        Some((
-            lsp_line.saturating_add(1),
-            u32::try_from(column.saturating_add(1)).unwrap_or(u32::MAX),
-            byte,
-        ))
-    }
-}
-
-/// Splits file content into physical lines. Both LF and CRLF are accepted;
-/// the line terminator is stripped so position math never counts it.
-pub fn split_physical_lines(content: &str) -> Vec<String> {
-    content
-        .split('\n')
-        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_owned())
-        .collect()
 }
 
 #[cfg(test)]
@@ -312,68 +252,6 @@ mod tests {
         assert_eq!(
             PositionCodec::character_to_byte(PositionEncoding::Utf32, line, 3),
             Some(6)
-        );
-    }
-
-    #[test]
-    fn human_coordinates_are_one_based_and_clamped_to_line_end() {
-        let lines = split_physical_lines("first\nsecond line\r\nthird");
-        let enc = PositionEncoding::Utf16;
-        assert_eq!(PositionCodec::human_to_lsp(enc, &lines, 2, 1), Some((1, 0)));
-        assert_eq!(PositionCodec::human_to_lsp(enc, &lines, 2, 7), Some((1, 6)));
-        // Column 8 maps to 'l' of "line", which is LSP character 7.
-        assert_eq!(PositionCodec::human_to_lsp(enc, &lines, 2, 8), Some((1, 7)));
-        // Column 13 (beyond line end of 11-char "second line"): not a position.
-        assert_eq!(PositionCodec::human_to_lsp(enc, &lines, 2, 13), None);
-        // 0-based inputs are rejected.
-        assert_eq!(PositionCodec::human_to_lsp(enc, &lines, 0, 1), None);
-        // Line beyond file: rejected.
-        assert_eq!(PositionCodec::human_to_lsp(enc, &lines, 4, 1), None);
-        let (l, c, byte) = PositionCodec::lsp_to_human(enc, &lines, 1, 7).expect("position");
-        assert_eq!((l, c), (2, 8));
-        assert_eq!(&lines[1][byte..byte + 4], "line");
-    }
-
-    #[test]
-    fn human_columns_count_chars_not_encoding_units() {
-        // "a🚀b": scalars a, rocket, b; UTF-16 units 1, 2, 1.
-        let lines = vec!["a\u{1F680}b".to_owned()];
-        let utf16 = PositionEncoding::Utf16;
-        assert_eq!(
-            PositionCodec::human_to_lsp(utf16, &lines, 1, 1),
-            Some((0, 0))
-        );
-        assert_eq!(
-            PositionCodec::human_to_lsp(utf16, &lines, 1, 2),
-            Some((0, 1))
-        );
-        assert_eq!(
-            PositionCodec::human_to_lsp(utf16, &lines, 1, 3),
-            Some((0, 3))
-        );
-        assert_eq!(
-            PositionCodec::human_to_lsp(utf16, &lines, 1, 4),
-            Some((0, 4))
-        );
-        assert_eq!(PositionCodec::human_to_lsp(utf16, &lines, 1, 5), None);
-        assert_eq!(
-            PositionCodec::lsp_to_human(utf16, &lines, 0, 1),
-            Some((1, 2, 1))
-        );
-        assert_eq!(
-            PositionCodec::lsp_to_human(utf16, &lines, 0, 3),
-            Some((1, 3, 5))
-        );
-        // UTF-8: "éx" is 2 + 1 bytes; scalars é, x.
-        let utf8_lines = vec!["\u{e9}x".to_owned()];
-        let utf8 = PositionEncoding::Utf8;
-        assert_eq!(
-            PositionCodec::human_to_lsp(utf8, &utf8_lines, 1, 2),
-            Some((0, 2))
-        );
-        assert_eq!(
-            PositionCodec::lsp_to_human(utf8, &utf8_lines, 0, 2),
-            Some((1, 2, 2))
         );
     }
 

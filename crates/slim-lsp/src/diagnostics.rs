@@ -280,6 +280,10 @@ mod tests {
     }
 
     fn url(path: &str) -> Url {
+        // Fixtures use Windows drive paths; elsewhere map them to the
+        // equivalent absolute path so the file URL is valid on the platform.
+        #[cfg(not(windows))]
+        let path = path.strip_prefix("D:").unwrap_or(path);
         Url::from_file_path(path).expect("file url")
     }
 

@@ -210,16 +210,49 @@ impl Drop for Workspace {
 #[test]
 fn shell_direct_arguments_are_literal_and_legacy_scripts_stay_available() {
     let root = Workspace::new();
+    #[cfg(windows)]
     let program = slim_core::process::ProcessRunner::default()
         .resolve_powershell()
         .unwrap()
         .expect("PowerShell test runtime");
-    let script = root.0.join("literal arguments.ps1");
-    fs::write(&script, "param([string]$value)\n[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n[Console]::Out.Write($value)\n[Console]::Out.Write(\" stdio=$env:PYTHONIOENCODING\")\nexit 7\n").unwrap();
+    #[cfg(not(windows))]
+    let program = slim_core::process::ProcessRunner::default()
+        .resolve_unix_shell()
+        .unwrap()
+        .expect("bash test runtime");
+    let script = root.0.join(if cfg!(windows) {
+        "literal arguments.ps1"
+    } else {
+        "literal arguments.sh"
+    });
+    if cfg!(windows) {
+        fs::write(&script, "param([string]$value)\n[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n[Console]::Out.Write($value)\n[Console]::Out.Write(\" stdio=$env:PYTHONIOENCODING\")\nexit 7\n").unwrap();
+    } else {
+        fs::write(
+            &script,
+            "printf '%s' \"$1\"\nprintf ' stdio=%s' \"$PYTHONIOENCODING\"\nexit 7\n",
+        )
+        .unwrap();
+    }
     let value = "ação with spaces, \"quotes\", $variable & semicolon; literal";
-    let result = root.call("shell", json!({
-        "command":program, "args":["-NoLogo","-NoProfile","-NonInteractive","-File",script,value]
-    }));
+    let program_args = if cfg!(windows) {
+        json!([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            script,
+            value
+        ])
+    } else {
+        json!([script, value])
+    };
+    let result = root.call(
+        "shell",
+        json!({
+            "command":program, "args":program_args
+        }),
+    );
     assert!(!result.success);
     assert!(result.output.starts_with("exit 7\n"), "{}", result.output);
     assert!(result.output.contains(value), "{}", result.output);
@@ -235,25 +268,37 @@ fn shell_direct_arguments_are_literal_and_legacy_scripts_stay_available() {
     let legacy = root.call(
         "shell",
         json!({
-            "command":"[Console]::Out.Write('script-mode')", "args":null
+            "command": if cfg!(windows) { "[Console]::Out.Write('script-mode')" } else { "printf script-mode" }, "args":null
         }),
     );
     assert!(legacy.success, "{}", legacy.output);
     assert!(legacy.output.contains("script-mode"));
-    let powershell = program.to_string_lossy().replace('\'', "''");
-    let script_path = script.to_string_lossy().replace('\'', "''");
-    let check = root.call("shell", json!({
-        "command": format!(
+    let check_command = if cfg!(windows) {
+        let powershell = program.to_string_lossy().replace('\'', "''");
+        let script_path = script.to_string_lossy().replace('\'', "''");
+        format!(
             "& '{powershell}' -NoLogo -NoProfile -NonInteractive -File '{script_path}' check; $validationExit = $LASTEXITCODE; Write-Output 'check completed'; exit $validationExit"
-        ),
-    }));
+        )
+    } else {
+        let bash = program.to_string_lossy().replace('\'', "'\\''");
+        let script_path = script.to_string_lossy().replace('\'', "'\\''");
+        format!(
+            "'{bash}' '{script_path}' check; validationExit=$?; echo 'check completed'; exit $validationExit"
+        )
+    };
+    let check = root.call(
+        "shell",
+        json!({
+            "command": check_command,
+        }),
+    );
     assert!(!check.success, "{}", check.output);
     assert!(check.output.starts_with("exit 7\n"), "{}", check.output);
     assert!(check.output.contains("check completed"), "{}", check.output);
     for args in [json!("not-an-array"), json!([1]), json!([null])] {
         let invalid = root.call(
             "shell",
-            json!({"command":"Set-Content forbidden.txt bad", "args":args}),
+            json!({"command": if cfg!(windows) { "Set-Content forbidden.txt bad" } else { "echo bad > forbidden.txt" }, "args":args}),
         );
         assert!(!invalid.success);
         assert!(invalid.output.contains("shell args"), "{}", invalid.output);
@@ -818,20 +863,38 @@ fn missing_file_precondition_explains_recovery_and_preserves_empty_file_semantic
 fn shell_has_one_interpreter_for_commands_with_and_without_heuristic_markers() {
     let root = Workspace::new();
     // Neither Get-Location nor this literal contains the old PowerShell markers.
-    let location = root.call("shell", json!({"command":"Get-Location"}));
+    let location = root.call(
+        "shell",
+        json!({"command": if cfg!(windows) { "Get-Location" } else { "pwd" }}),
+    );
     assert!(location.success, "{}", location.output);
     let literal = root.call(
         "shell",
-        json!({"command":"'dollar $content and :: stay literal'"}),
+        json!({"command": if cfg!(windows) {
+            "'dollar $content and :: stay literal'"
+        } else {
+            "echo 'dollar $content and :: stay literal'"
+        }}),
     );
     assert!(literal.success, "{}", literal.output);
     assert!(literal
         .output
         .contains("dollar $content and :: stay literal"));
-    let variable = root.call("shell", json!({"command":"$content = 'ação'; [IO.File]::WriteAllText((Join-Path (Get-Location) 'ação.txt'), $content); Get-Content -LiteralPath 'ação.txt'"}));
+    let variable = root.call("shell", json!({"command": if cfg!(windows) {
+        "$content = 'ação'; [IO.File]::WriteAllText((Join-Path (Get-Location) 'ação.txt'), $content); Get-Content -LiteralPath 'ação.txt'"
+    } else {
+        "content='ação'; printf '%s' \"$content\" > 'ação.txt'; cat 'ação.txt'"
+    }}));
     assert!(variable.success, "{}", variable.output);
     assert_eq!(fs::read_to_string(root.0.join("ação.txt")).unwrap(), "ação");
-    let failed = root.call("shell", json!({"command":"Write-Output 'failure'; exit 7"}));
+    let failed = root.call(
+        "shell",
+        json!({"command": if cfg!(windows) {
+            "Write-Output 'failure'; exit 7"
+        } else {
+            "echo 'failure'; exit 7"
+        }}),
+    );
     assert!(!failed.success);
     assert!(failed.output.starts_with("exit 7\n"), "{}", failed.output);
     let parse_error = root.call("shell", json!({"command":"if ("}));
@@ -839,6 +902,16 @@ fn shell_has_one_interpreter_for_commands_with_and_without_heuristic_markers() {
     #[cfg(windows)]
     {
         let native_failed = root.call("shell", json!({"command":"cmd /d /c exit 9"}));
+        assert!(!native_failed.success);
+        assert!(
+            native_failed.output.starts_with("exit 9\n"),
+            "{}",
+            native_failed.output
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let native_failed = root.call("shell", json!({"command":"sh -c 'exit 9'"}));
         assert!(!native_failed.success);
         assert!(
             native_failed.output.starts_with("exit 9\n"),
@@ -1709,13 +1782,12 @@ fn read_failures_on_unreadable_files_say_what_to_do_instead() {
             "{name}: {}",
             result.output
         );
-        assert!(
-            result
-                .output
-                .contains("Get-Content -LiteralPath 'wide.txt' -Encoding Unicode"),
-            "{name}: {}",
-            result.output
-        );
+        let reader = if cfg!(windows) {
+            "Get-Content -LiteralPath 'wide.txt' -Encoding Unicode"
+        } else {
+            "iconv -f UTF-16LE -t UTF-8 'wide.txt'"
+        };
+        assert!(result.output.contains(reader), "{name}: {}", result.output);
         assert!(
             result.output.contains("write tool"),
             "{name}: {}",
@@ -1730,7 +1802,11 @@ fn read_failures_on_unreadable_files_say_what_to_do_instead() {
     let big = root.call("read", json!({"path": "be.txt"}));
     assert!(big.output.contains("UTF-16 BE"), "{}", big.output);
     assert!(
-        big.output.contains("-Encoding BigEndianUnicode"),
+        big.output.contains(if cfg!(windows) {
+            "-Encoding BigEndianUnicode"
+        } else {
+            "-f UTF-16BE"
+        }),
         "{}",
         big.output
     );
@@ -1761,9 +1837,11 @@ fn read_limit_failures_name_a_way_around_them() {
     assert!(
         long.output.contains("Line 1 alone is over the limit")
             && long.output.contains("Search for a distinctive substring")
-            && long
-                .output
-                .contains("(Get-Content -LiteralPath 'one-line.txt')[0].Substring(0, 4000)"),
+            && long.output.contains(if cfg!(windows) {
+                "(Get-Content -LiteralPath 'one-line.txt')[0].Substring(0, 4000)"
+            } else {
+                "sed -n '1p' 'one-line.txt' | cut -c 1-4000"
+            }),
         "{}",
         long.output
     );
@@ -1784,8 +1862,11 @@ fn read_limit_failures_name_a_way_around_them() {
     assert!(!huge.success);
     assert!(huge.output.contains("safety limit"), "{}", huge.output);
     assert!(
-        huge.output
-            .contains("Slice it with shell instead, for example `Get-Content -LiteralPath 'huge.log' -TotalCount 200`"),
+        huge.output.contains(if cfg!(windows) {
+            "Slice it with shell instead, for example `Get-Content -LiteralPath 'huge.log' -TotalCount 200`"
+        } else {
+            "Slice it with shell instead, for example `head -n 200 'huge.log'`"
+        }),
         "{}",
         huge.output
     );
@@ -2080,18 +2161,25 @@ fn truthful_recovery_text_for_one_line_files_quotes_and_utf32() {
         wide.output
     );
     assert!(!wide.output.contains("UTF-16"), "{}", wide.output);
-    // The quote inside the name is doubled in the command to run.
+    // The quote inside the name is escaped in the command to run: doubled for
+    // PowerShell, closed and reopened (`'\''`) for POSIX shells.
     assert!(
-        wide.output
-            .contains("Get-Content -LiteralPath 'it''s utf32.txt' -Encoding UTF32"),
+        wide.output.contains(if cfg!(windows) {
+            "Get-Content -LiteralPath 'it''s utf32.txt' -Encoding UTF32"
+        } else {
+            "iconv -f UTF-32LE -t UTF-8 'it'\\''s utf32.txt'"
+        }),
         "{}",
         wide.output
     );
     fs::write(root.0.join("it's long.txt"), "x".repeat(1024 * 1024 + 1)).unwrap();
     let long = root.call("read", json!({"path":"it's long.txt"}));
     assert!(
-        long.output
-            .contains("(Get-Content -LiteralPath 'it''s long.txt')[0]"),
+        long.output.contains(if cfg!(windows) {
+            "(Get-Content -LiteralPath 'it''s long.txt')[0]"
+        } else {
+            "sed -n '1p' 'it'\\''s long.txt'"
+        }),
         "{}",
         long.output
     );
@@ -2100,8 +2188,11 @@ fn truthful_recovery_text_for_one_line_files_quotes_and_utf32() {
     drop(huge);
     let huge = root.call("read", json!({"path":"it's huge.log"}));
     assert!(
-        huge.output
-            .contains("-LiteralPath 'it''s huge.log' -TotalCount 200"),
+        huge.output.contains(if cfg!(windows) {
+            "-LiteralPath 'it''s huge.log' -TotalCount 200"
+        } else {
+            "head -n 200 'it'\\''s huge.log'"
+        }),
         "{}",
         huge.output
     );

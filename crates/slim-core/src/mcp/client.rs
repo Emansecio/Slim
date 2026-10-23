@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use crate::mcp::spec::{McpError, MCP_PROTOCOL_VERSION};
+use crate::sync::{lock_mutex, read_lock, write_lock};
 
 /// Revisions this client can speak, newest first. The server's choice in
 /// `initialize` must be one of them; it also becomes the
@@ -293,32 +294,18 @@ impl McpLog {
     pub fn set_secrets(&self, mut secrets: Vec<String>) {
         secrets.retain(|secret| !secret.is_empty());
         secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
-        *self
-            .secrets
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = secrets;
+        *write_lock(&self.secrets) = secrets;
     }
 
     /// Redacts, besides [`Self::set_secrets`], whatever `source` returns at
     /// the moment each entry is written.
     pub fn set_secret_source(&self, source: SecretSource) {
-        *self
-            .secret_source
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(source);
+        *write_lock(&self.secret_source) = Some(source);
     }
 
     pub(crate) fn write(&self, server: &str, params: &Value) {
-        let source = self
-            .secret_source
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let mut secrets = self
-            .secrets
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let source = read_lock(&self.secret_source).clone();
+        let mut secrets = read_lock(&self.secrets).clone();
         if let Some(source) = source {
             secrets.extend(source().into_iter().filter(|secret| !secret.is_empty()));
             secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
@@ -328,10 +315,7 @@ impl McpLog {
     }
 
     fn append(&self, line: &str) -> std::io::Result<()> {
-        let mut size = self
-            .size
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut size = lock_mutex(&self.size);
         if size.is_none() {
             if let Some(parent) = self.path.parent() {
                 std::fs::create_dir_all(parent)?;

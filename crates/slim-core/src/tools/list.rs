@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use super::execution::digest_bytes;
-use super::{DependencyObservation, FastStamp, ToolError, ToolExecutionError};
+use super::{
+    check_cancellation, lock_mutex, new_snapshot_id, parse_cursor, DependencyObservation, FastStamp,
+    ToolError, ToolExecutionError,
+};
 use crate::runtime::CancellationToken;
 
 pub const DEFAULT_MAX_ENTRIES: usize = 200;
@@ -13,8 +15,6 @@ pub const MAX_ENTRIES_CAP: usize = 500;
 const MAX_DIRECTORY_ENTRIES: usize = 10_000;
 const MAX_LIST_SNAPSHOTS: usize = 64;
 const LIST_SNAPSHOT_TTL: Duration = Duration::from_secs(120);
-
-static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ListService {
@@ -83,16 +83,9 @@ impl ListPage {
                 oversized_record: false,
             };
         }
-        let mut low = 0;
-        let mut high = self.entries.len();
-        while low < high {
-            let count = low + (high - low).div_ceil(2);
-            if render(count).len() <= max_bytes {
-                low = count;
-            } else {
-                high = count - 1;
-            }
-        }
+        let low = super::execution::fit_count(self.entries.len(), |count| {
+            render(count).len() <= max_bytes
+        });
         let mut text = render(low);
         if low == 0 {
             text.insert_str(0, "[entry and continuation exceed presentation budget; no entry delivered; narrow the path or use the continuation]");
@@ -158,10 +151,7 @@ impl ListService {
         let id = new_snapshot_id("list");
         let now = Instant::now();
         {
-            let mut cache = self
-                .snapshots
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut cache = lock_mutex(&self.snapshots);
             remove_expired(&mut cache, now);
             cache
                 .snapshots
@@ -196,7 +186,7 @@ impl ListService {
         cursor: &str,
         cancellation: Option<&CancellationToken>,
     ) -> Result<ListPage, ToolExecutionError> {
-        check_cancelled(cancellation)?;
+        check_cancellation(cancellation)?;
         let (id, offset) = parse_cursor(cursor).ok_or_else(invalid_cursor_error)?;
         if !id.starts_with("list-") {
             return Err(invalid_cursor_error().into());
@@ -204,10 +194,7 @@ impl ListService {
         let canonical = path.to_path_buf();
         let now = Instant::now();
         let (entries, stamp) = {
-            let mut cache = self
-                .snapshots
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut cache = lock_mutex(&self.snapshots);
             remove_expired(&mut cache, now);
             let Some(snapshot) = cache.snapshots.get_mut(id) else {
                 return Err(expired_cursor_error().into());
@@ -223,7 +210,7 @@ impl ListService {
             snapshot.expires_at = now + LIST_SNAPSHOT_TTL;
             (Arc::clone(&snapshot.entries), snapshot.stamp.clone())
         };
-        check_cancelled(cancellation)?;
+        check_cancellation(cancellation)?;
         Ok(build_page(
             id,
             entries.as_ref(),
@@ -240,10 +227,7 @@ impl ListService {
     fn reuse_snapshot(&self, path: &Path) -> Option<(String, Arc<Vec<PathBuf>>, FastStamp)> {
         let canonical = path.to_path_buf();
         let now = Instant::now();
-        let mut cache = self
-            .snapshots
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cache = lock_mutex(&self.snapshots);
         remove_expired(&mut cache, now);
         let id = cache
             .snapshots
@@ -312,12 +296,12 @@ fn collect_directory(
     cancellation: Option<&CancellationToken>,
 ) -> Result<DirectoryScan, ToolExecutionError> {
     let mut entries = Vec::new();
-    if let Err(error) = check_cancelled(cancellation) {
+    if let Err(error) = check_cancellation(cancellation) {
         return Err(observed_directory_failure(path, &entries, error));
     }
     let directory = std::fs::read_dir(path).map_err(|error| directory_open_error(path, error))?;
     for entry in directory {
-        if let Err(error) = check_cancelled(cancellation) {
+        if let Err(error) = check_cancellation(cancellation) {
             return Err(observed_directory_failure(path, &entries, error));
         }
         if entries.len() >= MAX_DIRECTORY_ENTRIES {
@@ -333,7 +317,7 @@ fn collect_directory(
             .map_err(|error| observed_directory_failure(path, &entries, ToolError::from(error)))?;
         entries.push(entry.path());
     }
-    if let Err(error) = check_cancelled(cancellation) {
+    if let Err(error) = check_cancellation(cancellation) {
         return Err(observed_directory_failure(path, &entries, error));
     }
     entries.sort();
@@ -384,24 +368,6 @@ fn directory_stamp(path: &Path, entries: &[PathBuf]) -> (FastStamp, u64) {
     let mut stamp = FastStamp::observed_directory(entries.len(), digest);
     stamp.modified_nanos = modified_nanos;
     (stamp, bytes_read)
-}
-
-fn check_cancelled(cancellation: Option<&CancellationToken>) -> Result<(), ToolError> {
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return Err(ToolError::Cancelled);
-    }
-    Ok(())
-}
-
-fn new_snapshot_id(prefix: &str) -> String {
-    let sequence = NEXT_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}-{:x}-{:x}", std::process::id(), sequence)
-}
-
-fn parse_cursor(cursor: &str) -> Option<(&str, usize)> {
-    let (id, offset) = cursor.rsplit_once(':')?;
-    let offset = usize::from_str_radix(offset, 16).ok()?;
-    (offset > 0 && !id.is_empty()).then_some((id, offset))
 }
 
 fn invalid_cursor_error() -> ToolError {

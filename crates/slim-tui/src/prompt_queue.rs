@@ -32,9 +32,25 @@ impl PersistentQueue {
     pub fn reduce(&mut self, state: &mut AppState, action: Action) -> io::Result<Vec<Effect>> {
         // Clock actions arrive on every wake of the loop and never touch the
         // queue: they skip the draft snapshot and the journal comparison.
+        // So do streamed output and usage events: they change neither the
+        // queue, the draft, nor the session identity, and emit no prompt
+        // command, so there is nothing to journal.
         if matches!(
             action,
-            Action::SyncClock(_) | Action::Tick(_) | Action::StatusTick(_)
+            Action::SyncClock(_)
+                | Action::Tick(_)
+                | Action::StatusTick(_)
+                | Action::UiEventReceived(
+                    UiEvent::AssistantDelta { .. }
+                        | UiEvent::ThinkingDelta { .. }
+                        | UiEvent::ToolProgress { .. }
+                        | UiEvent::ToolOutput { .. }
+                        | UiEvent::ToolDiff { .. }
+                        | UiEvent::UsagePartial { .. }
+                        | UiEvent::Usage { .. }
+                        | UiEvent::UsageEstimate { .. }
+                        | UiEvent::UsageEstimateForRun { .. }
+                )
         ) {
             return Ok(reduce(state, action));
         }
@@ -51,16 +67,18 @@ impl PersistentQueue {
         );
         // The draft is copied only when the action can edit it or a
         // preparation outcome may hand it back.
-        let composer_before = (explicit_edit
+        let composer_before = if explicit_edit
             || matches!(
                 &action,
                 Action::UiEventReceived(
                     UiEvent::PromptPreparationCancelled { .. }
                         | UiEvent::PromptPreparationFailed { .. }
                 )
-            ))
-        .then(|| state.composer.payload())
-        .unwrap_or_default();
+            ) {
+            state.composer.payload()
+        } else {
+            String::new()
+        };
         let ui_event = matches!(&action, Action::UiEventReceived(_));
         let session_event = matches!(
             &action,

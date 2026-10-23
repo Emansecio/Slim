@@ -11,9 +11,9 @@ use crate::context::{
     ContextUsage, SummaryRequest,
 };
 
-/// Metadata returned by the richer branch API. The path-returning
-/// `branch_v2` is kept symmetrical with the existing v1 helper; callers that
-/// need the sequence contract can use this API and receive `next_seq` too.
+/// Metadata returned by the richer branch API (`create_durable_branch_compacted`).
+/// The path-returning `branch_v2` is kept symmetrical with the existing v1
+/// helper; callers that need the sequence contract receive `next_seq` too.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DurableBranch {
     pub path: PathBuf,
@@ -26,29 +26,13 @@ pub struct DurableBranch {
 /// changing the parent. The child header records the parent and explicit
 /// cutoff, and the first valid append sequence is exactly cutoff+1.
 pub fn branch_v2(path: impl AsRef<Path>, child_id: &str, cutoff_seq: u64) -> io::Result<PathBuf> {
-    Ok(create_durable_branch(path, child_id, cutoff_seq)?.path)
-}
-
-pub fn branch_durable_v2(
-    path: impl AsRef<Path>,
-    child_id: &str,
-    cutoff_seq: u64,
-) -> io::Result<DurableBranch> {
-    create_durable_branch(path, child_id, cutoff_seq)
-}
-
-pub fn create_durable_branch(
-    path: impl AsRef<Path>,
-    child_id: &str,
-    cutoff_seq: u64,
-) -> io::Result<DurableBranch> {
     let prepared = prepare_durable_branch(path, child_id, cutoff_seq)?;
     drop(JsonlRepo::create_with_records(
         &prepared.branch.path,
         prepared.header,
         prepared.records,
     )?);
-    Ok(prepared.branch)
+    Ok(prepared.branch.path)
 }
 
 struct PreparedBranch {

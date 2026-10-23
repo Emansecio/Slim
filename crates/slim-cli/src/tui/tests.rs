@@ -1495,7 +1495,7 @@ fn selecting_codex_model_activates_saved_login_from_opencode() {
     channels
         .commands
         .send(super::UiCommand::SetModel {
-            model: super::ModelAlias::Sol,
+            model: super::ModelAlias::Sol.id().into(),
             effort: super::ReasoningEffort::High,
             fast: false,
         })
@@ -1652,7 +1652,7 @@ fn model_overlay_switches_across_all_saved_provider_groups() {
     channels
         .commands
         .send(super::UiCommand::SetModel {
-            model: super::ModelAlias::Sol,
+            model: super::ModelAlias::Sol.id().into(),
             effort: super::ReasoningEffort::High,
             fast: false,
         })
@@ -1671,4 +1671,738 @@ fn model_overlay_switches_across_all_saved_provider_groups() {
         Some("openai-codex".into())
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+// --- Characterization of the API-key provider commands (SaveApiKey, Set*Model,
+// Logout). They pin the emitted UiEvent sequence per provider.
+
+const API_KEY_ENV: [&str; 14] = [
+    "SLIM_AUTH_FILE",
+    "SLIM_CONFIG_FILE",
+    "SLIM_PROVIDER",
+    "SLIM_API_KEY",
+    "SLIM_MODEL",
+    "SLIM_ENDPOINT",
+    "OPENCODE_API_KEY",
+    "CLINEPASS_API_KEY",
+    "COMMANDCODE_API_KEY",
+    "CMD_API_KEY",
+    "XAI_API_KEY",
+    "OPEN_DESIGN_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+];
+
+const APPLIED_NOTICE: &str = "Modelo aplicado nesta sessão · /model --default para salvar o padrão";
+
+struct ProviderCommandEnv {
+    _restore: RestoreEnvironment<14>,
+    _root: RemoveDirectoryOnDrop,
+    auth: std::path::PathBuf,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+fn provider_command_env(tag: &str) -> ProviderCommandEnv {
+    let guard = ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let restore = RestoreEnvironment::capture(API_KEY_ENV);
+    for name in API_KEY_ENV {
+        std::env::remove_var(name);
+    }
+    let root = std::env::temp_dir().join(format!(
+        "slim-provider-commands-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("fixture directory");
+    let auth = root.join("auth.json");
+    let config = root.join("config.toml");
+    std::fs::write(&config, "").expect("isolated config");
+    std::env::set_var("SLIM_AUTH_FILE", &auth);
+    std::env::set_var("SLIM_CONFIG_FILE", &config);
+    ProviderCommandEnv {
+        _restore: restore,
+        _root: RemoveDirectoryOnDrop(root),
+        auth,
+        _guard: guard,
+    }
+}
+
+fn provider_command_startup(request: Option<crate::ProviderRequest>) -> TuiStartup {
+    TuiStartup {
+        request,
+        oauth_session: None,
+        options: crate::ProviderRunOptions::default(),
+        initial_prompt: None,
+        image_labels: Vec::new(),
+        resume_path: None,
+        resume_preflight: None,
+        pending_session_title: None,
+        persist_sessions: false,
+        mode: slim_core::OperatingMode::Auto,
+        effort: super::ReasoningEffort::High,
+        endpoint_override: None,
+        model_override: None,
+        timeout: Duration::from_secs(120),
+    }
+}
+
+fn connected_request(kind: slim_core::provider::ProviderKind) -> crate::ProviderRequest {
+    let (endpoint, model) = super::defaults_for_test(kind);
+    crate::ProviderRequest {
+        prompt: String::new(),
+        mode: slim_core::OperatingMode::Auto,
+        kind,
+        endpoint: endpoint.into(),
+        model: model.into(),
+        api_key: "connected-key".into(),
+        account_id: None,
+        timeout: Duration::from_secs(120),
+    }
+}
+
+/// Runs `commands` on a fresh session and returns every event emitted after
+/// startup, up to a sentinel notification the worker emits last: control-lane
+/// events first, then data-lane events (each lane keeps its own order).
+fn drive_provider_commands(
+    startup: TuiStartup,
+    auth: &std::path::Path,
+    commands: Vec<UiCommand>,
+) -> Vec<UiEvent> {
+    const SENTINEL: &str = "Nenhuma falha de conexão está aguardando /retry";
+    let oauth = OAuthService::new(
+        OAuthEndpoints::default(),
+        Arc::new(NoBrowser),
+        OAuthStore::at(auth),
+    )
+    .expect("service");
+    let (runtime, channels) = spawn_tui_session(startup, oauth).expect("runtime");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(Instant::now() < deadline, "startup events never finished");
+        if let Ok(UiEvent::CodexSpeedChanged { .. }) =
+            channels.events.recv_timeout(Duration::from_millis(50))
+        {
+            break;
+        }
+    }
+    // Startup tail that lands on the data lane (notices, restored state).
+    while channels.events_data.try_recv().is_ok() {}
+    for command in commands {
+        channels.commands.send(command).expect("send command");
+    }
+    channels
+        .commands
+        .send(UiCommand::RetryProvider)
+        .expect("send sentinel");
+    let mut data = Vec::new();
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "sentinel never arrived: {data:?}"
+        );
+        match channels.events_data.recv_timeout(Duration::from_millis(50)) {
+            Ok(UiEvent::Notification { message }) if message == SENTINEL => break,
+            Ok(event) => data.push(event),
+            Err(_) => {}
+        }
+    }
+    let mut events: Vec<UiEvent> = std::iter::from_fn(|| channels.events.try_recv().ok()).collect();
+    events.extend(data);
+    drop(channels);
+    drop(runtime);
+    events
+}
+
+/// Orders `expected` the way `drive_provider_commands` reports it.
+fn by_lane(expected: Vec<UiEvent>) -> Vec<UiEvent> {
+    let (mut control, data): (Vec<_>, Vec<_>) = expected.into_iter().partition(UiEvent::is_control);
+    control.extend(data);
+    control
+}
+
+fn notification(message: &str) -> UiEvent {
+    UiEvent::Notification {
+        message: message.into(),
+    }
+}
+
+fn auth_changed(provider: super::LoginProvider) -> UiEvent {
+    UiEvent::AuthStateChanged {
+        provider: Some(provider),
+        authenticated: true,
+    }
+}
+
+fn api_key_text(value: &str) -> slim_tui::api::SensitiveText {
+    let mut text = slim_tui::api::SensitiveText::default();
+    assert!(text.push_str_bounded(value, 4096));
+    text
+}
+
+struct ApiKeyProviderCase {
+    provider: super::LoginProvider,
+    kind: slim_core::provider::ProviderKind,
+    label: &'static str,
+    default_model: &'static str,
+    other_model: String,
+}
+
+fn api_key_provider_cases() -> Vec<ApiKeyProviderCase> {
+    use slim_core::provider::ProviderKind;
+    let other = |ids: Vec<&'static str>, default: &str| -> String {
+        ids.into_iter()
+            .find(|id| *id != default)
+            .expect("alternative model")
+            .to_owned()
+    };
+    vec![
+        ApiKeyProviderCase {
+            provider: super::LoginProvider::OpenCodeGo,
+            kind: ProviderKind::OpenCodeGo,
+            label: "OpenCode Go",
+            default_model: slim_core::provider::OPENCODE_GO_DEFAULT_MODEL,
+            other_model: other(
+                slim_core::provider::open_code_models()
+                    .iter()
+                    .map(|m| m.id)
+                    .collect(),
+                slim_core::provider::OPENCODE_GO_DEFAULT_MODEL,
+            ),
+        },
+        ApiKeyProviderCase {
+            provider: super::LoginProvider::OpenCodeZen,
+            kind: ProviderKind::OpenCodeZen,
+            label: "OpenCode Zen",
+            default_model: slim_core::provider::OPENCODE_ZEN_DEFAULT_MODEL,
+            other_model: other(
+                slim_core::provider::zen_models()
+                    .iter()
+                    .map(|m| m.id)
+                    .collect(),
+                slim_core::provider::OPENCODE_ZEN_DEFAULT_MODEL,
+            ),
+        },
+        ApiKeyProviderCase {
+            provider: super::LoginProvider::ClinePass,
+            kind: ProviderKind::ClinePass,
+            label: "ClinePass",
+            default_model: slim_core::provider::CLINEPASS_DEFAULT_MODEL,
+            other_model: "cline-pass/deepseek-v4-pro".into(),
+        },
+        ApiKeyProviderCase {
+            provider: super::LoginProvider::CommandCode,
+            kind: ProviderKind::CommandCode,
+            label: "Command Code",
+            default_model: slim_core::provider::COMMANDCODE_DEFAULT_MODEL,
+            other_model: "deepseek/deepseek-v4-pro".into(),
+        },
+        ApiKeyProviderCase {
+            provider: super::LoginProvider::OpenDesign,
+            kind: ProviderKind::OpenDesign,
+            label: "Open Design",
+            default_model: slim_core::provider::OPEN_DESIGN_DEFAULT_MODEL,
+            other_model: other(
+                slim_core::provider::open_design_models()
+                    .iter()
+                    .map(|m| m.id)
+                    .collect(),
+                slim_core::provider::OPEN_DESIGN_DEFAULT_MODEL,
+            ),
+        },
+        ApiKeyProviderCase {
+            provider: super::LoginProvider::Xai,
+            kind: ProviderKind::Xai,
+            label: "xAI",
+            default_model: slim_core::provider::XAI_DEFAULT_MODEL,
+            other_model: other(
+                slim_core::provider::xai_models()
+                    .iter()
+                    .map(|m| m.id)
+                    .collect(),
+                slim_core::provider::XAI_DEFAULT_MODEL,
+            ),
+        },
+    ]
+}
+
+#[test]
+fn save_api_key_connects_each_api_key_provider_and_emits_identical_events() {
+    for case in api_key_provider_cases() {
+        // Default model, a provider-valid override, and an id no provider
+        // accepts (falls back to the default).
+        for (model_override, expected_model) in [
+            (None, case.default_model.to_owned()),
+            (Some(case.other_model.clone()), case.other_model.clone()),
+            (
+                Some("not a model id!".to_owned()),
+                case.default_model.to_owned(),
+            ),
+        ] {
+            let env = provider_command_env("save");
+            let mut startup = provider_command_startup(None);
+            startup.model_override = model_override.clone();
+            let events = drive_provider_commands(
+                startup,
+                &env.auth,
+                vec![UiCommand::SaveApiKey {
+                    provider: case.provider,
+                    api_key: api_key_text("typed-secret-key"),
+                }],
+            );
+            assert_eq!(
+                events,
+                by_lane(vec![
+                    auth_changed(case.provider),
+                    UiEvent::ModelChanged {
+                        model: expected_model
+                    },
+                    notification(&format!("Connected: {}", case.label)),
+                ]),
+                "{} with override {model_override:?}",
+                case.label
+            );
+            let saved = crate::auth::resolve_provider_credential(case.kind)
+                .expect("resolve saved credential")
+                .expect("credential saved");
+            assert_eq!(saved.access, "typed-secret-key", "{}", case.label);
+        }
+    }
+}
+
+#[test]
+fn save_api_key_reports_unsupported_provider_and_storage_failure() {
+    let env = provider_command_env("save-fail");
+    let events = drive_provider_commands(
+        provider_command_startup(None),
+        &env.auth,
+        vec![
+            UiCommand::SaveApiKey {
+                provider: super::LoginProvider::OpenAiCodex,
+                api_key: api_key_text("typed-secret-key"),
+            },
+            UiCommand::SaveApiKey {
+                provider: super::LoginProvider::Anthropic,
+                api_key: api_key_text("typed-secret-key"),
+            },
+        ],
+    );
+    let unavailable = UiEvent::LoginFailed {
+        message: "API-key login is unavailable for this provider.".into(),
+    };
+    assert_eq!(events, vec![unavailable.clone(), unavailable]);
+    drop(env);
+
+    // The auth path sits below a regular file, so the save itself fails.
+    let env = provider_command_env("save-fail-io");
+    let blocker = env.auth.with_file_name("blocker");
+    std::fs::write(&blocker, "file").expect("blocker file");
+    std::env::set_var("SLIM_AUTH_FILE", blocker.join("auth.json"));
+    let events = drive_provider_commands(
+        provider_command_startup(None),
+        &env.auth,
+        vec![UiCommand::SaveApiKey {
+            provider: super::LoginProvider::Xai,
+            api_key: api_key_text("typed-secret-key"),
+        }],
+    );
+    assert_eq!(events.len(), 1, "{events:?}");
+    let UiEvent::LoginFailed { message } = &events[0] else {
+        panic!("expected LoginFailed, got {events:?}");
+    };
+    assert!(!message.is_empty());
+    assert!(!message.contains("typed-secret-key"));
+}
+
+fn set_model_command(
+    provider: super::LoginProvider,
+    model: &str,
+    effort: super::ReasoningEffort,
+) -> UiCommand {
+    let model = model.to_owned();
+    match provider {
+        super::LoginProvider::OpenCodeGo => UiCommand::SetOpenCodeModel { model, effort },
+        super::LoginProvider::OpenCodeZen => UiCommand::SetZenModel { model, effort },
+        super::LoginProvider::ClinePass => UiCommand::SetClinePassModel { model, effort },
+        super::LoginProvider::CommandCode => UiCommand::SetCommandCodeModel { model, effort },
+        super::LoginProvider::Xai => UiCommand::SetXaiModel { model, effort },
+        super::LoginProvider::OpenDesign => UiCommand::SetOpenDesignModel { model, effort },
+        other => panic!("no Set*Model command for {other:?}"),
+    }
+}
+
+#[test]
+fn set_model_switches_each_api_key_provider_from_a_saved_login() {
+    for case in api_key_provider_cases() {
+        let effort = super::ReasoningEffort::High;
+        let tail = |model: &str| {
+            vec![
+                notification(APPLIED_NOTICE),
+                UiEvent::ModelChanged {
+                    model: model.into(),
+                },
+                UiEvent::EffortChanged { effort },
+            ]
+        };
+
+        // Signed in elsewhere with a saved key: activates and announces.
+        let env = provider_command_env("set-switch");
+        crate::save_api_key_file(&env.auth, case.kind, "saved-key").expect("saved key");
+        let mut expected = vec![
+            auth_changed(case.provider),
+            notification(&format!("Connected: {}", case.label)),
+        ];
+        expected.extend(tail(case.default_model));
+        let events = drive_provider_commands(
+            provider_command_startup(None),
+            &env.auth,
+            vec![set_model_command(case.provider, case.default_model, effort)],
+        );
+        assert_eq!(events, by_lane(expected), "{} switch", case.label);
+        drop(env);
+
+        // Already on that provider: no activation noise.
+        let env = provider_command_env("set-same");
+        let events = drive_provider_commands(
+            provider_command_startup(Some(connected_request(case.kind))),
+            &env.auth,
+            vec![set_model_command(case.provider, &case.other_model, effort)],
+        );
+        assert_eq!(
+            events,
+            by_lane(tail(&case.other_model)),
+            "{} same provider",
+            case.label
+        );
+    }
+}
+
+#[test]
+fn set_model_rejects_unknown_models_and_missing_logins() {
+    for case in api_key_provider_cases() {
+        let effort = super::ReasoningEffort::High;
+        let env = provider_command_env("set-reject");
+        let rejection = match case.provider {
+            super::LoginProvider::OpenCodeGo => "Unsupported OpenCode Go model or reasoning effort",
+            super::LoginProvider::OpenCodeZen => {
+                "Unsupported OpenCode Zen model or reasoning effort"
+            }
+            super::LoginProvider::ClinePass => "Unsupported ClinePass model",
+            super::LoginProvider::CommandCode => "Unsupported Command Code model",
+            super::LoginProvider::Xai => "Unsupported xAI model",
+            super::LoginProvider::OpenDesign => "Unsupported Open Design model",
+            _ => unreachable!(),
+        };
+        let mut commands = vec![set_model_command(case.provider, "not a model id!", effort)];
+        let mut expected = vec![notification(rejection)];
+        // No saved key: Zen falls back to its public key, the rest ask for /login.
+        if case.kind != slim_core::provider::ProviderKind::OpenCodeZen {
+            commands.push(set_model_command(case.provider, case.default_model, effort));
+            expected.push(notification(&format!(
+                "{} login is not saved. Use /login.",
+                case.label
+            )));
+        }
+        let events = drive_provider_commands(provider_command_startup(None), &env.auth, commands);
+        assert_eq!(events, by_lane(expected), "{}", case.label);
+    }
+}
+
+#[test]
+fn set_model_rejects_unsupported_reasoning_effort_for_gateway_models() {
+    for (provider, kind, model) in [
+        (
+            super::LoginProvider::ClinePass,
+            slim_core::provider::ProviderKind::ClinePass,
+            "cline-pass/deepseek-v4-pro",
+        ),
+        (
+            super::LoginProvider::CommandCode,
+            slim_core::provider::ProviderKind::CommandCode,
+            "deepseek/deepseek-v4-pro",
+        ),
+    ] {
+        let env = provider_command_env("set-effort");
+        let events = drive_provider_commands(
+            provider_command_startup(Some(connected_request(kind))),
+            &env.auth,
+            vec![set_model_command(
+                provider,
+                model,
+                super::ReasoningEffort::Low,
+            )],
+        );
+        assert_eq!(
+            events,
+            vec![notification("Unsupported reasoning effort for this model")]
+        );
+    }
+}
+
+#[test]
+fn logout_disconnects_each_api_key_provider_and_warns_about_environment_keys() {
+    use slim_core::provider::ProviderKind;
+    let cases = [
+        (ProviderKind::OpenCodeGo, "OpenCode Go", "OPENCODE_API_KEY"),
+        (
+            ProviderKind::OpenCodeZen,
+            "OpenCode Zen",
+            "OPENCODE_API_KEY",
+        ),
+        (ProviderKind::ClinePass, "ClinePass", "CLINEPASS_API_KEY"),
+        (
+            ProviderKind::CommandCode,
+            "Command Code",
+            "COMMANDCODE_API_KEY",
+        ),
+        (ProviderKind::CommandCode, "Command Code", "CMD_API_KEY"),
+        (ProviderKind::Xai, "xAI", "XAI_API_KEY"),
+        (ProviderKind::Xai, "xAI", "SLIM_API_KEY"),
+        (
+            ProviderKind::OpenDesign,
+            "Open Design",
+            "OPEN_DESIGN_API_KEY",
+        ),
+    ];
+    for (kind, label, variable) in cases {
+        let disconnected = UiEvent::AuthStateChanged {
+            provider: None,
+            authenticated: false,
+        };
+
+        let env = provider_command_env("logout-clean");
+        crate::save_api_key_file(&env.auth, kind, "saved-key").expect("saved key");
+        let events = drive_provider_commands(
+            provider_command_startup(Some(connected_request(kind))),
+            &env.auth,
+            vec![UiCommand::Logout],
+        );
+        assert_eq!(
+            events,
+            by_lane(vec![
+                disconnected.clone(),
+                UiEvent::JobsChanged { jobs: Vec::new() }
+            ]),
+            "{label} clean logout"
+        );
+        drop(env);
+
+        let env = provider_command_env("logout-env");
+        crate::save_api_key_file(&env.auth, kind, "saved-key").expect("saved key");
+        std::env::set_var(variable, "environment-key");
+        let events = drive_provider_commands(
+            provider_command_startup(Some(connected_request(kind))),
+            &env.auth,
+            vec![UiCommand::Logout],
+        );
+        assert_eq!(
+            events,
+            by_lane(vec![
+                disconnected,
+                UiEvent::JobsChanged { jobs: Vec::new() },
+                notification(&format!(
+                    "{label} disconnected; environment API key still has precedence"
+                )),
+            ]),
+            "{label} with {variable}"
+        );
+    }
+
+    let env = provider_command_env("logout-none");
+    let events = drive_provider_commands(
+        provider_command_startup(None),
+        &env.auth,
+        vec![UiCommand::Logout],
+    );
+    assert_eq!(
+        events,
+        by_lane(vec![
+            UiEvent::JobsChanged { jobs: Vec::new() },
+            notification("No provider session is active")
+        ])
+    );
+}
+
+#[tokio::test]
+async fn refresh_gate_runs_one_refresh_at_a_time_and_delivers_its_result() {
+    let gate = super::RefreshGate::default();
+    let (release, wait) = tokio::sync::oneshot::channel::<()>();
+    let (delivered_tx, mut delivered) = tokio::sync::mpsc::unbounded_channel();
+    let first = delivered_tx.clone();
+    gate.spawn(
+        async move {
+            let _ = wait.await;
+            1
+        },
+        move |value| {
+            let _ = first.send(value);
+        },
+    );
+    // A second refresh while the first is in flight is dropped.
+    gate.spawn(async { 2 }, move |value| {
+        let _ = delivered_tx.send(value);
+    });
+    let _ = release.send(());
+    assert_eq!(delivered.recv().await, Some(1));
+    assert!(
+        delivered.recv().await.is_none(),
+        "second refresh must not run"
+    );
+
+    // Once finished, the gate accepts a new refresh.
+    let (again_tx, mut again) = tokio::sync::mpsc::unbounded_channel();
+    gate.spawn(async { 3 }, move |value| {
+        let _ = again_tx.send(value);
+    });
+    assert_eq!(again.recv().await, Some(3));
+}
+
+#[test]
+fn clinepass_refresh_failure_notifies_and_falls_back_to_the_bundled_catalog() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("catalog server");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buffer = [0_u8; 2048];
+            let _ = stream.read(&mut buffer);
+            let _ = stream.write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    let env = provider_command_env("clinepass-refresh");
+    let mut startup = provider_command_startup(Some(connected_request(
+        slim_core::provider::ProviderKind::ClinePass,
+    )));
+    startup.endpoint_override = Some(format!("http://{address}/chat/completions"));
+    let events = drive_provider_commands_until(
+        startup,
+        &env.auth,
+        vec![UiCommand::RefreshClinePassModels],
+        |event| matches!(event, UiEvent::ClinePassCatalogLoaded { .. }),
+    );
+    server.join().expect("catalog server");
+    let notices: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            UiEvent::Notification { message } => Some(message.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notices.len(), 1, "{events:?}");
+    assert!(
+        notices[0].starts_with("ClinePass live catalog unavailable; using cache/fallback: "),
+        "{notices:?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        UiEvent::ClinePassCatalogLoaded {
+            source: slim_tui::api::ClinePassCatalogSource::Cache,
+            models,
+        } if !models.is_empty()
+    )));
+}
+
+/// Like `drive_provider_commands`, for work that finishes in the background:
+/// waits for an event matching `done`, then collects what is still in flight.
+fn drive_provider_commands_until(
+    startup: TuiStartup,
+    auth: &std::path::Path,
+    commands: Vec<UiCommand>,
+    done: impl Fn(&UiEvent) -> bool,
+) -> Vec<UiEvent> {
+    let oauth = OAuthService::new(
+        OAuthEndpoints::default(),
+        Arc::new(NoBrowser),
+        OAuthStore::at(auth),
+    )
+    .expect("service");
+    let (runtime, channels) = spawn_tui_session(startup, oauth).expect("runtime");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(Instant::now() < deadline, "startup events never finished");
+        if let Ok(UiEvent::CodexSpeedChanged { .. }) =
+            channels.events.recv_timeout(Duration::from_millis(50))
+        {
+            break;
+        }
+    }
+    while channels.events_data.try_recv().is_ok() {}
+    for command in commands {
+        channels.commands.send(command).expect("send command");
+    }
+    let (mut control, mut data) = (Vec::new(), Vec::new());
+    let mut finished = false;
+    let mut grace_until = deadline;
+    while Instant::now() < grace_until {
+        while let Ok(event) = channels.events.try_recv() {
+            finished |= done(&event);
+            control.push(event);
+        }
+        while let Ok(event) = channels.events_data.try_recv() {
+            finished |= done(&event);
+            data.push(event);
+        }
+        if finished && grace_until == deadline {
+            grace_until = Instant::now() + Duration::from_millis(300);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        finished,
+        "expected event never arrived: {control:?} {data:?}"
+    );
+    drop(channels);
+    drop(runtime);
+    control.extend(data);
+    control
+}
+
+#[test]
+fn model_switch_effort_rules_follow_each_provider_family() {
+    use slim_core::provider::ProviderKind;
+    let effort = super::ReasoningEffort::High;
+    let zen = super::api_key_spec_for_kind(ProviderKind::OpenCodeZen).expect("zen spec");
+    let go = super::api_key_spec_for_kind(ProviderKind::OpenCodeGo).expect("go spec");
+    let knobless = slim_core::provider::zen_models()
+        .iter()
+        .find(|model| model.reasoning_levels.is_empty())
+        .expect("zen model without effort levels");
+    // Zen models without levels take any effort but send none.
+    assert_eq!(
+        super::switched_reasoning_effort(zen, knobless.id, effort),
+        None
+    );
+    assert_eq!(
+        super::model_switch_rejection(zen, knobless.id, effort),
+        None
+    );
+    // Everything else sends the chosen effort.
+    assert_eq!(
+        super::switched_reasoning_effort(
+            go,
+            slim_core::provider::OPENCODE_GO_DEFAULT_MODEL,
+            effort
+        ),
+        Some("high".to_owned())
+    );
+    if let Some(model) = slim_core::provider::zen_models()
+        .iter()
+        .find(|model| !model.reasoning_levels.is_empty())
+    {
+        assert_eq!(
+            super::switched_reasoning_effort(zen, model.id, effort),
+            Some("high".to_owned())
+        );
+    }
+    // Go requires the model to list the effort.
+    assert_eq!(
+        super::model_switch_rejection(go, "unknown-model", effort).as_deref(),
+        Some("Unsupported OpenCode Go model or reasoning effort")
+    );
 }

@@ -18,8 +18,8 @@ use slim_core::runtime::mode_name;
 
 use crate::api::{BlockId, LoginProvider, TodoItemStatus, UiChannels, UiCommand};
 use crate::app::{
-    ActivityPhase, AppState, EffortOverlay, LoginOverlay, LoginStage, ModelOverlay, ModelRow,
-    NotificationPriority, SlashSuggestions, INFO_TOAST_TTL_MS,
+    ActivityPhase, AppState, EffortOverlay, LoginOverlay, LoginStage, ModelCatalogs, ModelOverlay,
+    ModelRow, NotificationPriority, SlashSuggestions, INFO_TOAST_TTL_MS,
 };
 use crate::block::{
     question_option_marker, wrap_words, Block, BlockKind, BlockLifecycle, DiffRowKind, FoldState,
@@ -30,7 +30,9 @@ use crate::input::{DecodedEvent, PasteStreamDecoder};
 use crate::inspector::{is_mutating_tool, InspectorKind};
 use crate::layout::{plan_with_session_rail_and_composer, todo_height, Rect};
 use crate::markdown::{render_plain, render_prose, sanitize_terminal_text, MarkdownStyles};
-use crate::picker::{truncate_cells, visible_window, PICKER_NOMINAL_CAPACITY};
+use crate::picker::{
+    ensure_visible_start, truncate_cells, visible_window, PICKER_NOMINAL_CAPACITY,
+};
 use crate::reducer::{reduce, Action, Effect, ScrollIntent};
 use crate::render::{
     cached_lines_bytes, thinking_body_width, user_prompt_text_width, BodyKind, EventCoalescer,
@@ -46,9 +48,9 @@ use crate::theme::{
 
 const MENU_FOCUS_FLASH_MS: u64 = 166;
 use crate::view_model::{
-    activity_elapsed, activity_label, activity_phase_label, assistant_label, budget_near_limit,
-    completed_tool_phrase, display_cwd, format_context, is_trivial_cwd, run_status_label,
-    session_rail_projection, tool_budget_label, tool_effect, tool_target, tool_title,
+    activity_elapsed, activity_label, activity_phase_label, assistant_label, budget_label,
+    budget_near_limit, completed_tool_phrase, display_cwd, format_context, is_trivial_cwd,
+    run_status_label, session_rail_projection, tool_effect, tool_target, tool_title,
     truncate_display_width, ToolEffect,
 };
 
@@ -634,26 +636,7 @@ pub fn terminal_action(
             if inspector_has_keyboard_focus(state) {
                 if let Some(intent) = inspector_scroll_intent(key) {
                     if let Some(area) = inspector_panel_area_for_size(state, size, cache) {
-                        let palette = Palette::of(Capabilities {
-                            color_depth: ColorDepth::None,
-                            mouse: false,
-                            clipboard: false,
-                            images: false,
-                            reduced_motion: false,
-                        });
-                        let metrics = inspector_panel_metrics(
-                            state,
-                            state.inspector.active,
-                            area,
-                            &palette,
-                            cache,
-                            false,
-                        );
-                        return Some(Action::InspectorScroll {
-                            intent,
-                            total_rows: metrics.total_rows,
-                            capacity: metrics.capacity,
-                        });
+                        return Some(inspector_scroll_action(state, area, intent, cache));
                     }
                 }
             }
@@ -722,6 +705,23 @@ pub fn terminal_action(
     }
 }
 
+/// Scrolls the inspector panel at `area`, measured without painting it.
+fn inspector_scroll_action(
+    state: &AppState,
+    area: ratatui::layout::Rect,
+    intent: ScrollIntent,
+    cache: &mut WrapCache,
+) -> Action {
+    let palette = Palette::of(Capabilities::plain());
+    let metrics =
+        inspector_panel_metrics(state, state.inspector.active, area, &palette, cache, false);
+    Action::InspectorScroll {
+        intent,
+        total_rows: metrics.total_rows,
+        capacity: metrics.capacity,
+    }
+}
+
 fn mouse_action(
     mouse: MouseEvent,
     state: &AppState,
@@ -761,26 +761,7 @@ fn mouse_action(
             if let Some(area) = inspector_panel_area_for_size(state, size, cache)
                 .filter(|area| area_contains(*area, mouse.column, mouse.row))
             {
-                let palette = Palette::of(Capabilities {
-                    color_depth: ColorDepth::None,
-                    mouse: false,
-                    clipboard: false,
-                    images: false,
-                    reduced_motion: false,
-                });
-                let metrics = inspector_panel_metrics(
-                    state,
-                    state.inspector.active,
-                    area,
-                    &palette,
-                    cache,
-                    false,
-                );
-                return Some(Action::InspectorScroll {
-                    intent,
-                    total_rows: metrics.total_rows,
-                    capacity: metrics.capacity,
-                });
+                return Some(inspector_scroll_action(state, area, intent, cache));
             }
             Some(Action::WheelScroll {
                 intent,
@@ -863,12 +844,7 @@ fn selection_area(state: &AppState, cache: &WrapCache) -> Option<ratatui::layout
         .map(|current| area.intersection(*current))
 }
 
-fn extract_visible_selection(
-    frame: &mut ratatui::Frame,
-    state: &AppState,
-    cache: &WrapCache,
-) -> String {
-    let _ = frame;
+fn extract_visible_selection(state: &AppState, cache: &WrapCache) -> String {
     cache
         .painted_selection
         .as_ref()
@@ -1085,6 +1061,32 @@ fn scrollbar_is_guaranteed(blocks: &[Block], viewport: u64) -> bool {
     false
 }
 
+/// The height index of the transcript in a region `width` cells wide and
+/// `viewport` rows tall, with the width its content wraps to and whether a
+/// scrollbar takes the last column. Measuring and painting share this, so a
+/// scroll position is always computed against the rows that get painted.
+fn scrollback_index<'a>(
+    state: &'a AppState,
+    width: u16,
+    viewport: u64,
+    cache: &mut WrapCache,
+) -> (crate::render::HeightIndex<'a>, u16, bool) {
+    let content_rev = state.revisions.content;
+    let fold_rev = state.revisions.fold;
+    if scrollbar_is_guaranteed(state.blocks(), viewport) {
+        let content_width = width.saturating_sub(1);
+        let index = cache.height_index(state.blocks(), content_rev, fold_rev, content_width);
+        return (index, content_width, true);
+    }
+    let index = cache.height_index(state.blocks(), content_rev, fold_rev, width);
+    if viewport > 0 && index.total_rows > viewport {
+        let content_width = width.saturating_sub(1);
+        let index = cache.height_index(state.blocks(), content_rev, fold_rev, content_width);
+        return (index, content_width, true);
+    }
+    (index, width, false)
+}
+
 pub fn measure_scrollback(
     state: &AppState,
     width: u16,
@@ -1096,21 +1098,7 @@ pub fn measure_scrollback(
     let workspace = workspace_regions(state, to_ratatui(regions.scrollback));
     let notices = toast_row_count(state, workspace.transcript.height);
     let viewport = u64::from(workspace.transcript.height.saturating_sub(notices));
-    let mut content_width = workspace.transcript.width;
-    let scrollbar_guaranteed = scrollbar_is_guaranteed(state.blocks(), viewport);
-    let content_rev = state.revisions.content;
-    let fold_rev = state.revisions.fold;
-    let index = if scrollbar_guaranteed {
-        content_width = content_width.saturating_sub(1);
-        cache.height_index(state.blocks(), content_rev, fold_rev, content_width)
-    } else {
-        let mut idx = cache.height_index(state.blocks(), content_rev, fold_rev, content_width);
-        if viewport > 0 && idx.total_rows > viewport {
-            content_width = content_width.saturating_sub(1);
-            idx = cache.height_index(state.blocks(), content_rev, fold_rev, content_width);
-        }
-        idx
-    };
+    let (index, _, _) = scrollback_index(state, workspace.transcript.width, viewport, cache);
     index.metrics(&state.scroll.mode, viewport)
 }
 
@@ -1385,7 +1373,7 @@ fn draw_state(
     let mut selected = String::new();
     backend.draw_synchronized(|frame| {
         render_frame(frame, state, capabilities, cache);
-        selected = extract_visible_selection(frame, state, cache);
+        selected = extract_visible_selection(state, cache);
     })?;
     if state.selection.is_some()
         && cache
@@ -1566,26 +1554,14 @@ pub fn render_frame(
         );
     }
     if let Some(overlay) = &state.model_overlay {
-        let rows = cache.model_rows(
-            overlay,
-            &state.open_code_models,
-            &state.cline_pass_models,
-            &state.command_code_models,
-            &state.zen_models,
-            &state.open_design_models,
-            state.catalog_revision,
-        );
+        let rows = cache.model_rows(overlay, &state.model_catalogs(), state.catalog_revision);
         render_model_overlay(
             frame,
             overlay,
             &state.model,
             state.auth_provider,
             state.effort,
-            &state.open_code_models,
-            &state.cline_pass_models,
-            &state.command_code_models,
-            &state.zen_models,
-            &state.open_design_models,
+            &state.model_catalogs(),
             &rows,
             &palette,
             capabilities,
@@ -2018,39 +1994,19 @@ fn render_scrollback(
     notice_highlight_enabled: bool,
     search_matches: &[usize],
 ) -> PaintedPhase {
-    if welcome_visible(state) {
-        frame.render_widget(
-            ratatui::widgets::Block::default().style(palette.surface),
-            area,
-        );
-        render_welcome(frame, area, state, palette, capabilities);
-        return PaintedPhase::default();
-    }
     frame.render_widget(
         ratatui::widgets::Block::default().style(palette.surface),
         area,
     );
+    if welcome_visible(state) {
+        render_welcome(frame, area, state, palette, capabilities);
+        return PaintedPhase::default();
+    }
     let notice_count = toast_row_count(state, area.height);
     let viewport = u64::from(area.height.saturating_sub(notice_count));
-    let mut content_width = area.width;
-    let scrollbar_guaranteed = scrollbar_is_guaranteed(state.blocks(), viewport);
+    let (index, content_width, scrollbar) = scrollback_index(state, area.width, viewport, cache);
     let content_rev = state.revisions.content;
     let fold_rev = state.revisions.fold;
-    let (index, scrollbar) = if scrollbar_guaranteed {
-        content_width = area.width.saturating_sub(1);
-        (
-            cache.height_index(state.blocks(), content_rev, fold_rev, content_width),
-            true,
-        )
-    } else {
-        let mut idx = cache.height_index(state.blocks(), content_rev, fold_rev, content_width);
-        let bar = viewport > 0 && idx.total_rows > viewport;
-        if bar {
-            content_width = area.width.saturating_sub(1);
-            idx = cache.height_index(state.blocks(), content_rev, fold_rev, content_width);
-        }
-        (idx, bar)
-    };
     let metrics = index.metrics(&state.scroll.mode, viewport);
     let bottom = metrics.bottom_start;
     let start_row = metrics.viewport_start;
@@ -2614,23 +2570,9 @@ fn notification_toast_label(
             if history_count == 1 { "" } else { "s" }
         ));
     }
-    truncate_with_marker(&label, max_width)
-}
-
-/// Truncate one-line chrome while leaving an explicit marker that more content
-/// is available through the Diagnostics history.  The marker is counted in
-/// terminal cells, so wide glyphs cannot spill into the border.
-fn truncate_with_marker(text: &str, max_width: usize) -> String {
-    if UnicodeWidthStr::width(text) <= max_width {
-        return text.to_owned();
-    }
-    if max_width == 0 {
-        return String::new();
-    }
-    if max_width == 1 {
-        return "…".into();
-    }
-    format!("{}…", truncate_cells(text, max_width.saturating_sub(1)))
+    // The `…` marks that the Diagnostics history holds the full text; the
+    // marker is counted in terminal cells, so wide glyphs cannot spill.
+    truncate_cells(&label, max_width)
 }
 
 fn render_todo_dock(
@@ -2975,11 +2917,10 @@ const WELCOME_MARK: [&str; 3] = [
 const WELCOME_MARK_CELLS: u16 = 20;
 /// Resting light of each mark row: lit from above, settling toward the base.
 const WELCOME_MARK_REST: [f32; 3] = [0.34, 0.17, 0.0];
-/// A slanted sheen crosses the mark once per period, after a short pause at
-/// launch; between passes the screen stays still and the loop sleeps.
+/// A slanted sheen crosses the mark once, after a short pause at launch;
+/// afterwards the screen stays still and the loop sleeps.
 const WELCOME_SWEEP_DELAY_MS: u64 = 400;
 const WELCOME_SWEEP_MS: u64 = 1_800;
-const WELCOME_SWEEP_PERIOD_MS: u64 = 8_000;
 /// Half width of the sheen, in cells, and how far it leans per row.
 const WELCOME_SHEEN_HALF: f32 = 3.5;
 const WELCOME_SHEEN_LEAN: f32 = 1.5;
@@ -4687,15 +4628,6 @@ impl CaretPhase {
             Self::Off
         }
     }
-
-    fn tag(self) -> u64 {
-        match self {
-            Self::Hidden => 0,
-            Self::On => 1,
-            Self::Off => 2,
-            Self::Stalled => 3,
-        }
-    }
 }
 
 /// `● Slim` opens the agent's side of a turn, in the same gutter as the
@@ -5482,13 +5414,7 @@ fn approval_overlay_metrics(
     cache: &mut WrapCache,
 ) -> Option<(ratatui::layout::Rect, usize, usize)> {
     let geometry = approval_overlay_geometry_for_size(state, size, cache)?;
-    let palette = Palette::of(Capabilities {
-        color_depth: ColorDepth::None,
-        mouse: false,
-        clipboard: false,
-        images: false,
-        reduced_motion: false,
-    });
+    let palette = Palette::of(Capabilities::plain());
     let interaction = state.pending_interaction()?;
     let mut lines = interaction_overlay_lines(interaction, geometry.inner_width, &palette);
     let bordered = |content: usize| (content as u16).saturating_add(INTERACTION_CHROME_ROWS);
@@ -6731,7 +6657,7 @@ pub(crate) fn run_inspector_lines(
         row("Erros", errors.to_string(), error_style),
         row(
             "Turnos",
-            format!("{}/{}", state.turns_used, state.max_turns),
+            budget_label(state.turns_used, state.max_turns),
             palette.text,
         ),
         row("Contexto", format_context(state, true), palette.text),
@@ -7059,17 +6985,11 @@ pub(crate) fn inspector_lines(
                     "ferramentas",
                     format!(
                         "leituras {} · alterações {}",
-                        tool_budget_label(state.tools_used_read, state.max_read_tool_calls),
-                        tool_budget_label(
-                            state.tools_used_mutating,
-                            state.max_mutating_tool_calls
-                        ),
+                        budget_label(state.tools_used_read, state.max_read_tool_calls),
+                        budget_label(state.tools_used_mutating, state.max_mutating_tool_calls),
                     ),
                 ),
-                (
-                    "turnos",
-                    format!("{}/{}", state.turns_used, state.max_turns),
-                ),
+                ("turnos", budget_label(state.turns_used, state.max_turns)),
                 ("contexto", format_context(state, false)),
                 ("latência", format_provider_timings(state)),
             ];
@@ -7460,11 +7380,7 @@ fn render_model_overlay(
     active_model: &str,
     active_provider: Option<LoginProvider>,
     active_effort: crate::api::ReasoningEffort,
-    opencode: &[crate::api::OpenCodeModelView],
-    clinepass: &[crate::api::OpenCodeModelView],
-    command_code: &[crate::api::OpenCodeModelView],
-    zen: &[crate::api::OpenCodeModelView],
-    open_design: &[crate::api::OpenCodeModelView],
+    catalogs: &ModelCatalogs<'_>,
     rows: &[ModelRow],
     palette: &Palette,
     capabilities: Capabilities,
@@ -7475,14 +7391,7 @@ fn render_model_overlay(
     let area = frame.area();
     let width = usize::from(area.width);
     let keys = hint_keys(capabilities);
-    let group_size = |group: usize| match group {
-        0 => crate::api::ModelAlias::ALL.len(),
-        1 => opencode.len(),
-        2 => clinepass.len(),
-        3 => command_code.len(),
-        4 => zen.len(),
-        _ => open_design.len(),
-    };
+    let group_size = |group: usize| catalogs.group_size(group);
     let detail_rows = match area.height {
         14.. => 2,
         10..=13 => 1,
@@ -7520,17 +7429,11 @@ fn render_model_overlay(
     // The effort field is as wide as the deepest ladder any row shows, so the
     // level column is one axis for the whole list.
     let field_cells = EFFORT_FIELD_MIN_CELLS.max(
-        crate::api::ModelAlias::ALL
-            .iter()
-            .map(|alias| crate::api::ReasoningEffort::supported(*alias).len())
-            .chain(opencode.iter().map(|model| model.reasoning_levels.len()))
-            .chain(clinepass.iter().map(|model| model.reasoning_levels.len()))
-            .chain(
-                command_code
-                    .iter()
-                    .map(|model| model.reasoning_levels.len()),
-            )
-            .chain(zen.iter().map(|model| model.reasoning_levels.len()))
+        catalogs
+            .groups()
+            .into_iter()
+            .flatten()
+            .map(|model| model.reasoning_levels.len())
             .max()
             .unwrap_or(0)
             .max(4)
@@ -7591,7 +7494,7 @@ fn render_model_overlay(
                 Span::styled(format!(" {count}"), palette.muted),
             ]
         } else {
-            let choice = row.choice(opencode, clinepass, command_code, zen, open_design);
+            let choice = row.choice(catalogs);
             let active = choice.as_ref().is_some_and(|choice| {
                 choice.id == active_model
                     && active_provider.is_none_or(|provider| choice.target.provider() == provider)
@@ -7616,7 +7519,7 @@ fn render_model_overlay(
             // the model in use, or the speed the focused alias toggles.
             let speed = selected
                 && choice.as_ref().is_some_and(|choice| {
-                    matches!(choice.target, crate::app::EffortTarget::Alias(_))
+                    matches!(choice.target, crate::app::EffortTarget::Codex(_))
                 });
             let speed_label = if overlay.pending_fast {
                 "Rápida"
@@ -7679,8 +7582,7 @@ fn render_model_overlay(
     if let Some(detail) = regions.detail {
         lines.push(picker_rule(width, palette));
         let focused_row = rows.get(overlay.selected);
-        let focused = focused_row
-            .and_then(|row| row.choice(opencode, clinepass, command_code, zen, open_design));
+        let focused = focused_row.and_then(|row| row.choice(catalogs));
         let (title, facts): (Vec<Span>, String) = if overlay.selection_lost {
             (
                 vec![Span::styled(
@@ -7763,7 +7665,7 @@ fn render_model_overlay(
                 .unwrap_or_default();
             let speed = focused
                 .as_ref()
-                .filter(|choice| matches!(choice.target, crate::app::EffortTarget::Alias(_)))
+                .filter(|choice| matches!(choice.target, crate::app::EffortTarget::Codex(_)))
                 .map(|_| {
                     format!(
                         "velocidade {} ({} alterna)",
@@ -7786,10 +7688,10 @@ fn render_model_overlay(
     }
     let speed_hint = rows
         .get(overlay.selected)
-        .is_some_and(|row| matches!(row, ModelRow::Alias(_)));
+        .is_some_and(|row| matches!(row, ModelRow::Codex(_)));
     let effort_hint = rows
         .get(overlay.selected)
-        .and_then(|row| row.choice(opencode, clinepass, command_code, zen, open_design))
+        .and_then(|row| row.choice(catalogs))
         .is_some_and(|choice| !choice.levels.is_empty());
     let hints: Vec<String> = if !effort_hint {
         vec![
@@ -8602,7 +8504,7 @@ fn render_palette(
         .iter()
         .position(|row| row.command_index == Some(viewport_start))
         .unwrap_or(0);
-    let start = ensure_palette_row_visible(
+    let start = ensure_visible_start(
         preferred_row,
         selected_row.unwrap_or(preferred_row),
         rows.len(),
@@ -8975,26 +8877,6 @@ fn palette_heading(name: &str, width: usize, palette: &Palette) -> PaletteRow {
             Span::styled(format!(" {}", "─".repeat(rule)), palette.border),
         ]),
     }
-}
-
-fn ensure_palette_row_visible(
-    preferred_start: usize,
-    selected: usize,
-    total: usize,
-    capacity: usize,
-) -> usize {
-    if total == 0 {
-        return 0;
-    }
-    let capacity = capacity.max(1).min(total);
-    let max_start = total.saturating_sub(capacity);
-    let mut start = preferred_start.min(max_start);
-    if selected < start {
-        start = selected;
-    } else if selected >= start.saturating_add(capacity) {
-        start = selected.saturating_add(1).saturating_sub(capacity);
-    }
-    start.min(max_start)
 }
 
 /// Recedes everything already painted so a centered modal reads as the only

@@ -112,6 +112,44 @@ fn snapshot_bounded(
     Ok(files)
 }
 
+/// Whether a bounded walk finds a source file for the profile. Stops at the
+/// first match; an unreadable subdirectory or an oversized tree counts as a
+/// match so a capable workspace is never hidden.
+pub(crate) fn has_source(root: &Path, server_id: &str, limit: usize) -> bool {
+    let mut directories = vec![root.to_path_buf()];
+    let mut visited = 0;
+    while let Some(directory) = directories.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            return directory.as_path() != root;
+        };
+        for entry in entries {
+            visited += 1;
+            if visited > limit {
+                return true;
+            }
+            let Ok(entry) = entry else { return true };
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                let name = entry.file_name();
+                if !kind.is_symlink()
+                    && !matches!(
+                        name.to_str(),
+                        Some(".git" | ".slim" | "node_modules" | "target")
+                    )
+                {
+                    directories.push(path);
+                }
+            } else if kind.is_file() && source_file(&path, server_id) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn source_file(path: &Path, server_id: &str) -> bool {
     let extension = path.extension().and_then(|ext| ext.to_str());
     if typescript(server_id) {

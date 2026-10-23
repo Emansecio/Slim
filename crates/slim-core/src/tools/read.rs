@@ -7,7 +7,10 @@ use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 
-use super::{DependencyKind, DependencyObservation, FastStamp, ToolError, ToolExecutionError};
+use super::{
+    check_cancellation, lock_mutex, DependencyKind, DependencyObservation, FastStamp, ToolError,
+    ToolExecutionError,
+};
 use crate::runtime::CancellationToken;
 
 pub const DEFAULT_MAX_READ_LINES: usize = 200;
@@ -112,6 +115,7 @@ impl ReadService {
         numbered: bool,
         cancellation: Option<&CancellationToken>,
     ) -> Result<ReadPage, ToolExecutionError> {
+        ensure_not_special_file(canonical)?;
         let file =
             std::fs::File::open(canonical).map_err(|error| read_path_error(canonical, error))?;
         super::execution::verify_opened_path(&file, canonical)?;
@@ -177,7 +181,7 @@ impl ReadService {
         let mut bytes_read = 0u64;
 
         while current_line < requested_first {
-            check_cancelled(cancellation)
+            check_cancellation(cancellation)
                 .map_err(|error| observed_read_error(error, &dependency, bytes_read))?;
             if read_utf8_line(
                 &mut reader,
@@ -223,7 +227,7 @@ impl ReadService {
                 .map(|progress| progress.hasher.clone())
         };
         while returned < max_lines {
-            check_cancelled(cancellation)
+            check_cancellation(cancellation)
                 .map_err(|error| observed_read_error(error, &dependency, bytes_read))?;
             let Some(line) = read_utf8_line(
                 &mut reader,
@@ -246,20 +250,13 @@ impl ReadService {
                 line.len()
             };
             if output.len().saturating_add(rendered_bytes) > MAX_READ_PAGE_BYTES {
-                return Err(with_context(
-                    observed_read_error(
-                        ToolError::InvalidInput {
-                            message: format!(
-                                "read page exceeds the {MAX_READ_PAGE_BYTES}-byte safety limit"
-                            ),
-                        },
-                        &dependency,
-                        bytes_read,
-                    ),
+                return Err(page_too_large(
+                    &dependency,
+                    bytes_read,
                     if returned == 0 {
                         long_line_hint(canonical, current_line)
                     } else {
-                        "Pass a smaller max_lines to read fewer lines per page.".into()
+                        SMALLER_PAGE_HINT.into()
                     },
                 ));
             }
@@ -284,7 +281,7 @@ impl ReadService {
         }
 
         let has_more = if returned == max_lines && returned > 0 {
-            check_cancelled(cancellation)
+            check_cancellation(cancellation)
                 .map_err(|error| observed_read_error(error, &dependency, bytes_read))?;
             // Capture the next page's start before lookahead consumes its first line.
             let next_page = Checkpoint {
@@ -322,26 +319,16 @@ impl ReadService {
                 last.saturating_add(1)
             );
             if output.len().saturating_add(footer.len()) > MAX_READ_PAGE_BYTES {
-                return Err(with_context(
-                    observed_read_error(
-                        ToolError::InvalidInput {
-                            message: format!(
-                                "read page exceeds the {MAX_READ_PAGE_BYTES}-byte safety limit"
-                            ),
-                        },
-                        &dependency,
-                        bytes_read,
-                    ),
-                    "Pass a smaller max_lines to read fewer lines per page.".into(),
+                return Err(page_too_large(
+                    &dependency,
+                    bytes_read,
+                    SMALLER_PAGE_HINT.into(),
                 ));
             }
             output.push_str(&footer);
         }
         if let Some(hasher) = content_hasher {
-            let mut cache = self
-                .cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut cache = lock_mutex(&self.cache);
             if let Some(index) = cache.entries.get_mut(canonical) {
                 if index.version == version {
                     if has_more {
@@ -372,10 +359,7 @@ impl ReadService {
     }
 
     pub(crate) fn invalidate(&self, path: &Path) {
-        let mut cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cache = lock_mutex(&self.cache);
         for key in cache_lookup_paths(path) {
             cache.entries.remove(&key);
         }
@@ -385,10 +369,7 @@ impl ReadService {
     /// path, authorizes an implicit overwrite. Create and failed writes do
     /// not. The writer rechecks this digest against the locked current file.
     pub(crate) fn complete_digest(&self, path: &Path) -> Option<[u8; 32]> {
-        let cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache = lock_mutex(&self.cache);
         cache_lookup_paths(path).into_iter().find_map(|key| {
             cache
                 .entries
@@ -401,10 +382,7 @@ impl ReadService {
     /// can omit expected without a confirmation read.
     pub(crate) fn remember_complete_digest(&self, path: &Path, digest: [u8; 32]) {
         let version = file_version_best_effort(path);
-        let mut cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cache = lock_mutex(&self.cache);
         cache.clock = cache.clock.wrapping_add(1);
         let index = ReadIndex {
             version,
@@ -420,10 +398,7 @@ impl ReadService {
     }
 
     fn index_for(&self, path: &Path, version: FileVersion) -> ReadIndex {
-        let mut cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cache = lock_mutex(&self.cache);
         cache.clock = cache.clock.wrapping_add(1);
         let now = cache.clock;
         if let Some(index) = cache.entries.get_mut(path) {
@@ -448,10 +423,7 @@ impl ReadService {
         if discovered.is_empty() {
             return;
         }
-        let mut cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cache = lock_mutex(&self.cache);
         let Some(index) = cache.entries.get_mut(path) else {
             return;
         };
@@ -470,9 +442,7 @@ impl ReadService {
     #[cfg(test)]
     fn checkpoint_count(&self, path: &Path) -> usize {
         let canonical = path.canonicalize().expect("canonical path");
-        self.cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        lock_mutex(&self.cache)
             .entries
             .get(&canonical)
             .map_or(0, |index| index.checkpoints.len())
@@ -542,6 +512,40 @@ fn long_line_hint(path: &Path, line: usize) -> String {
         "Line {line} alone is over the limit. Search for a distinctive substring of it (a hit on a long line is windowed around the match), or slice it with shell, for example `sed -n '{line}p' {path} | cut -c 1-4000`.",
         path = shell_literal(path)
     )
+}
+
+const SMALLER_PAGE_HINT: &str = "Pass a smaller max_lines to read fewer lines per page.";
+
+fn page_too_large(
+    dependency: &DependencyObservation,
+    bytes_read: u64,
+    context: String,
+) -> ToolExecutionError {
+    with_context(
+        observed_read_error(
+            ToolError::InvalidInput {
+                message: format!("read page exceeds the {MAX_READ_PAGE_BYTES}-byte safety limit"),
+            },
+            dependency,
+            bytes_read,
+        ),
+        context,
+    )
+}
+
+pub(super) const NOT_REGULAR_FILE_MESSAGE: &str =
+    "path is not a regular file (FIFO, socket or device); read and write handle regular files only";
+
+/// Opening a FIFO with no writer blocks forever, so special files are refused
+/// from their metadata before any `open`. Missing paths and directories pass:
+/// their own errors are produced where they are opened.
+pub(super) fn ensure_not_special_file(path: &Path) -> Result<(), ToolError> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() && !metadata.is_dir() => Err(ToolError::InvalidInput {
+            message: NOT_REGULAR_FILE_MESSAGE.into(),
+        }),
+        _ => Ok(()),
+    }
 }
 
 fn with_context(mut failure: ToolExecutionError, context: String) -> ToolExecutionError {
@@ -661,13 +665,6 @@ fn read_utf8_line<'a>(
             *bytes_read,
         )
     })
-}
-
-fn check_cancelled(cancellation: Option<&CancellationToken>) -> Result<(), ToolError> {
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return Err(ToolError::Cancelled);
-    }
-    Ok(())
 }
 
 fn record_checkpoint(checkpoints: &mut Vec<Checkpoint>, line: usize, offset: u64) {

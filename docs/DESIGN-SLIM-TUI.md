@@ -429,10 +429,14 @@ milestone correspondente passou seu gate.
   SessionRail conversacional no topo quando cabe; contexto/tokens retornam ao
   footer quando ela oculta; sem row vazia entre box e footer;
 - paradas por budget (`tool_limit` / `turn_limit`): mensagem humanizada em bloco
-  `System` colapsado (não toast efêmero); `turn_limit` inclui o teto `(N/N)`
-  (default 128, `SLIM_MAX_TURNS` / `max_turns` em `slim.toml`, cap 1024);
-  `max_read_tool_calls` e `max_mutating_tool_calls` (sem limite por padrão) são
-  caps **por turn** (batch) quando configurados, não acumulados no run — exploração 1-tool/turn encontra
+  `System` colapsado (não toast efêmero); `max_turns` e as tool calls são
+  ilimitados por padrão (o run termina na resposta do provider, no orçamento de
+  tempo ou nos guards de falta de progresso); quando configurados
+  (`SLIM_MAX_TURNS` / `max_turns` em `slim.toml`, cap 1024) `turn_limit` inclui o
+  teto `(N/N)`;
+  `max_read_tool_calls` e `max_mutating_tool_calls` são
+  caps **por turn** (batch) quando configurados, não acumulados no run — com
+  ambos configurados, exploração 1-tool/turn encontra
   `max_turns` primeiro; um batch paralelo acima do cap ainda aborta em
   `tool_limit`; ActivityRail mostra `turn N/M · reads n/m · edits n/m` quando
   largura ≥ 72, omite contadores zerados e inclui somente os que cabem
@@ -3621,7 +3625,7 @@ com a URL no painel e fim do sign-in, trust/untrust, aviso de início único).
   (`Tick`/`StatusTick`/`SyncClock`);
 - cada toast visível ocupa uma row truncada pela largura do scrollback;
 - reduced motion desativa transições, não duração.
-- `tool_limit` / `turn_limit`: mensagem humanizada via bloco `System` colapsado (não toast efêmero); `turn_limit` mostra o teto `(N/N)` (default 128); `tool_limit` com caps 0/0 explicitamente configurados usa mensagem dedicada, não 32/96; ActivityRail mostra `turn N/M · reads n/m · edits n/m` só a partir de 80% do limite, quando largura ≥ 72 (`reads`/`edits` deste turn); aviso one-shot ao atingir 80% dos turns do run e 80% do batch deste turn.
+- `tool_limit` / `turn_limit`: mensagem humanizada via bloco `System` colapsado (não toast efêmero); `turn_limit` só existe quando um teto foi configurado e mostra `(N/N)` — turns são ilimitados por padrão; `tool_limit` com caps 0/0 explicitamente configurados usa mensagem dedicada, não 32/96; ActivityRail mostra `turn N/M · reads n/m · edits n/m` só a partir de 80% do limite, quando largura ≥ 72 (`reads`/`edits` deste turn); aviso one-shot ao atingir 80% dos turns do run e 80% do batch deste turn.
 
 ## 16. State machines
 

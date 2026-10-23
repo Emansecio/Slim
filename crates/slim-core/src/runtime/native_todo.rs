@@ -313,7 +313,9 @@ impl Runtime {
             };
             let revision = bridge.task_revision("session").saturating_add(1);
             let request = TaskMutationRequest {
-                idempotency_key: format!("{}-{index}", invocation.call_id),
+                // The ledger outlives the turn and providers may reuse a call
+                // id (`call_0`) in the next one: the batch makes the key unique.
+                idempotency_key: format!("{}-{}-{index}", invocation.batch_id, invocation.call_id),
                 entity_id: "session".into(),
                 revision,
                 mutation,

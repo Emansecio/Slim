@@ -97,6 +97,24 @@ pub(super) fn prepared_code_intel_request(
     }
 }
 
+/// Puts the admission feedback in front of a code_intel result, as native
+/// tools get it, and returns the presentation source that carries the same
+/// prefix.
+pub(super) fn admit_code_intel_output(
+    result: &mut ToolResult,
+    prepared: &PreparedToolInvocation,
+    presentation: Option<crate::tools::CodeIntelPresentation>,
+) -> Option<ToolPresentationSource> {
+    let prefix = crate::tools::admission_output_prefix(&prepared.admission_notes);
+    if let Some(prefix) = &prefix {
+        result.output.insert_str(0, prefix);
+    }
+    presentation.map(|presentation| ToolPresentationSource::CodeIntel {
+        prefix: prefix.unwrap_or_default(),
+        presentation,
+    })
+}
+
 /// How long the next request waits for the language server to validate a batch
 /// of edits. Bounded so a silent server costs one short pause, not a stall.
 pub(super) const POST_EDIT_DIAGNOSTICS_DEADLINE: std::time::Duration =
@@ -122,30 +140,14 @@ impl Runtime {
         if self.is_cancelled() {
             outcome.success = false;
         }
-        if let Some(prefix) = crate::tools::admission_output_prefix(&prepared.admission_notes) {
-            outcome.output.insert_str(0, &prefix);
-            if let Some(presentation) = semantic_presentation {
-                self.presentation_sources.insert(
-                    (
-                        invocation.batch_id.to_owned(),
-                        invocation.call_id.to_owned(),
-                    ),
-                    ToolPresentationSource::CodeIntel {
-                        prefix,
-                        presentation,
-                    },
-                );
-            }
-        } else if let Some(presentation) = semantic_presentation {
+        if let Some(source) = admit_code_intel_output(&mut outcome, prepared, semantic_presentation)
+        {
             self.presentation_sources.insert(
                 (
                     invocation.batch_id.to_owned(),
                     invocation.call_id.to_owned(),
                 ),
-                ToolPresentationSource::CodeIntel {
-                    prefix: String::new(),
-                    presentation,
-                },
+                source,
             );
         }
         self.finish_tool(invocation, &mut outcome, started_at, &mut seq, None)?;

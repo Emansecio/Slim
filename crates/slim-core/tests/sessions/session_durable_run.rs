@@ -36,6 +36,20 @@ struct TransportFailExecutor {
 
 struct DefaultClassifiedFailExecutor;
 
+struct UnknownResponseExecutor;
+
+impl ManualExecutor for UnknownResponseExecutor {
+    type Error = &'static str;
+
+    fn execute(&mut self, _effect: &Effect) -> Result<ProviderResponse, Self::Error> {
+        Ok(ProviderResponse::with_outcome(
+            "uncertain tool effect",
+            None,
+            slim_core::session::DurableOutcome::Unknown,
+        ))
+    }
+}
+
 struct FailedResponseExecutor;
 
 impl ManualExecutor for FailedResponseExecutor {
@@ -294,6 +308,39 @@ fn non_success_provider_response_never_persists_success_terminal() {
                 }
             )
     ));
+}
+
+// An interactive (ManualDrive) turn with an uncertain tool effect ends Aborted,
+// not Suspended: the attempt still records Unknown, but Aborted keeps the
+// session resumable instead of dead-ending `/resume`. Queued FIFO work keeps
+// its own Suspended block elsewhere.
+#[test]
+fn uncertain_manual_turn_aborts_instead_of_suspending() {
+    let mut repo = MemoryRepo::new(header("uncertain-response"));
+    let mut executor = UnknownResponseExecutor;
+
+    drive_manual(&mut repo, &mut executor, spec()).expect("durable uncertain response");
+
+    assert!(matches!(
+        &repo.records()[4],
+        DurableRecord::Operation { operation, .. }
+            if matches!(
+                operation.kind,
+                DurableOperationKind::ProviderAttemptFinished {
+                    outcome: slim_core::session::DurableOutcome::Unknown,
+                    ..
+                }
+            )
+    ));
+    assert!(
+        matches!(
+            &repo.records()[5],
+            DurableRecord::Operation { operation, .. }
+                if matches!(operation.kind, DurableOperationKind::Aborted)
+        ),
+        "uncertain manual terminal must be Aborted, got {:?}",
+        repo.records()[5]
+    );
 }
 
 #[derive(Default)]

@@ -2,7 +2,9 @@ use super::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AgentLoopConfig {
-    /// Run ceiling. Sequential 1-tool/turn work stops here, not on tool caps.
+    /// Run ceiling, uncapped unless configured: a run ends on the provider, on
+    /// the time budget or on the no-progress guards, never on a turn count of
+    /// its own accord.
     pub max_turns: usize,
     /// Per-turn mutating native action slots; then_run reserves a second slot.
     pub max_mutating_tool_calls: usize,
@@ -30,9 +32,10 @@ pub struct AgentLoopConfig {
 }
 
 impl AgentLoopConfig {
-    pub const DEFAULT_MAX_TURNS: usize = 128;
-    /// Tool calls are not capped unless configured: the turn limit, the time
-    /// budget and the no-progress guards end a run that stops advancing.
+    /// Turns are not capped unless configured (`max_turns`, `SLIM_MAX_TURNS`).
+    pub const DEFAULT_MAX_TURNS: usize = usize::MAX;
+    /// Tool calls are not capped unless configured: the time budget and the
+    /// no-progress guards end a run that stops advancing.
     pub const DEFAULT_MAX_MUTATING_TOOL_CALLS: usize = usize::MAX;
     pub const DEFAULT_MAX_READ_TOOL_CALLS: usize = usize::MAX;
     pub const DEFAULT_MAX_TOTAL_TOOL_CALLS: usize = usize::MAX;

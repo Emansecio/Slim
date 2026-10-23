@@ -11,7 +11,7 @@ pub const OPEN_DESIGN_BASE_URL: &str = "https://amr-link.open-design.ai/v1/chat/
 pub const OPEN_DESIGN_MODELS_URL: &str = "https://amr-link.open-design.ai/v1/models";
 pub const OPEN_DESIGN_DEFAULT_MODEL: &str = "deepseek-v4.1-flash";
 
-const MAX_CATALOG_BYTES: usize = 1024 * 1024;
+use super::catalog_fetch::MAX_CATALOG_BYTES;
 const MAX_CATALOG_ENTRIES: usize = 256;
 const MAX_MODEL_ID_BYTES: usize = 128;
 
@@ -241,62 +241,8 @@ pub async fn fetch_open_design_catalog(
     url: &str,
     api_key: &str,
 ) -> Result<Vec<OpenDesignCatalogEntry>, ProviderError> {
-    let mut response = client
-        .get(url)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .send()
-        .await
-        .map_err(|error| ProviderError::Transport {
-            safe_to_retry: error.is_connect() || error.is_timeout(),
-            message: super::redact_values(
-                &format!("Open Design catalog connection: {}", error.without_url()),
-                &[api_key.to_owned()],
-            ),
-        })?;
-    if !response.status().is_success() {
-        return Err(ProviderError::Remote {
-            message: format!(
-                "Open Design catalog failed ({})",
-                response.status().as_u16()
-            ),
-        });
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_CATALOG_BYTES as u64)
-    {
-        return Err(ProviderError::InvalidResponse {
-            message: "Open Design catalog exceeds its bound".into(),
-        });
-    }
-    let mut bytes = Vec::with_capacity(
-        response
-            .content_length()
-            .unwrap_or_default()
-            .min(MAX_CATALOG_BYTES as u64) as usize,
-    );
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| ProviderError::Transport {
-            safe_to_retry: true,
-            message: super::redact_values(
-                &format!("Open Design catalog stream: {}", error.without_url()),
-                &[api_key.to_owned()],
-            ),
-        })?
-    {
-        if bytes
-            .len()
-            .checked_add(chunk.len())
-            .is_none_or(|length| length > MAX_CATALOG_BYTES)
-        {
-            return Err(ProviderError::InvalidResponse {
-                message: "Open Design catalog exceeds its bound".into(),
-            });
-        }
-        bytes.extend_from_slice(&chunk);
-    }
+    let bytes =
+        super::catalog_fetch::fetch_bounded_catalog(client, url, api_key, "Open Design").await?;
     parse_open_design_catalog(&bytes)
 }
 

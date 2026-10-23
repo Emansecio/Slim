@@ -544,6 +544,61 @@ pub struct LayeredConfig {
     pub mcp: McpConfig,
 }
 
+/// The run caps a config layer can set. `Copy`, so it can be taken before the
+/// rest of the layered config is consumed field by field.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RunLimits {
+    max_mutating_tool_calls: Option<usize>,
+    max_read_tool_calls: Option<usize>,
+    max_total_tool_calls: Option<usize>,
+    max_turns: Option<usize>,
+    time_budget_secs: Option<u64>,
+    max_output_tokens: Option<u32>,
+    max_result_bytes: Option<usize>,
+}
+
+impl RunLimits {
+    /// Applies the limits that are set; unset ones keep the options' defaults.
+    pub(crate) fn apply(self, mut options: crate::ProviderRunOptions) -> crate::ProviderRunOptions {
+        if let Some(calls) = self.max_mutating_tool_calls {
+            options = options.with_max_tool_calls(calls);
+        }
+        if let Some(calls) = self.max_read_tool_calls {
+            options = options.with_max_read_tool_calls(calls);
+        }
+        if let Some(calls) = self.max_total_tool_calls {
+            options = options.with_max_total_tool_calls(calls);
+        }
+        if let Some(turns) = self.max_turns {
+            options = options.with_max_turns(turns);
+        }
+        if let Some(secs) = self.time_budget_secs {
+            options = options.with_time_budget_secs(secs);
+        }
+        if let Some(tokens) = self.max_output_tokens {
+            options = options.with_max_output_tokens(tokens);
+        }
+        if let Some(bytes) = self.max_result_bytes {
+            options = options.with_max_result_bytes(bytes);
+        }
+        options
+    }
+}
+
+impl LayeredConfig {
+    pub(crate) fn run_limits(&self) -> RunLimits {
+        RunLimits {
+            max_mutating_tool_calls: self.max_mutating_tool_calls,
+            max_read_tool_calls: self.max_read_tool_calls,
+            max_total_tool_calls: self.max_total_tool_calls,
+            max_turns: self.max_turns,
+            time_budget_secs: self.time_budget_secs,
+            max_output_tokens: self.max_output_tokens,
+            max_result_bytes: self.max_result_bytes,
+        }
+    }
+}
+
 impl LayeredConfig {
     pub fn compaction_policy(&self) -> Result<CompactionPolicy, String> {
         let mut policy = CompactionPolicy::default();
@@ -1047,12 +1102,7 @@ pub fn load_layered_for(workspace: &Path) -> Result<LayeredConfig, String> {
 }
 
 fn load_layered_with_project(project: PathBuf) -> Result<LayeredConfig, String> {
-    let mut layers = Vec::new();
-    if let Some(global) = global_config_path() {
-        layers.push((global, McpOrigin::Global));
-    }
-    layers.push((project, McpOrigin::Project));
-    let mut config = load_layers(layers)?;
+    let mut config = load_layers(layer_paths(project))?;
     // A file value is a default, not an explicit ProviderRunOptions override.
     // Leave env-backed values unset so the shared resolvers validate them;
     // invalid/empty environment settings must not silently fall back to TOML.
@@ -1071,6 +1121,17 @@ fn load_layered_with_project(project: PathBuf) -> Result<LayeredConfig, String> 
     config.max_result_bytes = file_default(config.max_result_bytes, "SLIM_MAX_RESULT_BYTES");
     config.mcp.validate()?;
     Ok(config)
+}
+
+/// Config layers in precedence order: the global file (when a home exists),
+/// then the project file, which wins.
+fn layer_paths(project: PathBuf) -> Vec<(PathBuf, McpOrigin)> {
+    let mut layers = Vec::new();
+    if let Some(global) = global_config_path() {
+        layers.push((global, McpOrigin::Global));
+    }
+    layers.push((project, McpOrigin::Project));
+    layers
 }
 
 fn file_default<T>(value: Option<T>, env_key: &str) -> Option<T> {
@@ -1134,14 +1195,9 @@ fn layer_server_error(name: &str, server: &FileMcpServerConfig) -> Option<String
 pub(crate) fn load_layered_lenient_for(
     workspace: &Path,
 ) -> Result<(LayeredConfig, Vec<(String, String)>), String> {
-    let mut layers = Vec::new();
-    if let Some(global) = global_config_path() {
-        layers.push((global, McpOrigin::Global));
-    }
-    layers.push((project_config_path(workspace), McpOrigin::Project));
     let mut layered = LayeredConfig::default();
     let mut invalid: BTreeMap<String, String> = BTreeMap::new();
-    for (path, origin) in layers {
+    for (path, origin) in layer_paths(project_config_path(workspace)) {
         let Some(mut config) = FileConfig::load(&path)? else {
             continue;
         };
@@ -1195,73 +1251,43 @@ pub(crate) fn merge_layer(target: &mut LayeredConfig, source: FileConfig) {
     merge_layer_as(target, source, McpOrigin::Global);
 }
 
+/// Copies each `Option` field the source layer sets over the same-named
+/// `Option` field of the target; unset fields leave the target untouched.
+macro_rules! overlay_option {
+    ($target:expr, $source:expr; $($field:ident),+ $(,)?) => {
+        $(
+            if $source.$field.is_some() {
+                $target.$field = $source.$field;
+            }
+        )+
+    };
+}
+
+/// Like [`overlay_option!`] for targets that hold a plain value: a set source
+/// field replaces it.
+macro_rules! overlay_value {
+    ($target:expr, $source:expr; $($field:ident),+ $(,)?) => {
+        $(
+            if let Some(value) = $source.$field {
+                $target.$field = value;
+            }
+        )+
+    };
+}
+
 pub(crate) fn merge_layer_as(target: &mut LayeredConfig, source: FileConfig, origin: McpOrigin) {
-    if source.model.is_some() {
-        target.model = source.model;
-    }
-    if source.endpoint.is_some() {
-        target.endpoint = source.endpoint;
-    }
-    if source.effort.is_some() {
-        target.effort = source.effort;
-    }
-    if source.codex_fast.is_some() {
-        target.codex_fast = source.codex_fast;
-    }
-    if source.max_mutating_tool_calls.is_some() {
-        target.max_mutating_tool_calls = source.max_mutating_tool_calls;
-    }
-    if source.max_read_tool_calls.is_some() {
-        target.max_read_tool_calls = source.max_read_tool_calls;
-    }
-    if source.max_total_tool_calls.is_some() {
-        target.max_total_tool_calls = source.max_total_tool_calls;
-    }
-    if source.max_turns.is_some() {
-        target.max_turns = source.max_turns;
-    }
-    if source.max_output_tokens.is_some() {
-        target.max_output_tokens = source.max_output_tokens;
-    }
-    if source.timeout_secs.is_some() {
-        target.timeout_secs = source.timeout_secs;
-    }
-    if source.time_budget_secs.is_some() {
-        target.time_budget_secs = source.time_budget_secs;
-    }
-    if source.max_result_bytes.is_some() {
-        target.max_result_bytes = source.max_result_bytes;
-    }
+    overlay_option!(target, source; model, endpoint, effort, codex_fast, max_mutating_tool_calls, max_read_tool_calls, max_total_tool_calls, max_turns, max_output_tokens, timeout_secs, time_budget_secs, max_result_bytes);
     if let Some(jobs) = source.shell_jobs {
-        if let Some(v) = jobs.max_running {
-            target.shell_jobs.max_running = v;
-        }
-        if let Some(v) = jobs.max_retained {
-            target.shell_jobs.max_retained = v;
-        }
-        if let Some(v) = jobs.memory_bytes {
-            target.shell_jobs.memory_bytes = v;
-        }
-        if let Some(v) = jobs.interrupt_grace_ms {
-            target.shell_jobs.interrupt_grace_ms = v;
-        }
+        overlay_value!(
+            target.shell_jobs, jobs;
+            max_running, max_retained, memory_bytes, interrupt_grace_ms
+        );
     }
     if let Some(lsp) = source.lsp {
-        if let Some(enabled) = lsp.enabled {
-            target.lsp.enabled = enabled;
-        }
-        if let Some(idle) = lsp.idle_shutdown_minutes {
-            target.lsp.idle_shutdown_minutes = idle;
-        }
-        if let Some(max_servers) = lsp.max_servers {
-            target.lsp.max_servers = max_servers;
-        }
-        if let Some(timeout) = lsp.request_timeout_ms {
-            target.lsp.request_timeout_ms = timeout;
-        }
-        if let Some(max_open_documents) = lsp.max_open_documents {
-            target.lsp.max_open_documents = max_open_documents;
-        }
+        overlay_value!(
+            target.lsp, lsp;
+            enabled, idle_shutdown_minutes, max_servers, request_timeout_ms, max_open_documents
+        );
         if let Some(servers) = lsp.servers {
             for (name, server) in servers {
                 let entry = target.lsp.servers.entry(name).or_default();
@@ -1275,35 +1301,14 @@ pub(crate) fn merge_layer_as(target: &mut LayeredConfig, source: FileConfig, ori
                         Some(true) => entry.project.enabled = Some(true),
                         None => {}
                     }
-                    if server.path.is_some() {
-                        entry.project.path = server.path;
-                    }
-                    if server.args.is_some() {
-                        entry.project.args = server.args;
-                    }
-                    if server.initialization_options.is_some() {
-                        entry.project.initialization_options = server.initialization_options;
-                    }
-                    if server.settings.is_some() {
-                        entry.project.settings = server.settings;
-                    }
+                    overlay_option!(
+                        entry.project, server;
+                        path, args, initialization_options, settings
+                    );
                     continue;
                 }
-                if let Some(enabled) = server.enabled {
-                    entry.enabled = enabled;
-                }
-                if let Some(path) = server.path {
-                    entry.path = Some(path);
-                }
-                if let Some(args) = server.args {
-                    entry.args = Some(args);
-                }
-                if let Some(options) = server.initialization_options {
-                    entry.initialization_options = Some(options);
-                }
-                if let Some(settings) = server.settings {
-                    entry.settings = Some(settings);
-                }
+                overlay_value!(entry, server; enabled);
+                overlay_option!(entry, server; path, args, initialization_options, settings);
             }
         }
     }
@@ -1344,68 +1349,30 @@ pub(crate) fn merge_layer_as(target: &mut LayeredConfig, source: FileConfig, ori
                 if let Some(headers) = server.headers {
                     entry.headers.extend(headers);
                 }
-                if let Some(cwd) = server.cwd {
-                    entry.cwd = Some(cwd);
-                }
-                if let Some(enabled) = server.enabled {
-                    entry.enabled = enabled;
-                }
-                if let Some(timeout_ms) = server.timeout_ms {
-                    entry.timeout_ms = timeout_ms;
-                }
-                if let Some(description) = server.description {
-                    entry.description = Some(description);
-                }
-                if let Some(exposure) = server.exposure {
-                    entry.exposure = exposure;
-                }
+                // `cwd` comes after the `url` branch above, which clears it.
+                overlay_option!(entry, server; cwd, description);
+                overlay_value!(entry, server; enabled, timeout_ms, exposure);
                 if let Some(tool_exposure) = server.tool_exposure {
                     entry.tool_exposure.extend(tool_exposure);
                 }
-                if let Some(lazy) = server.lazy {
-                    entry.lazy = lazy;
-                }
+                overlay_value!(entry, server; lazy);
                 if let Some(oauth) = server.oauth {
                     let merged = entry.oauth.get_or_insert_with(McpOAuthConfig::default);
-                    if oauth.client_id.is_some() {
-                        merged.client_id = oauth.client_id;
-                    }
-                    if oauth.client_secret.is_some() {
-                        merged.client_secret = oauth.client_secret;
-                    }
-                    if oauth.callback_port.is_some() {
-                        merged.callback_port = oauth.callback_port;
-                    }
-                    if oauth.scope.is_some() {
-                        merged.scope = oauth.scope;
-                    }
-                    if oauth.client_name.is_some() {
-                        merged.client_name = oauth.client_name;
-                    }
-                    if oauth.auth_server_metadata_url.is_some() {
-                        merged.auth_server_metadata_url = oauth.auth_server_metadata_url;
-                    }
+                    overlay_option!(
+                        merged, oauth;
+                        client_id, client_secret, callback_port, scope, client_name,
+                        auth_server_metadata_url
+                    );
                 }
             }
         }
     }
     if let Some(compaction) = source.compaction {
-        if compaction.enabled.is_some() {
-            target.compaction.enabled = compaction.enabled;
-        }
-        if compaction.reserve_tokens.is_some() {
-            target.compaction.reserve_tokens = compaction.reserve_tokens;
-        }
-        if compaction.keep_recent_tokens.is_some() {
-            target.compaction.keep_recent_tokens = compaction.keep_recent_tokens;
-        }
-        if compaction.summary_max_bytes.is_some() {
-            target.compaction.summary_max_bytes = compaction.summary_max_bytes;
-        }
-        if compaction.manual_instructions_max_bytes.is_some() {
-            target.compaction.manual_instructions_max_bytes =
-                compaction.manual_instructions_max_bytes;
-        }
+        overlay_option!(
+            target.compaction, compaction;
+            enabled, reserve_tokens, keep_recent_tokens, summary_max_bytes,
+            manual_instructions_max_bytes
+        );
     }
 }
 

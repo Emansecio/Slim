@@ -3,6 +3,48 @@
 > Caminhos de campanhas/runs exibidos em código são artefatos locais ignorados
 > pelo Git; relatórios e resumos versionados continuam linkados normalmente.
 
+## macOS, GPT‑6.1 Sol e cenário visual — 22/10/2026
+
+O modelo padrão do harness passou a ser `gpt-6.1-sol`. O Slim usa a rota
+`openai-codex`; o Pi 1.3 chama a mesma conta ChatGPT/Codex de `openai`.
+O manifesto registra os dois nomes (`provider`, `pi_provider`), e
+`--pi-provider` sobrescreve o do Pi. O Pi gerenciado (`~/.pi/agent/install`) é
+localizado automaticamente. Quando o host só tem `python3`, um shim `python`
+entra no `PATH` dos dois braços, para que os prompts continuem iguais. O
+runner fecha o stdin do processo, porque o Pi em `--print` espera stdin
+herdado aberto.
+
+Cenário `svg_3d_scene` ([`visual.py`](visual.py)): página autocontida com um
+icosaedro 3D em SVG (projeção em perspectiva, culling, Lambert), animada e
+congelável por `?t=`. O `check.py` valida o código estaticamente e o DOM
+renderizado no Chrome headless (faces, tons, ângulo, dependência de t,
+período de 8 s). Depois de cada braço, o harness captura quadros em
+t = 0, 1, 2,5 e 4 s e grava `visual/` e `visual.html` com os dois braços
+lado a lado e a animação ao vivo.
+
+Toda campanha também grava `code.diff`, o diff unificado dos workspaces finais.
+O relatório ganhou a seção "Codigo, resposta final e visual", com arquivos
+criados ou modificados (linhas e bytes), a resposta final de cada agente e as
+métricas dos quadros.
+
+```bash
+python3 bench/luna-live/daily.py --rounds 1 --scenario svg_3d_scene --scenario repair_catalog
+python3 bench/luna-live/daily.py --rounds 2 --shuffle-seed 7
+python3 bench/luna-live/report.py bench/luna-live/2026* --output-md /tmp/RELATORIO.md --output-json /tmp/report.json
+```
+
+Sem `--timeout`, cada cenário usa o seu próprio limite: 600 s no visual e
+240 s nos demais.
+
+Skills: o Slim não tem opção para desligá-las e lê as raízes do HOME. Por
+isso, o braço Pi deixou de usar `--no-skills` e os dois descobrem o mesmo
+`~/.agents/skills` (campo `skills` no manifesto). Campanhas anteriores a essa
+mudança tinham o Pi sem skills, e a comparação entre elas carrega essa
+diferença. O relatório também mostra o custo efetivo, que soma tokens sem
+cache, escrita em cache e saída (leituras de cache ficam de fora porque são
+cobradas com desconto). Ele aparece por braço, por par (razão, sinais e IC95)
+e por cenário.
+
 ## Implementações nativas — 15/09/2026
 
 O checkout reduz descrições das ferramentas sem mudar seus parâmetros, exclui

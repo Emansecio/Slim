@@ -439,10 +439,14 @@ pub(super) fn persist_manual_terminal_with_facts<R: DurableRepo, E>(
     });
     seq = next_seq(seq)?;
     let terminal = match response.outcome {
-        DurableOutcome::Cancelled => DurableOperationKind::Aborted,
-        DurableOutcome::Unknown => DurableOperationKind::Suspended {
-            reason: "tool execution did not produce a known terminal result".into(),
-        },
+        // A ManualDrive (interactive/single) turn with an uncertain tool effect
+        // ends Aborted, not Suspended: the per-tool "[Unconfirmed result]"
+        // messages already carry the uncertainty into the transcript, and the
+        // ProviderAttemptFinished above still records the Unknown outcome, so
+        // nothing is lost — but Aborted lets `/resume` continue instead of
+        // dead-ending. Queued FIFO work keeps the Suspended block, which lives
+        // on the separate `DurableQueue::suspend` path.
+        DurableOutcome::Cancelled | DurableOutcome::Unknown => DurableOperationKind::Aborted,
         outcome => DurableOperationKind::Finished { outcome },
     };
     suffix.push(DurableRecord::Operation {

@@ -142,13 +142,13 @@ fn codex_alias_filters_and_adjusts_effort_inline() {
     assert_eq!(
         overlay.pending_efforts,
         vec![(
-            EffortTarget::Alias(ModelAlias::Luna),
+            EffortTarget::Codex(ModelAlias::Luna.id().into()),
             ReasoningEffort::XHigh
         )]
     );
     let effects = reduce(&mut state, Action::Key(press(KeyCode::Enter)));
     assert!(effects.contains(&Effect::Send(UiCommand::SetModel {
-        model: ModelAlias::Luna,
+        model: ModelAlias::Luna.id().into(),
         effort: ReasoningEffort::XHigh,
         fast: false,
     })));
@@ -179,11 +179,11 @@ fn opencode_catalog_filters_and_enter_sends_selection() {
 }
 
 #[test]
-fn astra_picker_selects_reasoning_and_speed_and_cancel_does_not_apply_speed() {
+fn luna_picker_selects_reasoning_and_speed_and_cancel_does_not_apply_speed() {
     use slim_tui::api::{ModelAlias, ReasoningEffort};
     let mut state = state_with_opencode_catalog();
-    type_text(&mut state, "astra");
-    assert!(render_to_string(&state).contains("GPT-6 Astra"));
+    type_text(&mut state, "luna");
+    assert!(render_to_string(&state).contains("GPT-5.6 Luna"));
     let normal = render_to_string(&state);
     assert!(normal.contains("velocidade Normal"));
     assert!(!normal.contains("Ultra"));
@@ -200,14 +200,14 @@ fn astra_picker_selects_reasoning_and_speed_and_cancel_does_not_apply_speed() {
         &mut state,
         Action::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
     );
-    type_text(&mut state, "astra");
+    type_text(&mut state, "luna");
     assert!(!state.model_overlay.as_ref().unwrap().pending_fast);
     reduce(&mut state, Action::Key(press(KeyCode::Tab)));
     reduce(&mut state, Action::Key(press(KeyCode::Right)));
     reduce(&mut state, Action::Key(press(KeyCode::Right)));
     let effects = reduce(&mut state, Action::Key(press(KeyCode::Enter)));
     assert!(effects.contains(&Effect::Send(UiCommand::SetModel {
-        model: ModelAlias::Astra,
+        model: ModelAlias::Luna.id().into(),
         effort: ReasoningEffort::Max,
         fast: true,
     })));
@@ -241,13 +241,11 @@ fn state_with_zen_catalog() -> AppState {
 /// Headers are rows, so tests position on a row by predicate instead of
 /// counting Downs.
 fn select_row(state: &mut AppState, predicate: impl Fn(&ModelRow) -> bool) {
-    let rows = state.model_overlay.clone().expect("picker").rows(
-        &state.open_code_models,
-        &state.cline_pass_models,
-        &state.command_code_models,
-        &state.zen_models,
-        &state.open_design_models,
-    );
+    let rows = state
+        .model_overlay
+        .clone()
+        .expect("picker")
+        .rows(&state.model_catalogs());
     let index = rows.iter().position(predicate).expect("row in the picker");
     reduce(state, Action::Key(press(KeyCode::Home)));
     for _ in 0..index {
@@ -377,13 +375,7 @@ fn catalog_refresh_keeps_model_identity_and_removed_focus_cannot_apply() {
         source: OpenCodeCatalogSource::Live,
     });
     let overlay = state.model_overlay.as_ref().unwrap();
-    let rows = overlay.rows(
-        &state.open_code_models,
-        &state.cline_pass_models,
-        &state.command_code_models,
-        &state.zen_models,
-        &state.open_design_models,
-    );
+    let rows = overlay.rows(&state.model_catalogs());
     assert!(matches!(rows[overlay.selected], ModelRow::Catalog(51)));
     assert!(!overlay.selection_lost);
 
@@ -433,13 +425,7 @@ fn active_model_identity_includes_the_provider_when_catalog_ids_overlap() {
         )),
     );
     let overlay = state.model_overlay.as_ref().expect("picker");
-    let rows = overlay.rows(
-        &state.open_code_models,
-        &state.cline_pass_models,
-        &state.command_code_models,
-        &state.zen_models,
-        &state.open_design_models,
-    );
+    let rows = overlay.rows(&state.model_catalogs());
     assert!(matches!(rows[overlay.selected], ModelRow::Catalog(0)));
     let frame = render_to_string(&state);
     assert!(frame.contains("Catalog Sol"), "{frame}");
@@ -479,7 +465,7 @@ fn groups_are_headings_and_models_sit_under_them() {
             .trim_end()
             .trim_end_matches('│')
             .trim_end()
-            .ends_with(" 4"),
+            .ends_with(" 3"),
         "the heading counts the group's models\n{heading}"
     );
     let collapsed = rows
@@ -504,8 +490,8 @@ fn groups_are_headings_and_models_sit_under_them() {
         column(model, "GPT-5.6") > title_column,
         "models sit one step in under their heading\n{frame}"
     );
-    // The cursor starts on the active model, the first of four models.
-    assert!(frame.contains("1/4 modelos"), "{frame}");
+    // The cursor starts on the active model, the first of three models.
+    assert!(frame.contains("1/3 modelos"), "{frame}");
     assert!(frame.contains("OpenAI Codex · GPT-5.6 Sol"), "{frame}");
     assert!(frame.contains("gpt-5.6-sol"), "{frame}");
     assert!(frame.contains("só nesta sessão"), "{frame}");
@@ -514,11 +500,11 @@ fn groups_are_headings_and_models_sit_under_them() {
     reduce(&mut state, Action::Key(press(KeyCode::Up)));
     let on_heading = render_to_string(&state);
     assert!(
-        on_heading.contains("OpenAI Codex · 4 modelos"),
+        on_heading.contains("OpenAI Codex · 3 modelos"),
         "{on_heading}"
     );
     assert!(on_heading.contains("Enter recolhe o grupo"), "{on_heading}");
-    assert!(on_heading.contains("4 modelos"), "{on_heading}");
+    assert!(on_heading.contains("3 modelos"), "{on_heading}");
 }
 
 /// Filtering does not move the panel or its search cursor.
@@ -551,6 +537,64 @@ fn overlay_geometry_is_stable_while_filtering() {
     assert!(
         filtered_lines[bottom].contains("↵ aplicar"),
         "the panel keeps its geometry while filtering:\n{filtered}"
+    );
+}
+
+/// The effort field is as wide as the deepest ladder any row shows, so the
+/// level column is one axis for the whole list. Every catalog counts toward
+/// that depth, Open Design included: its ladder here is deeper than any Codex
+/// alias (synthetic: the real catalogs top out at six levels, the aliases'
+/// own depth), and the level label must still line up with the Codex rows.
+#[test]
+fn open_design_ladder_sets_the_effort_column_width_like_any_catalog() {
+    let mut state = AppState::new();
+    state.authenticated = true;
+    state.auth_provider = Some(LoginProvider::OpenDesign);
+    state.model = "od-deep".into();
+    state.open_design_models = vec![OpenCodeModelView {
+        id: "od-deep".into(),
+        name: "OD Deep".into(),
+        context_window_tokens: 128_000,
+        max_output_tokens: 16_000,
+        reasoning_levels: ReasoningEffort::ALL
+            .iter()
+            .copied()
+            .chain([ReasoningEffort::Ultra; 2])
+            .collect(),
+        accepts_images: false,
+    }];
+    type_text(&mut state, "/model");
+    reduce(&mut state, Action::Key(press(KeyCode::Enter)));
+    // Expand the Codex group too and rest the cursor on a Codex model, so a
+    // focused Codex row and the unfocused Open Design row share the frame.
+    select_row(&mut state, |row| matches!(row, ModelRow::Header(0)));
+    reduce(&mut state, Action::Key(press(KeyCode::Char(' '))));
+    select_row(&mut state, |row| matches!(row, ModelRow::Codex(_)));
+    let frame = render_at(&state, 100, 30);
+    let rows: Vec<&str> = frame.lines().collect();
+    let row_of = |needle: &str| {
+        *rows
+            .iter()
+            .find(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} missing:\n{frame}"))
+    };
+    // Column of the level label: the first non-blank cell after the meter.
+    let label_column = |row: &str| {
+        let cells: Vec<char> = row.chars().collect();
+        let meter_end = cells
+            .iter()
+            .rposition(|c| matches!(c, '\u{25b0}' | '\u{25b1}' | '\u{2192}'))
+            .unwrap_or_else(|| panic!("no meter in {row}"));
+        meter_end
+            + cells[meter_end..]
+                .iter()
+                .position(|c| c.is_alphabetic())
+                .unwrap_or_else(|| panic!("no level label in {row}"))
+    };
+    assert_eq!(
+        label_column(row_of("OD Deep")),
+        label_column(row_of("GPT-5.6 Sol")),
+        "the level column is one axis for every group:\n{frame}"
     );
 }
 

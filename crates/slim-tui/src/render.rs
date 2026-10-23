@@ -372,6 +372,39 @@ pub(crate) fn assistant_text_width(width: u16) -> u16 {
     width.saturating_sub(ASSISTANT_PREFIX_COLS + 1).max(1)
 }
 
+/// Rows of each member of an expanded tool group, without the turn boundary
+/// the group's leader already accounts for; empty while the group is folded.
+fn grouped_member_heights(
+    members: &[Block],
+    expanded: bool,
+    width: u16,
+    cache: &mut WrapCache,
+) -> Vec<u64> {
+    if !expanded {
+        return Vec::new();
+    }
+    members
+        .iter()
+        .map(|member| {
+            (block_height(member, group_member_width(width), cache)
+                - usize::from(member.turn_boundary_before())) as u64
+        })
+        .collect()
+}
+
+/// Whether the leader of a presented span folds: thought, queued prompts and
+/// the work of a turn always do; a tool does when it has a body to expand or
+/// leads a group.
+fn is_foldable_leader(leader: &Block, members: &[Block]) -> bool {
+    match leader.kind() {
+        BlockKind::Thinking(_) | BlockKind::QueuedUser(_) | BlockKind::Work(_) => true,
+        BlockKind::Tool(tool) => {
+            members.len() > 1 || tool.content_handle.is_some() || tool.has_expanded_body()
+        }
+        _ => false,
+    }
+}
+
 fn block_height(block: &Block, width: u16, cache: &mut WrapCache) -> usize {
     let content_rows = match block.kind() {
         BlockKind::User(text) => {
@@ -619,18 +652,12 @@ impl<'a> HeightIndex<'a> {
                             .map(|row| row.member)
                             .collect()
                     };
-                    let member_heights: Vec<u64> = if block.group_expanded {
-                        blocks[start..end]
-                            .iter()
-                            .map(|member| {
-                                (block_height(member, group_member_width(width), cache)
-                                    - usize::from(member.turn_boundary_before()))
-                                    as u64
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
+                    let member_heights = grouped_member_heights(
+                        &blocks[start..end],
+                        block.group_expanded,
+                        width,
+                        cache,
+                    );
                     let entry_prefix = prefix;
                     prefix = record_grouped_member_rows(
                         &mut block_rows,
@@ -651,18 +678,12 @@ impl<'a> HeightIndex<'a> {
                 {
                     let tool_count = end.saturating_sub(start);
                     if tool_count > 1 && start == index {
-                        let member_heights: Vec<u64> = if block.group_expanded {
-                            blocks[start..end]
-                                .iter()
-                                .map(|member| {
-                                    (block_height(member, group_member_width(width), cache)
-                                        - usize::from(member.turn_boundary_before()))
-                                        as u64
-                                })
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
+                        let member_heights = grouped_member_heights(
+                            &blocks[start..end],
+                            block.group_expanded,
+                            width,
+                            cache,
+                        );
                         let entry_prefix = prefix;
                         prefix = record_grouped_member_rows(
                             &mut block_rows,
@@ -969,13 +990,7 @@ impl<'a> HeightIndex<'a> {
         for &(_, leader, start, end) in &self.memo.spans {
             let block = &self.blocks[leader];
             let members = &self.blocks[start..end];
-            let foldable_tool = matches!(block.kind(), BlockKind::Tool(tool)
-                if members.len() > 1 || tool.content_handle.is_some() || tool.has_expanded_body());
-            if matches!(
-                block.kind(),
-                BlockKind::Thinking(_) | BlockKind::QueuedUser(_) | BlockKind::Work(_)
-            ) || foldable_tool
-            {
+            if is_foldable_leader(block, members) {
                 anchors.push(ScrollAnchor {
                     block_id: block.id.clone(),
                     row_offset: 0,
@@ -1018,13 +1033,7 @@ impl<'a> HeightIndex<'a> {
             if block_prefix.saturating_add(rows) <= viewport_start {
                 break;
             }
-            let foldable_tool = matches!(block.kind(), BlockKind::Tool(state)
-                if members.len() > 1 || state.content_handle.is_some() || state.has_expanded_body());
-            if matches!(
-                block.kind(),
-                BlockKind::Thinking(_) | BlockKind::QueuedUser(_) | BlockKind::Work(_)
-            ) || foldable_tool
-            {
+            if is_foldable_leader(block, members) {
                 return Some(ScrollAnchor {
                     block_id: block.id.clone(),
                     row_offset: 0,
@@ -1713,22 +1722,16 @@ impl WrapCache {
     }
 
     /// Flattened model-overlay rows keyed by (filter, collapsed, catalogs).
-    /// Mirrors `ModelOverlay::for_current`: the catalogs stay explicit.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn model_rows(
         &mut self,
         overlay: &ModelOverlay,
-        opencode: &[crate::api::OpenCodeModelView],
-        clinepass: &[crate::api::OpenCodeModelView],
-        command_code: &[crate::api::OpenCodeModelView],
-        zen: &[crate::api::OpenCodeModelView],
-        open_design: &[crate::api::OpenCodeModelView],
+        catalogs: &crate::app::ModelCatalogs<'_>,
         catalog_rev: u64,
     ) -> Arc<Vec<ModelRow>> {
         memoized(
             &mut self.model_rows_memo,
             (overlay.filter.clone(), overlay.collapsed, catalog_rev),
-            || Arc::new(overlay.rows(opencode, clinepass, command_code, zen, open_design)),
+            || Arc::new(overlay.rows(catalogs)),
         )
         .clone()
     }

@@ -1,16 +1,16 @@
 use serde_json::Value;
 
 use super::{
-    endpoint_sensitive_values, harden_compaction_body, materialize_native_prompt_cache_key,
-    normalize_messages, OpenAiCodexAdapter, PreparedProviderRequest, ProviderAdapter,
-    ProviderCapabilities, ProviderConfig, ProviderError, ProviderEvent, ProviderKind,
-    ProviderMessage,
+    endpoint::protocol_url, normalize_messages, wire::ResponsesWire, HttpRequest,
+    PreparedProviderRequest, ProviderAdapter, ProviderCapabilities, ProviderError, ProviderEvent,
+    ProviderKind, ProviderMessage,
 };
 
 pub const XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const XAI_DEFAULT_MODEL: &str = "grok-4.5";
 
 const REASONING_STANDARD: &[&str] = &["low", "medium", "high"];
+const REASONING_GROK_4_3: &[&str] = &["none", "low", "medium", "high", "xhigh"];
 const REASONING_STANDARD_XHIGH: &[&str] = &["low", "medium", "high", "xhigh"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,7 +48,7 @@ const MODELS: &[XaiModel] = &[
         "Grok 4.3",
         1_000_000,
         30_000,
-        REASONING_STANDARD,
+        REASONING_GROK_4_3,
     ),
     model("grok-4.5", "Grok 4.5", 500_000, 500_000, REASONING_STANDARD),
     model(
@@ -83,10 +83,7 @@ pub fn is_xai_model_id(id: &str) -> bool {
 /// responses arm), Bearer access token from OAuth device flow or `XAI_API_KEY`.
 pub struct XaiAdapter {
     model: &'static XaiModel,
-    parser: OpenAiCodexAdapter,
-    endpoint: String,
-    api_key: String,
-    max_output_tokens: u32,
+    wire: ResponsesWire,
 }
 
 impl XaiAdapter {
@@ -104,51 +101,40 @@ impl XaiAdapter {
                 message: "unsupported xAI reasoning effort".into(),
             });
         }
-        let endpoint = protocol_url(endpoint, "responses");
-        let mut config = ProviderConfig::openai_codex(&endpoint, model.id, api_key, "xai");
-        if let Some(effort) = reasoning_effort {
-            config = config.with_reasoning_effort(effort);
-        }
-        Ok(Self {
-            model,
-            parser: OpenAiCodexAdapter::new(config)?,
-            endpoint,
-            api_key: api_key.into(),
-            max_output_tokens: super::DEFAULT_MAX_OUTPUT_TOKENS,
-        })
+        let mut wire = ResponsesWire::new(
+            protocol_url(endpoint, "responses"),
+            model.id,
+            api_key,
+            "xai",
+            reasoning_effort,
+        )?;
+        // xAI keeps a prompt cache per server and routes by this key: one
+        // conversation's requests share a server.
+        wire.set_conversation_key(super::opencode::new_conversation_id());
+        Ok(Self { model, wire })
+    }
+
+    /// Ties the cache routing to `session_id`, so a resumed session finds
+    /// the server that cached it.
+    pub fn with_session_id(mut self, session_id: &str) -> Self {
+        self.wire
+            .set_conversation_key(super::opencode::opaque_session_id(session_id));
+        self
     }
 
     pub fn with_response_cache_scope_id(mut self, id: u64) -> Self {
-        self.parser.set_response_cache_scope_id(id);
+        self.wire.parser.set_response_cache_scope_id(id);
         self
     }
 
     pub fn with_max_output_tokens(mut self, max_output_tokens: u32) -> Self {
-        self.max_output_tokens = max_output_tokens.max(1);
+        self.wire.set_max_output_tokens(max_output_tokens);
         self
     }
 
     pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
-        self.parser.set_system_prompt(prompt);
+        self.wire.parser.set_system_prompt(prompt);
         self
-    }
-
-    fn responses_request(
-        &self,
-        messages: &[ProviderMessage],
-        tools: &[Value],
-    ) -> super::HttpRequest {
-        let mut body = self.parser.request_body(messages, tools);
-        body["max_output_tokens"] = Value::from(self.max_output_tokens);
-        super::HttpRequest {
-            url: self.endpoint.clone(),
-            headers: vec![
-                ("Authorization".into(), format!("Bearer {}", self.api_key)),
-                ("accept".into(), "text/event-stream".into()),
-                ("content-type".into(), "application/json".into()),
-            ],
-            body: body.to_string(),
-        }
     }
 }
 
@@ -170,19 +156,19 @@ impl ProviderAdapter for XaiAdapter {
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
-        self.parser.capabilities()
+        self.wire.parser.capabilities()
     }
 
     fn materialize_prompt_cache_intent(&self, body: &mut Value) {
-        self.parser.materialize_prompt_cache_intent(body);
+        self.wire.parser.materialize_prompt_cache_intent(body);
     }
 
     fn response_cache_scope_id(&self) -> Option<u64> {
-        self.parser.response_cache_scope_id()
+        self.wire.parser.response_cache_scope_id()
     }
 
     fn system_prompt_for_budget(&self) -> Option<&str> {
-        self.parser.system_prompt_for_budget()
+        self.wire.parser.system_prompt_for_budget()
     }
 
     fn request_envelope_upper_bound_chars(&self) -> Option<u64> {
@@ -190,25 +176,23 @@ impl ProviderAdapter for XaiAdapter {
     }
 
     fn sensitive_values(&self) -> Vec<String> {
-        let mut values = endpoint_sensitive_values(&self.endpoint);
-        values.push(self.api_key.clone());
-        values
+        self.wire.sensitive_values()
     }
 
-    fn build_request(&self, prompt: &str) -> super::HttpRequest {
-        self.responses_request(&[ProviderMessage::user(prompt)], &[])
+    fn build_request(&self, prompt: &str) -> HttpRequest {
+        self.wire.request(&[ProviderMessage::user(prompt)], &[])
     }
 
-    fn build_messages_request(&self, messages: &[ProviderMessage]) -> super::HttpRequest {
-        self.responses_request(messages, &[])
+    fn build_messages_request(&self, messages: &[ProviderMessage]) -> HttpRequest {
+        self.wire.request(messages, &[])
     }
 
     fn build_messages_request_with_tools(
         &self,
         messages: &[ProviderMessage],
         tools: &[Value],
-    ) -> super::HttpRequest {
-        self.responses_request(messages, tools)
+    ) -> HttpRequest {
+        self.wire.request(messages, tools)
     }
 
     fn prepare_messages_request_with_tools_checked(
@@ -217,19 +201,7 @@ impl ProviderAdapter for XaiAdapter {
         tools: &[Value],
     ) -> Result<PreparedProviderRequest, ProviderError> {
         normalize_messages(messages)?;
-        let (mut body, stable_prefixes) = self.parser.request_body_with_prefixes(messages, tools);
-        body["max_output_tokens"] = Value::from(self.max_output_tokens);
-        let prepared = PreparedProviderRequest::from_http_body_with_prefixes(
-            self.endpoint.clone(),
-            vec![
-                ("Authorization".into(), format!("Bearer {}", self.api_key)),
-                ("accept".into(), "text/event-stream".into()),
-                ("content-type".into(), "application/json".into()),
-            ],
-            body,
-            self,
-            stable_prefixes,
-        )?;
+        let prepared = self.wire.prepare(self, messages, tools)?;
         Ok(prepared.with_routing_identity(self.kind(), self.wire_kind(), self.model()))
     }
 
@@ -238,21 +210,7 @@ impl ProviderAdapter for XaiAdapter {
         messages: &[ProviderMessage],
     ) -> Result<PreparedProviderRequest, ProviderError> {
         normalize_messages(messages)?;
-        let (mut body, _) = self.parser.request_body_with_prefixes(messages, &[]);
-        body["max_output_tokens"] = Value::from(self.max_output_tokens);
-        harden_compaction_body(&mut body, false)?;
-        let stable_prefixes = materialize_native_prompt_cache_key(&self.parser, &mut body);
-        let prepared = PreparedProviderRequest::from_http_body_with_prefixes(
-            self.endpoint.clone(),
-            vec![
-                ("Authorization".into(), format!("Bearer {}", self.api_key)),
-                ("accept".into(), "text/event-stream".into()),
-                ("content-type".into(), "application/json".into()),
-            ],
-            body,
-            self,
-            stable_prefixes,
-        )?;
+        let prepared = self.wire.prepare_compaction(self, messages)?;
         Ok(prepared.with_routing_identity(self.kind(), self.wire_kind(), self.model()))
     }
 
@@ -264,31 +222,6 @@ impl ProviderAdapter for XaiAdapter {
                 .map(|text| vec![ProviderEvent::ReasoningDelta(text.into())])
                 .unwrap_or_default());
         }
-        self.parser.parse_event(value)
+        self.wire.parser.parse_event(value)
     }
-}
-
-fn protocol_url(endpoint: &str, route: &str) -> String {
-    if let Ok(mut url) = reqwest::Url::parse(endpoint) {
-        let mut path = url.path().trim_end_matches('/').to_owned();
-        for known in ["/chat/completions", "/responses", "/messages"] {
-            if path.ends_with(known) {
-                path.truncate(path.len() - known.len());
-                break;
-            }
-        }
-        url.set_path(&format!("{}/{route}", path.trim_end_matches('/')));
-        return url.to_string();
-    }
-
-    let split = endpoint.find(['?', '#']).unwrap_or(endpoint.len());
-    let (base, suffix) = endpoint.split_at(split);
-    let mut base = base.trim_end_matches('/').to_owned();
-    for known in ["/chat/completions", "/responses", "/messages"] {
-        if base.ends_with(known) {
-            base.truncate(base.len() - known.len());
-            break;
-        }
-    }
-    format!("{}/{route}{suffix}", base.trim_end_matches('/'))
 }

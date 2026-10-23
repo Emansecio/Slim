@@ -62,7 +62,7 @@ fn listing_respects_gitignore_skip_dirs_and_includes_dotfiles() {
     workspace.write(".pi/x", "x");
     workspace.write(".venv/bin/python", "x");
 
-    let files = list_workspace_files(workspace.root(), 1000, None).expect("list");
+    let files = list_workspace_files(workspace.root(), 1000, None).expect("list").files;
     // Shallower first, then lexicographic ('.' sorts before 'R').
     assert_eq!(
         files,
@@ -82,8 +82,8 @@ fn listing_honors_limit_and_is_deterministic() {
     for index in 0..30 {
         workspace.write(&format!("dir{}/file{index:02}.txt", index % 3), "x");
     }
-    let first = list_workspace_files(workspace.root(), 10, None).expect("list");
-    let second = list_workspace_files(workspace.root(), 10, None).expect("list");
+    let first = list_workspace_files(workspace.root(), 10, None).expect("list").files;
+    let second = list_workspace_files(workspace.root(), 10, None).expect("list").files;
     assert_eq!(first.len(), 10);
     assert_eq!(first, second);
     let mut sorted = first.clone();
@@ -91,13 +91,41 @@ fn listing_honors_limit_and_is_deterministic() {
     assert_eq!(first, sorted);
     assert!(list_workspace_files(workspace.root(), 0, None)
         .expect("list")
+        .files
         .is_empty());
     assert_eq!(
         list_workspace_files(workspace.root(), usize::MAX, None)
             .expect("list")
+            .files
             .len(),
         30
     );
+}
+
+#[test]
+fn hitting_the_limit_is_not_a_time_cut() {
+    let workspace = Workspace::new();
+    for index in 0..5 {
+        workspace.write(&format!("f{index}.txt"), "x");
+    }
+    let listing = list_workspace_files(workspace.root(), 3, None).expect("list");
+    assert_eq!(listing.files.len(), 3);
+    assert!(!listing.timed_out);
+}
+
+#[test]
+fn listing_ignores_macos_finder_and_appledouble_litter() {
+    let workspace = Workspace::new();
+    workspace.write("keep.txt", "x");
+    workspace.write(".DS_Store", "x");
+    workspace.write("._keep.txt", "x");
+    workspace.write("sub/.DS_Store", "x");
+    workspace.write("sub/._other", "x");
+    workspace.write("sub/other", "x");
+    let files = list_workspace_files(workspace.root(), 100, None)
+        .expect("list")
+        .files;
+    assert_eq!(files, ["keep.txt", "sub/other"]);
 }
 
 #[test]
@@ -129,7 +157,7 @@ fn listing_skips_symlinked_files_and_directories() {
         eprintln!("symlink creation unavailable; skipping symlink assertions");
         return;
     }
-    let files = list_workspace_files(workspace.root(), 100, None).expect("list");
+    let files = list_workspace_files(workspace.root(), 100, None).expect("list").files;
     assert_eq!(files, ["real.txt", "real_dir/inner.txt"]);
 }
 
@@ -148,7 +176,7 @@ fn listing_skips_directory_junctions() {
         eprintln!("junction creation unavailable; skipping");
         return;
     }
-    let files = list_workspace_files(workspace.root(), 100, None).expect("list");
+    let files = list_workspace_files(workspace.root(), 100, None).expect("list").files;
     assert_eq!(files, ["real_dir/inner.txt"]);
 }
 

@@ -15,6 +15,7 @@ mod discovery;
 mod flow;
 mod types;
 
+use crate::sync::lock_mutex;
 use std::fmt;
 use std::sync::Mutex;
 
@@ -95,10 +96,7 @@ impl MemoryOAuthStore {
     }
 
     pub fn snapshot(&self) -> Option<McpOAuthState> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        lock_mutex(&self.state).clone()
     }
 }
 
@@ -108,20 +106,12 @@ impl McpOAuthStore for MemoryOAuthStore {
     }
 
     fn save(&self, state: &McpOAuthState) -> Result<(), String> {
-        *self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(state.clone());
+        *lock_mutex(&self.state) = Some(state.clone());
         Ok(())
     }
 
     fn clear(&self) -> Result<bool, String> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-            .is_some())
+        Ok(lock_mutex(&self.state).take().is_some())
     }
 
     fn lock_refresh(&self) -> Result<Box<dyn Send>, String> {

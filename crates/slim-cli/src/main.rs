@@ -82,7 +82,7 @@ fn known_options_without_prompt(args: &[String]) -> bool {
             // Recovery has no prompt and must not wait for a piped stdin EOF.
             "--recover" => return false,
             "--plan" | "--read-only" | "--verbose" | "--jsonl" | "--headless" | "--tui"
-            | "--fake" | "--abandon-pending" | "--fast" | "--normal" => {}
+            | "--fake" | "--abandon-pending" | "--fast" | "--normal" | "--trust-project" => {}
             "--prompt" | "--provider" | "--model" | "--endpoint" | "--session" | "--resume"
             | "--image" | "--effort" | "--experiment-id" | "--task-id" => {
                 if args.get(index + 1).is_none() {

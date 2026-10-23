@@ -7,9 +7,7 @@ pub(super) fn push_runtime_event(
 ) -> Result<(), ProviderError> {
     let persistence = if let Some(journal) = &app.run_journal {
         let record = || {
-            journal
-                .lock()
-                .map_err(|_| journal_error("durable run lock poisoned"))
+            lock_journal(journal)
                 .and_then(|mut journal| journal.record_event(&kind).map_err(journal_error))
         };
         // An append the journal syncs to disk stalls the thread for the
@@ -26,9 +24,7 @@ pub(super) fn push_runtime_event(
         Ok(())
     };
     app.push_event(crate::SessionEvent::new(*next_seq, kind))
-        .map_err(|message| ProviderError::InvalidResponse {
-            message: message.into(),
-        })?;
+        .map_err(event_rejected)?;
     *next_seq = checked_next_seq(*next_seq)?;
     persistence?;
     Ok(())
@@ -136,6 +132,22 @@ pub(super) fn journal_error(error: impl std::fmt::Display) -> ProviderError {
     }
 }
 
+/// The durable run journal, or the error of a poisoned lock.
+pub(super) fn lock_journal(
+    journal: &Mutex<crate::session::ManualRunJournal>,
+) -> Result<std::sync::MutexGuard<'_, crate::session::ManualRunJournal>, ProviderError> {
+    journal
+        .lock()
+        .map_err(|_| journal_error("durable run lock poisoned"))
+}
+
+/// A session event the app refused (`push_event`'s static reason).
+pub(super) fn event_rejected(message: &'static str) -> ProviderError {
+    ProviderError::InvalidResponse {
+        message: message.into(),
+    }
+}
+
 pub(crate) fn persist_provider_call(
     journal: &Option<Arc<Mutex<crate::session::ManualRunJournal>>>,
     telemetry: ProviderCallTelemetry,
@@ -143,9 +155,7 @@ pub(crate) fn persist_provider_call(
     let Some(journal) = journal else {
         return Ok(None);
     };
-    journal
-        .lock()
-        .map_err(|_| journal_error("durable run lock poisoned"))?
+    lock_journal(journal)?
         .record_provider_call(&telemetry)
         .map(Some)
         .map_err(journal_error)
@@ -161,9 +171,7 @@ pub(crate) fn persist_tool_batch(
         return Ok(());
     };
     let call_ids: Vec<&str> = calls.iter().map(|call| call.id.as_str()).collect();
-    journal
-        .lock()
-        .map_err(|_| journal_error("durable run lock poisoned"))?
+    lock_journal(journal)?
         .record_tool_batch(batch_id, &call_ids, wall_ms)
         .map_err(journal_error)
 }
@@ -176,9 +184,7 @@ pub(crate) fn persist_provider_validation_failure(
     let (Some(journal), Some(provider_call_id)) = (journal, provider_call_id) else {
         return Ok(());
     };
-    journal
-        .lock()
-        .map_err(|_| journal_error("durable run lock poisoned"))?
+    lock_journal(journal)?
         .record_provider_validation_failure(provider_call_id, error)
         .map_err(journal_error)
 }
@@ -189,11 +195,31 @@ pub(super) fn push_runtime_transient_event(
     kind: crate::EventKind,
 ) -> Result<(), ProviderError> {
     app.push_transient_event(crate::SessionEvent::new(*next_seq, kind))
-        .map_err(|message| ProviderError::InvalidResponse {
-            message: message.into(),
-        })?;
+        .map_err(event_rejected)?;
     *next_seq = checked_next_seq(*next_seq)?;
     Ok(())
+}
+
+/// One transient `ToolProgress` event for a running call, `preview` redacted
+/// with `sensitive_values`. A failed push is returned: the caller decides
+/// whether it also cancels the call.
+pub(super) fn push_tool_progress(
+    app: &mut AppHandle,
+    next_seq: &mut u64,
+    sensitive_values: &[String],
+    invocation: ToolInvocation<'_>,
+    preview: &str,
+) -> Result<(), ProviderError> {
+    push_runtime_transient_event(
+        app,
+        next_seq,
+        crate::EventKind::ToolProgress {
+            batch_id: invocation.batch_id.into(),
+            call_id: invocation.call_id.into(),
+            name: invocation.name.into(),
+            preview: redact_values(sensitive_values, preview),
+        },
+    )
 }
 
 pub(super) fn checked_next_seq(seq: u64) -> Result<u64, ProviderError> {

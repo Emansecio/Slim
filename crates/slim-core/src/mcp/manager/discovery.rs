@@ -10,6 +10,7 @@ use crate::mcp::exposure::{
     MAX_DIRECT_TOOLS,
 };
 use crate::mcp::search::{tool_search_document, Bm25Ranker, SearchServer};
+use crate::sync::{lock_mutex, read_lock, write_lock};
 
 /// Text of `{list:true}`, in bytes.
 const MAX_SERVER_LIST_BYTES: usize = 16 * 1024;
@@ -79,19 +80,11 @@ pub(super) fn visible_tools<'a>(
 
 impl McpManager {
     fn entries_snapshot(&self) -> Vec<Arc<ServerEntry>> {
-        self.servers
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .cloned()
-            .collect()
+        read_lock(&self.servers).values().cloned().collect()
     }
 
     fn instructions_of(entry: &ServerEntry) -> Option<String> {
-        entry
-            .handshake
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        read_lock(&entry.handshake)
             .as_ref()
             .and_then(|handshake| handshake.instructions.clone())
     }
@@ -145,10 +138,7 @@ impl McpManager {
         let name = spec.name.clone();
         self.insert_connection(spec, connection, tools);
         if let Ok(entry) = self.entry(&name) {
-            *entry
-                .handshake
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(handshake));
+            *write_lock(&entry.handshake) = Some(Arc::new(handshake));
             self.bump();
         }
     }
@@ -163,10 +153,7 @@ impl McpManager {
     /// with their owner for the life of the manager.
     pub fn direct_tools(&self) -> Arc<Vec<McpDirectTool>> {
         let revision = self.revision();
-        let mut state = self
-            .direct
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = lock_mutex(&self.direct);
         if let Some((cached, tools)) = &state.cache {
             if *cached == revision {
                 return Arc::clone(tools);
@@ -178,11 +165,7 @@ impl McpManager {
             if !entry.spec.enabled || options.block.is_some() || !options.has_direct_tools() {
                 continue;
             }
-            let status = entry
-                .status
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
+            let status = read_lock(&entry.status).clone();
             let tools = match status {
                 McpServerStatus::Ready { tools } => tools,
                 // A cancelled call or a lost connection resets the entry to
@@ -191,11 +174,7 @@ impl McpManager {
                 // tools (and the prompt-cache prefix) vanish for good. Calls
                 // reconnect lazily.
                 McpServerStatus::Disconnected | McpServerStatus::Connecting => {
-                    let last = entry
-                        .last_tools
-                        .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone();
+                    let last = read_lock(&entry.last_tools).clone();
                     match last {
                         Some(tools) => tools,
                         None => continue,
@@ -244,13 +223,7 @@ impl McpManager {
     /// The `(server, tool)` behind a provider tool name, while that tool is
     /// still direct on an enabled, trusted server.
     pub fn resolve_direct_tool(&self, name: &str) -> Option<(String, String)> {
-        let (server, tool) = self
-            .direct
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .names
-            .resolve(name)?
-            .clone();
+        let (server, tool) = lock_mutex(&self.direct).names.resolve(name)?.clone();
         let entry = self.entry(&server).ok()?;
         (entry.spec.enabled
             && entry.spec.options.block.is_none()
@@ -273,11 +246,7 @@ impl McpManager {
             if !entry.spec.enabled || options.block.is_some() || options.fully_hidden() {
                 continue;
             }
-            let status = entry
-                .status
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
+            let status = read_lock(&entry.status).clone();
             let tools = match &status {
                 McpServerStatus::Ready { tools } => Some(visible_indexes(&entry.spec, tools).len()),
                 McpServerStatus::Disabled | McpServerStatus::Untrusted => continue,
@@ -327,11 +296,7 @@ impl McpManager {
                 text.push_str(&format!("\n… {} more servers", visible.len() - index));
                 break;
             }
-            let status = entry
-                .status
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
+            let status = read_lock(&entry.status).clone();
             let state = match &status {
                 McpServerStatus::Disabled => "disabled".to_owned(),
                 McpServerStatus::Disconnected => "disconnected".to_owned(),
@@ -458,11 +423,7 @@ impl McpManager {
             if !entry.spec.enabled || options.block.is_some() || options.fully_hidden() {
                 continue;
             }
-            let status = entry
-                .status
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
+            let status = read_lock(&entry.status).clone();
             match status {
                 McpServerStatus::Ready { tools } => {
                     sources.push(Self::search_source(&entry, tools));
@@ -668,11 +629,7 @@ impl McpManager {
             .filter(|entry| !entry.spec.options.fully_hidden())
             .take(MAX_LIST_SERVERS)
             .map(|entry| {
-                let status = entry
-                    .status
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
+                let status = read_lock(&entry.status).clone();
                 let mut described = json!({
                     "name": entry.spec.name,
                     "transport": entry.spec.transport.kind(),

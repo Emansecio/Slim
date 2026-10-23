@@ -281,9 +281,7 @@ impl Runtime {
             return Ok(());
         }
         if let Some(journal) = &self.app.run_journal {
-            let journal = journal
-                .lock()
-                .map_err(|_| journal_error("durable run lock poisoned"))?;
+            let journal = lock_journal(journal)?;
             for record in journal.repo().records() {
                 if let DurableRecord::Fact { fact, .. } = record {
                     if fact.namespace == STATE_NAMESPACE {
@@ -311,9 +309,7 @@ impl Runtime {
     ) -> Result<(), ProviderError> {
         if let Some(journal) = &self.app.run_journal {
             redact_value(&mut value, &self.sensitive_values.0);
-            journal
-                .lock()
-                .map_err(|_| journal_error("durable run lock poisoned"))?
+            lock_journal(journal)?
                 .record_fact(DurableFact {
                     namespace: namespace.into(),
                     key: self.redact_sensitive(key),

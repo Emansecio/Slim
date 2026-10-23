@@ -59,7 +59,34 @@ fn deduplicate_descriptions(tools: &mut [Value]) {
             }
             _ => {}
         }
+        condense_job_and_check_guidance(tool);
     }
+}
+
+// Same rules in fewer tokens: these schemas ride on every provider turn.
+fn condense_job_and_check_guidance(tool: &mut Value) {
+    let replacements: &[(&str, &str)] = match tool["name"].as_str() {
+        Some("write" | "patch") => &[(
+            "When a check or test command exists, attach it as then_run on the last edit instead of a separate shell call: it runs only after the write succeeds, waits, and reports both results; a failed command leaves the edit applied.",
+            "Attach any check/test as then_run on the last edit instead of a separate shell call; it runs after success and reports both results (a failed check keeps the edit).",
+        ), (
+            "When a check or test command exists, attach it as then_run on the last edit instead of a separate shell call: it runs only after the patch succeeds, waits, and reports both results; a failed command leaves the edit applied.",
+            "Attach any check/test as then_run on the last edit instead of a separate shell call; it runs after success and reports both results (a failed check keeps the edit).",
+        )],
+        Some("shell") => &[(
+            "In the agent loop, returns a job after yield_ms; continue independent work. Completion is delivered automatically; use shell_job to list, inspect, read output, wait, interrupt or cancel; do not poll. background=true yields immediately. TUI jobs survive responses within the session; headless waits. Run cancellation stops jobs launched by that run; do not detach child processes.",
+            "Past yield_ms (background=true: at once) it becomes a job whose completion is delivered automatically; continue independent work, use shell_job to inspect, read output, wait or cancel, and never poll or detach child processes.",
+        )],
+        _ => &[],
+    };
+    let Some(description) = tool["description"].as_str() else {
+        return;
+    };
+    let mut condensed = description.to_owned();
+    for (long, short) in replacements {
+        condensed = condensed.replace(long, short);
+    }
+    tool["description"] = Value::String(condensed);
 }
 
 #[cfg(test)]
@@ -133,5 +160,34 @@ mod tests {
             strip_descriptions(tool);
         }
         assert_eq!(description_free_baseline, description_free_candidate);
+    }
+
+    #[test]
+    fn job_and_check_guidance_is_condensed_without_dropping_rules() {
+        let registry = crate::tools::ToolRegistry::default();
+        let native = registry.definitions_for_mode(crate::OperatingMode::Auto);
+        let mut provider = native.clone();
+        compact_provider_definitions(&mut provider);
+        let description = |tools: &[Value], name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .and_then(|tool| tool["description"].as_str())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        for (name, rules) in [
+            ("write", &["then_run", "last edit", "instead of a separate shell call", "keeps the edit", "then_run.final"][..]),
+            ("patch", &["then_run", "last edit", "instead of a separate shell call", "keeps the edit", "then_run.final"][..]),
+            ("shell", &["yield_ms", "background=true", "shell_job", "never poll", "detach child processes", "Use file tools for edits"][..]),
+        ] {
+            let condensed = description(&provider, name);
+            assert!(!condensed.contains("When a check or test command exists"), "{name} kept the long guidance");
+            assert!(!condensed.contains("TUI jobs survive"), "{name} kept the long guidance");
+            assert!(condensed.len() < description(&native, name).len(), "{name} did not shrink");
+            for rule in rules {
+                assert!(condensed.contains(rule), "{name} lost {rule}");
+            }
+        }
     }
 }

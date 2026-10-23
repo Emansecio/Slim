@@ -392,7 +392,9 @@ pub(super) fn shrink_history_to_fit(
 }
 
 fn drop_earlier_reasoning(messages: &mut [ProviderMessage]) -> ElisionStats {
-    let last_assistant = messages.iter().rposition(|message| message.role == "assistant");
+    let last_assistant = messages
+        .iter()
+        .rposition(|message| message.role == "assistant");
     let mut stats = ElisionStats::default();
     for (index, message) in messages.iter_mut().enumerate() {
         if message.role != "assistant" || Some(index) == last_assistant {

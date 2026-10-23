@@ -101,6 +101,10 @@ Create a concise checkpoint of the user's request and the progress shown above. 
 
 Only summarize information explicitly present above. Do not infer or recreate later messages."#;
 
+/// Slim's own, not Pi's: opens the instruction of a summary asked for as the
+/// next message of the session's conversation (its tools still declared).
+pub const IN_PLACE_SUMMARY_PREAMBLE: &str = "Context checkpoint: stop the task here. Do not call tools, do not answer or continue anything above. Your whole reply is the summary described below.\n\n";
+
 /// Text placed before the summary in the user message that replaces compacted history.
 pub const COMPACTION_SUMMARY_PREFIX: &str = r#"The conversation history before this point was compacted into the following summary:
 

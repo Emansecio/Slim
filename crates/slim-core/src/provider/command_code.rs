@@ -2,9 +2,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    AnthropicAdapter, OpenAiCompatibleAdapter, PreparedProviderRequest, ProviderAdapter,
-    ProviderCapabilities, ProviderConfig, ProviderError, ProviderEvent, ProviderKind,
-    ProviderMessage,
+    endpoint::protocol_url_with, wire::WireAdapter, AnthropicAdapter, HttpRequest,
+    OpenAiCompatibleAdapter, PreparedProviderRequest, ProviderAdapter, ProviderCapabilities,
+    ProviderConfig, ProviderError, ProviderEvent, ProviderKind, ProviderMessage,
 };
 
 pub const COMMANDCODE_BASE_URL: &str = "https://api.commandcode.ai/provider/v1";
@@ -259,35 +259,6 @@ fn invalid_catalog(message: &str) -> ProviderError {
     }
 }
 
-fn protocol_url(endpoint: &str, route: &str) -> String {
-    if let Ok(mut url) = reqwest::Url::parse(endpoint) {
-        let mut path = url.path().trim_end_matches('/').to_owned();
-        for known in ["/chat/completions", "/messages", "/models"] {
-            if path.ends_with(known) {
-                path.truncate(path.len() - known.len());
-                break;
-            }
-        }
-        url.set_path(&format!("{}/{route}", path.trim_end_matches('/')));
-        return url.to_string();
-    }
-    let split = endpoint.find(['?', '#']).unwrap_or(endpoint.len());
-    let (base, suffix) = endpoint.split_at(split);
-    let mut base = base.trim_end_matches('/').to_owned();
-    for known in ["/chat/completions", "/messages", "/models"] {
-        if base.ends_with(known) {
-            base.truncate(base.len() - known.len());
-            break;
-        }
-    }
-    format!("{}/{route}{suffix}", base.trim_end_matches('/'))
-}
-
-enum WireAdapter {
-    Chat(OpenAiCompatibleAdapter),
-    Messages(AnthropicAdapter),
-}
-
 pub struct CommandCodeAdapter {
     model_id: String,
     api: CommandCodeApi,
@@ -337,27 +308,17 @@ impl CommandCodeAdapter {
     }
 
     pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
-        let prompt = prompt.into();
-        match &mut self.wire {
-            WireAdapter::Chat(adapter) => adapter.set_system_prompt(prompt),
-            WireAdapter::Messages(adapter) => adapter.set_system_prompt(prompt),
-        }
+        self.wire.set_system_prompt(prompt.into());
         self
     }
 
     pub fn with_response_cache_scope_id(mut self, id: u64) -> Self {
-        match &mut self.wire {
-            WireAdapter::Chat(adapter) => adapter.set_response_cache_scope_id(id),
-            WireAdapter::Messages(adapter) => adapter.set_response_cache_scope_id(id),
-        }
+        self.wire.set_response_cache_scope_id(id);
         self
     }
 
     pub fn with_max_output_tokens(mut self, tokens: u32) -> Self {
-        match &mut self.wire {
-            WireAdapter::Chat(adapter) => adapter.config.max_output_tokens = tokens.max(1),
-            WireAdapter::Messages(adapter) => adapter.config.max_output_tokens = tokens.max(1),
-        }
+        self.wire.set_max_output_tokens(tokens);
         self
     }
 
@@ -367,12 +328,7 @@ impl CommandCodeAdapter {
     /// intentional and surfaces as an ordinary provider error.
     pub fn with_zero_data_retention(mut self, enabled: bool) -> Self {
         if enabled {
-            match &mut self.wire {
-                WireAdapter::Chat(adapter) => adapter.config.push_extra_header("x-cmd-zdr", "1"),
-                WireAdapter::Messages(adapter) => {
-                    adapter.config.push_extra_header("x-cmd-zdr", "1")
-                }
-            }
+            self.wire.push_extra_header("x-cmd-zdr", "1");
         }
         self
     }
@@ -395,31 +351,19 @@ impl ProviderAdapter for CommandCodeAdapter {
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
-        match &self.wire {
-            WireAdapter::Chat(adapter) => adapter.capabilities(),
-            WireAdapter::Messages(adapter) => adapter.capabilities(),
-        }
+        self.wire.capabilities()
     }
 
     fn materialize_prompt_cache_intent(&self, body: &mut Value) {
-        match &self.wire {
-            WireAdapter::Chat(adapter) => adapter.materialize_prompt_cache_intent(body),
-            WireAdapter::Messages(adapter) => adapter.materialize_prompt_cache_intent(body),
-        }
+        self.wire.materialize_prompt_cache_intent(body);
     }
 
     fn response_cache_scope_id(&self) -> Option<u64> {
-        match &self.wire {
-            WireAdapter::Chat(adapter) => adapter.response_cache_scope_id(),
-            WireAdapter::Messages(adapter) => adapter.response_cache_scope_id(),
-        }
+        self.wire.response_cache_scope_id()
     }
 
     fn system_prompt_for_budget(&self) -> Option<&str> {
-        match &self.wire {
-            WireAdapter::Chat(adapter) => adapter.system_prompt_for_budget(),
-            WireAdapter::Messages(adapter) => adapter.system_prompt_for_budget(),
-        }
+        self.wire.system_prompt_for_budget()
     }
 
     fn request_envelope_upper_bound_chars(&self) -> Option<u64> {
@@ -427,39 +371,23 @@ impl ProviderAdapter for CommandCodeAdapter {
     }
 
     fn sensitive_values(&self) -> Vec<String> {
-        match &self.wire {
-            WireAdapter::Chat(adapter) => adapter.sensitive_values(),
-            WireAdapter::Messages(adapter) => adapter.sensitive_values(),
-        }
+        self.wire.sensitive_values()
     }
 
-    fn build_request(&self, prompt: &str) -> super::HttpRequest {
-        match &self.wire {
-            WireAdapter::Chat(adapter) => adapter.build_request(prompt),
-            WireAdapter::Messages(adapter) => adapter.build_request(prompt),
-        }
+    fn build_request(&self, prompt: &str) -> HttpRequest {
+        self.wire.build_request(prompt)
     }
 
-    fn build_messages_request(&self, messages: &[ProviderMessage]) -> super::HttpRequest {
-        match &self.wire {
-            WireAdapter::Chat(adapter) => adapter.build_messages_request(messages),
-            WireAdapter::Messages(adapter) => adapter.build_messages_request(messages),
-        }
+    fn build_messages_request(&self, messages: &[ProviderMessage]) -> HttpRequest {
+        self.wire.build_messages_request(messages)
     }
 
     fn build_messages_request_with_tools(
         &self,
         messages: &[ProviderMessage],
         tools: &[Value],
-    ) -> super::HttpRequest {
-        match &self.wire {
-            WireAdapter::Chat(adapter) => {
-                adapter.build_messages_request_with_tools(messages, tools)
-            }
-            WireAdapter::Messages(adapter) => {
-                adapter.build_messages_request_with_tools(messages, tools)
-            }
-        }
+    ) -> HttpRequest {
+        self.wire.build_messages_request_with_tools(messages, tools)
     }
 
     fn prepare_messages_request_with_tools_checked(
@@ -467,14 +395,9 @@ impl ProviderAdapter for CommandCodeAdapter {
         messages: &[ProviderMessage],
         tools: &[Value],
     ) -> Result<PreparedProviderRequest, ProviderError> {
-        let prepared = match &self.wire {
-            WireAdapter::Chat(adapter) => {
-                adapter.prepare_messages_request_with_tools_checked(messages, tools)?
-            }
-            WireAdapter::Messages(adapter) => {
-                adapter.prepare_messages_request_with_tools_checked(messages, tools)?
-            }
-        };
+        let prepared = self
+            .wire
+            .prepare_messages_request_with_tools_checked(self, messages, tools)?;
         Ok(prepared.with_routing_identity(self.kind(), self.wire_kind(), self.model()))
     }
 
@@ -482,19 +405,21 @@ impl ProviderAdapter for CommandCodeAdapter {
         &self,
         messages: &[ProviderMessage],
     ) -> Result<PreparedProviderRequest, ProviderError> {
-        let prepared = match &self.wire {
-            WireAdapter::Chat(adapter) => adapter.prepare_compaction_request_checked(messages)?,
-            WireAdapter::Messages(adapter) => {
-                adapter.prepare_compaction_request_checked(messages)?
-            }
-        };
+        let prepared = self
+            .wire
+            .prepare_compaction_request_checked(self, messages)?;
         Ok(prepared.with_routing_identity(self.kind(), self.wire_kind(), self.model()))
     }
 
     fn parse_event(&self, value: &Value) -> Result<Vec<ProviderEvent>, ProviderError> {
-        match &self.wire {
-            WireAdapter::Chat(adapter) => adapter.parse_event(value),
-            WireAdapter::Messages(adapter) => adapter.parse_event(value),
-        }
+        self.wire.parse_event(value)
     }
+}
+
+fn protocol_url(endpoint: &str, route: &str) -> String {
+    protocol_url_with(
+        endpoint,
+        route,
+        &["/chat/completions", "/messages", "/models"],
+    )
 }

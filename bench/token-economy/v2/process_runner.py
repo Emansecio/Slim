@@ -41,6 +41,8 @@ def main(spec_path, result_path, stdout_path, stderr_path):
                 [spec["executable"], *spec.get("arguments", [])],
                 cwd=spec["cwd"],
                 env=env,
+                # Headless CLIs may wait for piped stdin when it is inherited open.
+                stdin=subprocess.DEVNULL,
                 stdout=stdout,
                 stderr=stderr,
             )

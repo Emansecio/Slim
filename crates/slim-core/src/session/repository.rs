@@ -3,7 +3,7 @@ use std::io;
 
 use super::attempts::{AttemptLedger, AttemptLedgerError};
 use super::queue::{DurableQueue, DurableQueueError};
-use super::reducer::{reduce, restore_records, DurableState, ReduceError};
+use super::reducer::{EntryIndex, ReduceError};
 use super::schema_v2::{DurableOperationKind, DurableRecord, DurableSessionHeader};
 use super::tool_phases::{is_legacy_tool_phase, ToolPhaseError, ToolPhaseLedger};
 
@@ -100,7 +100,7 @@ struct OperationLifecycle {
 /// `prepare` clones and applies one record without mutating `self`.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DurableAppendValidator {
-    reducer: DurableState,
+    reducer: EntryIndex,
     lifecycle: BTreeMap<String, OperationLifecycle>,
     attempts: AttemptLedger,
     queue: DurableQueue,
@@ -117,7 +117,7 @@ pub(crate) struct PreparedDurableAppend {
 impl DurableAppendValidator {
     pub(crate) fn empty() -> Self {
         Self {
-            reducer: DurableState::default(),
+            reducer: EntryIndex::default(),
             lifecycle: BTreeMap::new(),
             attempts: AttemptLedger::default(),
             queue: DurableQueue::new(1),
@@ -150,8 +150,7 @@ impl DurableAppendValidator {
             ToolPhaseLedger::default()
         };
         Ok(Self {
-            reducer: restore_records(records)
-                .map_err(|error| reduce_error(io::ErrorKind::InvalidData, error))?,
+            reducer: entry_index_from_records(records)?,
             lifecycle: operation_lifecycle_from_records(records, io::ErrorKind::InvalidData)?,
             attempts,
             queue,
@@ -203,7 +202,9 @@ impl DurableAppendValidator {
         error_kind: io::ErrorKind,
     ) -> io::Result<()> {
         apply_lifecycle(&mut self.lifecycle, record, error_kind)?;
-        reduce(&mut self.reducer, record).map_err(|error| reduce_error(error_kind, error))?;
+        self.reducer
+            .apply(record)
+            .map_err(|error| reduce_error(error_kind, error))?;
         self.attempts
             .apply_record(record)
             .map_err(|error| attempt_error(error_kind, error))?;
@@ -253,6 +254,16 @@ impl DurableAppendValidator {
         }
         Ok(())
     }
+}
+
+fn entry_index_from_records(records: &[DurableRecord]) -> io::Result<EntryIndex> {
+    let mut index = EntryIndex::default();
+    for record in records {
+        index
+            .apply(record)
+            .map_err(|error| reduce_error(io::ErrorKind::InvalidData, error))?;
+    }
+    Ok(index)
 }
 
 fn replay_tools(
@@ -589,5 +600,27 @@ mod tests {
             validator,
             DurableAppendValidator::from_records(&records).expect("rebuild")
         );
+    }
+
+    #[test]
+    fn entry_index_keeps_identity_and_reference_checks() {
+        let records = vec![entry(0, "op-1")];
+        let validator = DurableAppendValidator::from_records(&records).expect("open");
+        let mut duplicate = entry(1, "op-1");
+        if let DurableRecord::Entry { entry, .. } = &mut duplicate {
+            entry.entry_id = "entry-0".into();
+        }
+        let error = validator
+            .prepare(&records, &duplicate)
+            .expect_err("duplicate entry id");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let error = validator
+            .prepare(&records, &started(1, "op-2", "entry-0"))
+            .expect_err("input entry belongs to another operation");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let error = validator
+            .prepare(&records, &started(1, "op-1", "entry-9"))
+            .expect_err("missing input entry");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

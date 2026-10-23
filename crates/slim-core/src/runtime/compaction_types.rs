@@ -90,6 +90,7 @@ impl CompactionSummary {
             ProviderEvent::ReasoningDelta(_)
             | ProviderEvent::ResponsesReasoning(_)
             | ProviderEvent::ChatReasoning(_)
+            | ProviderEvent::ThinkingBlock { .. }
             | ProviderEvent::ReasoningStarted
             | ProviderEvent::ReasoningEnded
             | ProviderEvent::Phase { .. }

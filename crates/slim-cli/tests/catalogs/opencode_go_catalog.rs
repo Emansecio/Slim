@@ -167,3 +167,10 @@ fn directory_cache_path_is_ignored_without_destroying_it() {
     assert!(root.is_dir());
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn errors_name_the_go_provider() {
+    let error = parse_catalog(b"{}").expect_err("schema");
+
+    assert_eq!(error.to_string(), "OpenCode Go catalog schema is invalid");
+}
