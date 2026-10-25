@@ -1319,7 +1319,15 @@ fn decorate_code_row(
     if lead > 0 {
         decorated.push(Span::styled(" ".repeat(lead), styles.text));
     }
-    decorated.push(Span::styled(CODE_RAIL, styles.code_rail.patch(background)));
+    // The rail keeps its quiet tone: only the row's surface carries over, so
+    // the block's text color never paints it.
+    decorated.push(Span::styled(
+        CODE_RAIL,
+        styles.code_rail.patch(Style {
+            bg: background.bg,
+            ..Style::default()
+        }),
+    ));
     decorated.extend(spans);
     decorated.push(Span::styled(
         " ".repeat(width.saturating_sub(lead + 2).saturating_sub(used)),

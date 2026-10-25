@@ -255,13 +255,13 @@ fn quote_paragraphs_share_one_rail_separated_by_a_rail_only_row() {
 }
 
 #[test]
-fn inline_code_uses_raised_surface_not_green() {
+fn inline_code_reads_by_tone_on_its_raised_surface_not_green() {
     let rendered = render("see `target\\debug` and more", 80);
-    assert_eq!(
-        rendered.word_style("target").0,
-        Color::Rgb(0xE8, 0xE5, 0xDB),
-        "inline paths must stay readable on near-black"
-    );
+    let code = rendered.word_style("target").0;
+    // `tool_accent`: readable on near-black (10.7:1) and apart from prose,
+    // which the raised surface alone (1.14:1) does not set apart.
+    assert_eq!(code, Color::Rgb(0xBC, 0xB9, 0xAF));
+    assert_ne!(code, rendered.word_style("more").0);
     assert_eq!(rendered.word_bg("target"), Color::Rgb(0x14, 0x14, 0x14));
     assert_ne!(rendered.word_bg("more"), rendered.word_bg("target"));
 }

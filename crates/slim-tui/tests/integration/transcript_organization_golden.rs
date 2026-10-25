@@ -1872,3 +1872,87 @@ fn restoring_a_long_session_folds_every_turn_in_one_pass() {
         "{elapsed:?}"
     );
 }
+
+const IDENTITY: Color = Color::Rgb(0x72, 0xCC, 0x91);
+const REASONING: Color = Color::Rgb(0xA9, 0x9F, 0xD6);
+
+#[test]
+fn a_code_rail_keeps_its_quiet_tone_on_the_block_surface() {
+    let state = answer("Antes.\n\n```rust\nfn main() {}\n```\n\n```diff\n+novo\n```\n");
+    let rendered = render(&state, 60, 24);
+    for needle in ["│ fn main", "│ +novo"] {
+        let (y, x) = rendered
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?}\n{}", rendered.text()));
+        assert_eq!(rendered.foreground[y][x], CODE_RAIL, "{needle:?}");
+    }
+    let (y, x) = rendered.find("│ fn main").expect("code row");
+    assert_eq!(rendered.background[y][x], CODE_BG);
+    assert_eq!(rendered.fg("fn main"), TEXT, "the code keeps the text tone");
+}
+
+/// Row of the `● Slim` label, apart from the `SLIM` of the session rail.
+fn agent_label(rendered: &Rendered) -> usize {
+    rendered.row("● Slim")
+}
+
+#[test]
+fn the_agent_label_keeps_the_identity_rail_whichever_block_opens_the_turn() {
+    let reduced = |state: &AppState| {
+        render_with(
+            state,
+            60,
+            24,
+            caps(ColorDepth::TrueColor, true),
+            &mut WrapCache::default(),
+        )
+    };
+    // Waiting for the first output, the label closes the prompt's block.
+    let mut state = connected();
+    state.apply_event(UiEvent::UserMessageAdded {
+        text: "investigue".into(),
+    });
+    state.apply_event(UiEvent::run_started(1));
+    let pending = reduced(&state);
+    let label = agent_label(&pending);
+    assert_eq!(pending.foreground[label][0], IDENTITY, "{}", pending.text());
+    assert!(
+        pending.rows[label + 1].starts_with('─'),
+        "the rule under a pending label carries no rail\n{}",
+        pending.text()
+    );
+
+    // Opened by a thought: the label is green, the thought keeps its violet.
+    state.apply_event(UiEvent::ThinkingStarted);
+    state.apply_event(UiEvent::ThinkingDelta {
+        text: "plano".into(),
+    });
+    let thinking = reduced(&state);
+    let label = agent_label(&thinking);
+    assert_eq!(
+        thinking.foreground[label][0],
+        IDENTITY,
+        "{}",
+        thinking.text()
+    );
+    let thought = thinking.row("Pensando");
+    assert_eq!(thinking.foreground[thought][0], REASONING);
+
+    // Opened by a call.
+    let mut state = connected();
+    state.apply_event(UiEvent::UserMessageAdded {
+        text: "leia".into(),
+    });
+    state.apply_event(UiEvent::run_started(1));
+    tool(
+        &mut state,
+        "1",
+        "read",
+        r#"{"path":"src/lib.rs"}"#,
+        "ok",
+        true,
+    );
+    let called = reduced(&state);
+    let label = agent_label(&called);
+    assert_eq!(called.foreground[label][0], IDENTITY, "{}", called.text());
+}

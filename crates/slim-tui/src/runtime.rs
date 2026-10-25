@@ -1302,15 +1302,16 @@ impl Palette {
             link: base.fg(color(theme.link_accent)),
             quote: base.fg(color(theme.secondary_text)),
             tool: base.fg(color(theme.tool_accent)),
-            // The raised background collapses to Black in ANSI16/no-color, so
-            // those depths keep marking inline code by foreground instead.
+            // Inline code is told from prose by its tone at every depth: the
+            // raised surface alone sits too close to the transcript, and it
+            // collapses to Black in ANSI16/no-color.
             inline_code: if matches!(
                 capabilities.color_depth,
                 ColorDepth::Ansi16 | ColorDepth::None
             ) {
                 base.fg(color(theme.tool_accent))
             } else {
-                base.fg(color(theme.foreground)).bg(color(theme.code_bg))
+                base.fg(color(theme.tool_accent)).bg(color(theme.code_bg))
             },
             code_block: base.fg(color(theme.foreground)).bg(color(theme.code_bg)),
             code_rail: base.fg(color(theme.code_rail)),
@@ -2312,7 +2313,16 @@ fn render_scrollback(
             // above it, the rule under it and the breathing rows between blocks
             // keep their own row.
             let lead_blank = response_header.map_or(0, |header| usize::from(header.lead_blank));
-            let rule_row = response_header.map(|header| header.rows() - 1);
+            // A prompt still waiting for the agent ends with the agent's header:
+            // its label and rule are the last two rows of the block.
+            let pending_label = block
+                .awaiting_agent()
+                .then(|| block_lines.len().saturating_sub(2));
+            // The `● Slim` label is the agent's, whichever block carries it.
+            let label_row = response_header.map(|_| lead_blank).or(pending_label);
+            let rule_row = response_header
+                .map(|header| header.rows() - 1)
+                .or(pending_label.map(|label| label + 1));
             let gap_row = transition_gap.then_some(header_rows);
             let boundary_row = block
                 .turn_boundary_before()
@@ -2333,7 +2343,12 @@ fn render_scrollback(
                 }
                 let cell = &mut buf[(text_area.x, row)];
                 cell.set_char(rail);
-                if let Some(fg) = tone.fg {
+                let fg = if Some(index) == label_row {
+                    palette.assistant.fg
+                } else {
+                    tone.fg
+                };
+                if let Some(fg) = fg {
                     cell.set_fg(fg);
                 }
             }
@@ -3986,7 +4001,11 @@ fn tool_member_lines(
     let mut lines = vec![Line::from(header_spans)];
     if block.fold == FoldState::Expanded && state.has_expanded_body() {
         let body_width = width.saturating_sub(4).max(1);
-        let rail = palette.code_rail.patch(palette.code_block);
+        // The rail keeps its quiet tone; only the block's surface carries over.
+        let rail = palette.code_rail.patch(Style {
+            bg: palette.code_block.bg,
+            ..Style::default()
+        });
         lines.extend(cache.wrapped_body(
             block,
             BodyKind::ToolOutput,

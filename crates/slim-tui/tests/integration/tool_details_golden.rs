@@ -1,5 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::style::Color;
 use ratatui::Terminal;
 
 use slim_tui::api::{
@@ -33,6 +35,31 @@ fn render_at(state: &AppState) -> String {
 }
 
 fn render_at_width(state: &AppState, width: u16) -> String {
+    let buffer = draw(state, width);
+    let mut output = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            output.push(buffer[(x, y)].symbol().chars().next().unwrap_or(' '));
+        }
+        output.push('\n');
+    }
+    output
+}
+
+/// Foreground and background of the first cell of `needle` at 80 columns.
+fn cell_colors(state: &AppState, needle: &str) -> (Color, Color) {
+    let buffer = draw(state, 80);
+    let frame = render_at(state);
+    for (y, row) in frame.lines().enumerate() {
+        if let Some(byte) = row.find(needle) {
+            let cell = &buffer[(row[..byte].chars().count() as u16, y as u16)];
+            return (cell.fg, cell.bg);
+        }
+    }
+    panic!("{needle:?} missing\n{frame}");
+}
+
+fn draw(state: &AppState, width: u16) -> Buffer {
     let backend = TestBackend::new(width, 24);
     let mut terminal = Terminal::new(backend).expect("terminal");
     let mut cache = WrapCache::default();
@@ -52,15 +79,7 @@ fn render_at_width(state: &AppState, width: u16) -> String {
             )
         })
         .expect("draw");
-    let buffer = terminal.backend().buffer();
-    let mut output = String::new();
-    for y in 0..buffer.area.height {
-        for x in 0..buffer.area.width {
-            output.push(buffer[(x, y)].symbol().chars().next().unwrap_or(' '));
-        }
-        output.push('\n');
-    }
-    output
+    terminal.backend().buffer().clone()
 }
 
 #[test]
@@ -882,6 +901,11 @@ fn an_open_call_frames_its_details_and_says_what_enter_does() {
     assert!(
         rows[first - 1].trim_end().ends_with("Enter mais"),
         "{paged}"
+    );
+    assert_eq!(
+        cell_colors(&state, "│ first line"),
+        (Color::Rgb(0x68, 0x66, 0x5A), Color::Rgb(0x14, 0x14, 0x14)),
+        "the details rail keeps code_rail on the code surface"
     );
 
     reduce(&mut state, Action::Key(enter()));

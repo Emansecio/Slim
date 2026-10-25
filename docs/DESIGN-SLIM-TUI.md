@@ -759,6 +759,26 @@ real, com degradação explícita e testes golden (G340–G341).
 
 ### 1.2 Direção visual revisada
 
+**Revisão de 24/10/2026 (tons da resposta e do turno):** nenhuma cor, row ou
+timer novo; três tons voltam ao que os tokens prometem e o contrato passa a
+descrever o que a row de ferramenta já mostrava.
+
+- **Régua do código.** A régua `│` de um bloco de código, de um diff e dos
+  detalhes de uma ferramenta aberta usa `code_rail` sobre o fundo do bloco. Antes
+  o estilo do bloco sobrepunha a cor do texto e a régua saía em marfim, tão forte
+  quanto o código (14,6:1 contra 3,2:1 sobre `code_bg`).
+- **Código inline.** Passa a `tool_accent` sobre `code_bg` também em truecolor e
+  256 cores, o tom que ANSI16 e no-color já usavam. Só a superfície (1,14:1 contra
+  o transcript) não o separava da prosa, que tem o mesmo marfim. Substitui, para
+  code inline, o texto marfim da revisão de 26/09/2026 (fase 1).
+- **Rail do rótulo do agente.** A row `● Slim` leva o verde de identidade no rail
+  qualquer que seja o primeiro bloco do turno (pensamento, chamada ou prosa);
+  antes herdava o tom desse bloco (violeta, cinza ou verde). No cabeçalho
+  pendente sob o prompt, a row do rótulo também é verde e a régua abaixo dele fica
+  sem rail, como a do cabeçalho de um turno.
+- **Row de ferramenta concluída.** §15.2 passa a descrever o que o código já
+  fazia: alvo, tamanho da edição e o primeiro segmento do resultado.
+
 **Revisão de 22/10/2026 (espaçamento da resposta):** nenhuma cor, row de
 chrome ou timer novo; muda só a projeção do Markdown.
 
@@ -3145,7 +3165,10 @@ o `row_offset` dentro da nova altura.
   como colapsado; bloco omitido se reasoning vazio;
 - tools colapsados ocupam uma row: glyph de lifecycle discreto, resumo verbal
   do grupo (`3 leituras, 1 comando`) ou o nome da call isolada, e duração em
-  `muted`; concluídos não exibem `command=` nem preview, mas tools ativas
+  `muted`; concluídos não exibem `command=` nem telemetria, mas mantêm o alvo,
+  o tamanho de uma edição e o primeiro segmento do resultado
+  (`✓ Leu src/parser.rs · fn parse() · 1.2s`), salvo em `patch`/`write` e
+  quando o resultado é só `exit 0`; tools ativas
   mantêm nome, limite e progresso e tools falhas mantêm uma razão curta
   redigida, sem telemetria `key=value`. Toda summary ocupa exatamente uma row
   física: o comando perde largura primeiro. Args e output completos só aparecem expandidos; `Enter
