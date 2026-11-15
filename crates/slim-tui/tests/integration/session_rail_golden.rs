@@ -123,9 +123,9 @@ fn the_home_reads_as_a_tilde_and_the_project_folder_is_the_one_in_text_tone() {
         "{}",
         row.line()
     );
-    // The right edge says who the session is talking to.
-    assert!(row.line().ends_with("● Anthropic"), "{}", row.line());
-    assert_eq!(row.fg("Anthropic"), MUTED);
+    // Who the session is talking to reads in the footer, beside the model:
+    // the rail ends at the path.
+    assert!(row.line().ends_with(r"~\Projects\Slim"), "{}", row.line());
     // The brand a step above the quiet path, the folder in the text tone.
     assert_eq!(row.fg("SLIM"), SECONDARY);
     assert_eq!(row.fg("~"), MUTED);
@@ -195,8 +195,7 @@ fn without_color_the_folder_is_told_apart_by_weight_alone() {
         "{}",
         row.line()
     );
-    // Without color the chip's dot is ASCII.
-    assert!(row.line().ends_with("* Anthropic"), "{}", row.line());
+    assert!(!row.line().contains("Anthropic"), "{}", row.line());
     // No tone at all: every cell keeps the terminal's own color...
     assert!(row.foreground.iter().all(|fg| *fg == Color::Reset));
     // ...and only the project folder is bold.

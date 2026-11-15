@@ -74,7 +74,7 @@ fn type_text(state: &mut AppState, text: &str) {
 }
 
 #[test]
-fn submit_during_run_enqueues_visible_block_and_clears_composer() {
+fn submit_during_run_steers_and_clears_composer() {
     let mut state = AppState::new();
     reduce(&mut state, run_started(1));
     assert!(state.working, "RunStarted must flip the run active flag");
@@ -82,22 +82,27 @@ fn submit_during_run_enqueues_visible_block_and_clears_composer() {
     type_text(&mut state, "second question");
     let effects = reduce(&mut state, Action::Key(enter()));
 
-    assert_eq!(effects, vec![Effect::RequestRender]);
+    assert_eq!(
+        effects,
+        vec![Effect::Send(UiCommand::Steer("second question".into()))]
+    );
     assert!(state.composer.payload().is_empty());
-    assert_eq!(queued_texts(&state), vec!["second question"]);
-    assert_eq!(state.queued_prompts.len(), 1);
+    assert!(state.queued_prompts.is_empty());
+    assert!(queued_texts(&state).is_empty());
 }
 
 #[test]
-fn second_enqueue_increments_fifo_position() {
+fn second_submit_during_run_steers_in_fifo_order() {
     let mut state = AppState::new();
     reduce(&mut state, run_started(1));
     type_text(&mut state, "first");
-    reduce(&mut state, Action::Key(enter()));
+    let first = reduce(&mut state, Action::Key(enter()));
     type_text(&mut state, "second");
-    reduce(&mut state, Action::Key(enter()));
+    let second = reduce(&mut state, Action::Key(enter()));
 
-    assert_eq!(queued_texts(&state), vec!["first", "second"]);
+    assert_eq!(first, vec![Effect::Send(UiCommand::Steer("first".into()))]);
+    assert_eq!(second, vec![Effect::Send(UiCommand::Steer("second".into()))]);
+    assert!(state.queued_prompts.is_empty());
 }
 
 #[test]
@@ -202,18 +207,20 @@ fn queue_groups_preserve_output_between_pending_messages_and_editing_indices() {
 
 #[test]
 fn ninth_queued_prompt_is_rejected_without_losing_the_draft() {
+    // The Enter-while-working path now steers; the queue cap is still
+    // enforced on the remaining enqueue path (a skill selection mid-run).
     let mut state = AppState::new();
+    state.set_skill_names_for_test(vec!["review-code".into()]);
     reduce(&mut state, run_started(1));
     for index in 0..8 {
-        type_text(&mut state, &format!("queued-{index}"));
-        reduce(&mut state, Action::Key(enter()));
+        state.enqueue_queued_prompt(format!("queued-{index}"));
     }
-    type_text(&mut state, "keep ninth");
+    type_text(&mut state, "/review-code");
 
     let effects = reduce(&mut state, Action::Key(enter()));
 
     assert_eq!(state.queued_prompts.len(), 8);
-    assert_eq!(state.composer.payload(), "keep ninth");
+    assert_eq!(state.composer.payload(), "/review-code ");
     assert_eq!(effects, vec![Effect::RequestRender]);
     assert!(state
         .notifications
@@ -222,14 +229,14 @@ fn ninth_queued_prompt_is_rejected_without_losing_the_draft() {
 }
 
 #[test]
-fn alt_enter_during_run_enqueues_too() {
+fn alt_enter_during_run_steers_too() {
     let mut state = AppState::new();
     reduce(&mut state, run_started(1));
     type_text(&mut state, "steered");
     let effects = reduce(&mut state, Action::Key(alt_enter()));
 
-    assert_eq!(effects, vec![Effect::RequestRender]);
-    assert_eq!(queued_texts(&state), vec!["steered"]);
+    assert_eq!(effects, vec![Effect::Send(UiCommand::Steer("steered".into()))]);
+    assert!(state.queued_prompts.is_empty());
 }
 
 #[test]
@@ -245,8 +252,7 @@ fn empty_draft_never_enqueues() {
 fn run_terminal_drains_exactly_one_prompt() {
     let mut state = AppState::new();
     reduce(&mut state, run_started(1));
-    type_text(&mut state, "queued prompt");
-    reduce(&mut state, Action::Key(enter()));
+    state.enqueue_queued_prompt("queued prompt".into());
 
     let effects = reduce(&mut state, run_completed(1));
 
@@ -256,30 +262,27 @@ fn run_terminal_drains_exactly_one_prompt() {
 }
 
 #[test]
-fn two_queued_two_terminals_fifo_order() {
+fn prompt_run_started_drains_the_remaining_queue_into_steers() {
     let mut state = AppState::new();
     reduce(&mut state, run_started(1));
-    type_text(&mut state, "alpha");
-    reduce(&mut state, Action::Key(enter()));
-    type_text(&mut state, "beta");
-    reduce(&mut state, Action::Key(enter()));
+    state.enqueue_queued_prompt("alpha".into());
+    state.enqueue_queued_prompt("beta".into());
 
     let first = reduce(&mut state, run_completed(1));
     let alpha = assert_prepared_prompt(&first, "alpha", PromptOrigin::Queued);
     assert_eq!(state.queued_prompts.len(), 1);
     assert_eq!(queued_texts(&state), vec!["beta"]);
 
-    reduce(&mut state, prompt_run_started(alpha, 2));
-    let second = reduce(
-        &mut state,
-        Action::UiEventReceived(UiEvent::PromptRunCompleted {
-            admission: alpha,
-            run_id: 2,
-        }),
+    // The run that just started absorbs the remaining queued prompt instead
+    // of making it wait for another terminal.
+    let second = reduce(&mut state, prompt_run_started(alpha, 2));
+    assert_eq!(
+        second,
+        vec![
+            Effect::RequestRender,
+            Effect::Send(UiCommand::Steer("beta".into()))
+        ]
     );
-    let beta = assert_prepared_prompt(&second, "beta", PromptOrigin::Queued);
-    assert_ne!(alpha.id, beta.id);
-    assert_ne!(alpha.generation, beta.generation);
     assert_eq!(state.queued_prompts.len(), 0);
     assert!(queued_texts(&state).is_empty());
 }
@@ -291,8 +294,8 @@ fn locally_handled_skill_selection_drains_the_next_queued_prompt() {
     reduce(&mut state, run_started(1));
     type_text(&mut state, "/review-code");
     reduce(&mut state, Action::Key(enter()));
-    type_text(&mut state, "after selection");
-    reduce(&mut state, Action::Key(enter()));
+    state.enqueue_queued_prompt("after selection".into());
+    assert_eq!(state.queued_prompts.len(), 2);
 
     let first = reduce(&mut state, run_completed(1));
     let admission = assert_prepared_prompt(&first, "/review-code ", PromptOrigin::Queued);
@@ -314,12 +317,79 @@ fn locally_handled_skill_selection_drains_the_next_queued_prompt() {
 fn non_terminal_event_does_not_drain() {
     let mut state = AppState::new();
     reduce(&mut state, run_started(1));
-    type_text(&mut state, "kept while running");
-    reduce(&mut state, Action::Key(enter()));
+    state.enqueue_queued_prompt("kept while running".into());
     assert_eq!(state.queued_prompts.len(), 1);
 
     // A non-terminal event (tick) must not drain the queue.
     reduce(&mut state, Action::Tick(Default::default()));
     assert_eq!(state.queued_prompts.len(), 1);
     assert_eq!(queued_texts(&state).len(), 1);
+}
+
+#[test]
+fn refunded_steer_while_idle_becomes_a_queued_prompt_and_drains() {
+    let mut state = AppState::new();
+
+    let effects = reduce(
+        &mut state,
+        Action::UiEventReceived(UiEvent::QueuedUserAdded {
+            text: "refunded".into(),
+            position: 0,
+        }),
+    );
+
+    assert_prepared_prompt(&effects, "refunded", PromptOrigin::Queued);
+    assert!(state.queued_prompts.is_empty());
+    assert!(queued_texts(&state).is_empty(), "drain removes the block");
+}
+
+#[test]
+fn refunded_steer_during_a_run_waits_in_the_queue() {
+    let mut state = AppState::new();
+    reduce(&mut state, run_started(1));
+
+    let effects = reduce(
+        &mut state,
+        Action::UiEventReceived(UiEvent::QueuedUserAdded {
+            text: "refunded".into(),
+            position: 0,
+        }),
+    );
+
+    assert_eq!(effects, vec![Effect::RequestRender]);
+    assert_eq!(state.queued_prompts.len(), 1);
+    assert_eq!(queued_texts(&state), vec!["refunded"]);
+}
+
+#[test]
+fn run_started_drains_queued_prompts_into_steers() {
+    let mut state = AppState::new();
+    state.enqueue_queued_prompt("queued-1".into());
+    state.enqueue_queued_prompt("queued-2".into());
+
+    let effects = reduce(&mut state, run_started(1));
+
+    assert_eq!(
+        effects,
+        vec![
+            Effect::RequestRender,
+            Effect::Send(UiCommand::Steer("queued-1".into())),
+            Effect::Send(UiCommand::Steer("queued-2".into())),
+        ]
+    );
+    assert!(state.queued_prompts.is_empty());
+    assert!(queued_texts(&state).is_empty());
+}
+
+#[test]
+fn paused_queue_does_not_drain_into_steers_on_run_start() {
+    let mut state = AppState::new();
+    state.enqueue_queued_prompt("held".into());
+    state.queue_paused = true;
+
+    let effects = reduce(&mut state, run_started(1));
+
+    assert_eq!(effects, vec![Effect::RequestRender]);
+    assert_eq!(state.queued_prompts.len(), 1);
+    assert_eq!(queued_texts(&state), vec!["held"]);
 }

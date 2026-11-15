@@ -8,7 +8,7 @@ momento em que foram produzidos.
 
 | Necessidade | Fonte |
 |---|---|
-| Regras para agentes | [`../AGENTS.md`](../AGENTS.md) e [`../RULES.md`](../RULES.md) |
+| Regras para agentes | [`../AGENTS.md`](../AGENTS.md) — política operacional; [`../RULES.md`](../RULES.md) — protocolo de evidência, incidentes e checklist |
 | Visão geral e início rápido | [`../README.md`](../README.md) |
 | Contrato normativo da TUI | [`DESIGN-SLIM-TUI.md`](DESIGN-SLIM-TUI.md) |
 | Decisões de produto | [`DECISOES-GRILL-PRE-IMPLEMENTACAO.md`](DECISOES-GRILL-PRE-IMPLEMENTACAO.md) |

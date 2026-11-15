@@ -123,6 +123,12 @@ struct AuthProviders {
         skip_serializing_if = "Option::is_none"
     )]
     open_design: Option<AuthProvider>,
+    #[serde(
+        rename = "devin",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    devin: Option<AuthProvider>,
     /// Legacy controller credential. Slim no longer reads or writes it, but the
     /// entry is preserved so existing auth files keep parsing under
     /// `deny_unknown_fields` and no stored model credential is lost.
@@ -252,6 +258,7 @@ pub fn resolve_provider_credential(
         ProviderKind::CommandCode => "COMMANDCODE_API_KEY",
         ProviderKind::Xai => "XAI_API_KEY",
         ProviderKind::OpenDesign => "OPEN_DESIGN_API_KEY",
+        ProviderKind::Devin => "DEVIN_API_KEY",
     };
     if let Some(value) = non_empty_environment_value("SLIM_API_KEY") {
         return Ok(Some(env_credential(value)));
@@ -303,6 +310,7 @@ pub fn load_auth_credential(
         ProviderKind::CommandCode => document.providers.command_code,
         ProviderKind::Xai => document.providers.xai,
         ProviderKind::OpenDesign => document.providers.open_design,
+        ProviderKind::Devin => document.providers.devin,
     };
     let Some(provider) = provider else {
         return Ok(None);
@@ -459,6 +467,7 @@ fn provider_name(kind: ProviderKind) -> &'static str {
         ProviderKind::CommandCode => "command-code",
         ProviderKind::Xai => "xai",
         ProviderKind::OpenDesign => "open-design",
+        ProviderKind::Devin => "devin",
     }
 }
 
@@ -476,6 +485,7 @@ fn provider_slot_mut(
         ProviderKind::CommandCode => &mut providers.command_code,
         ProviderKind::Xai => &mut providers.xai,
         ProviderKind::OpenDesign => &mut providers.open_design,
+        ProviderKind::Devin => &mut providers.devin,
     }
 }
 

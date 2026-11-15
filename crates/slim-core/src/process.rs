@@ -19,6 +19,9 @@ pub(crate) mod windows_job;
 
 const EXECUTABLE_CACHE_CAPACITY: usize = 128;
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// How long output is still read after the command itself exited while a
+/// process it left behind keeps the pipes open.
+const POST_EXIT_DRAIN: Duration = Duration::from_secs(2);
 const INTERRUPTED_PIPE_DRAIN_LIMIT: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Debug)]
@@ -335,6 +338,9 @@ pub(crate) struct ProcessObserver {
     pub interrupt: Arc<AtomicBool>,
     pub grace: Duration,
     pub capture_bytes: usize,
+    /// A job that asked for a piped stdin receives the child's write end
+    /// here; `None` keeps the tool's stdin at /dev/null as always.
+    pub stdin_slot: Option<Arc<Mutex<Option<std::process::ChildStdin>>>>,
 }
 impl std::fmt::Debug for ProcessObserver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -417,7 +423,18 @@ impl ProcessRunner {
                 std::env::var_os("PYTHONIOENCODING").unwrap_or_else(|| "utf-8".into()),
             )
             // Tools are noninteractive; runtime input must remain with the UI.
-            .stdin(Stdio::null())
+            // Only a job that declared a stdin slot gets a pipe, and its bytes
+            // arrive through `shell_job input`, never through the UI.
+            .stdin(
+                if observer
+                    .as_ref()
+                    .is_some_and(|o| o.stdin_slot.is_some())
+                {
+                    Stdio::piped()
+                } else {
+                    Stdio::null()
+                },
+            )
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(unix)]
@@ -435,6 +452,12 @@ impl ProcessRunner {
         let pid = child.id();
         #[cfg(unix)]
         let _tree = UnixTree::new(pid);
+        if let Some(slot) = observer.as_ref().and_then(|o| o.stdin_slot.as_ref()) {
+            // The write end lives in the job from here on: `shell_job input`
+            // writes into it and `eof` drops it, which is the only EOF the
+            // child ever sees (the slot outlives this runner).
+            *lock_mutex(slot) = child.stdin.take();
+        }
         let stdout = child.stdout.take().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "process stdout pipe unavailable")
         })?;
@@ -469,6 +492,7 @@ impl ProcessRunner {
         let mut interrupt_started = None;
         let mut interrupt_escalated = false;
         let mut capture_may_be_incomplete = false;
+        let mut exited_at = None;
         let status = (|| -> io::Result<ExitStatus> {
             let mut status = None;
             loop {
@@ -490,6 +514,16 @@ impl ProcessRunner {
                 }
                 if let Some(status) = status {
                     if stdout_reader.is_finished() && stderr_reader.is_finished() {
+                        return Ok(status);
+                    }
+                    // The command is over, but something it started still
+                    // holds its output open (`server &`, a daemon). What is
+                    // already in the pipes is drained for a moment; waiting
+                    // for an end of file that never comes would turn a
+                    // finished command into a timeout.
+                    let exited = *exited_at.get_or_insert_with(Instant::now);
+                    if exited.elapsed() >= POST_EXIT_DRAIN {
+                        capture_may_be_incomplete = true;
                         return Ok(status);
                     }
                 }
@@ -627,11 +661,13 @@ impl UnixTree {
 #[cfg(unix)]
 impl Drop for UnixTree {
     fn drop(&mut self) {
-        live_groups::unregister(self.0 as i32);
         // SAFETY: only the group created for this child is targeted.
         unsafe {
             libc::kill(-(self.0 as i32), libc::SIGKILL);
         }
+        // Unregistered only after the kill: a fatal signal arriving between
+        // the two must still find the group in the table.
+        live_groups::unregister(self.0 as i32);
     }
 }
 
@@ -661,6 +697,18 @@ pub(crate) mod live_groups {
             slot.compare_exchange(group, 0, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
         });
+    }
+
+    pub(super) fn kill_all() {
+        for slot in &GROUPS {
+            let group = slot.load(Ordering::Acquire);
+            if group > 0 {
+                // SAFETY: only groups created for tool children are registered.
+                unsafe {
+                    libc::kill(-group, libc::SIGKILL);
+                }
+            }
+        }
     }
 
     extern "C" fn on_termination(signal: libc::c_int) {
@@ -703,6 +751,15 @@ pub(crate) mod live_groups {
 pub fn install_termination_cleanup() {
     #[cfg(unix)]
     live_groups::install();
+}
+
+/// Kills every running tool process group now. For a host that embeds Slim
+/// and exits while its workers are still shutting down, so their children
+/// (background jobs, commands in flight) do not outlive it. A no-op on
+/// Windows, where the job object already ties children to the process.
+pub fn kill_live_process_groups() {
+    #[cfg(unix)]
+    live_groups::kill_all();
 }
 
 #[cfg(windows)]
@@ -971,9 +1028,15 @@ fn read_pipe(
                 tail.extend(trailing);
             }
         }
-        let mut progress = lock_mutex(&progress);
-        if let Some(observer) = &progress.observer {
-            (observer.output)(
+        // The observer redacts and writes the job log; it runs outside the
+        // progress lock so the other pipe and the progress snapshot do not
+        // wait behind that work.
+        let output = lock_mutex(&progress)
+            .observer
+            .as_ref()
+            .map(|observer| Arc::clone(&observer.output));
+        if let Some(output) = output {
+            output(
                 match kind {
                     PipeKind::Stdout => 0,
                     PipeKind::Stderr => 1,
@@ -982,16 +1045,20 @@ fn read_pipe(
                 false,
             );
         }
+        // Only the last non-blank line is shown: decode that line, not the
+        // whole chunk.
+        let last_line = chunk[..read]
+            .rsplit(|byte| *byte == b'\n')
+            .map(String::from_utf8_lossy)
+            .find(|line| !line.trim().is_empty())
+            .map(|line| bound_last_line(&line));
+        let mut progress = lock_mutex(&progress);
         match kind {
             PipeKind::Stdout => progress.stdout_bytes = progress.stdout_bytes.saturating_add(read),
             PipeKind::Stderr => progress.stderr_bytes = progress.stderr_bytes.saturating_add(read),
         }
-        if let Some(line) = String::from_utf8_lossy(&chunk[..read])
-            .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-        {
-            progress.last_line = bound_last_line(line);
+        if let Some(line) = last_line {
+            progress.last_line = line;
         }
     }
     {
@@ -1072,6 +1139,7 @@ mod tests {
             interrupt: Arc::new(AtomicBool::new(false)),
             grace: Duration::from_millis(50),
             capture_bytes: 512,
+            stdin_slot: None,
         };
         let capture = Ok(PipeCapture {
             bytes: b"raw-secret-fragment".to_vec(),
@@ -1235,6 +1303,39 @@ mod tests {
         assert!(result.is_err() || result.unwrap().timed_out);
     }
 
+    #[test]
+    fn a_finished_command_does_not_wait_for_a_descendant_holding_its_pipes() {
+        // The parent exits at once; its child keeps the pipes for three
+        // seconds. The run ends with the parent's own status after the drain
+        // window, long before the timeout, and says the capture was cut.
+        let started = Instant::now();
+        let result = ProcessRunner::default()
+            .run(ProcessRequest {
+                cwd: std::env::current_dir().unwrap(),
+                program: std::env::current_exe().unwrap(),
+                args: [
+                    "--exact",
+                    "process::tests::inherited_pipe_parent",
+                    "--ignored",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+                timeout: Duration::from_secs(60),
+                cancellation: None,
+                output_budget: ProcessOutputBudget::per_stream(1024),
+            })
+            .expect("the command itself finished");
+        assert!(
+            started.elapsed() < POST_EXIT_DRAIN + Duration::from_secs(1),
+            "waited for the descendant: {:?}",
+            started.elapsed()
+        );
+        assert!(!result.timed_out);
+        assert!(result.output.status.success());
+        assert!(result.capture_may_be_incomplete);
+    }
+
     #[cfg(unix)]
     #[test]
     fn cancellation_terminates_process_group_without_blocking() {
@@ -1271,6 +1372,36 @@ mod tests {
             .process_group(0)
             .spawn()
             .expect("spawn")
+    }
+
+    /// Runs in its own test process (see the parent branch): killing every
+    /// registered group must not reach other tests' children.
+    #[cfg(unix)]
+    #[test]
+    fn kill_live_process_groups_kills_registered_groups() {
+        use std::os::unix::process::ExitStatusExt;
+        if std::env::var_os("SLIM_KILL_LIVE_GROUPS_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::tests::kill_live_process_groups_kills_registered_groups",
+                ])
+                .env("SLIM_KILL_LIVE_GROUPS_CHILD", "1")
+                .output()
+                .expect("child test");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}"
+            );
+            return;
+        }
+        let mut child = spawn_in_new_group("sleep 30 & wait");
+        live_groups::register(child.id() as i32);
+        kill_live_process_groups();
+        let status = child.wait().expect("wait");
+        live_groups::unregister(child.id() as i32);
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 
     #[cfg(unix)]

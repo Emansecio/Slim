@@ -10,6 +10,8 @@ const MAX_RETAINED: usize = 32;
 const JOB_PREFIX: &str = "shell-";
 /// Longest single `shell_job` wait; also the schema's `timeout_ms` maximum.
 const MAX_WAIT_MS: u64 = 10_000;
+/// How long `shell_job input` waits for the job to take what was written.
+const INPUT_WRITE_LIMIT: Duration = Duration::from_secs(30);
 /// One page of job output as the model reads it. The offsets stay raw byte
 /// positions in the log, so a page can be followed by `next_offset`; only the
 /// text is cleaned of terminal noise, as a finished command's output is.
@@ -123,13 +125,22 @@ struct Job {
     command: String,
     origin: String,
     output: JobOutput,
+    /// The child's stdin write end while it runs: `Some` only for jobs
+    /// launched with `stdin: true`; the inner value stays `None` until the
+    /// process spawns and again once `eof` or completion closes it.
+    stdin_slot: Option<Arc<Mutex<Option<std::process::ChildStdin>>>>,
     batch_id: String,
     call_id: String,
     delivered: bool,
     notified: bool,
+    /// An undelivered completion already claimed by one idle wake: a failed
+    /// or cancelled wake never re-arms, so the flag is never cleared.
+    wake_claimed: bool,
     done: Option<Done>,
     lost: Option<ShellJobInfo>,
 }
+/// Most output one job may leave on disk.
+const MAX_JOB_LOG_BYTES: u64 = 512 * 1024 * 1024;
 struct JobOutput {
     pending: [Vec<u8>; 2],
     suppress: [bool; 2],
@@ -366,6 +377,14 @@ impl JobOutput {
             self.log = Some((file, path));
         }
         if let Some((file, _)) = &mut self.log {
+            // A job that never stops writing (a dev server, `yes`) must not
+            // fill the disk: at the cap the capture fails, which stops it.
+            if self.bytes.saturating_add(text.len() as u64) > MAX_JOB_LOG_BYTES {
+                return Err(std::io::Error::other(format!(
+                    "job output reached the {} MiB log cap",
+                    MAX_JOB_LOG_BYTES / (1024 * 1024)
+                )));
+            }
             file.seek(SeekFrom::End(0))?;
             file.write_all(text.as_bytes())?;
         }
@@ -642,10 +661,12 @@ impl ShellJobs {
                     command: restored.command.clone(),
                     origin: restored.origin.clone(),
                     output: JobOutput::new(self.0.limits.memory_bytes, Vec::new(), None),
+                    stdin_slot: None,
                     batch_id: String::new(),
                     call_id: String::new(),
                     delivered: true,
                     notified: true,
+                    wake_claimed: true,
                     done: None,
                     lost: Some(restored),
                 },
@@ -727,6 +748,83 @@ impl ShellJobs {
             job.interrupt.store(true, Ordering::Relaxed);
         }
         Ok(())
+    }
+    /// Writes bytes to a piped job stdin; `eof` then closes it. The reply
+    /// never echoes the input text. The map lock is released before writing:
+    /// a child that never drains its pipe must not freeze every other job.
+    pub fn input(&self, id: &str, text: &[u8], eof: bool) -> Result<String, String> {
+        let slot = {
+            let jobs = self.jobs();
+            let job = job_key(id)
+                .and_then(|k| jobs.get(&k))
+                .ok_or("Unknown or expired shell job in this session")?;
+            if job.lost.is_some() {
+                return Err("Job lost after restart; no live process".into());
+            }
+            if job.done.is_some() {
+                return Err("job already finished".into());
+            }
+            job.stdin_slot
+                .clone()
+                .ok_or("job has no piped stdin (launch shell with stdin=true)")?
+        };
+        // A write still blocked on a child that is not reading holds this
+        // lock; a second caller is told so instead of queueing behind it.
+        let mut slot = match slot.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(
+                    "job stdin is busy: an earlier input is still waiting for the job to read it"
+                        .into(),
+                )
+            }
+        };
+        let Some(stdin) = slot.as_mut() else {
+            return Err("job stdin is closed or not ready yet".into());
+        };
+        stdin
+            .write_all(text)
+            .and_then(|()| stdin.flush())
+            .map_err(|error| format!("job stdin write failed: {error}"))?;
+        if eof {
+            // Dropping the write end is the only EOF the child sees.
+            slot.take();
+        }
+        Ok(format!(
+            "wrote {} byte(s) to {id} stdin{}",
+            text.len(),
+            if eof { " · eof" } else { "" }
+        ))
+    }
+    /// Model-launched jobs able to still produce an idle wake: running, or a
+    /// completion not yet claimed for one. Arms the host's wake check.
+    pub fn may_wake(&self) -> bool {
+        self.jobs().values().any(|job| {
+            (job.done.is_none() && job.lost.is_none())
+                || (job.done.is_some()
+                    && !job.delivered
+                    && !job.wake_claimed
+                    && job.origin != "user")
+        })
+    }
+    /// Claims the undelivered completions of model-launched jobs for one idle
+    /// wake: `true` at most once per completion, so a cancelled or failed
+    /// wake run does not re-arm itself; leftovers ride the next prompt.
+    pub fn take_pending_model_completions(&self) -> bool {
+        let mut jobs = self.jobs();
+        let mut found = false;
+        for job in jobs.values_mut() {
+            if job.done.is_some()
+                && !job.delivered
+                && !job.wake_claimed
+                && job.origin != "user"
+            {
+                job.wake_claimed = true;
+                found = true;
+            }
+        }
+        found
     }
     pub fn output(
         &self,
@@ -862,9 +960,16 @@ impl ShellJobs {
             .into();
             job.output.secrets = tools.sensitive_values.to_vec();
             job.output.store = tools.job_artifacts();
+            let stdin_slot = matches!(
+                &prepared.arguments,
+                PreparedToolArguments::Shell { stdin: true, .. }
+            )
+            .then(|| Arc::new(Mutex::new(None)));
+            job.stdin_slot.clone_from(&stdin_slot);
             let state = self.clone();
             let preview_state = self.clone();
             tools.process_observer = Some(crate::process::ProcessObserver {
+                stdin_slot,
                 redacted_output: Arc::new(move || {
                     let jobs = preview_state.jobs();
                     jobs.get(&key)
@@ -908,7 +1013,7 @@ impl ShellJobs {
                                 .output
                                 .tail
                                 .lines()
-                                .last()
+                                .next_back()
                                 .unwrap_or("no output yet")
                                 .chars()
                                 .take(160)
@@ -970,6 +1075,7 @@ impl ShellJobs {
                 command: String::new(),
                 origin: "model".into(),
                 output: JobOutput::new(limits.memory_bytes, Vec::new(), None),
+                stdin_slot: None,
                 batch_id: if invocation.batch_id == "user" {
                     format!("user-shell-{key}")
                 } else {
@@ -982,6 +1088,7 @@ impl ShellJobs {
                 },
                 delivered: false,
                 notified: false,
+                wake_claimed: false,
                 done: None,
                 lost: None,
             },
@@ -1044,6 +1151,11 @@ impl ShellJobs {
                     receipt,
                     elapsed_ms: job.started.elapsed().as_millis() as u64,
                 });
+                if let Some(slot) = &job.stdin_slot {
+                    // The pipe died with the process; a late `input` must fail
+                    // cleanly instead of writing into a stale handle.
+                    *crate::tools::lock_mutex(slot) = None;
+                }
                 state.record_metadata(job.info(key));
             }
             state.0.changed.notify_one();
@@ -1086,8 +1198,8 @@ impl ShellJobs {
     }
 }
 pub(super) fn definition() -> Value {
-    json!({"name":"shell_job", "description":"Control owned shell jobs: list, status, output by byte cursor or tail lines, bounded wait, interrupt (graceful then forced tree stop), cancel (tree stop). TUI IDs survive responses in the same session, not restart. Completion arrives automatically; do not poll.",
-        "input_schema":{"type":"object","properties":{"job_id":{"type":"string"},"action":{"type":"string","enum":["status","cancel","interrupt","output","wait","list"]},"since":{"type":"integer","minimum":0},"offset":{"type":"integer","minimum":0},"tail":{"type":"integer","minimum":1,"maximum":1000},"max_bytes":{"type":"integer","minimum":1,"maximum":65536},"timeout_ms":{"type":"integer","minimum":0,"maximum":10000}},"required":["action"],"additionalProperties":false}})
+    json!({"name":"shell_job", "description":"Control owned shell jobs: list, status, output by byte cursor or tail lines, bounded wait, interrupt (graceful then forced tree stop), cancel (tree stop), input writes text to a piped stdin (eof closes it). TUI IDs survive responses in the same session, not restart. Completion arrives automatically; do not poll.",
+        "input_schema":{"type":"object","properties":{"job_id":{"type":"string"},"action":{"type":"string","enum":["status","cancel","interrupt","output","wait","list","input"]},"since":{"type":"integer","minimum":0},"offset":{"type":"integer","minimum":0},"tail":{"type":"integer","minimum":1,"maximum":1000},"max_bytes":{"type":"integer","minimum":1,"maximum":65536},"timeout_ms":{"type":"integer","minimum":0,"maximum":10000},"text":{"type":"string"},"eof":{"type":"boolean","default":false}},"required":["action"],"additionalProperties":false}})
 }
 
 /// How a managed shell call ended up before its result is published.
@@ -1198,6 +1310,8 @@ impl Runtime {
             tail: Option<usize>,
             max_bytes: Option<usize>,
             timeout_ms: Option<u64>,
+            text: Option<String>,
+            eof: Option<bool>,
         }
         let args: Control = serde_json::from_str(arguments)
             .map_err(|e| format!("Invalid shell_job arguments: {e}"))?;
@@ -1252,7 +1366,34 @@ impl Runtime {
                 }
                 Ok(result)
             }
-            _ => Err("action must be status, cancel, interrupt, output, wait or list".into()),
+            "input" => {
+                let text = args.text.unwrap_or_default();
+                if text.len() > 64 * 1024 {
+                    return Err("shell_job input text is capped at 65536 bytes".into());
+                }
+                // The write blocks while the job does not read its stdin, so
+                // it runs off the executor and gives up after a bounded wait.
+                let jobs = self.shell_jobs.clone();
+                let job_id = id.to_owned();
+                let eof = args.eof.unwrap_or(false);
+                let write = tokio::task::spawn_blocking(move || {
+                    jobs.input(&job_id, text.as_bytes(), eof)
+                });
+                let cancelled = CancellationToken::cancelled_or_pending(self.cancellation.clone());
+                tokio::select! {
+                    written = write => written
+                        .map_err(|error| format!("job stdin write failed: {error}"))?
+                        .map(|line| ToolResult::ok("shell_job", format!("{line}\n{CONTROL_HINT}"))),
+                    () = cancelled => Err("shell_job input cancelled before the job read it".into()),
+                    () = tokio::time::sleep(INPUT_WRITE_LIMIT) => Err(format!(
+                        "job did not read its stdin within {} s; the input may be partially delivered. Check the job with shell_job status",
+                        INPUT_WRITE_LIMIT.as_secs()
+                    )),
+                }
+            }
+            _ => Err(
+                "action must be status, cancel, interrupt, output, wait, list or input".into(),
+            ),
         }
     }
     /// Records the job's current state; a job already evicted has none.
@@ -2068,6 +2209,97 @@ mod tests {
         assert!(jobs.ready().is_empty());
         assert!(!jobs.running());
     }
+    /// A piped job echoes what `input` writes; `eof` closes the pipe and the
+    /// job ends; a write after that fails without echoing its text.
+    #[tokio::test]
+    async fn piped_stdin_echoes_input_and_eof_closes() {
+        let jobs = ShellJobs::default();
+        let _scope = jobs.scope();
+        let tools = ToolRegistry::default();
+        let command = if cfg!(windows) {
+            "$in = [Console]::In.ReadToEnd(); Write-Output $in"
+        } else {
+            "cat"
+        };
+        let args = json!({"command":command,"stdin":true,"timeout_ms":10_000,"yield_ms":0})
+            .to_string();
+        let call = tools.prepare_invocation(
+            crate::OperatingMode::Auto,
+            std::env::temp_dir(),
+            "shell",
+            &args,
+        );
+        assert!(call.error.is_none(), "{:?}", call.error);
+        let id = jobs.start(tools, call, None, invocation()).unwrap();
+        // The write end lands in the slot only after the process spawns.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match jobs.input(&id, b"echoed-input\n", false) {
+                    Ok(_) => break,
+                    Err(error) if error.contains("not ready") => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(jobs
+            .input(&id, b"", true)
+            .unwrap()
+            .contains("eof"));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while jobs.running() {
+                jobs.wait().await;
+            }
+        })
+        .await
+        .unwrap();
+        let output = jobs.output(&id, Some(0), None, 4096).unwrap();
+        assert!(output.text.contains("echoed-input"), "{}", output.text);
+        let error = jobs.input(&id, b"late-secret", false).unwrap_err();
+        assert!(error.contains("already finished"), "{error}");
+        assert!(!error.contains("late-secret"), "{error}");
+    }
+    #[tokio::test]
+    async fn input_requires_a_piped_live_job() {
+        let jobs = ShellJobs::default();
+        let _scope = jobs.scope();
+        let tools = ToolRegistry::default();
+        let call = prepared(&tools, SLEEP_8S, 10_000);
+        let id = jobs.start(tools, call, None, invocation()).unwrap();
+        assert_eq!(
+            jobs.input(&id, b"x", false).unwrap_err(),
+            "job has no piped stdin (launch shell with stdin=true)"
+        );
+        assert!(jobs.input("shell-999", b"x", false).is_err());
+        jobs.cancel(&id).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), jobs.shutdown())
+            .await
+            .unwrap();
+    }
+    #[test]
+    fn take_pending_model_completions_claims_undelivered_done_jobs_once() {
+        let jobs = jobs_with_finished(2);
+        assert!(jobs.may_wake());
+        assert!(jobs.take_pending_model_completions());
+        // A claimed completion never re-arms a second wake.
+        assert!(!jobs.take_pending_model_completions());
+        assert!(!jobs.may_wake());
+        jobs.mark_delivered("shell-1");
+        jobs.mark_delivered("shell-2");
+        assert!(!jobs.take_pending_model_completions());
+        // A finished `!&` job reports to the user; it never wakes the agent.
+        {
+            let mut map = jobs.jobs();
+            let mut user = finished_job();
+            user.origin = "user".into();
+            map.insert(3, user);
+        }
+        assert!(!jobs.take_pending_model_completions());
+        assert!(!jobs.may_wake());
+    }
     #[test]
     fn waits_longer_than_the_maximum_are_served_at_the_maximum() {
         assert_eq!(capped_wait_ms(0), 0);
@@ -2149,7 +2381,9 @@ mod tests {
             command: String::new(),
             origin: "model".into(),
             output: JobOutput::new(256 * 1024, Vec::new(), None),
+            stdin_slot: None,
             notified: false,
+            wake_claimed: false,
             lost: None,
             batch_id: "batch".into(),
             call_id: "call".into(),

@@ -117,22 +117,19 @@ fn wait_for_handles(
     }
 }
 
-/// Unix wait: `poll` on terminal input (fd 0 — the TUI only runs on a TTY)
-/// and the wake pipe together, so lane events interrupt the wait without
-/// waiting for terminal input or a 60 s fallback deadline.
+/// Unix wait: the wake pipe alone. Terminal input never reaches this wait:
+/// [`InputPump`] reads it on its own thread and signals the same pipe, so
+/// lane events, input and resizes all interrupt the wait the same way.
 #[cfg(unix)]
 pub(crate) fn wait_for_runtime_signal(
     wake: &WakeSignal,
     timeout: Option<Duration>,
 ) -> io::Result<WaitOutcome> {
-    use std::os::fd::AsRawFd;
-
-    wait_for_fds(Some(std::io::stdin().as_raw_fd()), wake, timeout)
+    wait_for_fds(None, wake, timeout)
 }
 
-/// Polls `input` (when present) and the wake pipe. Takes the input fd as a
-/// parameter, like `wait_for_handles` on Windows, so a test can wait on the
-/// wake pipe alone without depending on the process's stdin.
+/// Polls `input` (when present) and the wake pipe. The runtime passes no
+/// input fd; the parameter mirrors `wait_for_handles` on Windows.
 #[cfg(unix)]
 fn wait_for_fds(
     input: Option<std::os::fd::RawFd>,
@@ -158,10 +155,16 @@ fn wait_for_fds(
             revents: 0,
         },
     ];
+    let started = std::time::Instant::now();
     loop {
+        // A signal restarts the wait with what is left of the budget, so a
+        // stream of them cannot push a visual deadline away.
+        let spent = i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX);
+        let remaining_ms = timeout_ms.saturating_sub(spent).max(0);
         // SAFETY: `fds` is a valid slice for the duration of the call and
         // `nfds` matches its length.
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+        let ready =
+            unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, remaining_ms) };
         if ready < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -201,6 +204,102 @@ pub(crate) fn wait_for_runtime_signal(
         Ok(WaitOutcome::Input)
     } else {
         Ok(WaitOutcome::Deadline)
+    }
+}
+
+/// Terminal input for the UI loop.
+///
+/// On Unix a dedicated thread owns crossterm's reader. `crossterm::event::read`
+/// blocks until a *public* event exists, and bytes that never become one (a
+/// terminal reply, a partial escape such as Alt+[, a resize that swallowed the
+/// keyboard's readiness edge) would park whoever called it; on the UI thread
+/// that stopped drawing and lane draining until the next keystroke. The
+/// thread also sits in crossterm's own wait, the only place that sees
+/// `SIGWINCH`, so a resize reaches an idle UI at once. Events arrive in the
+/// batches crossterm had ready, which keeps the "more input queued" signal the
+/// paste decoder reads.
+#[cfg(unix)]
+pub(crate) struct InputPump {
+    batches: std::sync::mpsc::Receiver<io::Result<Vec<crossterm::event::Event>>>,
+    ready: std::collections::VecDeque<crossterm::event::Event>,
+}
+
+#[cfg(unix)]
+impl InputPump {
+    pub(crate) fn start(wake: WakeSignal) -> io::Result<Self> {
+        let (sender, batches) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("slim-tui-input".into())
+            .spawn(move || loop {
+                let batch = read_ready_batch();
+                let failed = batch.is_err();
+                if sender.send(batch).is_err() {
+                    break;
+                }
+                wake.notify();
+                if failed {
+                    break;
+                }
+            })?;
+        Ok(Self {
+            batches,
+            ready: std::collections::VecDeque::new(),
+        })
+    }
+
+    /// Whether an event is ready, without blocking.
+    pub(crate) fn pending(&mut self) -> io::Result<bool> {
+        while self.ready.is_empty() {
+            match self.batches.try_recv() {
+                Ok(batch) => self.ready.extend(batch?),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "terminal input reader stopped",
+                    ))
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// The next ready event; `None` when nothing is queued.
+    pub(crate) fn next(&mut self) -> io::Result<Option<crossterm::event::Event>> {
+        if !self.pending()? {
+            return Ok(None);
+        }
+        Ok(self.ready.pop_front())
+    }
+}
+
+/// One blocking read plus everything crossterm already has parsed.
+#[cfg(unix)]
+fn read_ready_batch() -> io::Result<Vec<crossterm::event::Event>> {
+    let mut batch = vec![crossterm::event::read()?];
+    while batch.len() < 256 && crossterm::event::poll(Duration::ZERO)? {
+        batch.push(crossterm::event::read()?);
+    }
+    Ok(batch)
+}
+
+/// Off Unix the console wait already reports input readiness, so the loop
+/// reads crossterm directly.
+#[cfg(not(unix))]
+pub(crate) struct InputPump;
+
+#[cfg(not(unix))]
+impl InputPump {
+    pub(crate) fn start(_wake: WakeSignal) -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    pub(crate) fn pending(&mut self) -> io::Result<bool> {
+        crossterm::event::poll(Duration::ZERO)
+    }
+
+    pub(crate) fn next(&mut self) -> io::Result<Option<crossterm::event::Event>> {
+        crossterm::event::read().map(Some)
     }
 }
 

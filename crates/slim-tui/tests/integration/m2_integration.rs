@@ -517,7 +517,7 @@ fn activity_queue_todo_and_composer_are_projected_into_one_frame() {
     assert!(lines.iter().any(|line| line == "> second prompt"));
     assert!(lines
         .iter()
-        .any(|line| line == "TODO 1/2 · parada · second prompt"));
+        .any(|line| line == "TODO second prompt · 1/2 · parada"));
     assert!(lines
         .iter()
         .any(|line| line == "composer: [Pasted Content 0 10 chars]"));

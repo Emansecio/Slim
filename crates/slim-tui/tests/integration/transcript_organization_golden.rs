@@ -1,9 +1,8 @@
 //! How the transcript is organized: the work of a finished turn folded under
 //! one row, what small groups say, how an open group is laid out, a failed
-//! run's reason, code against quotes, the prompt's marker, and the three
-//! style-only motions (a settling tool row, a running command's last line, the
-//! glow of an answer being written). DESIGN-SLIM-TUI §1.2, revision of
-//! 05/10/2026.
+//! run's reason, code against quotes, the prompt's marker, and the two
+//! style-only motions (a settling tool row, a running command's last line);
+//! an answer being written is not lit. DESIGN-SLIM-TUI §1.2.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
@@ -302,13 +301,13 @@ fn a_finished_turn_folds_its_work_into_one_row_under_the_header() {
     // One row says what the work was; the failure keeps a row of its own.
     let header = rendered.row("● Slim");
     assert_eq!(
-        rendered.rows[header + 2].trim_end(),
-        "▏ ▸ Trabalhou · 3 leituras, 1 busca, 2 edições, 2 comandos",
+        rendered.rows[header + 1].trim_end(),
+        "▏ ▸ Trabalhou 12s · 3 leituras, 1 busca, 2 edições, 2 comandos",
         "{}",
         rendered.text()
     );
     assert!(
-        rendered.rows[header + 3].starts_with("▏   ✕ $ cargo test parser · exit 101"),
+        rendered.rows[header + 2].starts_with("▏   ✕ $ cargo test parser · exit 101"),
         "{}",
         rendered.text()
     );
@@ -362,9 +361,9 @@ fn enter_on_the_row_restores_the_unfolded_presentation_and_folds_again() {
     // The open row points down and keeps what it said; below it the transcript
     // reads as it did before the fold: the same blocks, the same rows.
     assert!(
-        open.rows[open.row("● Slim") + 2]
+        open.rows[open.row("● Slim") + 1]
             .trim_end()
-            .starts_with("> ▾ Trabalhou · 3 leituras"),
+            .starts_with("> ▾ Trabalhou 12s · 3 leituras"),
         "{}",
         open.text()
     );
@@ -378,11 +377,11 @@ fn enter_on_the_row_restores_the_unfolded_presentation_and_folds_again() {
     let reference = render(&unfolded, 80, 70);
     let expected = reference.between("● Slim", "✓ 2 arquivos");
     let actual = open.between("▾ Trabalhou", "✓ 2 arquivos");
-    // Both ranges start below the header; the reference still carries the rule
-    // that closes it, which the open row replaces.
+    // Both ranges start below the row they are measured from: the header in
+    // the reference, the open work row here.
     assert_eq!(
         actual,
-        expected[1..],
+        expected,
         "open:\n{}\nreference:\n{}",
         open.text(),
         reference.text()
@@ -650,7 +649,7 @@ fn search_scroll_anchors_selection_and_details_keep_working_on_folded_work() {
         selection,
         ratatui::layout::Rect::new(2, 0, 78, 40),
     );
-    assert!(copied.contains("Trabalhou · 3 leituras"), "{copied:?}");
+    assert!(copied.contains("Trabalhou 12s · 3 leituras"), "{copied:?}");
 
     // Details still list what the folded work changed.
     let mut details = turn(true);
@@ -766,7 +765,7 @@ fn small_groups_name_their_calls_and_larger_ones_count() {
     assert!(text.contains("✓ 2 leituras, 1 comando · 3.6s"), "{text}");
     // The row is still one row.
     let rows = HeightIndex::build(two.blocks(), 100, &mut WrapCache::default()).total_rows;
-    assert_eq!(rows, 6, "prompt (3 rows), the agent header and the group");
+    assert_eq!(rows, 4, "prompt (2 rows), the agent header and the group");
 }
 
 // ---- 3. an open group ----------------------------------------------------
@@ -856,7 +855,7 @@ fn an_open_group_points_down_and_steps_its_members_in() {
         );
         // The measured height is what is drawn, from the prompt to the last
         // member.
-        let drawn = edit - open.row("● Você") + 1;
+        let drawn = edit - open.row("● vai") + 1;
         let measured = HeightIndex::build(state.blocks(), width, &mut WrapCache::default());
         assert_eq!(
             drawn as u64,
@@ -904,7 +903,7 @@ fn an_open_group_of_identical_failures_steps_its_members_in_too() {
     }
     let measured = HeightIndex::build(state.blocks(), 80, &mut WrapCache::default());
     assert_eq!(
-        (header + 3 - open.row("● Você") + 1) as u64,
+        (header + 3 - open.row("● vai") + 1) as u64,
         measured.total_rows
     );
 }
@@ -931,7 +930,8 @@ fn a_failed_run_shows_its_reason_and_the_way_on_under_the_partial_answer() {
     let partial = rendered.row("Rodei a suíte e três testes");
     let reason = rendered.row("provedor indisponível: http 503");
     assert!(header < partial && partial < reason, "{text}");
-    assert!(rendered.rows[reason].starts_with("  ✕ "), "{text}");
+    // The reason sits on the turn's rail, like every other row of it.
+    assert!(rendered.rows[reason].starts_with("▏ ✕ "), "{text}");
     assert!(
         rendered.rows[reason + 1].contains("Envie uma nova mensagem"),
         "{text}"
@@ -984,7 +984,7 @@ fn fenced_code_names_its_language_and_quotes_keep_a_rail_of_their_own() {
     // The measured height is what is drawn, tag row included.
     let measured = HeightIndex::build(state.blocks(), 60, &mut WrapCache::default()).total_rows;
     assert_eq!(
-        (quote - rendered.row("● Você") + 1) as u64,
+        (quote - rendered.row("● mostre") + 1) as u64,
         measured,
         "{}",
         rendered.text()
@@ -1056,10 +1056,10 @@ fn the_prompt_is_found_by_its_band_or_by_a_marker_of_its_own() {
     let state = turn(true);
     // The rail is the same glyph everywhere; only the marks change with depth.
     for (depth, rail, user, agent) in [
-        (ColorDepth::TrueColor, "▏", "● Você", "● Slim"),
-        (ColorDepth::Ansi256, "▏", "● Você", "● Slim"),
-        (ColorDepth::Ansi16, "▏", "> Você", "● Slim"),
-        (ColorDepth::None, "|", "> Você", "* Slim"),
+        (ColorDepth::TrueColor, "▏", "● O parser", "● Slim"),
+        (ColorDepth::Ansi256, "▏", "● O parser", "● Slim"),
+        (ColorDepth::Ansi16, "▏", "> O parser", "● Slim"),
+        (ColorDepth::None, "|", "> O parser", "* Slim"),
     ] {
         let rendered = render_with(&state, 80, 40, caps(depth, true), &mut WrapCache::default());
         assert!(
@@ -1076,13 +1076,12 @@ fn the_prompt_is_found_by_its_band_or_by_a_marker_of_its_own() {
             assert_ne!(user.chars().next(), agent.chars().next(), "{depth:?}");
         }
     }
-    // Where shades show, the header and every row of the prompt sit on the
-    // band, edge to edge, and nothing else in the turn does.
+    // Where shades show, the prompt and the row of air that closes it sit on
+    // the band, edge to edge, and nothing else in the turn does.
     let rendered = render(&state, 80, 40);
     let band = Color::Rgb(0x14, 0x14, 0x14);
-    let header = rendered.row("● Você");
-    let body = rendered.row("O parser quebra");
-    for row in [header, body] {
+    let prompt = rendered.row("● O parser quebra");
+    for row in [prompt, prompt + 1] {
         assert!(
             rendered.background[row][..78].iter().all(|bg| *bg == band),
             "row {row} is not on the band\n{}",
@@ -1240,21 +1239,36 @@ fn running(progress: &[&str], elapsed_ms: u64) -> AppState {
 
 #[test]
 fn a_running_command_shows_its_last_output_line_after_the_clock() {
-    // Nothing yet: the row is what it was.
+    // Nothing yet: the row is the command and its clock.
     let silent = render(
         &running(&["no output yet · out 0 B · err 0 B"], 5_300),
         100,
         20,
     );
-    let row = silent.row("○ $ cargo clippy");
+    // The only live call carries the run's spinner in its marker cell.
+    let row = silent.row("$ cargo clippy");
     assert_eq!(
         silent.rows[row].trim_end(),
-        "▏ ○ $ cargo clippy --all-targets · limit 600s · out 0 B · err 0 B · 5s"
+        "▏ ⠋ $ cargo clippy --all-targets · 5s"
     );
+    // Five seconds without a word: a command that is executing is busy, not
+    // stalled, so its mark keeps the run's spinner instead of the 1 Hz step.
     let first = render(&running(&[], 5_300), 100, 20);
     assert_eq!(
-        first.rows[first.row("○ $ cargo clippy")].trim_end(),
-        "▏ ○ $ cargo clippy --all-targets · limit 600s · 5s"
+        first.rows[first.row("$ cargo clippy")].trim_end(),
+        "▏ ⠋ $ cargo clippy --all-targets · 5s"
+    );
+    // Reduced motion keeps the still mark.
+    let still = render_with(
+        &running(&[], 5_300),
+        100,
+        20,
+        caps(ColorDepth::TrueColor, true),
+        &mut WrapCache::default(),
+    );
+    assert_eq!(
+        still.rows[still.row("$ cargo clippy")].trim_end(),
+        "▏ ○ $ cargo clippy --all-targets · 5s"
     );
 
     // The newest line follows the clock, a step quieter than it.
@@ -1266,7 +1280,7 @@ fn a_running_command_shows_its_last_output_line_after_the_clock() {
         120,
         20,
     );
-    let text = &live.rows[live.row("○ $ cargo clippy")];
+    let text = &live.rows[live.row("$ cargo clippy")];
     assert!(
         text.trim_end()
             .ends_with("· 5s · Checking slim-tui v0.1.0 (crates/slim-tui)"),
@@ -1321,9 +1335,7 @@ fn the_last_line_is_cut_at_a_word_and_gives_way_to_the_row() {
     let long = "warning: unused variable `bytes_discovered_in_the_workspace` in src/discover.rs";
     let preview = format!("{long} · out 0 B · err 212 B");
     let wide = render(&running(&[preview.as_str()], 5_300), 100, 20);
-    let row = wide.rows[wide.row("○ $ cargo clippy")]
-        .trim_end()
-        .to_owned();
+    let row = wide.rows[wide.row("$ cargo clippy")].trim_end().to_owned();
     assert!(row.ends_with('…'), "{row}");
     assert!(
         unicode_width::UnicodeWidthStr::width(row.as_str()) <= 100,
@@ -1336,8 +1348,12 @@ fn the_last_line_is_cut_at_a_word_and_gives_way_to_the_row() {
     );
     // Narrow: the call itself keeps the row and the line is dropped, never
     // wrapped onto a second one.
-    let narrow = render(&running(&[preview.as_str()], 5_300), 52, 20);
-    let rows: Vec<_> = narrow.rows.iter().filter(|row| row.contains('○')).collect();
+    let narrow = render(&running(&[preview.as_str()], 5_300), 44, 20);
+    let rows: Vec<_> = narrow
+        .rows
+        .iter()
+        .filter(|row| row.contains("$ cargo") || row.contains("warning"))
+        .collect();
     assert_eq!(rows.len(), 1, "{}", narrow.text());
     assert!(!rows[0].contains("warning"), "{}", rows[0]);
     // Other tools keep their progress as it was.
@@ -1365,7 +1381,7 @@ fn the_last_line_is_cut_at_a_word_and_gives_way_to_the_row() {
         .contains("Waiting for file lock"));
 }
 
-// ---- 9. the glow of an answer being written -------------------------------
+// ---- 9. an answer being written is not lit ---------------------------------
 
 fn arriving(later: u64) -> AppState {
     let mut state = connected();
@@ -1390,22 +1406,32 @@ fn arriving(later: u64) -> AppState {
 }
 
 #[test]
-fn the_newest_words_of_a_streaming_answer_glow_and_settle() {
-    let peak = Color::Rgb(138, 209, 160);
+fn the_newest_words_of_a_streaming_answer_arrive_in_the_text_tone() {
     let caret = Color::Rgb(0x72, 0xCC, 0x91);
     let at = |later: u64| render(&arriving(later), 60, 20);
     let fresh = at(0);
-    // The last row of the answer is the one lit, strongest at its edge.
     let last = fresh.row("sem motivo");
     let (_, word) = fresh.find("motivo.").expect("last word");
     let edge = word + 6;
-    assert_eq!(
-        fresh.foreground[last][edge], peak,
-        "the final cell is at the peak"
-    );
-    let deeper = fresh.foreground[last][word];
-    assert!(deeper != peak && deeper != TEXT, "still lit {deeper:?}");
-    // The caret behind it keeps its own color, and nothing moves.
+    // Nothing is lit as it arrives: the caret is the only sign of writing, so
+    // the row reads the same the frame it is written and half a second later.
+    for later in [0u64, 166, 498] {
+        let rendered = at(later);
+        for (x, character) in rendered.rows[last]
+            .chars()
+            .enumerate()
+            .skip(4)
+            .take(edge - 3)
+        {
+            if !character.is_whitespace() {
+                assert_eq!(
+                    rendered.foreground[last][x], TEXT,
+                    "{later} ms, x={x} {character:?}"
+                );
+            }
+        }
+    }
+    // The caret behind the last word keeps its own color, and nothing moves.
     assert_eq!(fresh.rows[last].chars().nth(edge + 1), Some('▏'));
     assert_eq!(fresh.foreground[last][edge + 1], caret);
     let steady = |rendered: &Rendered| {
@@ -1415,30 +1441,7 @@ fn the_newest_words_of_a_streaming_answer_glow_and_settle() {
             .collect::<Vec<_>>()
     };
     assert_eq!(steady(&fresh), steady(&at(166)));
-    // Lines already written are not touched.
-    assert_ne!(fresh.row("O cache guarda"), last);
-    assert_eq!(fresh.fg("O cache"), TEXT);
-    // It fades: a little later it is dimmer, and after six motion frames
-    // (498 ms) it is gone.
-    let later = at(166).foreground[last][edge];
-    assert!(later != peak && later != TEXT, "{later:?}");
-    assert!(brightness(later) != brightness(peak));
-    let settled = at(498);
-    for (x, character) in settled.rows[last].chars().enumerate().skip(4) {
-        if !character.is_whitespace() {
-            assert_eq!(settled.foreground[last][x], TEXT, "x={x} {character:?}");
-        }
-    }
-    // Reduced motion shows no glow at all.
-    let reduced = render_with(
-        &arriving(0),
-        60,
-        20,
-        caps(ColorDepth::TrueColor, true),
-        &mut WrapCache::default(),
-    );
-    assert_eq!(reduced.foreground[last][edge], TEXT);
-    // Where shades are scarce the newest words take weight instead.
+    // Where shades are scarce the newest words take no weight either.
     let sixteen = render_with(
         &arriving(0),
         60,
@@ -1446,12 +1449,11 @@ fn the_newest_words_of_a_streaming_answer_glow_and_settle() {
         caps(ColorDepth::Ansi16, false),
         &mut WrapCache::default(),
     );
-    assert!(sixteen.modifier("motivo").contains(Modifier::BOLD));
-    assert!(!sixteen.modifier("O cache").contains(Modifier::BOLD));
+    assert!(!sixteen.modifier("motivo").contains(Modifier::BOLD));
 }
 
 #[test]
-fn a_motion_frame_of_the_answer_glow_does_not_invalidate_the_caches() {
+fn a_motion_frame_of_a_streaming_answer_does_not_invalidate_the_caches() {
     let mut cache = WrapCache::default();
     let mut state = arriving(0);
     render_with(&state, 60, 20, truecolor(), &mut cache);
@@ -1575,8 +1577,7 @@ fn approvals_notices_and_queued_prompts_inside_the_turn_are_folded_with_the_rest
         let text = rendered.text();
         // One row for the whole turn, counted over the whole turn.
         assert!(
-            text.contains("▸ Trabalhou 1s · 2 leituras, 1 edição, 1 comando")
-                || text.contains("▸ Trabalhou · 2 leituras, 1 edição, 1 comando"),
+            text.contains("▸ Trabalhou 5s · 2 leituras, 1 edição, 1 comando"),
             "{text}"
         );
         for hidden in [
@@ -1638,13 +1639,20 @@ fn a_prompt_removed_after_the_fold_leaves_the_stretch_ending_at_the_answer() {
 }
 
 #[test]
-fn a_turn_with_a_receipt_leaves_the_duration_to_it_and_one_without_keeps_it() {
-    // The reference turn changed files and ran commands: the receipt says 12s.
+fn the_work_row_keeps_the_duration_and_the_receipt_only_the_result() {
+    // The reference turn changed files and ran commands: the work row says
+    // how it went and how long it took, the receipt what came out of it.
     let with = render(&turn(true), 80, 40).text();
-    assert!(with.contains("▸ Trabalhou · 3 leituras"), "{with}");
-    assert!(with.contains("2 comandos, 1 falhou · 12s"), "{with}");
-    assert!(!with.contains("Trabalhou 12s"), "{with}");
-    // A turn that only read has no receipt, so the row keeps its time.
+    assert!(with.contains("▸ Trabalhou 12s · 3 leituras"), "{with}");
+    assert!(
+        with.contains("✓ 2 arquivos · +2 -2 ou mais   Ctrl+D diff"),
+        "{with}"
+    );
+    assert!(
+        !with.contains("comandos, 1 falhou") && !with.contains("· 12s"),
+        "{with}"
+    );
+    // A turn that only read has no receipt; the row reads the same way.
     let mut state = connected();
     state.apply_event(UiEvent::UserMessageAdded {
         text: "leia".into(),
@@ -1917,8 +1925,8 @@ fn the_agent_label_keeps_the_identity_rail_whichever_block_opens_the_turn() {
     let label = agent_label(&pending);
     assert_eq!(pending.foreground[label][0], IDENTITY, "{}", pending.text());
     assert!(
-        pending.rows[label + 1].starts_with('─'),
-        "the rule under a pending label carries no rail\n{}",
+        pending.rows[label].trim_end().ends_with("───"),
+        "the rule shares the pending label's row\n{}",
         pending.text()
     );
 

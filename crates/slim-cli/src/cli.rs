@@ -54,6 +54,8 @@ Output:
 
 Other:
   --trust-project    Trust this project's slim.toml (MCP servers, LSP overrides) for this run
+  --mcp-config <file>
+                     Add the [mcp.servers] of this TOML file for this run (trusted, never saved)
   -h, --help         Show this help
   -V, --version      Show the version
 
@@ -92,6 +94,8 @@ pub(crate) struct ParsedArgs {
     pub fake: bool,
     pub verbose: bool,
     pub trust_project: bool,
+    /// `--mcp-config`: extra `[mcp]` layer for this run only.
+    pub mcp_config: Option<String>,
 }
 
 pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
@@ -117,6 +121,7 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
         fake: false,
         verbose: false,
         trust_project: false,
+        mcp_config: None,
     };
     let mut index = 0;
     // Parsed flags are the only evidence of a selected mode: values such as
@@ -139,7 +144,8 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
             }
             "--jsonl" => parsed.format = OutputFormat::Jsonl,
             "--prompt" | "--provider" | "--model" | "--endpoint" | "--session" | "--resume"
-            | "--recover" | "--image" | "--effort" | "--experiment-id" | "--task-id" => {
+            | "--recover" | "--image" | "--effort" | "--experiment-id" | "--task-id"
+            | "--mcp-config" => {
                 let option = args[index].clone();
                 index += 1;
                 let value = args.get(index).cloned().ok_or_else(|| {
@@ -157,6 +163,7 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
                     "--image" => parsed.image_paths.push(value),
                     "--experiment-id" => parsed.experiment_id = Some(value),
                     "--task-id" => parsed.task_id = Some(value),
+                    "--mcp-config" => parsed.mcp_config = Some(value),
                     _ => unreachable!(),
                 }
             }
@@ -228,6 +235,7 @@ where
         fake,
         verbose,
         trust_project,
+        mcp_config,
     } = match parse_cli_args(&args) {
         Ok(parsed) => parsed,
         Err(output) => return output,
@@ -455,6 +463,7 @@ where
         }
         options.codex_fast = codex_fast;
         options.trust_project = trust_project;
+        options.host_mcp_config = mcp_config.clone().map(std::path::PathBuf::from);
         let provider_result = match resume_preflight {
             Some(preflight) => {
                 crate::headless::run_provider_headless_with_resume_preflight_and_options(
@@ -633,7 +642,7 @@ fn finish_oauth_output(output: CliOutput, context: Option<HeadlessOAuthContext>)
     }
 }
 
-const UNSUPPORTED_PROVIDER_MESSAGE: &str = "unsupported provider; use openai-compatible, openai-codex, anthropic, opencode-go, opencode-zen, clinepass, command-code, xai, or open-design";
+const UNSUPPORTED_PROVIDER_MESSAGE: &str = "unsupported provider; use openai-compatible, openai-codex, anthropic, opencode-go, opencode-zen, clinepass, command-code, xai, open-design, or devin";
 
 /// Maps a provider name (flag, `SLIM_PROVIDER`, stored key) to its kind; the
 /// error is the user-facing refusal shared by the headless and TUI entries.
@@ -648,6 +657,7 @@ pub(crate) fn parse_provider_kind(name: &str) -> Result<ProviderKind, &'static s
         "command-code" | "commandcode" | "cmd" => Ok(ProviderKind::CommandCode),
         "xai" | "grok" => Ok(ProviderKind::Xai),
         "open-design" | "opendesign" | "od" => Ok(ProviderKind::OpenDesign),
+        "devin" | "devin-agent" | "swe" => Ok(ProviderKind::Devin),
         _ => Err(UNSUPPORTED_PROVIDER_MESSAGE),
     }
 }
@@ -673,6 +683,7 @@ pub(crate) fn default_provider_endpoint(kind: ProviderKind) -> &'static str {
         ProviderKind::CommandCode => slim_core::provider::COMMANDCODE_BASE_URL,
         ProviderKind::Xai => slim_core::provider::XAI_BASE_URL,
         ProviderKind::OpenDesign => slim_core::provider::OPEN_DESIGN_BASE_URL,
+        ProviderKind::Devin => slim_core::provider::DEVIN_DEFAULT_BASE_URL,
     }
 }
 
@@ -687,6 +698,7 @@ pub(crate) fn default_provider_model(kind: ProviderKind) -> &'static str {
         ProviderKind::CommandCode => slim_core::provider::COMMANDCODE_DEFAULT_MODEL,
         ProviderKind::Xai => slim_core::provider::XAI_DEFAULT_MODEL,
         ProviderKind::OpenDesign => slim_core::provider::OPEN_DESIGN_DEFAULT_MODEL,
+        ProviderKind::Devin => slim_core::provider::DEVIN_DEFAULT_MODEL,
     }
 }
 
@@ -942,6 +954,19 @@ fn recovery_output(format: OutputFormat, abandoned: bool) -> CliOutput {
 #[cfg(test)]
 mod tests {
     use super::parse_cli_args;
+
+    #[test]
+    fn mcp_config_takes_a_value_and_defaults_to_none() {
+        let args = ["--mcp-config", "/tmp/host mcp.toml", "--prompt", "--mcp-config"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let parsed = parse_cli_args(&args).expect("parse");
+        assert_eq!(parsed.mcp_config.as_deref(), Some("/tmp/host mcp.toml"));
+        assert_eq!(parsed.prompt.as_deref(), Some("--mcp-config"), "a prompt value is never a flag");
+        assert!(parse_cli_args(&["--mcp-config".to_owned()]).is_err(), "the path is required");
+        assert_eq!(parse_cli_args(&[]).expect("empty").mcp_config, None);
+    }
 
     #[test]
     fn benchmark_labels_are_parsed_as_explicit_values() {

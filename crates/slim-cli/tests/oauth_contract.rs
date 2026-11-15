@@ -20,7 +20,7 @@ use tokio::sync::watch;
 fn production_anthropic_endpoint_matches_direct_inference_oauth_contract() {
     assert_eq!(
         OAuthEndpoints::default().anthropic_token,
-        "https://api.anthropic.com/v1/oauth/token"
+        "https://platform.claude.com/v1/oauth/token"
     );
 }
 

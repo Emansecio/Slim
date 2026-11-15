@@ -128,7 +128,7 @@ pub(crate) fn write_file_with_receipt(
             return Err(failure);
         }
         if preserve_crlf {
-            content = Cow::Owned(content.replace("\r\n", "\n").replace('\n', "\r\n"));
+            content = Cow::Owned(with_crlf_line_endings(&content));
         }
         if observed.content.starts_with(UTF8_BOM) && !content.starts_with(UTF8_BOM) {
             content = Cow::Owned(format!("{UTF8_BOM}{content}"));
@@ -184,13 +184,54 @@ pub(super) fn lock_mutations<'a>(
     slot: &'a Arc<Mutex<()>>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<MutexGuard<'a, ()>, ToolError> {
+    let wait_started = std::time::Instant::now();
     loop {
         check_cancellation(cancellation)?;
         match slot.try_lock() {
             Ok(guard) => return Ok(guard),
             Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
-            Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
+            Err(TryLockError::WouldBlock) => {
+                if wait_started.elapsed() >= LOCK_WAIT_LIMIT {
+                    return Err(ToolError::Io {
+                        message: format!(
+                            "another mutation of the same file held its lock for over {} s; nothing was changed, retry later",
+                            LOCK_WAIT_LIMIT.as_secs()
+                        ),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
+    }
+}
+
+/// `text` with every line ending as CRLF, in one pass: existing CRLF pairs
+/// are kept and a lone LF gains its CR.
+pub(super) fn with_crlf_line_endings(text: &str) -> String {
+    let mut output = String::with_capacity(text.len() + text.len() / 32);
+    let mut previous = '\0';
+    for character in text.chars() {
+        if character == '\n' && previous != '\r' {
+            output.push('\r');
+        }
+        output.push(character);
+        previous = character;
+    }
+    output
+}
+
+/// How long a mutation waits for a lock another writer holds. A stuck holder
+/// must end the wait with an error instead of holding the tool until the
+/// user cancels the run.
+const LOCK_WAIT_LIMIT: Duration = Duration::from_secs(60);
+
+fn lock_wait_expired(path: &Path) -> ToolError {
+    ToolError::Io {
+        message: format!(
+            "{} stayed locked by another process for over {} s; nothing was changed, retry later",
+            path.display(),
+            LOCK_WAIT_LIMIT.as_secs()
+        ),
     }
 }
 
@@ -392,6 +433,7 @@ pub(super) fn read_existing_file_observed(
     super::read::ensure_not_special_file(path)?;
     let mut file = open_precondition_file(path)?;
     let mut reported_wait = false;
+    let wait_started = std::time::Instant::now();
     loop {
         check_cancellation(cancellation)?;
         match file.try_lock() {
@@ -400,6 +442,9 @@ pub(super) fn read_existing_file_observed(
                 if !reported_wait {
                     on_lock_wait();
                     reported_wait = true;
+                }
+                if wait_started.elapsed() >= LOCK_WAIT_LIMIT {
+                    return Err(lock_wait_expired(path).into());
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -423,7 +468,22 @@ pub(super) fn read_existing_file_observed(
         ));
     }
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    if let Err(error) = file.read_to_end(&mut bytes) {
+    // The size was checked above, but the file can grow before it is read
+    // (a job appending to it): the read itself stops one byte past the limit.
+    let limit = MAX_MUTATING_FILE_BYTES as u64 + 1;
+    let read = (&mut file).take(limit).read_to_end(&mut bytes);
+    if read.is_ok() && bytes.len() > MAX_MUTATING_FILE_BYTES {
+        return Err(ToolExecutionError::observed(
+            ToolError::InvalidInput {
+                message: format!(
+                    "file exceeds the {MAX_MUTATING_FILE_BYTES}-byte mutation safety limit"
+                ),
+            },
+            vec![dependency],
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        ));
+    }
+    if let Err(error) = read {
         return Err(ToolExecutionError::observed(
             error.into(),
             vec![dependency],
@@ -586,9 +646,51 @@ fn cleanup_displaced_if_unchanged(backup: &Path, before: &str) -> (Option<String
 /// Publishes `temp` at a `target` that did not exist when the write began.
 /// The hard link fails, rather than overwrites, if a third writer created it.
 fn publish_new(temp: &Path, target: &Path) -> io::Result<()> {
-    fs::hard_link(temp, target)?;
-    let _ = fs::remove_file(temp);
-    Ok(())
+    link_or_rename_into_gap(temp, target)
+}
+
+/// Gives `temp` the name `target`, which must be free. A hard link refuses an
+/// occupied name atomically. Filesystems without hard links (exFAT, FAT32,
+/// some network and FUSE mounts) get a rename guarded by a check that the
+/// name is still free: not atomic against a third writer, but the only way
+/// to publish there at all.
+pub(crate) fn link_or_rename_into_gap(temp: &Path, target: &Path) -> io::Result<()> {
+    match fs::hard_link(temp, target) {
+        Ok(()) => {
+            let _ = fs::remove_file(temp);
+            Ok(())
+        }
+        Err(error) if hard_links_unsupported(&error) => {
+            if fs::symlink_metadata(target).is_ok() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "publication target appeared while it was being written",
+                ));
+            }
+            fs::rename(temp, target)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn hard_links_unsupported(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::ENOTSUP
+                || code == libc::EOPNOTSUPP
+                || code == libc::ENOSYS
+                || code == libc::EPERM
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 /// Publishes `temp` over the existing `target`, leaving the displaced object
@@ -646,9 +748,7 @@ fn publish_replacing(temp: &Path, target: &Path, backup: &Path) -> io::Result<()
         // Preserve the object actually displaced. Publishing the new path
         // must not overwrite a third writer that fills the resulting gap.
         fs::rename(target, backup)?;
-        fs::hard_link(temp, target)?;
-        let _ = fs::remove_file(temp);
-        Ok(())
+        link_or_rename_into_gap(temp, target)
     }
 }
 
@@ -690,6 +790,17 @@ fn temp_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod lock_tests {
     use super::*;
+
+    #[test]
+    fn crlf_normalization_in_one_pass_matches_the_two_replacements() {
+        for text in ["", "a", "a\nb", "a\r\nb", "\n", "\r\n", "a\r\r\nb\n\n", "\r", "a\rb\n", "é\n\r\n"] {
+            assert_eq!(
+                with_crlf_line_endings(text),
+                text.replace("\r\n", "\n").replace('\n', "\r\n"),
+                "{text:?}"
+            );
+        }
+    }
 
     #[test]
     fn json_diagnostics_are_bounded_and_do_not_reinterpret_other_formats() {

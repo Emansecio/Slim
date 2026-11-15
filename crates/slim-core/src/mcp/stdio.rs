@@ -69,10 +69,10 @@ impl JsonLineFramer {
                 Ok(message) => lines.push(FramedLine::Message(message)),
                 Err(_) => {
                     let noise = String::from_utf8_lossy(line);
-                    let noise = if noise.chars().count() > 160 {
-                        format!("{}…", noise.chars().take(160).collect::<String>())
-                    } else {
-                        noise.into_owned()
+                    // One bounded walk: the line may be megabytes of noise.
+                    let noise = match noise.char_indices().nth(160) {
+                        Some((cut, _)) => format!("{}…", &noise[..cut]),
+                        None => noise.into_owned(),
                     };
                     lines.push(FramedLine::Noise(noise));
                 }
@@ -501,7 +501,15 @@ impl StdioConnection {
         resolver: &ExecutableResolver,
         context: Arc<ClientContext>,
     ) -> Result<Arc<Self>, McpError> {
-        let program = resolver.resolve(command)?.ok_or_else(|| {
+        // `./server` and `bin/server` are relative to the server's working
+        // directory, where the child runs, not to wherever Slim was started.
+        let relative = Path::new(command);
+        let lookup = if relative.is_relative() && relative.components().count() > 1 {
+            cwd.join(relative)
+        } else {
+            relative.to_path_buf()
+        };
+        let program = resolver.resolve(&lookup)?.ok_or_else(|| {
             McpError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("executable not found: {command}"),
@@ -950,7 +958,13 @@ fn spawn_reader(
                 Ok(0) | Err(_) => break,
                 Ok(read) => read,
             };
-            if framer.pending_bytes() + read > MAX_MESSAGE_BYTES {
+            // Only the bytes that extend the pending line count against the
+            // cap; what follows its newline starts another message.
+            let extends = chunk[..read]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap_or(read);
+            if framer.pending_bytes() + extends > MAX_MESSAGE_BYTES {
                 break;
             }
             for line in framer.push(&chunk[..read]) {

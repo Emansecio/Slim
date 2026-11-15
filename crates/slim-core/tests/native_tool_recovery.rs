@@ -1094,11 +1094,20 @@ fn shared_native_contracts_reach_chat_messages_and_responses() {
                     "optional fields must remain optional on Responses"
                 );
             }
+            // The Messages wire and Claude reject top-level unions; native
+            // admission still enforces them.
+            let mut expected = original["input_schema"].clone();
+            if wire.get("input_schema").is_some() || adapter.model().contains("claude") {
+                slim_core::provider::strip_top_level_combinators(&mut expected);
+                assert!(expected.get("oneOf").is_none() && expected.get("anyOf").is_none());
+            }
             assert_eq!(
                 wire.get("parameters")
                     .or_else(|| wire.get("input_schema"))
                     .unwrap(),
-                &original["input_schema"]
+                &expected,
+                "{} {name}",
+                adapter.model()
             );
         }
         let write = tools.iter().find(|tool| tool["name"] == "write").unwrap();
@@ -1761,6 +1770,12 @@ fn read_failures_on_unreadable_files_say_what_to_do_instead() {
     let mut big_endian = vec![0xFE, 0xFF];
     big_endian.extend("x".encode_utf16().flat_map(u16::to_be_bytes));
     fs::write(root.0.join("be.txt"), &big_endian).unwrap();
+    // UTF-16 without a byte-order mark is valid UTF-8 full of NULs.
+    let bare: Vec<u8> = "plain\n".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    fs::write(root.0.join("bare.txt"), &bare).unwrap();
+    let result = root.call("read", json!({"path": "bare.txt"}));
+    assert!(!result.success);
+    assert!(result.output.contains("has NUL bytes at line 1"), "{}", result.output);
 
     for (name, args) in [
         ("read", json!({"path": "wide.txt"})),

@@ -327,3 +327,98 @@ fn a_restored_session_closes_an_open_picker() {
     });
     assert!(state.session_picker.is_none());
 }
+
+fn running_job() -> slim_core::runtime::ShellJobInfo {
+    slim_core::runtime::ShellJobInfo {
+        id: "shell-1".into(),
+        command: "sleep 60".into(),
+        origin: "user".into(),
+        state: "running".into(),
+        elapsed_ms: 0,
+        exit_code: None,
+        output_bytes: 0,
+    }
+}
+
+#[test]
+fn new_asks_the_host_for_an_empty_session_and_leaves_the_composer() {
+    let mut state = AppState::new();
+    let effects = submit(&mut state, "/new");
+    assert!(effects.contains(&Effect::Send(UiCommand::NewSession)));
+    assert!(state.composer.is_empty(), "the command leaves the composer");
+    assert!(state.job_exit_confirm.is_none());
+}
+
+#[test]
+fn new_waits_for_an_idle_session_and_never_queues_as_a_prompt() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::UserMessageAdded {
+        text: "trabalho".into(),
+    });
+    state.apply_event(UiEvent::run_started(1));
+    let effects = submit(&mut state, "/new");
+    assert!(!effects.contains(&Effect::Send(UiCommand::NewSession)));
+    assert!(
+        state.queued_prompts.is_empty(),
+        "/new must not reach the model as text"
+    );
+    assert!(state
+        .notifications
+        .iter()
+        .any(|notice| notice.message.contains("execução inativa")));
+}
+
+#[test]
+fn new_confirms_before_ending_running_jobs() {
+    let mut state = AppState::new();
+    state.jobs.push(running_job());
+    let effects = submit(&mut state, "/new");
+    assert!(!effects.contains(&Effect::Send(UiCommand::NewSession)));
+    assert_eq!(state.job_exit_confirm, Some(UiCommand::NewSession));
+    // Esc keeps the session; Enter goes on.
+    press(&mut state, KeyCode::Esc);
+    assert!(state.job_exit_confirm.is_none());
+    submit(&mut state, "/new");
+    let effects = press(&mut state, KeyCode::Enter);
+    assert!(effects.contains(&Effect::Send(UiCommand::NewSession)));
+    assert!(state.job_exit_confirm.is_none());
+}
+
+#[test]
+fn a_cleared_session_resets_the_view_to_a_clean_start() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::SessionRestored {
+        session_id: crate::api::SessionId("tui-1".into()),
+        cwd: "C:\\proj".into(),
+        messages: vec![crate::api::TranscriptMessage {
+            role: crate::api::TranscriptRole::User,
+            text: "pergunta antiga".into(),
+        }],
+        skill_names: Vec::new(),
+    });
+    state.apply_event(UiEvent::SessionTitleChanged {
+        title: Some("Antiga".into()),
+    });
+    state.jobs.push(running_job());
+    assert!(!state.blocks().is_empty());
+
+    state.apply_event(UiEvent::SessionCleared {
+        cwd: "C:\\proj".into(),
+        skill_names: Vec::new(),
+    });
+    assert!(state.blocks().is_empty(), "no turn of the old conversation");
+    assert_eq!(
+        state.session_id, None,
+        "the next prompt creates the session"
+    );
+    assert_eq!(state.session_title, None);
+    assert!(state.jobs.is_empty());
+    assert_eq!(state.cwd, "C:\\proj");
+}
+
+#[test]
+fn new_is_listed_with_the_conversation_commands() {
+    assert_eq!(super::slash_matches("ne"), ["/new"]);
+    assert_eq!(super::palette_description("/new"), "nova sessão");
+    assert!(super::palette_matches("nova sessão").contains(&"/new"));
+}

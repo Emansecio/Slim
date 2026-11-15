@@ -127,6 +127,19 @@ fn login_command_opens_selector_and_selected_provider_is_sent() {
 }
 
 #[test]
+fn devin_login_starts_the_browser_flow_instead_of_the_key_form() {
+    let mut state = AppState::new();
+    state.login_overlay = Some(crate::app::LoginOverlay {
+        selected: 8,
+        ..Default::default()
+    });
+    let effects = reduce(&mut state, Action::Key(enter()));
+    assert!(effects.contains(&Effect::Send(UiCommand::StartLogin(
+        LoginProvider::Devin
+    ))));
+}
+
+#[test]
 fn login_failure_releases_overlay_instead_of_sticking_in_progress() {
     // G251: a terminal failure must reset `in_progress` — while set, the
     // reducer swallows every key, freezing the dialog on the error.
@@ -966,23 +979,23 @@ fn signed_out_prompt_preserves_draft_without_sending() {
 }
 
 #[test]
-fn enter_during_active_run_enqueues_draft_instead_of_sending() {
-    // G244 (§7.4): submit while a run is active queues the draft as a
-    // visible QueuedUser block instead of silently dropping it.
+fn enter_during_active_run_steers_draft_into_the_live_run() {
+    // G244 (§7.4): submit while a run is active delivers the draft to the
+    // live run at the next turn boundary instead of dropping it.
     let mut state = AppState::new();
     state.working = true;
     state.composer.insert_text("keep this draft");
     let effects = reduce(&mut state, Action::Key(enter()));
     assert_eq!(state.composer.payload(), "");
-    assert_eq!(state.queued_prompts.len(), 1);
+    assert!(state.queued_prompts.is_empty());
     assert_eq!(
-        state.queued_prompts.front().map(String::as_str),
-        Some("keep this draft")
+        effects,
+        vec![Effect::Send(UiCommand::Steer("keep this draft".into()))]
     );
-    assert!(effects.iter().all(|effect| !matches!(
-        effect,
-        Effect::Send(UiCommand::PreparePrompt { .. } | UiCommand::SendPrompt(_))
-    )));
+    // The steered prompt is recalled with Up like any submitted one.
+    let recalled = reduce(&mut state, Action::HistoryRecall { older: true });
+    assert!(recalled.iter().any(|effect| matches!(effect, Effect::RequestRender)));
+    assert_eq!(state.composer.payload(), "keep this draft");
 }
 
 #[test]

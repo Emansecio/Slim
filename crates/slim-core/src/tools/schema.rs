@@ -74,8 +74,8 @@ fn condense_job_and_check_guidance(tool: &mut Value) {
             "Attach any check/test as then_run on the last edit instead of a separate shell call; it runs after success and reports both results (a failed check keeps the edit).",
         )],
         Some("shell") => &[(
-            "In the agent loop, returns a job after yield_ms; continue independent work. Completion is delivered automatically; use shell_job to list, inspect, read output, wait, interrupt or cancel; do not poll. background=true yields immediately. TUI jobs survive responses within the session; headless waits. Run cancellation stops jobs launched by that run; do not detach child processes.",
-            "Past yield_ms (background=true: at once) it becomes a job whose completion is delivered automatically; continue independent work, use shell_job to inspect, read output, wait or cancel, and never poll or detach child processes.",
+            "In the agent loop, returns a job after yield_ms; continue independent work. Completion is delivered automatically; use shell_job to list, inspect, read output, wait, interrupt or cancel; do not poll. background=true yields immediately. stdin=true pipes the job's stdin; feed it with shell_job input (eof closes it). TUI jobs survive responses within the session; headless waits. Run cancellation stops jobs launched by that run; do not detach child processes.",
+            "Past yield_ms (background=true: at once) it becomes a job whose completion is delivered automatically; continue independent work, use shell_job to inspect, read output, wait or cancel, and never poll or detach child processes. stdin=true pipes the job's stdin; feed it with shell_job input (eof closes it).",
         )],
         _ => &[],
     };
@@ -179,7 +179,7 @@ mod tests {
         for (name, rules) in [
             ("write", &["then_run", "last edit", "instead of a separate shell call", "keeps the edit", "then_run.final"][..]),
             ("patch", &["then_run", "last edit", "instead of a separate shell call", "keeps the edit", "then_run.final"][..]),
-            ("shell", &["yield_ms", "background=true", "shell_job", "never poll", "detach child processes", "Use file tools for edits"][..]),
+            ("shell", &["yield_ms", "background=true", "shell_job", "never poll", "detach child processes", "Use file tools for edits", "stdin=true"][..]),
         ] {
             let condensed = description(&provider, name);
             assert!(!condensed.contains("When a check or test command exists"), "{name} kept the long guidance");

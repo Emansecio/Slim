@@ -207,12 +207,12 @@ fn latest_short_turn_page_fills_from_its_prompt_after_long_history() {
         .unwrap_or_else(|| panic!("latest prompt missing\n{frame}"));
 
     assert_eq!(
-        question_row, 1,
-        "an overflowing history starts with the header followed by its body\n{frame}"
+        question_row, 0,
+        "an overflowing history starts at the prompt, beside its marker\n{frame}"
     );
     assert_eq!(
         transcript[0].trim_end_matches(['│', '┃']).trim(),
-        "▏ ● Você"
+        "▏ ● LATEST_QUESTION"
     );
     assert!(frame.contains("LATEST_ANSWER"));
     assert!(
@@ -253,23 +253,23 @@ fn turn_boundary_adds_one_row_only_before_later_user() {
         .expect("second question");
 
     assert!(
-        first_question >= 2,
-        "user label precedes first body\n{frame}"
+        first_question >= 1,
+        "a page-fill row precedes the first prompt\n{frame}"
     );
     assert!(
-        rows[first_question - 2].trim().is_empty(),
+        rows[first_question - 1].trim().is_empty(),
         "a short conversation gets one page-fill row above its first turn\n{frame}"
     );
     assert!(
-        second_question >= 3,
+        second_question >= 2,
         "second turn has boundary rows\n{frame}"
     );
     assert!(
-        rows[second_question - 2].trim().is_empty(),
-        "exactly one spacer must precede the next user label\n{frame}"
+        rows[second_question - 1].trim().is_empty(),
+        "exactly one spacer must precede the next prompt\n{frame}"
     );
     assert!(
-        !rows[second_question - 3].trim().is_empty(),
+        !rows[second_question - 2].trim().is_empty(),
         "the turn boundary must not add a second spacer\n{frame}"
     );
 }

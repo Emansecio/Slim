@@ -21,8 +21,7 @@ pub struct WorkState {
     /// count, so a block removed from inside it later (a queued prompt that
     /// is popped) cannot move its end onto the answer.
     pub until: BlockId,
-    /// Wall-clock the work took, when the blocks carry their own timestamps
-    /// and the turn has no receipt to say it.
+    /// Wall-clock the work took, when the blocks carry their own timestamps.
     pub duration_ms: Option<u64>,
     /// The calls by kind (`3 leituras, 1 edição`); empty when none ran.
     pub tally: String,
@@ -75,8 +74,7 @@ fn turn_end(blocks: &[Block], user: usize) -> usize {
 /// running, was cancelled, or failed as prose or as a thought, when a question
 /// is still unanswered, when an error closed it, when a receipt sits inside
 /// the stretch, or when it already has its row. A failed tool call does not
-/// stop the fold: the folded row keeps one row for each failure. The duration
-/// is left out when the turn has a receipt, which already says it.
+/// stop the fold: the folded row keeps one row for each failure.
 pub fn plan_turn(blocks: &[Block], user: usize) -> Option<(usize, WorkState)> {
     if !matches!(blocks.get(user)?.kind(), BlockKind::User(_)) {
         return None;
@@ -114,9 +112,6 @@ pub fn plan_turn(blocks: &[Block], user: usize) -> Option<(usize, WorkState)> {
     {
         return None;
     }
-    let has_receipt = turn[last..]
-        .iter()
-        .any(|block| matches!(block.kind(), BlockKind::Receipt(_)));
     let names: Vec<&str> = folded
         .iter()
         .filter_map(|block| match block.kind() {
@@ -126,11 +121,7 @@ pub fn plan_turn(blocks: &[Block], user: usize) -> Option<(usize, WorkState)> {
         .collect();
     let state = WorkState {
         until: turn[last].id.clone(),
-        duration_ms: if has_receipt {
-            None
-        } else {
-            duration_ms(folded)
-        },
+        duration_ms: duration_ms(folded),
         tally: crate::view_model::completed_tool_phrase(&names),
     };
     Some((user + 1 + first, state))
@@ -386,9 +377,7 @@ mod tests {
                 removed: 0,
                 stats_partial: false,
                 commands: 1,
-                failed_commands: 0,
                 last_command_ok: Some(true),
-                duration_ms: 5_000,
                 outcome: crate::receipt::ReceiptOutcome::Completed,
             }),
             BlockLifecycle::Complete,
@@ -398,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn a_receipt_after_the_answer_owns_the_duration() {
+    fn a_receipt_after_the_answer_leaves_the_duration_with_the_work() {
         let mut first = thought();
         first.started_ms = Some(1_000);
         first.ended_ms = Some(4_000);
@@ -413,17 +402,15 @@ mod tests {
                 removed: 0,
                 stats_partial: false,
                 commands: 1,
-                failed_commands: 0,
                 last_command_ok: Some(true),
-                duration_ms: 12_000,
                 outcome: crate::receipt::ReceiptOutcome::Completed,
             }),
             BlockLifecycle::Complete,
         );
         let blocks = [user(), first, second, answer("fim"), receipt];
         let (_, work) = plan_turn(&blocks, 0).expect("folds");
-        assert_eq!(work.duration_ms, None);
-        assert_eq!(work.summary(), "Trabalhou · 1 leitura");
+        assert_eq!(work.duration_ms, Some(12_000));
+        assert_eq!(work.summary(), "Trabalhou 12s · 1 leitura");
     }
 
     #[test]

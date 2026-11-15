@@ -610,12 +610,12 @@ fn working_activity_reads_once_in_the_footer_below_the_composer() {
         .expect("top border");
     assert!(top_index > 0);
     assert!(
-        !lines[top_index - 1].contains("Em atividade"),
+        !lines[top_index - 1].contains("Trabalhando"),
         "no activity row above the composer\n{frame}"
     );
-    assert_eq!(frame.matches("Em atividade").count(), 1, "{frame}");
+    assert_eq!(frame.matches("Trabalhando").count(), 1, "{frame}");
     let footer = lines.last().expect("footer");
-    assert!(footer.contains("Em atividade"), "{footer}");
+    assert!(footer.contains("Trabalhando"), "{footer}");
     assert!(footer.contains("Esc parar"), "{footer}");
 }
 
@@ -642,7 +642,7 @@ fn constrained_working_state_moves_from_activity_to_footer() {
     let frame = render_to_string(&state, 40, 8);
     let footer = frame.lines().last().expect("footer");
     assert!(
-        footer.contains("Em atividade"),
+        footer.contains("Trabalhando"),
         "active state lives in the footer: {footer}"
     );
     assert!(
@@ -916,8 +916,8 @@ fn manual_todo_collapse_survives_subsequent_updates() {
     );
     let frame = render_to_string(&state, 100, 24);
     assert!(
-        frame.contains("TODO 1/3"),
-        "collapsed dock keeps progress\n{frame}"
+        frame.contains("TODO rodar testes · 1/3"),
+        "collapsed dock leads with the active item and keeps progress\n{frame}"
     );
     assert!(
         frame.contains("rodar testes"),

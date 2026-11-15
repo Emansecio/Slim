@@ -408,6 +408,7 @@ pub(super) fn is_session_command(command: &UiCommand) -> bool {
         UiCommand::RenameSession { .. }
             | UiCommand::ListSessions { .. }
             | UiCommand::ResumeSession { .. }
+            | UiCommand::NewSession
             | UiCommand::ListTurns { .. }
             | UiCommand::RewindSession { .. }
     )
@@ -442,6 +443,9 @@ pub(super) fn refuse_session_command(sink: &EventSink, command: &UiCommand, wait
         }
         UiCommand::RewindSession { .. } => {
             notify(sink, format!("{wait} antes de voltar a um turno"));
+        }
+        UiCommand::NewSession => {
+            notify(sink, format!("{wait} antes de iniciar uma nova sessão"));
         }
         _ => {}
     }

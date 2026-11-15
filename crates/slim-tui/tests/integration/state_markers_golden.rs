@@ -187,8 +187,7 @@ fn failed_and_interrupted_turns_differ_from_a_finished_one_by_shape_not_only_col
             )));
             let rendered = render(&state, 60, color_depth);
             let header = &rendered.rows[rendered.row("Slim")];
-            // One cell: the name stays in the fourth column, where the
-            // pending header's sweep expects it.
+            // One cell: the name stays in the fourth column, the text column.
             assert_eq!(
                 header
                     .find("Slim")
@@ -613,71 +612,43 @@ fn thinking(text: &str) -> AppState {
 }
 
 #[test]
-fn a_highlight_sweeps_the_thinking_label_and_leaves_the_clock_alone() {
+fn the_thinking_label_rests_in_the_reasoning_hue_with_no_sweep() {
     let mut state = thinking("plano");
     // The runtime clock: one motion frame every 83 ms.
-    let sweep = |state: &mut AppState, elapsed_ms: u64, capabilities: Capabilities| {
+    let label = |state: &mut AppState, elapsed_ms: u64, capabilities: Capabilities| {
         tick(state, elapsed_ms / 83, elapsed_ms);
-        // Words arrived a second ago: a thought silent for five seconds is
-        // shown waiting (slow marker, no sweep), and words just arrived glow
-        // at the edge; neither is what this measures.
         state.last_provider_content_ms = Some(elapsed_ms.saturating_sub(1_000));
         let rendered = render_with(state, 80, capabilities);
         let row = rendered.row("Pensando");
         // "  ⠋ Pensando · 3s": the label fills columns 4..12, the clock follows.
-        let label: Vec<Color> = (4..12).map(|c| rendered.foreground[row][c]).collect();
-        let clock: Vec<Color> = (12..16).map(|c| rendered.foreground[row][c]).collect();
+        let label: Vec<Color> = (4..16).map(|c| rendered.foreground[row][c]).collect();
         let text = rendered.rows[row][rendered.rows[row].find("Pensando").unwrap()..].to_owned();
-        (label, clock, text, rendered.modifiers[row][4..12].to_vec())
+        (label, text, rendered.modifiers[row][4..12].to_vec())
     };
 
-    // The peak crosses the label one cell every two frames (166 ms); a pass
-    // with its rest is 14 cells, 2_324 ms. Two passes in, the clock reads 5s.
-    let at_cell = |cell: u64| 2 * 2_324 + 166 * cell;
-    let mut peaks = Vec::new();
-    for cell in [3, 4, 5, 6] {
-        let (label, clock, text, _) =
-            sweep(&mut state, at_cell(cell), moving(ColorDepth::TrueColor));
-        let peak = (0..8).max_by_key(|index| luma(label[*index])).unwrap();
-        peaks.push(peak);
-        assert!(
-            text.starts_with("Pensando · 5s"),
-            "text never changes: {text}"
-        );
-        assert!(
-            clock.iter().all(|color| *color == VIOLET),
-            "the clock beside the label is not swept: {clock:?}"
-        );
-    }
-    assert_eq!(peaks, [1, 2, 3, 4]);
-
-    // Between those frames the light slides instead of jumping: halfway
-    // across, the two cells it straddles share it, below the full peak.
-    let (whole, ..) = sweep(&mut state, at_cell(4), moving(ColorDepth::TrueColor));
-    let (half, ..) = sweep(&mut state, at_cell(4) + 83, moving(ColorDepth::TrueColor));
-    assert_eq!(half[2], half[3], "{half:?}");
-    assert!(luma(half[2]) < luma(whole[2]), "{half:?}");
-    assert!(luma(half[2]) > luma(whole[3]), "{half:?}");
-
-    // The label is brighter at the peak than at rest, and rests in the
-    // reasoning hue's own family (not a grey).
-    let (label, ..) = sweep(&mut state, at_cell(4), moving(ColorDepth::TrueColor));
-    assert!(luma(label[2]) > luma(label[7]));
-    assert!(
-        luma(label[7]) < luma(VIOLET) + 1,
-        "resting shade is not brighter than the hue"
-    );
-
-    // Reduced motion stops the sweep and keeps the plain reasoning hue.
-    for frame in [0, 6, 12] {
-        let (label, _, _, _) = sweep(&mut state, frame, caps(ColorDepth::TrueColor));
-        assert!(label.iter().all(|color| *color == VIOLET), "frame {frame}");
+    // The spinner beside the label is the row's only motion: whatever the
+    // frame, the label and its clock keep the plain reasoning hue.
+    for elapsed_ms in [4_648, 4_814, 4_897, 5_146, 5_644] {
+        for capabilities in [moving(ColorDepth::TrueColor), caps(ColorDepth::TrueColor)] {
+            let (label, text, _) = label(&mut state, elapsed_ms, capabilities);
+            assert!(
+                label.iter().all(|color| *color == VIOLET),
+                "{elapsed_ms} ms: {label:?}"
+            );
+            assert!(text.starts_with("Pensando · "), "{text}");
+        }
     }
 
-    // Without color the sweep is weight: bold at the peak, plain elsewhere.
-    let (_, _, _, modifiers) = sweep(&mut state, at_cell(4), moving(ColorDepth::None));
-    assert!(modifiers[2].contains(Modifier::BOLD), "{modifiers:?}");
-    assert!(!modifiers[7].contains(Modifier::BOLD), "{modifiers:?}");
+    // Without color nothing takes weight in turns either.
+    for elapsed_ms in [4_648, 5_146] {
+        let (_, _, modifiers) = label(&mut state, elapsed_ms, moving(ColorDepth::None));
+        assert!(
+            modifiers
+                .iter()
+                .all(|modifier| !modifier.contains(Modifier::BOLD)),
+            "{modifiers:?}"
+        );
+    }
 }
 
 #[test]
@@ -704,7 +675,7 @@ fn a_long_thought_stays_one_row_with_its_newest_words() {
 }
 
 #[test]
-fn arriving_thought_lights_the_edge_where_it_is_written_and_settles() {
+fn an_arriving_thought_keeps_its_resting_shade_from_the_first_frame() {
     let mut state = thinking("");
     tick(&mut state, 12, 1_000);
     state.apply_event(UiEvent::ThinkingDelta {
@@ -715,13 +686,11 @@ fn arriving_thought_lights_the_edge_where_it_is_written_and_settles() {
         let rendered = render_with(state, 100, capabilities);
         let row = rendered.row("chegar");
         let end = rendered.rows[row].trim_end().chars().count() - 1;
-        // The tail rides on the header row; its first word sits past the glow.
         let start = rendered.rows[row].find("primeira").unwrap();
         let start = rendered.rows[row][..start].chars().count();
         (
             rendered.foreground[row][end],
             rendered.foreground[row][start],
-            rendered.foreground[row][end - 14],
             // The spinner beside the label moves; the words never do.
             rendered.rows[row][rendered.rows[row].find("Pensando").unwrap()..]
                 .trim_end()
@@ -729,31 +698,17 @@ fn arriving_thought_lights_the_edge_where_it_is_written_and_settles() {
         )
     };
 
-    // Reduced motion shows the resting shade of the tail.
-    let (resting, resting_start, ..) = edge(&mut state, 12, 1_000, caps(ColorDepth::TrueColor));
-    assert_eq!(resting, resting_start, "reduced motion has no glow");
-
-    let (fresh_edge, start, deep, text) =
-        edge(&mut state, 12, 1_000, moving(ColorDepth::TrueColor));
-    assert!(
-        luma(fresh_edge) > luma(start),
-        "the edge is lit: {fresh_edge:?}"
-    );
-    assert_eq!(start, resting);
-    assert_eq!(
-        deep, resting,
-        "the glow is 14 cells deep, not the whole row"
-    );
-
-    // Half-way through it has faded, but is still above the resting shade.
-    let (fading, _, _, same_text) = edge(&mut state, 15, 1_250, moving(ColorDepth::TrueColor));
-    assert!(luma(fading) < luma(fresh_edge));
-    assert!(luma(fading) > luma(resting));
-    assert_eq!(same_text, text, "the glow never moves or changes the text");
-
-    // After 450 ms it is gone.
-    let (settled, ..) = edge(&mut state, 18, 1_500, moving(ColorDepth::TrueColor));
-    assert_eq!(settled, resting);
+    let (resting, resting_start, text) = edge(&mut state, 12, 1_000, caps(ColorDepth::TrueColor));
+    assert_eq!(resting, resting_start);
+    // Words that have just arrived are not lit: the row reads the same the
+    // moment it is written and half a second later, with or without motion.
+    for (frame, elapsed_ms) in [(12, 1_000), (15, 1_250), (18, 1_500)] {
+        let (newest, first, same_text) =
+            edge(&mut state, frame, elapsed_ms, moving(ColorDepth::TrueColor));
+        assert_eq!(newest, resting, "{elapsed_ms} ms");
+        assert_eq!(first, resting, "{elapsed_ms} ms");
+        assert_eq!(same_text, text);
+    }
 }
 
 #[test]
@@ -792,7 +747,7 @@ fn prompt_sent() -> AppState {
 
 fn header_rows(rendered: &Rendered) -> Vec<usize> {
     (0..rendered.rows.len())
-        .filter(|row| rendered.rows[*row].trim_end() == "▏ ● Slim")
+        .filter(|row| rendered.rows[*row].starts_with("▏ ● Slim ─"))
         .collect()
 }
 
@@ -800,16 +755,16 @@ fn header_rows(rendered: &Rendered) -> Vec<usize> {
 fn the_agent_header_waits_under_the_prompt_before_any_agent_output() {
     let state = prompt_sent();
     let rendered = render_with(&state, 80, caps(ColorDepth::TrueColor));
-    let prompt = rendered.row("● Você");
-    // prompt, its text, the breathing row, then the agent's header.
+    let prompt = rendered.row("● oi");
+    // The prompt beside its marker, the breathing row, then the agent's header.
     assert_eq!(
         header_rows(&rendered),
-        vec![prompt + 3],
+        vec![prompt + 2],
         "{}",
         rendered.rows.join("\n")
     );
-    assert_eq!(rendered.style_at(prompt + 3, "●").0, GREEN);
-    assert_eq!(rendered.style_at(prompt + 3, "Slim").0, GREEN);
+    assert_eq!(rendered.style_at(prompt + 2, "●").0, GREEN);
+    assert_eq!(rendered.style_at(prompt + 2, "Slim").0, GREEN);
 }
 
 #[test]
@@ -818,7 +773,7 @@ fn the_pending_header_becomes_the_first_blocks_header_without_moving_anything() 
     let mut state = prompt_sent();
     let before = render_with(&state, 80, caps(ColorDepth::TrueColor));
     let rows_before = HeightIndex::build(state.blocks(), 80, &mut WrapCache::default()).total_rows;
-    let prompt_before = before.row("● Você");
+    let prompt_before = before.row("● oi");
     let header_offset = header_rows(&before)[0] - prompt_before;
 
     state.apply_event(UiEvent::ThinkingStarted);
@@ -828,23 +783,23 @@ fn the_pending_header_becomes_the_first_blocks_header_without_moving_anything() 
     let after = render_with(&state, 80, caps(ColorDepth::TrueColor));
     // The screen is anchored to the bottom, so absolute rows shift as content
     // grows; the header stays the same distance under its prompt.
-    let prompt_after = after.row("● Você");
+    let prompt_after = after.row("● oi");
     assert_eq!(
         header_rows(&after),
         vec![prompt_after + header_offset],
         "one header, same place under the prompt"
     );
     let rows_after = HeightIndex::build(state.blocks(), 80, &mut WrapCache::default()).total_rows;
-    // The header is now the block's (label plus rule); only the thought's own
-    // row is new.
+    // The header is now the block's (label and rule on one row); only the
+    // thought's own row is new.
     assert_eq!(
         rows_after,
         rows_before + 1,
         "header row is not counted twice"
     );
     assert!(
-        after.rows[prompt_after + header_offset + 2].contains("Pensando"),
-        "the rule closes the header, the thought follows it"
+        after.rows[prompt_after + header_offset + 1].contains("Pensando"),
+        "the thought follows the header row"
     );
 }
 
@@ -893,7 +848,7 @@ fn no_pending_header_when_nothing_is_running_or_the_run_ends_empty() {
 }
 
 #[test]
-fn the_pending_name_is_swept_in_green_and_still_when_motion_is_reduced() {
+fn the_pending_name_stays_still_in_the_identity_green() {
     let mut state = prompt_sent();
     let cells = |state: &mut AppState, frame: u64, capabilities: Capabilities| {
         tick(state, frame, frame * 83);
@@ -907,20 +862,15 @@ fn the_pending_name_is_swept_in_green_and_still_when_motion_is_reduced() {
             rendered.rows[row].trim_end().to_owned(),
         )
     };
-    let mut peaks = Vec::new();
-    for frame in [4, 6, 8, 10] {
-        let (name, marker, text) = cells(&mut state, frame, moving(ColorDepth::TrueColor));
-        peaks.push((0..4).max_by_key(|index| luma(name[*index])).unwrap());
-        assert_eq!(marker, GREEN, "the marker stays the identity green");
-        assert_eq!(text, "▏ ● Slim", "the sweep only restyles");
-    }
-    assert_eq!(peaks, [0, 1, 2, 3]);
-    for frame in [0, 6, 12] {
-        let (name, ..) = cells(&mut state, frame, caps(ColorDepth::TrueColor));
-        assert!(
-            name.iter().all(|color| *color == GREEN),
-            "reduced motion, frame {frame}"
-        );
+    // The footer says the run is alive; the name is not swept while it waits.
+    let (_, _, resting) = cells(&mut state, 0, caps(ColorDepth::TrueColor));
+    for frame in [0, 4, 6, 8, 10, 12] {
+        for capabilities in [moving(ColorDepth::TrueColor), caps(ColorDepth::TrueColor)] {
+            let (name, marker, text) = cells(&mut state, frame, capabilities);
+            assert!(name.iter().all(|color| *color == GREEN), "frame {frame}");
+            assert_eq!(marker, GREEN, "the marker stays the identity green");
+            assert_eq!(text, resting, "frame {frame}");
+        }
     }
 }
 
@@ -991,7 +941,7 @@ fn a_turn_that_changed_files_ends_with_a_receipt() {
     let row = receipt_row(&rendered).expect("receipt row");
     assert_eq!(
         rendered.rows[row].trim_end(),
-        "▏ ✓ 2 arquivos · +2 -4 · 1 comando · 6s   Ctrl+D"
+        "▏ ✓ 2 arquivos · +2 -4   Ctrl+D diff"
     );
     // The receipt sits in the text column, set apart from the prose above it.
     assert!(
@@ -1037,13 +987,13 @@ fn the_marker_follows_how_the_turn_ended() {
         UiEvent::RunCompleted { run_id: 1 },
     );
     assert_eq!((glyph, color), ('✕', RED), "{text}");
-    assert!(text.contains("1 comando, 1 falhou"), "{text}");
-    // Only commands: a quiet check, no green.
-    let (glyph, color, _) = marker(
-        |state| ran(state, "1", true),
-        UiEvent::RunCompleted { run_id: 1 },
-    );
-    assert_eq!((glyph, color), ('✓', MUTED));
+    assert!(text.contains("último comando falhou"), "{text}");
+    // Only commands: nothing changed, so there is no result to close with.
+    let mut commands = prompt_sent();
+    ran(&mut commands, "1", true);
+    tick(&mut commands, 12, 1_000);
+    commands.apply_event(UiEvent::RunCompleted { run_id: 1 });
+    assert!(receipt_row(&render_with(&commands, 100, caps(ColorDepth::TrueColor))).is_none());
     // Interrupted: amber, and the word says so.
     let (glyph, color, text) = marker(
         |state| edited(state, "1", "a.rs", 1, 0),
@@ -1092,7 +1042,7 @@ fn a_narrow_receipt_drops_pieces_from_the_right_and_never_overflows() {
     }
     let wide = render_with(&state, 100, caps(ColorDepth::TrueColor));
     assert!(wide.rows[receipt_row(&wide).unwrap()].contains("Ctrl+D"));
-    let narrow = render_with(&state, 40, caps(ColorDepth::TrueColor));
+    let narrow = render_with(&state, 30, caps(ColorDepth::TrueColor));
     assert!(!narrow.rows[receipt_row(&narrow).unwrap()].contains("Ctrl+D"));
 }
 

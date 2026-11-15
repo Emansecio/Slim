@@ -11,8 +11,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use slim_core::mcp::{McpManager, McpServerStatus};
 use slim_core::provider::{
     clinepass_model, fetch_clinepass_catalog, is_clinepass_model_id, is_command_code_model_id,
-    is_open_design_model_id, is_xai_model_id, open_code_model, zen_model, ProviderKind,
-    CLINEPASS_BASE_URL, CLINEPASS_DEFAULT_MODEL, COMMANDCODE_BASE_URL, COMMANDCODE_DEFAULT_MODEL,
+    is_devin_model_id, is_open_design_model_id, is_xai_model_id, open_code_model, zen_model,
+    ProviderKind, CLINEPASS_BASE_URL, CLINEPASS_DEFAULT_MODEL, COMMANDCODE_BASE_URL,
+    COMMANDCODE_DEFAULT_MODEL, DEVIN_DEFAULT_BASE_URL, DEVIN_DEFAULT_MODEL,
     OPENCODE_GO_BASE_URL, OPENCODE_GO_DEFAULT_MODEL, OPENCODE_ZEN_BASE_URL,
     OPENCODE_ZEN_DEFAULT_MODEL, OPENCODE_ZEN_PUBLIC_KEY, OPEN_DESIGN_BASE_URL,
     OPEN_DESIGN_DEFAULT_MODEL, XAI_BASE_URL, XAI_DEFAULT_MODEL,
@@ -24,11 +25,11 @@ use slim_core::{
     InteractionResponder, ProviderError, ProviderMessage, SessionEvent, SessionEventSender,
 };
 use slim_tui::api::{
-    ClinePassCatalogSource, CommandCodeCatalogSource, ContentHandle, ContentRequestId,
-    CodexCatalogSource, InteractionRequestId, LoginProvider, McpServerView, McpStatusView, ModelAlias,
-    OpenCodeCatalogSource, OpenCodeModelView, OpenDesignCatalogSource, PageCursor, PromptAdmission,
-    ReasoningEffort, ToolBatchId, ToolCallId, TranscriptMessage, TranscriptRole, UiChannels,
-    UiCommand, UiEvent, WakeSignal, ZenCatalogSource, STREAM_EVENT_CAPACITY,
+    ClinePassCatalogSource, CodexCatalogSource, CommandCodeCatalogSource, ContentHandle,
+    ContentRequestId, DevinCatalogSource, InteractionRequestId, LoginProvider, McpServerView, McpStatusView,
+    ModelAlias, OpenCodeCatalogSource, OpenCodeModelView, OpenDesignCatalogSource, PageCursor,
+    PromptAdmission, ReasoningEffort, ToolBatchId, ToolCallId, TranscriptMessage, TranscriptRole,
+    UiChannels, UiCommand, UiEvent, WakeSignal, ZenCatalogSource, STREAM_EVENT_CAPACITY,
 };
 
 use crate::cli::parse_cli_args;
@@ -589,33 +590,10 @@ fn switch_session(
             return false;
         }
     };
-    if let Some(policy) = startup
-        .options
-        .compaction
-        .as_ref()
-        .map(slim_core::context::CompactionHandle::policy)
-    {
-        startup.options.compaction = Some(slim_core::context::CompactionHandle::new(policy));
+    if !leave_session(startup, sink) {
+        return false;
     }
     if let Some(jobs) = &startup.options.shell_jobs {
-        let count = jobs.running_count();
-        if count > 0 {
-            sink.send(UiEvent::Notification {
-                message: format!("Encerrando {count} job(s) antes de trocar a sessão"),
-            });
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(jobs.reset())
-            });
-        } else {
-            jobs.clear_finished();
-        }
-        let jobs = jobs.clone();
-        if let Err(message) = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(persist_job_metadata(startup))
-        }) {
-            sink.send(UiEvent::Notification { message });
-            return false;
-        }
         jobs.restore_lost(&session_job_metadata(&selected.preflight));
     }
     startup.options.history = selected.history;
@@ -650,6 +628,82 @@ fn switch_session(
     true
 }
 
+/// What leaving the current session takes, whatever comes next: a fresh
+/// compaction state, and its jobs ended with their metadata recorded beside
+/// it. False when the metadata could not be recorded; the session is kept.
+fn leave_session(startup: &mut TuiStartup, sink: &EventSink) -> bool {
+    if let Some(policy) = startup
+        .options
+        .compaction
+        .as_ref()
+        .map(slim_core::context::CompactionHandle::policy)
+    {
+        startup.options.compaction = Some(slim_core::context::CompactionHandle::new(policy));
+    }
+    if let Some(jobs) = &startup.options.shell_jobs {
+        let count = jobs.running_count();
+        if count > 0 {
+            sink.send(UiEvent::Notification {
+                message: format!("Encerrando {count} job(s) antes de trocar a sessão"),
+            });
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(jobs.reset())
+            });
+        } else {
+            jobs.clear_finished();
+        }
+        if let Err(message) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(persist_job_metadata(startup))
+        }) {
+            sink.send(UiEvent::Notification { message });
+            return false;
+        }
+    }
+    true
+}
+
+/// `/new`: leaves the current conversation, whose file stays resumable, for
+/// an empty one. As at a clean start, no file exists until the next prompt
+/// creates it.
+fn start_new_session(
+    startup: &mut TuiStartup,
+    sink: &EventSink,
+    skill_memo: &mut SkillNameMemo,
+    user_shell_context: &UserShellContext,
+) {
+    if !leave_session(startup, sink) {
+        return;
+    }
+    let workspace = startup
+        .options
+        .workspace_root
+        .clone()
+        .expect("workspace root initialized");
+    startup.options.history.clear();
+    startup.options.task_facts.clear();
+    startup.options.artifact_ids.clear();
+    startup.options.tool_registry = None;
+    startup.options.ensure_shared_tool_registry();
+    startup.resume_path = None;
+    startup.resume_preflight = None;
+    startup.pending_session_title = None;
+    user_shell_context.clear();
+    let cwd = display_workspace_path(&workspace);
+    let skill_names = skill_memo.names(Some(workspace));
+    let _ = sink.send(UiEvent::SessionCleared { cwd, skill_names });
+    if let Some(jobs) = &startup.options.shell_jobs {
+        sink.send(UiEvent::JobsChanged { jobs: jobs.list() });
+    }
+    if !skill_memo.warnings.is_empty() {
+        sink.send(UiEvent::Notification {
+            message: skill_memo.warnings.clone(),
+        });
+    }
+    let _ = sink.send(UiEvent::Notification {
+        message: "Nova sessão. A anterior continua em /resume.".into(),
+    });
+}
+
 pub fn run_tui(args: Vec<String>) -> Result<(), TuiError> {
     let oauth = OAuthService::production()
         .map_err(|error| TuiError::new(ExitCode::Auth, error.to_string()))?;
@@ -668,6 +722,16 @@ pub fn run_tui(args: Vec<String>) -> Result<(), TuiError> {
 }
 
 fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, TuiError> {
+    prepare_tui_in(args, oauth, None)
+}
+
+/// [`prepare_tui`] for a host whose workspace is not the process directory:
+/// the project `slim.toml` and the LSP trust decision come from `workspace`.
+fn prepare_tui_in(
+    args: Vec<String>,
+    oauth: &OAuthService,
+    workspace: Option<&Path>,
+) -> Result<TuiStartup, TuiError> {
     let parsed = parse_cli_args(&args)
         .map_err(|output| TuiError::new(output.code, output.stderr.trim_end().to_owned()))?;
     if parsed.format == OutputFormat::Jsonl {
@@ -709,13 +773,19 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
     let initial_prompt = parsed
         .prompt
         .or_else(|| (!parsed.positional.is_empty()).then(|| parsed.positional.join(" ")));
-    let layered_config = crate::config::load_layered()
-        .map_err(|error| TuiError::new(ExitCode::Internal, format!("config error: {error}")))?;
-    // load_layered reads the project slim.toml from the process directory;
-    // its LSP launch overrides follow the project MCP trust decision.
+    let layered_config = match workspace {
+        Some(root) => crate::config::load_layered_for(root),
+        None => crate::config::load_layered(),
+    }
+    .map_err(|error| TuiError::new(ExitCode::Internal, format!("config error: {error}")))?;
+    // The project slim.toml comes from the workspace (the process directory
+    // when none is given); its LSP launch overrides follow the project MCP
+    // trust decision.
     let lsp_trust = crate::code_intel::project_trust(
         &layered_config.lsp,
-        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        &workspace
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
         parsed.trust_project,
     );
     let application_code_intelligence =
@@ -766,7 +836,19 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
             parsed.mode,
             endpoint_override.as_deref(),
             model_override.as_deref(),
-            || oauth.active().map_err(tui_auth_error),
+            || {
+                let active = oauth.active().map_err(tui_auth_error)?;
+                // An embedded host runs several conversations at once, each
+                // naming its provider: the stored login of that provider is
+                // used even when another conversation made a different one
+                // active. The terminal keeps the active-login rule.
+                if workspace.is_none() {
+                    return Ok(active);
+                }
+                oauth_session_for_kind(kind, active, |provider| {
+                    oauth.credential(provider).map_err(tui_auth_error)
+                })
+            },
         )?
     } else if let Some(request) = api_key_request(
         ProviderKind::OpenAiCompatible,
@@ -889,6 +971,7 @@ fn prepare_tui(args: Vec<String>, oauth: &OAuthService) -> Result<TuiStartup, Tu
         options = options.with_code_intelligence(manager);
     }
     options.trust_project = parsed.trust_project;
+    options.host_mcp_config = parsed.mcp_config.clone().map(PathBuf::from);
     options.codex_fast = parsed
         .codex_fast
         .or(layered_config.codex_fast)
@@ -979,7 +1062,7 @@ fn is_open_code_zen_model(id: &str) -> bool {
     zen_model(id).is_some()
 }
 
-static API_KEY_PROVIDERS: [ApiKeyProviderSpec; 6] = [
+static API_KEY_PROVIDERS: [ApiKeyProviderSpec; 7] = [
     ApiKeyProviderSpec {
         login: LoginProvider::OpenCodeGo,
         kind: ProviderKind::OpenCodeGo,
@@ -1034,6 +1117,17 @@ static API_KEY_PROVIDERS: [ApiKeyProviderSpec; 6] = [
         public_key: None,
         env_keys: &["OPEN_DESIGN_API_KEY"],
         is_model: is_open_design_model_id,
+    },
+    ApiKeyProviderSpec {
+        login: LoginProvider::Devin,
+        kind: ProviderKind::Devin,
+        store_key: "devin",
+        label: "Devin",
+        base_url: DEVIN_DEFAULT_BASE_URL,
+        default_model: DEVIN_DEFAULT_MODEL,
+        public_key: None,
+        env_keys: &["DEVIN_API_KEY"],
+        is_model: is_devin_model_id,
     },
     ApiKeyProviderSpec {
         login: LoginProvider::Xai,
@@ -1117,6 +1211,46 @@ async fn save_api_key_login(
                 message: format!("{} key save task failed", spec.label),
             });
         }
+    }
+}
+
+/// Stores Devin's session token, then starts on the account's default model
+/// once discovery reports one; a failed refresh keeps the bundled default.
+async fn finish_devin_login(startup: &mut TuiStartup, sink: &EventSink, token: String) {
+    let Some(spec) = api_key_spec(LoginProvider::Devin) else {
+        return;
+    };
+    save_api_key_login(spec, startup, sink, token.clone()).await;
+    let connected = startup
+        .request
+        .as_ref()
+        .is_some_and(|request| request.kind == ProviderKind::Devin && request.api_key == token);
+    if !connected {
+        return;
+    }
+    let Ok(catalog) = crate::devin_catalog::DevinCatalog::production() else {
+        return;
+    };
+    let _ = sink.send(UiEvent::LoginProgress {
+        message: "Loading Devin models…".into(),
+    });
+    let Ok(snapshot) = catalog.refresh(&token).await else {
+        let _ = sink.send(UiEvent::Notification {
+            message: "Devin catalog refresh failed; using the bundled models".into(),
+        });
+        return;
+    };
+    let default = snapshot
+        .models
+        .iter()
+        .find(|model| model.default)
+        .map(|model| model.id.clone());
+    let _ = sink.send(devin_catalog_event(snapshot));
+    if let (None, Some(model), Some(request)) =
+        (&startup.model_override, default, startup.request.as_mut())
+    {
+        request.model.clone_from(&model);
+        let _ = sink.send(UiEvent::ModelChanged { model });
     }
 }
 
@@ -1304,6 +1438,32 @@ fn request_for_kind(
     };
     let request = oauth_request(provider, &credential, mode, endpoint, model)?;
     Ok((Some(request), Some((provider, credential))))
+}
+
+/// The OAuth login for `kind` when the host names its provider: the active
+/// login when it belongs to `kind`, else the credential `stored` holds for the
+/// OAuth provider of `kind`. `None` for kinds without OAuth or without a
+/// stored login.
+fn oauth_session_for_kind(
+    kind: ProviderKind,
+    active: Option<OAuthSession>,
+    stored: impl FnOnce(OAuthProvider) -> Result<Option<OAuthCredential>, TuiError>,
+) -> Result<Option<OAuthSession>, TuiError> {
+    if let Some(session) =
+        active.filter(|(provider, _)| provider_kind_for_oauth(*provider) == kind)
+    {
+        return Ok(Some(session));
+    }
+    let Some(provider) = [
+        OAuthProvider::Anthropic,
+        OAuthProvider::OpenAiCodex,
+        OAuthProvider::Xai,
+    ]
+    .into_iter()
+    .find(|provider| provider_kind_for_oauth(*provider) == kind) else {
+        return Ok(None);
+    };
+    Ok(stored(provider)?.map(|credential| (provider, credential)))
 }
 
 fn api_key_request(
@@ -1529,6 +1689,51 @@ pub fn spawn_tui_runtime_with_resume(
     )
 }
 
+/// Embedded host seam (GUI clients such as Bancada): the same startup the
+/// terminal TUI uses — layered config, stored login with OAuth refresh and
+/// lazily created durable sessions — driven through `UiChannels` instead of a
+/// terminal. `args` are the TUI flags; `workspace_root` replaces the process
+/// directory for tools and sessions. A `--prompt` in `args` is sent as the
+/// first prompt.
+pub fn spawn_embedded_runtime(
+    args: Vec<String>,
+    workspace_root: impl Into<PathBuf>,
+) -> Result<(TuiRuntimeHandle, UiChannels), TuiError> {
+    let oauth = OAuthService::production()
+        .map_err(|error| TuiError::new(ExitCode::Auth, error.to_string()))?;
+    let workspace_root = workspace_root.into();
+    let mut startup = prepare_tui_in(args, &oauth, Some(&workspace_root))?;
+    startup.options.workspace_root = Some(workspace_root);
+    // The worker would otherwise create the session before the host can send
+    // the prompt; `SendPrompt` creates it on the same path.
+    let initial_prompt = startup.initial_prompt.take();
+    let (runtime, channels) = spawn_tui_session(startup, oauth).map_err(tui_provider_error)?;
+    if let Some(prompt) = initial_prompt {
+        let _ = channels.commands.send(UiCommand::SendPrompt(prompt));
+    }
+    Ok((runtime, channels))
+}
+
+/// [`spawn_embedded_runtime`] for hosts that submit prompts themselves, the
+/// way the TUI reducer does: `SetMode`/`AttachImage` first, then
+/// `PreparePrompt` with their own admission (so `@path` mentions, `!` notes
+/// and job completions reach the model). The `--prompt` in `args` (required
+/// with `--resume`) is returned instead of being sent as a legacy
+/// `SendPrompt`.
+pub fn spawn_embedded_runtime_deferred(
+    args: Vec<String>,
+    workspace_root: impl Into<PathBuf>,
+) -> Result<(TuiRuntimeHandle, UiChannels, Option<String>), TuiError> {
+    let oauth = OAuthService::production()
+        .map_err(|error| TuiError::new(ExitCode::Auth, error.to_string()))?;
+    let workspace_root = workspace_root.into();
+    let mut startup = prepare_tui_in(args, &oauth, Some(&workspace_root))?;
+    startup.options.workspace_root = Some(workspace_root);
+    let initial_prompt = startup.initial_prompt.take();
+    let (runtime, channels) = spawn_tui_session(startup, oauth).map_err(tui_provider_error)?;
+    Ok((runtime, channels, initial_prompt))
+}
+
 fn spawn_tui_session(
     mut startup: TuiStartup,
     oauth: OAuthService,
@@ -1739,6 +1944,9 @@ struct ActiveRun {
     /// prompt by surprise. A normal run leaves the handle alone, since a
     /// `/compact` queued during it is meant to survive.
     idle_compaction: Option<slim_core::context::CompactionHandle>,
+    /// A wake run seeded by a finished model job: it carries no prompt, so
+    /// its end must not pair one into the history bookkeeping.
+    job_wake: bool,
 }
 
 struct ActiveRunLaunch {
@@ -2268,7 +2476,8 @@ impl PendingRun {
 }
 
 struct ActiveLogin {
-    provider: OAuthProvider,
+    /// `None` is Devin's browser login, which ends in a stored key.
+    provider: Option<OAuthProvider>,
     task: tokio::task::JoinHandle<Result<OAuthCredential, OAuthError>>,
     progress: tokio::task::JoinHandle<()>,
     cancel: tokio::sync::watch::Sender<bool>,
@@ -2350,6 +2559,17 @@ fn apply_mode_change(startup: &mut TuiStartup, sink: &EventSink, mode: slim_core
     let _ = sink.send(UiEvent::ModeChanged { mode });
 }
 
+/// Messages the run ended without delivering re-enter the prompt queue as
+/// ordinary queued prompts (FIFO), surfaced as `QueuedUser` blocks.
+fn refund_steers(options: &ProviderRunOptions, sink: &EventSink) {
+    let Some(inbox) = options.steer_inbox.as_ref() else {
+        return;
+    };
+    for (position, text) in inbox.drain().into_iter().enumerate() {
+        let _ = sink.send(UiEvent::QueuedUserAdded { text, position });
+    }
+}
+
 fn run_worker(
     mut startup: TuiStartup,
     oauth: OAuthService,
@@ -2395,6 +2615,9 @@ fn run_worker(
         };
         if let Some(preflight) = &startup.resume_preflight { jobs.restore_lost(&session_job_metadata(preflight)); }
         startup.options.shell_jobs = Some(jobs.clone());
+        // One inbox for the whole worker: the shared handle is cloned into
+        // every spawned run's options, so mid-run steers reach the live run.
+        startup.options.steer_inbox = Some(slim_core::runtime::SteerInbox::default());
         let _job_scope = jobs.scope();
         let mut job_persist_at=tokio::time::Instant::now()+Duration::from_secs(1);
         let watcher_jobs = jobs.clone();
@@ -2532,6 +2755,7 @@ fn run_worker(
         let zen_catalog = OpenCodeZenCatalog::production().ok();
         let command_code_catalog = CommandCodeCatalog::production().ok();
         let open_design_catalog = OpenDesignCatalog::production().ok();
+        let devin_catalog = crate::devin_catalog::DevinCatalog::production().ok();
         // A client that cannot be built disables the ClinePass live refresh
         // (announced when requested), like a missing catalog path does.
         let cline_client = reqwest::Client::builder()
@@ -2544,20 +2768,16 @@ fn run_worker(
         let cline_refresh = RefreshGate::default();
         let command_code_refresh = RefreshGate::default();
         let open_design_refresh = RefreshGate::default();
+        let devin_refresh = RefreshGate::default();
         // Project LSP launch overrides held back by trust are announced once;
         // the manager was built at startup, so trusting takes a restart.
-        if let Ok(layered) = crate::config::load_layered() {
-            let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let trust = crate::code_intel::project_trust(
-                &layered.lsp,
-                &workspace,
-                startup.options.trust_project,
-            );
-            if let Some(notice) = trust.notice {
-                let _ = sink.send(UiEvent::Notification {
-                    message: format!("{notice}; /mcp trust e reinicie o Slim para aplicar"),
-                });
-            }
+        if let Some(notice) = project_lsp_trust_notice(
+            startup.options.workspace_root.as_deref(),
+            startup.options.trust_project,
+        ) {
+            let _ = sink.send(UiEvent::Notification {
+                message: format!("{notice}; /mcp trust e reinicie o Slim para aplicar"),
+            });
         }
         // Application-scoped MCP manager: built once from layered config,
         // never spawns a process until a server is actually exercised.
@@ -2566,7 +2786,11 @@ fn run_worker(
             // Servers that cannot start (untrusted project, unresolved
             // values) stay listed in /mcp and are announced once here;
             // an unreadable config disables MCP loudly, never silently.
-            match crate::mcp::load_mcp(&cwd, startup.options.trust_project) {
+            match crate::mcp::load_mcp(
+                &cwd,
+                startup.options.trust_project,
+                startup.options.host_mcp_config.as_deref(),
+            ) {
                 Ok(load) => {
                     if let Some(manager) = crate::mcp::build_mcp_manager(&load, &cwd) {
                         // Enabled, trusted, non-lazy servers connect while the
@@ -2601,6 +2825,10 @@ fn run_worker(
         // re-send an identical one a second later.
         let mcp_seen_revision = Arc::new(AtomicU64::new(0_u64));
         let mut mcp_watch_tick = tokio::time::interval(Duration::from_secs(1));
+        let mut job_wake_tick = tokio::time::interval(Duration::from_millis(500));
+        // One shared handle cloned once: the select arm borrows it instead of
+        // `startup` so `receive_tui_command` can keep its `&mut` borrow.
+        let wake_jobs = startup.options.shell_jobs.clone();
         let mcp_inflight = Arc::new(Mutex::new(HashSet::<String>::new()));
         let mcp_logins: mcp_login::McpLogins = Arc::default();
         loop {
@@ -2663,6 +2891,10 @@ fn run_worker(
                         ..
                     })) => {
                         reject_user_shell(&sink, request_id, "Aguarde ou cancele a preparação ativa");
+                        preparing = Some(prompt_prep);
+                    }
+                    PromptPreparationEvent::Command(Some(UiCommand::Steer(text))) => {
+                        let _ = sink.send(UiEvent::QueuedUserAdded { text, position: 0 });
                         preparing = Some(prompt_prep);
                     }
                     PromptPreparationEvent::Command(Some(command))
@@ -2894,10 +3126,13 @@ fn run_worker(
                     LoginEvent::Finished(result) => {
                         let current = login.take().expect("active login");
                         let _ = current.progress.await;
-                        match result {
-                            Ok(Ok(credential)) => {
+                        match (current.provider, result) {
+                            (None, Ok(Ok(credential))) => {
+                                finish_devin_login(&mut startup, &sink, credential.access).await;
+                            }
+                            (Some(provider), Ok(Ok(credential))) => {
                                 match oauth_request(
-                                    current.provider,
+                                    provider,
                                     &credential,
                                     startup.mode,
                                     startup.endpoint_override.as_deref(),
@@ -2905,17 +3140,13 @@ fn run_worker(
                                 ) {
                                     Ok(request) => {
                                         startup.request = Some(request);
-                                        startup.oauth_session =
-                                            Some((current.provider, credential));
+                                        startup.oauth_session = Some((provider, credential));
                                         let _ = sink.send(UiEvent::AuthStateChanged {
-                                            provider: Some(login_provider(current.provider)),
+                                            provider: Some(login_provider(provider)),
                                             authenticated: true,
                                         });
                                         let _ = sink.send(UiEvent::Notification {
-                                            message: format!(
-                                                "Connected: {}",
-                                                current.provider.label()
-                                            ),
+                                            message: format!("Connected: {}", provider.label()),
                                         });
                                     }
                                     Err(error) => {
@@ -2926,12 +3157,12 @@ fn run_worker(
                                     }
                                 }
                             }
-                            Ok(Err(error)) => {
+                            (_, Ok(Err(error))) => {
                                 let _ = sink.send(UiEvent::LoginFailed {
                                     message: error.to_string(),
                                 });
                             }
-                            Err(_) => {
+                            (_, Err(_)) => {
                                 let _ = sink.send(UiEvent::LoginFailed {
                                     message: "OAuth task failed".into(),
                                 });
@@ -2976,7 +3207,7 @@ fn run_worker(
                         }
                     }
                     ActiveEvent::Command(None) => {
-                        let _ = abort_active(&mut active).await;
+                        let _ = abort_active(&mut active, &startup.options, &sink).await;
                         break;
                     }
                     ActiveEvent::Command(Some(UiCommand::CancelPromptPreparation { admission })) => {
@@ -3006,8 +3237,13 @@ fn run_worker(
                         }
                         let now = Instant::now();
                         if esc_forces_quit(last_esc_at, now) {
-                            pending =
-                                abort_active_with_grace(&mut active, Duration::ZERO).await;
+                            pending = abort_active_with_grace(
+                                &mut active,
+                                &startup.options,
+                                &sink,
+                                Duration::ZERO,
+                            )
+                            .await;
                             last_esc_at = None;
                         } else if let Some(run) = active.as_mut() {
                             let run_id = run.run_id;
@@ -3026,12 +3262,17 @@ fn run_worker(
                         }
                     }
                     ActiveEvent::CancelTimeout => {
-                        pending =
-                            abort_active_with_grace(&mut active, Duration::ZERO).await;
+                        pending = abort_active_with_grace(
+                            &mut active,
+                            &startup.options,
+                            &sink,
+                            Duration::ZERO,
+                        )
+                        .await;
                         last_esc_at = None;
                     }
                     ActiveEvent::Command(Some(UiCommand::Shutdown)) => {
-                        let _ = abort_active(&mut active).await;
+                        let _ = abort_active(&mut active, &startup.options, &sink).await;
                         let _ = sink.send(UiEvent::Shutdown);
                         break;
                     }
@@ -3107,6 +3348,25 @@ fn run_worker(
                             "Aguarde ou cancele a execução antes de rodar um comando com !",
                         );
                     }
+                    ActiveEvent::Command(Some(UiCommand::Steer(text))) => {
+                        let delivered = startup
+                            .options
+                            .steer_inbox
+                            .as_ref()
+                            .is_some_and(|inbox| inbox.push(text.clone()));
+                        if delivered {
+                            let display = startup
+                                .request
+                                .as_ref()
+                                .map(|request| redact_for_ui(&text, &request.api_key))
+                                .unwrap_or_else(|| text.clone());
+                            let _ = sink.send(UiEvent::UserMessageAdded { text: display });
+                        } else {
+                            let _ = sink.send(UiEvent::Notification {
+                                message: "Limite de mensagens em trânsito atingido".into(),
+                            });
+                        }
+                    }
                     ActiveEvent::Command(Some(command)) if sessions::is_session_command(&command) => {
                         sessions::refuse_session_command(
                             &sink,
@@ -3150,6 +3410,10 @@ fn run_worker(
                         // (not RunFailed) via send_cancel_result.
                         let esc_cancelled = last_esc_at.is_some();
                         last_esc_at = None;
+                        // The task is done: nothing can drain the inbox
+                        // anymore, so undelivered steers go back to the queue
+                        // before the terminal event reaches the UI.
+                        refund_steers(&startup.options, &sink);
                         if let Ok(Ok(execution)) = &*result {
                             for message in &execution.warnings {
                                 let _ = sink.send(UiEvent::Notification {
@@ -3167,7 +3431,9 @@ fn run_worker(
                             }
                             if let Some(history) = execution.history.as_ref() {
                                 startup.options.history.clone_from(history);
-                            } else if execution.result.code == ExitCode::Success {
+                            } else if execution.result.code == ExitCode::Success
+                                && !active.as_ref().is_some_and(|run| run.job_wake)
+                            {
                                 if let Some(request) = startup.request.as_ref() {
                                     record_completed_turn(
                                         &mut startup.options,
@@ -3202,26 +3468,37 @@ fn run_worker(
                 continue;
             }
 
-            let command = if mcp_watch {
+            let command = tokio::select! {
+                command = receive_tui_command(&mut async_rx, &mut startup, &sink, true, job_persist_at) => command,
                 // Status polling only runs while the /mcp overlay is open; a
                 // revision counter keeps identical snapshots off the UI lane.
-                tokio::select! {
-                    command = receive_tui_command(&mut async_rx, &mut startup, &sink, true, job_persist_at) => command,
-                    _ = mcp_watch_tick.tick() => {
-                        if let Some(manager) = mcp_manager.as_ref() {
-                            let revision = manager.revision();
-                            if revision != mcp_seen_revision.load(Ordering::Relaxed) {
-                                mcp_seen_revision.store(revision, Ordering::Relaxed);
-                                let _ = sink.send(UiEvent::McpServersChanged {
-                                    servers: mcp_server_views(manager),
-                                });
-                            }
+                _ = mcp_watch_tick.tick(), if mcp_watch => {
+                    if let Some(manager) = mcp_manager.as_ref() {
+                        let revision = manager.revision();
+                        if revision != mcp_seen_revision.load(Ordering::Relaxed) {
+                            mcp_seen_revision.store(revision, Ordering::Relaxed);
+                            let _ = sink.send(UiEvent::McpServersChanged {
+                                servers: mcp_server_views(manager),
+                            });
                         }
-                        continue;
                     }
+                    continue;
                 }
-            } else {
-                receive_tui_command(&mut async_rx, &mut startup, &sink, true, job_persist_at).await
+                // A model job that finished while idle wakes the agent so its
+                // completion is delivered inside a run of its own. The tick
+                // only arms while something can still wake: no live or
+                // unclaimed work means zero polling.
+                _ = job_wake_tick.tick(), if wake_jobs.as_ref().is_some_and(|jobs| jobs.may_wake()) => {
+                    maybe_start_job_wake(
+                        &mut startup,
+                        &sink,
+                        content_store.clone(),
+                        &mut next_run_id,
+                        &mut active,
+                    )
+                    .await;
+                    continue;
+                }
             };
             let Some(command) = command else {
                 break;
@@ -3370,7 +3647,9 @@ fn run_worker(
                 UiCommand::ListTurns { request_id } => {
                     sessions::serve_turn_list(&startup, &sink, request_id);
                 }
-                UiCommand::ResumeSession { .. } | UiCommand::RewindSession { .. }
+                UiCommand::ResumeSession { .. }
+                | UiCommand::RewindSession { .. }
+                | UiCommand::NewSession
                     if user_shell.as_ref().is_some_and(UserShellRun::is_running) =>
                 {
                     let _ = sink.send(UiEvent::Notification {
@@ -3386,6 +3665,9 @@ fn run_worker(
                         &id,
                     );
                 }
+                UiCommand::NewSession => {
+                    start_new_session(&mut startup, &sink, &mut skill_memo, &user_shell_context);
+                }
                 UiCommand::RewindSession { first_seq } => {
                     sessions::rewind_current_session(
                         &mut startup,
@@ -3397,7 +3679,9 @@ fn run_worker(
                 }
                 UiCommand::StartLogin(provider) => {
                     if let Some(provider) = oauth_provider(provider) {
-                        login = Some(start_login(oauth.clone(), provider, sink.clone()));
+                        login = Some(start_login(oauth.clone(), Some(provider), sink.clone()));
+                    } else if provider == LoginProvider::Devin {
+                        login = Some(start_login(oauth.clone(), None, sink.clone()));
                     } else {
                         let _ = sink.send(UiEvent::LoginFailed {
                             message: "This provider uses the API-key form.".into(),
@@ -3615,6 +3899,48 @@ fn run_worker(
                         },
                     );
                 }
+                UiCommand::RefreshDevinModels => {
+                    let Some(catalog) = devin_catalog.clone() else {
+                        let _ = sink.send(UiEvent::Notification {
+                            message: "Devin catalog path is unavailable".into(),
+                        });
+                        continue;
+                    };
+                    let _ = sink.send(devin_catalog_event(catalog.load_or_fallback()));
+                    if startup.endpoint_override.is_some() {
+                        continue;
+                    }
+                    let api_key = match startup
+                        .request
+                        .as_ref()
+                        .filter(|request| request.kind == ProviderKind::Devin)
+                    {
+                        Some(request) => Some(request.api_key.clone()),
+                        None => tokio::task::spawn_blocking(|| {
+                            crate::auth::resolve_api_key(ProviderKind::Devin)
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .flatten(),
+                    };
+                    let Some(api_key) = api_key else {
+                        continue;
+                    };
+                    let sink = sink.clone();
+                    devin_refresh.spawn(
+                        async move { catalog.refresh(&api_key).await },
+                        move |result| {
+                            let _ = sink.send(match result {
+                                Ok(snapshot) => devin_catalog_event(snapshot),
+                                Err(error) => live_catalog_unavailable(
+                                    "Devin",
+                                    provider_error_message(error),
+                                ),
+                            });
+                        },
+                    );
+                }
                 UiCommand::RefreshCommandCodeModels => {
                     let Some(catalog) = command_code_catalog.clone() else {
                         let _ = sink.send(UiEvent::Notification {
@@ -3658,6 +3984,9 @@ fn run_worker(
                 }
                 UiCommand::SetOpenDesignModel { model, effort } => {
                     switch_api_key_model(LoginProvider::OpenDesign, &mut startup, &oauth, &sink, model, effort);
+                }
+                UiCommand::SetDevinModel { model, effort } => {
+                    switch_api_key_model(LoginProvider::Devin, &mut startup, &oauth, &sink, model, effort);
                 }
                 UiCommand::SetXaiModel { model, effort } => {
                     switch_api_key_model(LoginProvider::Xai, &mut startup, &oauth, &sink, model, effort);
@@ -3712,6 +4041,11 @@ fn run_worker(
                             message: "Selecione um modelo antes de salvar o padrão".into(),
                         });
                     }
+                }
+                UiCommand::Steer(text) => {
+                    // No run is active: a steer becomes an ordinary queued
+                    // prompt, which the next run boundary drains normally.
+                    let _ = sink.send(UiEvent::QueuedUserAdded { text, position: 0 });
                 }
                 UiCommand::SendPrompt(prompt) if !prompt.trim().is_empty() => {
                     let skill_instructions = match startup.options.workspace_root.as_deref() {
@@ -4396,6 +4730,21 @@ fn redact_mcp_text(manager: &McpManager, input: &str) -> String {
 
 /// Workspace root MCP configuration, trust and server working directories
 /// are anchored to.
+/// The notice for project LSP launch overrides held back by trust, read
+/// like `prepare_tui_in` does: from the host's workspace when there is one
+/// (an embedded runtime), else from the process directory.
+fn project_lsp_trust_notice(workspace_root: Option<&Path>, trust_project: bool) -> Option<String> {
+    let layered = match workspace_root {
+        Some(root) => crate::config::load_layered_for(root),
+        None => crate::config::load_layered(),
+    }
+    .ok()?;
+    let workspace = workspace_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    crate::code_intel::project_trust(&layered.lsp, &workspace, trust_project).notice
+}
+
 fn mcp_workspace(startup: &TuiStartup) -> PathBuf {
     startup
         .options
@@ -4412,7 +4761,11 @@ fn reload_mcp(
     mcp_manager: &mut Option<Arc<McpManager>>,
 ) -> Result<crate::mcp::McpLoad, String> {
     let cwd = mcp_workspace(startup);
-    let load = crate::mcp::load_mcp(&cwd, startup.options.trust_project)?;
+    let load = crate::mcp::load_mcp(
+        &cwd,
+        startup.options.trust_project,
+        startup.options.host_mcp_config.as_deref(),
+    )?;
     match mcp_manager.as_ref() {
         Some(manager) => {
             manager.reconcile(load.specs.clone());
@@ -4682,7 +5035,11 @@ fn service_pending_command(
     }
 }
 
-fn start_login(oauth: OAuthService, provider: OAuthProvider, sink: EventSink) -> ActiveLogin {
+fn start_login(
+    oauth: OAuthService,
+    provider: Option<OAuthProvider>,
+    sink: EventSink,
+) -> ActiveLogin {
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let progress = tokio::spawn(async move {
@@ -4697,7 +5054,12 @@ fn start_login(oauth: OAuthService, provider: OAuthProvider, sink: EventSink) ->
             sink.send(event);
         }
     });
-    let task = tokio::spawn(async move { oauth.login(provider, progress_tx, cancel_rx).await });
+    let task = tokio::spawn(async move {
+        match provider {
+            Some(provider) => oauth.login(provider, progress_tx, cancel_rx).await,
+            None => oauth.login_devin(progress_tx, cancel_rx).await,
+        }
+    });
     ActiveLogin {
         provider,
         task,
@@ -4761,11 +5123,7 @@ fn codex_catalog_event(
                     .map(|model| model.reasoning_levels.to_vec())
                     .unwrap_or_default()
             } else {
-                entry
-                    .reasoning_levels
-                    .iter()
-                    .map(String::as_str)
-                    .collect()
+                entry.reasoning_levels.iter().map(String::as_str).collect()
             };
             OpenCodeModelView {
                 id: entry.slug.clone(),
@@ -4899,6 +5257,33 @@ fn open_design_catalog_event(
     UiEvent::OpenDesignCatalogLoaded { models, source }
 }
 
+fn devin_catalog_event(
+    snapshot: crate::devin_catalog::DevinCatalogSnapshot,
+) -> UiEvent {
+    let models = snapshot
+        .models
+        .into_iter()
+        .map(|model| OpenCodeModelView {
+            reasoning_levels: model
+                .effort_routes
+                .iter()
+                .filter_map(|(effort, _)| ReasoningEffort::parse(effort))
+                .collect(),
+            id: model.id,
+            name: model.name,
+            context_window_tokens: model.context_window,
+            max_output_tokens: u64::from(model.max_output_tokens),
+            accepts_images: model.accepts_images,
+        })
+        .collect();
+    let source = match snapshot.source {
+        crate::command_code_catalog::CatalogSource::Live => DevinCatalogSource::Live,
+        crate::command_code_catalog::CatalogSource::Cache => DevinCatalogSource::Cache,
+        crate::command_code_catalog::CatalogSource::Fallback => DevinCatalogSource::Fallback,
+    };
+    UiEvent::DevinCatalogLoaded { models, source }
+}
+
 fn oauth_provider(provider: LoginProvider) -> Option<OAuthProvider> {
     match provider {
         LoginProvider::Anthropic => Some(OAuthProvider::Anthropic),
@@ -4908,7 +5293,8 @@ fn oauth_provider(provider: LoginProvider) -> Option<OAuthProvider> {
         | LoginProvider::OpenCodeZen
         | LoginProvider::ClinePass
         | LoginProvider::CommandCode
-        | LoginProvider::OpenDesign => None,
+        | LoginProvider::OpenDesign
+        | LoginProvider::Devin => None,
     }
 }
 
@@ -5578,6 +5964,100 @@ fn request_compaction_during_run(
     }
 }
 
+/// Model jobs that finished while the agent was idle wake it: a run seeded
+/// with the session history; the loop itself delivers the completions as
+/// user messages at the first turn boundary.
+async fn maybe_start_job_wake(
+    startup: &mut TuiStartup,
+    sink: &EventSink,
+    content_store: SharedContentStore,
+    next_run_id: &mut u64,
+    active: &mut Option<ActiveRun>,
+) {
+    if startup
+        .request
+        .as_ref()
+        .is_none_or(|request| request.prompt.trim().is_empty())
+    {
+        return;
+    }
+    if !startup
+        .options
+        .shell_jobs
+        .as_ref()
+        .is_some_and(|jobs| jobs.take_pending_model_completions())
+    {
+        return;
+    }
+    let Some(run_id) = take_run_id(next_run_id) else {
+        return;
+    };
+    // `job_wake` skips the prompt push, so the run is seeded with the session
+    // history only and the completions land as its user input. `prompt` keeps
+    // its stale (non-empty) value because the run gates require it; it never
+    // reaches the model, only this run's durable input record.
+    let request = startup.request.clone().expect("checked");
+    let (max_mutating, max_read, max_turns) = match (
+        resolve_max_mutating_tool_calls(&startup.options),
+        resolve_max_read_tool_calls(&startup.options),
+        resolve_max_turns(&startup.options),
+    ) {
+        (Ok(max_mutating), Ok(max_read), Ok(max_turns)) => (max_mutating, max_read, max_turns),
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+            let _ = sink.send(UiEvent::RunFailed {
+                run_id: None,
+                message: provider_error_message(error),
+            });
+            return;
+        }
+    };
+    let _ = sink.send(UiEvent::run_started_with_budget(
+        run_id,
+        max_mutating,
+        max_read,
+        max_turns,
+    ));
+    let mut options = startup.options.clone();
+    options.job_wake = true;
+    let resume_preflight = if startup
+        .options
+        .shell_jobs
+        .as_ref()
+        .is_some_and(|j| !j.list().is_empty())
+    {
+        startup.resume_preflight = None;
+        None
+    } else {
+        startup.resume_preflight.take()
+    };
+    match start_active_run(
+        run_id,
+        None,
+        ActiveRunLaunch {
+            request,
+            options,
+            skill_instructions: None,
+        },
+        startup.resume_path.clone(),
+        resume_preflight,
+        sink.clone(),
+        content_store,
+    ) {
+        Ok(run) => {
+            *active = Some(run);
+            let _ = sink.send(UiEvent::Notification {
+                message: "Job em segundo plano concluído · o agente retomou para processar".into(),
+            });
+        }
+        Err(message) => {
+            let _ = sink.send(UiEvent::RunFailed {
+                run_id: Some(run_id),
+                message,
+            });
+        }
+    }
+}
+
 /// `/compact` while the session is idle: the summary is produced right away as
 /// a run of its own (cancellable, durable, usage-recorded) that ends without a
 /// model turn. The compacted history comes back through the run's execution
@@ -5753,6 +6233,7 @@ fn start_active_run(
         })
         .map_err(|error| format!("TUI projector thread: {error}"))?;
     options.cancellation = Some(cancellation.clone());
+    let job_wake = options.job_wake;
     let idle_compaction = if options.compact_only {
         options.compaction.clone()
     } else {
@@ -5833,6 +6314,7 @@ fn start_active_run(
         manual_retry,
         workspace_root: Some(workspace_root),
         idle_compaction,
+        job_wake,
     })
 }
 
@@ -5849,12 +6331,18 @@ fn esc_forces_quit(last_esc_at: Option<Instant>, now: Instant) -> bool {
     last_esc_at.is_some_and(|at| now.duration_since(at) <= ESC_FORCE_WINDOW)
 }
 
-async fn abort_active(active: &mut Option<ActiveRun>) -> Option<PendingRun> {
-    abort_active_with_grace(active, ESC_GRACE_PERIOD).await
+async fn abort_active(
+    active: &mut Option<ActiveRun>,
+    options: &ProviderRunOptions,
+    sink: &EventSink,
+) -> Option<PendingRun> {
+    abort_active_with_grace(active, options, sink, ESC_GRACE_PERIOD).await
 }
 
 async fn abort_active_with_grace(
     active: &mut Option<ActiveRun>,
+    options: &ProviderRunOptions,
+    sink: &EventSink,
     grace: Duration,
 ) -> Option<PendingRun> {
     if let Some(mut run) = active.take() {
@@ -5873,6 +6361,8 @@ async fn abort_active_with_grace(
         if let Some(handle) = &run.idle_compaction {
             handle.clear_manual();
         }
+        // The task is dead: undelivered steers re-enter the prompt queue.
+        refund_steers(options, sink);
         Some(PendingRun {
             jobs: None,
             run_id: run.run_id,

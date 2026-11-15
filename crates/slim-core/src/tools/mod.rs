@@ -39,6 +39,7 @@ pub use code_intel::{
 };
 pub use list::{list_directory, DEFAULT_MAX_ENTRIES, MAX_ENTRIES_CAP};
 pub use patch::apply_exact_patch;
+pub(crate) use read::page_lines as read_page_lines;
 pub use read::{read_file, read_file_range, DEFAULT_MAX_READ_LINES, MAX_READ_LINES_CAP};
 pub(crate) use schema::compact_provider_definitions;
 pub use search::{
@@ -51,6 +52,7 @@ pub use shell::{
     run_shell_timeout_cancellable_with_progress, ShellProgress, TimedShellOutput,
 };
 pub use write::{write_file, FilePrecondition, MAX_MUTATING_FILE_BYTES};
+pub(crate) use write::link_or_rename_into_gap;
 
 // Bounds the stored summary; tool rows still fit it to the terminal width,
 // so this only needs to cover a wide row's command or path.
@@ -1166,9 +1168,9 @@ impl ToolRegistry {
         let mut cache = lock_mutex(&self.services.evidence_cache);
         cache.retain(|entry| {
             !entry.outcome.receipt.dependencies.iter().any(|dependency| {
-                identities
-                    .iter()
-                    .any(|identity| identity == &path_identity(&dependency.path))
+                // One identity per dependency, not one per path compared.
+                let dependency = path_identity(&dependency.path);
+                identities.contains(&dependency)
             })
         });
     }
@@ -1554,7 +1556,11 @@ impl ToolRegistry {
             });
         }
         if result.capture_may_be_incomplete {
-            output.push_str("\n[note: pipe capture may be incomplete after interruption]");
+            output.push_str(if result.timed_out || result.cancelled || result.interrupted {
+                "\n[note: pipe capture may be incomplete after interruption]"
+            } else {
+                "\n[note: the command exited but a process it started kept its output open; that process was stopped and later output is not captured. For a long-lived process use background=true]"
+            });
         }
         if args.is_none()
             && shell::script_shell_is_windows_powershell(&self.services.process_runner)
@@ -1870,7 +1876,7 @@ fn cap_shell_bytes(raw: &[u8], previously_discarded_bytes: usize, basis: &str) -
 
 macro_rules! shell_tool_description_tail {
     () => {
-        "Inspect workspace metadata before Git. Exit status alone does not validate the task. Use file tools for edits. In the agent loop, returns a job after yield_ms; continue independent work. Completion is delivered automatically; use shell_job to list, inspect, read output, wait, interrupt or cancel; do not poll. background=true yields immediately. TUI jobs survive responses within the session; headless waits. Run cancellation stops jobs launched by that run; do not detach child processes. Avoid concurrent edits to files used by a running job."
+        "Inspect workspace metadata before Git. Exit status alone does not validate the task. Use file tools for edits. In the agent loop, returns a job after yield_ms; continue independent work. Completion is delivered automatically; use shell_job to list, inspect, read output, wait, interrupt or cancel; do not poll. background=true yields immediately. stdin=true pipes the job's stdin; feed it with shell_job input (eof closes it). TUI jobs survive responses within the session; headless waits. Run cancellation stops jobs launched by that run; do not detach child processes. Avoid concurrent edits to files used by a running job."
     };
 }
 /// `shell` tool description: the script form names the interpreter
@@ -1904,7 +1910,7 @@ fn tool_definition(name: &str) -> Value {
     });
     let (description, properties, required) = match name {
         "read" => (
-            "Read exact UTF-8 text; follow the returned offset for more. Complete reads authorize overwrite; prefer search+patch for local edits. For calculations, use shell and return aggregates.",
+            "Read exact UTF-8 text, at most 1000 lines per call; follow the returned offset for more. Complete reads authorize overwrite; prefer search+patch for local edits. For calculations, use shell and return aggregates.",
             json!({"path": {"type": "string", "description": "Workspace-relative path."}, "max_lines": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LINES_CAP, "description": "Page size; omit for automatic sizing."}, "lines": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LINES_CAP, "description": "Alias for `max_lines`."}, "offset": {"type": "integer", "minimum": 1, "description": "First line (1-based); omit for line 1."}}),
             json!(["path"]),
         ),
@@ -1960,7 +1966,7 @@ fn tool_definition(name: &str) -> Value {
         ),
         "shell" => (
             SHELL_TOOL_DESCRIPTION,
-            json!({"command": {"type": "string"}, "args": {"type": ["array", "null"], "items": {"type": "string"}}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_MS, "default": DEFAULT_SHELL_TIMEOUT_MS}, "yield_ms": {"type": "integer", "minimum": 0, "maximum": 10000, "default": 1000}, "background": {"type": "boolean", "default": false}}),
+            json!({"command": {"type": "string"}, "args": {"type": ["array", "null"], "items": {"type": "string"}}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_MS, "default": DEFAULT_SHELL_TIMEOUT_MS}, "yield_ms": {"type": "integer", "minimum": 0, "maximum": 10000, "default": 1000}, "background": {"type": "boolean", "default": false}, "stdin": {"type": "boolean", "default": false}}),
             json!(["command"]),
         ),
         _ => ("Slim tool", json!({}), json!([])),

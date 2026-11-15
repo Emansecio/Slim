@@ -112,13 +112,15 @@ pub struct OAuthEndpoints {
     pub codex_device_verify: String,
     pub xai_device_code: String,
     pub xai_token: String,
+    pub devin_authorize: String,
+    pub devin_token: String,
 }
 
 impl Default for OAuthEndpoints {
     fn default() -> Self {
         Self {
-            anthropic_authorize: "https://claude.ai/oauth/authorize".into(),
-            anthropic_token: "https://api.anthropic.com/v1/oauth/token".into(),
+            anthropic_authorize: "https://platform.claude.com/oauth/authorize".into(),
+            anthropic_token: "https://platform.claude.com/v1/oauth/token".into(),
             codex_authorize: "https://auth.openai.com/oauth/authorize".into(),
             codex_token: "https://auth.openai.com/oauth/token".into(),
             codex_device_code: "https://auth.openai.com/api/accounts/deviceauth/usercode".into(),
@@ -126,6 +128,8 @@ impl Default for OAuthEndpoints {
             codex_device_verify: "https://auth.openai.com/codex/device".into(),
             xai_device_code: "https://auth.x.ai/oauth2/device/code".into(),
             xai_token: "https://auth.x.ai/oauth2/token".into(),
+            devin_authorize: "https://app.devin.ai/auth/cli/continue".into(),
+            devin_token: "https://api.devin.ai/auth/cli/token".into(),
         }
     }
 }

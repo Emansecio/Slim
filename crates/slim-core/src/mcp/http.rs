@@ -1198,7 +1198,12 @@ fn classify_inbound(message: Value, expected_id: Option<u64>) -> Inbound {
                 method: method.unwrap_or_default().to_owned(),
             };
         }
-        if expected_id.is_some() && id.as_u64() == expected_id {
+        // Ids are sent as numbers; a server that echoes one back as a string
+        // still answered this request.
+        let echoed = id
+            .as_u64()
+            .or_else(|| id.as_str().and_then(|text| text.parse().ok()));
+        if expected_id.is_some() && echoed == expected_id {
             return Inbound::Response(extract_result(message));
         }
         return Inbound::Other;
@@ -1814,5 +1819,19 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_ne!(connection.listener_state(), ListenerState::Stopped);
+    }
+
+    #[test]
+    fn a_response_whose_id_came_back_as_a_string_still_answers_its_request() {
+        let message = json!({"jsonrpc": "2.0", "id": "7", "result": {}});
+        assert!(matches!(
+            super::classify_inbound(message, Some(7)),
+            super::Inbound::Response(_)
+        ));
+        let other = json!({"jsonrpc": "2.0", "id": "8", "result": {}});
+        assert!(matches!(
+            super::classify_inbound(other, Some(7)),
+            super::Inbound::Other
+        ));
     }
 }

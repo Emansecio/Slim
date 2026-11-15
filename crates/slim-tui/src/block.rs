@@ -403,22 +403,10 @@ fn is_tool_group_bridge(block: &Block) -> bool {
     is_complete_thinking(block)
 }
 
-/// How long a just-finished tool keeps its own row before joining a group.
-/// Matches the 249 ms emphasis so the row the eye is following does not
-/// vanish in the same frame it turns bold.
-pub const TOOL_GROUP_HOLD_MS: u64 = 249;
-
-pub fn tool_hold_pending(block: &Block, now_ms: u64, reduced_motion: bool) -> bool {
-    !reduced_motion
-        && is_complete_tool(block)
-        && block
-            .ended_ms
-            .is_some_and(|ended| now_ms.saturating_sub(ended) < TOOL_GROUP_HOLD_MS)
-}
-
-pub fn is_presented_complete_tool(block: &Block, now_ms: u64, reduced_motion: bool) -> bool {
-    is_complete_tool(block) && !tool_hold_pending(block, now_ms, reduced_motion)
-}
+/// How long a call that just settled eases from its brighter tone to rest.
+/// The call joins its group in the frame it settles; the group's header
+/// carries this emphasis, so no row appears only to disappear.
+pub const TOOL_SETTLE_MS: u64 = 249;
 
 /// A live call that has finished, successfully or not. Restored calls have no
 /// trustworthy outcome and never join a group.
@@ -427,27 +415,6 @@ pub fn is_settled_tool(block: &Block) -> bool {
         block.lifecycle,
         BlockLifecycle::Complete | BlockLifecycle::Failed
     ) && matches!(block.kind(), BlockKind::Tool(tool) if !tool.historical)
-}
-
-fn is_presented_settled_tool(block: &Block, now_ms: u64, reduced_motion: bool) -> bool {
-    is_presented_complete_tool(block, now_ms, reduced_motion)
-        || (is_settled_tool(block) && block.lifecycle == BlockLifecycle::Failed)
-}
-
-/// Stable while the set of tools still inside [`TOOL_GROUP_HOLD_MS`] does not
-/// change. Height and leader memos key on it so a motion frame does not
-/// rebuild the transcript.
-pub fn tool_hold_epoch(blocks: &[Block], now_ms: u64, reduced_motion: bool) -> u64 {
-    if reduced_motion {
-        return 0;
-    }
-    let mut epoch = 0u64;
-    for block in blocks {
-        if tool_hold_pending(block, now_ms, false) {
-            epoch = epoch.wrapping_mul(31).wrapping_add(block.cache_identity());
-        }
-    }
-    epoch
 }
 
 fn consecutive_tool_span(
@@ -485,20 +452,6 @@ pub fn consecutive_settled_tool_span(blocks: &[Block], index: usize) -> Option<(
     consecutive_tool_span(blocks, index, is_settled_tool)
 }
 
-/// Same span as [`consecutive_settled_tool_span`], excluding successful tools
-/// still inside the completion emphasis. Those keep a row of their own until
-/// the hold expires. Reduced motion settles immediately.
-pub fn consecutive_presented_tool_span(
-    blocks: &[Block],
-    index: usize,
-    now_ms: u64,
-    reduced_motion: bool,
-) -> Option<(usize, usize)> {
-    consecutive_tool_span(blocks, index, |block| {
-        is_presented_settled_tool(block, now_ms, reduced_motion)
-    })
-}
-
 /// Whether a settled span reads as one group: more than one call, at least
 /// one of them successful. Failures alone keep their own rows (or the
 /// identical-failure row).
@@ -511,19 +464,63 @@ pub fn is_tool_group(blocks: &[Block], start: usize, end: usize) -> bool {
 }
 
 /// One failure row under a collapsed group: the first member of a run of
-/// identical failures, how many there were, and whether the same call later
-/// succeeded inside the group.
+/// failures it stands for, how many there were, and whether a later call
+/// inside the group succeeded where they failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GroupFailureRow {
     pub member: usize,
     pub repeats: usize,
     pub recovered: bool,
+    /// The calls were refused before running (see [`rejection_reason`]).
+    pub rejection: bool,
+    /// Every call the row stands for had the same arguments, so the first
+    /// one's target names them all.
+    pub same_call: bool,
+}
+
+/// What a collapsed group shows for its failures: the rows it keeps, and how
+/// many refused calls a later success made moot, which the header counts
+/// instead of listing.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GroupFailures {
+    pub rows: Vec<GroupFailureRow>,
+    pub folded_rejections: usize,
+}
+
+/// Failure texts of a call the tool refused before anything ran: a malformed
+/// argument or an edit precondition. The model corrects these itself.
+const REJECTION_MARKERS: [&str; 3] = [
+    "has unknown argument",
+    "no write applied",
+    "expected one match",
+];
+
+/// The reason a failed call was refused before running, as its row reads it,
+/// or None for a failure that ran (a command that exited non-zero, say).
+pub fn rejection_reason(block: &Block) -> Option<&str> {
+    let BlockKind::Tool(tool) = block.kind() else {
+        return None;
+    };
+    if block.lifecycle != BlockLifecycle::Failed {
+        return None;
+    }
+    let line = tool.preview.lines().next().unwrap_or_default();
+    let line = line
+        .find("[note:")
+        .map_or(line, |start| &line[..start])
+        .trim_end_matches([' ', '·']);
+    REJECTION_MARKERS
+        .iter()
+        .any(|marker| line.contains(marker))
+        .then_some(line)
 }
 
 /// Failures a collapsed group still shows. Identical consecutive failures
 /// share one row; a call retried with the same arguments that then succeeded
-/// is marked `recovered` instead of disappearing.
-pub fn group_failure_rows(members: &[Block]) -> Vec<GroupFailureRow> {
+/// is marked `recovered` instead of disappearing. Refused calls share a row by
+/// reason whatever their arguments, and leave the rows once a later call of
+/// the same tool (on the same file, for edits) succeeded.
+pub fn group_failures(members: &[Block]) -> GroupFailures {
     let call = |block: &Block| match block.kind() {
         BlockKind::Tool(tool) => Some((tool.name.clone(), tool.arguments_summary.clone())),
         _ => None,
@@ -533,7 +530,29 @@ pub fn group_failure_rows(members: &[Block]) -> Vec<GroupFailureRow> {
         if !is_failed_tool(member) {
             continue;
         }
-        if let Some(last) = rows.last_mut() {
+        if let Some(reason) = rejection_reason(member) {
+            let recovered = rejection_recovered(members, index);
+            let same = rows.iter_mut().find(|row| {
+                row.rejection
+                    && tool_name(&members[row.member]) == tool_name(member)
+                    && rejection_reason(&members[row.member]) == Some(reason)
+            });
+            if let Some(row) = same {
+                row.repeats += 1;
+                row.recovered &= recovered;
+                row.same_call &= call(&members[row.member]) == call(member);
+                continue;
+            }
+            rows.push(GroupFailureRow {
+                member: index,
+                repeats: 1,
+                recovered,
+                rejection: true,
+                same_call: true,
+            });
+            continue;
+        }
+        if let Some(last) = rows.iter_mut().rev().find(|row| !row.rejection) {
             let previous = &members[last.member];
             if failed_tool_signature(previous) == failed_tool_signature(member)
                 && call(previous) == call(member)
@@ -552,9 +571,64 @@ pub fn group_failure_rows(members: &[Block]) -> Vec<GroupFailureRow> {
             member: index,
             repeats: 1,
             recovered,
+            rejection: false,
+            same_call: true,
         });
     }
-    rows
+    let folded_rejections = rows
+        .iter()
+        .filter(|row| row.rejection && row.recovered)
+        .map(|row| row.repeats)
+        .sum();
+    rows.retain(|row| !(row.rejection && row.recovered));
+    GroupFailures {
+        rows,
+        folded_rejections,
+    }
+}
+
+/// The rows of [`group_failures`], for row accounting.
+pub fn group_failure_rows(members: &[Block]) -> Vec<GroupFailureRow> {
+    group_failures(members).rows
+}
+
+fn tool_name(block: &Block) -> Option<&str> {
+    match block.kind() {
+        BlockKind::Tool(tool) => Some(tool.name.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether a later call made a refused one moot: an edit that later landed on
+/// the same file (by either edit tool), or any later success of the same tool
+/// when the refused call names no file.
+fn rejection_recovered(members: &[Block], index: usize) -> bool {
+    let BlockKind::Tool(failed) = members[index].kind() else {
+        return false;
+    };
+    let edits = |name: &str| matches!(name, "write" | "patch");
+    let target = |summary: &str| {
+        summary
+            .split(" · ")
+            .map(str::trim)
+            .find(|part| !part.is_empty())
+            .map(str::to_owned)
+    };
+    let failed_target = target(&failed.arguments_summary);
+    members[index + 1..].iter().any(|later| {
+        let BlockKind::Tool(tool) = later.kind() else {
+            return false;
+        };
+        if !is_complete_tool(later) {
+            return false;
+        }
+        match &failed_target {
+            Some(path) if edits(&failed.name) => {
+                edits(&tool.name) && target(&tool.arguments_summary).as_ref() == Some(path)
+            }
+            _ => tool.name == failed.name,
+        }
+    })
 }
 
 /// The `● Slim` header that opens the agent's side of a turn. It belongs to
@@ -574,17 +648,17 @@ pub struct ResponseHeader {
 
 impl ResponseHeader {
     /// The header a prompt shows while it waits for the agent's first output:
-    /// the label and its rule, with no blank row above.
+    /// the label row, with no blank row above.
     pub const PENDING: Self = Self {
         cancelled: false,
         failed: false,
         lead_blank: false,
     };
 
-    /// Label row plus the rule that closes the header, and the blank row a
-    /// notice before it asks for.
+    /// The label row, which carries the rule that opens the turn, and the
+    /// blank row a notice before it asks for.
     pub fn rows(self) -> usize {
-        2 + usize::from(self.lead_blank)
+        1 + usize::from(self.lead_blank)
     }
 
     pub fn cache_tag(self) -> u64 {
@@ -662,6 +736,29 @@ pub fn response_header(blocks: &[Block], index: usize) -> Option<ResponseHeader>
         failed,
         lead_blank,
     })
+}
+
+/// Prose the agent wrote on the way to something else in the same turn: a
+/// thought, a call or more prose follows it before the next prompt. The last
+/// prose of a turn is its answer. A receipt or a command the user ran (`!`)
+/// closes the agent's side, so nothing after them makes the answer a note.
+pub fn is_narration(blocks: &[Block], index: usize) -> bool {
+    let Some(block) = blocks.get(index) else {
+        return false;
+    };
+    if !matches!(block.kind(), BlockKind::Assistant(_)) {
+        return false;
+    }
+    for later in &blocks[index + 1..] {
+        match later.kind() {
+            BlockKind::User(_) | BlockKind::Receipt(_) => return false,
+            BlockKind::Tool(tool) => return !tool.arguments_summary.starts_with("! "),
+            BlockKind::Thinking(_) => return true,
+            BlockKind::Assistant(text) if !text.trim().is_empty() => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// One breathing row where the agent switches between prose and work inside
@@ -1125,9 +1222,7 @@ mod turn_layout_tests {
                 removed: 1,
                 stats_partial: false,
                 commands: 0,
-                failed_commands: 0,
                 last_command_ok: None,
-                duration_ms: 1_000,
                 outcome: crate::receipt::ReceiptOutcome::Completed,
             }),
             BlockLifecycle::Complete,
@@ -1187,8 +1282,8 @@ mod turn_layout_tests {
         let after_notice = [user(), system(), tool()];
         let header = response_header(&after_notice, 2).expect("header");
         assert!(header.lead_blank);
-        assert_eq!(header.rows(), 3);
-        assert_eq!(leading_rows(&after_notice, 2), 3);
+        assert_eq!(header.rows(), 2);
+        assert_eq!(leading_rows(&after_notice, 2), 2);
         assert!(
             response_header(&after_notice, 1).is_none(),
             "notices do not open a turn"

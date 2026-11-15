@@ -1,10 +1,11 @@
 # Slim
 
-**Visual do transcript, 18/10/2026:** cada turno abre com o rail `▌` na primeira
-coluna — marfim no prompt, verde no agente — e o cabeçalho `● Slim` fecha com uma
-régua. O cabeçalho `● Você` fica em linha própria, corpo alinhado ao rótulo e
-fundo igual ao histórico. Apenas o marcador do prompt recebe realce breve ao
-enviar; com movimento reduzido, permanece estático.
+**Visual do transcript, 13/11/2026:** cada turno leva o rail `▏` na primeira
+coluna — marfim no prompt, colorido só no que está em andamento e cinza no que
+já assentou. O prompt começa ao lado do marcador (`● texto`, sobre a banda) e o
+agente abre com `● Slim ─────`, rótulo e régua na mesma row. Apenas o marcador
+do prompt recebe realce breve ao enviar; com movimento reduzido, permanece
+estático.
 
 Harness de coding agent em Rust para Windows x64/MSVC e macOS (arm64). O
 projeto reúne CLI headless, TUI fullscreen, providers, ferramentas nativas,
@@ -58,11 +59,23 @@ configuração, providers, MCP, autenticação e contratos operacionais.
 
 ```powershell
 cargo build --workspace
-cargo test --workspace
 .\refresh-slim.ps1          # release + cópia para o PATH + smoke
-.\refresh-slim.ps1 -Test    # inclui cargo test --workspace
+.\refresh-slim.ps1 -Test    # inclui cargo test --workspace; só se a mudança cruza crates
 .\refresh-slim.ps1 -FastBuild # ciclo local com menos otimização; veja release/README.md
 ```
+
+Rode o mínimo de testes que cobre o que foi alterado, somente onde foi mexido,
+e suba de nível apenas se a mudança exigir:
+
+```sh
+cargo test -p slim-core --lib run_guards           # 1. o módulo alterado
+cargo test -p slim-core --test agent_loop <filtro> # 2. o arquivo de integração tocado
+cargo test -p slim-core                            # 3. o crate, se a mudança atravessa módulos
+cargo test --workspace                             # 4. tudo, só se cruza crates ou a pedido
+```
+
+Crate não alterado e sem dependência do que mudou não precisa ser testado. A
+publicação normal é o refresh sem suíte (`./refresh-slim.sh`, `.\refresh-slim.ps1`).
 
 O comando `slim` instalado é uma cópia estática em
 `%USERPROFILE%\bin\Slim.exe`; ele não acompanha o checkout automaticamente.

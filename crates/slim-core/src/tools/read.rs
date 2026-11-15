@@ -74,6 +74,20 @@ struct FileVersion {
     file_id: Option<String>,
 }
 
+/// Lines a model-facing read starting at `first_line` returns at most, for a
+/// file of `len` bytes: an omitted limit widens the first page of a file that
+/// fits one page to the whole file.
+pub(crate) fn page_lines(first_line: usize, max_lines: Option<usize>, len: u64) -> usize {
+    if first_line <= 1
+        && max_lines.is_none()
+        && len <= MAX_READ_PAGE_BYTES.saturating_sub(128) as u64
+    {
+        MAX_READ_LINES_CAP
+    } else {
+        max_lines.unwrap_or(DEFAULT_MAX_READ_LINES)
+    }
+}
+
 pub fn read_file(path: impl AsRef<Path>, max_lines: usize) -> Result<String, ToolError> {
     read_file_range(path, 1, max_lines)
 }
@@ -153,14 +167,10 @@ impl ReadService {
         // Default first page of a file that fits the page/line caps returns
         // the whole file so one read records complete_digest. Explicit
         // max_lines and numbered public pages keep their requested window.
-        let max_lines = if !numbered
-            && requested_first == 1
-            && max_lines.is_none()
-            && metadata.len() <= MAX_READ_PAGE_BYTES.saturating_sub(128) as u64
-        {
-            MAX_READ_LINES_CAP
-        } else {
+        let max_lines = if numbered {
             max_lines.unwrap_or(DEFAULT_MAX_READ_LINES)
+        } else {
+            page_lines(requested_first, max_lines, metadata.len())
         };
         let index = self.index_for(canonical, version.clone());
         let checkpoint = index
@@ -651,8 +661,24 @@ fn read_utf8_line<'a>(
     if read == 0 {
         return Ok(None);
     }
-    std::str::from_utf8(buffer).map(Some).map_err(|error| {
-        observed_read_error(
+    // NUL bytes are valid UTF-8, so UTF-16/UTF-32 text without a byte-order
+    // mark would come back as letters interleaved with NULs. `search` skips
+    // such files as binary; `read` says so instead of returning them. Bytes
+    // that are not UTF-8 at all keep their own, more specific message.
+    let has_nul = buffer.contains(&0);
+    match std::str::from_utf8(buffer) {
+        Ok(_) if has_nul => Err(observed_read_error(
+            ToolError::InvalidInput {
+                message: format!(
+                    "{} has NUL bytes at line {line_number}: it is binary, or UTF-16/UTF-32 text without a byte-order mark; convert it to UTF-8 first (iconv -f UTF-16LE -t UTF-8) or inspect it with a shell tool",
+                    dependency.path.display()
+                ),
+            },
+            dependency,
+            *bytes_read,
+        )),
+        Ok(text) => Ok(Some(text)),
+        Err(error) => Err(observed_read_error(
             ToolError::InvalidInput {
                 message: non_utf8_message(
                     &dependency.path,
@@ -663,8 +689,8 @@ fn read_utf8_line<'a>(
             },
             dependency,
             *bytes_read,
-        )
-    })
+        )),
+    }
 }
 
 fn record_checkpoint(checkpoints: &mut Vec<Checkpoint>, line: usize, offset: u64) {

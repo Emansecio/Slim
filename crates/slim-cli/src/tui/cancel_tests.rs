@@ -926,11 +926,14 @@ async fn a_forced_abort_clears_only_the_manual_request_of_an_idle_compaction() {
         manual_retry: Default::default(),
         workspace_root: None,
         idle_compaction: idle.then(|| handle.clone()),
+        job_wake: false,
     };
 
     handle.request_manual("queued during a normal run").unwrap();
     let mut active = Some(active_run(false));
-    let pending = abort_active_with_grace(&mut active, Duration::ZERO).await;
+    let options = crate::ProviderRunOptions::default();
+    let (sink, _control_rx, _data_rx) = sink();
+    let pending = abort_active_with_grace(&mut active, &options, &sink, Duration::ZERO).await;
     assert!(pending.is_some() && active.is_none());
     assert_eq!(
         handle.manual_instructions().as_deref(),
@@ -939,7 +942,7 @@ async fn a_forced_abort_clears_only_the_manual_request_of_an_idle_compaction() {
     );
 
     let mut active = Some(active_run(true));
-    let pending = abort_active_with_grace(&mut active, Duration::ZERO).await;
+    let pending = abort_active_with_grace(&mut active, &options, &sink, Duration::ZERO).await;
     assert!(pending.is_some() && active.is_none());
     assert_eq!(handle.manual_instructions(), None);
 }
@@ -967,6 +970,7 @@ async fn a_second_compact_during_an_idle_compaction_is_refused() {
         manual_retry: Default::default(),
         workspace_root: None,
         idle_compaction: idle.then(|| handle.clone()),
+        job_wake: false,
     };
     let notification = |control: &mpsc::Receiver<UiEvent>, data: &mpsc::Receiver<UiEvent>| {
         control

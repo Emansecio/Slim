@@ -9,8 +9,10 @@ use sha2::{Digest, Sha256};
 use slim_core::context::{CompactionHandle, CompactionPolicy};
 use slim_core::provider::{
     claude_context_window, claude_max_output_tokens, clinepass_model, codex_model,
-    command_code_model, history_response_cache_scope, open_code_model, open_design_model,
-    xai_model, zen_model, AnthropicAdapter, ClinePassAdapter, CommandCodeAdapter,
+    command_code_model, devin_model, history_response_cache_scope, open_code_model,
+    open_design_model,
+    xai_model, zen_model, AnthropicAdapter, ClinePassAdapter, CommandCodeAdapter, DevinAdapter,
+    DevinCatalogEntry,
     HttpProviderClient, OpenAiCodexAdapter, OpenAiCompatibleAdapter, OpenCodeGoAdapter,
     OpenCodeZenAdapter, OpenDesignAdapter, ProviderAdapter, ProviderConfig, ProviderContentBlock,
     ProviderError, ProviderKind, ProviderPricing, ProviderTimeouts, XaiAdapter,
@@ -33,6 +35,7 @@ use slim_core::{
 use crate::codex_catalog::{should_fetch_live_codex_catalog, CodexCatalog};
 use crate::command_code_catalog::CommandCodeCatalog;
 use crate::exit_codes::ExitCode;
+use crate::devin_catalog::DevinCatalog;
 use crate::open_design_catalog::OpenDesignCatalog;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -95,8 +98,15 @@ fn executable_identity() -> &'static ExecutableIdentity {
 }
 
 fn executable_identity_from_path(path: &Path) -> ExecutableIdentity {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    // Hashed in blocks: the binary is tens of megabytes and only its digest
+    // is kept.
+    let hashed = std::fs::File::open(path).and_then(|mut file| {
+        let mut hasher = Sha256::new();
+        std::io::copy(&mut file, &mut hasher)?;
+        Ok(hasher.finalize())
+    });
+    let digest = match hashed {
+        Ok(digest) => digest,
         Err(_) => {
             return ExecutableIdentity {
                 sha256: None,
@@ -104,7 +114,6 @@ fn executable_identity_from_path(path: &Path) -> ExecutableIdentity {
             };
         }
     };
-    let digest = Sha256::digest(bytes);
     ExecutableIdentity {
         sha256: Some(format!("{digest:x}")),
         error: None,
@@ -244,6 +253,9 @@ pub struct ProviderRunOptions {
     pub compaction: Option<CompactionHandle>,
     /// Interactive-only retry, scoped to one active run. Never persisted.
     pub manual_retry: Option<slim_core::runtime::ManualRetryHandle>,
+    /// Interactive-only mid-run messages, scoped to one active run. Never
+    /// persisted.
+    pub steer_inbox: Option<slim_core::runtime::SteerInbox>,
     /// Shared for the whole host application; cloned into per-turn runtimes.
     pub code_intelligence: Option<CodeIntelligenceHandle>,
     /// Application-scoped MCP manager; connections stay lazy per server.
@@ -255,9 +267,16 @@ pub struct ProviderRunOptions {
     /// Run only a manual compaction of `history`: no prompt, no model turn.
     /// Set by the TUI for `/compact` while the session is idle.
     pub compact_only: bool,
+    /// Run seeded with the session history only: pending job completions are
+    /// the user input. Never persisted.
+    pub job_wake: bool,
     /// Start MCP servers defined by the workspace's `slim.toml` for this run
     /// without a stored trust decision (`--trust-project`). Never persisted.
     pub trust_project: bool,
+    /// Extra `[mcp]` layer the host chose for this run (`--mcp-config`), read
+    /// after global and project config. Trusted as the host's own choice;
+    /// never persisted.
+    pub host_mcp_config: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1563,6 +1582,7 @@ fn provider_kind_name(provider: ProviderKind) -> &'static str {
         ProviderKind::CommandCode => "command-code",
         ProviderKind::Xai => "xai",
         ProviderKind::OpenDesign => "open-design",
+        ProviderKind::Devin => "devin",
     }
 }
 
@@ -1797,7 +1817,11 @@ fn attach_local_mcp(
     };
     // The project layer is the workspace's slim.toml, which is not the
     // process directory when a session resumes in its recorded workspace.
-    let load = match crate::mcp::load_mcp(&cwd, options.trust_project) {
+    let load = match crate::mcp::load_mcp(
+        &cwd,
+        options.trust_project,
+        options.host_mcp_config.as_deref(),
+    ) {
         Ok(load) => load,
         Err(error) => return (None, vec![format!("MCP disabled: config error: {error}")]),
     };
@@ -1919,6 +1943,20 @@ pub(crate) async fn execute_provider_turn_async(
             }
         }
     }
+    if request.kind == ProviderKind::Devin
+        && request.endpoint == slim_core::provider::DEVIN_DEFAULT_BASE_URL
+    {
+        if let Ok(catalog) = DevinCatalog::production() {
+            if catalog.load_or_fallback().find(&request.model).is_some() {
+                let api_key = request.api_key.clone();
+                tokio::spawn(async move {
+                    let _ = catalog.refresh(&api_key).await;
+                });
+            } else {
+                let _ = catalog.refresh(&request.api_key).await;
+            }
+        }
+    }
     let context_window_tokens = if catalog_override_absent {
         if let Some(model) = open_code_spec {
             require_model_context_window(model.context_window)?
@@ -2018,6 +2056,9 @@ pub(crate) async fn execute_provider_turn_async(
     if let Some(handle) = options.manual_retry.clone() {
         runtime.set_manual_retry_handle(handle);
     }
+    if let Some(inbox) = options.steer_inbox.clone() {
+        runtime.set_steer_inbox(inbox);
+    }
     runtime.register_sensitive_value(&request.api_key);
     runtime.restore_task_facts(&options.task_facts, &cwd)?;
     runtime.restore_artifact_ids(&options.artifact_ids);
@@ -2074,8 +2115,9 @@ pub(crate) async fn execute_provider_turn_async(
         None => request.prompt.clone(),
     };
     let compact_only = options.compact_only;
+    let job_wake = options.job_wake;
     let mut initial_messages = options.history;
-    if !compact_only {
+    if !compact_only && !job_wake {
         let mut message =
             ProviderMessage::user(user_text).with_content_blocks(options.content_blocks);
         if skill_user_prefix.is_some() {
@@ -2226,6 +2268,24 @@ pub(crate) async fn execute_provider_turn_async(
             )?
             .with_max_output_tokens(max_output_tokens);
             run_loop!(adapter, OpenDesignAdapter)
+        }
+        ProviderKind::Devin => {
+            let adapter = DevinAdapter::new(
+                &request.endpoint,
+                &request.model,
+                &api_key,
+                reasoning_effort.as_deref(),
+            )?
+            .with_max_output_tokens(max_output_tokens);
+            let adapter = match devin_entry(&request.model) {
+                Some(entry) => adapter.with_catalog_entry(&entry),
+                None => adapter,
+            };
+            let adapter = match options.provider_session_id.as_deref() {
+                Some(id) => adapter.with_session_id(id),
+                None => adapter,
+            };
+            run_loop!(adapter, DevinAdapter)
         }
     }
     .map_err(|error| redact_provider_error(error, &api_key));
@@ -3179,6 +3239,25 @@ fn open_design_max_output_tokens(model: &str) -> Option<u32> {
         .map(|entry| entry.max_output_tokens)
         .or_else(|| open_design_model(model).map(|model| model.max_output_tokens))
 }
+/// Looks a Devin model up in the catalog's disk cache, falling back to the
+/// static seed table. Never performs network I/O.
+fn devin_entry(model: &str) -> Option<DevinCatalogEntry> {
+    DevinCatalog::production()
+        .ok()
+        .and_then(|catalog| catalog.load_or_fallback().find(model).cloned())
+}
+
+fn devin_context_window(model: &str) -> Option<u64> {
+    devin_entry(model)
+        .map(|entry| entry.context_window)
+        .or_else(|| devin_model(model).map(|model| model.context_window))
+}
+
+fn devin_max_output_tokens(model: &str) -> Option<u32> {
+    devin_entry(model)
+        .map(|entry| entry.max_output_tokens)
+        .or_else(|| devin_model(model).map(|model| model.max_output_tokens))
+}
 
 fn known_model_context_window(
     kind: ProviderKind,
@@ -3194,6 +3273,7 @@ fn known_model_context_window(
         ProviderKind::CommandCode => command_code_context_window(model),
         ProviderKind::Xai => xai_model(model).map(|model| model.context_window),
         ProviderKind::OpenDesign => open_design_context_window(model),
+        ProviderKind::Devin => devin_context_window(model),
         ProviderKind::Anthropic => command_code_model(model)
             .map(|model| model.context_window)
             .or_else(|| claude_context_window(model)),
@@ -3322,6 +3402,7 @@ fn known_model_max_output_tokens(kind: ProviderKind, model: &str) -> Option<u32>
         ProviderKind::OpenCodeZen => zen_model(model).and_then(|model| model.max_output_tokens),
         ProviderKind::Xai => xai_model(model).map(|model| model.max_output_tokens),
         ProviderKind::OpenDesign => open_design_max_output_tokens(model),
+        ProviderKind::Devin => devin_max_output_tokens(model),
         // Claude's documented limits; a Command Code model that is not Claude
         // keeps the default.
         ProviderKind::Anthropic | ProviderKind::CommandCode => claude_max_output_tokens(model),

@@ -44,6 +44,8 @@ pub(crate) struct SseDecoder {
     last_event_id: Option<String>,
     retry: Option<Duration>,
     events_seen: bool,
+    /// The last line ended in `\r`: a `\n` right after it is the same break.
+    skip_lf: bool,
 }
 
 impl SseDecoder {
@@ -60,6 +62,7 @@ impl SseDecoder {
             last_event_id: None,
             retry: None,
             events_seen: false,
+            skip_lf: false,
         }
     }
 
@@ -83,14 +86,27 @@ impl SseDecoder {
     /// the cursor and are not returned.
     pub fn next_event(&mut self) -> Result<Option<SseEvent>, McpError> {
         loop {
-            let Some(relative) = self.buffer[self.scan..].iter().position(|b| *b == b'\n') else {
+            if self.skip_lf {
+                match self.buffer.get(self.start) {
+                    Some(b'\n') => self.start += 1,
+                    Some(_) => {}
+                    None => return Ok(None),
+                }
+                self.skip_lf = false;
+                self.scan = self.scan.max(self.start);
+            }
+            // The stream's line breaks are `\n`, `\r\n` and a lone `\r`.
+            let Some(relative) = self.buffer[self.scan..]
+                .iter()
+                .position(|b| matches!(*b, b'\n' | b'\r'))
+            else {
                 self.scan = self.buffer.len();
                 return Ok(None);
             };
             let end = self.scan + relative;
+            self.skip_lf = self.buffer[end] == b'\r';
             let line = std::str::from_utf8(&self.buffer[self.start..end])
                 .map_err(|_| McpError::Protocol("invalid UTF-8 in SSE message".into()))?
-                .trim_end_matches('\r')
                 .to_owned();
             self.start = end + 1;
             self.scan = self.start;
@@ -208,6 +224,22 @@ mod tests {
         assert_eq!(events[1].data, "x\ny");
         assert_eq!(decoder.last_event_id(), Some("7"));
         assert!(decoder.events_seen());
+    }
+
+    #[test]
+    fn a_lone_carriage_return_ends_a_line_like_the_other_breaks() {
+        let mut decoder = decoder();
+        decoder.push(b"data: a\rdata: b\r\r").unwrap();
+        let events = drain(&mut decoder);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "a\nb");
+        // A `\r\n` split across chunks is still one break, not two.
+        decoder.push(b"data: c\r").unwrap();
+        assert!(drain(&mut decoder).is_empty());
+        decoder.push(b"\ndata: d\r\n\r\n").unwrap();
+        let events = drain(&mut decoder);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "c\nd");
     }
 
     #[test]

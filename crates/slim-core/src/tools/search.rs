@@ -1397,9 +1397,16 @@ where
                     hit: SearchHit {
                         path: path.to_path_buf(),
                         line: line_number,
-                        text: hit_text
-                            .get_or_insert_with(|| bound_hit_text(line, patterns, &matched))
-                            .clone(),
+                        // A line that fits is shared by its hits; a longer
+                        // one is windowed around the pattern of each hit, so
+                        // the excerpt always contains its own match.
+                        text: if line.len() <= MAX_HIT_TEXT_BYTES {
+                            hit_text
+                                .get_or_insert_with(|| bound_hit_text(line, patterns, &matched))
+                                .clone()
+                        } else {
+                            bound_hit_text(line, patterns, &[pattern_index])
+                        },
                     },
                     pattern_index,
                     context: preceding
@@ -1539,7 +1546,7 @@ fn find_case_variants(
         if metadata.len() > MAX_FILE_BYTES {
             continue;
         }
-        let mut reader = BufReader::new(file);
+        let mut reader = BufReader::with_capacity(SEARCH_READ_BUFFER_BYTES, file);
         match reader.fill_buf() {
             Ok(sample) if sample.contains(&0) => continue,
             Ok(_) => {}
@@ -1636,7 +1643,12 @@ fn find_ignoring_case<'a>(line: &'a str, needle: &[char]) -> Option<&'a str> {
         let mut matched = 0;
         'candidate: for (offset, character) in line[start..].char_indices() {
             for lowered in character.to_lowercase() {
-                if needle.get(matched) != Some(&lowered) {
+                // The needle can end inside one character's lowercase
+                // expansion (`İ` is `i` + U+0307): that character matched.
+                if matched == needle.len() {
+                    break;
+                }
+                if needle[matched] != lowered {
                     break 'candidate;
                 }
                 matched += 1;
@@ -1815,6 +1827,14 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::{self, BufRead, Cursor, Read};
+
+    #[test]
+    fn a_needle_ending_inside_a_lowercase_expansion_still_matches() {
+        // `İ` lowercases to `i` + U+0307; the needle `xi` ends on the `i`.
+        assert_eq!(find_ignoring_case("aXİb", &['x', 'i']), Some("Xİ"));
+        assert_eq!(find_ignoring_case("aXYb", &['x', 'i']), None);
+        assert_eq!(find_ignoring_case("Straße", &['s', 't', 'r']), Some("Str"));
+    }
 
     #[test]
     fn presentation_pages_preserve_multipattern_records_context_and_final_cursor() {

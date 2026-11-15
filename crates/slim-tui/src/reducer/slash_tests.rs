@@ -86,7 +86,7 @@ fn filter_narrows_to_prefix() {
     assert_eq!(slash_matches("lo"), vec!["/login", "/logout"]);
     assert_eq!(slash_matches("logi"), vec!["/login"]);
     assert_eq!(slash_matches("he"), vec!["/help"]);
-    assert_eq!(slash_matches("").len(), 19);
+    assert_eq!(slash_matches("").len(), 20);
     assert_eq!(slash_matches("job"), vec!["/jobs"]);
     assert_eq!(
         slash_matches("re"),
@@ -99,14 +99,14 @@ fn filter_narrows_to_prefix() {
 fn slash_and_palette_navigation_follow_the_visible_category_order() {
     let commands = slash_matches("");
     assert_eq!(
-        &commands[3..7],
+        &commands[4..8],
         &["/rewind", "/compact", "/model", "/model --default"]
     );
     assert_eq!(commands, palette_matches(""));
 
     let mut state = AppState::new();
     type_text(&mut state, "/");
-    for _ in 0..4 {
+    for _ in 0..5 {
         press_key(&mut state, KeyCode::Down);
     }
     press_key(&mut state, KeyCode::Tab);
@@ -118,7 +118,7 @@ fn slash_and_palette_navigation_follow_the_visible_category_order() {
         &mut state,
         Action::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
     );
-    for _ in 0..5 {
+    for _ in 0..6 {
         press_key(&mut state, KeyCode::Down);
     }
     press_key(&mut state, KeyCode::Enter);

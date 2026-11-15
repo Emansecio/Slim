@@ -49,7 +49,6 @@ fn palette_rows_keep_the_description_a_reading_measure_from_the_name() {
         false,
         64,
         &palette,
-        true,
     ));
     assert!(wide.starts_with("· /model --default"), "{wide}");
     assert!(wide.contains("salvar modelo atual"), "{wide}");
@@ -60,7 +59,6 @@ fn palette_rows_keep_the_description_a_reading_measure_from_the_name() {
         false,
         32,
         &palette,
-        true,
     ));
     assert_eq!(narrow.trim_end(), "· /model --default", "{narrow}");
 }
@@ -277,19 +275,122 @@ fn a_stalled_run_stops_the_motion_clock_until_content_arrives() {
 }
 
 #[test]
-fn an_unfocused_terminal_pauses_motion_until_focus_returns() {
+fn an_unfocused_terminal_keeps_the_run_animated() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::run_started(1));
     let mut cache = WrapCache::default();
     assert!(super::motion_needed(&state, caps(), &mut cache));
     reduce(&mut state, Action::TerminalFocus(false));
-    assert!(!super::motion_needed(&state, caps(), &mut cache));
+    assert!(
+        super::motion_needed(&state, caps(), &mut cache),
+        "a run watched from another window must not look hung"
+    );
     assert_eq!(
         super::terminal_action(Event::FocusGained, &state, (80, 24), &mut cache),
         Some(Action::TerminalFocus(true))
     );
-    reduce(&mut state, Action::TerminalFocus(true));
+}
+
+#[test]
+fn typing_implies_focus_but_pointer_motion_does_not() {
+    use crate::input::DecodedEvent;
+    let key = Event::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('a'),
+        KeyModifiers::NONE,
+    ));
+    assert!(super::implies_terminal_focus(&DecodedEvent::Event(key)));
+    assert!(super::implies_terminal_focus(&DecodedEvent::Paste(
+        "texto".into()
+    )));
+    let moved = Event::Mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: 1,
+        row: 1,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(!super::implies_terminal_focus(&DecodedEvent::Event(moved)));
+    assert!(!super::implies_terminal_focus(&DecodedEvent::Event(
+        Event::FocusLost
+    )));
+}
+
+#[test]
+fn a_tool_call_being_written_or_executed_is_not_a_stalled_run() {
+    let mut state = AppState::new();
+    state.apply_event(UiEvent::run_started(1));
+    state.apply_event(UiEvent::AssistantDelta {
+        text: "vou escrever o arquivo".into(),
+    });
+    state.apply_event(UiEvent::AssistantEnded);
+    let mut cache = WrapCache::default();
+    // The model streams the call's arguments: the announced size grows.
+    for step in 1..=40u64 {
+        state.clock.elapsed_ms += 250;
+        state.apply_event(UiEvent::ProviderPhaseChanged {
+            phase: slim_core::ProviderPhase::PreparingTool,
+            label: format!("Preparing tool · write · {step} KB"),
+            elapsed_ms: 0,
+        });
+        assert!(!super::activity_stalled(&state), "step {step}");
+    }
     assert!(super::motion_needed(&state, caps(), &mut cache));
+    // The provider then goes quiet for real.
+    state.clock.elapsed_ms += super::ACTIVITY_STALL_MS;
+    assert!(super::activity_stalled(&state));
+    // A running tool is silent by nature and keeps the motion clock.
+    state.apply_event(UiEvent::ToolStarted {
+        batch_id: ToolBatchId("b".into()),
+        call_id: ToolCallId("c".into()),
+        name: "bash".into(),
+        arguments_summary: "cargo test".into(),
+    });
+    state.clock.elapsed_ms += 3 * super::ACTIVITY_STALL_MS;
+    assert!(matches!(
+        state.activity.as_ref().map(|activity| &activity.phase),
+        Some(ActivityPhase::RunningTool(_))
+    ));
+    assert!(!super::activity_stalled(&state));
+    assert!(super::motion_needed(&state, caps(), &mut cache));
+}
+
+#[test]
+fn a_visible_answer_too_large_for_the_cache_is_wrapped_once() {
+    use crate::block::{Block, BlockKind, BlockLifecycle};
+    let mut state = AppState::new();
+    let text = "Um parágrafo comum com **ênfase** e `código` que quebra em linhas. ".repeat(4_000);
+    assert!(text.len() > 256 * 1024);
+    assert!(state.append_block(Block::new(
+        "grande",
+        BlockKind::Assistant(text),
+        BlockLifecycle::Complete,
+    )));
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+    let mut cache = WrapCache::default();
+    terminal
+        .draw(|frame| render_frame(frame, &state, caps(), &mut cache))
+        .expect("first draw");
+    assert!(cache.body_oversized_skips() > 0, "fixture must be oversized");
+    let wrapped = (
+        cache.body_misses(),
+        cache.body_bypasses(),
+        cache.body_oversized_skips(),
+    );
+    for frame in 1..=5 {
+        state.clock.frame = frame;
+        state.clock.elapsed_ms = frame * 83;
+        terminal
+            .draw(|frame| render_frame(frame, &state, caps(), &mut cache))
+            .expect("redraw");
+    }
+    assert_eq!(
+        wrapped,
+        (
+            cache.body_misses(),
+            cache.body_bypasses(),
+            cache.body_oversized_skips(),
+        ),
+        "a redraw with the same content must reuse the wrapped answer"
+    );
 }
 
 #[test]
@@ -303,43 +404,6 @@ fn the_welcome_sheen_passes_once_after_launch() {
     assert_eq!(super::welcome_sweep_progress(over), None);
     assert_eq!(super::next_welcome_sweep_ms(over), None);
     assert_eq!(super::welcome_sweep_progress(over + 60_000), None);
-}
-
-#[test]
-fn tool_hold_epoch_memo_matches_the_scan_as_the_clock_moves() {
-    let mut state = AppState::new();
-    state.apply_event(UiEvent::run_started(1));
-    state.clock = FrameClock {
-        frame: 120,
-        elapsed_ms: 10_000,
-    };
-    complete_tool(&mut state, "b1", "c1", "read", 3);
-    let mut cache = WrapCache::default();
-    let scan = |state: &AppState, now_ms: u64| {
-        crate::block::tool_hold_epoch(state.blocks(), now_ms, false)
-    };
-    let rev = state.revisions.content;
-    let held = cache.tool_hold_epoch(state.blocks(), rev, 10_050, false);
-    assert_eq!(held, scan(&state, 10_050));
-    assert_ne!(held, 0, "a tool that just finished is held");
-    assert_eq!(
-        cache.tool_hold_epoch(state.blocks(), rev, 10_300, false),
-        scan(&state, 10_300)
-    );
-    assert_eq!(cache.tool_hold_epoch(state.blocks(), rev, 10_300, false), 0);
-    // A second tool finishing moves the revision and is seen at once.
-    state.clock = FrameClock {
-        frame: 125,
-        elapsed_ms: 10_400,
-    };
-    complete_tool(&mut state, "b1", "c2", "read", 3);
-    let rev = state.revisions.content;
-    assert_eq!(
-        cache.tool_hold_epoch(state.blocks(), rev, 10_450, false),
-        scan(&state, 10_450)
-    );
-    assert_ne!(cache.tool_hold_epoch(state.blocks(), rev, 10_450, false), 0);
-    assert_eq!(cache.tool_hold_epoch(state.blocks(), rev, 10_450, true), 0);
 }
 
 #[test]
@@ -1646,7 +1710,7 @@ fn a_settling_tool_row_is_woken_only_inside_the_hold_window_and_never_when_reduc
     assert_eq!(curve[0], super::TOOL_SETTLE_LEVELS);
     assert!(curve.windows(2).all(|pair| pair[0] >= pair[1]), "{curve:?}");
     assert!(curve.iter().all(|level| *level >= 1), "{curve:?}");
-    assert_eq!(level(crate::block::TOOL_GROUP_HOLD_MS, caps()), 0);
+    assert_eq!(level(crate::block::TOOL_SETTLE_MS, caps()), 0);
     let reduced = Capabilities {
         reduced_motion: true,
         ..caps()
@@ -1657,7 +1721,7 @@ fn a_settling_tool_row_is_woken_only_inside_the_hold_window_and_never_when_reduc
     let mut now = 1_000;
     let mut wakes = 0;
     while let Some(next) = transition_deadline(&state, now, caps()) {
-        assert!(next > now && next <= 1_000 + crate::block::TOOL_GROUP_HOLD_MS);
+        assert!(next > now && next <= 1_000 + crate::block::TOOL_SETTLE_MS);
         now = next;
         wakes += 1;
     }
@@ -1751,7 +1815,7 @@ fn todo_active_marker_is_stable_when_the_primary_indicator_animates() {
         terminal.backend().buffer().clone()
     };
     let first = render(&state);
-    state.clock.frame = 1;
+    state.clock.frame = 2;
     let second = render(&state);
 
     let todo_marker = |buffer: &ratatui::buffer::Buffer| {
@@ -2299,10 +2363,12 @@ fn data_barrier_drains_prefetched_event_and_full_bounded_stream_lane() {
 #[test]
 fn spinner_glyph_cycles_braille_and_honors_fallbacks() {
     let full = caps();
+    // Each glyph holds for two motion frames: about six steps a second.
     assert_eq!(super::spinner_glyph(0, full), '⠋');
-    assert_eq!(super::spinner_glyph(1, full), '⠙');
-    assert_eq!(super::spinner_glyph(9, full), '⠏');
-    assert_eq!(super::spinner_glyph(10, full), '⠋');
+    assert_eq!(super::spinner_glyph(1, full), '⠋');
+    assert_eq!(super::spinner_glyph(2, full), '⠙');
+    assert_eq!(super::spinner_glyph(19, full), '⠏');
+    assert_eq!(super::spinner_glyph(20, full), '⠋');
 
     let reduced = Capabilities {
         reduced_motion: true,
@@ -2318,7 +2384,7 @@ fn spinner_glyph_cycles_braille_and_honors_fallbacks() {
         ..full
     };
     let ascii: Vec<char> = (0..10)
-        .map(|frame| super::spinner_glyph(frame, no_color))
+        .map(|frame| super::spinner_glyph(frame * 2, no_color))
         .collect();
     assert_eq!(ascii, ['|', '|', '/', '/', '-', '-', '\\', '\\', '|', '|']);
     // Only the reduced-motion preference stops it, and then it is the static

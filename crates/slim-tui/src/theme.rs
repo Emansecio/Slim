@@ -58,7 +58,6 @@ pub struct Theme {
     pub scrollbar_thumb: (u8, u8, u8),
     pub user_accent: (u8, u8, u8),
     pub assistant_accent: (u8, u8, u8),
-    pub thinking_accent: (u8, u8, u8),
     /// Reasoning and planning: thought rows and the Plan mode. A violet grey
     /// at the lightness of `secondary_text`, so it separates thought from
     /// action by hue, not by brightness.
@@ -208,7 +207,6 @@ pub fn resolve_theme(capabilities: Capabilities) -> Theme {
         scrollbar_thumb: (0x62, 0x67, 0x56),
         user_accent: (0xBC, 0xB9, 0xAF),
         assistant_accent: (0x72, 0xCC, 0x91),
-        thinking_accent: (0xAF, 0xA9, 0x9D),
         reasoning_accent: (0xA9, 0x9F, 0xD6),
         // Headings carry hierarchy by weight on ivory; links use the cool
         // structural hue so green keeps meaning success and identity.

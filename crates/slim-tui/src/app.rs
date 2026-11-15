@@ -5,8 +5,9 @@ use slim_core::OperatingMode;
 
 use crate::api::{
     BlockId, ClinePassCatalogSource, CodexCatalogSource, CommandCodeCatalogSource,
-    ContentRequestId, InteractionRequestId, LoginProvider, ModelAlias, OpenCodeCatalogSource,
-    OpenCodeModelView, OpenDesignCatalogSource, PromptAdmission, PromptGeneration, PromptId,
+    ContentRequestId, DevinCatalogSource, InteractionRequestId, LoginProvider, ModelAlias,
+    OpenCodeCatalogSource, OpenCodeModelView, OpenDesignCatalogSource, PromptAdmission,
+    PromptGeneration, PromptId,
     PromptOrigin, ReasoningEffort, SensitiveText, SessionId, ToolBatchId, ToolCallId,
     TranscriptMessage, TranscriptRole, UiCommand, UiEvent, ZenCatalogSource,
 };
@@ -89,6 +90,26 @@ fn default_open_design_models() -> Vec<OpenCodeModelView> {
             max_output_tokens: u64::from(m.max_output_tokens),
             reasoning_levels: slim_core::provider::gateway_reasoning_levels(
                 slim_core::provider::ProviderKind::OpenDesign,
+                m.id,
+            )
+            .iter()
+            .filter_map(|level| ReasoningEffort::parse(level))
+            .collect(),
+            accepts_images: m.accepts_images,
+        })
+        .collect()
+}
+
+fn default_devin_models() -> Vec<OpenCodeModelView> {
+    slim_core::provider::devin_models()
+        .iter()
+        .map(|m| OpenCodeModelView {
+            id: m.id.to_owned(),
+            name: m.name.to_owned(),
+            context_window_tokens: m.context_window,
+            max_output_tokens: u64::from(m.max_output_tokens),
+            reasoning_levels: slim_core::provider::gateway_reasoning_levels(
+                slim_core::provider::ProviderKind::Devin,
                 m.id,
             )
             .iter()
@@ -405,8 +426,9 @@ impl LoginOverlay {
             5 => LoginProvider::Xai,
             6 => LoginProvider::OpenCodeZen,
             7 => LoginProvider::OpenDesign,
-            // The provider list navigates 0..=7, so this arm is only a clamp.
-            _ => LoginProvider::OpenDesign,
+            8 => LoginProvider::Devin,
+            // The provider list navigates 0..=8, so this arm is only a clamp.
+            _ => LoginProvider::Devin,
         }
     }
 }
@@ -420,8 +442,9 @@ pub struct ModelOverlay {
     /// Case-insensitive substring filter typed by the user (§15.7-style).
     pub filter: String,
     /// Collapsed state per group: 0 = OpenAI Codex, 1 = OpenCode Go,
-    /// 2 = ClinePass, 3 = Command Code, 4 = OpenCode Zen, 5 = Open Design.
-    pub collapsed: [bool; 6],
+    /// 2 = ClinePass, 3 = Command Code, 4 = OpenCode Zen, 5 = Open Design,
+    /// 6 = Devin.
+    pub collapsed: [bool; 7],
     /// Edits made in the picker are local until Enter confirms the model.
     pub pending_efforts: Vec<(EffortTarget, ReasoningEffort)>,
     pub pending_fast: bool,
@@ -528,6 +551,8 @@ pub enum ModelRow {
     /// An Open Design model, carrying its index into
     /// `AppState::open_design_models`.
     OpenDesign(usize),
+    /// A Devin model, carrying its index into `AppState::devin_models`.
+    Devin(usize),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -551,11 +576,12 @@ pub struct ModelCatalogs<'a> {
     pub command_code: &'a [OpenCodeModelView],
     pub zen: &'a [OpenCodeModelView],
     pub open_design: &'a [OpenCodeModelView],
+    pub devin: &'a [OpenCodeModelView],
 }
 
 impl<'a> ModelCatalogs<'a> {
-    /// The provider catalogs in overlay group order (groups 0..=5).
-    pub fn groups(&self) -> [&'a [OpenCodeModelView]; 6] {
+    /// The provider catalogs in overlay group order (groups 0..=6).
+    pub fn groups(&self) -> [&'a [OpenCodeModelView]; 7] {
         [
             self.codex,
             self.opencode,
@@ -563,6 +589,7 @@ impl<'a> ModelCatalogs<'a> {
             self.command_code,
             self.zen,
             self.open_design,
+            self.devin,
         ]
     }
 
@@ -581,6 +608,7 @@ impl ModelRow {
             command_code,
             zen,
             open_design,
+            devin,
         } = *catalogs;
         let catalog_choice = |model: &OpenCodeModelView, target| ModelChoice {
             target,
@@ -612,6 +640,9 @@ impl ModelRow {
             Self::OpenDesign(index) => open_design
                 .get(*index)
                 .map(|model| catalog_choice(model, EffortTarget::OpenDesign(model.id.clone()))),
+            Self::Devin(index) => devin
+                .get(*index)
+                .map(|model| catalog_choice(model, EffortTarget::Devin(model.id.clone()))),
         }
     }
 }
@@ -629,6 +660,7 @@ impl ModelOverlay {
             command_code: command_code_models,
             zen: zen_models,
             open_design: open_design_models,
+            devin: devin_models,
         } = *catalogs;
         let query = self.filter.to_lowercase();
         let mut out = Vec::new();
@@ -721,6 +753,18 @@ impl ModelOverlay {
                 .collect(),
         );
 
+        // Group 6: Devin catalog
+        push_group(
+            &mut out,
+            6,
+            devin_models
+                .iter()
+                .enumerate()
+                .filter(|(_, model)| keep(&model.id, &model.name))
+                .map(|(index, _)| ModelRow::Devin(index))
+                .collect(),
+        );
+
         out
     }
 
@@ -776,6 +820,7 @@ impl ModelOverlay {
             command_code: command_code_models,
             zen: zen_models,
             open_design: open_design_models,
+            devin: devin_models,
         } = *catalogs;
         let provider_group = active_provider.and_then(|provider| match provider {
             LoginProvider::OpenAiCodex
@@ -816,6 +861,13 @@ impl ModelOverlay {
             {
                 Some(5)
             }
+            LoginProvider::Devin
+                if devin_models
+                    .iter()
+                    .any(|model| model.id == current_model) =>
+            {
+                Some(6)
+            }
             _ => None,
         });
         let active_group = if let Some(group) = provider_group {
@@ -844,6 +896,11 @@ impl ModelOverlay {
             .any(|model| model.id == current_model)
         {
             5
+        } else if devin_models
+            .iter()
+            .any(|model| model.id == current_model)
+        {
+            6
         } else {
             active_provider.map_or(0, |provider| match provider {
                 LoginProvider::OpenAiCodex | LoginProvider::Anthropic => 0,
@@ -854,10 +911,11 @@ impl ModelOverlay {
                 LoginProvider::OpenDesign => 5,
                 // xAI tem grupo próprio adiado no /models; cai no grupo 0.
                 LoginProvider::Xai => 0,
+                LoginProvider::Devin => 6,
             })
         };
         let mut overlay = Self {
-            collapsed: [true; 6],
+            collapsed: [true; 7],
             ..Self::default()
         };
         overlay.collapsed[active_group] = false;
@@ -914,6 +972,7 @@ pub enum EffortTarget {
     CommandCode(String),
     Xai(String),
     OpenDesign(String),
+    Devin(String),
 }
 
 impl EffortTarget {
@@ -926,6 +985,7 @@ impl EffortTarget {
             Self::CommandCode(_) => LoginProvider::CommandCode,
             Self::Xai(_) => LoginProvider::Xai,
             Self::OpenDesign(_) => LoginProvider::OpenDesign,
+            Self::Devin(_) => LoginProvider::Devin,
         }
     }
 }
@@ -1021,12 +1081,14 @@ pub struct AppState {
     pub command_code_models: Vec<OpenCodeModelView>,
     pub zen_models: Vec<OpenCodeModelView>,
     pub open_design_models: Vec<OpenCodeModelView>,
+    pub devin_models: Vec<OpenCodeModelView>,
     pub codex_catalog_source: Option<CodexCatalogSource>,
     pub open_code_catalog_source: Option<OpenCodeCatalogSource>,
     pub cline_pass_catalog_source: Option<ClinePassCatalogSource>,
     pub command_code_catalog_source: Option<CommandCodeCatalogSource>,
     pub zen_catalog_source: Option<ZenCatalogSource>,
     pub open_design_catalog_source: Option<OpenDesignCatalogSource>,
+    pub devin_catalog_source: Option<DevinCatalogSource>,
     /// Bumped whenever a model catalog Vec is replaced; render memos key on it
     /// because catalog swaps can otherwise reuse a stale row list.
     pub catalog_revision: u64,
@@ -1216,12 +1278,14 @@ impl Default for AppState {
             command_code_models: default_command_code_models(),
             zen_models: default_zen_models(),
             open_design_models: default_open_design_models(),
+            devin_models: default_devin_models(),
             codex_catalog_source: None,
             open_code_catalog_source: None,
             cline_pass_catalog_source: None,
             command_code_catalog_source: None,
             zen_catalog_source: None,
             open_design_catalog_source: None,
+            devin_catalog_source: None,
             catalog_revision: 0,
             skill_names: Vec::new(),
             skills_revision: 0,
@@ -1532,14 +1596,17 @@ impl AppState {
         self.revisions.viewport += 1;
     }
 
+    /// Replaces the conversation with `messages`. Without a `session_id` (the
+    /// `/new` reset) the view is that of a clean start: no session until the
+    /// first prompt creates one.
     fn restore_session(
         &mut self,
-        session_id: SessionId,
+        session_id: Option<SessionId>,
         cwd: String,
         messages: Vec<TranscriptMessage>,
         skill_names: Vec<String>,
     ) {
-        self.session_id = Some(session_id);
+        self.session_id = session_id;
         self.jobs.clear();
         self.jobs_overlay = None;
         self.job_exit_confirm = None;
@@ -2419,14 +2486,9 @@ impl AppState {
         self.execution_history.push_back(summary);
     }
 
-    /// Closes the turn with what it changed, when it changed or ran anything.
-    /// Runs after `finish_execution`, which fixes the duration it reports.
+    /// Closes the turn with what it changed, when it changed anything.
     fn append_turn_receipt(&mut self, outcome: crate::receipt::ReceiptOutcome) {
-        let duration_ms = self
-            .last_execution
-            .as_ref()
-            .map_or(0, |summary| summary.duration_ms);
-        let receipt = crate::receipt::turn_receipt(&self.blocks, duration_ms, outcome);
+        let receipt = crate::receipt::turn_receipt(&self.blocks, outcome);
         if !receipt.is_worth_showing() {
             return;
         }
@@ -2874,6 +2936,7 @@ impl AppState {
             command_code: &self.command_code_models,
             zen: &self.zen_models,
             open_design: &self.open_design_models,
+            devin: &self.devin_models,
         }
     }
 
@@ -2898,6 +2961,7 @@ impl AppState {
             command_code: &self.command_code_models,
             zen: &self.zen_models,
             open_design: &self.open_design_models,
+            devin: &self.devin_models,
         };
         let Some(overlay) = self.model_overlay.as_mut() else {
             return;
@@ -3172,7 +3236,10 @@ impl AppState {
                 cwd,
                 messages,
                 skill_names,
-            } => self.restore_session(session_id, cwd, messages, skill_names),
+            } => self.restore_session(Some(session_id), cwd, messages, skill_names),
+            UiEvent::SessionCleared { cwd, skill_names } => {
+                self.restore_session(None, cwd, Vec::new(), skill_names);
+            }
             UiEvent::WorkspaceChanged { cwd, skill_names } => {
                 self.set_workspace(cwd, skill_names);
                 self.revisions.status += 1;
@@ -3773,6 +3840,12 @@ impl AppState {
                     state.open_design_catalog_source = Some(source);
                 });
             }
+            UiEvent::DevinCatalogLoaded { models, source } => {
+                self.replace_model_catalog(|state| {
+                    state.devin_models = models;
+                    state.devin_catalog_source = Some(source);
+                });
+            }
             UiEvent::ZenCatalogLoaded { models, source } => {
                 self.replace_model_catalog(|state| {
                     state.zen_models = models;
@@ -4095,7 +4168,13 @@ impl AppState {
                         self.provider_timings.first_semantic_ms = Some(elapsed_ms);
                     }
                     slim_core::ProviderPhase::Compacting => {}
-                    slim_core::ProviderPhase::PreparingTool => {}
+                    // The model is writing a tool call (or the run reports
+                    // on its shell jobs): each of these is the provider
+                    // producing, so the run is not shown as stalled while
+                    // the announced size keeps growing.
+                    slim_core::ProviderPhase::PreparingTool => {
+                        self.last_provider_content_ms = Some(self.clock.elapsed_ms);
+                    }
                 }
                 // FirstSemantic is a timing fence shared by text, reasoning,
                 // usage and tool-call events. The following semantic event owns

@@ -171,7 +171,7 @@ pub(crate) fn activity_label(state: &AppState) -> String {
         }
         Some(ActivityPhase::WaitingForInput) => "Aguardando resposta".into(),
         Some(ActivityPhase::External(label)) => external_activity_label(label),
-        None => "Em atividade".into(),
+        None => "Trabalhando".into(),
     }
 }
 
@@ -646,7 +646,7 @@ impl ViewModel {
             lines.push(format!("notice: {}", safe(notification)));
         }
         if !state.todo_items.is_empty() {
-            lines.push(crate::todo::compact_summary(state));
+            lines.push(crate::todo::compact_summary(state, width as usize));
         }
         lines.push(format!(
             "composer: {}",
@@ -919,6 +919,18 @@ fn execution_needs_attention(execution: &crate::app::ExecutionSummary) -> bool {
     execution.outcome != crate::app::RunOutcomeKind::Completed || execution.pending_count > 0
 }
 
+/// The provider the session is signed in to, by its short name.
+pub(crate) fn provider_name(state: &AppState) -> Option<&'static str> {
+    let provider = state.auth_provider.filter(|_| state.authenticated)?;
+    Some(
+        provider
+            .label()
+            .split(" — ")
+            .next()
+            .unwrap_or(provider.label()),
+    )
+}
+
 pub(crate) fn model_metadata(state: &AppState, width: usize) -> String {
     let context = format_context(state, true);
     let context = if context == "ctx --" {
@@ -938,6 +950,16 @@ pub(crate) fn model_metadata(state: &AppState, width: usize) -> String {
         format!("{effort} · {context}")
     };
     let suffix_width = unicode_width::UnicodeWidthStr::width(suffix.as_str());
+    // Who the session talks to leads the model it uses. The provider gives
+    // way first: on a narrow footer the model and the effort stay.
+    if let Some(provider) = provider_name(state) {
+        let lead = format!("{provider} · ");
+        let lead_width = unicode_width::UnicodeWidthStr::width(lead.as_str());
+        let model_width = unicode_width::UnicodeWidthStr::width(model.as_str());
+        if width >= lead_width + model_width + 1 + suffix_width {
+            return format!("{lead}{model} {suffix}");
+        }
+    }
     if width >= suffix_width + 5 {
         return format!(
             "{} {suffix}",
@@ -959,6 +981,30 @@ pub(crate) fn model_metadata(state: &AppState, width: usize) -> String {
 mod minimal_footer_tests {
     use super::{completed_tool_phrase, footer_lines};
     use crate::app::AppState;
+
+    #[test]
+    fn the_provider_leads_the_model_and_gives_way_first() {
+        let mut state = AppState::new();
+        state.authenticated = true;
+        state.auth_provider = Some(crate::api::LoginProvider::Anthropic);
+        state.model = "sol".into();
+        let full = "Anthropic · GPT-5.6 Sol (high)";
+        let width = unicode_width::UnicodeWidthStr::width(full);
+        assert_eq!(super::model_metadata(&state, 60), full);
+        assert_eq!(super::model_metadata(&state, width), full);
+        // One cell short: the provider leaves, the model and the effort stay.
+        assert_eq!(
+            super::model_metadata(&state, width - 1),
+            "GPT-5.6 Sol (high)"
+        );
+        // No known provider, or signed out: nothing is invented.
+        state.auth_provider = None;
+        assert_eq!(super::model_metadata(&state, 60), "GPT-5.6 Sol (high)");
+        state.auth_provider = Some(crate::api::LoginProvider::Anthropic);
+        state.authenticated = false;
+        assert!(super::model_metadata(&state, 60).is_empty());
+    }
+
     #[test]
     fn summaries_count_operations_without_claiming_unique_files() {
         assert_eq!(completed_tool_phrase(&["read", "read"]), "2 leituras");

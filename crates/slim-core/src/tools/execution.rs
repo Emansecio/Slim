@@ -9,7 +9,6 @@ use crate::codeintel::DEFAULT_CODE_INTEL_LIMIT;
 use crate::OperatingMode;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::fmt::Write as _;
 use std::fs::{File, Metadata};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -265,10 +264,37 @@ fn present_read_records(
             oversized_record: false,
         };
     }
+    // The probes need only the length a prefix would render to: record bytes
+    // are summed once and the notice is formatted alone, instead of building
+    // the whole prefix again for every step of the search.
+    let mut prefix_bytes = Vec::with_capacity(records.len() + 1);
+    prefix_bytes.push(0usize);
+    for record in records {
+        prefix_bytes.push(prefix_bytes[prefix_bytes.len() - 1] + record.len());
+    }
+    let rendered_len = |count: usize| {
+        let mut length = prefix_bytes[count];
+        if count < records.len() || next_offset.is_some() {
+            let cursor = first.saturating_add(count);
+            let last = cursor.saturating_sub(1);
+            let ends_with_newline = records[..count]
+                .iter()
+                .rev()
+                .find(|record| !record.is_empty())
+                .is_some_and(|record| record.ends_with('\n'));
+            length += usize::from(!ends_with_newline);
+            length += format!(
+                "[showing lines {first}-{last}; more content available; pass \"offset\": {cursor} for the next page]"
+            )
+            .len();
+        }
+        length
+    };
     let low = fit_count(records.len(), |count| {
-        render(count).len() <= budget.max_bytes
+        rendered_len(count) <= budget.max_bytes
     });
     let mut text = render(low);
+    debug_assert_eq!(text.len(), rendered_len(low));
     if low == 0 {
         text.push_str(&format!(
             "\n[line and continuation exceed presentation budget; no line delivered; pass \"offset\": {first} or request a narrower page; a line this long is reached by searching for a distinctive substring of it, or by slicing it with shell; not safe for patch.expected]"
@@ -643,6 +669,7 @@ pub(crate) enum PreparedToolArguments {
         args: Option<Vec<String>>,
         timeout_ms: u64,
         yield_ms: u64,
+        stdin: bool,
     },
     CodeIntel(CodeIntelRequest),
     External,
@@ -920,9 +947,11 @@ fn hash_field(hasher: &mut Sha256, field: &[u8]) {
 
 pub(crate) fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
     let bytes = bytes.as_ref();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     output
 }
@@ -1060,6 +1089,7 @@ fn materialize_defaults_and_paths(
             );
             insert_default(object, "yield_ms", Value::from(1000));
             insert_default(object, "background", Value::from(false));
+            insert_default(object, "stdin", Value::from(false));
             if object.get("args").is_some_and(Value::is_null) {
                 object.remove("args");
             }
@@ -1114,7 +1144,14 @@ fn native_argument_keys(tool_name: &str) -> Option<&'static [&'static str]> {
         ]),
         "write" => Some(&["path", "content", "expected", "then_run"]),
         "patch" => Some(&["path", "edits", "expected", "replacement", "then_run"]),
-        "shell" => Some(&["command", "args", "timeout_ms", "yield_ms", "background"]),
+        "shell" => Some(&[
+            "command",
+            "args",
+            "timeout_ms",
+            "yield_ms",
+            "background",
+            "stdin",
+        ]),
         "code_intel" => Some(&[
             "action",
             "path",
@@ -1142,6 +1179,13 @@ fn reject_unknown_native_fields(
         return Ok(());
     };
     if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        // A near spelling of one valid field gets that field alone: a direct
+        // correction sticks better than the whole list.
+        if let Some(field) = nearest_native_field(key, allowed) {
+            return Err(format!(
+                "{tool_name} has unknown argument `{key}`; use `{field}`"
+            ));
+        }
         return Err(format!(
             "{tool_name} has unknown argument `{key}`; valid fields: {}",
             allowed.join(", ")
@@ -1167,6 +1211,46 @@ fn reject_unknown_native_fields(
     Ok(())
 }
 
+/// The one valid field an unknown key most likely meant: same leading word
+/// with words added or dropped (`yield_time_ms` → `yield_ms`, `timeout` →
+/// `timeout_ms`), or at most two typed characters away (`max_line`). None when
+/// nothing or more than one field qualifies.
+fn nearest_native_field(key: &str, allowed: &[&'static str]) -> Option<&'static str> {
+    let key = key.to_ascii_lowercase().replace('-', "_");
+    let words = |text: &str| -> Vec<String> {
+        text.split('_')
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let key_words = words(&key);
+    let mut matches = allowed.iter().copied().filter(|field| {
+        let field_words = words(field);
+        let same_lead = key_words.first().is_some() && key_words.first() == field_words.first();
+        let nested = key_words.iter().all(|word| field_words.contains(word))
+            || field_words.iter().all(|word| key_words.contains(word));
+        (same_lead && nested) || (key.len() >= 4 && edit_distance(&key, field) <= 2)
+    });
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (row, left_char) in left.chars().enumerate() {
+        let mut current = vec![row + 1; right.len() + 1];
+        for (column, right_char) in right.iter().enumerate() {
+            let substitution = previous[column] + usize::from(left_char != *right_char);
+            current[column + 1] = substitution
+                .min(previous[column + 1] + 1)
+                .min(current[column] + 1);
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
 /// Model spellings of a native argument that name an existing one. Each is
 /// admitted with a note; a value that contradicts the canonical field is not.
 fn normalize_argument_aliases(
@@ -1189,9 +1273,12 @@ fn normalize_argument_aliases(
                 rename_argument(object, alias, "query", admission_notes)?;
             }
         }
-        // A free-text label that never changes what runs.
         "shell" => {
+            // A free-text label that never changes what runs.
             object.remove("description");
+            // Codex `exec_command` spellings of the same fields.
+            rename_argument(object, "cmd", "command", admission_notes)?;
+            rename_argument(object, "yield_time_ms", "yield_ms", admission_notes)?;
         }
         _ => {}
     }
@@ -1753,11 +1840,16 @@ fn typed_arguments(
                 args
             };
             admit_shell_command(&command, args.as_deref(), admission_notes)?;
+            let stdin = arguments
+                .get("stdin")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             Ok(PreparedToolArguments::Shell {
                 command,
                 args,
                 timeout_ms,
                 yield_ms,
+                stdin,
             })
         }
         "code_intel" => {
@@ -2304,9 +2396,22 @@ pub(crate) fn verify_opened_path(file: &File, expected: &Path) -> std::io::Resul
     }
 }
 
+/// Without `/proc`, the open descriptor is compared with what the validated
+/// path names now: the same device and inode, through a path that is still
+/// canonical. A component swapped for a symlink while the file was opened
+/// leaves the descriptor on another object even if it is swapped back. The
+/// identity is used instead of `F_GETPATH` because that names one arbitrary
+/// link of a hard-linked file.
 #[cfg(all(unix, not(any(target_os = "android", target_os = "linux"))))]
-pub(crate) fn verify_opened_path(_file: &File, expected: &Path) -> std::io::Result<()> {
-    if std::fs::canonicalize(expected)? == expected {
+pub(crate) fn verify_opened_path(file: &File, expected: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let opened = file.metadata()?;
+    let named = std::fs::metadata(expected)?;
+    if std::fs::canonicalize(expected)? == expected
+        && opened.dev() == named.dev()
+        && opened.ino() == named.ino()
+    {
         Ok(())
     } else {
         Err(std::io::Error::new(
@@ -3367,7 +3472,7 @@ mod tests {
             (
                 "shell",
                 json!({"command":"echo", "extra":1}),
-                "command, args, timeout_ms, yield_ms, background",
+                "command, args, timeout_ms, yield_ms, background, stdin",
             ),
         ] {
             let error = prepare(&root, tool, arguments).error.expect("rejected");
@@ -3388,6 +3493,48 @@ mod tests {
             "{error}"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_near_spelling_of_one_field_names_that_field() {
+        let root = workspace("unknown-near-field");
+        fs::write(root.join("a.txt"), "one\n").expect("fixture");
+        for (tool, arguments, expected) in [
+            (
+                "shell",
+                json!({"command":"echo", "timeout":5}),
+                "shell has unknown argument `timeout`; use `timeout_ms`",
+            ),
+            (
+                "shell",
+                json!({"command":"echo", "yield_wait_ms":5}),
+                "shell has unknown argument `yield_wait_ms`; use `yield_ms`",
+            ),
+            (
+                "read",
+                json!({"path":"a.txt", "offsets":1}),
+                "read has unknown argument `offsets`; use `offset`",
+            ),
+        ] {
+            let error = prepare(&root, tool, arguments).error.expect("rejected");
+            assert_eq!(error, expected);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nearest_native_field_requires_one_unambiguous_match() {
+        let shell = native_argument_keys("shell").expect("shell keys");
+        assert_eq!(nearest_native_field("YIELD-TIME-MS", shell), Some("yield_ms"));
+        assert_eq!(nearest_native_field("extra", shell), None);
+        assert_eq!(nearest_native_field("", shell), None);
+        // `max` leads both read limits: no single answer.
+        assert_eq!(
+            nearest_native_field("max", &["max_lines", "max_entries"]),
+            None
+        );
+        assert_eq!(edit_distance("max_line", "max_lines"), 1);
+        assert_eq!(edit_distance("", "abc"), 3);
     }
 
     #[test]
@@ -3426,6 +3573,29 @@ mod tests {
         );
         assert!(described.error.is_none(), "{:?}", described.error);
         assert_eq!(described.canonical_fingerprint, plain.canonical_fingerprint);
+        // Codex `exec_command` spellings name the same shell fields.
+        let yielded = prepare(&root, "shell", json!({"command":"echo hi", "yield_ms":500}));
+        let codex = prepare(
+            &root,
+            "shell",
+            json!({"cmd":"echo hi", "yield_time_ms":500}),
+        );
+        note(&codex, "cmd -> command");
+        note(&codex, "yield_time_ms -> yield_ms");
+        assert_eq!(codex.canonical_fingerprint, yielded.canonical_fingerprint);
+        let clash = prepare(
+            &root,
+            "shell",
+            json!({"command":"echo hi", "yield_ms":500, "yield_time_ms":900}),
+        );
+        assert!(
+            clash
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("`yield_time_ms` conflicts with `yield_ms`")),
+            "{:?}",
+            clash.error
+        );
         // The same value spelled twice is fine; a contradiction is not.
         let same = prepare(&root, "read", json!({"path":"a.txt", "file_path":"a.txt"}));
         assert!(same.error.is_none(), "{:?}", same.error);

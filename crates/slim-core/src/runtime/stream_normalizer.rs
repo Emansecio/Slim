@@ -35,7 +35,7 @@ enum Wire {
 impl Wire {
     fn of(kind: ProviderKind) -> Self {
         match kind {
-            ProviderKind::OpenAiCompatible => Self::Chat,
+            ProviderKind::OpenAiCompatible | ProviderKind::Devin => Self::Chat,
             ProviderKind::OpenAiCodex => Self::Responses,
             ProviderKind::Anthropic => Self::Anthropic,
             _ => Self::Other,
@@ -1286,7 +1286,7 @@ fn tool_progress_detail(name: Option<&str>, bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_reasoning_detail;
+    use super::{merge_reasoning_detail, ProviderKind, Wire};
     use serde_json::{json, Value};
 
     #[test]
@@ -1312,5 +1312,10 @@ mod tests {
                 json!({"index":2,"type":"reasoning.encrypted","data":"y"}),
             ]
         );
+    }
+
+    #[test]
+    fn devin_tool_deltas_buffer_like_chat() {
+        assert!(Wire::of(ProviderKind::Devin).is_openai());
     }
 }

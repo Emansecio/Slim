@@ -2891,7 +2891,12 @@ fn a_manual_request_summarizes_the_history_then_the_real_turn_uses_the_same_prov
 #[test]
 fn economy_projection_keeps_written_bytes_and_reconciles_todo_in_normal_turn() {
     let root = TempRoot::new("economy-wire");
-    std::fs::write(root.join("source.txt"), "source line\n".repeat(5000)).unwrap();
+    // A page of the most lines one read returns, wider than the presentation budget.
+    std::fs::write(
+        root.join("source.txt"),
+        "source line wide enough to overflow\n".repeat(5000),
+    )
+    .unwrap();
     let content = "generated content 日本語\n".repeat(1400);
     let expected = content.clone();
     let (listener, address) = bind_listener();
@@ -2944,7 +2949,11 @@ fn economy_projection_keeps_written_bytes_and_reconciles_todo_in_normal_turn() {
                         "write",
                         json!({"path":"output.txt", "content":content}),
                     ),
-                    ("read-page", "read", json!({"path":"source.txt"})),
+                    (
+                        "read-page",
+                        "read",
+                        json!({"path":"source.txt", "max_lines":1000}),
+                    ),
                     (
                         "todo-done",
                         "todo",
@@ -7130,10 +7139,11 @@ fn failed_volatile_shell_keeps_its_side_effects_and_allows_continuation() {
     let root = TempRoot::new("volatile-retry");
     let (listener, address) = bind_listener();
     let server = thread::spawn(move || {
-        for index in 0..3 {
+        // The immediate retry is held once; the one after it runs.
+        for index in 0..4 {
             let mut stream = accept_with_deadline(&listener);
             read_http_request(&mut stream);
-            let (delta, reason) = if index == 2 {
+            let (delta, reason) = if index == 3 {
                 (json!({"content":"partial changes recorded"}), "stop")
             } else {
                 let command = if cfg!(windows) {
@@ -7170,8 +7180,11 @@ fn failed_volatile_shell_keeps_its_side_effects_and_allows_continuation() {
     .unwrap();
     assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
     server.join().unwrap();
-    assert_eq!(result.tool_results.len(), 2);
+    assert_eq!(result.tool_results.len(), 3);
     assert!(result.tool_results.iter().all(|result| !result.success));
+    assert!(result.tool_results[1]
+        .output
+        .contains("This exact command just failed."));
     assert_eq!(
         std::fs::read_to_string(root.join("progress.txt"))
             .unwrap()
@@ -9559,17 +9572,112 @@ fn run_guards_hold_a_failing_command_and_a_second_full_rewrite_once() {
     assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
     assert_eq!(requests.len(), turns);
     let loop_hold = "This exact command failed 2 times in a row.";
-    assert!(!requests[2].contains(loop_hold));
-    assert!(requests[3].contains(loop_hold), "the third try is held");
     assert!(
-        !requests[4].contains("failed 3 times"),
-        "the deliberate rerun ran"
+        requests[2].contains("This exact command just failed."),
+        "the immediate retry is held"
     );
+    assert!(!requests[3].contains(loop_hold), "the deliberate rerun ran");
+    assert!(requests[4].contains(loop_hold), "the fourth try is held");
     assert!(requests[6].contains("You rewrote all of big.txt."));
     assert!(requests[8].contains("big.txt exists; change it with patch"));
     assert_eq!(
         std::fs::read_to_string(root.join("big.txt")).expect("big"),
         format!("{big}y"),
         "the second rewrite was held"
+    );
+}
+
+/// Runs `script` against the fixture provider; returns the loop result and
+/// the requests it received.
+fn run_script(root: &TempRoot, script: Vec<String>) -> (AgentLoopResult, Vec<String>) {
+    let (listener, address) = bind_listener();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for response in script {
+            let (mut stream, request) = accept_request(&listener);
+            requests.push(request);
+            write_sse(&mut stream, &response);
+        }
+        requests
+    });
+    let client = fixture_client(format!("http://{address}"), Duration::from_secs(10));
+    let mut runtime = Runtime::new();
+    let result = run_loop(
+        &mut runtime,
+        &client,
+        "build it",
+        OperatingMode::Auto,
+        root,
+        1,
+        AgentLoopConfig {
+            max_turns: 16,
+            ..test_loop_config()
+        },
+    )
+    .expect("loop");
+    (result, server.join().expect("server"))
+}
+
+#[cfg(not(windows))]
+#[test]
+fn run_guards_refuse_a_long_read_and_hold_a_shell_reread_of_a_native_read() {
+    let root = TempRoot::new("run-guards-reads");
+    let long: String = (1..=1001).map(|line| format!("row {line}\n")).collect();
+    std::fs::write(root.join("long.txt"), long).expect("long");
+    std::fs::write(root.join("a.txt"), "alpha\nbeta\n").expect("a");
+    let cat = json!({"command": "cat a.txt"});
+    let (result, requests) = run_script(
+        &root,
+        vec![
+            tool_call_response("long", "read", json!({"path": "long.txt"})),
+            tool_call_response(
+                "page",
+                "read",
+                json!({"path": "long.txt", "offset": 1001, "max_lines": 1000}),
+            ),
+            tool_call_response("native", "read", json!({"path": "a.txt"})),
+            tool_call_response("again", "shell", cat.clone()),
+            tool_call_response("retry", "shell", cat),
+            text_response("done"),
+        ],
+    );
+
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    let limit = "long.txt: this read would return more than 1000 lines.";
+    assert!(requests[1].contains(limit), "the whole file is refused");
+    assert!(!requests[1].contains("row 1000"));
+    assert!(requests[2].contains("row 1001"), "a page is read");
+    let reread = "a.txt is unchanged and these lines were already read";
+    assert!(!requests[3].contains(reread));
+    assert!(requests[4].contains(reread), "cat after read is held");
+    assert_eq!(
+        requests[5].matches(reread).count(),
+        1,
+        "the retry ran instead of being held again"
+    );
+}
+
+#[test]
+fn a_held_retry_does_not_hide_a_repeated_failure_from_the_loop_guard() {
+    let root = TempRoot::new("run-guards-loop-guard");
+    // With no manifest here it fails at once, as a validation command.
+    let check = json!({"command": "cargo check"});
+    let (result, requests) = run_script(
+        &root,
+        vec![
+            tool_call_response("check-1", "shell", check.clone()),
+            tool_call_response("check-2", "shell", check.clone()),
+            tool_call_response("check-3", "shell", check),
+        ],
+    );
+
+    assert!(
+        requests[2].contains("This exact command just failed."),
+        "the immediate retry is held, and the run goes on"
+    );
+    assert_eq!(
+        result.stop,
+        AgentLoopStop::RepeatedFailedTool,
+        "the rerun failed the same way"
     );
 }

@@ -157,13 +157,13 @@ pub(crate) fn apply_exact_patches_with_content(
             && has_only_crlf_newlines(&updated);
         if normalized_crlf {
             expected = Cow::Owned(expected.replace('\n', "\r\n"));
-            replacement = Cow::Owned(replacement.replace("\r\n", "\n").replace('\n', "\r\n"));
+            replacement = Cow::Owned(super::write::with_crlf_line_endings(&replacement));
             found = first_two_matches(&updated, expected.as_ref());
         } else if found.seen == 1 && contains_bare_lf(&replacement) && has_only_crlf_newlines(&updated) {
             // New LF lines must inherit the file's CRLF style, whatever the
             // excerpt carried, or later LF excerpts would encounter a mixed
             // file introduced by this patch itself.
-            replacement = Cow::Owned(replacement.replace("\r\n", "\n").replace('\n', "\r\n"));
+            replacement = Cow::Owned(super::write::with_crlf_line_endings(&replacement));
             normalized_crlf = true;
         }
         if found.seen != 1 {

@@ -202,7 +202,12 @@ fn plan_elisions(messages: &[ProviderMessage]) -> Vec<PlannedElision> {
     // Call ids are only unique within one assistant turn (providers recycle
     // short ids), so a tool message resolves against the assistant before it.
     let mut call_paths = vec![None::<(String, String)>; messages.len()];
-    let mut turn_calls = std::collections::HashMap::<&str, (String, String)>::new();
+    // Per id, the calls of the turn in order: a provider that repeats an id
+    // inside one turn answers them in the same order.
+    let mut turn_calls = std::collections::HashMap::<
+        &str,
+        std::collections::VecDeque<Option<(String, String)>>,
+    >::new();
     for (index, message) in messages.iter().enumerate() {
         match message.role.as_str() {
             "assistant" => {
@@ -215,16 +220,24 @@ fn plan_elisions(messages: &[ProviderMessage]) -> Vec<PlannedElision> {
                     } else {
                         tool_call_path(&call.arguments)
                     };
-                    if let Some(key) = key {
-                        turn_calls.insert(call.id.as_str(), key);
-                    }
+                    turn_calls
+                        .entry(call.id.as_str())
+                        .or_default()
+                        .push_back(key);
                 }
             }
             "tool" => {
                 call_paths[index] = message
                     .tool_call_id
                     .as_deref()
-                    .and_then(|call_id| turn_calls.get(call_id).cloned());
+                    .and_then(|call_id| turn_calls.get_mut(call_id))
+                    .and_then(|calls| {
+                        if calls.len() > 1 {
+                            calls.pop_front().flatten()
+                        } else {
+                            calls.front().cloned().flatten()
+                        }
+                    });
             }
             _ => {}
         }

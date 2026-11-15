@@ -1145,3 +1145,17 @@ fn accept_fixture(listener: &TcpListener) -> (TcpStream, std::net::SocketAddr) {
         }
     }
 }
+
+#[test]
+fn devin_session_token_activates_and_is_removed_like_other_api_keys() {
+    let root = temp_root("devin-api-key");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = OAuthStore::at(root.join("auth.json"));
+    store.save_api_key("devin", "token-devin").unwrap();
+    store.save_api_key("opencode-go", "key-go").unwrap();
+    assert_eq!(store.activate_api_key("devin").unwrap().as_deref(), Some("token-devin"));
+    assert_eq!(store.active_provider_key().unwrap().as_deref(), Some("devin"));
+    store.remove_api_key("devin").unwrap();
+    assert_eq!(store.api_key("devin").unwrap(), None);
+    assert!(store.activate_api_key("unknown").is_err());
+}

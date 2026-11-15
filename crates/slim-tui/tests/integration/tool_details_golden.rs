@@ -480,7 +480,7 @@ fn collapsed_single_tool_keeps_compact_target_and_result() {
 }
 
 #[test]
-fn running_shell_shows_command_limit_and_live_progress() {
+fn running_shell_shows_the_command_and_its_last_line_and_the_limit_only_when_close() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::ToolStarted {
         batch_id: batch("batch-1"),
@@ -499,19 +499,29 @@ fn running_shell_shows_command_limit_and_live_progress() {
     let frame = render_at(&state);
     assert!(frame.contains(" $ cargo test"), "{frame}");
     assert!(!frame.contains("Executando $"), "{frame}");
-    assert!(frame.contains("limit 120s"), "{frame}");
     assert!(frame.contains("Compiling slim-core"), "{frame}");
+    // Telemetry waits behind Enter: the row is the command and its last line.
+    assert!(
+        !frame.contains("limit 120s") && !frame.contains("out 128 B"),
+        "{frame}"
+    );
+    // The limit comes forward once the command is close to it.
+    state.clock.elapsed_ms += 100_000;
+    let near = render_at(&state);
+    assert!(near.contains("limit 120s"), "{near}");
+    assert!(!near.contains("out 128 B"), "{near}");
 }
 
 #[test]
-fn running_tool_summary_stays_on_one_row_and_preserves_progress_metadata() {
+fn running_tool_summary_stays_on_one_row_and_keeps_telemetry_behind_details() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::ToolStarted {
         batch_id: batch("batch-1"),
         call_id: call("call-a"),
         name: "shell".into(),
-        arguments_summary: "command=very-long-command-that-cannot-fit-in-the-terminal · limit 120s"
-            .into(),
+        arguments_summary:
+            "command=very-long-command-that-cannot-fit-in-the-terminal --with=more-arguments-than-a-row-holds · limit 120s"
+                .into(),
     });
     state.apply_event(UiEvent::ToolProgress {
         batch_id: batch("batch-1"),
@@ -527,21 +537,19 @@ fn running_tool_summary_stays_on_one_row_and_preserves_progress_metadata() {
         .lines()
         .take(transcript_rows as usize)
         .filter(|line| {
-            ["○ $", "limit 120s", "out 128 B", "err 0 B"]
+            ["very-long-command", "arguments", "Compiling"]
                 .iter()
                 .any(|needle| line.contains(needle))
         })
         .collect::<Vec<_>>();
     assert_eq!(matching.len(), 1, "tool summary wrapped:\n{frame}");
     let summary = matching[0];
-    assert!(summary.contains("○ $"), "{summary}");
-    assert!(summary.contains("limit 120s"), "{summary}");
-    assert!(summary.contains("out 128 B"), "{summary}");
-    assert!(summary.contains("err 0 B"), "{summary}");
-    assert!(
-        !summary.contains("very-long-command-that-cannot-fit-in-the-terminal"),
-        "{summary}"
-    );
+    // The only live call carries the run's spinner in its own marker cell.
+    assert!(summary.contains("⠋ $ very-long-command"), "{summary}");
+    assert!(summary.trim_end().ends_with('…'), "{summary}");
+    for telemetry in ["limit 120s", "out 128 B", "err 0 B"] {
+        assert!(!frame.contains(telemetry), "{telemetry}\n{frame}");
+    }
 }
 
 #[test]
@@ -691,9 +699,12 @@ fn projected_patch_and_shell_rows_read_as_verb_target_and_outcome() {
     let collapsed = render_at_width(&state, 100);
     let header = collapsed
         .lines()
-        .find(|line| line.contains("Editou src/lib.rs · $ cargo test"))
+        .find(|line| line.contains("✓ Editou src/lib.rs"))
         .unwrap_or_else(|| panic!("group header\n{collapsed}"));
-    assert!(header.contains("✓ "), "{header}");
+    assert!(
+        !header.contains("cargo test"),
+        "the check does not name the call that failed\n{header}"
+    );
     let failure = collapsed
         .lines()
         .find(|line| line.contains("✕ $"))

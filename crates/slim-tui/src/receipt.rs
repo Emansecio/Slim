@@ -1,9 +1,10 @@
 //! What a turn changed, derived from the blocks that follow the last prompt.
 //!
-//! The receipt closes a run that touched the project: files edited, lines
-//! added and removed, commands run and how the last one ended. Everything
-//! comes from data the transcript already holds, so nothing is accumulated
-//! per event and a restored session simply has no receipt.
+//! The receipt closes a run that touched the project with its result: files
+//! edited, lines added and removed, and a last command that failed. How the
+//! turn got there (calls, commands, time) is the folded work row's to say.
+//! Everything comes from data the transcript already holds, so nothing is
+//! accumulated per event and a restored session simply has no receipt.
 
 use crate::block::{Block, BlockKind, BlockLifecycle, ToolState};
 
@@ -31,21 +32,21 @@ pub struct ReceiptState {
     /// Some file has no exact line counts, so the totals are a lower bound.
     pub stats_partial: bool,
     pub commands: usize,
-    pub failed_commands: usize,
     /// Whether the last command of the turn succeeded, if any ran.
     pub last_command_ok: Option<bool>,
-    pub duration_ms: u64,
     pub outcome: ReceiptOutcome,
 }
 
 impl ReceiptState {
-    /// A turn that changed nothing and ran nothing has no receipt.
+    /// A turn that changed no file has no receipt, unless it was interrupted
+    /// while it ran commands: the row then says where the run stopped.
     pub fn is_worth_showing(&self) -> bool {
-        self.files > 0 || self.commands > 0
+        self.files > 0 || (self.outcome == ReceiptOutcome::Interrupted && self.commands > 0)
     }
 
-    /// The counts of the receipt as separate segments, in reading order:
-    /// files, lines, commands. Segments with nothing to say are absent.
+    /// The result as separate segments, in reading order: files, lines, and
+    /// the last command when it failed. Segments with nothing to say are
+    /// absent.
     pub fn segments(&self) -> Vec<ReceiptSegment> {
         let mut segments = Vec::new();
         if self.files > 0 {
@@ -62,20 +63,9 @@ impl ReceiptState {
                 });
             }
         }
-        if self.commands > 0 {
-            let mut text = if self.commands == 1 {
-                "1 comando".to_owned()
-            } else {
-                format!("{} comandos", self.commands)
-            };
-            match self.failed_commands {
-                0 => {}
-                1 => text.push_str(", 1 falhou"),
-                failed => text.push_str(&format!(", {failed} falharam")),
-            }
-            segments.push(ReceiptSegment::Text(text));
+        if self.last_command_ok == Some(false) {
+            segments.push(ReceiptSegment::Text("último comando falhou".into()));
         }
-        segments.push(ReceiptSegment::Text(format_duration(self.duration_ms)));
         segments
     }
 
@@ -91,7 +81,10 @@ impl ReceiptState {
                 added,
                 removed,
                 partial,
-            } => format!("{}+{added} -{removed}", if partial { "~" } else { "" }),
+            } => format!(
+                "+{added} -{removed}{}",
+                if partial { PARTIAL_SUFFIX } else { "" }
+            ),
         }));
         parts.join(" · ")
     }
@@ -101,13 +94,16 @@ impl ReceiptState {
 pub enum ReceiptSegment {
     Text(String),
     /// Added and removed lines, drawn as `+A -R` in the diff colors. `partial`
-    /// marks a lower bound (`~+A -R`).
+    /// marks a lower bound (`+A -R ou mais`).
     Lines {
         added: u64,
         removed: u64,
         partial: bool,
     },
 }
+
+/// What follows line totals that are a lower bound.
+pub const PARTIAL_SUFFIX: &str = " ou mais";
 
 pub(crate) fn format_duration(ms: u64) -> String {
     match ms {
@@ -204,11 +200,10 @@ fn estimated_stats(arguments_summary: &str) -> Option<(u64, u64)> {
 }
 
 /// The receipt of the turn that just ended.
-pub fn turn_receipt(blocks: &[Block], duration_ms: u64, outcome: ReceiptOutcome) -> ReceiptState {
+pub fn turn_receipt(blocks: &[Block], outcome: ReceiptOutcome) -> ReceiptState {
     let turn = turn_blocks(blocks);
     let changes = file_changes(turn);
     let mut commands = 0;
-    let mut failed_commands = 0;
     let mut last_command_ok = None;
     for block in turn {
         let BlockKind::Tool(tool) = block.kind() else {
@@ -224,7 +219,6 @@ pub fn turn_receipt(blocks: &[Block], duration_ms: u64, outcome: ReceiptOutcome)
             }
             BlockLifecycle::Failed => {
                 commands += 1;
-                failed_commands += 1;
                 last_command_ok = Some(false);
             }
             _ => {}
@@ -236,9 +230,7 @@ pub fn turn_receipt(blocks: &[Block], duration_ms: u64, outcome: ReceiptOutcome)
         removed: changes.iter().map(|change| change.removed).sum(),
         stats_partial: changes.iter().any(|change| !change.exact),
         commands,
-        failed_commands,
         last_command_ok,
-        duration_ms,
         outcome,
     }
 }
@@ -312,7 +304,7 @@ mod tests {
                 Some(diff("src/b.rs", 0, 4, false)),
             ),
         ];
-        let receipt = turn_receipt(&blocks, 6_000, ReceiptOutcome::Completed);
+        let receipt = turn_receipt(&blocks, ReceiptOutcome::Completed);
         assert_eq!((receipt.files, receipt.added, receipt.removed), (2, 5, 5));
         assert!(!receipt.stats_partial);
         assert!(receipt.is_worth_showing());
@@ -330,7 +322,7 @@ mod tests {
                 Some(diff("a.rs", 1, 1, false)),
             ),
         ];
-        let receipt = turn_receipt(&blocks, 0, ReceiptOutcome::Completed);
+        let receipt = turn_receipt(&blocks, ReceiptOutcome::Completed);
         assert_eq!((receipt.files, receipt.added, receipt.removed), (2, 1, 1));
         assert!(receipt.stats_partial, "the write has no counts");
     }
@@ -346,13 +338,13 @@ mod tests {
                 Some(diff("a.rs", 400, 0, true)),
             ),
         ];
-        assert!(turn_receipt(&truncated, 0, ReceiptOutcome::Completed).stats_partial);
+        assert!(turn_receipt(&truncated, ReceiptOutcome::Completed).stats_partial);
         // No diff arrived: the estimate in the summary stands in, flagged partial.
         let estimated = [
             user(),
             tool("patch", "path=a.rs · +7 -2", BlockLifecycle::Complete, None),
         ];
-        let receipt = turn_receipt(&estimated, 0, ReceiptOutcome::Completed);
+        let receipt = turn_receipt(&estimated, ReceiptOutcome::Completed);
         assert_eq!((receipt.added, receipt.removed), (7, 2));
         assert!(receipt.stats_partial);
     }
@@ -376,16 +368,20 @@ mod tests {
             ),
             tool("read", "path=x", BlockLifecycle::Complete, None),
         ];
-        let receipt = turn_receipt(&blocks, 0, ReceiptOutcome::Completed);
+        let receipt = turn_receipt(&blocks, ReceiptOutcome::Completed);
         assert_eq!(receipt.files, 0);
-        assert_eq!((receipt.commands, receipt.failed_commands), (2, 1));
+        assert_eq!(receipt.commands, 2);
         assert_eq!(receipt.last_command_ok, Some(true));
+        assert!(
+            !receipt.is_worth_showing(),
+            "commands alone are the work row's to report"
+        );
         let last_failed = [
             user(),
             tool("shell", "command=x", BlockLifecycle::Failed, None),
         ];
         assert_eq!(
-            turn_receipt(&last_failed, 0, ReceiptOutcome::Completed).last_command_ok,
+            turn_receipt(&last_failed, ReceiptOutcome::Completed).last_command_ok,
             Some(false)
         );
     }
@@ -404,7 +400,7 @@ mod tests {
             tool("read", "path=x", BlockLifecycle::Complete, None),
             tool("search", "pattern=y", BlockLifecycle::Complete, None),
         ];
-        let receipt = turn_receipt(&blocks, 1_000, ReceiptOutcome::Completed);
+        let receipt = turn_receipt(&blocks, ReceiptOutcome::Completed);
         assert!(
             !receipt.is_worth_showing(),
             "the earlier turn's edit is not this turn's"

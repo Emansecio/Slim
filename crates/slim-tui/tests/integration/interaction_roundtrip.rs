@@ -118,10 +118,14 @@ fn explicit_cancellation_pauses_queue_until_resume_command() {
     state.authenticated = true;
     state.apply_event(UiEvent::run_started(1));
 
+    // Enter-while-working now steers; the queue is seeded through the
+    // refund event because this test is about the cancellation pause, not
+    // the submit path.
     for prompt in ["first queued prompt", "second queued prompt"] {
-        state.composer.insert_text(prompt);
-        let effects = reduce(&mut state, Action::Key(key(KeyCode::Enter)));
-        assert!(!effects.iter().any(starts_prompt));
+        state.apply_event(UiEvent::QueuedUserAdded {
+            text: prompt.into(),
+            position: 0,
+        });
     }
     assert_eq!(state.queue_len(), 2);
     assert_eq!(state.queued_prompt(0), Some("first queued prompt"));

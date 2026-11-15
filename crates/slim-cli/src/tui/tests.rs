@@ -2406,3 +2406,45 @@ fn model_switch_effort_rules_follow_each_provider_family() {
         Some("Unsupported OpenCode Go model or reasoning effort")
     );
 }
+
+#[test]
+fn an_embedded_host_uses_the_stored_login_of_the_provider_it_names() {
+    use crate::oauth::{OAuthCredential, OAuthProvider};
+    use slim_core::provider::ProviderKind;
+    let credential = |access: &str| OAuthCredential {
+        access: access.into(),
+        refresh: "r".into(),
+        expires: 0,
+        account_id: None,
+    };
+    let none = |_: OAuthProvider| -> Result<Option<OAuthCredential>, super::TuiError> {
+        panic!("the active login of the same kind is used as is")
+    };
+    // The active login of the named kind wins.
+    let active = Some((OAuthProvider::Anthropic, credential("ativo")));
+    let found = super::oauth_session_for_kind(ProviderKind::Anthropic, active, none).unwrap();
+    assert_eq!(found, Some((OAuthProvider::Anthropic, credential("ativo"))));
+    // Another kind is active: the stored login of the named one.
+    let active = Some((OAuthProvider::OpenAiCodex, credential("codex")));
+    let mut asked = Vec::new();
+    let found = super::oauth_session_for_kind(ProviderKind::Anthropic, active, |provider| {
+        asked.push(provider);
+        Ok(Some(credential("guardado")))
+    })
+    .unwrap();
+    assert_eq!(asked, [OAuthProvider::Anthropic]);
+    assert_eq!(found, Some((OAuthProvider::Anthropic, credential("guardado"))));
+    // Nothing stored, or a kind without OAuth: no login.
+    let found = super::oauth_session_for_kind(ProviderKind::Xai, None, |_| Ok(None)).unwrap();
+    assert_eq!(found, None);
+    let found = super::oauth_session_for_kind(ProviderKind::OpenCodeGo, None, |_| {
+        panic!("no OAuth provider for API-key kinds")
+    })
+    .unwrap();
+    assert_eq!(found, None);
+    // A store error is reported, not hidden.
+    let failed = super::oauth_session_for_kind(ProviderKind::OpenAiCodex, None, |_| {
+        Err(super::TuiError::new(crate::ExitCode::Auth, "store"))
+    });
+    assert!(failed.is_err());
+}

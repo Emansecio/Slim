@@ -13,6 +13,7 @@ pub enum LoginProvider {
     CommandCode,
     Xai,
     OpenDesign,
+    Devin,
 }
 
 impl LoginProvider {
@@ -26,6 +27,7 @@ impl LoginProvider {
             Self::CommandCode => "Command Code — API key",
             Self::Xai => "xAI — Grok/X subscription",
             Self::OpenDesign => "Open Design — API key",
+            Self::Devin => "Devin — Cognition account",
         }
     }
 }
@@ -362,6 +364,13 @@ pub enum OpenDesignCatalogSource {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DevinCatalogSource {
+    Live,
+    Cache,
+    Fallback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ZenCatalogSource {
     Live,
     Cache,
@@ -441,6 +450,13 @@ pub enum UiEvent {
         session_id: SessionId,
         cwd: String,
         messages: Vec<TranscriptMessage>,
+        /// Workspace skills discovered off the UI thread; applied as-is.
+        skill_names: Vec<String>,
+    },
+    /// `/new` left the previous conversation: the view resets as at a clean
+    /// start, with no session until the first prompt creates one.
+    SessionCleared {
+        cwd: String,
         /// Workspace skills discovered off the UI thread; applied as-is.
         skill_names: Vec<String>,
     },
@@ -719,6 +735,10 @@ pub enum UiEvent {
     OpenDesignCatalogLoaded {
         models: Vec<OpenCodeModelView>,
         source: OpenDesignCatalogSource,
+    },
+    DevinCatalogLoaded {
+        models: Vec<OpenCodeModelView>,
+        source: DevinCatalogSource,
     },
     ZenCatalogLoaded {
         models: Vec<OpenCodeModelView>,
@@ -1329,6 +1349,9 @@ pub enum UiCommand {
         command: String,
     },
     SendPrompt(String),
+    /// Delivers text to the active run's conversation at the next turn
+    /// boundary; outside a run the worker routes it to the prompt queue.
+    Steer(String),
     /// Admission-aware prompt path used by the reducer. The legacy
     /// `SendPrompt` remains for existing programmatic bridge callers.
     PreparePrompt {
@@ -1380,6 +1403,7 @@ pub enum UiCommand {
     RefreshClinePassModels,
     RefreshCommandCodeModels,
     RefreshOpenDesignModels,
+    RefreshDevinModels,
     SetOpenCodeModel {
         model: String,
         effort: ReasoningEffort,
@@ -1401,6 +1425,10 @@ pub enum UiCommand {
         effort: ReasoningEffort,
     },
     SetOpenDesignModel {
+        model: String,
+        effort: ReasoningEffort,
+    },
+    SetDevinModel {
         model: String,
         effort: ReasoningEffort,
     },
@@ -1463,6 +1491,10 @@ pub enum UiCommand {
     ResumeSession {
         id: String,
     },
+    /// `/new`: leaves the current conversation (its file stays resumable) and
+    /// starts an empty one, created by the next prompt; answered by
+    /// `UiEvent::SessionCleared`.
+    NewSession,
     /// Lists the current session's finished turns (`/rewind` overlay); answered
     /// by `UiEvent::TurnsListed`.
     ListTurns {
@@ -1765,6 +1797,7 @@ impl UiEvent {
             Self::RunStarted { .. }
                 | Self::PromptRunStarted { .. }
                 | Self::SessionRestored { .. }
+                | Self::SessionCleared { .. }
                 | Self::JobsChanged { .. }
                 | Self::JobOutput { .. }
                 | Self::PromptRunCompleted { .. }
@@ -2282,6 +2315,10 @@ mod tests {
                 session_id: SessionId("restored".into()),
                 cwd: "workspace".into(),
                 messages: Vec::new(),
+                skill_names: Vec::new(),
+            },
+            UiEvent::SessionCleared {
+                cwd: "workspace".into(),
                 skill_names: Vec::new(),
             },
             UiEvent::ToolStarted {

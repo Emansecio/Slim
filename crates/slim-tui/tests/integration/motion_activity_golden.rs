@@ -203,7 +203,7 @@ fn hidden_activity_rail_keeps_phase_and_cancel_in_footer() {
                 footer.contains("Esc"),
                 "the compact footer keeps the stop shortcut: {footer}"
             );
-            assert!(!footer.contains("Em atividade"), "{footer}");
+            assert!(!footer.contains("Trabalhando"), "{footer}");
         }
     }
 }
@@ -241,7 +241,7 @@ fn activity_projects_known_phase_and_elapsed() {
     // The visible header owns the phase and its time; the rail carries the run.
     assert!(frame.contains("Pensando · 2s"), "{frame}");
     assert_eq!(frame.matches("Pensando").count(), 1, "{frame}");
-    assert!(frame.contains("execução 2s"), "{frame}");
+    assert!(frame.contains("Trabalhando · 2s"), "{frame}");
 }
 
 #[test]
@@ -267,10 +267,10 @@ fn rail_labels_the_run_total_when_it_differs_from_the_thinking_time() {
 
     let frame = render_state(&state, caps(false)).join("\n");
     assert!(frame.contains("Pensando · 2s"), "{frame}");
-    assert!(frame.contains("execução 6s"), "{frame}");
+    assert!(frame.contains("Trabalhando · 6s"), "{frame}");
     let rail = frame
         .lines()
-        .find(|line| line.contains("execução"))
+        .find(|line| line.contains("Trabalhando"))
         .expect("rail row");
     assert!(!rail.trim_start().starts_with('·'), "{rail}");
 }
@@ -313,9 +313,9 @@ fn rail_carries_the_run_while_the_running_tool_row_is_in_the_transcript() {
         );
         let rail = frame
             .lines()
-            .find(|line| line.contains("execução"))
+            .find(|line| line.contains("Trabalhando"))
             .expect("activity row");
-        assert!(rail.contains("execução 7s"), "{rail}");
+        assert!(rail.contains("Trabalhando · 7s"), "{rail}");
         assert!(rail.contains("Esc parar"), "{rail}");
         assert!(!rail.contains("5s"), "{rail}");
         assert_eq!(
@@ -332,7 +332,7 @@ fn rail_keeps_the_full_label_when_the_running_tool_row_is_scrolled_away() {
     state.scroll.mode = slim_tui::app::FollowMode::Top;
     let frame = render_state(&state, caps(false)).join("\n");
     assert!(!frame.contains("cargo clippy"), "{frame}");
-    assert!(!frame.contains("execução"), "{frame}");
+    assert!(!frame.contains("Trabalhando"), "{frame}");
     let rail = frame
         .lines()
         .find(|line| line.contains("Executando"))
@@ -376,12 +376,12 @@ fn rail_is_not_blank_while_the_thinking_header_owns_the_phase() {
         assert!(frame.contains("Pensando · 2s"), "{frame}");
         let rail: Vec<&str> = frame
             .lines()
-            .filter(|line| line.contains("execução"))
+            .filter(|line| line.contains("Trabalhando"))
             .collect();
         assert_eq!(rail.len(), 1, "{frame}");
-        assert!(rail[0].contains("execução 2s"), "{frame}");
+        assert!(rail[0].contains("Trabalhando · 2s"), "{frame}");
         assert!(
-            !rail[0].trim_start().starts_with("execução"),
+            !rail[0].trim_start().starts_with("Trabalhando"),
             "the row leads with the run indicator\n{}",
             rail[0]
         );
@@ -894,9 +894,9 @@ fn visible_activity_rail_prevents_working_footer_duplication() {
     state.authenticated = true;
     state.apply_event(UiEvent::run_started(1));
     let frame = render_state(&state, caps(false)).join("\n");
-    assert_eq!(frame.matches("Em atividade").count(), 1, "{frame}");
+    assert_eq!(frame.matches("Trabalhando").count(), 1, "{frame}");
     let footer = frame.lines().last().expect("footer");
-    assert!(footer.contains("Em atividade · Esc parar"), "{footer}");
+    assert!(footer.contains("Trabalhando · Esc parar"), "{footer}");
     assert!(
         !footer.contains("Shift+Tab"),
         "the run owns the row; the footer keeps the stop only\n{footer}"
@@ -964,7 +964,7 @@ fn working_elapsed_is_anchored_to_run_start() {
     );
 
     let buffer = render_state(&state, caps(false)).join("\n");
-    assert!(buffer.contains("Em atividade · 3s"));
+    assert!(buffer.contains("Trabalhando · 3s"));
 }
 
 #[test]

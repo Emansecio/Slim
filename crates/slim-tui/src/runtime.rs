@@ -4,15 +4,13 @@ use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{
-    read, Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Alignment;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as RatatuiBlock, BorderType, Borders, Clear, Paragraph, Wrap};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use slim_core::runtime::mode_name;
 
@@ -39,7 +37,7 @@ use crate::render::{
     InspectorPaletteKey, ScrollMetrics, WrapCache,
 };
 use crate::runtime_wait::{
-    next_visual_deadline, runtime_clock, wait_for_runtime_signal, WaitOutcome, MOTION_INTERVAL_MS,
+    next_visual_deadline, runtime_clock, wait_for_runtime_signal, InputPump, WaitOutcome,
 };
 use crate::theme::{
     detect_capabilities, glyph, mix_rgb, resolve_theme, to_terminal_color, Capabilities,
@@ -64,7 +62,7 @@ const CONTROL_BATCH_LIMIT: usize = 32;
 // slot when a control event establishes a causal barrier.
 const STREAM_BATCH_LIMIT: usize = crate::api::STREAM_EVENT_CAPACITY + 1;
 const DOCKED_INSPECTOR_MIN_WIDTH: u16 = 100;
-const INFO_TOAST_HIGHLIGHT_MS: u64 = crate::block::TOOL_GROUP_HOLD_MS;
+const INFO_TOAST_HIGHLIGHT_MS: u64 = crate::block::TOOL_SETTLE_MS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LaneDrain {
@@ -153,6 +151,7 @@ fn run_loop(
     let (clipboard_tx, clipboard_rx) = std::sync::mpsc::channel::<ClipboardOutcome>();
     let mut control_prefetched = Vec::new();
     let mut stream_prefetched = Vec::new();
+    let mut input = InputPump::start(channels.wake.clone())?;
     // Terminal size is only re-queried on resize events; the query is an OS
     // call on Windows.
     let mut size = backend.terminal().size()?;
@@ -332,28 +331,38 @@ fn run_loop(
         .min();
         // Arming before the probes closes the race between the last drain and
         // the wait: producers only signal while a waiter is armed, so the
-        // prefetch/`poll(0)` checks are the single place that decides.
+        // prefetch/pending-input checks are the single place that decides.
         channels.wake.arm();
         let outcome = if prefetch_event(&channels.events, &mut control_prefetched)
             | prefetch_event(&channels.events_data, &mut stream_prefetched)
         {
             WaitOutcome::Wake
-        } else if crossterm::event::poll(Duration::ZERO)? {
+        } else if input.pending()? {
             WaitOutcome::Input
         } else {
             wait_for_runtime_signal(&channels.wake, deadline)?
         };
         channels.wake.disarm();
+        // On Unix input arrives through the wake signal as well; it goes
+        // first, and the lanes are drained at the top of the next pass.
+        #[cfg(unix)]
+        let outcome = if input.pending()? {
+            WaitOutcome::Input
+        } else {
+            outcome
+        };
         match outcome {
             WaitOutcome::Wake => {}
             WaitOutcome::Input => {
                 // Drain the reader's buffered events: crossterm can read ahead,
                 // which would otherwise strand input until the next OS signal.
                 let mut handled = 0usize;
-                let mut input_pending;
+                let mut input_pending = false;
                 loop {
-                    let event = read()?;
-                    input_pending = crossterm::event::poll(Duration::ZERO)?;
+                    let Some(event) = input.next()? else {
+                        break;
+                    };
+                    input_pending = input.pending()?;
                     if let Event::Resize(width, height) = event {
                         size = ratatui::layout::Size { width, height };
                         resize_settles_at = Some(started.elapsed() + RESIZE_SETTLE);
@@ -369,6 +378,11 @@ fn run_loop(
                         dirty = false;
                     }
                     for decoded in paste_decoder.feed(event, input_pending) {
+                        if !state.terminal_focused && implies_terminal_focus(&decoded) {
+                            let effects =
+                                queue.reduce(&mut state, Action::TerminalFocus(true))?;
+                            run_effects(channels, &clipboard_tx, effects)?;
+                        }
                         let action = match decoded {
                             DecodedEvent::Paste(payload) => Some(Action::Paste(payload)),
                             DecodedEvent::Event(event) => terminal_action(
@@ -438,6 +452,16 @@ fn run_loop(
             }
         }
     }
+}
+
+/// Typing or pasting only reaches a focused terminal. A focus-in report that
+/// never arrived (a multiplexer, a terminal that sends only one of the two)
+/// must not leave the motion clock off for the rest of the session.
+fn implies_terminal_focus(decoded: &DecodedEvent) -> bool {
+    matches!(
+        decoded,
+        DecodedEvent::Paste(_) | DecodedEvent::Event(Event::Key(_) | Event::Paste(_))
+    )
 }
 
 /// How long after the last resize event the frame waits before measuring
@@ -1093,7 +1117,6 @@ pub fn measure_scrollback(
     height: u16,
     cache: &mut WrapCache,
 ) -> ScrollMetrics {
-    cache.set_tool_presentation(state.clock.elapsed_ms, cache.reduced_motion_presentation());
     let regions = plan_regions(state, width, height, cache);
     let workspace = workspace_regions(state, to_ratatui(regions.scrollback));
     let notices = toast_row_count(state, workspace.transcript.height);
@@ -1142,23 +1165,10 @@ pub(crate) struct Palette {
     assistant_bold: Style,
     accent: Style,
     accent_bold: Style,
-    thinking: Style,
-    /// Thought rows and the Plan mode (violet); `thinking` stays the H3 tone.
+    /// Thought rows and the Plan mode (violet).
     reasoning: Style,
     /// The older of the two preview rows: one step back toward the surface.
     reasoning_dim: Style,
-    /// The thinking sweep, from a shade below the resting violet up to its
-    /// peak.
-    shimmer: Ramp,
-    /// The glow at the edge of arriving text, up to the same peak: anything
-    /// above rest is brighter than the text it lights.
-    glow: Ramp,
-    /// The sweep across the agent name while it has not answered yet: the
-    /// identity green, from dim to bright.
-    presence: Ramp,
-    /// The glow at the edge of the answer being written: from the text color
-    /// up to the identity green, so fresh words read as wet ink.
-    arrival: Ramp,
     /// The welcome wordmark, from a quiet gray up to a white touched by the
     /// identity green where its sheen passes.
     mark: Ramp,
@@ -1212,11 +1222,9 @@ impl Palette {
         } else {
             color(MENU_SELECTION_BG)
         };
-        // Four steps from `from` up to the peak of the reasoning hue, for the
-        // sweep and the glow. Where shades cannot be told apart, weight
-        // carries the upper steps.
-        let violet_peak = mix_rgb(theme.foreground, theme.reasoning_accent, 0.25);
-        let green_peak = mix_rgb(theme.foreground, theme.assistant_accent, 0.30);
+        // Four steps from `from` up to `peak`, for the welcome wordmark's
+        // sheen. Where shades cannot be told apart, weight carries the upper
+        // steps.
         let truecolor = capabilities.color_depth == ColorDepth::TrueColor;
         let scale = |from: (u8, u8, u8), peak: (u8, u8, u8)| Ramp {
             steps: std::array::from_fn(|level| {
@@ -1251,7 +1259,6 @@ impl Palette {
                 .add_modifier(Modifier::BOLD),
             accent: base.fg(color(theme.accent)),
             accent_bold: base.fg(color(theme.accent)).add_modifier(Modifier::BOLD),
-            thinking: base.fg(color(theme.thinking_accent)),
             reasoning: base.fg(color(theme.reasoning_accent)),
             reasoning_dim: match capabilities.color_depth {
                 ColorDepth::TrueColor | ColorDepth::Ansi256 => base.fg(color(reasoning_dim_rgb)),
@@ -1260,25 +1267,6 @@ impl Palette {
                     .fg(color(theme.reasoning_accent))
                     .add_modifier(Modifier::DIM),
             },
-            shimmer: scale(
-                mix_rgb(theme.reasoning_accent, theme.background, 0.15),
-                violet_peak,
-            ),
-            // Steps start at the resting violet, and only those above it
-            // are painted; the continuous light rises from the dimmer shade
-            // of the words it lights, so it never jumps on.
-            glow: Ramp {
-                ends: truecolor.then_some([reasoning_dim_rgb, violet_peak]),
-                ..scale(theme.reasoning_accent, violet_peak)
-            },
-            presence: scale(
-                mix_rgb(theme.assistant_accent, theme.background, 0.35),
-                green_peak,
-            ),
-            arrival: scale(
-                theme.foreground,
-                mix_rgb(theme.assistant_accent, theme.foreground, 0.2),
-            ),
             mark: scale(
                 mix_rgb(theme.muted, theme.foreground, 0.30),
                 mix_rgb(theme.foreground, theme.assistant_accent, 0.22),
@@ -1302,16 +1290,21 @@ impl Palette {
             link: base.fg(color(theme.link_accent)),
             quote: base.fg(color(theme.secondary_text)),
             tool: base.fg(color(theme.tool_accent)),
-            // Inline code is told from prose by its tone at every depth: the
-            // raised surface alone sits too close to the transcript, and it
-            // collapses to Black in ANSI16/no-color.
+            // Inline code reads at the full tone of the prose around it and is
+            // told apart by a chip a step above the code surface, which alone
+            // sits too close to the transcript. ANSI16/no-color have no such
+            // step (it collapses to Black), so there the tone carries it.
             inline_code: if matches!(
                 capabilities.color_depth,
                 ColorDepth::Ansi16 | ColorDepth::None
             ) {
                 base.fg(color(theme.tool_accent))
             } else {
-                base.fg(color(theme.tool_accent)).bg(color(theme.code_bg))
+                base.fg(color(theme.foreground)).bg(color(mix_rgb(
+                    theme.code_bg,
+                    theme.foreground,
+                    0.10,
+                )))
             },
             code_block: base.fg(color(theme.foreground)).bg(color(theme.code_bg)),
             code_rail: base.fg(color(theme.code_rail)),
@@ -1393,7 +1386,6 @@ pub fn render_frame(
     capabilities: Capabilities,
     cache: &mut WrapCache,
 ) {
-    cache.set_tool_presentation(state.clock.elapsed_ms, capabilities.reduced_motion);
     let modal_open = dimmed_modal_open(state);
     let modal_opened_ms = cache.note_modal_frame(modal_open, state.clock.elapsed_ms);
     cache.selection_regions = [None, None];
@@ -1804,9 +1796,10 @@ fn next_transition_visual_deadline_ms(
 /// Whether the run is animating at all. Only a blocking modal (dimmed
 /// backdrop) pauses it; popups, search, todo focus, a pending question and
 /// inspectors leave the animated surfaces readable, so they keep moving.
+/// A terminal without focus keeps moving too: a run is often watched from
+/// beside the window that has it, and a still frame there reads as a hang.
 fn motion_needed(state: &AppState, capabilities: Capabilities, cache: &mut WrapCache) -> bool {
     if capabilities.reduced_motion
-        || !state.terminal_focused
         || welcome_visible(state)
         || blocking_modal_open(state)
         || state.cancellation.is_some()
@@ -1823,18 +1816,24 @@ fn motion_needed(state: &AppState, capabilities: Capabilities, cache: &mut WrapC
 /// one-second status tick and the motion clock stops.
 const ACTIVITY_STALL_MS: u64 = 5_000;
 
-/// Neither the provider nor a tool has produced anything for
-/// [`ACTIVITY_STALL_MS`] while the run is still working.
+/// The provider has produced nothing for [`ACTIVITY_STALL_MS`] while the run
+/// is still working. A tool that is executing is busy, not stalled: a build
+/// or a test suite is silent for minutes, and the footer already says for
+/// how long (`sem progresso há …`).
 fn activity_stalled(state: &AppState) -> bool {
     state.working
         && state.cancellation.is_none()
         && state.retry.is_none()
+        && !matches!(
+            state.activity.as_ref().map(|activity| &activity.phase),
+            Some(ActivityPhase::RunningTool(_))
+        )
         && last_useful_update_age_ms(state).is_some_and(|age| age >= ACTIVITY_STALL_MS)
 }
 
 /// Motion is worth a repaint only when something animated is on screen: the
-/// footer's activity spinner, or the transcript's thinking header, presence
-/// sweep and streaming caret. Those exist only while the run is working, and
+/// footer's activity spinner, or the transcript's thinking header, live tool
+/// mark and streaming caret. Those exist only while the run is working, and
 /// a floating inspector covers the transcript, so it leaves just the footer.
 fn motion_on_screen(
     state: &AppState,
@@ -1878,33 +1877,10 @@ fn render_session_rail(
         palette,
         capabilities,
     );
-    // The right edge says who the session is talking to: the workspace is
-    // already named on the left, and the footer owns the model and the
-    // context, so this is the one fact the chrome was missing.
-    let chip = state
-        .auth_provider
-        .filter(|_| state.authenticated)
-        .map(|provider| {
-            provider
-                .label()
-                .split(" — ")
-                .next()
-                .unwrap_or_else(|| provider.label())
-                .to_owned()
-        });
-    let chip_width = chip
-        .as_ref()
-        .map_or(0, |chip| UnicodeWidthStr::width(chip.as_str()) + 2);
-    let gap = projection.gap.saturating_sub(chip_width);
-    if gap > 0 {
-        spans.push(Span::raw(" ".repeat(gap)));
-    }
-    if let Some(chip) = chip.filter(|_| gap > 0) {
-        spans.push(Span::styled(
-            format!("{} ", glyph(capabilities, '\u{25cf}', '*')),
-            palette.success,
-        ));
-        spans.push(Span::styled(chip, palette.muted));
+    // Where the session runs is all this row says; who it talks to (provider,
+    // model, effort) reads together in the footer.
+    if projection.gap > 0 {
+        spans.push(Span::raw(" ".repeat(projection.gap)));
     }
     if !projection.status.is_empty() {
         spans.push(Span::styled(projection.status, palette.secondary));
@@ -2036,13 +2012,7 @@ fn render_scrollback(
             .map(|block| &block.id)
     });
     let live_collapsed_group = if state.working {
-        cache.tool_group_leader(
-            state.blocks(),
-            content_rev,
-            fold_rev,
-            state.clock.elapsed_ms,
-            capabilities.reduced_motion,
-        )
+        cache.tool_group_leader(state.blocks(), content_rev, fold_rev)
     } else {
         None
     };
@@ -2071,6 +2041,9 @@ fn render_scrollback(
     let capacity = viewport.saturating_sub(u64::from(leading_space)) as usize;
     let buf = frame.buffer_mut();
     buf.set_style(text_area, palette.text);
+    // One call in flight: its row moves and the footer stays still. Several
+    // keep their still marks and leave the moving one to the footer.
+    let single_live = tool_activity_is_active(state) && single_live_tool(state);
     let mut y = text_area.y;
     while idx < index.len() && rows < capacity && y < text_area.bottom() {
         let block_index = index.entry_start(idx);
@@ -2130,6 +2103,8 @@ fn render_scrollback(
                 && !capabilities.reduced_motion
                 && thinking_header_candidate,
             caret: CaretPhase::of(state, capabilities),
+            narration: members.len() == 1
+                && crate::block::is_narration(state.blocks(), block_index),
         };
         // Key on everything the produced lines depend on: each member's
         // generation/lifecycle/fold/timing folded together, selection and the
@@ -2197,7 +2172,10 @@ fn render_scrollback(
         let key = (
             block.cache_identity(),
             member_state,
-            u8::from(is_selected) | u8::from(show_enter_hint) << 1 | u8::from(transition_gap) << 2,
+            u8::from(is_selected)
+                | u8::from(show_enter_hint) << 1
+                | u8::from(transition_gap) << 2
+                | u8::from(ctx.narration) << 3,
             content_width,
         );
         // A block still being written gets a new key every generation; it
@@ -2218,6 +2196,7 @@ fn render_scrollback(
                 now_ms: ctx.now_ms,
                 animate_thinking: false,
                 caret: ctx.caret,
+                narration: ctx.narration,
             };
             let mut built = if matches!(block.kind(), BlockKind::QueuedUser(_)) {
                 grouped_queued_user_lines(block, members, show_enter_hint, &static_ctx)
@@ -2305,35 +2284,28 @@ fn render_scrollback(
         if let Some(tone) = rail_tone(block, palette) {
             // The turn's edge: one cell of tone down the gutter of every row
             // the block painted, over the surfaces already there (the prompt
-            // band, a diff, a code block). The header's rule and the breathing
-            // rows between blocks keep their own row.
+            // band, a diff, a code block). The breathing rows between blocks
+            // keep their own row.
             let rail = glyph(capabilities, '\u{258f}', '|');
             let header_rows = response_header.map_or(0, crate::block::ResponseHeader::rows);
             // The rail starts at the label that opens the turn: the blank row
-            // above it, the rule under it and the breathing rows between blocks
-            // keep their own row.
+            // above it and the breathing rows between blocks keep their own
+            // row.
             let lead_blank = response_header.map_or(0, |header| usize::from(header.lead_blank));
             // A prompt still waiting for the agent ends with the agent's header:
-            // its label and rule are the last two rows of the block.
+            // its label is the last row of the block.
             let pending_label = block
                 .awaiting_agent()
-                .then(|| block_lines.len().saturating_sub(2));
+                .then(|| block_lines.len().saturating_sub(1));
             // The `● Slim` label is the agent's, whichever block carries it.
             let label_row = response_header.map(|_| lead_blank).or(pending_label);
-            let rule_row = response_header
-                .map(|header| header.rows() - 1)
-                .or(pending_label.map(|label| label + 1));
             let gap_row = transition_gap.then_some(header_rows);
             let boundary_row = block
                 .turn_boundary_before()
                 .then_some(header_rows + usize::from(transition_gap));
             for (offset, row) in (block_start_y..y).enumerate() {
                 let index = skip + offset;
-                if index < lead_blank
-                    || Some(index) == rule_row
-                    || Some(index) == gap_row
-                    || Some(index) == boundary_row
-                {
+                if index < lead_blank || Some(index) == gap_row || Some(index) == boundary_row {
                     continue;
                 }
                 // A row under the keyboard cursor keeps its marker where the
@@ -2383,6 +2355,25 @@ fn render_scrollback(
         }
         if live_tool_candidate && skip <= lead_rows && skip.saturating_add(written) > lead_rows {
             live_tool_visible = true;
+            let glyph_x = text_area.x.saturating_add(2);
+            let glyph_y = block_start_y.saturating_add((lead_rows - skip) as u16);
+            // The motion clock stops while the run stalls; the mark then steps
+            // once a second with the footer's indicator instead of freezing.
+            let stalled = activity_stalled(state);
+            if single_live
+                && (spinner_motion_enabled || stalled)
+                && !capabilities.reduced_motion
+                && glyph_x < text_area.right()
+                && glyph_y < text_area.bottom()
+            {
+                // The row is cached with its still mark; only this cell moves.
+                let mark = if stalled {
+                    slow_spinner_glyph(state.clock.elapsed_ms, capabilities)
+                } else {
+                    spinner_glyph(state.clock.frame, capabilities)
+                };
+                buf[(glyph_x, glyph_y)].set_char(mark);
+            }
         }
         if header_written
             && !ctx.animate_thinking
@@ -2405,78 +2396,6 @@ fn render_scrollback(
                 block_start_y.saturating_add((thinking_header_index.saturating_sub(skip)) as u16);
             if glyph_x < text_area.right() && glyph_y < text_area.bottom() {
                 buf[(glyph_x, glyph_y)].set_char(spinner_glyph(ctx.frame, ctx.capabilities));
-                // The label sits after the marker and its space; the sweep
-                // touches the label only, never the clock beside it.
-                for index in 0..THINKING_LABEL_CELLS {
-                    let label_x = glyph_x.saturating_add(2 + index as u16);
-                    if label_x < text_area.right() {
-                        buf[(label_x, glyph_y)].set_style(palette.shimmer.at(sweep_strength(
-                            index,
-                            THINKING_LABEL_CELLS,
-                            ctx.now_ms,
-                        )));
-                    }
-                }
-            }
-        }
-        // A prompt still waiting for its first agent output sweeps the name in
-        // its pending header: the label, one row above the rule that closes it.
-        // `● Slim`: the name starts in the fourth column.
-        if spinner_motion_enabled
-            && block.awaiting_agent()
-            && written >= 2
-            && skip + written == block_lines.len()
-        {
-            for index in 0..AGENT_NAME_CELLS {
-                let x = text_area.x.saturating_add(4 + index as u16);
-                if x < text_area.right() {
-                    buf[(x, y - 2)].set_style(palette.presence.at(sweep_strength(
-                        index,
-                        AGENT_NAME_CELLS,
-                        ctx.now_ms,
-                    )));
-                }
-            }
-        }
-        // Words that just arrived light the edge where the text is being
-        // written, then settle. The preview keeps no caret, so this is what
-        // shows the thought is still pouring in when it arrives in bursts.
-        // A collapsed thought showing a headline has no such edge: its row
-        // holds a settled sentence, not the words arriving. The answer has a
-        // caret, and the glow adds to it.
-        if spinner_motion_enabled
-            && members.len() == 1
-            && block.lifecycle == BlockLifecycle::Streaming
-            && written > 0
-            && skip + written == block_lines.len()
-        {
-            match block.kind() {
-                BlockKind::Thinking(text) => {
-                    if let Some(freshness) = glow_freshness(state).filter(|_| {
-                        !text.trim().is_empty()
-                            && (block.fold == FoldState::Expanded
-                                || !crate::thought::has_headline(text))
-                    }) {
-                        apply_frontier_glow(buf, text_area, y - 1, &palette.glow, freshness, false);
-                    }
-                }
-                // The answer being written lights its newest words the same
-                // way; lines already settled above it keep their colors.
-                BlockKind::Assistant(text) => {
-                    if let Some(freshness) =
-                        glow_freshness(state).filter(|_| !text.trim().is_empty())
-                    {
-                        apply_frontier_glow(
-                            buf,
-                            text_area,
-                            y - 1,
-                            &palette.arrival,
-                            freshness,
-                            matches!(ctx.caret, CaretPhase::On | CaretPhase::Stalled),
-                        );
-                    }
-                }
-                _ => {}
             }
         }
         rows += written;
@@ -2608,8 +2527,11 @@ fn render_todo_dock(
     let summary = crate::todo::summary(state);
     if area.height == 1 {
         frame.render_widget(
-            Paragraph::new(truncate_cells(&crate::todo::compact_summary(state), width))
-                .style(palette.text),
+            Paragraph::new(truncate_cells(
+                &crate::todo::compact_summary(state, width),
+                width,
+            ))
+            .style(palette.text),
             area,
         );
         return;
@@ -2713,7 +2635,8 @@ struct FooterActivity {
 
 /// The run's phase as the footer reads it: indicator, phase (or the run total
 /// when the transcript already shows the phase), elapsed, staleness and
-/// near-limit budgets, fitted to `width` cells.
+/// near-limit budgets, fitted to `width` cells. Every state reads the same
+/// way: what is going on, then for how long.
 fn activity_spans(
     state: &AppState,
     width: u16,
@@ -2788,32 +2711,20 @@ fn activity_spans(
         spinner_glyph(state.clock.frame, capabilities)
     };
     let mut spans = if let Some(total) = run_total {
-        // The indicator keeps the row alive without competing with the
-        // phase row above it.
+        // The row of the phase is on screen and carries the one moving
+        // indicator; here a still mark and the run's clock are enough.
         vec![
-            Span::styled(format!("{indicator} "), palette.muted),
-            Span::styled(format!("execução {total}s"), palette.muted),
+            Span::styled(
+                format!("{} ", glyph(capabilities, '\u{25cb}', '~')),
+                palette.muted,
+            ),
+            Span::styled(format!("{RUN_LABEL} · {total}s"), palette.muted),
         ]
     } else {
-        // While the model thinks and its header is out of view, the rail
-        // carries the same sweep the header would.
-        let sweeping = !capabilities.reduced_motion
-            && cancellation.is_none()
-            && retry.is_none()
-            && matches!(
-                state.activity.as_ref().map(|activity| &activity.phase),
-                Some(ActivityPhase::Thinking)
-            );
-        let mut spans = vec![Span::styled(format!("{indicator} "), semantic_style)];
-        if sweeping {
-            spans.extend(shimmer_spans(
-                &activity_label(state),
-                state.clock.elapsed_ms,
-                palette,
-            ));
-        } else {
-            spans.push(Span::styled(activity_label(state), semantic_style));
-        }
+        let mut spans = vec![
+            Span::styled(format!("{indicator} "), semantic_style),
+            Span::styled(activity_label(state), semantic_style),
+        ];
         if elapsed > 0 {
             spans.push(Span::styled(format!(" · {elapsed}s"), palette.muted));
         }
@@ -3185,11 +3096,7 @@ fn render_welcome(
     );
 }
 
-pub(crate) fn last_collapsed_tool_group_leader(
-    blocks: &[Block],
-    now_ms: u64,
-    reduced_motion: bool,
-) -> Option<BlockId> {
+pub(crate) fn last_collapsed_tool_group_leader(blocks: &[Block]) -> Option<BlockId> {
     let mut index = blocks.len();
     while index > 0 {
         index -= 1;
@@ -3197,9 +3104,8 @@ pub(crate) fn last_collapsed_tool_group_leader(
         if !matches!(block.kind(), BlockKind::Tool(_)) {
             continue;
         }
-        let group =
-            crate::block::consecutive_presented_tool_span(blocks, index, now_ms, reduced_motion)
-                .filter(|(start, end)| crate::block::is_tool_group(blocks, *start, *end));
+        let group = crate::block::consecutive_settled_tool_span(blocks, index)
+            .filter(|(start, end)| crate::block::is_tool_group(blocks, *start, *end));
         let span = if let Some((start, _)) = group {
             Some((start, true))
         } else if crate::block::is_failed_tool(block) {
@@ -3242,6 +3148,16 @@ fn grouped_tool_lines(
             accumulated_duration_ms.map(|value| format!(" · acumulado {}", duration_label(value)))
         })
         .unwrap_or_default();
+    let failures = if leader.group_expanded {
+        crate::block::GroupFailures::default()
+    } else {
+        crate::block::group_failures(members)
+    };
+    // Refused calls a later success made moot: counted here, listed on Enter.
+    let duration = format!(
+        "{duration}{}",
+        rejection_tally(failures.folded_rejections)
+    );
     let marker = if ctx.selected { "> " } else { "  " };
     // An open group points down, like an open thought; closed it keeps the
     // check that says its calls settled.
@@ -3253,9 +3169,9 @@ fn grouped_tool_lines(
     let names: Vec<&str> = members
         .iter()
         .filter_map(|block| match block.kind() {
-            // Failed calls count too: the work they took is part of the
-            // group, and their own rows below say they failed.
-            BlockKind::Tool(tool) if crate::block::is_settled_tool(block) => {
+            // The check stands for what passed. A failed call has its own
+            // row below and is not repeated under the check.
+            BlockKind::Tool(tool) if crate::block::is_complete_tool(block) => {
                 Some(tool.name.as_str())
             }
             _ => None,
@@ -3353,9 +3269,24 @@ fn grouped_tool_lines(
             cache,
         ));
     } else {
-        lines.extend(group_failure_lines(members, selected_member, ctx, cache));
+        lines.extend(group_failure_lines(
+            members,
+            &failures.rows,
+            selected_member,
+            ctx,
+            cache,
+        ));
     }
     lines
+}
+
+/// ` · 3 recusadas`: refused calls a group folded into its header.
+fn rejection_tally(count: usize) -> String {
+    match count {
+        0 => String::new(),
+        1 => " · 1 recusada".into(),
+        count => format!(" · {count} recusadas"),
+    }
 }
 
 /// What a small group did, in its own words: the short label of each call
@@ -3367,7 +3298,7 @@ fn named_group_detail(members: &[Block], duration: &str, room: usize) -> Option<
     const MIN_LABEL_CELLS: usize = 14;
     let mut labels: Vec<String> = members
         .iter()
-        .filter(|block| crate::block::is_settled_tool(block))
+        .filter(|block| crate::block::is_complete_tool(block))
         .map(tool_short_label)
         .collect::<Option<_>>()?;
     let separators = UnicodeWidthStr::width(" · ") * labels.len().saturating_sub(1);
@@ -3414,19 +3345,20 @@ fn tool_short_label(block: &Block) -> Option<String> {
 
 /// Rows a collapsed group keeps for its failures, one step in from the
 /// header: the failed call as its own row reads it with `×N` for identical
-/// repeats, or a short `depois passou` row when the same call later succeeded.
+/// repeats, a short `depois passou` row when the same call later succeeded,
+/// or one short row per refusal reason shared by calls with different targets.
 fn group_failure_lines(
     members: &[Block],
+    rows: &[crate::block::GroupFailureRow],
     selected_member: Option<&BlockId>,
     ctx: &BlockRender<'_>,
     cache: &mut WrapCache,
 ) -> Vec<Line<'static>> {
-    crate::block::group_failure_rows(members)
-        .into_iter()
+    rows.iter()
         .map(|row| {
             let member = &members[row.member];
-            if row.recovered {
-                return recovered_failure_line(member, row.repeats, selected_member, ctx);
+            if row.recovered || !row.same_call {
+                return short_failure_line(member, row, selected_member, ctx);
             }
             let suffix = if row.repeats > 1 {
                 format!(" · ×{}", row.repeats)
@@ -3462,11 +3394,13 @@ fn group_failure_lines(
         .collect()
 }
 
-/// A failure the group later fixed: what failed and how, in one short row.
-/// Its duration and the rest of its output stay behind Enter.
-fn recovered_failure_line(
+/// A failure in one short row: what failed and how. A failure the group later
+/// fixed says `depois passou` and recedes; a refusal shared by calls with
+/// different targets names none of them. Durations and the rest of the output
+/// stay behind Enter.
+fn short_failure_line(
     member: &Block,
-    repeats: usize,
+    row: &crate::block::GroupFailureRow,
     selected_member: Option<&BlockId>,
     ctx: &BlockRender<'_>,
 ) -> Line<'static> {
@@ -3476,13 +3410,15 @@ fn recovered_failure_line(
     let name = sanitize_terminal_text(&tool.name);
     let target = first_tool_segment(&sanitize_terminal_text(&tool.arguments_summary))
         .map(|segment| tool_target(&segment));
-    let command_row = target.as_deref().is_some_and(is_command_target);
+    let command_row = target.as_deref().is_some_and(is_command_target)
+        || (!row.same_call && name == "shell");
     let title = match target.as_deref() {
-        Some(target) if command_row => target[..1].to_owned(),
+        Some(target) if is_command_target(target) => target[..1].to_owned(),
+        _ if command_row => "$".to_owned(),
         _ => tool_title(&name, BlockLifecycle::Failed),
     };
     let mut parts = vec![ToolDetailPart::fixed(title.clone())];
-    if let Some(target) = target {
+    if let Some(target) = target.filter(|_| row.same_call) {
         parts.push(ToolDetailPart::flexible(command_text(target, command_row), 0, 1).attached());
     }
     if let Some(reason) = short_failure_reason(&tool.preview)
@@ -3492,10 +3428,12 @@ fn recovered_failure_line(
     {
         parts.push(ToolDetailPart::flexible(reason.to_owned(), 1, 1));
     }
-    if repeats > 1 {
-        parts.push(ToolDetailPart::fixed(format!("×{repeats}")));
+    if row.repeats > 1 {
+        parts.push(ToolDetailPart::fixed(format!("×{}", row.repeats)));
     }
-    parts.push(ToolDetailPart::fixed("depois passou".into()));
+    if row.recovered {
+        parts.push(ToolDetailPart::fixed("depois passou".into()));
+    }
     let marker = if selected_member == Some(&member.id) {
         "> "
     } else {
@@ -3504,18 +3442,18 @@ fn recovered_failure_line(
     let glyph_text = format!("{} ", glyph(ctx.capabilities, '\u{2715}', 'x'));
     let occupied = 2 + UnicodeWidthStr::width(marker) + UnicodeWidthStr::width(glyph_text.as_str());
     let detail = fit_tool_detail(parts, (ctx.width as usize).saturating_sub(occupied));
+    // Fixed later in the same group: the mark recedes instead of alarming.
+    let (glyph_style, text_style) = if row.recovered {
+        (ctx.palette.muted, ctx.palette.muted)
+    } else {
+        (ctx.palette.error, ctx.palette.secondary)
+    };
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(marker.to_owned(), ctx.palette.muted),
-        // Fixed later in the same group: the mark recedes instead of alarming.
-        Span::styled(glyph_text, ctx.palette.muted),
+        Span::styled(glyph_text, glyph_style),
     ];
-    spans.extend(tool_detail_spans(
-        &detail,
-        &title,
-        ctx.palette.muted,
-        ctx.palette,
-    ));
+    spans.extend(tool_detail_spans(&detail, &title, text_style, ctx.palette));
     Line::from(spans)
 }
 
@@ -3816,8 +3754,7 @@ fn tool_member_lines(
         ),
     };
     // The glyph and the verb ease from a brighter tone to their resting one
-    // right after the call settles, success or failure, inside the window
-    // the row keeps before it joins a group.
+    // right after the call settles, success or failure.
     let settle = tool_settle_level(block, now_ms, capabilities);
     let glyph_style = tool_settled(glyph_style, settle, capabilities.color_depth);
     let name_style = tool_settled(name_style, settle, capabilities.color_depth);
@@ -3825,15 +3762,26 @@ fn tool_member_lines(
     let name = sanitize_terminal_text(&state.name);
     let args = sanitize_terminal_text(&state.arguments_summary);
     // A running command's last output line rides after the clock instead of
-    // among the call's own segments; its byte counts stay where they were,
-    // and the line takes only the width they leave.
-    let (live_tail, preview) = if block.lifecycle == BlockLifecycle::Streaming
-        && !state.historical
-        && state.name == "shell"
+    // among the call's own segments. Its collapsed row is the command, the
+    // clock and that line: the byte counts and the time limit are telemetry
+    // and wait behind Enter, the limit coming forward only when it is close.
+    let live_shell =
+        block.lifecycle == BlockLifecycle::Streaming && !state.historical && state.name == "shell";
+    let quiet_live = live_shell && block.fold != FoldState::Expanded && !expanded_member;
+    let preview_line = tool_preview_line(&state.preview);
+    let (live_tail, preview) = match live_shell
+        .then(|| split_shell_progress(&preview_line))
+        .flatten()
     {
-        split_shell_progress(&tool_preview_line(&state.preview))
-    } else {
-        (None, tool_preview_line(&state.preview))
+        Some((tail, _)) if quiet_live => (tail, String::new()),
+        Some((tail, counts)) => (tail, counts),
+        None => (None, preview_line),
+    };
+    let limit_is_far = |segment: &str| {
+        limit_segment_ms(segment).is_some_and(|limit| {
+            let elapsed = now_ms.saturating_sub(block.started_ms.unwrap_or(now_ms));
+            elapsed.saturating_mul(5) < limit.saturating_mul(4)
+        })
     };
     let first_target = first_tool_segment(&args).map(|segment| tool_target(&segment));
     let command_row = !state.historical && first_target.as_deref().is_some_and(is_command_target);
@@ -3919,6 +3867,7 @@ fn tool_member_lines(
             .split(" · ")
             .filter(|value| !value.is_empty())
             .enumerate()
+            .filter(|(index, value)| *index == 0 || !quiet_live || !limit_is_far(value))
         {
             parts.push(if index == 0 {
                 ToolDetailPart::flexible(command_text(tool_target(value), command_row), 0, 1)
@@ -4078,21 +4027,34 @@ const LIVE_TAIL_MIN_CELLS: usize = 8;
 /// into its last output line, whitespace folded, and the byte counts. Nothing
 /// has been printed yet when the line is the harness's `no output yet`; a
 /// preview in any other shape is left alone.
-fn split_shell_progress(preview: &str) -> (Option<String>, String) {
+fn split_shell_progress(preview: &str) -> Option<(Option<String>, String)> {
     let segments: Vec<&str> = preview.split(" · ").collect();
     let [line @ .., out, err] = segments.as_slice() else {
-        return (None, preview.to_owned());
+        return None;
     };
     if line.is_empty() || !out.starts_with("out ") || !err.starts_with("err ") {
-        return (None, preview.to_owned());
+        return None;
     }
     let line = line.join(" · ");
     let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
     let counts = format!("{out} · {err}");
-    (
+    Some((
         (!line.is_empty() && line != "no output yet").then_some(line),
         counts,
-    )
+    ))
+}
+
+/// The time limit a command's summary states (`limit 600s`, `limit 250ms`).
+fn limit_segment_ms(segment: &str) -> Option<u64> {
+    let value = segment.strip_prefix("limit ")?;
+    match value.strip_suffix("ms") {
+        Some(millis) => millis.parse().ok(),
+        None => value
+            .strip_suffix('s')?
+            .parse::<u64>()
+            .ok()
+            .map(|seconds| seconds.saturating_mul(1_000)),
+    }
 }
 
 /// First line of a tool's preview as a summary row reads it. Runtime
@@ -4414,9 +4376,8 @@ const TOOL_SETTLE_LEVELS: u8 = 8;
 const TOOL_SETTLE_LIFT: f32 = 0.55;
 
 /// How far a tool row that just settled still is from its resting tone, from
-/// `TOOL_SETTLE_LEVELS` (just settled) down to `0` (at rest). The window is
-/// the hold the row keeps before it joins a group, so one timing serves both,
-/// and the curve is a smoothstep: it leaves quickly and lands softly.
+/// `TOOL_SETTLE_LEVELS` (just settled) down to `0` (at rest). The curve is a
+/// smoothstep: it leaves quickly and lands softly.
 /// Reduced motion shows the resting tone at once.
 fn tool_settle_level(block: &Block, now_ms: u64, capabilities: Capabilities) -> u8 {
     if capabilities.reduced_motion || !crate::block::is_settled_tool(block) {
@@ -4426,10 +4387,10 @@ fn tool_settle_level(block: &Block, now_ms: u64, capabilities: Capabilities) -> 
         return 0;
     };
     let elapsed = now_ms.saturating_sub(ended);
-    if elapsed >= crate::block::TOOL_GROUP_HOLD_MS {
+    if elapsed >= crate::block::TOOL_SETTLE_MS {
         return 0;
     }
-    let progress = elapsed as f32 / crate::block::TOOL_GROUP_HOLD_MS as f32;
+    let progress = elapsed as f32 / crate::block::TOOL_SETTLE_MS as f32;
     let remaining = 1.0 - progress * progress * (3.0 - 2.0 * progress);
     ((remaining * f32::from(TOOL_SETTLE_LEVELS)).ceil() as u8).clamp(1, TOOL_SETTLE_LEVELS)
 }
@@ -4462,19 +4423,27 @@ fn block_transition_phase(block: &Block, ctx: &BlockRender<'_>) -> Option<u8> {
 }
 
 /// Tone of the rail that runs down a block's rows: the turn's edge. The
-/// user's side keeps the ivory of its marker, the agent's the identity green,
-/// a thought the violet it reasons in, a call still running the blue every
-/// live indicator uses, and settled work the quiet grey of the gutter.
+/// user's side keeps the ivory of its marker. The agent's side takes a hue
+/// only where something is happening: the identity green under the answer
+/// being written, the violet of a thought in progress, the blue of a call
+/// still running. Everything settled, an error that closed the turn included,
+/// shares the quiet tone of a border, so color on the edge always means now.
 fn rail_tone(block: &Block, palette: &Palette) -> Option<Style> {
+    let live = matches!(
+        block.lifecycle,
+        BlockLifecycle::Pending | BlockLifecycle::Streaming
+    );
     match block.kind() {
         BlockKind::User(_) | BlockKind::QueuedUser(_) => Some(palette.user),
-        BlockKind::Assistant(_) => Some(palette.assistant),
-        BlockKind::Thinking(_) => Some(palette.reasoning),
-        BlockKind::Tool(_) => Some(match block.lifecycle {
-            BlockLifecycle::Pending | BlockLifecycle::Streaming => palette.accent,
-            _ => palette.muted,
-        }),
-        BlockKind::Work(_) | BlockKind::Receipt(_) => Some(palette.muted),
+        BlockKind::Assistant(_) if live => Some(palette.assistant),
+        BlockKind::Thinking(_) if live => Some(palette.reasoning),
+        BlockKind::Tool(_) if live => Some(palette.accent),
+        BlockKind::Assistant(_)
+        | BlockKind::Thinking(_)
+        | BlockKind::Tool(_)
+        | BlockKind::Work(_)
+        | BlockKind::Receipt(_)
+        | BlockKind::Error(_) => Some(palette.border),
         _ => None,
     }
 }
@@ -4513,25 +4482,32 @@ fn user_message_lines(
         }
         Line::from(spans)
     };
-    let mut lines = vec![band(vec![
-        Span::styled("  ", surface),
-        Span::styled(
-            user_marker(ctx.capabilities).to_string(),
-            marker_style.patch(surface),
-        ),
-        Span::styled(" Você", ctx.palette.secondary.patch(surface)),
-    ])];
+    // The band and the marker say whose words these are; the first row of the
+    // prompt sits beside the marker, with no label row of its own.
     let indent = " ".repeat(crate::render::USER_PROMPT_PREFIX_COLS as usize);
-    lines.extend(
-        render_prose(text, user_prompt_text_width(ctx.width))
-            .into_iter()
-            .map(|row| {
-                band(vec![Span::styled(
-                    format!("{indent}{row}"),
-                    ctx.palette.text.patch(surface),
-                )])
-            }),
-    );
+    let mut rows = render_prose(text, user_prompt_text_width(ctx.width));
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    let mut lines: Vec<Line<'static>> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let text = Span::styled(row, ctx.palette.text.patch(surface));
+            if index == 0 {
+                band(vec![
+                    Span::styled("  ", surface),
+                    Span::styled(
+                        format!("{} ", user_marker(ctx.capabilities)),
+                        marker_style.patch(surface),
+                    ),
+                    text,
+                ])
+            } else {
+                band(vec![Span::styled(indent.clone(), surface), text])
+            }
+        })
+        .collect();
     // One row of air inside the band closes the prompt, so the next turn never
     // starts against the text.
     lines.push(band(Vec::new()));
@@ -4610,6 +4586,8 @@ struct BlockRender<'a> {
     now_ms: u64,
     animate_thinking: bool,
     caret: CaretPhase,
+    /// The block is prose written between calls, not the turn's answer.
+    narration: bool,
 }
 
 /// Streaming caret cadence: on for six motion frames (498 ms), then off.
@@ -4649,9 +4627,10 @@ impl CaretPhase {
     }
 }
 
-/// `● Slim` opens the agent's side of a turn, in the same gutter as the
-/// user's `● Você`. Cancellation or failure of any prose segment of the turn
-/// is reported here and mutes the label.
+/// `● Slim ─────` opens the agent's side of a turn, in the same gutter as the
+/// prompt's marker: the label and the rule that sets the turn apart share one
+/// row. Cancellation or failure of any prose segment of the turn is reported
+/// here and mutes the label.
 fn response_header_lines(
     header: crate::block::ResponseHeader,
     ctx: &BlockRender<'_>,
@@ -4672,8 +4651,7 @@ fn response_header_lines(
     };
     // Color alone cannot tell the outcomes apart (16 colors, NO_COLOR), so a
     // failed or interrupted turn also takes the shape tool rows use for it.
-    // Every marker is one cell: the pending header's name sweep starts in the
-    // fourth column.
+    // Every marker is one cell, so the name always starts in the text column.
     let marker = if header.failed {
         glyph(ctx.capabilities, '\u{2715}', 'x')
     } else if header.cancelled {
@@ -4690,17 +4668,23 @@ fn response_header_lines(
     if header.lead_blank {
         lines.push(Line::default());
     }
-    lines.push(Line::from(vec![
+    let label = assistant_label(lifecycle);
+    let mut spans = vec![
         Span::raw("  "),
         Span::styled(format!("{marker} "), marker_style),
-        Span::styled(assistant_label(lifecycle), label_style),
-    ]));
-    // A rule closes the header, so every turn opens as a section and the
-    // agent's work reads under its own edge.
-    lines.push(Line::from(Span::styled(
-        "─".repeat(usize::from(ctx.width)),
-        ctx.palette.border,
-    )));
+        Span::styled(label, label_style),
+    ];
+    // The rule runs from the label to the edge, so every turn opens as a
+    // section without a row spent on the line alone.
+    let used = 4 + UnicodeWidthStr::width(label) + 1;
+    if let Some(rule) = usize::from(ctx.width)
+        .checked_sub(used)
+        .filter(|rule| *rule > 0)
+    {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("─".repeat(rule), ctx.palette.border));
+    }
+    lines.push(Line::from(spans));
     lines
 }
 
@@ -4747,7 +4731,7 @@ fn thinking_header(block: &Block, count: usize, ctx: &BlockRender<'_>) -> Line<'
         .flatten();
     // The thought reads in the reasoning hue whether it streams or has
     // settled; only the marker of a streaming one keeps the blue of every
-    // live indicator. While motion runs, a highlight sweeps the label.
+    // live indicator. The spinner is the row's only motion.
     let label_style = settled(
         ctx.palette.reasoning,
         end_phase,
@@ -5027,12 +5011,23 @@ fn work_lines(
             &mut used,
         );
     }
-    if !work.tally.is_empty() {
+    let failures = if expanded {
+        crate::block::GroupFailures::default()
+    } else {
+        crate::block::group_failures(&members[1..])
+    };
+    let rejected = rejection_tally(failures.folded_rejections);
+    let tally = if work.tally.is_empty() {
+        rejected.trim_start_matches(" · ").to_owned()
+    } else {
+        format!("{}{rejected}", work.tally)
+    };
+    if !tally.is_empty() {
         let reserved = hint.map_or(0, |hint| hint.len() + 2);
         let room = width.saturating_sub(used + reserved + UnicodeWidthStr::width(" · "));
         if room > 0 {
             push(" · ".into(), palette.muted, &mut used);
-            push(truncate_cells(&work.tally, room), palette.muted, &mut used);
+            push(truncate_cells(&tally, room), palette.muted, &mut used);
         }
     }
     if let Some(hint) = hint {
@@ -5043,16 +5038,22 @@ fn work_lines(
     }
     let mut lines = vec![Line::from(spans)];
     if !expanded {
-        lines.extend(group_failure_lines(&members[1..], None, ctx, cache));
+        lines.extend(group_failure_lines(
+            &members[1..],
+            &failures.rows,
+            None,
+            ctx,
+            cache,
+        ));
     }
     lines
 }
 
-/// The row that closes a turn: `✓ 3 arquivos · +42 -7 · 2 comandos · 6s  Ctrl+D`.
-/// The marker follows the turn: an interrupted run is amber, a last command
-/// that failed is red, a run that changed files is green, and one that only
-/// ran commands stays quiet. Pieces are dropped from the right when the row
-/// is too narrow, the shortcut first.
+/// The row that closes a turn with its result: `✓ 3 arquivos · +42 -7   Ctrl+D
+/// diff`. The marker follows the turn: an interrupted run is amber, a last
+/// command that failed is red (and said in words), a run that changed files is
+/// green. Pieces are dropped from the right when the row is too narrow, the
+/// shortcut first.
 fn receipt_line(receipt: &crate::receipt::ReceiptState, ctx: &BlockRender<'_>) -> Line<'static> {
     use crate::receipt::{ReceiptOutcome, ReceiptSegment};
     let palette = ctx.palette;
@@ -5060,10 +5061,8 @@ fn receipt_line(receipt: &crate::receipt::ReceiptState, ctx: &BlockRender<'_>) -
         (glyph(ctx.capabilities, '\u{25a0}', 'x'), palette.warning)
     } else if receipt.last_command_ok == Some(false) {
         (glyph(ctx.capabilities, '\u{2715}', 'x'), palette.error)
-    } else if receipt.files > 0 {
-        (glyph(ctx.capabilities, '\u{2713}', '+'), palette.success)
     } else {
-        (glyph(ctx.capabilities, '\u{2713}', '+'), palette.muted)
+        (glyph(ctx.capabilities, '\u{2713}', '+'), palette.success)
     };
     let mut pieces: Vec<Vec<(String, Style)>> = Vec::new();
     if receipt.outcome == ReceiptOutcome::Interrupted {
@@ -5077,13 +5076,14 @@ fn receipt_line(receipt: &crate::receipt::ReceiptState, ctx: &BlockRender<'_>) -
                 removed,
                 partial,
             } => {
-                let mut parts = Vec::new();
+                let mut parts = vec![
+                    (format!("+{added}"), palette.diff_add),
+                    (" ".to_owned(), palette.muted),
+                    (format!("-{removed}"), palette.diff_remove),
+                ];
                 if partial {
-                    parts.push(("~".to_owned(), palette.muted));
+                    parts.push((crate::receipt::PARTIAL_SUFFIX.to_owned(), palette.muted));
                 }
-                parts.push((format!("+{added}"), palette.diff_add));
-                parts.push((" ".to_owned(), palette.muted));
-                parts.push((format!("-{removed}"), palette.diff_remove));
                 parts
             }
         });
@@ -5115,7 +5115,7 @@ fn receipt_line(receipt: &crate::receipt::ReceiptState, ctx: &BlockRender<'_>) -
                 .map(|(text, style)| Span::styled(text.clone(), *style)),
         );
     }
-    const HINT: &str = "Ctrl+D";
+    const HINT: &str = "Ctrl+D diff";
     if receipt.files > 0 && used + 3 + HINT.len() <= limit {
         spans.push(Span::styled(format!("   {HINT}"), palette.muted));
     }
@@ -5163,7 +5163,8 @@ fn assistant_body(
         text: ctx.palette.text,
         h1: ctx.palette.h1,
         h2: ctx.palette.heading,
-        h3: ctx.palette.thinking.add_modifier(Modifier::BOLD),
+        // A sub-heading is never dimmer than the prose under it.
+        h3: ctx.palette.heading,
         link: ctx.palette.link,
         code: ctx.palette.inline_code,
         code_block: ctx.palette.code_block,
@@ -5205,6 +5206,16 @@ fn assistant_body(
             cached_lines_bytes,
         )
     };
+    // Prose between calls is the agent talking on its way to the answer: it
+    // reads one step down, and only the answer keeps the full tone.
+    if ctx.narration {
+        let (full, quiet) = (ctx.palette.text.fg, ctx.palette.secondary.fg);
+        for span in lines.iter_mut().flat_map(|line| line.spans.iter_mut()) {
+            if span.style.fg == full {
+                span.style.fg = quiet;
+            }
+        }
+    }
     // The cell reserved for the streaming caret always exists and is cached
     // blank; the caret itself is painted into it after the lines (see
     // `render_scrollback`), so its blinking never rebuilds the block.
@@ -5862,15 +5873,12 @@ fn render_composer(
     let snapshot = cache.composer_snapshot(&state.composer, snapshot_width as u16);
     let content_area = if boxed {
         let label = composer_label(state, area.width, snapshot.total_lines);
-        let border = if focused {
-            palette.border_focus
-        } else {
-            palette.border
-        };
+        // The frame stays neutral: the prompt glyph and the cursor say where
+        // typing goes, and blue is left to overlays that take the focus.
         let block = RatatuiBlock::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(border)
+            .border_style(palette.border)
             .title_bottom(Line::from(Span::styled(label, palette.muted)))
             .title_alignment(Alignment::Left);
         let inner = block.inner(area);
@@ -7131,6 +7139,7 @@ fn model_group_of(provider: LoginProvider) -> usize {
         LoginProvider::CommandCode => 3,
         LoginProvider::OpenCodeZen => 4,
         LoginProvider::OpenDesign => 5,
+        LoginProvider::Devin => 6,
     }
 }
 
@@ -8038,7 +8047,7 @@ fn render_jobs_overlay(frame: &mut ratatui::Frame, state: &AppState, palette: &P
         (lines.len() as u16).saturating_add(2).min(max_height)
     };
     let area = centered(screen, width, height);
-    frame.render_widget(Clear, area);
+    clear_overlay(frame, area, palette);
     frame.render_widget(
         Paragraph::new(lines).block(modal_block(" Jobs da sessão ", palette)),
         area,
@@ -8206,6 +8215,7 @@ fn render_login_overlay(
             LoginProvider::OpenAiCodex => " OpenAI Codex API key ",
             LoginProvider::Xai => " xAI API key ",
             LoginProvider::OpenDesign => " Open Design API key ",
+            LoginProvider::Devin => " Devin API key ",
         };
         let area = centered(frame.area(), 58, 8);
         let inner = ratatui::layout::Rect {
@@ -8293,6 +8303,7 @@ fn render_login_overlay(
         LoginProvider::Xai,
         LoginProvider::OpenCodeZen,
         LoginProvider::OpenDesign,
+        LoginProvider::Devin,
     ];
     let frame_area = frame.area();
     let status = if let Some(code) = &overlay.user_code {
@@ -8378,7 +8389,6 @@ fn render_slash_popup(
         Some(suggestions.selected),
         inner_width.saturating_sub(2),
         palette,
-        false,
     );
     let selected_row = rows
         .iter()
@@ -8393,6 +8403,32 @@ fn render_slash_popup(
         inner_width,
         palette,
     );
+}
+
+/// Clears `area` for an overlay, along with the sliver an overlay that nearly
+/// spans the screen would leave beside it: a cell or two of the transcript's
+/// rail or scrollbar against a border reads as a broken frame.
+fn clear_overlay(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, palette: &Palette) {
+    const SLIVER: u16 = 2;
+    let screen = frame.area();
+    let left = if area.x.saturating_sub(screen.x) <= SLIVER {
+        screen.x
+    } else {
+        area.x
+    };
+    let right = if screen.right().saturating_sub(area.right()) <= SLIVER {
+        screen.right()
+    } else {
+        area.right()
+    };
+    let cleared = ratatui::layout::Rect {
+        x: left,
+        y: area.y,
+        width: right.saturating_sub(left),
+        height: area.height,
+    };
+    frame.render_widget(Clear, cleared);
+    frame.render_widget(RatatuiBlock::default().style(palette.surface), cleared);
 }
 
 /// Draws `rows` plus a key-hint row as a dropdown resting on the composer's
@@ -8417,7 +8453,7 @@ fn render_dropdown(
         width: composer_area.width,
         height,
     };
-    frame.render_widget(Clear, area);
+    clear_overlay(frame, area, palette);
     frame.render_widget(
         Paragraph::new(rows).block(
             RatatuiBlock::default()
@@ -8511,10 +8547,10 @@ fn render_palette(
     let width = usize::from(area.width);
     let keys = hint_keys(capabilities);
     let regions = picker_regions(area, false, 0);
-    let rows = grouped_command_lines(&matches, Some(selected), width, palette, true);
+    let rows = grouped_command_lines(&matches, Some(selected), width, palette);
     // The viewport is measured in rendered rows, not command indices: group
-    // headings and the focused command's description consume the same vertical
-    // space as a command, so they participate in keeping the focus visible.
+    // headings consume the same vertical space as a command, so they
+    // participate in keeping the focus visible.
     let capacity = usize::from(regions.list.height).max(1);
     let selected_row = rows
         .iter()
@@ -8614,6 +8650,11 @@ fn palette_header(
 }
 
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// Motion frames each spinner glyph stays for: about six steps a second, a
+/// turn the eye can follow instead of a flicker at the edge of the view.
+const SPINNER_FRAME_HOLD: usize = 2;
+/// What the footer calls a run whose phase the transcript is already showing.
+const RUN_LABEL: &str = "Trabalhando";
 /// Same spinner for terminals told not to use color (`NO_COLOR`): ASCII, so it
 /// survives fonts without braille, and half as fast because it has 4 frames.
 const ASCII_SPINNER_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
@@ -8627,107 +8668,15 @@ fn spinner_glyph(frame: u64, capabilities: Capabilities) -> char {
     if capabilities.reduced_motion {
         glyph(capabilities, '\u{25cb}', '~')
     } else if capabilities.color_depth == ColorDepth::None {
-        ASCII_SPINNER_FRAMES[(frame as usize / 2) % ASCII_SPINNER_FRAMES.len()]
+        ASCII_SPINNER_FRAMES
+            [(frame as usize / (2 * SPINNER_FRAME_HOLD)) % ASCII_SPINNER_FRAMES.len()]
     } else {
-        SPINNER_FRAMES[(frame as usize) % SPINNER_FRAMES.len()]
+        SPINNER_FRAMES[(frame as usize / SPINNER_FRAME_HOLD) % SPINNER_FRAMES.len()]
     }
 }
 
 /// Label of a thought that is still streaming.
 const THINKING_LABEL: &str = "Pensando";
-/// Cells the sweep crosses (the label is ASCII).
-const THINKING_LABEL_CELLS: usize = THINKING_LABEL.len();
-/// Cells of the agent name in its header (`Slim`, ASCII).
-const AGENT_NAME_CELLS: usize = 4;
-/// Cells lit on each side of the sweep's peak, and the pause once it leaves.
-const SHIMMER_HALO: usize = 2;
-const SHIMMER_REST: usize = 2;
-/// A burst of thought lights the edge of the newest row for this long,
-/// fading out, and this many cells deep. Six motion frames: the fade lands
-/// on a frame boundary, like the caret's blink.
-const GLOW_MS: u64 = 6 * MOTION_INTERVAL_MS;
-const GLOW_CELLS: u16 = 14;
-
-/// The sweep's peak crosses one cell every two motion frames, on every label.
-const SWEEP_MS_PER_CELL: u64 = 2 * MOTION_INTERVAL_MS;
-
-/// Strength (0.0 resting, 1.0 peak) of cell `index` in a label `width` cells
-/// wide while a highlight sweeps across it at `elapsed_ms`. The peak moves at
-/// one speed whatever the label's length ([`SWEEP_MS_PER_CELL`]), so a pass
-/// takes about two seconds on a short label, then rests before the next. Its
-/// position is continuous and its edge eases out, so the light slides between
-/// frames (half a cell per frame) instead of jumping a cell.
-fn sweep_strength(index: usize, width: usize, elapsed_ms: u64) -> f32 {
-    let travel = (width + 2 * SHIMMER_HALO + SHIMMER_REST) as u64;
-    let peak = (elapsed_ms % (travel * SWEEP_MS_PER_CELL)) as f32 / SWEEP_MS_PER_CELL as f32;
-    // The peak starts outside the label on the left and leaves on the right.
-    let distance = ((index + SHIMMER_HALO) as f32 - peak).abs();
-    let reach = 1.0 - distance / (SHIMMER_HALO + 1) as f32;
-    let reach = reach.max(0.0);
-    reach * reach * (3.0 - 2.0 * reach)
-}
-
-/// `text` as spans with the sweep applied; equal neighbors share a span.
-fn shimmer_spans(text: &str, elapsed_ms: u64, palette: &Palette) -> Vec<Span<'static>> {
-    let width = UnicodeWidthStr::width(text);
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut cell = 0usize;
-    let mut run = String::new();
-    let mut run_style = Style::default();
-    for character in text.chars() {
-        let style = palette.shimmer.at(sweep_strength(cell, width, elapsed_ms));
-        if !run.is_empty() && style != run_style {
-            spans.push(Span::styled(std::mem::take(&mut run), run_style));
-        }
-        run_style = style;
-        run.push(character);
-        cell += UnicodeWidthChar::width(character).unwrap_or(0);
-    }
-    if !run.is_empty() {
-        spans.push(Span::styled(run, run_style));
-    }
-    spans
-}
-
-/// How fresh the last content from the provider is, from 1.0 (just arrived)
-/// to 0.0; `None` once it no longer glows.
-fn glow_freshness(state: &AppState) -> Option<f32> {
-    let arrived = state.last_provider_content_ms?;
-    let age = state.clock.elapsed_ms.saturating_sub(arrived);
-    (age < GLOW_MS).then(|| 1.0 - age as f32 / GLOW_MS as f32)
-}
-
-/// Lights the last cells of text on row `y`, strongest at the edge where the
-/// text is being written and fading toward the start. Only styles change, so
-/// nothing moves and nothing waits: the words are already on screen.
-fn apply_frontier_glow(
-    buf: &mut ratatui::buffer::Buffer,
-    area: ratatui::layout::Rect,
-    y: u16,
-    ramp: &Ramp,
-    freshness: f32,
-    caret_visible: bool,
-) {
-    // Text starts in the fourth column of the transcript, after the gutter.
-    let first = area.x.saturating_add(4);
-    let last = area.right().saturating_sub(1);
-    // The caret rides after the last word and keeps its own color.
-    let Some(end) = (first..=last).rev().find(|x| {
-        let symbol = buf[(*x, y)].symbol();
-        !symbol.trim().is_empty() && !(caret_visible && symbol == "▏")
-    }) else {
-        return;
-    };
-    for depth in 0..GLOW_CELLS.min(end - first + 1) {
-        let strength = (1.0 - f32::from(depth) / f32::from(GLOW_CELLS)) * freshness;
-        // Below the first step the stepped light would only repaint the
-        // words in their own color; the continuous one still rises.
-        if ramp.ends.is_some() || strength >= 0.5 / 3.0 {
-            buf[(end - depth, y)].set_style(ramp.at(strength));
-        }
-    }
-}
-
 /// One step per second, driven by the status tick instead of the motion
 /// clock, so waiting states show life without arming a faster timer.
 fn slow_spinner_glyph(elapsed_ms: u64, capabilities: Capabilities) -> char {
@@ -8751,16 +8700,17 @@ fn palette_command_hint(command: &str) -> &'static str {
 /// Cells a command name takes before its description: wide enough for the
 /// longest command, narrow enough to leave the description a reading measure.
 const PALETTE_HEAD_CELLS: usize = 24;
-/// Cells a description needs before it is worth a row of its own; below that
-/// the name keeps the whole width instead of trailing a stub.
+/// Cells a description needs before it is worth showing; below that the name
+/// keeps the whole width instead of trailing a stub.
 const PALETTE_DESCRIPTION_CELLS: usize = 12;
 
+/// One command, one row, focused or not: the description keeps its column, so
+/// moving the focus never shifts the rows under it.
 fn palette_command_line(
     command: &str,
     selected_here: bool,
     width: usize,
     palette: &Palette,
-    describe_below: bool,
 ) -> Line<'static> {
     let detail = crate::reducer::palette_description(command);
     let head_width = PALETTE_HEAD_CELLS.min(width);
@@ -8774,10 +8724,7 @@ fn palette_command_line(
             palette,
         ),
     ];
-    // Where the palette describes the focused command on the row below, the
-    // row keeps the label only; the composer's list, which has no room for a
-    // second row per suggestion, keeps the description beside it.
-    if (!selected_here || !describe_below) && !detail.is_empty() {
+    if !detail.is_empty() {
         let room = width.saturating_sub(2 + head_width + hint_width + 2);
         if room >= PALETTE_DESCRIPTION_CELLS {
             spans.push(Span::styled(truncate_cells(detail, room), palette.muted));
@@ -8792,15 +8739,6 @@ fn palette_command_line(
     menu_line(spans, selected_here, width, palette)
 }
 
-/// Description of the focused command, on its own row under the label.
-fn palette_command_detail(command: &str, width: usize, palette: &Palette) -> Line<'static> {
-    let detail = crate::reducer::palette_description(command);
-    Line::from(Span::styled(
-        truncate_cells(&format!("   {detail}"), width),
-        palette.muted,
-    ))
-}
-
 struct PaletteRow {
     command_index: Option<usize>,
     line: Line<'static>,
@@ -8811,7 +8749,6 @@ fn grouped_command_lines(
     selected: Option<usize>,
     width: usize,
     palette: &Palette,
-    describe_below: bool,
 ) -> Vec<PaletteRow> {
     let mut lines = Vec::new();
     for (group, members) in crate::reducer::COMMAND_GROUPS {
@@ -8835,20 +8772,8 @@ fn grouped_command_lines(
         for (index, command) in visible {
             lines.push(PaletteRow {
                 command_index: Some(index),
-                line: palette_command_line(
-                    command,
-                    selected == Some(index),
-                    width,
-                    palette,
-                    describe_below,
-                ),
+                line: palette_command_line(command, selected == Some(index), width, palette),
             });
-            if describe_below && selected == Some(index) {
-                lines.push(PaletteRow {
-                    command_index: None,
-                    line: palette_command_detail(command, width, palette),
-                });
-            }
         }
     }
     let ungrouped = commands
@@ -8866,20 +8791,8 @@ fn grouped_command_lines(
         for (index, command) in ungrouped {
             lines.push(PaletteRow {
                 command_index: Some(index),
-                line: palette_command_line(
-                    command,
-                    selected == Some(index),
-                    width,
-                    palette,
-                    describe_below,
-                ),
+                line: palette_command_line(command, selected == Some(index), width, palette),
             });
-            if describe_below && selected == Some(index) {
-                lines.push(PaletteRow {
-                    command_index: None,
-                    line: palette_command_detail(command, width, palette),
-                });
-            }
         }
     }
     lines

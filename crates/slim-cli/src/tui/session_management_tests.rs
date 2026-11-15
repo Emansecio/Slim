@@ -467,6 +467,63 @@ fn provider(answers: usize, hold_first: bool) -> Provider {
     }
 }
 
+/// Serves `answers` streamed completions like `provider`, except the first
+/// request gets a `shell` tool call for `command` instead of text.
+fn provider_with_job(command: &str, answers: usize) -> Provider {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+    let (body_tx, bodies) = mpsc::channel();
+    let (release_first, _release_rx) = mpsc::channel::<()>();
+    let arguments = serde_json::json!({"command": command, "background": true}).to_string();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        for index in 0..answers {
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() > deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            };
+            stream.set_nonblocking(false).expect("blocking stream");
+            let body = read_request_body(&mut stream);
+            let _ = body_tx.send(body);
+            let events = if index == 0 {
+                let call = serde_json::json!({
+                    "choices": [{"delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": "job-call",
+                        "function": {"name": "shell", "arguments": arguments}
+                    }]}}]
+                });
+                format!(
+                    "data: {call}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+                )
+            } else {
+                format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"answer-{index}-marker\"}}}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+                )
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}",
+                events.len()
+            );
+        }
+    });
+    Provider {
+        endpoint,
+        bodies,
+        release_first,
+    }
+}
+
 // -------------------------------------------------------------------- sidecar
 
 #[test]
@@ -1170,6 +1227,53 @@ fn rename_before_the_first_prompt_is_written_at_creation_and_rewind_continues_tr
     assert_eq!(jsonl_ids(&ws.sessions()).len(), 2, "original and child");
 }
 
+#[test]
+fn new_leaves_the_conversation_resumable_and_the_next_prompt_starts_another() {
+    let ws = Workspace::new("worker-new");
+    let provider = provider(2, false);
+    let mut harness = start(&ws, None, Some(&provider.endpoint));
+    harness.run_prompt("hello world");
+    provider
+        .bodies
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    let first = jsonl_ids(&ws.sessions());
+    assert_eq!(first.len(), 1);
+
+    let mark = harness.seen.len();
+    harness.send(UiCommand::NewSession);
+    harness.until("the cleared session and its notice", |seen| {
+        seen[mark..]
+            .iter()
+            .any(|event| matches!(event, UiEvent::SessionCleared { .. }))
+            && seen[mark..].iter().any(|event| {
+                matches!(event, UiEvent::Notification { message } if message.contains("/resume"))
+            })
+    });
+    assert_eq!(
+        jsonl_ids(&ws.sessions()),
+        first,
+        "no file until the next prompt creates it"
+    );
+
+    harness.run_prompt("second question");
+    let body = provider
+        .bodies
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    assert!(body.contains("second question"), "{body}");
+    assert!(
+        !body.contains("hello world") && !body.contains("answer-0-marker"),
+        "the previous conversation must not reach the model: {body}"
+    );
+    let ids = jsonl_ids(&ws.sessions());
+    assert_eq!(ids.len(), 2, "a new file for the new conversation");
+    assert!(ids.is_superset(&first), "the previous file stays");
+    let (items, error, _) = harness.sessions_listed(77);
+    assert_eq!(error, None);
+    assert_eq!(items.len(), 2, "both conversations are resumable");
+}
+
 // ----------------------------------------------------- refusals off the idle path
 
 #[test]
@@ -1189,7 +1293,8 @@ fn every_session_command_is_answered_while_a_run_is_active() {
     harness.send(UiCommand::RenameSession { title: "x".into() });
     harness.send(UiCommand::ResumeSession { id: "tui-x".into() });
     harness.send(UiCommand::RewindSession { first_seq: 0 });
-    harness.until("all five answers", |seen| {
+    harness.send(UiCommand::NewSession);
+    harness.until("all six answers", |seen| {
         let listed = seen[mark..].iter().any(|event| {
             matches!(event,
             UiEvent::SessionsListed { request_id: 21, items, error: Some(error), .. }
@@ -1207,8 +1312,14 @@ fn every_session_command_is_answered_while_a_run_is_active() {
                 if message.starts_with("Aguarde ou cancele a execução antes de"))
             })
             .count();
-        listed && turns && notices == 3
+        listed && turns && notices == 4
     });
+    assert!(
+        !harness.seen[mark..]
+            .iter()
+            .any(|event| matches!(event, UiEvent::SessionCleared { .. })),
+        "a refused /new keeps the conversation"
+    );
     assert!(
         !harness.seen[mark..]
             .iter()
@@ -1312,6 +1423,93 @@ fn a_prompt_admitted_while_a_run_is_active_has_its_admission_resolved() {
             .any(|event| matches!(event, UiEvent::RunCompleted { .. }))
     });
     harness.wait_idle();
+}
+
+#[test]
+fn a_steer_during_a_run_reaches_the_next_provider_call() {
+    let ws = Workspace::new("worker-active-steer");
+    let provider = provider(2, true);
+    let mut harness = start(&ws, None, Some(&provider.endpoint));
+    let mark = harness.seen.len();
+    harness.send(UiCommand::SendPrompt("hold this run".into()));
+    let first_body = provider
+        .bodies
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+    assert!(first_body.contains("hold this run"), "{first_body}");
+
+    harness.send(UiCommand::Steer("steered mid-run".into()));
+    harness.until("the steered message to surface", |seen| {
+        seen[mark..]
+            .iter()
+            .any(|event| matches!(event,
+                UiEvent::UserMessageAdded { text } if text == "steered mid-run"))
+    });
+    assert!(
+        !harness.seen[mark..]
+            .iter()
+            .any(|event| matches!(event,
+                UiEvent::Notification { message } if message.contains("Já há uma execução ativa"))),
+        "a steer must not hit the active-run catch-all"
+    );
+
+    provider.release_first.send(()).unwrap();
+    // The pending steer keeps the run alive: the second provider call reads it.
+    let second_body = provider
+        .bodies
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+    assert!(second_body.contains("steered mid-run"), "{second_body}");
+    harness.until("the run to complete", |seen| {
+        seen[mark..]
+            .iter()
+            .any(|event| matches!(event, UiEvent::RunCompleted { .. }))
+    });
+    harness.wait_idle();
+}
+
+#[test]
+fn a_steer_left_undelivered_by_a_cancelled_run_returns_to_the_queue() {
+    let ws = Workspace::new("worker-steer-refund");
+    let provider = provider(1, true);
+    let mut harness = start(&ws, None, Some(&provider.endpoint));
+    let mark = harness.seen.len();
+    harness.send(UiCommand::SendPrompt("hold this run".into()));
+    provider
+        .bodies
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+
+    harness.send(UiCommand::Steer("never delivered".into()));
+    harness.until("the steered message to surface", |seen| {
+        seen[mark..]
+            .iter()
+            .any(|event| matches!(event,
+                UiEvent::UserMessageAdded { text } if text == "never delivered"))
+    });
+
+    harness.send(UiCommand::CancelRun);
+    harness.until("the refund", |seen| {
+        seen[mark..]
+            .iter()
+            .any(|event| matches!(event,
+                UiEvent::QueuedUserAdded { text, .. } if text == "never delivered"))
+    });
+    harness.wait_idle();
+}
+
+#[test]
+fn a_steer_while_idle_becomes_a_queued_prompt() {
+    let ws = Workspace::new("idle-steer");
+    let mut harness = start(&ws, None, None);
+    let mark = harness.seen.len();
+    harness.send(UiCommand::Steer("queued steer".into()));
+    harness.until("the queued prompt", |seen| {
+        seen[mark..]
+            .iter()
+            .any(|event| matches!(event,
+                UiEvent::QueuedUserAdded { text, .. } if text == "queued steer"))
+    });
 }
 
 #[test]
@@ -1561,6 +1759,57 @@ fn session_switch_stops_background_jobs_and_preserves_terminal_metadata() {
     assert_eq!(metadata[0].state, "cancelled");
     std::fs::write(ws.0.join("release-job"), "go").unwrap();
     assert!(!ws.0.join("escaped").exists());
+}
+
+#[test]
+fn a_model_job_finishing_while_idle_wakes_the_agent_with_its_completion() {
+    let ws = Workspace::new("job-wake");
+    let command = if cfg!(windows) {
+        "while (!(Test-Path 'release-job')) { Start-Sleep -Milliseconds 20 }; Write-Output 'IDLE-DONE'"
+    } else {
+        "while [ ! -f release-job ]; do sleep 0.02; done; printf 'IDLE-DONE\\n'"
+    };
+    let provider = provider_with_job(command, 3);
+    let mut harness = start(&ws, None, Some(&provider.endpoint));
+    let mark = harness.seen.len();
+    harness.send(UiCommand::SendPrompt("launch the job".into()));
+    // The first call launches the job, the second ends the run with it held.
+    provider
+        .bodies
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+    provider
+        .bodies
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+    harness.until("the first run to complete", |seen| {
+        seen[mark..]
+            .iter()
+            .any(|e| matches!(e, UiEvent::RunCompleted { .. }))
+    });
+    harness.wait_idle();
+    assert!(provider.bodies.try_recv().is_err(), "still held by the file");
+
+    // The job finishing while idle starts a run of its own; the loop delivers
+    // the completion to the model inside it.
+    let mark = harness.seen.len();
+    std::fs::write(ws.0.join("release-job"), "go").unwrap();
+    harness.until("the wake run to complete", |seen| {
+        seen[mark..]
+            .iter()
+            .any(|e| matches!(e, UiEvent::RunCompleted { .. }))
+    });
+    let body = provider
+        .bodies
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+    assert!(body.contains("[Shell job completion"), "{body}");
+    assert!(body.contains("IDLE-DONE"), "{body}");
+    harness.wait_idle();
+    assert!(
+        provider.bodies.try_recv().is_err(),
+        "the completion is delivered once"
+    );
 }
 
 #[test]

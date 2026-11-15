@@ -2,6 +2,7 @@ mod anthropic;
 pub mod browser;
 pub mod callback;
 mod codex;
+mod devin;
 pub mod pkce;
 mod store;
 mod types;
@@ -275,6 +276,23 @@ impl OAuthService {
         };
         self.activate(provider, &credential)?;
         Ok(credential)
+    }
+
+    /// Browser sign-in for Devin. Its session token never refreshes, so the
+    /// caller stores it as the provider's key instead of an OAuth credential.
+    pub async fn login_devin(
+        &self,
+        progress: mpsc::UnboundedSender<OAuthProgress>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<OAuthCredential, OAuthError> {
+        devin::login(
+            &self.worker.client,
+            &self.worker.endpoints,
+            self.worker.browser.clone(),
+            &progress,
+            cancel,
+        )
+        .await
     }
 
     /// Starts a supervised credential preparation. Dropping the returned

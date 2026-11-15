@@ -57,8 +57,10 @@ fn count_label(count: usize, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
 
-/// Compact mode keeps blockers before the active title that may be truncated.
-pub fn compact_summary(state: &AppState) -> String {
+/// One row for the dock: the task in hand first, then the count and the
+/// blockers. The title is what gives way on a narrow row (`width` cells), so
+/// it leads without ever pushing the blockers out of view.
+pub fn compact_summary(state: &AppState, width: usize) -> String {
     if state.todo_focused {
         if let Some(item) = state.todo_items.get(state.todo_selected) {
             let order = ordered_indices(state);
@@ -89,21 +91,30 @@ pub fn compact_summary(state: &AppState) -> String {
         .iter()
         .find(|item| item.status == TodoItemStatus::InProgress)
     {
-        let phase = if state.working { "em curso" } else { "parada" };
         let blocked = state
             .todo_items
             .iter()
             .filter(|item| item.status == TodoItemStatus::Blocked)
             .count();
-        let mut label = format!("TODO {done}/{total}");
+        let mut tail = format!(" · {done}/{total}");
         if blocked > 0 {
-            label.push_str(&format!(
+            tail.push_str(&format!(
                 " · {}",
                 count_label(blocked, "bloqueada", "bloqueadas")
             ));
         }
-        label.push_str(&format!(" · {phase} · {}", title(&active.title)));
-        label
+        // A task in hand while nothing runs is the state worth a word; the
+        // footer already says when the run is going.
+        if !state.working {
+            tail.push_str(" · parada");
+        }
+        const LEAD: &str = "TODO ";
+        let room =
+            width.saturating_sub(LEAD.len() + unicode_width::UnicodeWidthStr::width(tail.as_str()));
+        format!(
+            "{LEAD}{}{tail}",
+            crate::picker::truncate_cells(&title(&active.title), room)
+        )
     } else {
         summary(state)
     }
@@ -232,7 +243,7 @@ mod tests {
         assert!(state.working);
         assert!(!state.todo_focused && !state.todo_dock_open);
         // Tiny terminals still expose a compact summary, without a panic.
-        assert!(draw(&state, 40, 8).contains("TODO 0/9"));
+        assert!(draw(&state, 40, 8).contains("… · 0/9"));
     }
 
     #[test]
@@ -254,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_todo_keeps_blocked_count_before_the_active_title_on_narrow_screens() {
+    fn compact_todo_leads_with_the_active_title_and_never_cuts_the_blocked_count() {
         let mut state = AppState::new();
         state.authenticated = true;
         state.apply_event(UiEvent::TodoChanged {
@@ -267,17 +278,26 @@ mod tests {
         assert!(!state.todo_dock_open);
         for working in [false, true] {
             state.working = working;
-            let phase = if working { "em curso" } else { "parada" };
-            assert!(compact_summary(&state)
-                .starts_with(&format!("TODO 1/3 · 1 bloqueada · {phase} · Tarefa 1")));
+            let tail = if working {
+                "… · 1/3 · 1 bloqueada"
+            } else {
+                "… · 1/3 · 1 bloqueada · parada"
+            };
+            let summary = compact_summary(&state, 60);
+            assert!(summary.starts_with("TODO Tarefa 1"), "{summary}");
+            assert!(summary.ends_with(tail), "{summary}");
+            assert!(
+                unicode_width::UnicodeWidthStr::width(summary.as_str()) <= 60,
+                "{summary}"
+            );
             for (width, height) in [(40, 8), (80, 24)] {
                 let frame = draw(&state, width, height);
                 let row = frame
                     .lines()
                     .find(|row| row.trim_start().starts_with("TODO"))
                     .unwrap_or_else(|| panic!("missing Todo at {width}x{height}\n{frame}"));
-                assert!(row.contains("1 bloqueada ·"), "{row}");
-                assert!(row.trim_end().ends_with('…'), "{row}");
+                assert!(row.trim_start().starts_with("TODO Tar"), "{row}");
+                assert!(row.trim_end().ends_with(tail), "{row}");
                 assert!(!frame.contains("Tarefa 2"), "{frame}");
             }
         }

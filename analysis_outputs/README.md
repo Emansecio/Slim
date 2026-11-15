@@ -16,6 +16,7 @@ o código nem os contratos normativos** em [`docs/`](../docs/README.md) — cons
 | [HARNESS-SLIM-ETAPA-1.md](HARNESS-SLIM-ETAPA-1.md) … [ETAPA-5](HARNESS-SLIM-ETAPA-5.md) | Cinco etapas do harness Slim |
 | [QUICK-WINS-AGILIDADE-NATIVA-SLIM.md](QUICK-WINS-AGILIDADE-NATIVA-SLIM.md) | Quick wins de agilidade nativa |
 | [REVISAO-ECONOMIA-TOKENS-NATIVA-SLIM.md](REVISAO-ECONOMIA-TOKENS-NATIVA-SLIM.md) | Economia de tokens nativa |
+| [2026-11-13-AUDITORIA-20-AGENTES-BUGS-OTIMIZACOES.md](2026-11-13-AUDITORIA-20-AGENTES-BUGS-OTIMIZACOES.md) | Auditoria estática por 20 agentes em paralelo: ~21 bugs e ~42 otimizações deduplicadas (2026-11-13) |
 
 ## Auditorias por data
 

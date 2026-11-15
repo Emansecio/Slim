@@ -17,6 +17,7 @@ mod catalog_fetch;
 mod clinepass;
 mod codex;
 mod command_code;
+mod devin;
 mod endpoint;
 pub(crate) mod image_limits;
 mod open_design;
@@ -32,15 +33,22 @@ pub use clinepass::{
     parse_clinepass_catalog, ClinePassAdapter, ClinePassCatalogEntry, ClinePassModel,
     CLINEPASS_BASE_URL, CLINEPASS_DEFAULT_MODEL, CLINEPASS_MODELS_URL,
 };
+pub use command_code::{
+    command_code_api, command_code_model, command_code_models, is_command_code_model_id,
+    parse_command_code_catalog,
+    CommandCodeAdapter, CommandCodeApi, CommandCodeCatalogEntry, CommandCodeModel,
+    COMMANDCODE_BASE_URL, COMMANDCODE_DEFAULT_MODEL, COMMANDCODE_MODELS_URL,
+};
 pub use codex::{
     codex_model, codex_models, codex_models_url, parse_codex_catalog, resolve_codex_context_window,
     CodexCatalogEntry, CodexCatalogError, CodexModel, OpenAiCodexAdapter,
     CODEX_BUNDLED_CONTEXT_WINDOW, CODEX_CATALOG_CLIENT_VERSION, CODEX_MAX_OUTPUT_TOKENS,
 };
-pub use command_code::{
-    command_code_api, command_code_model, command_code_models, is_command_code_model_id,
-    parse_command_code_catalog, CommandCodeAdapter, CommandCodeApi, CommandCodeCatalogEntry,
-    CommandCodeModel, COMMANDCODE_BASE_URL, COMMANDCODE_DEFAULT_MODEL, COMMANDCODE_MODELS_URL,
+pub use devin::{
+    devin_model, devin_models, encode_devin_models_json, fetch_devin_model_configs,
+    is_devin_model_id,
+    parse_devin_models_json, DevinAdapter, DevinCatalogEntry, DevinModel, DEVIN_CHAT_MESSAGE_PATH,
+    DEVIN_DEFAULT_BASE_URL, DEVIN_DEFAULT_MODEL,
 };
 pub use open_design::{
     fetch_open_design_catalog, is_open_design_model_id, open_design_model, open_design_models,
@@ -105,6 +113,23 @@ pub fn claude_context_window(model: &str) -> Option<u64> {
         (5.., _) | (4, 6..) => 1_000_000,
         _ => 200_000,
     })
+}
+
+/// `output_config.effort` values the Messages API documents per Claude
+/// generation: `xhigh` from the 4.7 generation on, `max` from 4.6, and
+/// low/medium/high from Opus 4.5. Haiku and older generations expose no
+/// effort knob (empty).
+pub fn claude_reasoning_levels(model: &str) -> &'static [&'static str] {
+    let Some((family, major, minor)) = claude_generation(model) else {
+        return &[];
+    };
+    match (family, major, minor) {
+        ("haiku", _, _) => &[],
+        (_, 5.., _) | (_, 4, 7..) => &["low", "medium", "high", "xhigh", "max"],
+        ("opus" | "sonnet", 4, 6) => &["low", "medium", "high", "max"],
+        ("opus", 4, 5) => &["low", "medium", "high"],
+        _ => &[],
+    }
 }
 
 /// Documented effort controls for catalog gateways without capability metadata.
@@ -634,6 +659,7 @@ pub enum ProviderKind {
     CommandCode,
     Xai,
     OpenDesign,
+    Devin,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1373,6 +1399,42 @@ impl PreparedProviderRequest {
         }
     }
 
+    /// Builds a request whose wire body is already-encoded bytes (Devin's
+    /// Connect/protobuf frame). `identity_body` is the semantic JSON the
+    /// request would have been — it drives fingerprints, item hashes, cache
+    /// and component accounting exactly like a JSON request body.
+    /// `scope_credential` names a secret the wire carries outside headers
+    /// (Devin's `Metadata.api_key`): it feeds credential-scope identity and
+    /// redaction like a sensitive header, but is stripped from the stored
+    /// headers so it never reaches the wire.
+    pub(crate) fn from_parts<A: ProviderAdapter + ?Sized>(
+        url: String,
+        headers: Vec<(String, String)>,
+        wire_body: Vec<u8>,
+        identity_body: String,
+        scope_credential: Option<String>,
+        adapter: &A,
+    ) -> Self {
+        let identity_value = serde_json::from_str::<Value>(&identity_body).ok();
+        let mut scope_headers = headers.clone();
+        if let Some(credential) = scope_credential {
+            scope_headers.push(("authorization".to_owned(), format!("Bearer {credential}")));
+        }
+        let mut request = Self::from_http_request_and_value(
+            HttpRequest {
+                url,
+                headers: scope_headers,
+                body: identity_body,
+            },
+            identity_value.as_ref(),
+            adapter,
+            None,
+        );
+        request.headers = headers;
+        request.body = wire_body;
+        request
+    }
+
     pub fn with_estimated_tokens(mut self, estimated_tokens: u64) -> Self {
         self.estimated_tokens = estimated_tokens;
         self
@@ -1445,12 +1507,71 @@ impl PreparedProviderRequest {
     fn set_response_cache_key(&mut self, key: String) {
         self.response_cache_key = Some(key);
     }
+
+    /// Replaces the request target/body after a Connect pre-request rewrote it
+    /// (fresh user JWT, router assignment, edge-supplied base URL override).
+    /// The body bytes are opaque to the routing identity, which is computed
+    /// from url + headers + stable prefixes before auth splicing.
+    pub(crate) fn with_url_and_body(mut self, url: String, body: Vec<u8>) -> Self {
+        self.url = url;
+        self.body = body;
+        self
+    }
+
+    /// Registers a secret the redactor must scrub from emitted events/errors —
+    /// values the pre-request learned after the request was prepared (JWTs).
+    pub(crate) fn push_sensitive_value(&mut self, value: String) {
+        if !value.is_empty() {
+            self.sensitive_values.push(value);
+        }
+    }
+}
+
+/// Response framing on the wire. `Sse` is the default `data:` JSON event
+/// stream; `Connect` is the Connect-RPC envelope (1 flag byte + u32be length +
+/// protobuf payload, flag 0x02 = end-of-stream JSON trailer) used by Devin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamWire {
+    Sse,
+    Connect,
 }
 
 pub trait ProviderAdapter {
     fn kind(&self) -> ProviderKind;
     fn wire_kind(&self) -> ProviderKind {
         self.kind()
+    }
+    /// Response framing on the wire. `Connect` adapters implement
+    /// [`ProviderAdapter::connect_preflight`] and
+    /// [`ProviderAdapter::parse_connect_frame`].
+    fn stream_wire(&self) -> StreamWire {
+        StreamWire::Sse
+    }
+    /// Unary pre-request a Connect wire needs before the chat stream: Devin
+    /// exchanges the stored credential for a per-request user JWT (and, for
+    /// router uids, an assignment) and splices it into the request body.
+    /// Boxed so the trait stays dyn-compatible for `PreparedProviderRequest`'s
+    /// `&dyn ProviderAdapter` helpers.
+    fn connect_preflight<'a>(
+        &'a self,
+        _client: &'a Client,
+        request: PreparedProviderRequest,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<PreparedProviderRequest, ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(async move { Ok(request) })
+    }
+    /// Decode one Connect frame payload into provider events. Only called for
+    /// `StreamWire::Connect` adapters; `trailer` is true for the end-of-stream
+    /// JSON frame (flag 0x02).
+    fn parse_connect_frame(
+        &self,
+        _payload: &[u8],
+        _trailer: bool,
+    ) -> Result<Vec<ProviderEvent>, ProviderError> {
+        Err(ProviderError::InvalidResponse {
+            message: "adapter does not speak the Connect protocol".into(),
+        })
     }
     /// Whether tool results may carry images on this adapter's wire
     /// (Anthropic `tool_result` image blocks, Responses `input_image` output
@@ -2904,6 +3025,7 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
             ProviderKind::Xai => xai_model(model).map(|m| m.max_output_tokens),
             ProviderKind::Anthropic | ProviderKind::CommandCode => claude_max_output_tokens(model),
             ProviderKind::OpenAiCompatible => None,
+            ProviderKind::Devin => devin::devin_model(model).map(|m| m.max_output_tokens),
         }
         .map(u64::from)
     }
@@ -3356,6 +3478,20 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
     where
         F: FnMut(ProviderEvent),
     {
+        let mut request = request;
+        if self.adapter.stream_wire() == StreamWire::Connect {
+            // Connect adapters need a unary pre-request (Devin's GetUserJwt /
+            // AssignModel) that splices fresh auth into the prepared body.
+            request = tokio::time::timeout(
+                self.timeouts.idle.min(self.timeouts.first_semantic),
+                self.adapter.connect_preflight(&self.client, request),
+            )
+            .await
+            .map_err(|_| ProviderError::Transport {
+                safe_to_retry: false,
+                message: "provider pre-request timed out".into(),
+            })??;
+        }
         let sensitive_values = request.sensitive_values;
         let routing = self.adapter.turn_state_header().zip(request.turn_routing);
         let started = Instant::now();
@@ -3508,7 +3644,18 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
                     on_event(event);
                 }
             };
-            let parsed = if end_of_stream {
+            let connect_wire = self.adapter.stream_wire() == StreamWire::Connect;
+            let parsed = if connect_wire {
+                // Connect frames have no text tail: drain complete envelopes and
+                // surface the adapter's events. The end-of-stream trailer (flag
+                // 0x02) is the terminal frame.
+                drain_connect_frames(
+                    self.adapter.as_ref(),
+                    &mut pending,
+                    &mut emit,
+                    end_of_stream,
+                )
+            } else if end_of_stream {
                 let tail =
                     std::str::from_utf8(&pending).map_err(|_| ProviderError::InvalidResponse {
                         message: "provider SSE line was not valid UTF-8".into(),
@@ -3604,6 +3751,78 @@ fn checked_provider_stream_bytes(total: usize, chunk: usize) -> Result<usize, Pr
         .ok_or_else(|| ProviderError::InvalidResponse {
             message: "provider stream exceeded byte limit".into(),
         })
+}
+
+/// Connect-protocol envelope overhead: 1 flag byte + 4-byte big-endian length.
+const CONNECT_HEADER_BYTES: usize = 5;
+/// Flag bit: the frame payload carries the negotiated compression (gzip).
+const CONNECT_COMPRESSED_FLAG: u8 = 0x01;
+/// Flag bit: the frame payload is the end-of-stream JSON trailer.
+const CONNECT_END_STREAM_FLAG: u8 = 0x02;
+/// Hard bound on a single Connect frame payload (matches the omp client).
+const MAX_CONNECT_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
+
+/// Drains complete Connect frames out of `pending`, dispatching each payload
+/// to the adapter. Returns true once the end-of-stream trailer was consumed.
+/// A compressed payload is a hard failure: Slim never negotiates an encoding,
+/// so arriving gzip means an edge misbehaved.
+fn drain_connect_frames<A: ProviderAdapter, F: FnMut(ProviderEvent)>(
+    adapter: &A,
+    pending: &mut Vec<u8>,
+    on_event: &mut F,
+    end_of_stream: bool,
+) -> Result<bool, ProviderError> {
+    let mut offset = 0;
+    let mut saw_done = false;
+    loop {
+        let available = pending.len() - offset;
+        if available < CONNECT_HEADER_BYTES {
+            if end_of_stream && available > 0 {
+                return Err(ProviderError::InvalidResponse {
+                    message: "provider Connect stream ended mid-frame".into(),
+                });
+            }
+            break;
+        }
+        let flags = pending[offset];
+        let length = u32::from_be_bytes(
+            pending[offset + 1..offset + CONNECT_HEADER_BYTES]
+                .try_into()
+                .expect("slice is exactly 4 bytes"),
+        ) as usize;
+        if length > MAX_CONNECT_FRAME_PAYLOAD {
+            return Err(ProviderError::InvalidResponse {
+                message: format!(
+                    "provider Connect frame length {length} exceeds the {MAX_CONNECT_FRAME_PAYLOAD}-byte cap"
+                ),
+            });
+        }
+        if available < CONNECT_HEADER_BYTES + length {
+            if end_of_stream {
+                return Err(ProviderError::InvalidResponse {
+                    message: "provider Connect stream ended mid-frame".into(),
+                });
+            }
+            break;
+        }
+        let payload_start = offset + CONNECT_HEADER_BYTES;
+        let payload = &pending[payload_start..payload_start + length];
+        if flags & CONNECT_COMPRESSED_FLAG != 0 {
+            return Err(ProviderError::InvalidResponse {
+                message: "provider sent a compressed Connect frame Slim never negotiated".into(),
+            });
+        }
+        let trailer = flags & CONNECT_END_STREAM_FLAG != 0;
+        for event in adapter.parse_connect_frame(payload, trailer)? {
+            on_event(event);
+        }
+        if trailer {
+            saw_done = true;
+        }
+        offset = payload_start + length;
+    }
+    pending.drain(..offset);
+    Ok(saw_done)
 }
 
 fn drain_sse<A: ProviderAdapter, F: FnMut(ProviderEvent)>(
@@ -4080,6 +4299,7 @@ pub(crate) fn provider_kind_name(kind: ProviderKind) -> &'static str {
         ProviderKind::CommandCode => "command-code",
         ProviderKind::Xai => "xai",
         ProviderKind::OpenDesign => "open-design",
+        ProviderKind::Devin => "devin",
     }
 }
 
@@ -5363,6 +5583,75 @@ impl ProviderCache {
     }
 }
 
+/// The Messages API rejects a tool whose `input_schema` has `oneOf`, `anyOf`
+/// or `allOf` at the top level ("input_schema does not support oneOf, allOf,
+/// or anyOf at the top level"). Native admission still enforces those rules
+/// when the call arrives, so only the wire copy drops them.
+fn anthropic_tool_definitions(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            let mut tool = tool.clone();
+            if let Some(schema) = tool.get_mut("input_schema") {
+                strip_top_level_combinators(schema);
+            }
+            tool
+        })
+        .collect()
+}
+
+/// Removes `oneOf`/`anyOf`/`allOf` from the top of a tool schema, for wires
+/// that end at Claude. Properties declared only inside the branches (a union
+/// of argument shapes, as some MCP servers publish) move up so the model still
+/// sees them; a property the top already defines keeps its definition.
+pub fn strip_top_level_combinators(schema: &mut Value) {
+    let Some(fields) = schema.as_object_mut() else {
+        return;
+    };
+    let mut lifted = serde_json::Map::new();
+    for key in ["oneOf", "anyOf", "allOf"] {
+        let Some(Value::Array(branches)) = fields.remove(key) else {
+            continue;
+        };
+        for branch in branches {
+            if let Some(Value::Object(properties)) = branch.get("properties") {
+                for (name, property) in properties {
+                    lifted.entry(name.clone()).or_insert_with(|| property.clone());
+                }
+            }
+        }
+    }
+    if lifted.is_empty() {
+        return;
+    }
+    if let Some(properties) = fields
+        .entry("properties")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+    {
+        for (name, property) in lifted {
+            properties.entry(name).or_insert(property);
+        }
+    }
+}
+
+/// `parameters` of a Chat Completions tool for `model`. Gateways that serve
+/// Claude hand them to the Messages API as `input_schema` (no top-level
+/// combinators); Gemini backends reject JSON Schema type arrays.
+fn chat_tool_parameters(tool: &Value, model: &str) -> Value {
+    let mut schema = tool
+        .get("input_schema")
+        .cloned()
+        .unwrap_or_else(|| json!({"type": "object"}));
+    if claude_generation(model).is_some() {
+        strip_top_level_combinators(&mut schema);
+    }
+    if model.to_ascii_lowercase().contains("gemini") {
+        devin::scalarize_schema_types(&mut schema);
+    }
+    schema
+}
+
 fn anthropic_headers(config: &ProviderConfig) -> Vec<(String, String)> {
     let mut headers = if config.auth.uses_bearer() {
         vec![(
@@ -5546,7 +5835,7 @@ impl OpenAiCompatibleAdapter {
                             "function": {
                                 "name": tool.get("name").cloned().unwrap_or(Value::Null),
                                 "description": tool.get("description").cloned().unwrap_or(Value::Null),
-                                "parameters": tool.get("input_schema").cloned().unwrap_or_else(|| json!({"type": "object"}))
+                                "parameters": chat_tool_parameters(tool, &self.config.model)
                             }
                         })
                     })
@@ -6090,7 +6379,7 @@ impl AnthropicAdapter {
             body["output_config"] = json!({"effort": effort});
         }
         if !tools.is_empty() {
-            body["tools"] = Value::Array(tools.to_vec());
+            body["tools"] = Value::Array(anthropic_tool_definitions(tools));
         }
         settle_thinking_blocks(&mut body, &bindings);
         self.materialize_prompt_cache_intent(&mut body);
@@ -6880,6 +7169,85 @@ mod finalization_tests {
     }
 
     #[test]
+    fn anthropic_tools_drop_top_level_schema_combinators() {
+        let adapter = AnthropicAdapter::new(ProviderConfig::anthropic(
+            "https://api.anthropic.com/v1/messages",
+            "claude-opus-4-7",
+            "fixture-key",
+        ))
+        .expect("adapter");
+        let nested = json!({"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "integer"}]}});
+        let tools = [
+            json!({"name": "search", "description": "Search.", "input_schema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}, "patterns": nested},
+                "anyOf": [{"required": ["query"]}, {"required": ["patterns"]}],
+                "oneOf": [{"required": ["query"]}],
+                "allOf": [{"required": ["query"]}]
+            }}),
+            json!({"name": "read", "description": "Read.", "input_schema": {"type": "object"}}),
+            json!({"name": "bare", "description": "No schema."}),
+        ];
+        let body: Value = serde_json::from_str(
+            &adapter
+                .build_messages_request_with_tools(&[ProviderMessage::user("go")], &tools)
+                .body,
+        )
+        .expect("body");
+        let schema = &body["tools"][0]["input_schema"];
+        for key in ["oneOf", "anyOf", "allOf"] {
+            assert!(schema.get(key).is_none(), "{key} stayed at the top level");
+        }
+        assert_eq!(schema["properties"]["patterns"], nested, "nested combinators are allowed");
+        assert_eq!(body["tools"][1]["input_schema"], json!({"type": "object"}));
+        assert!(body["tools"][2].get("input_schema").is_none());
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[test]
+    fn top_level_unions_lift_their_properties_without_overriding() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {"action": {"type": "string", "enum": ["a", "b"]}},
+            "oneOf": [
+                {"properties": {"action": {"enum": ["a"]}, "path": {"type": "string"}}, "required": ["path"]},
+                {"properties": {"query": {"type": "string"}}}
+            ],
+            "anyOf": [{"required": ["path"]}]
+        });
+        strip_top_level_combinators(&mut schema);
+        assert!(schema.get("oneOf").is_none() && schema.get("anyOf").is_none());
+        assert_eq!(schema["properties"]["action"], json!({"type": "string", "enum": ["a", "b"]}), "the top keeps its definition");
+        assert_eq!(schema["properties"]["path"], json!({"type": "string"}));
+        assert_eq!(schema["properties"]["query"], json!({"type": "string"}));
+        // A schema made only of a union (zod style) gets its properties back.
+        let mut union = json!({"anyOf": [{"type": "object", "properties": {"id": {"type": "integer"}}}]});
+        strip_top_level_combinators(&mut union);
+        assert_eq!(union, json!({"properties": {"id": {"type": "integer"}}}));
+        let mut plain = json!({"type": "object"});
+        strip_top_level_combinators(&mut plain);
+        assert_eq!(plain, json!({"type": "object"}));
+    }
+
+    #[test]
+    fn chat_tools_fit_the_model_family_behind_the_gateway() {
+        let tool = json!({"name": "search", "description": "Search.", "input_schema": {
+            "type": "object",
+            "properties": {"args": {"type": ["array", "null"], "items": {"type": "string"}}},
+            "anyOf": [{"required": ["args"]}]
+        }});
+        let claude = chat_tool_parameters(&tool, "anthropic/claude-sonnet-5-5");
+        assert!(claude.get("anyOf").is_none());
+        assert_eq!(claude["properties"]["args"]["type"], json!(["array", "null"]), "Claude takes type arrays");
+        let gemini = chat_tool_parameters(&tool, "google/gemini-3-pro");
+        assert_eq!(gemini["properties"]["args"]["type"], "array");
+        assert_eq!(gemini["properties"]["args"]["nullable"], true);
+        let gpt = chat_tool_parameters(&tool, "gpt-5.6-sol");
+        assert_eq!(gpt, tool["input_schema"], "other families keep the schema as written");
+        assert_eq!(chat_tool_parameters(&json!({"name": "x"}), "gpt-5.6-sol"), json!({"type": "object"}));
+    }
+
+    #[test]
     fn anthropic_breakpoints_cover_the_system_prompt_and_the_previous_request_tail() {
         let adapter = AnthropicAdapter::new(ProviderConfig::anthropic(
             "https://api.anthropic.com/v1/messages",
@@ -6951,6 +7319,27 @@ mod finalization_tests {
             .expect("compaction");
         let compaction: Value = serde_json::from_slice(&compaction.body).expect("body");
         assert!(!compaction.to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn claude_effort_levels_follow_the_generation() {
+        let full: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+        assert_eq!(claude_reasoning_levels("claude-opus-5-5"), full);
+        assert_eq!(claude_reasoning_levels("claude-fable-5-2"), full);
+        assert_eq!(claude_reasoning_levels("anthropic/claude-sonnet-4-7"), full);
+        assert_eq!(claude_reasoning_levels("claude-sonnet-4-6"), ["low", "medium", "high", "max"]);
+        assert_eq!(claude_reasoning_levels("claude-opus-4-5-20251101"), ["low", "medium", "high"]);
+        assert!(claude_reasoning_levels("claude-haiku-5-5").is_empty(), "Haiku has no effort knob");
+        assert!(claude_reasoning_levels("claude-sonnet-4-5").is_empty());
+        assert!(claude_reasoning_levels("claude-3-7-sonnet-20250219").is_empty());
+        assert!(claude_reasoning_levels("gpt-5.6-sol").is_empty());
+        for model in ["claude-opus-5-5", "claude-sonnet-4-6"] {
+            for level in claude_reasoning_levels(model) {
+                let config = ProviderConfig::anthropic("https://api.anthropic.com/v1/messages", model, "k")
+                    .with_reasoning_effort(*level);
+                assert!(AnthropicAdapter::new(config).is_ok(), "{model} {level} must pass the adapter");
+            }
+        }
     }
 
     #[test]

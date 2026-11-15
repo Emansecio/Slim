@@ -60,12 +60,6 @@ pub(crate) fn status(text: &str, cells: usize) -> Option<Status> {
     (!tail.is_empty()).then_some(Status::Tail(tail))
 }
 
-/// Whether the status shows a headline rather than words still arriving.
-pub(crate) fn has_headline(text: &str) -> bool {
-    let (window, truncated) = window(text);
-    headline(&sanitize_terminal_text_cow(window), truncated).is_some()
-}
-
 /// Body rows wrapped to `width`, each marked when it belongs to a title.
 pub(crate) fn body_rows(text: &str, width: u16) -> Vec<(String, bool)> {
     let safe = sanitize_terminal_text_cow(text);
@@ -416,10 +410,9 @@ mod tests {
     fn long_thoughts_read_only_their_end() {
         let text = format!("{}\n**Final title**\n", "word ".repeat(5_000));
         assert_eq!(headline_of(&text).as_deref(), Some("Final title"));
-        assert!(has_headline(&text));
         // One line with no break at all still yields its newest sentence.
         let text = format!("{}Last one", "Each sentence is here. ".repeat(500));
         assert_eq!(headline_of(&text).as_deref(), Some("Each sentence is here"));
-        assert!(!has_headline("still writing the first"));
+        assert_eq!(headline_of("still writing the first"), None);
     }
 }

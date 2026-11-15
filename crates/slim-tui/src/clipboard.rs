@@ -296,19 +296,44 @@ fn copy_text_platform(text: &str) -> io::Result<()> {
     }
 }
 
+/// Most text a paste is read for; far above anything the composer accepts.
+#[cfg(target_os = "macos")]
+const MAX_CLIPBOARD_TEXT_BYTES: u64 = 16 * 1024 * 1024;
+
 #[cfg(target_os = "macos")]
 fn paste_text_platform() -> io::Result<String> {
-    let output = pasteboard_command("/usr/bin/pbpaste")
+    use std::io::Read;
+
+    let mut child = pasteboard_command("/usr/bin/pbpaste")
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()?;
-    if !output.status.success() {
+        .spawn()?;
+    // A pathological clipboard is cut off instead of being held in memory.
+    let mut bytes = Vec::new();
+    let read = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("pbpaste stdout is unavailable"))
+        .and_then(|stdout| {
+            stdout
+                .take(MAX_CLIPBOARD_TEXT_BYTES + 1)
+                .read_to_end(&mut bytes)
+        });
+    if bytes.len() as u64 > MAX_CLIPBOARD_TEXT_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
         return Err(io::Error::other(format!(
-            "pbpaste exited with {}",
-            output.status
+            "clipboard text exceeds {} MiB",
+            MAX_CLIPBOARD_TEXT_BYTES / (1024 * 1024)
         )));
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    let status = child.wait()?;
+    read?;
+    if !status.success() {
+        return Err(io::Error::other(format!("pbpaste exited with {status}")));
+    }
+    let text = String::from_utf8_lossy(&bytes);
     Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
 }
 

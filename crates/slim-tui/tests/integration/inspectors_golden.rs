@@ -373,14 +373,14 @@ fn wide_transcript_uses_terminal_width_without_automatic_inspector() {
         "automatic inspector must stay absent\n{wide}"
     );
     assert!(
-        wide.lines().any(|row| row.trim_end() == "▏ ● Slim"),
+        wide.lines().any(|row| row.starts_with("▏ ● Slim ─")),
         "assistant must retain its explicit role label\n{wide}"
     );
     assert!(wide.contains("assistant-tail-marker"), "{wide}");
 
     let user_line = wide
         .lines()
-        .find(|line| line.contains("● Você"))
+        .find(|line| line.contains("● Revise"))
         .expect("user prompt");
     assert_eq!(
         column_of(user_line, "●"),
@@ -397,7 +397,7 @@ fn below_default_breakpoint_uses_full_width_single_column_without_run_inspector(
         assert!(!narrow.contains(" Run "), "width {width}\n{narrow}");
         let user_line = narrow
             .lines()
-            .find(|line| line.contains("● Você"))
+            .find(|line| line.contains("● Revise"))
             .expect("user prompt");
         assert_eq!(
             column_of(user_line, "●"),
@@ -405,7 +405,7 @@ fn below_default_breakpoint_uses_full_width_single_column_without_run_inspector(
             "width {width} transcript should use the full terminal width\n{narrow}"
         );
         assert!(
-            narrow.lines().any(|row| row.trim_end() == "▏ ● Slim"),
+            narrow.lines().any(|row| row.starts_with("▏ ● Slim ─")),
             "assistant role must remain visible at width {width}\n{narrow}"
         );
         assert!(

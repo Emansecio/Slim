@@ -12,7 +12,7 @@ use super::{
     parse_json_response_bounded, OAuthCredential, OAuthEndpoints, OAuthError, OAuthProgress,
 };
 
-const CLIENT_ID: &str = "9d1c250a-e6ae-44d9-88ed-5944d1962f5e";
+const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 const CALLBACK_PORT: u16 = 54545;
 const CALLBACK_PATH: &str = "/callback";

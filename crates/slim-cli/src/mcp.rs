@@ -227,8 +227,12 @@ pub(crate) fn specs_from_config(
 /// Loads layered config for `workspace`, applies the trust decision and
 /// builds specs. `session_trust` is `--trust-project` (this run only).
 /// Errors are configuration errors the caller must surface.
-pub(crate) fn load_mcp(workspace: &Path, session_trust: bool) -> Result<McpLoad, String> {
-    let layered = crate::config::load_layered_for(workspace)?;
+pub(crate) fn load_mcp(
+    workspace: &Path,
+    session_trust: bool,
+    host: Option<&Path>,
+) -> Result<McpLoad, String> {
+    let layered = crate::config::load_layered_with_host(workspace, host)?;
     Ok(load_mcp_from(&layered, workspace, session_trust))
 }
 
@@ -470,6 +474,44 @@ mod tests {
         );
         layered.mcp.validate().expect("valid");
         layered.mcp
+    }
+
+    #[test]
+    fn host_mcp_config_adds_trusted_servers_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("slim-host-mcp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let host = dir.join("host.toml");
+        std::fs::write(
+            &host,
+            "model = \"host-model\"\n[mcp.servers.board]\ncommand = \"/apps/desktop\"\nargs = [\"--swarm-mcp\", \"/d\", \"backend\"]\n",
+        )
+        .unwrap();
+        let mut layered = LayeredConfig::default();
+        crate::config::merge_layer_as(
+            &mut layered,
+            FileConfig::parse("[mcp.servers.proj]\ncommand = \"p\"\n").unwrap(),
+            McpOrigin::Project,
+        );
+        crate::config::merge_host_mcp(&mut layered, &host).expect("host layer");
+        assert_eq!(layered.model, None, "only [mcp] of the host file counts");
+        layered.mcp.validate().expect("valid");
+        let load = specs_from_config(&layered.mcp, Path::new("."), false, &Source::default());
+        assert_eq!(load.untrusted, ["proj"], "the project still waits for trust");
+        let board = &load.specs["board"];
+        assert_eq!(board.options.block, None, "the host's server starts without trust");
+        assert!(
+            matches!(&board.transport, McpTransport::Stdio { command, args, .. } if command == "/apps/desktop" && args == &["--swarm-mcp", "/d", "backend"]),
+            "{:?}",
+            board.transport
+        );
+
+        // A named file must exist, and one entry with both transports is refused.
+        let missing = crate::config::merge_host_mcp(&mut layered, &dir.join("none.toml"));
+        assert!(missing.unwrap_err().contains("--mcp-config file not found"));
+        let both = dir.join("both.toml");
+        std::fs::write(&both, "[mcp.servers.x]\ncommand = \"a\"\nurl = \"https://x\"\n").unwrap();
+        assert!(crate::config::merge_host_mcp(&mut layered, &both).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

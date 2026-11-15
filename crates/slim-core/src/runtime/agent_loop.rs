@@ -896,6 +896,7 @@ impl Runtime {
             return Err(self.cancel_loop(ctx, st, Vec::new()));
         }
         self.deliver_loop_shell_jobs(st)?;
+        self.deliver_steers(st)?;
         st.turns = st.turn + 1;
         Ok(())
     }
@@ -1298,6 +1299,11 @@ impl Runtime {
                 st.messages,
                 ProviderMessage::user(TODO_FINAL_REVIEW),
             )?;
+            return Ok(TurnEnd::NextTurn);
+        }
+        // A message sent while the model was producing this "final" answer keeps
+        // the run alive: it is delivered (and answered) on the next turn.
+        if self.steer_pending() {
             return Ok(TurnEnd::NextTurn);
         }
         Ok(TurnEnd::Stop(match provider_stop {
@@ -1783,6 +1789,24 @@ impl Runtime {
 
     fn deliver_loop_shell_jobs(&mut self, st: &mut LoopState<'_>) -> Result<bool, ProviderError> {
         self.deliver_shell_completions(st.messages, st.config.max_result_bytes, &mut st.next_seq)
+    }
+
+    /// Delivers user messages sent mid-run: each is journaled and appended so
+    /// the next provider call reads them in FIFO order.
+    fn deliver_steers(&mut self, st: &mut LoopState<'_>) -> Result<(), ProviderError> {
+        let Some(inbox) = self.steer_inbox.clone() else {
+            return Ok(());
+        };
+        for text in inbox.drain() {
+            self.append_conversation_message(st.messages, ProviderMessage::user(text))?;
+        }
+        Ok(())
+    }
+
+    fn steer_pending(&self) -> bool {
+        self.steer_inbox
+            .as_ref()
+            .is_some_and(|inbox| !inbox.is_empty())
     }
 
     /// After a budget or no-progress stop, asks for a final answer without

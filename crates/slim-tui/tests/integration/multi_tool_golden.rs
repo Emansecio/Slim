@@ -81,60 +81,6 @@ fn opening_group_keeps_materialized_member_details_closed() {
 }
 
 #[test]
-fn fitted_navigation_uses_the_rows_presented_during_the_tool_hold() {
-    let mut state = AppState::new();
-    state.clock.elapsed_ms = 500;
-    for (id, ended_ms) in [("first", 0), ("second", 500)] {
-        let mut block = Block::new(
-            id,
-            BlockKind::Tool(ToolState {
-                name: "read".into(),
-                content_handle: Some(ContentHandle(id.into())),
-                ..ToolState::default()
-            }),
-            BlockLifecycle::Complete,
-        );
-        block.ended_ms = Some(ended_ms);
-        state.append_block(block);
-    }
-    let ids: Vec<_> = state
-        .blocks()
-        .iter()
-        .map(|block| block.id.clone())
-        .collect();
-    state.scroll.mode = FollowMode::Pinned(ScrollAnchor {
-        block_id: ids[0].clone(),
-        row_offset: 0,
-    });
-    let mut cache = WrapCache::default();
-    let down = terminal_action(
-        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-        &state,
-        (80, 24),
-        &mut cache,
-    )
-    .unwrap();
-    reduce(&mut state, down);
-    assert_eq!(state.selected_block_id(), Some(&ids[1]));
-    settle(&mut state);
-    let up = terminal_action(
-        Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
-        &state,
-        (80, 24),
-        &mut cache,
-    )
-    .unwrap();
-    reduce(&mut state, up);
-    assert_eq!(
-        state.scroll.mode,
-        FollowMode::Pinned(ScrollAnchor {
-            block_id: ids[0].clone(),
-            row_offset: 0
-        })
-    );
-}
-
-#[test]
 fn live_enter_hint_targets_the_queued_texts_after_a_tool_group() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::run_started(1));
@@ -682,10 +628,11 @@ fn failed_and_cancelled_members_remain_individual_and_ordered() {
     state.apply_event(UiEvent::RunCancelled { run_id: 1 });
 
     let blocks = state.blocks();
-    // Three tool rows, then the receipt that closes an interrupted turn.
+    // Three tool rows, then the receipt that closes an interrupted turn: it
+    // says where the run stopped, not how many commands it took.
     assert_eq!(blocks.len(), 4);
     assert!(matches!(blocks[3].kind(), BlockKind::Receipt(receipt)
-        if receipt.summary().starts_with("interrompido") && receipt.summary().contains("1 comando, 1 falhou")));
+        if receipt.summary() == "interrompido · último comando falhou"));
     assert_eq!(blocks[0].lifecycle, BlockLifecycle::Complete);
     assert_eq!(blocks[1].lifecycle, BlockLifecycle::Failed);
     assert_eq!(blocks[2].lifecycle, BlockLifecycle::Cancelled);
@@ -754,7 +701,8 @@ fn a_failure_joins_its_group_and_a_successful_retry_is_folded_into_its_row() {
     let rows = frame.lines().collect::<Vec<_>>();
     let header = rows
         .iter()
-        .position(|row| row.contains("✓ 1 edição, 4 comandos"))
+        // The check names what passed; the failures have their rows below.
+        .position(|row| row.contains("✓ Editou src/lib.rs · $ cargo test · "))
         .unwrap_or_else(|| panic!("one group for the whole streak\n{frame}"));
     // Identical failures share a row; the retried call says it later passed;
     // a failure nothing fixed stays plain.
@@ -787,33 +735,125 @@ fn a_failure_joins_its_group_and_a_successful_retry_is_folded_into_its_row() {
     reduce(&mut state, Action::Key(enter()));
     assert!(state.blocks()[0].group_expanded);
     let expanded = render_terminal_text(&state, 100, 24);
-    assert_eq!(expanded.matches("$ cargo test").count(), 3, "{expanded}");
+    // Three members, and the header that names the one that passed.
+    assert_eq!(expanded.matches("$ cargo test").count(), 4, "{expanded}");
     assert!(!expanded.contains("depois passou"), "{expanded}");
 }
 
 #[test]
-fn fresh_tool_keeps_its_row_until_the_emphasis_expires() {
+fn refused_calls_share_a_row_by_reason_and_fold_into_the_header_once_moot() {
+    let refuse = |state: &mut AppState, call_id: &str, name: &str, arguments: &str, why: &str| {
+        state.apply_event(UiEvent::ToolStarted {
+            batch_id: batch(call_id),
+            call_id: call(call_id),
+            name: name.into(),
+            arguments_summary: arguments.into(),
+        });
+        state.apply_event(UiEvent::ToolProgress {
+            batch_id: batch(call_id),
+            call_id: call(call_id),
+            name: name.into(),
+            preview: why.into(),
+            content_handle: None,
+        });
+        state.apply_event(UiEvent::ToolEnded {
+            batch_id: batch(call_id),
+            call_id: call(call_id),
+            name: name.into(),
+            success: false,
+            duration_ms: 1,
+        });
+    };
+    let unknown = "shell has unknown argument `yield_time_ms`; use `yield_ms`";
+    let mut state = AppState::new();
+    complete(&mut state, "b-0", "read", "read", "path=src/app.rs", 2);
+    // Two commands refused for the same slip, then a command that ran.
+    refuse(&mut state, "sh-1", "shell", "command=cd /a", unknown);
+    refuse(&mut state, "sh-2", "shell", "command=cd /b", unknown);
+    complete(&mut state, "b-3", "sh-3", "shell", "command=cargo build", 9);
+    // A write refused for its precondition, then landed on the same file.
+    refuse(
+        &mut state,
+        "w-1",
+        "write",
+        "path=src/app.rs",
+        "precondition required: src/app.rs; no write applied.",
+    );
+    complete(&mut state, "b-5", "w-2", "write", "path=src/app.rs", 3);
+    // Edits on two files that never matched: still the agent's problem.
+    refuse(
+        &mut state,
+        "p-1",
+        "patch",
+        "path=src/sidebar.rs",
+        "expected one match; got 0",
+    );
+    refuse(
+        &mut state,
+        "p-2",
+        "patch",
+        "path=src/main_view.rs",
+        "expected one match; got 0",
+    );
+    settle(&mut state);
+
+    let frame = render_terminal_text(&state, 120, 24);
+    let rows = frame.lines().collect::<Vec<_>>();
+    let header = rows
+        .iter()
+        .position(|row| row.contains("3 recusadas"))
+        .unwrap_or_else(|| panic!("moot refusals are counted on the header\n{frame}"));
+    assert!(!frame.contains("yield_time_ms"), "{frame}");
+    assert!(!frame.contains("precondition required"), "{frame}");
+    // The unresolved refusal is one row for both files, naming neither.
+    assert!(
+        rows[header + 1].contains("✕ Editou")
+            && rows[header + 1].contains("expected one match; got 0")
+            && rows[header + 1].contains("×2")
+            && !rows[header + 1].contains("depois passou"),
+        "{frame}"
+    );
+    assert!(!frame.contains("sidebar"), "{frame}");
+    assert_eq!(frame.matches('✕').count(), 1, "{frame}");
+
+    // Measured rows match what is drawn: the header and one failure row.
+    let mut cache = WrapCache::default();
+    let index = HeightIndex::build(state.blocks(), 119, &mut cache);
+    assert_eq!(index.len(), 1);
+    assert_eq!(index.total_rows, 2);
+
+    // Enter still opens every call, refusals included, without the tally.
+    let leader = state.blocks()[0].id.clone();
+    state.scroll.mode = FollowMode::Pinned(ScrollAnchor {
+        block_id: leader,
+        row_offset: 0,
+    });
+    reduce(&mut state, Action::Key(enter()));
+    assert!(state.blocks()[0].group_expanded);
+    let expanded = render_terminal_text(&state, 120, 40);
+    assert!(expanded.contains("yield_time_ms"), "{expanded}");
+    assert!(expanded.contains("sidebar"), "{expanded}");
+    assert!(!expanded.contains("recusad"), "{expanded}");
+}
+
+#[test]
+fn a_finished_tool_joins_its_group_in_the_frame_it_settles() {
     let mut state = AppState::new();
     complete(&mut state, "batch-a", "call-1", "read", "one", 3);
     complete(&mut state, "batch-a", "call-2", "read", "two", 4);
 
+    // No row of its own that would vanish a moment later: the header already
+    // names both calls, and stays as it is once the emphasis has passed.
     let fresh = render_terminal_text(&state, 80, 24);
-    assert_eq!(
-        fresh.matches("Leu ").count(),
-        2,
-        "each just-finished call keeps a row\n{fresh}"
-    );
-    assert!(
-        !fresh.contains("Leu one · Leu two"),
-        "the group waits out the emphasis\n{fresh}"
-    );
+    assert!(fresh.contains("✓ Leu one · Leu two"), "{fresh}");
+    assert_eq!(fresh.matches('✓').count(), 1, "{fresh}");
 
     settle(&mut state);
     let grouped = render_terminal_text(&state, 80, 24);
-    assert!(grouped.contains("✓ Leu one · Leu two"), "{grouped}");
-    assert!(
-        !grouped.contains("✓ read"),
-        "settled calls fold into the group\n{grouped}"
+    assert_eq!(
+        fresh.lines().find(|row| row.contains("Leu one")),
+        grouped.lines().find(|row| row.contains("Leu one")),
+        "the row does not change after the emphasis\n{grouped}"
     );
 }
 

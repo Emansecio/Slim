@@ -1101,6 +1101,41 @@ pub fn load_layered_for(workspace: &Path) -> Result<LayeredConfig, String> {
     load_layered_with_project(project_config_path(workspace))
 }
 
+/// [`load_layered_for`] plus the host's `--mcp-config` file, read last. Only
+/// its `[mcp]` section counts, and its servers need no project trust: the
+/// host that started the run chose them. A named file that is missing is an
+/// error, never silently skipped.
+pub(crate) fn load_layered_with_host(
+    workspace: &Path,
+    host: Option<&Path>,
+) -> Result<LayeredConfig, String> {
+    let mut layered = load_layered_for(workspace)?;
+    if let Some(path) = host {
+        merge_host_mcp(&mut layered, path)?;
+    }
+    Ok(layered)
+}
+
+/// Merges only the `[mcp]` section of the host file over `layered`, as a
+/// trusted (global-origin) layer. See [`load_layered_with_host`].
+pub(crate) fn merge_host_mcp(layered: &mut LayeredConfig, path: &Path) -> Result<(), String> {
+    let config = FileConfig::load(path)?
+        .ok_or_else(|| format!("{}: --mcp-config file not found", path.display()))?;
+    if let Some(servers) = config.mcp.as_ref().and_then(|mcp| mcp.servers.as_ref()) {
+        for (name, server) in servers {
+            if let Some(error) = layer_server_error(name, server) {
+                return Err(error);
+            }
+        }
+    }
+    let mcp_only = FileConfig {
+        mcp: config.mcp,
+        ..FileConfig::default()
+    };
+    merge_layer_as(layered, mcp_only, McpOrigin::Global);
+    Ok(())
+}
+
 fn load_layered_with_project(project: PathBuf) -> Result<LayeredConfig, String> {
     let mut config = load_layers(layer_paths(project))?;
     // A file value is a default, not an explicit ProviderRunOptions override.

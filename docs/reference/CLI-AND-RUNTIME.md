@@ -1313,6 +1313,34 @@ caso contrário, atualiza em background para a próxima execução. Com
 Credencial: `SLIM_API_KEY` > `OPEN_DESIGN_API_KEY` > chave salva pelo Slim
 (`auth.json`, slot `open-design`). Aliases: `open-design`, `opendesign`, `od`.
 
+## Devin
+
+O provider nativo `devin` usa o backend Cascade (Codeium/Windsurf) com o
+protocolo Connect sobre protobuf em `https://server.codeium.com`, com a mesma
+identidade do Devin CLI.
+
+Na TUI:
+1. `/login` — escolha **Devin** e entre com a conta no navegador. O login é PKCE
+   em `app.devin.ai` com retorno para `127.0.0.1:59653/callback`; a porta cai
+   para uma aleatória quando está ocupada. O token de sessão não renova: ao
+   expirar, repita o `/login`.
+2. `/models` — escolha o modelo no grupo **Devin**.
+
+```bash
+DEVIN_API_KEY=… slim --headless --provider devin --model swe-1-6 --prompt "hello"
+```
+
+O catálogo vem de `GetCliModelConfigs` e depende da conta. Antes da primeira
+descoberta valem `swe-1-6` (padrão) e `swe-1-6-fast`; depois do login vale o
+padrão da conta. Famílias com escada de esforço aparecem como um modelo só, e o
+esforço escolhe o lane enviado. Pares Fusion rodam o modelo líder. Modelos
+roteados pelo servidor (`adaptive`, por exemplo) passam por `AssignModel` antes
+do `GetChatMessage`. A credencial nunca viaja em header — vai dentro do
+`Metadata` protobuf, como no cliente nativo.
+
+Credencial: `SLIM_API_KEY` > `DEVIN_API_KEY` > chave salva pelo Slim
+(`auth.json`, slot `devin`). Aliases: `devin`, `devin-agent`, `swe`.
+
 ## OpenCode Go
 
 O provider `opencode-go` usa chave em `SLIM_API_KEY`, depois
@@ -1437,7 +1465,7 @@ deltas OpenAI e os IDs de `content_block` Anthropic; somente chamadas legadas
 sem ID recebem identificador interno. JSON de tool malformado ou incompleto é
 rejeitado.
 
-Tool calls não têm limite por padrão; budgets separados read-only vs mutating por turno e um total por run só valem quando configurados (`max_read_tool_calls`, `max_mutating_tool_calls`, `max_total_tool_calls`; env `SLIM_MAX_READ_TOOL_CALLS` / `SLIM_MAX_MUTATING_TOOL_CALLS` / `SLIM_MAX_TOTAL_TOOL_CALLS` e chaves `slim.toml`, sem teto); esgotamento → `tool_limit` (exit 22). Turns também não têm teto por padrão: um run termina na resposta do provider, no orçamento de tempo ou nos guards de falta de progresso. Só quando configurado (`SLIM_MAX_TURNS` / `max_turns` em `slim.toml`, cap 1024) o teto vale; esgotamento → `turn_limit` (exit 12) com mensagem `Turn limit reached (N/N)`. O orçamento de tempo por run (`time_budget_secs` / `SLIM_TIME_BUDGET_SECS`, desligado por padrão, zero é recusado) conta do início do run: a partir de 3/4 o modelo recebe uma vez o tempo usado e o total, e patches que só alteram números ou cores (literais numéricos e cores hex, com o restante do texto idêntico) são recusados antes de executar; esgotado, o run para em `time_limit` (exit 12) e pede a resposta final sem tools. Independente do orçamento, o ledger causal conta turnos seguidos cujas edições só reajustaram números ou cores: no terceiro avisa o modelo, no sexto para em `no_progress` (anomalia `tuning_loop`) com resposta final própria; uma edição estrutural zera a contagem e turnos sem edição (render, leitura) a mantêm. Três guards nativos seguram uma chamada desperdiçada uma vez por run, e repetir a mesma chamada logo em seguida a executa: uma leitura simples pelo `shell` (`cat`, `sed -n 'A,Bp'`, `head`, `tail`, `Get-Content`, sem pipe, redirecionamento ou variável) de um arquivo sem mudança desde a mesma leitura; um `write` que reescreve por inteiro um arquivo existente de 2 KiB ou mais (o primeiro do run passa com uma nota sugerindo `patch`, os seguintes são segurados); e um comando de `shell` que já falhou duas vezes seguidas. A memória dos guards zera a cada run e a cada compactação. O `read` nativo dispensa guard: saída idêntica ainda no contexto já vira ponteiro. Quando o teto por turno corta calls de um batch, a mensagem seguinte ao modelo lista cada call não executada (nome e argumentos abreviados) para que só elas sejam repetidas. A tool `search` respeita `.gitignore`, ignora árvores de build, cap default 200 hits e paginação `offset`/`max_hits`. Emite `ToolStarted`, mantém pares assistant/tool através da compactação (veja "Compactação de contexto" abaixo).
+Tool calls não têm limite por padrão; budgets separados read-only vs mutating por turno e um total por run só valem quando configurados (`max_read_tool_calls`, `max_mutating_tool_calls`, `max_total_tool_calls`; env `SLIM_MAX_READ_TOOL_CALLS` / `SLIM_MAX_MUTATING_TOOL_CALLS` / `SLIM_MAX_TOTAL_TOOL_CALLS` e chaves `slim.toml`, sem teto); esgotamento → `tool_limit` (exit 22). Turns também não têm teto por padrão: um run termina na resposta do provider, no orçamento de tempo ou nos guards de falta de progresso. Só quando configurado (`SLIM_MAX_TURNS` / `max_turns` em `slim.toml`, cap 1024) o teto vale; esgotamento → `turn_limit` (exit 12) com mensagem `Turn limit reached (N/N)`. O orçamento de tempo por run (`time_budget_secs` / `SLIM_TIME_BUDGET_SECS`, desligado por padrão, zero é recusado) conta do início do run: a partir de 3/4 o modelo recebe uma vez o tempo usado e o total, e patches que só alteram números ou cores (literais numéricos e cores hex, com o restante do texto idêntico) são recusados antes de executar; esgotado, o run para em `time_limit` (exit 12) e pede a resposta final sem tools. Independente do orçamento, o ledger causal conta turnos seguidos cujas edições só reajustaram números ou cores: no terceiro avisa o modelo, no sexto para em `no_progress` (anomalia `tuning_loop`) com resposta final própria; uma edição estrutural zera a contagem e turnos sem edição (render, leitura) a mantêm. Quatro guards nativos seguram uma chamada desperdiçada antes de executar. Três seguram uma vez, e repetir a mesma chamada logo em seguida a executa: uma leitura simples pelo `shell` (`cat`, `cat -n`, `nl -ba`, `sed -n 'A,Bp'`, `head`, `tail`, `Get-Content`, sem pipe, redirecionamento ou variável) de linhas que o run já recebeu de um arquivo sem mudança, pelo `shell` ou pelo `read` nativo (vale o mesmo início sem ir além do já lido, em qualquer grafia: `head -n 50` de um arquivo de 3 linhas é o mesmo que `cat`; um trecho que começa em outra linha passa, e saída numerada conta à parte); um `write` que reescreve por inteiro um arquivo existente de 2 KiB ou mais (o primeiro do run passa com uma nota sugerindo `patch`, os seguintes são segurados); e um comando de `shell` repetido logo após falhar (só leituras entre a falha e a repetição não reabrem o comando; outra tool, sim) ou que já falhou duas vezes seguidas. O quarto não cede à repetição: uma leitura, pelo `read` nativo ou pelo `shell`, que devolveria mais de 1000 linhas é recusada com a orientação de usar `search` ou ler faixas de até 1000 linhas (`offset`/`max_lines`); arquivos de até 1000 linhas seguem lidos por inteiro. Uma leitura só entra na memória dos guards quando o modelo recebeu a saída inteira, e uma leitura posterior a uma tool com efeito no mesmo batch não é segurada. Chamada segurada por guard não conta como falha repetida para `repeated_failed_tool`. A memória dos guards zera a cada run e a cada compactação. O `read` nativo não é segurado como releitura: saída idêntica ainda no contexto já vira ponteiro. Quando o teto por turno corta calls de um batch, a mensagem seguinte ao modelo lista cada call não executada (nome e argumentos abreviados) para que só elas sejam repetidas. A tool `search` respeita `.gitignore`, ignora árvores de build, cap default 200 hits e paginação `offset`/`max_hits`. Emite `ToolStarted`, mantém pares assistant/tool através da compactação (veja "Compactação de contexto" abaixo).
 
 Cada valor de API key fornecido é redigido exatamente antes
 de tool output, follow-up ao provider, renderização e sessão; isso não promete

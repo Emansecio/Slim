@@ -23,11 +23,24 @@ pub(super) fn push_runtime_event(
     } else {
         Ok(())
     };
+    // An event the journal refused is not shown either: the UI and the
+    // durable record must agree on what happened when the session resumes.
+    persistence?;
     app.push_event(crate::SessionEvent::new(*next_seq, kind))
         .map_err(event_rejected)?;
     *next_seq = checked_next_seq(*next_seq)?;
-    persistence?;
     Ok(())
+}
+
+/// Runs a journal append that syncs to disk. On a multi-thread runtime the
+/// worker hands its other tasks over for the duration of the fsync, as
+/// `push_runtime_event` does for events.
+fn journal_io<T>(append: impl FnOnce() -> T) -> T {
+    if on_multi_thread_runtime() {
+        tokio::task::block_in_place(append)
+    } else {
+        append()
+    }
 }
 
 /// Whether blocking here would block other tasks of a multi-thread Tokio
@@ -155,10 +168,12 @@ pub(crate) fn persist_provider_call(
     let Some(journal) = journal else {
         return Ok(None);
     };
-    lock_journal(journal)?
-        .record_provider_call(&telemetry)
-        .map(Some)
-        .map_err(journal_error)
+    journal_io(|| {
+        lock_journal(journal)?
+            .record_provider_call(&telemetry)
+            .map(Some)
+            .map_err(journal_error)
+    })
 }
 
 pub(crate) fn persist_tool_batch(
@@ -171,9 +186,11 @@ pub(crate) fn persist_tool_batch(
         return Ok(());
     };
     let call_ids: Vec<&str> = calls.iter().map(|call| call.id.as_str()).collect();
-    lock_journal(journal)?
-        .record_tool_batch(batch_id, &call_ids, wall_ms)
-        .map_err(journal_error)
+    journal_io(|| {
+        lock_journal(journal)?
+            .record_tool_batch(batch_id, &call_ids, wall_ms)
+            .map_err(journal_error)
+    })
 }
 
 pub(crate) fn persist_provider_validation_failure(
@@ -184,9 +201,11 @@ pub(crate) fn persist_provider_validation_failure(
     let (Some(journal), Some(provider_call_id)) = (journal, provider_call_id) else {
         return Ok(());
     };
-    lock_journal(journal)?
-        .record_provider_validation_failure(provider_call_id, error)
-        .map_err(journal_error)
+    journal_io(|| {
+        lock_journal(journal)?
+            .record_provider_validation_failure(provider_call_id, error)
+            .map_err(journal_error)
+    })
 }
 
 pub(super) fn push_runtime_transient_event(

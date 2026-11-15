@@ -176,12 +176,20 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                         | UiEvent::RunStopped { .. }
                         | UiEvent::RunCancelled { .. }
                         | UiEvent::RunFailed { .. }
+                        // A steer refunded while idle lands as a queued
+                        // prompt and must drain immediately.
+                        | UiEvent::QueuedUserAdded { .. }
                 );
+            let run_starting = matches!(
+                &event,
+                UiEvent::RunStarted { .. } | UiEvent::PromptRunStarted { .. }
+            );
             let skills_changed = matches!(
                 &event,
                 UiEvent::WorkspaceChanged { .. }
                     | UiEvent::SessionSnapshot { .. }
                     | UiEvent::SessionRestored { .. }
+                    | UiEvent::SessionCleared { .. }
             );
             let jobs_changed = matches!(&event, UiEvent::JobsChanged { .. });
             state.apply_event(event);
@@ -218,6 +226,14 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     if let Some(effect) = prepare_prompt(state, prompt, PromptOrigin::Queued) {
                         effects.push(effect);
                     }
+                }
+            }
+            if run_starting && !state.queue_paused {
+                // Prompts typed during preparation (or refunded leftovers)
+                // join the run that just started instead of waiting for its
+                // end.
+                while let Some(prompt) = state.pop_queued_prompt() {
+                    effects.push(Effect::Send(UiCommand::Steer(prompt)));
                 }
             }
             effects
@@ -528,7 +544,7 @@ pub const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     ("help", &["/help"]),
     (
         "conversation",
-        &["/resume", "/rename", "/rewind", "/compact"],
+        &["/new", "/resume", "/rename", "/rewind", "/compact"],
     ),
     (
         "runtime",
@@ -576,6 +592,7 @@ pub fn palette_description(command: &str) -> &'static str {
         "/help" => "atalhos e comandos",
         "/login" => "conectar provedor",
         "/logout" => "sair",
+        "/new" => "nova sessão",
         "/resume" => "retomar sessão",
         "/rename" => "nomear esta sessão",
         "/rewind" => "voltar a um turno",
@@ -861,9 +878,39 @@ fn reduce_slash_key(state: &mut AppState, key: KeyEvent) -> Option<Vec<Effect>> 
     Some(effects)
 }
 
-/// G244 (§7.4): while a run is active, Submit/Steer enqueue the draft as a
-/// visible `QueuedUser` block (FIFO) instead of dropping it (core has no
-/// mid-run steer). Drained one-prompt-per-run by `UiEventReceived`.
+/// G244 (§7.4): while a run is active, Submit/Steer deliver the draft to
+/// the live run at the next turn boundary; the worker shows it as a user
+/// message (`UserMessageAdded`) and refunds it to the queue if the run
+/// ended first.
+fn steer_active(state: &mut AppState) -> Vec<Effect> {
+    let prompt = state.composer.payload();
+    if prompt.trim().is_empty() {
+        return vec![];
+    }
+    if session_command(prompt.trim()) {
+        state.push_notification(
+            "Comandos de sessão exigem uma execução inativa; aguarde ou cancele".into(),
+        );
+        state.revisions.status += 1;
+        return vec![Effect::RequestRender];
+    }
+    if user_shell_body(prompt.trim()).is_some() {
+        state.push_notification(
+            "Comandos com ! rodam só sem execução ativa; aguarde ou cancele".into(),
+        );
+        state.revisions.status += 1;
+        return vec![Effect::RequestRender];
+    }
+    state.remember_prompt(&prompt);
+    state.composer.clear();
+    state.slash_suggestions = None;
+    state.mention_suggestions = None;
+    vec![Effect::Send(UiCommand::Steer(prompt))]
+}
+
+/// G244 (§7.4): while a run is active, a skill selection (or a queue
+/// recovery) enqueues the draft as a visible `QueuedUser` block (FIFO).
+/// Drained one-prompt-per-run by `UiEventReceived`.
 fn enqueue_queued(state: &mut AppState) -> Vec<Effect> {
     let prompt = state.composer.payload();
     if prompt.trim().is_empty() {
@@ -1239,10 +1286,10 @@ fn reduce_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     }
     match classify_enter(normalize(key), state.working || state.prompt_is_busy()) {
         EnterIntent::Submit if state.working || state.prompt_is_busy() => {
-            return enqueue_queued(state)
+            return steer_active(state)
         }
         EnterIntent::Submit => return submit_composer(state),
-        EnterIntent::Steer => return enqueue_queued(state),
+        EnterIntent::Steer => return steer_active(state),
         EnterIntent::Newline => {
             state.composer.insert_text("\n");
             state.revisions.composer += 1;
@@ -1730,6 +1777,7 @@ fn open_model_overlay(state: &mut AppState) -> Vec<Effect> {
         Effect::Send(UiCommand::RefreshCommandCodeModels),
         Effect::Send(UiCommand::RefreshZenModels),
         Effect::Send(UiCommand::RefreshOpenDesignModels),
+        Effect::Send(UiCommand::RefreshDevinModels),
     ]
 }
 
@@ -1934,11 +1982,11 @@ fn parse_mcp_args(
     }
 }
 
-/// `/resume`, `/rewind` and `/rename` (with or without an argument): they swap
-/// or edit the session, so they wait for an idle worker.
+/// `/new`, `/resume`, `/rewind` and `/rename` (with or without an argument):
+/// they swap or edit the session, so they wait for an idle worker.
 fn session_command(command: &str) -> bool {
     let name = command.split_whitespace().next().unwrap_or_default();
-    matches!(name, "/resume" | "/rewind" | "/rename")
+    matches!(name, "/new" | "/resume" | "/rewind" | "/rename")
 }
 
 fn session_management_busy(state: &AppState) -> bool {
@@ -2135,6 +2183,21 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                 state.job_exit_confirm = Some(UiCommand::Logout);
             } else {
                 effects.push(Effect::Send(UiCommand::Logout));
+            }
+            state.revisions.status += 1;
+        }
+        "/new" => {
+            if session_management_busy(state) {
+                state.push_notification(
+                    "Há uma execução ativa; aguarde ou cancele antes de iniciar uma nova sessão"
+                        .into(),
+                );
+                keep_draft = true;
+            } else if state.running_jobs() > 0 {
+                // Leaving the session ends its jobs: confirm first, as /resume.
+                state.job_exit_confirm = Some(UiCommand::NewSession);
+            } else {
+                effects.push(Effect::Send(UiCommand::NewSession));
             }
             state.revisions.status += 1;
         }
@@ -2381,6 +2444,18 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                         "Modelo Open Design desconhecido. Use /models.",
                         EffortTarget::OpenDesign,
                         |model, effort| UiCommand::SetOpenDesignModel { model, effort },
+                    );
+                }
+                Some(LoginProvider::Devin) => {
+                    let found = catalog_entry(&state.devin_models, value);
+                    select_stepped_model(
+                        state,
+                        &mut effects,
+                        &mut keep_draft,
+                        found,
+                        "Modelo Devin desconhecido. Use /models.",
+                        EffortTarget::Devin,
+                        |model, effort| UiCommand::SetDevinModel { model, effort },
                     );
                 }
                 Some(LoginProvider::Xai) => {
@@ -2801,6 +2876,7 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 }
                 EffortTarget::Xai(model) => UiCommand::SetXaiModel { model, effort },
                 EffortTarget::OpenDesign(model) => UiCommand::SetOpenDesignModel { model, effort },
+                EffortTarget::Devin(model) => UiCommand::SetDevinModel { model, effort },
             };
             state.model_overlay = None;
             return vec![Effect::Send(command), Effect::RequestRender];
@@ -3189,6 +3265,7 @@ fn reduce_effort_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 }
                 EffortTarget::Xai(model) => UiCommand::SetXaiModel { model, effort },
                 EffortTarget::OpenDesign(model) => UiCommand::SetOpenDesignModel { model, effort },
+                EffortTarget::Devin(model) => UiCommand::SetDevinModel { model, effort },
             };
             return vec![Effect::Send(command), Effect::RequestRender];
         }
@@ -3276,7 +3353,7 @@ fn reduce_login_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         KeyCode::Down => {
             if let Some(current) = state.login_overlay.as_mut() {
-                current.selected = (current.selected + 1).min(7);
+                current.selected = (current.selected + 1).min(8);
             }
         }
         KeyCode::Home => {
@@ -3286,7 +3363,7 @@ fn reduce_login_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         }
         KeyCode::End => {
             if let Some(current) = state.login_overlay.as_mut() {
-                current.selected = 7;
+                current.selected = 8;
             }
         }
         KeyCode::Enter

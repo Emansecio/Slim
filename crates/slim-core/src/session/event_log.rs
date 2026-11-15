@@ -149,7 +149,11 @@ fn write_line(file: &mut impl Write, line: &impl serde::Serialize) -> io::Result
 }
 
 pub(crate) fn acquire_lock(path: &Path) -> io::Result<File> {
-    let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+    // Appended to the raw path: `display()` is lossy, and two distinct
+    // non-UTF-8 paths must not share one lock file.
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
     let mut options = OpenOptions::new();
     options.write(true).create(true);
     #[cfg(windows)]

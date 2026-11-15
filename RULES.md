@@ -1,6 +1,10 @@
 # RULES.md — Protocolo anti-alucinação e anti-esquecimento
 
-> **Protocolo técnico de evidência e deploy, subordinado ao AGENTS.md e às instruções do usuário.**
+> **Protocolo de evidência consultivo, subordinado ao [`AGENTS.md`](AGENTS.md) e às instruções do usuário.**
+> O AGENTS.md é a política operacional sempre carregada: escopo, git, escada de
+> testes, publicação e documentação. Aqui ficam só o *como provar* (R1–R6, R8–R12),
+> a memória de incidentes (§3) e o checklist de entrega (§4). Onde um item repetir
+> uma obrigação do AGENTS.md, o texto dele prevalece e este arquivo não a redefine.
 > Consulte as seções pertinentes à tarefa. Os incidentes da seção 3 são históricos;
 > não exigem leitura nem repetição de verificações em toda mudança.
 
@@ -17,8 +21,9 @@ Não apresente análise estática como prova de execução ou de comportamento l
 Para afirmar uma contagem, versão ou medida como atual, verifique-a nesta sessão
 quando ela for necessária à tarefa. Resultados anteriores podem ser citados com
 data e fonte, identificados como históricos e não revalidados. Não rode a suíte
-só para renovar números de documentação. Quando a suíte completa for necessária,
-conte sua saída real, incluindo Doc-tests, falhas e testes ignorados.
+só para renovar números de documentação (escopo de testes em AGENTS.md). Quando a
+suíte completa for necessária, conte sua saída real, incluindo Doc-tests, falhas e
+testes ignorados.
 
 ### R3 — Caminho:linha só existe se você leu
 Proibido citar `arquivo.rs:NN` como evidência sem ter lido o arquivo **nesta
@@ -47,33 +52,24 @@ executável contra o último build. (Incidente I1: usuário validou a TUI num
 
 ## 2. Memória do ambiente — NUNCA esquecer o básico
 
-### R7 — Validação e deploy têm escopos distintos
-Escolha verificações que cubram o comportamento alterado e seus riscos. Não
-repita checks aprovados sem mudança relevante, falha ou dúvida concreta.
-Análise e mudanças somente documentais dispensam build, testes de código e deploy.
+### R7 — Deploy tem escopo e identidade próprios
+Quais verificações cobrem a mudança e quando publicar estão em
+[`AGENTS.md`](AGENTS.md); aqui ficam o registro e a prova do deploy.
 
-O deploy local instala uma cópia estática em `%USERPROFILE%\bin\Slim.exe`;
-ela não acompanha o checkout automaticamente. Alterar código do Slim encerra
-com o deploy:
-
-```powershell
-.\refresh-slim.ps1          # build release + cópia + smoke
-.\refresh-slim.ps1 -Test    # alternativa: inclui a suíte completa antes do deploy
-```
-
-Escolha uma alternativa. `-Test` já executa `cargo test --workspace`: não rode
-a mesma suíte imediatamente antes sem uma mudança intermediária. Se os checks
-necessários já passaram, use o comando sem `-Test`. Informe `OK:` e a identidade
-do executável ao declarar deploy concluído. Falha preexistente fora do escopo
-alterado não bloqueia o deploy: ela consta no relatório.
+O deploy local instala uma cópia estática (`%USERPROFILE%\bin\Slim.exe`; no
+macOS, `~/.local/bin/slim`) que não acompanha o checkout automaticamente.
+Informe `OK:` e a identidade do executável ao declarar deploy concluído. Falha
+preexistente fora do escopo alterado não bloqueia o deploy: ela consta no
+relatório.
 
 ### R8 — Toolchain e variáveis do ambiente
 O incidente I2 envolveu instalações Rust diferentes e variáveis herdadas inválidas.
 Antes de comandos Cargo necessários, confira os caminhos efetivos e mantenha
 rustc/rustdoc no mesmo toolchain. Remova ou ajuste variáveis inválidas somente
-no processo da tarefa. `refresh-slim.ps1` contém os caminhos usados no deploy
-local; versões históricas não comprovam o ambiente atual. Não limpe caches por
-ritual: investigue incompatibilidades e preserve trabalho existente.
+no processo da tarefa. O script de refresh (`refresh-slim.sh` no macOS,
+`refresh-slim.ps1` no Windows) contém os caminhos usados no deploy local; versões
+históricas não comprovam o ambiente atual. Não limpe caches por ritual:
+investigue incompatibilidades e preserve trabalho existente.
 
 ### R9 — Exit code de pipeline PowerShell mente
 `cargo ... 2>&1 | Select-String ...` pode reportar exit 1 com tudo verde.
@@ -86,13 +82,14 @@ Teste que falha pode estar errado, não o código. Leia o assert antes de
 wordmark — o teste pegou o bug do próprio código novo.)
 
 ### R11 — Atualize apenas a documentação afetada
-Mudou comportamento documentado? Corrija sua referência vigente na mesma tarefa.
-O README identifica o estado do checkout; `release/README.md` registra o deploy.
-Tracker e DESIGN da TUI só precisam mudar quando seus contratos ou estados forem
-afetados. Não replique contagens de testes em vários arquivos: registre a
-evidência uma vez e use links. Preserve resultados antigos com data e escopo;
-auditorias e planos históricos devem ser identificados como tal. Não apague
-números históricos legítimos para obter uma busca vazia.
+Atualizar a referência vigente, o índice e os links relativos é obrigação do
+[`AGENTS.md`](AGENTS.md); aqui ficam os limites. `README.md` identifica o estado
+do checkout; `release/README.md` registra o deploy. Tracker e DESIGN da TUI só
+mudam quando seus contratos ou estados forem afetados. Não replique contagens de
+testes em vários arquivos: registre a evidência uma vez e use links. Preserve
+resultados antigos com data e escopo; auditorias e planos históricos devem ser
+identificados como tal. Não apague números históricos legítimos para obter uma
+busca vazia.
 
 ### R12 — Não "conserte" o que a spec normativa define
 `DESIGN-SLIM-TUI.md` §§2–29 é contrato. Layout, motion (ex.: ambient idle ≤
@@ -117,12 +114,14 @@ mudança passa pela spec primeiro. "Modernizar" violando contrato não é melhor
 ## 4. Checklist de entrega por escopo
 
 Cubra os itens abaixo de forma concisa na entrega; não é necessário copiar o
-formulário. Indique explicitamente o que não se aplica.
+formulário. Indique explicitamente o que não se aplica. Quais e quantos checks
+rodar é decisão do [`AGENTS.md`](AGENTS.md): o checklist registra evidência, não
+amplia escopo.
 
 - Evidência das alterações ou conclusões e referências lidas (R1, R3).
 - Comandos realmente executados, resultados e falhas; testes de código são
   não aplicáveis a análise e documentação. A suíte completa só é necessária
-  quando o risco ou o escopo a justificar (R7).
+  quando o risco ou o escopo a justificar ([AGENTS.md](AGENTS.md)).
 - Medições atuais verificadas ou resultados históricos identificados (R2).
 - Deploy: resultado do script e identidade do binário; não aplicável a mudança
   somente documental (R6, R7).

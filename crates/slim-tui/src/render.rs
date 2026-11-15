@@ -342,7 +342,8 @@ pub(crate) fn prose_row_count(text: &str, width: usize) -> usize {
     crate::markdown::prose_row_count(text, width.min(u16::MAX as usize) as u16)
 }
 
-/// Align the body with the label in the separate `"  ● Você"` header.
+/// The prompt's text starts after its marker (`"  ● "`), in the column the
+/// agent's prose uses.
 pub(crate) const USER_PROMPT_PREFIX_COLS: u16 = 4;
 
 pub(crate) fn user_prompt_text_width(width: u16) -> u16 {
@@ -408,10 +409,11 @@ fn is_foldable_leader(leader: &Block, members: &[Block]) -> bool {
 fn block_height(block: &Block, width: u16, cache: &mut WrapCache) -> usize {
     let content_rows = match block.kind() {
         BlockKind::User(text) => {
-            // Header row, the prompt's rows, the air that closes the band, and
-            // the agent's header while the prompt waits for its first output.
-            prose_row_count(text, user_prompt_text_width(width) as usize)
-                + 2
+            // The prompt's rows (the marker shares the first), the air that
+            // closes the band, and the agent's header while the prompt waits
+            // for its first output.
+            prose_row_count(text, user_prompt_text_width(width) as usize).max(1)
+                + 1
                 + usize::from(block.awaiting_agent()) * crate::block::ResponseHeader::PENDING.rows()
         }
         BlockKind::Assistant(text) => {
@@ -630,14 +632,7 @@ impl<'a> HeightIndex<'a> {
                 index = end;
                 continue;
             }
-            let tool_span = if cache.present_tool_hold {
-                crate::block::consecutive_presented_tool_span(
-                    blocks,
-                    index,
-                    cache.present_now_ms,
-                    cache.present_reduced_motion,
-                )
-            } else if crate::block::is_settled_tool(block) {
+            let tool_span = if crate::block::is_settled_tool(block) {
                 crate::block::consecutive_settled_tool_span(blocks, index)
             } else {
                 None
@@ -983,7 +978,7 @@ impl<'a> HeightIndex<'a> {
             })
     }
 
-    /// Focus targets come from the presented spans, including the tool hold.
+    /// Focus targets come from the presented spans.
     /// Only a transcript that fits needs block navigation rather than scrolling.
     fn fitted_fold_anchors(&self) -> Vec<ScrollAnchor> {
         let mut anchors = Vec::new();
@@ -1133,10 +1128,8 @@ pub struct WrapCache {
     projections: Vec<((u64, u64, u16, u8), Arc<Vec<LogicalLine>>)>,
     /// The projected stable prefix of the body being streamed.
     streaming_prefix: Option<StreamingPrefix>,
-    /// Built height indexes keyed by (content rev, fold rev, width, tool-hold
-    /// epoch). The epoch stays put across motion frames and changes only when
-    /// a just-finished tool joins or leaves its group.
-    height_indexes: HashMap<(u64, u64, u16, u64), Arc<HeightIndexMemo>>,
+    /// Built height indexes keyed by (content rev, fold rev, width).
+    height_indexes: HashMap<(u64, u64, u16), Arc<HeightIndexMemo>>,
     /// Transcript search results keyed by (query, filter, content rev).
     #[allow(clippy::type_complexity)]
     search_memo: Option<((String, SearchFilter, u64), Arc<[usize]>)>,
@@ -1144,14 +1137,8 @@ pub struct WrapCache {
     /// Keyed by (content, fold, scroll mode, whether the wheel set the pin).
     #[allow(clippy::type_complexity)]
     selected_memo: Option<((u64, u64, FollowMode, bool), Option<BlockId>)>,
-    /// Last collapsed tool-group leader keyed by (content, fold, hold epoch).
-    tool_leader_memo: Option<((u64, u64, u64), Option<BlockId>)>,
-    /// Live clock for tool-group hold. Direct `HeightIndex::build` leaves
-    /// this off and keeps the settled span, so probes that do not paint a
-    /// frame stay independent of the emphasis window.
-    present_tool_hold: bool,
-    present_now_ms: u64,
-    present_reduced_motion: bool,
+    /// Last collapsed tool-group leader keyed by (content, fold).
+    tool_leader_memo: Option<((u64, u64), Option<BlockId>)>,
     /// Composer display snapshot keyed by (composer revision, width).
     composer_memo: Option<((u64, u16), DisplaySnapshot)>,
     /// Slash completion matches keyed by (query, skill list revision).
@@ -1159,7 +1146,7 @@ pub struct WrapCache {
     slash_memo: Option<((String, u64), Arc<Vec<String>>)>,
     /// Model overlay flattened rows keyed by (filter, collapsed, catalog rev).
     #[allow(clippy::type_complexity)]
-    model_rows_memo: Option<((String, [bool; 6], u64), Arc<Vec<ModelRow>>)>,
+    model_rows_memo: Option<((String, [bool; 7], u64), Arc<Vec<ModelRow>>)>,
     /// Inspector panel lines keyed by (kind, content, status, second, width,
     /// palette). The row count is retained independently of the palette so a
     /// keyboard-only probe can reuse it without rebuilding styled lines.
@@ -1171,8 +1158,6 @@ pub struct WrapCache {
     streaming_blocks_memo: Option<(u64, bool)>,
     /// Timestamps of block transitions that can still be inside their window.
     transition_stamps_memo: Option<TransitionStamps>,
-    /// Finished tools whose group hold can still be open; see `tool_hold_epoch`.
-    hold_candidates_memo: Option<HoldCandidates>,
     /// Lines of the blocks still being written: one key per content generation,
     /// so they never pass through (and empty) the stable block LRU.
     streaming_line_memos: Vec<(BlockLinesKey, Arc<Vec<RatatuiLine<'static>>>)>,
@@ -1245,18 +1230,11 @@ struct StreamingPrefix {
     wrapped: Option<(MarkdownStyles, Vec<RatatuiLine<'static>>)>,
 }
 
-/// Settled tools whose hold window was open when `blocks` were scanned.
-/// Later clocks only narrow the set, so the scan is per content revision.
-struct HoldCandidates {
-    content_rev: u64,
-    now_ms: u64,
-    candidates: Vec<(u64, u64)>,
-}
-
 const SCRATCH_BODY_SLOTS: usize = 4;
 /// Line memos of blocks being written: the answer, a thought, a tool row
-/// whose clock advances. One generation at a time per block.
-const STREAMING_LINE_SLOTS: usize = 3;
+/// whose clock advances, one generation at a time per block; and stable
+/// entries too large for the LRU.
+const STREAMING_LINE_SLOTS: usize = 6;
 const SCRATCH_PROJECTION_SLOTS: usize = 4;
 const MAX_HEIGHT_INDEX_MEMOS: usize = 4;
 const MAX_BLOCK_LINE_MEMOS: usize = 256;
@@ -1290,21 +1268,8 @@ fn memoized<K: PartialEq, V>(slot: &mut Option<(K, V)>, key: K, produce: impl Fn
 }
 
 impl WrapCache {
-    /// Arms the tool-group hold for the next height build. Motion frames that
-    /// share the same hold set reuse the index; only a settlement or a new
-    /// completion changes the epoch.
-    pub(crate) fn set_tool_presentation(&mut self, now_ms: u64, reduced_motion: bool) {
-        self.present_now_ms = now_ms;
-        self.present_reduced_motion = reduced_motion;
-        self.present_tool_hold = true;
-    }
-
-    pub(crate) fn reduced_motion_presentation(&self) -> bool {
-        self.present_reduced_motion
-    }
-
     /// Height index for the current frame: shares the memoized index content
-    /// when (content, fold, width, hold epoch) are unchanged, built otherwise.
+    /// when (content, fold, width) are unchanged, built otherwise.
     pub(crate) fn height_index<'a>(
         &mut self,
         blocks: &'a [Block],
@@ -1312,17 +1277,7 @@ impl WrapCache {
         fold_rev: u64,
         width: u16,
     ) -> HeightIndex<'a> {
-        let epoch = if self.present_tool_hold {
-            self.tool_hold_epoch(
-                blocks,
-                content_rev,
-                self.present_now_ms,
-                self.present_reduced_motion,
-            )
-        } else {
-            0
-        };
-        let key = (content_rev, fold_rev, width, epoch);
+        let key = (content_rev, fold_rev, width);
         if let Some(memo) = self.height_indexes.get(&key) {
             return HeightIndex {
                 blocks,
@@ -1332,60 +1287,12 @@ impl WrapCache {
         }
         let index = HeightIndex::build(blocks, width, self);
         self.height_indexes
-            .retain(|(c, f, _, e), _| *c == content_rev && *f == fold_rev && *e == epoch);
+            .retain(|(c, f, _), _| *c == content_rev && *f == fold_rev);
         if self.height_indexes.len() >= MAX_HEIGHT_INDEX_MEMOS {
             self.height_indexes.clear();
         }
         self.height_indexes.insert(key, Arc::clone(&index.memo));
         index
-    }
-
-    /// [`crate::block::tool_hold_epoch`] without the per-frame scan: the
-    /// tools that can still be inside the hold are collected once per content
-    /// revision (a tool finishing bumps it) and only re-tested against the
-    /// clock, which can only drop them.
-    pub(crate) fn tool_hold_epoch(
-        &mut self,
-        blocks: &[Block],
-        content_rev: u64,
-        now_ms: u64,
-        reduced_motion: bool,
-    ) -> u64 {
-        if reduced_motion {
-            return 0;
-        }
-        let holding = |ended: u64| ended.saturating_add(crate::block::TOOL_GROUP_HOLD_MS) > now_ms;
-        match &mut self.hold_candidates_memo {
-            Some(memo) if memo.content_rev == content_rev && memo.now_ms <= now_ms => {
-                memo.candidates.retain(|(_, ended)| holding(*ended));
-                memo.now_ms = now_ms;
-            }
-            slot => {
-                let candidates = blocks
-                    .iter()
-                    .filter(|block| crate::block::tool_hold_pending(block, now_ms, false))
-                    .map(|block| {
-                        (
-                            block.cache_identity(),
-                            block.ended_ms.expect("a held tool has ended"),
-                        )
-                    })
-                    .collect();
-                *slot = Some(HoldCandidates {
-                    content_rev,
-                    now_ms,
-                    candidates,
-                });
-            }
-        }
-        self.hold_candidates_memo
-            .as_ref()
-            .expect("hold candidates populated")
-            .candidates
-            .iter()
-            .fold(0u64, |epoch, (identity, _)| {
-                epoch.wrapping_mul(31).wrapping_add(*identity)
-            })
     }
 
     pub(crate) fn has_streaming_block(&mut self, blocks: &[Block], content_rev: u64) -> bool {
@@ -1677,22 +1584,17 @@ impl WrapCache {
     }
 
     /// The most recent collapsed tool-group leader while a run is active.
-    /// Keyed by the hold epoch so a spinner frame does not rescan, and a
-    /// tool joining the group does.
+    /// Keyed by the revisions so a spinner frame does not rescan, and a tool
+    /// joining the group does.
     pub(crate) fn tool_group_leader(
         &mut self,
         blocks: &[Block],
         content_rev: u64,
         fold_rev: u64,
-        now_ms: u64,
-        reduced_motion: bool,
     ) -> Option<BlockId> {
-        let epoch = self.tool_hold_epoch(blocks, content_rev, now_ms, reduced_motion);
-        memoized(
-            &mut self.tool_leader_memo,
-            (content_rev, fold_rev, epoch),
-            || crate::runtime::last_collapsed_tool_group_leader(blocks, now_ms, reduced_motion),
-        )
+        memoized(&mut self.tool_leader_memo, (content_rev, fold_rev), || {
+            crate::runtime::last_collapsed_tool_group_leader(blocks)
+        })
         .clone()
     }
 
@@ -1812,11 +1714,19 @@ impl WrapCache {
                 .find(|(stored, _)| stored == key)
                 .map(|(_, lines)| Arc::clone(lines));
         }
-        self.block_line_memos.get(key).cloned()
+        if let Some(lines) = self.block_line_memos.get(key) {
+            return Some(lines.clone());
+        }
+        // Oversized stable entries live in the slots below.
+        self.streaming_line_memos
+            .iter()
+            .find(|(stored, _)| stored == key)
+            .map(|(_, lines)| Arc::clone(lines))
     }
 
-    /// Stores produced block lines under `key`. Oversized entries bypass the
-    /// cache but are still returned — the frame always paints.
+    /// Stores produced block lines under `key`. Entries too large for the
+    /// LRU's budget share the few slots of blocks still being written, so a
+    /// long visible answer is not rebuilt on every frame.
     pub(crate) fn store_block_lines(
         &mut self,
         key: BlockLinesKey,
@@ -1824,7 +1734,12 @@ impl WrapCache {
         streaming: bool,
     ) -> Arc<Vec<RatatuiLine<'static>>> {
         let lines = Arc::new(lines);
-        if streaming {
+        let bytes = if streaming {
+            0
+        } else {
+            cached_lines_bytes(&lines)
+        };
+        if streaming || bytes > MAX_CACHED_BLOCK_LINES_BYTES {
             // A block being written replaces its own previous generation.
             self.streaming_line_memos
                 .retain(|(stored, _)| stored.0 != key.0);
@@ -1834,10 +1749,7 @@ impl WrapCache {
             self.streaming_line_memos.push((key, Arc::clone(&lines)));
             return lines;
         }
-        let bytes = cached_lines_bytes(&lines);
-        if bytes <= MAX_CACHED_BLOCK_LINES_BYTES {
-            self.block_line_memos.insert(key, lines.clone(), bytes);
-        }
+        self.block_line_memos.insert(key, lines.clone(), bytes);
         lines
     }
 
@@ -2001,13 +1913,29 @@ impl WrapCache {
             self.body_hits = self.body_hits.saturating_add(1);
             return body.clone();
         }
+        // A stable body too large for the LRU waits in a scratch slot.
+        if let Some((_, body)) = self
+            .scratch_bodies
+            .iter()
+            .find(|(stored, _)| *stored == key)
+        {
+            self.body_hits = self.body_hits.saturating_add(1);
+            return body.as_ref().clone();
+        }
         self.body_misses = self.body_misses.saturating_add(1);
         let body = produce();
         let bytes = weight(&body);
         if bytes <= MAX_CACHED_BODY_BYTES {
             self.bodies.insert(key, body.clone(), bytes);
         } else {
+            // Too large for the shared budget, but wrapping it again on
+            // every frame it is visible costs milliseconds per frame: it
+            // takes a scratch slot until newer oversized bodies push it out.
             self.body_oversized_skips = self.body_oversized_skips.saturating_add(1);
+            if self.scratch_bodies.len() >= SCRATCH_BODY_SLOTS {
+                self.scratch_bodies.remove(0);
+            }
+            self.scratch_bodies.push((key, Arc::new(body.clone())));
         }
         body
     }
@@ -2047,16 +1975,12 @@ impl Default for WrapCache {
             search_memo: None,
             selected_memo: None,
             tool_leader_memo: None,
-            present_tool_hold: false,
-            present_now_ms: 0,
-            present_reduced_motion: false,
             composer_memo: None,
             slash_memo: None,
             model_rows_memo: None,
             palette_memo: None,
             streaming_blocks_memo: None,
             transition_stamps_memo: None,
-            hold_candidates_memo: None,
             streaming_line_memos: Vec::new(),
             frame_painted: false,
             modal_was_open: false,

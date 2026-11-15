@@ -341,6 +341,21 @@ pub(crate) struct ParsedJsonl {
     pub(crate) needs_separator: bool,
 }
 
+/// A record line decoded without an intermediate `Value`, or `None` when it
+/// is anything else (a header, malformed or unusual JSON).
+fn decode_record_line(line: &[u8]) -> Option<DurableRecord> {
+    #[derive(serde::Deserialize)]
+    struct TypeProbe<'a> {
+        #[serde(rename = "type", borrow)]
+        kind: std::borrow::Cow<'a, str>,
+    }
+    let probe = serde_json::from_slice::<TypeProbe<'_>>(line).ok()?;
+    if probe.kind == "session" {
+        return None;
+    }
+    serde_json::from_slice::<DurableRecord>(line).ok()
+}
+
 pub(crate) fn parse(file: &mut File) -> io::Result<ParsedJsonl> {
     let file_len = file.metadata()?.len();
     if file_len > MAX_DURABLE_SESSION_BYTES {
@@ -360,6 +375,22 @@ pub(crate) fn parse(file: &mut File) -> io::Result<ParsedJsonl> {
     for line in bytes.split_inclusive(|byte| *byte == b'\n') {
         let has_newline = line.ends_with(b"\n");
         let is_final_line = offset + line.len() == bytes.len();
+        // Records after the header are decoded straight from the line. Going
+        // through a `Value` first builds every record twice; that path stays
+        // for the header and for any line the direct decode refuses, so
+        // errors and tolerated oddities are exactly what they were.
+        if header.is_some() {
+            if let Some(record) = decode_record_line(line) {
+                validate_next(&records, record.seq())
+                    .map_err(|_| invalid_data("record sequence is not increasing"))?;
+                records.push(record);
+                if is_final_line && !has_newline {
+                    needs_separator = true;
+                }
+                offset += line.len();
+                continue;
+            }
+        }
         let value = match serde_json::from_slice::<Value>(line) {
             Ok(value) => value,
             Err(error) if error.is_eof() && !has_newline && is_final_line => {
@@ -579,7 +610,9 @@ fn create_temp_file(path: &Path) -> io::Result<(PathBuf, File)> {
         file_name.to_string_lossy(),
         std::process::id()
     ));
-    for index in 0.. {
+    // Every name here already carries the pid and a nanosecond stamp; a run
+    // of collisions this long is a hostile or broken directory, not a race.
+    for index in 0..TEMP_NAME_ATTEMPTS {
         let candidate = if index == 0 {
             base.clone()
         } else {
@@ -594,8 +627,13 @@ fn create_temp_file(path: &Path) -> io::Result<(PathBuf, File)> {
             Err(error) => return Err(error),
         }
     }
-    unreachable!("temporary path suffix space exhausted")
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no free temporary name beside the session file",
+    ))
 }
+
+const TEMP_NAME_ATTEMPTS: u32 = 1_024;
 
 #[cfg(windows)]
 fn configure_temp_file_access(options: &mut OpenOptions) {
@@ -676,8 +714,8 @@ fn publish_temp_file(file: &File, temp_path: &Path, final_path: &Path) -> io::Re
     let _ = file;
     // A same-filesystem hard link publishes without replacing a raced destination;
     // unlinking the temporary name leaves the already-open inode at the final path.
-    fs::hard_link(temp_path, final_path)?;
-    fs::remove_file(temp_path)
+    // Filesystems without hard links fall back to a guarded rename.
+    crate::tools::link_or_rename_into_gap(temp_path, final_path)
 }
 
 fn invalid_data(message: &str) -> io::Error {

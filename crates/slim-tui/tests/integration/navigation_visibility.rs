@@ -97,10 +97,10 @@ fn login_end_keeps_the_last_provider_visible_in_a_short_viewport() {
     let frame = render(&state, 80, 12);
     assert_eq!(
         state.login_overlay.as_ref().map(|overlay| overlay.selected),
-        Some(7)
+        Some(8)
     );
     assert!(
-        frame.contains("> Open Design"),
+        frame.contains("> Devin"),
         "last provider must be visible after End:\n{frame}"
     );
     assert!(

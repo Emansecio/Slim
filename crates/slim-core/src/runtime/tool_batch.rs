@@ -263,6 +263,9 @@ impl Runtime {
                 });
             let ok = result.success || mutation_changed;
             let full_output = presentation.text.clone();
+            // Cut to fit the request, the model did not receive all of it.
+            let shown = full_output == result.output;
+            let held = self.run_guards.was_held(&call.id);
             let tool_name = self.redact_sensitive(&call.name);
             let pointer = duplicate_pointer(&tool_name);
             let already_in_context = |text: &str| {
@@ -293,7 +296,7 @@ impl Runtime {
             } else {
                 full_output
             };
-            if let Some(note) = self.run_guards.settle(&call.id, result.success) {
+            if let Some(note) = self.run_guards.settle(&call.id, result.success, shown) {
                 output.push('\n');
                 output.push_str(&note);
             }
@@ -337,7 +340,9 @@ impl Runtime {
                 *guard = LoopGuard::default();
                 repeated_failure_in_batch = false;
                 false
-            } else if ok {
+            } else if ok || held {
+                // A hold is the guard's answer, not a failure of the call:
+                // the retry it invites must not count as a repetition.
                 false
             } else {
                 // Reuse the governor's prepared identity and dependency state.
@@ -561,6 +566,7 @@ impl Runtime {
         let mut prepared = self
             .prepare_provider_tool_invocations(mode, cwd, calls)
             .await?;
+        self.run_guards.begin_batch();
         for (call, prepared) in calls.iter().zip(prepared.iter_mut()) {
             self.run_guards.admit(&call.id, prepared);
         }

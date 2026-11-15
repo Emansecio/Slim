@@ -269,7 +269,7 @@ fn a_denied_workspace_is_remembered_and_gets_no_nag() {
     });
     // A later session on this workspace loads with `denied`, which is what
     // suppresses the startup notice.
-    let load = crate::mcp::load_mcp(&harness.root, false).expect("load");
+    let load = crate::mcp::load_mcp(&harness.root, false, None).expect("load");
     assert!(load.denied);
     assert_eq!(load.untrusted, ["proj"]);
     assert!(crate::mcp::load_diagnostics(&load, "hint").is_empty());
@@ -679,4 +679,32 @@ fn reconnecting_a_server_also_fills_its_resource_counts() {
     assert_eq!(web.resources, Some(2));
     assert_eq!(web.resource_templates, Some(1));
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// An embedded runtime's workspace is not the process directory: the
+/// startup notice about held-back project LSP overrides reads the project
+/// slim.toml and trust decision of the workspace.
+#[test]
+fn lsp_trust_notice_follows_the_workspace_not_the_process_directory() {
+    let root = std::env::temp_dir().join(format!(
+        "slim-lsp-trust-notice-{}-{}",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("workspace");
+    std::fs::write(
+        root.join(crate::config::PROJECT_CONFIG_FILE),
+        "[lsp.servers.typescript-language-server]\npath = 'repo.mjs'\n",
+    )
+    .expect("project config");
+    let untrusted = super::project_lsp_trust_notice(Some(&root), false);
+    let trusted_session = super::project_lsp_trust_notice(Some(&root), true);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        untrusted
+            .as_deref()
+            .is_some_and(|notice| notice.contains("project LSP overrides ignored")),
+        "{untrusted:?}"
+    );
+    assert_eq!(trusted_session, None);
 }

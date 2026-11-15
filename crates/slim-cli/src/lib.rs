@@ -4,6 +4,7 @@ mod code_intel;
 pub mod codex_catalog;
 pub mod command_code_catalog;
 mod config;
+pub mod devin_catalog;
 mod exit_codes;
 mod headless;
 mod mcp;
@@ -23,6 +24,7 @@ pub use auth::{
 pub use cli::{run_cli, CliOutput};
 pub use code_intel::install_code_intel;
 pub use config::Config;
+pub use config::{global_config_path, project_config_path};
 pub use exit_codes::ExitCode;
 pub use headless::{
     load_local_images, render_jsonl, render_provider_jsonl, render_provider_text,
@@ -35,8 +37,8 @@ pub use headless::{
 };
 pub use mcp_cli::run_mcp_cli;
 pub use tui::{
-    run_provider_tui_turn, run_tui, spawn_tui_runtime, spawn_tui_runtime_with_resume, TuiError,
-    TuiRuntimeHandle,
+    run_provider_tui_turn, run_tui, spawn_embedded_runtime, spawn_embedded_runtime_deferred,
+    spawn_tui_runtime, spawn_tui_runtime_with_resume, TuiError, TuiRuntimeHandle,
 };
 
 pub(crate) fn canonical_provider_model(
@@ -72,6 +74,7 @@ pub(crate) fn provider_compatible_model(
         ProviderKind::CommandCode => slim_core::provider::is_command_code_model_id(model),
         ProviderKind::Xai => slim_core::provider::is_xai_model_id(model),
         ProviderKind::OpenDesign => slim_core::provider::is_open_design_model_id(model),
+        ProviderKind::Devin => slim_core::provider::is_devin_model_id(model),
         ProviderKind::Anthropic | ProviderKind::OpenAiCompatible => true,
     }
 }

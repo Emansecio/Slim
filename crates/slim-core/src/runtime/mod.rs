@@ -64,6 +64,7 @@ mod redaction;
 mod request_estimate;
 mod run_guards;
 mod shell_jobs;
+mod steer;
 mod stream_normalizer;
 #[cfg(test)]
 mod temp_root;
@@ -181,6 +182,7 @@ pub use loop_guard::LoopGuard;
 pub use manual_retry::ManualRetryHandle;
 pub use mode::mode_name;
 pub use shell_jobs::{ShellJobInfo, ShellJobLimits, ShellJobOutput, ShellJobScope, ShellJobs};
+pub use steer::SteerInbox;
 
 pub struct Runtime {
     pub app: AppHandle,
@@ -201,6 +203,7 @@ pub struct Runtime {
     capability_bridge: Option<RuntimeCapabilityBridge<MemoryRepo>>,
     compaction_handle: Option<CompactionHandle>,
     manual_retry: Option<ManualRetryHandle>,
+    steer_inbox: Option<SteerInbox>,
     read_presentation_bytes: usize,
     write_projection_cache: Mutex<mode::WriteProjectionCache>,
     code_intel: Option<Arc<dyn CodeIntelligence>>,
@@ -266,6 +269,7 @@ impl Runtime {
             capability_bridge: None,
             compaction_handle: None,
             manual_retry: None,
+            steer_inbox: None,
             read_presentation_bytes: 64 * 1024,
             write_projection_cache: Mutex::new(mode::WriteProjectionCache::default()),
             code_intel: None,

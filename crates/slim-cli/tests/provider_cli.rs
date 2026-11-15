@@ -169,7 +169,8 @@ fn spawn_image_fixture(kind: ProviderKind, image_count: usize) -> (String, threa
             | ProviderKind::ClinePass
             | ProviderKind::CommandCode
             | ProviderKind::Xai
-            | ProviderKind::OpenDesign => {
+            | ProviderKind::OpenDesign
+            | ProviderKind::Devin => {
                 unreachable!("image fixture does not use this provider")
             }
         }
@@ -198,7 +199,8 @@ fn spawn_image_fixture(kind: ProviderKind, image_count: usize) -> (String, threa
             | ProviderKind::ClinePass
             | ProviderKind::CommandCode
             | ProviderKind::Xai
-            | ProviderKind::OpenDesign => {
+            | ProviderKind::OpenDesign
+            | ProviderKind::Devin => {
                 unreachable!("image fixture does not use this provider")
             }
         }
@@ -210,7 +212,7 @@ fn spawn_image_fixture(kind: ProviderKind, image_count: usize) -> (String, threa
         let events = match kind {
             ProviderKind::OpenAiCompatible => b"data: {\"choices\":[{\"delta\":{\"content\":\"image ok\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".as_slice(),
             ProviderKind::Anthropic => b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"image ok\"}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: [DONE]\n\n".as_slice(),
-            ProviderKind::OpenAiCodex | ProviderKind::OpenCodeGo | ProviderKind::OpenCodeZen | ProviderKind::ClinePass | ProviderKind::CommandCode | ProviderKind::Xai | ProviderKind::OpenDesign => {
+            ProviderKind::OpenAiCodex | ProviderKind::OpenCodeGo | ProviderKind::OpenCodeZen | ProviderKind::ClinePass | ProviderKind::CommandCode | ProviderKind::Xai | ProviderKind::OpenDesign | ProviderKind::Devin => {
                 unreachable!("image fixture does not use this provider")
             }
         };

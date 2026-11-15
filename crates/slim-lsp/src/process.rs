@@ -70,7 +70,8 @@ pub async fn capture_stderr_tail(
 fn push_tail(buf: &mut String, chunk: &str) {
     buf.push_str(chunk);
     if buf.len() > STDERR_TAIL_BYTES {
-        *buf = buf.split_off(tail_start(buf, STDERR_TAIL_BYTES));
+        // In place: `split_off` would allocate a new buffer on every chunk.
+        buf.drain(..tail_start(buf, STDERR_TAIL_BYTES));
     }
 }
 

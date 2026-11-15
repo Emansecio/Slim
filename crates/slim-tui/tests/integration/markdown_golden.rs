@@ -66,9 +66,10 @@ fn at_text_column(row: &str, needle: &str) -> bool {
     column_of(row, needle) == Some(TEXT_COLUMN)
 }
 
-/// The rule that closes an agent header: a hairline across the row.
-fn is_rule(row: &str) -> bool {
-    !row.trim().is_empty() && row.trim_matches('─').trim().is_empty()
+/// The rule that closes an agent header: a hairline from the label to the
+/// edge, on the label's own row.
+fn has_rule(row: &str) -> bool {
+    row.trim_end().ends_with("───")
 }
 
 fn caps() -> Capabilities {
@@ -140,13 +141,14 @@ fn render_state_with_caps(state: &AppState, width: u16, capabilities: Capabiliti
 }
 
 #[test]
-fn headings_hide_markers_and_keep_three_distinct_levels() {
+fn headings_hide_markers_and_stay_above_the_body_at_every_level() {
     let rendered = render("# Primary\n## Structure\n### Detail", 80);
     let text = rendered.text();
     assert!(!text.contains("# Primary"));
     assert!(!text.contains("## Structure"));
     assert!(!text.contains("### Detail"));
-    // Hierarchy comes from weight and underline on ivory, not from green.
+    // Hierarchy comes from weight and underline on ivory, not from green: no
+    // level is ever fainter than the prose it titles.
     let ivory = Color::Rgb(0xE8, 0xE5, 0xDB);
     let (h1, h1_modifiers) = rendered.word_style("Primary");
     let (h2, h2_modifiers) = rendered.word_style("Structure");
@@ -155,10 +157,10 @@ fn headings_hide_markers_and_keep_three_distinct_levels() {
     assert_eq!(h2, ivory);
     assert!(h2_modifiers.contains(Modifier::BOLD));
     assert!(!h2_modifiers.contains(Modifier::UNDERLINED));
-    assert_eq!(
-        rendered.word_style("Detail").0,
-        Color::Rgb(0xAF, 0xA9, 0x9D)
-    );
+    let (h3, h3_modifiers) = rendered.word_style("Detail");
+    assert_eq!(h3, ivory);
+    assert!(h3_modifiers.contains(Modifier::BOLD));
+    assert!(!h3_modifiers.contains(Modifier::UNDERLINED));
 }
 
 #[test]
@@ -228,9 +230,8 @@ fn long_blockquote_wraps_under_its_rail_and_measures_the_same() {
         Action::UiEventReceived(UiEvent::AssistantDelta { text: text.into() }),
     );
     let measured = HeightIndex::build(state.blocks(), 30, &mut WrapCache::default()).total_rows;
-    // A lone block also carries its blank row, the turn header and the rule
-    // that closes it.
-    assert_eq!(measured, rows.len() as u64 + 3, "{}", rendered.text());
+    // A lone block also carries its blank row and the turn header.
+    assert_eq!(measured, rows.len() as u64 + 2, "{}", rendered.text());
 }
 
 #[test]
@@ -255,14 +256,16 @@ fn quote_paragraphs_share_one_rail_separated_by_a_rail_only_row() {
 }
 
 #[test]
-fn inline_code_reads_by_tone_on_its_raised_surface_not_green() {
+fn inline_code_reads_as_a_chip_in_the_prose_tone_not_green() {
     let rendered = render("see `target\\debug` and more", 80);
-    let code = rendered.word_style("target").0;
-    // `tool_accent`: readable on near-black (10.7:1) and apart from prose,
-    // which the raised surface alone (1.14:1) does not set apart.
-    assert_eq!(code, Color::Rgb(0xBC, 0xB9, 0xAF));
-    assert_ne!(code, rendered.word_style("more").0);
-    assert_eq!(rendered.word_bg("target"), Color::Rgb(0x14, 0x14, 0x14));
+    // The prose's own ivory, so a path in a sentence is not a second voice;
+    // the chip is what sets it apart, one step above the fenced-code surface
+    // (which alone sits too close to the transcript).
+    assert_eq!(
+        rendered.word_style("target").0,
+        rendered.word_style("more").0
+    );
+    assert_eq!(rendered.word_bg("target"), Color::Rgb(0x29, 0x29, 0x28));
     assert_ne!(rendered.word_bg("more"), rendered.word_bg("target"));
 }
 
@@ -409,11 +412,11 @@ fn assistant_body_uses_role_label_and_foreground() {
                 .position(|row| row.contains("Slim"))
                 .expect("agent role");
             assert!(rendered.rows[label - 1].trim().is_empty());
-            assert!(is_rule(&rendered.rows[label + 1]), "{}", rendered.text());
-            assert!(rendered.rows[label + 2].contains("plain answer"));
+            assert!(has_rule(&rendered.rows[label]), "{}", rendered.text());
+            assert!(rendered.rows[label + 1].contains("plain answer"));
             assert_eq!(
                 HeightIndex::build(state.blocks(), 40, &mut WrapCache::default()).total_rows,
-                4
+                3
             );
             if color_depth == ColorDepth::TrueColor {
                 assert_eq!(rendered.word_style("plain").0, Color::Rgb(0xE8, 0xE5, 0xDB));
@@ -464,7 +467,7 @@ fn agent_header_shares_the_prompt_gutter_and_degrades_to_ascii() {
     let prompt = color
         .rows
         .iter()
-        .position(|row| row.contains("● Você"))
+        .position(|row| row.contains("● oi"))
         .expect("prompt");
     assert_eq!(
         column_of(&color.rows[header], "●"),
@@ -483,12 +486,8 @@ fn agent_header_shares_the_prompt_gutter_and_degrades_to_ascii() {
         .iter()
         .position(|row| row.contains("✓"))
         .expect("tool row");
-    assert_eq!(tool, header + 2, "{}", color.text());
-    assert!(
-        color.rows[header + 1].trim_start().starts_with('─'),
-        "{}",
-        color.text()
-    );
+    assert_eq!(tool, header + 1, "{}", color.text());
+    assert!(has_rule(&color.rows[header]), "{}", color.text());
     assert_eq!(
         column_of(&color.rows[tool], "✓"),
         column_of(&color.rows[header], "●"),
@@ -522,7 +521,7 @@ fn agent_header_shares_the_prompt_gutter_and_degrades_to_ascii() {
 }
 
 #[test]
-fn user_header_and_body_are_followed_by_one_blank_row() {
+fn user_prompt_starts_beside_its_marker_and_is_followed_by_one_blank_row() {
     let mut state = AppState::new();
     state.apply_event(UiEvent::UserMessageAdded {
         text: "question".into(),
@@ -532,11 +531,6 @@ fn user_header_and_body_are_followed_by_one_blank_row() {
     });
     state.apply_event(UiEvent::AssistantEnded);
     let rendered = render_state(&state, 80);
-    let you = rendered
-        .rows
-        .iter()
-        .position(|row| row.contains("Você"))
-        .expect("Você");
     let question = rendered
         .rows
         .iter()
@@ -547,21 +541,30 @@ fn user_header_and_body_are_followed_by_one_blank_row() {
         .iter()
         .position(|row| row.contains("answer"))
         .expect("answer");
-    assert_eq!(question, you + 1, "user header precedes the body");
+    // No label row: the marker and the band say whose words these are.
     assert!(
-        rendered.rows[you].starts_with("▏ ● Você"),
+        rendered.rows[question].starts_with("▏ ● question"),
         "{}",
         rendered.text()
     );
+    assert!(!rendered.text().contains("Você"), "{}", rendered.text());
     assert_eq!(
         column_of(&rendered.rows[question], "question"),
         Some(TEXT_COLUMN)
     );
     assert!(body(&rendered.rows[question + 1]).trim().is_empty());
     // One breathing row, the same whether the agent opens with prose or work.
-    assert_eq!(rendered.rows[question + 2].trim_end(), "▏ ● Slim");
-    assert!(is_rule(&rendered.rows[question + 3]), "{}", rendered.text());
-    assert_eq!(answer, question + 4);
+    assert!(
+        rendered.rows[question + 2].starts_with("▏ ● Slim ─"),
+        "{}",
+        rendered.text()
+    );
+    assert!(
+        has_rule(&rendered.rows[question + 2]),
+        "{}",
+        rendered.text()
+    );
+    assert_eq!(answer, question + 3);
     assert_eq!(
         column_of(&rendered.rows[answer], "answer"),
         Some(TEXT_COLUMN),
@@ -586,7 +589,7 @@ fn agent_turn_opens_with_one_header_above_thinking_and_prose() {
     let prompt = rendered
         .rows
         .iter()
-        .position(|row| row.contains("● Você"))
+        .position(|row| row.contains("● oi"))
         .expect("prompt");
     let header = rendered
         .rows
@@ -599,9 +602,9 @@ fn agent_turn_opens_with_one_header_above_thinking_and_prose() {
         .position(|row| row.contains("Pensou"))
         .expect("thought");
     // The header owns the work that precedes the first prose of the turn.
-    assert_eq!(header, prompt + 3, "{}", rendered.text());
-    assert!(is_rule(&rendered.rows[header + 1]), "{}", rendered.text());
-    assert_eq!(thought, header + 2, "{}", rendered.text());
+    assert_eq!(header, prompt + 2, "{}", rendered.text());
+    assert!(has_rule(&rendered.rows[header]), "{}", rendered.text());
+    assert_eq!(thought, header + 1, "{}", rendered.text());
     assert!(rendered.rows[thought + 1].trim().is_empty());
     assert_eq!(
         column_of(&rendered.rows[thought + 2], "Oi! Tudo certo?"),
@@ -622,7 +625,9 @@ fn role_header(row: &str) -> bool {
     // rail stands in the first cell.
     let trimmed = row.trim().trim_start_matches(RAIL).trim();
     ["●", "■", "✕"].iter().any(|marker| {
-        trimmed == format!("{marker} Slim") || trimmed.starts_with(&format!("{marker} Slim ·"))
+        trimmed == format!("{marker} Slim")
+            || trimmed.starts_with(&format!("{marker} Slim ─"))
+            || trimmed.starts_with(&format!("{marker} Slim ·"))
     })
 }
 
@@ -792,7 +797,7 @@ fn user_marker_settles_without_changing_the_label_or_layout() {
     // step per motion frame, without ever changing weight.
     assert_eq!(recent.word_style("●").0, Color::Rgb(0xE1, 0xE0, 0xDB));
     assert!(!recent.word_style("●").1.contains(Modifier::BOLD));
-    assert!(!recent.word_style("Você").1.contains(Modifier::BOLD));
+    assert!(!recent.word_style("mensagem").1.contains(Modifier::BOLD));
     for (elapsed_ms, lifted) in [
         (83, Color::Rgb(0xD0, 0xCE, 0xC7)),
         (166, Color::Rgb(0xC4, 0xC1, 0xB9)),
@@ -817,7 +822,10 @@ fn user_marker_settles_without_changing_the_label_or_layout() {
     state.clock.elapsed_ms = 1000;
     let settled = render_state(&state, 80);
     assert_eq!(recent.rows, settled.rows);
-    assert_eq!(recent.word_style("Você"), settled.word_style("Você"));
+    assert_eq!(
+        recent.word_style("mensagem"),
+        settled.word_style("mensagem")
+    );
     assert!(settled.word_style("●").1.contains(Modifier::DIM));
     assert!(!settled.word_style("●").1.contains(Modifier::BOLD));
     let plain = render_state_with_caps(
@@ -830,7 +838,7 @@ fn user_marker_settles_without_changing_the_label_or_layout() {
     );
     // Without color the band is gone, so the prompt takes the composer's
     // chevron while the agent keeps its dot.
-    assert!(plain.text().contains("| > Você"));
+    assert!(plain.text().contains("| > mensagem"));
     assert_eq!(plain.word_style(">").0, Color::Reset);
 }
 
@@ -844,16 +852,17 @@ fn user_wrapping_keeps_body_alignment_and_measured_height() {
         let header = rendered
             .rows
             .iter()
-            .position(|row| row.contains("Você"))
+            .position(|row| row.contains('●'))
             .unwrap();
-        let body: Vec<_> = rendered.rows[header + 1..]
+        // The first row of the prompt sits beside the marker.
+        let body: Vec<_> = rendered.rows[header..]
             .iter()
             .take_while(|row| !body(row).trim().is_empty())
             .collect();
         assert!(body.len() > 1);
         for row in &body {
             assert_eq!(
-                column_of(row, row.trim_start_matches(['▏', ' '])),
+                column_of(row, row.trim_start_matches(['▏', ' ', '●'])),
                 Some(TEXT_COLUMN),
                 "{row:?}"
             );
@@ -862,12 +871,12 @@ fn user_wrapping_keeps_body_alignment_and_measured_height() {
             body.iter()
                 .map(|row| row[4..].trim_end())
                 .collect::<String>()
-                .replace(' ', ""),
+                .replace(['●', ' '], ""),
             text.replace(' ', "")
         );
         assert_eq!(
             HeightIndex::build(state.blocks(), width, &mut WrapCache::default()).total_rows,
-            body.len() as u64 + 2
+            body.len() as u64 + 1
         );
     }
 }
@@ -884,7 +893,7 @@ fn user_prompt_sits_on_a_raised_full_width_band() {
     state.apply_event(UiEvent::AssistantEnded);
     let rendered = render_state(&state, 80);
     let band = Color::Rgb(0x14, 0x14, 0x14);
-    assert_eq!(rendered.word_bg("Você"), band);
+    assert_eq!(rendered.word_bg("●"), band);
     assert_eq!(rendered.word_bg("question"), band);
     assert_eq!(rendered.word_bg("answer"), Color::Rgb(0, 0, 0));
     // The band fills the row, not only the painted text.
