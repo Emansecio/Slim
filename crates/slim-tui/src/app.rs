@@ -2986,7 +2986,9 @@ impl AppState {
     pub fn apply_event(&mut self, event: UiEvent) {
         if matches!(
             event,
-            UiEvent::ToolEnded { .. } | UiEvent::WorkspaceChanged { .. }
+            UiEvent::ToolEnded { .. }
+                | UiEvent::ToolStepEnded { .. }
+                | UiEvent::WorkspaceChanged { .. }
         ) {
             self.workspace_files_stale = true;
         }
@@ -4083,6 +4085,37 @@ impl AppState {
                     self.lifecycle_anomaly("Diff órfão do ciclo de vida da ferramenta ignorado");
                 }
                 self.revisions.content += 1;
+            }
+            UiEvent::ToolStepEnded {
+                batch_id,
+                call_id,
+                name,
+                success,
+                duration_ms,
+                output,
+                diff,
+            } => {
+                self.apply_event_inner(UiEvent::ToolOutput {
+                    batch_id: batch_id.clone(),
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    output,
+                    content_handle: None,
+                });
+                if let Some(diff) = diff {
+                    self.apply_event_inner(UiEvent::ToolDiff {
+                        batch_id: batch_id.clone(),
+                        call_id: call_id.clone(),
+                        diff,
+                    });
+                }
+                self.apply_event_inner(UiEvent::ToolEnded {
+                    batch_id,
+                    call_id,
+                    name,
+                    success,
+                    duration_ms,
+                });
             }
             UiEvent::ToolEnded {
                 batch_id,

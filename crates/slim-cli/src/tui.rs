@@ -5419,6 +5419,26 @@ fn namespace_projected_ids(event: UiEvent, scope: &str) -> UiEvent {
                 duration_ms,
             }
         }
+        UiEvent::ToolStepEnded {
+            batch_id,
+            call_id,
+            name,
+            success,
+            duration_ms,
+            output,
+            diff,
+        } => {
+            let (batch_id, call_id) = identity(batch_id, call_id);
+            UiEvent::ToolStepEnded {
+                batch_id,
+                call_id,
+                name,
+                success,
+                duration_ms,
+                output,
+                diff,
+            }
+        }
         UiEvent::ApprovalRequired {
             request_id,
             summary,

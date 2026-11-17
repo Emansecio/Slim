@@ -105,6 +105,26 @@ pub fn summarize_tool_arguments_for(name: &str, arguments: &str) -> String {
             _ => summarize_tool_arguments(arguments),
         };
     }
+    if name == "codemode" {
+        // The row target is the program's first statement, past comments.
+        if let Some(code) = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .as_ref()
+            .and_then(|value| value.get("code"))
+            .and_then(Value::as_str)
+        {
+            let statements = code
+                .lines()
+                .skip_while(|line| {
+                    let line = line.trim();
+                    line.is_empty() || line.starts_with("//")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            return bound_argument_summary(&statements);
+        }
+        return summarize_tool_arguments(arguments);
+    }
     if name == "search" {
         // The row target is the searched text, not the scope (TUI spec §11.4).
         return summarize_search_arguments(arguments)
@@ -2181,6 +2201,24 @@ mod argument_summary_tests {
         assert_eq!(
             summarize_tool_arguments_for("read", r#"{"path":"src/lib.rs\n"}"#),
             "path=src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn codemode_summary_is_the_first_statement_past_comments() {
+        let code = "\n// gather the files\nconst files = await slim.list({});\nreturn files;";
+        assert_eq!(
+            summarize_tool_arguments_for("codemode", &json!({ "code": code }).to_string()),
+            "const files = await slim.list({});…"
+        );
+        assert_eq!(
+            summarize_tool_arguments_for("codemode", &json!({"code": "return 1"}).to_string()),
+            "return 1"
+        );
+        assert_eq!(summarize_tool_arguments_for("codemode", "{}"), "");
+        assert_eq!(
+            summarize_tool_arguments_for("codemode", &json!({"code": "// only"}).to_string()),
+            ""
         );
     }
 

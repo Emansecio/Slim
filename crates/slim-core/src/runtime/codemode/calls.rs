@@ -1,12 +1,14 @@
 //! Lifecycle of one internal call: admission when the program asks for it,
 //! start when the scheduler admits it (budget, run guards, task, journal,
-//! progress) and settlement when it finishes.
+//! step event) and settlement when it finishes.
 
 use super::*;
 use dispatch::{Done, Finished, Job, Running, Target};
 
 /// Bytes of a failed native output kept in the journal.
 pub(super) const MAX_JOURNALED_ERROR_BYTES: usize = 1024;
+/// Output a step event carries for display; the program gets all of it.
+const MAX_STEP_OUTPUT_BYTES: usize = 16 * 1024;
 /// Characters of an unawaited failure kept in the result's note.
 const MAX_NOTE_ERROR_CHARS: usize = 200;
 
@@ -104,7 +106,7 @@ impl Runtime {
     }
 
     /// Starts every queued call the scheduler admits: budget and run guards,
-    /// then its task, then the `started` fact and progress, so a journal
+    /// then its task, then the `started` fact and step event, so a journal
     /// failure never spends budget on a call that does not run.
     pub(super) fn start_ready_calls(
         &mut self,
@@ -150,17 +152,23 @@ impl Runtime {
             let started = json!({
                 "parent_call_id": scope.parent.call_id, "name": job.name, "status": "started", "arguments": arguments,
             });
-            let preview = format!("{} — running", job.name);
+            let step = crate::EventKind::ToolStepStarted {
+                batch_id: scope.parent.batch_id.into(),
+                call_id: scope.parent.call_id.into(),
+                step_id: id.clone(),
+                name: job.name.clone(),
+                arguments: self.redact_sensitive(&arguments.to_string()),
+            };
             state.calls.spawn(id.clone(), job);
             self.persist_codemode_fact(CALL_NAMESPACE, &id, started)?;
-            self.codemode_progress(scope.parent, seq, &preview)?;
+            push_runtime_event(&mut self.app, seq, step)?;
         }
         Ok(())
     }
 
     /// Settles a finished call: redaction, the bridge limit, run guards and
     /// language-server sync, the program's promise, then the artifact, the
-    /// terminal fact and progress. The promise settles even when the
+    /// terminal fact and step event. The promise settles even when the
     /// journal fails.
     pub(super) async fn finish_call(
         &mut self,
@@ -176,6 +184,7 @@ impl Runtime {
             "duration_ms": elapsed_millis(running.started),
         });
         let mut artifact = None;
+        let mut diff = None;
         let (status, response) = match finished {
             Ok(Finished::Mcp(outcome)) => {
                 let (status, response) = self.mcp_response(outcome, cell, state);
@@ -187,8 +196,9 @@ impl Runtime {
                 (status, response)
             }
             Ok(Finished::Native(outcome)) => {
-                let (status, response, result) =
+                let (status, response, result, edit_diff) =
                     self.native_response(scope, &running, *outcome).await;
+                diff = edit_diff;
                 match &response {
                     Ok(output) => {
                         fact["result"] =
@@ -217,12 +227,22 @@ impl Runtime {
                 error.chars().take(MAX_NOTE_ERROR_CHARS).collect::<String>()
             ));
         }
+        let step = crate::EventKind::ToolStepFinished {
+            batch_id: scope.parent.batch_id.into(),
+            call_id: scope.parent.call_id.into(),
+            step_id: running.id.clone(),
+            name: running.name.clone(),
+            success: status == "completed" && response.is_ok(),
+            duration_ms: elapsed_millis(running.started),
+            output: step_output(&response),
+            diff,
+        };
         cell.settle(running.ticket, response);
         if let Some(result) = &artifact {
             self.record_existing_artifact(result, seq)?;
         }
         self.persist_codemode_fact(CALL_NAMESPACE, &running.id, fact)?;
-        self.codemode_progress(scope.parent, seq, &format!("{} — {status}", running.name))
+        push_runtime_event(&mut self.app, seq, step)
     }
 
     fn mcp_response(
@@ -267,14 +287,19 @@ impl Runtime {
         }
     }
 
-    /// The program's view of a native outcome, and the result whose artifact
-    /// the caller records.
+    /// The program's view of a native outcome, the result whose artifact
+    /// the caller records and the redacted edit diff for display.
     async fn native_response(
         &mut self,
         scope: &CellScope<'_>,
         running: &Running,
         outcome: ToolExecutionOutcome,
-    ) -> (&'static str, Result<Value, String>, ToolResult) {
+    ) -> (
+        &'static str,
+        Result<Value, String>,
+        ToolResult,
+        Option<crate::ToolEditDiff>,
+    ) {
         let mut output = self.redact_sensitive(&outcome.result.output);
         // The program, not the model, receives the output: nothing counts
         // as already read, and a hold is not remembered as a provider call.
@@ -315,27 +340,23 @@ impl Runtime {
         } else {
             Err(output)
         };
-        (status, response, outcome.result)
+        let diff = outcome
+            .result
+            .success
+            .then(|| self.redacted_edit_diff(outcome.receipt.edit_diff.as_ref()))
+            .flatten();
+        (status, response, outcome.result, diff)
     }
+}
 
-    pub(super) fn codemode_progress(
-        &mut self,
-        parent: ToolInvocation<'_>,
-        seq: &mut u64,
-        preview: &str,
-    ) -> Result<(), ProviderError> {
-        let preview = self.redact_sensitive(preview);
-        push_runtime_event(
-            &mut self.app,
-            seq,
-            crate::EventKind::ToolProgress {
-                batch_id: parent.batch_id.into(),
-                call_id: parent.call_id.into(),
-                name: parent.name.into(),
-                preview,
-            },
-        )
-    }
+/// What a step shows: the result text (an MCP result as compact JSON) or
+/// the error, bounded. Both are already redacted.
+fn step_output(response: &Result<Value, String>) -> String {
+    let text = match response {
+        Ok(Value::String(text)) | Err(text) => std::borrow::Cow::Borrowed(text.as_str()),
+        Ok(value) => std::borrow::Cow::Owned(value.to_string()),
+    };
+    prefix(&text, MAX_STEP_OUTPUT_BYTES).to_owned()
 }
 
 /// Refuses the arguments a program cannot use (see `build_native_definitions`).

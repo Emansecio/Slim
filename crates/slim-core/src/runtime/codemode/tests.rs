@@ -892,3 +892,74 @@ async fn native_failures_are_journaled_with_size_and_a_bounded_prefix() {
     assert_eq!((cut.len(), long.len()), (1024, 2000));
     assert_eq!(calls::prefix("ab€", 3), "ab");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_internal_call_is_shown_as_a_step_of_the_cell() {
+    let workspace = Workspace::new("steps");
+    std::fs::write(workspace.0.join("f.txt"), "x=0\n").unwrap();
+    let mut runtime = Runtime::new();
+    runtime.codemode.remaining_calls = 4;
+    eval_in(
+        &mut runtime,
+        crate::OperatingMode::Code,
+        &workspace.0,
+        r#"
+        await slim.patch({path: 'f.txt', edits: [{expected: 'x=0', replacement: 'x=1'}]});
+        try { await slim.read({path: 'missing.txt'}); } catch (error) {}
+        return 'ok';
+        "#,
+    )
+    .await
+    .unwrap();
+    let mut started = Vec::new();
+    let mut finished = Vec::new();
+    for event in runtime.app.events() {
+        match &event.kind {
+            crate::EventKind::ToolStepStarted {
+                batch_id,
+                call_id,
+                step_id,
+                name,
+                arguments,
+            } => {
+                assert_eq!((batch_id.as_str(), call_id.as_str()), ("cell", "code"));
+                started.push((step_id.clone(), name.clone(), arguments.clone()));
+            }
+            crate::EventKind::ToolStepFinished {
+                step_id,
+                name,
+                success,
+                output,
+                diff,
+                ..
+            } => finished.push((
+                step_id.clone(),
+                name.clone(),
+                *success,
+                output.clone(),
+                diff.clone(),
+            )),
+            _ => {}
+        }
+    }
+    assert_eq!(started.len(), 2, "{started:?}");
+    assert_eq!(started[0].1, "slim.patch");
+    assert!(
+        started[0].2.contains("\"path\":\"f.txt\""),
+        "{}",
+        started[0].2
+    );
+    assert_eq!(started[1].1, "slim.read");
+    assert_eq!(finished.len(), 2);
+    let (patch_id, _, patched, _, diff) = &finished[0];
+    assert_eq!(
+        patch_id, &started[0].0,
+        "a step ends under the id it started"
+    );
+    assert!(*patched);
+    assert_eq!(diff.as_ref().map(|diff| diff.path.as_str()), Some("f.txt"));
+    let (_, name, read, output, diff) = &finished[1];
+    assert_eq!(name, "slim.read");
+    assert!(!read && diff.is_none());
+    assert!(output.contains("missing.txt"), "{output}");
+}

@@ -292,6 +292,34 @@ pub enum EventKind {
         #[serde(default)]
         duration_ms: u64,
     },
+    /// One call a `codemode` program made (`slim.<tool>` or
+    /// `mcp.<server>.<tool>`), nested under the codemode call it belongs to.
+    /// Display only: steps are not provider tool calls, so they never reach
+    /// the durable session, the usage totals or the provider conversation.
+    ToolStepStarted {
+        batch_id: String,
+        /// The codemode call.
+        call_id: String,
+        /// Unique within the session.
+        step_id: String,
+        /// As the program named it.
+        name: String,
+        /// Redacted JSON arguments.
+        arguments: String,
+    },
+    /// Outcome of a [`EventKind::ToolStepStarted`] step. `output` is the
+    /// redacted result (or error), bounded; `diff` is the edit a successful
+    /// `slim.patch` applied.
+    ToolStepFinished {
+        batch_id: String,
+        call_id: String,
+        step_id: String,
+        name: String,
+        success: bool,
+        duration_ms: u64,
+        output: String,
+        diff: Option<ToolEditDiff>,
+    },
     ToolEvidenceReused {
         #[serde(default)]
         original_bytes: u64,

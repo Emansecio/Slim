@@ -1225,6 +1225,14 @@ status, descrição e instruções. Em Code, `describeTool` inclui `signature` e
 TypeScript (o retorno vem de `outputSchema`, ou `unknown`) e também descreve
 `slim.<nome>`. Não há helpers de recursos (`resources`/`uri` são só do gateway).
 
+**Exibição.** Cada chamada interna emite `ToolStepStarted` (nome e argumentos
+redigidos) e `ToolStepFinished` (sucesso, duração, até 16 KiB da saída ou do
+erro e, em `write`/`patch` bem-sucedidos, o diff) com o `batch_id`/`call_id` da
+célula. São eventos só de exibição: não entram no journal manual, na contagem de
+tools do usage nem na conversa do provider, e uma sessão retomada mostra a
+célula sem as rows de cada chamada (o journal `codemode.call.v1` continua a
+fonte durável).
+
 **Console.** `console.log/info/warn/error` são capturados (`warn:`/`error:`
 como prefixo; objetos em JSON) até 16 KiB por célula; o excedente é contado
 numa linha final de truncamento. A captura vem depois do resultado ou do erro,

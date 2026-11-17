@@ -299,6 +299,18 @@ fn tool_phrase(names: &[&str], completed: bool) -> String {
             });
             continue;
         }
+        if name == "codemode" {
+            // The program leads: the calls beside it are the ones it made.
+            parts.insert(
+                0,
+                if count == 1 && !completed {
+                    "Executando programa".into()
+                } else {
+                    tally(count, "programa", "programas")
+                },
+            );
+            continue;
+        }
         let name = safe(name);
         if count == 1 {
             parts.push(name);
@@ -341,6 +353,7 @@ pub(crate) fn tool_title(name: &str, lifecycle: BlockLifecycle) -> String {
         "shell" => ("Executando", "Executou"),
         "code_intel" => ("Analisando", "Analisou"),
         "shell_job" => ("Consultando job", "Consultou job"),
+        "codemode" => ("Executando programa", "Executou programa"),
         _ => return name.to_owned(),
     };
     if settled { verb.1 } else { verb.0 }.to_owned()
@@ -438,6 +451,7 @@ fn preparation_label(name: &str) -> String {
         "search" => "busca",
         "write" | "patch" => "edição",
         "shell" => "comando",
+        "codemode" => "programa",
         other => other,
     };
     format!("Preparando {}", safe(action))
@@ -1013,6 +1027,10 @@ mod minimal_footer_tests {
             "1 leitura, list, code_intel"
         );
         assert_eq!(completed_tool_phrase(&["patch", "patch"]), "2 edições");
+        assert_eq!(
+            completed_tool_phrase(&["codemode", "read", "patch", "read"]),
+            "1 programa, 2 leituras, 1 edição"
+        );
         assert_eq!(completed_tool_phrase(&["shell", "shell"]), "2 comandos");
     }
 

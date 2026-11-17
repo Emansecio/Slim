@@ -1189,3 +1189,89 @@ fn text_arriving_while_the_call_is_written_does_not_bounce_the_phase() {
         rendered.rows.join("\n")
     );
 }
+
+#[test]
+fn a_program_shows_each_call_it_made_with_its_verb_and_diff() {
+    let mut state = connected();
+    state.mode = OperatingMode::Code;
+    let batch = ToolBatchId("b-code".into());
+    let started = |state: &mut AppState, id: &str, name: &str, summary: &str| {
+        state.apply_event(UiEvent::ToolStarted {
+            batch_id: batch.clone(),
+            call_id: ToolCallId(id.into()),
+            name: name.into(),
+            arguments_summary: summary.into(),
+        });
+    };
+    started(
+        &mut state,
+        "code",
+        "codemode",
+        "const files = await slim.list({});…",
+    );
+    started(&mut state, "code:1", "read", "src/a.rs");
+    state.apply_event(UiEvent::ToolStepEnded {
+        batch_id: batch.clone(),
+        call_id: ToolCallId("code:1".into()),
+        name: "read".into(),
+        success: true,
+        duration_ms: 2,
+        output: "fn a() {}".into(),
+        diff: None,
+    });
+    started(&mut state, "code:2", "patch", "src/a.rs · +1 -1");
+    state.apply_event(UiEvent::ToolStepEnded {
+        batch_id: batch.clone(),
+        call_id: ToolCallId("code:2".into()),
+        name: "patch".into(),
+        success: true,
+        duration_ms: 4,
+        output: "patched".into(),
+        diff: Some(slim_core::ToolEditDiff {
+            path: "src/a.rs".into(),
+            hunks: vec![slim_core::ToolEditHunk {
+                start_line: 1,
+                removed: vec!["fn a() {}".into()],
+                added: vec!["fn a() -> u8 { 1 }".into()],
+            }],
+            truncated: false,
+        }),
+    });
+    state.apply_event(UiEvent::ToolEnded {
+        batch_id: batch.clone(),
+        call_id: ToolCallId("code".into()),
+        name: "codemode".into(),
+        success: true,
+        duration_ms: 9,
+    });
+    let screen = render(&state, 80, ColorDepth::TrueColor).rows.join("\n");
+    assert!(
+        screen.contains("✓ 1 programa, 1 leitura, 1 edição"),
+        "a settled program folds its calls under one tally\n{screen}"
+    );
+    let program = state
+        .blocks()
+        .iter()
+        .find(|block| matches!(block.kind(), BlockKind::Tool(tool) if tool.name == "codemode"))
+        .expect("program row")
+        .id
+        .clone();
+    reduce(&mut state, Action::ToggleBlock(program));
+    let screen = render(&state, 80, ColorDepth::TrueColor).rows.join("\n");
+    assert!(screen.contains("Executou programa"), "{screen}");
+    assert!(screen.contains("Leu src/a.rs"), "{screen}");
+    assert!(screen.contains("Editou src/a.rs"), "{screen}");
+    let edit = state
+        .blocks()
+        .iter()
+        .find(|block| matches!(block.kind(), BlockKind::Tool(tool) if tool.name == "patch"))
+        .expect("edit row")
+        .id
+        .clone();
+    reduce(&mut state, Action::ToggleBlock(edit));
+    let screen = render(&state, 80, ColorDepth::TrueColor).rows.join("\n");
+    assert!(
+        screen.contains("fn a() -> u8 { 1 }"),
+        "the edit opens on its diff\n{screen}"
+    );
+}

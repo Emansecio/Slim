@@ -635,6 +635,18 @@ pub enum UiEvent {
         success: bool,
         duration_ms: u64,
     },
+    /// End of one call a `codemode` program made. Its row opened with
+    /// `ToolStarted`; the state applies this as that row's `ToolOutput`,
+    /// `ToolDiff` (when an edit applied) and `ToolEnded`.
+    ToolStepEnded {
+        batch_id: ToolBatchId,
+        call_id: ToolCallId,
+        name: String,
+        success: bool,
+        duration_ms: u64,
+        output: String,
+        diff: Option<slim_core::ToolEditDiff>,
+    },
     QueuedUserAdded {
         text: String,
         position: usize,
@@ -867,6 +879,7 @@ impl UiEvent {
                     | Self::ToolAdmitted { .. }
                     | Self::ToolOutput { .. }
                     | Self::ToolEnded { .. }
+                    | Self::ToolStepEnded { .. }
                     | Self::ApprovalRequired { .. }
                     | Self::InputRequired { .. }
                     | Self::QuestionRequired { .. }
@@ -968,19 +981,52 @@ impl UiEvent {
                 arguments,
             } => {
                 let (batch_id, call_id) = projected_tool_identity(request_id, 0, batch_id, call_id);
-                let mut arguments_summary =
-                    slim_core::tools::summarize_tool_arguments_for(&name, &arguments);
-                // Edit size travels as one more summary segment; the tool
-                // row styles it (see `edit_stats_segment`).
-                if let Some((added, removed)) = slim_core::tools::edit_line_stats(&name, &arguments)
-                {
-                    arguments_summary.push_str(&format!(" · +{added} -{removed}"));
-                }
+                let arguments_summary = tool_arguments_summary(&name, &arguments);
                 Some(Self::ToolStarted {
                     batch_id,
                     call_id,
                     name,
                     arguments_summary,
+                })
+            }
+            // A codemode step is a row of its own, read like the tool it
+            // called: `slim.read` as `read`, `mcp.server.tool` as `mcp`.
+            slim_core::EventKind::ToolStepStarted {
+                batch_id,
+                step_id,
+                name,
+                arguments,
+                ..
+            } => {
+                let (batch_id, call_id) = projected_tool_identity(request_id, 0, batch_id, step_id);
+                let (name, arguments_summary) = codemode_step_row(&name, &arguments);
+                Some(Self::ToolStarted {
+                    batch_id,
+                    call_id,
+                    name,
+                    arguments_summary,
+                })
+            }
+            slim_core::EventKind::ToolStepFinished {
+                batch_id,
+                step_id,
+                name,
+                success,
+                duration_ms,
+                output,
+                diff,
+                ..
+            } => {
+                let (batch_id, call_id) = projected_tool_identity(request_id, 1, batch_id, step_id);
+                let name = codemode_step_tool(&name).to_owned();
+                Some(Self::ToolStepEnded {
+                    batch_id,
+                    call_id,
+                    output: tool_output_preview(&name, &output),
+                    name,
+                    success,
+                    duration_ms,
+                    diff,
                 })
             }
             slim_core::EventKind::ToolPrepared {
@@ -1230,6 +1276,39 @@ impl UiEvent {
             }),
         }
     }
+}
+
+/// Row target of a tool call: its argument summary, plus the edit size as
+/// one more segment the row styles (see `edit_stats_segment`).
+fn tool_arguments_summary(name: &str, arguments: &str) -> String {
+    let mut summary = slim_core::tools::summarize_tool_arguments_for(name, arguments);
+    if let Some((added, removed)) = slim_core::tools::edit_line_stats(name, arguments) {
+        summary.push_str(&format!(" · +{added} -{removed}"));
+    }
+    summary
+}
+
+/// The tool a codemode step's row is named after.
+fn codemode_step_tool(name: &str) -> &str {
+    if let Some(native) = name.strip_prefix("slim.") {
+        native
+    } else if name.starts_with("mcp.") {
+        "mcp"
+    } else {
+        name
+    }
+}
+
+/// Name and target of a codemode step's row: a native call keeps its
+/// tool's summary; an MCP call shows `server.tool`, like the gateway.
+fn codemode_step_row(name: &str, arguments: &str) -> (String, String) {
+    let tool = codemode_step_tool(name);
+    let summary = match name.strip_prefix("mcp.") {
+        // `server.tool` is not JSON: the summary bounds it as plain text.
+        Some(target) => slim_core::tools::summarize_tool_arguments(target),
+        None => tool_arguments_summary(tool, arguments),
+    };
+    (tool.to_owned(), summary)
 }
 
 fn projected_tool_identity(
@@ -1831,6 +1910,7 @@ impl UiEvent {
                 | Self::SessionTitleChanged { .. }
                 | Self::RestoreDraft { .. }
                 | Self::ToolEnded { .. }
+                | Self::ToolStepEnded { .. }
                 | Self::ActivityChanged { .. }
                 | Self::ProviderPhaseChanged { .. }
                 | Self::RetryScheduled { .. }
@@ -1886,6 +1966,76 @@ mod tests {
                 arguments_summary: String::new(),
             })
         );
+    }
+
+    #[test]
+    fn codemode_steps_project_as_rows_of_the_tool_they_called() {
+        let step = |name: &str, arguments: &str| {
+            UiEvent::from_core(SessionEvent::new(
+                5,
+                EventKind::ToolStepStarted {
+                    batch_id: "batch-1".into(),
+                    call_id: "code".into(),
+                    step_id: "code:1".into(),
+                    name: name.into(),
+                    arguments: arguments.into(),
+                },
+            ))
+        };
+        let Some(UiEvent::ToolStarted {
+            batch_id,
+            call_id,
+            name,
+            arguments_summary,
+        }) = step("slim.read", r#"{"path":"src/a.rs"}"#)
+        else {
+            panic!("a native step starts a row");
+        };
+        assert_eq!(batch_id, ToolBatchId("batch-1".into()));
+        assert_eq!(call_id, ToolCallId("code:1".into()));
+        assert_eq!(name, "read");
+        assert!(
+            arguments_summary.contains("src/a.rs"),
+            "{arguments_summary}"
+        );
+
+        let Some(UiEvent::ToolStarted {
+            name,
+            arguments_summary,
+            ..
+        }) = step("mcp.github.search_issues", r#"{"q":"x"}"#)
+        else {
+            panic!("an MCP step starts a row");
+        };
+        assert_eq!(
+            (name.as_str(), arguments_summary.as_str()),
+            ("mcp", "github.search_issues")
+        );
+
+        let ended = UiEvent::from_core(SessionEvent::new(
+            6,
+            EventKind::ToolStepFinished {
+                batch_id: "batch-1".into(),
+                call_id: "code".into(),
+                step_id: "code:1".into(),
+                name: "slim.read".into(),
+                success: false,
+                duration_ms: 3,
+                output: "missing".into(),
+                diff: None,
+            },
+        ));
+        let Some(UiEvent::ToolStepEnded {
+            call_id,
+            name,
+            success,
+            ..
+        }) = ended
+        else {
+            panic!("a step ends its row");
+        };
+        assert_eq!(call_id, ToolCallId("code:1".into()));
+        assert_eq!((name.as_str(), success), ("read", false));
     }
 
     #[test]
