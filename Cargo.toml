@@ -55,7 +55,10 @@ single_char_pattern = "deny"
 [profile.release]
 opt-level = 3
 lto = "thin"
-codegen-units = 1
+# Codegen parallel: with codegen-units = 1 every crate ran its codegen in one job and the cold release build
+# took 125.7 s here (8 cores, 4 jobs). With 8 units it takes 93.8 s, with the same total CPU: the gain is
+# parallelism, not extra work. Thin LTO still optimizes across the units; the final link stays one unit (~45 s).
+codegen-units = 8
 strip = true
 
 # Same reasoning as the dependencies below, for the crates that change: in the

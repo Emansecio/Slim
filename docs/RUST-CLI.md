@@ -525,7 +525,8 @@ afirmar que o Slim “protegeu” uma operação que foi executada irrestritamen
 
 #### Solo (v1) e Fusion histórico
 
-Mode seleciona `Plan`, `Read-only` ou `Auto`. Auto não possui permission engine;
+Mode seleciona `Plan`, `Read-only`, `Auto` ou `Code`. Auto não possui permission
+engine; Code tem o mesmo acesso de Auto, exercido por programas `codemode`;
 Plan/Read-only usam catálogos fixos sem mutação. Fusion é referência histórica e
 não é planejado.
 

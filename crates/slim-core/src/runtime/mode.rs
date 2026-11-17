@@ -5,6 +5,7 @@ pub fn mode_name(mode: crate::OperatingMode) -> &'static str {
         crate::OperatingMode::Auto => "Auto",
         crate::OperatingMode::ReadOnly => "Read-only",
         crate::OperatingMode::Plan => "Plan",
+        crate::OperatingMode::Code => "Code",
     }
 }
 
@@ -341,6 +342,12 @@ pub(super) fn channel_stanza(mode: crate::OperatingMode, can_ask: bool) -> &'sta
         (crate::OperatingMode::Auto, false) => {
             concat!("\n\nHarness channel: Auto, unattended. No interactive pause (ask_question is not available). Take the most reasonable reading and finish the work. Skip only irreversible loss of data the request does not cover, production or external writes it does not cover, and exposing secrets; report what you skipped and why.", shell_note!())
         }
+        (crate::OperatingMode::Code, true) => {
+            concat!("\n\nHarness channel: Code, interactive. Full access, exercised through programs: each step is one codemode call whose JavaScript reads, searches, edits, runs shell and calls MCP tools, loops, branches and runs independent calls in parallel with Promise.all, then returns only the distilled result. Use ask_question only before irreversible loss of data the request does not cover, production or external writes it does not cover, exposing secrets, or a material decision the request and code cannot settle.", shell_note!())
+        }
+        (crate::OperatingMode::Code, false) => {
+            concat!("\n\nHarness channel: Code, unattended. Full access, exercised through programs: each step is one codemode call whose JavaScript reads, searches, edits, runs shell and calls MCP tools, loops, branches and runs independent calls in parallel with Promise.all, then returns only the distilled result. No interactive pause (ask_question is not available). Skip only irreversible loss of data the request does not cover, production or external writes it does not cover, and exposing secrets; report what you skipped and why.", shell_note!())
+        }
         (crate::OperatingMode::Plan, _) => {
             "\n\nHarness channel: Plan. Inspect and report only. Workspace mutations, shell, todo, skill and ask_question are not available."
         }
@@ -351,6 +358,24 @@ pub(super) fn channel_stanza(mode: crate::OperatingMode, can_ask: bool) -> &'sta
             "\n\nHarness channel: Read-only. Inspect without mutating the workspace. write, patch, shell, todo, skill and ask_question are not available."
         }
     }
+}
+
+/// Code mode advertises only these tools: the program runner and the meta
+/// tools whose result belongs to the conversation (a question, the visible
+/// plan, skill instructions, a stored artifact). Workspace and MCP tools are
+/// reached from a `codemode` program, which calls the registry itself.
+const CODE_MODE_DIRECT_TOOLS: [&str; 5] =
+    ["codemode", "artifact_read", "ask_question", "todo", "skill"];
+
+/// Refusal for a provider call that Code mode does not accept directly.
+/// `None` in every other mode and for the tools Code mode advertises.
+pub(super) fn code_mode_direct_refusal(mode: crate::OperatingMode, name: &str) -> Option<String> {
+    (mode == crate::OperatingMode::Code && !CODE_MODE_DIRECT_TOOLS.contains(&name)).then(|| {
+        format!(
+            "{} is not callable directly in Code mode; call it from a codemode program: slim.<tool>(args) for native tools, tools.call('mcp.server.tool', args) for MCP",
+            name.chars().take(64).collect::<String>()
+        )
+    })
 }
 
 #[cfg(test)]
@@ -756,5 +781,60 @@ mod tests {
         assert!(readonly.contains("Read-only, interactive"));
         assert!(readonly.contains("Use ask_question"));
         assert!(!channel_stanza(OperatingMode::ReadOnly, false).contains("Use ask_question"));
+    }
+
+    #[test]
+    fn code_stanza_steers_to_codemode_and_matches_advertised_ask_question() {
+        let interactive = channel_stanza(OperatingMode::Code, true);
+        let unattended = channel_stanza(OperatingMode::Code, false);
+        for stanza in [interactive, unattended] {
+            assert!(stanza.starts_with(CHANNEL_MARKER));
+            assert!(stanza.contains("codemode"));
+            assert!(stanza.contains("Promise.all"));
+            assert!(stanza.ends_with(shell_note!()));
+            assert!(!stanza.contains("Auto"));
+        }
+        assert!(interactive.contains("Code, interactive"));
+        assert!(interactive.contains("Use ask_question"));
+        assert!(unattended.contains("Code, unattended"));
+        assert!(unattended.contains("ask_question is not available"));
+        assert!(!unattended.contains("Use ask_question"));
+    }
+
+    #[test]
+    fn code_mode_refuses_every_direct_call_except_its_advertised_tools() {
+        use super::code_mode_direct_refusal;
+        for name in ["codemode", "artifact_read", "ask_question", "todo", "skill"] {
+            assert_eq!(code_mode_direct_refusal(OperatingMode::Code, name), None);
+        }
+        for name in [
+            "read",
+            "list",
+            "search",
+            "write",
+            "patch",
+            "shell",
+            "shell_job",
+            "code_intel",
+            "mcp",
+            "mcp__fs__read",
+            "no_such_tool",
+        ] {
+            let refusal = code_mode_direct_refusal(OperatingMode::Code, name).expect(name);
+            assert!(refusal.starts_with(name), "{refusal}");
+            assert!(refusal.contains("not callable directly in Code mode"));
+            assert!(refusal.contains("codemode"));
+            for mode in [
+                OperatingMode::Auto,
+                OperatingMode::ReadOnly,
+                OperatingMode::Plan,
+            ] {
+                assert_eq!(code_mode_direct_refusal(mode, name), None, "{mode:?}");
+            }
+        }
+        let long = "x".repeat(500);
+        let refusal = code_mode_direct_refusal(OperatingMode::Code, &long).unwrap();
+        assert!(refusal.starts_with(&"x".repeat(64)));
+        assert!(!refusal.starts_with(&"x".repeat(65)));
     }
 }

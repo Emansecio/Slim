@@ -12,7 +12,7 @@ qualquer mudança, rode:
 
 ```powershell
 .\refresh-slim.ps1          # build release + copia para o PATH + smoke test
-.\refresh-slim.ps1 -Test    # idem, rodando cargo test --workspace antes
+.\refresh-slim.ps1 -Test    # idem, rodando cargo test --workspace antes (só a pedido)
 ```
 
 O checkout limita o Cargo a um job em `.cargo/config.toml` para reduzir picos
@@ -163,6 +163,42 @@ O adaptador Anthropic preserva texto e thinking presentes em `content_block_star
 antes dos deltas. Chat Completions conserva `reasoning_details` em ordem no
 contexto vivo, com o mesmo escopo de conta/endpoint/modelo do reasoning existente.
 Esses detalhes opacos não entram no transcript persistido nem no Debug público.
+`--thinking-display summarized|omitted` separa o texto do raciocínio do esforço:
+sem a flag, o resumo só é pedido quando há effort; em Claude 5+, `omitted`
+mantém o pensamento ligado e esconde o texto, e `summarized` o mostra.
+
+<a id="modos-de-operacao"></a>
+
+## Modos de operação
+
+| Modo | Acesso | Tools anunciadas ao modelo |
+|---|---|---|
+| Auto (padrão) | total, sem permission engine | nativas uma a uma (`read`, `list`, `search`, `write`, `patch`, `shell`, `code_intel`), `shell_job`, `todo`, `skill`; com MCP, `mcp`, `codemode` e tools `direct` |
+| Read-only | inspeção, sem mutação | `read`, `list`, `search`, `code_intel`; `ask_question` quando interativo |
+| Plan | inspecionar e relatar | `read`, `list`, `search`, `code_intel` |
+| Code | total, como Auto, exercido por programas | `codemode`, `todo`, `skill`; `artifact_read` com artifact store e `ask_question` quando interativo |
+
+`artifact_read` acompanha qualquer modo quando há artifact store, e `ask_question`
+qualquer modo exceto Plan quando há rota interativa. Em Code o modelo não recebe
+tools nativas de workspace, `shell_job`, `mcp` nem tools MCP `direct`: cada passo é um programa
+[`codemode`](#codemode) que chama as nativas e o MCP por dentro. `todo` e `skill`
+ficam no topo porque o resultado deles pertence à conversa (plano visível e
+instruções), não a um programa. Uma chamada
+direta do modelo a qualquer outra tool nesse modo é recusada antes de executar,
+com mensagem que aponta para `codemode` (`slim.<tool>(args)` para nativas,
+`tools.call('mcp.server.tool', args)` para MCP); os demais modos não mudam. O
+ledger de capabilities dá a Code as mesmas permissões de Auto.
+
+Seleção:
+
+- CLI: `--read-only`, `--plan` ou `--code` (sem flag, Auto). `--code` junto de
+  `--plan` ou `--read-only` é recusado como entrada inválida; entre `--plan` e
+  `--read-only`, vale o último.
+- TUI: `Shift+Tab` percorre `Auto → Read-only → Plan → Code → Auto` e
+  `/mode auto|read-only|plan|code` escolhe direto (`/mode` sem argumento avança
+  como `Shift+Tab`). O rodapé mostra o nome do modo; Code usa o âmbar de `warning`.
+- Comandos do usuário na TUI (`!COMANDO`, `!& COMANDO` e controle de `/jobs`)
+  rodam em Auto e Code.
 
 ## Admissão e resultados nativos
 
@@ -524,7 +560,9 @@ definidos pelo projeto esperam a confiança do workspace → os valores
 `env`/`headers` são resolvidos → os servidores habilitados conectam em segundo
 plano → o modelo os alcança por gateway, direct ou codemode. MCP só é anunciado
 ao modelo em modo **Auto** e quando há ao menos um servidor habilitado
-(`mcp` e `codemode` entram juntos); Plan e Read-only nunca o recebem.
+(`mcp` e `codemode` entram juntos). Em **Code** nem `mcp` nem tools `direct` são
+anunciados: os servidores são alcançados só de dentro de programas `codemode`.
+Plan e Read-only nunca o recebem.
 
 <a id="mcp-configuracao"></a>
 
@@ -1125,21 +1163,72 @@ incerto ("do not replay the call automatically").
 
 ### CodeMode
 
-Com MCP habilitado, `codemode` também fica disponível em Auto. Executa o corpo
-de uma função JavaScript assíncrona em QuickJS embutido no binário, sem Node.js,
-acesso direto a arquivos, rede ou carregamento de módulos. O agente descobre
-nomes/schemas com `mcp` e usa `await tools.call('mcp.servidor.ferramenta', args)`.
-O retorno é `structuredContent`, quando presente, ou o envelope MCP completo;
-`isError` lança uma exceção. O `return` da célula é a saída enviada ao modelo;
-os retornos intermediários ficam fora desse contexto. Helpers de descoberta
-(síncronos, não consomem o limite de chamadas, nunca mostram tools `hidden`):
-`searchTools(query, {limit?, server?})` (BM25; padrão 8, máximo 64) devolve
-`[{name, server, tool, description}]` com `name` no formato de `tools.call`;
-`describeTool('mcp.servidor.ferramenta')` devolve `{inputSchema, outputSchema?, …}`
-ou `null`; `listServers()` devolve nome, status, descrição e instruções. As
-chamadas ao host são sequenciais: o interpretador é síncrono, então chamadas em
-paralelo (por exemplo `Promise.all` de `tools.call`) não rodam em paralelo. Não
-há helpers de recursos (`resources`/`uri` são só do gateway).
+Com MCP habilitado, `codemode` também fica disponível em Auto. No modo Code é a
+única ferramenta de workspace anunciada (além de `artifact_read` e
+`ask_question`, quando aplicáveis). Executa o corpo de uma função JavaScript
+assíncrona em QuickJS embutido no binário, sem Node.js, acesso direto a
+arquivos, rede ou carregamento de módulos. O `return` da célula (JSON) é a
+saída enviada ao modelo; os resultados intermediários ficam no programa.
+
+**Auto.** O agente descobre nomes/schemas com `mcp` e usa
+`await tools.call('mcp.servidor.ferramenta', args)`. O retorno é
+`structuredContent`, quando presente, ou o envelope MCP completo; `isError`
+rejeita a promise. As chamadas rodam uma de cada vez, na ordem pedida, como
+descreve a ferramenta, inclusive as que o programa não aguardou; não há
+binding `slim`, e `tools.call('slim.…')` falha.
+
+**Code.** A descrição da ferramenta traz um bloco TypeScript gerado das
+definições nativas que Auto anuncia (compactadas, sem campos legados):
+`declare const slim: { read(…): Promise<string>; list; search; write; patch;
+shell; code_intel }` (`code_intel` só com servidor de linguagem para o
+workspace), mais as declarações dos helpers. `slim.<nome>(args = {})` é
+`tools.call('slim.<nome>', args)`: resolve com a saída textual da tool e
+rejeita com `Error` na falha. Cada chamada nativa passa por
+`prepare_invocation` no modo Code e no cwd do turno, pelos mesmos run guards
+de uma chamada do provider (leitura acima de 1.000 linhas, comando que acabou
+de falhar, segunda reescrita completa) e pela mesma checagem de material
+sensível; a saída é redigida e, depois de `write`/`patch`, o servidor de
+linguagem é notificado antes da próxima chamada. A saída não conta como lida
+pelo modelo; uma saída guardada como artefato é registrada na sessão e a
+referência `[artifact id=…]` vem no fim do texto. O `shell` do programa é o do
+registry: roda em primeiro plano com o `timeout_ms` da chamada (padrão 600 s,
+reduzido ao tempo que resta à célula) e os limites de captura de saída da tool;
+`background`, `yield_ms` e `stdin` são recusados. Em `write`/`patch`,
+`then_run.final` é recusado (a resposta sai do `return`), e `then_run` conta
+como duas chamadas no limite; com o ajuste fino encerrado, patch só de ajuste
+falha como no provider. MCP não é anunciado de início: o programa descobre com os helpers e
+chama `tools.call('mcp.…')`. Sem MCP configurado, `slim` funciona normalmente
+e só `tools.call('mcp.…')` e os helpers de descoberta falham.
+
+**Paralelismo (Code).** `tools.call` devolve uma promise real. O interpretador
+envia a chamada com um ticket e continua o programa; o host executa cada
+chamada em uma task própria e liquida as promises na ordem em que terminam.
+Leituras (`read`, `list`, `search`, `code_intel`) e chamadas MCP rodam em
+paralelo, até 8 de cada vez; só `write`, `patch` e `shell` são serializadas pelo
+host: começam depois que as chamadas em voo terminam, e nada começa enquanto
+rodam. As chamadas começam na ordem pedida. Pôr chamadas MCP no mesmo
+`Promise.all` declara que são independentes; o host não as ordena entre si. O
+transporte MCP aceita requisições concorrentes (ids multiplexados no stdio e no
+HTTP), então não há serialização por servidor. Depois do `return`, o
+interpretador segue processando as chamadas que o programa não aguardou (por
+exemplo, `forEach(async …)`) até não restar nenhuma em voo, e o host executa a
+fila inteira; falhas e resultados incertos dessas chamadas viram uma nota curta
+(nome e erro) logo após o resultado. Uma promise pendente sem nenhuma chamada
+em voo nunca se resolveria e falha como deadlock.
+
+**Descoberta** (síncrona, não consome o limite de chamadas, nunca mostra tools
+`hidden`): `searchTools(query, {limit?, server?})` (BM25; padrão 8, máximo 64)
+devolve `[{name, server, tool, description}]` com `name` no formato de
+`tools.call`; `describeTool('mcp.servidor.ferramenta')` devolve
+`{inputSchema, outputSchema?, …}` ou `null`; `listServers()` devolve nome,
+status, descrição e instruções. Em Code, `describeTool` inclui `signature` em
+TypeScript (o retorno vem de `outputSchema`, ou `unknown`) e também descreve
+`slim.<nome>`. Não há helpers de recursos (`resources`/`uri` são só do gateway).
+
+**Console.** `console.log/info/warn/error` são capturados (`warn:`/`error:`
+como prefixo; objetos em JSON) até 16 KiB por célula; o excedente é contado
+numa linha final de truncamento. A captura vem depois do resultado ou do erro,
+após uma linha `console:`.
 
 `store(chave, valorJSON)` e `load(chave)` mantêm valores na sessão;
 `store(chave, null)` remove uma chave, e `load` de chave ausente retorna `null`.
@@ -1147,18 +1236,27 @@ Cada célula tem globais novos. Com sessão durável, os valores são registrado
 no journal e restaurados ao retomar ou ramificar, sem reexecutar código ou MCP.
 Um `store` concluído permanece aplicado mesmo se o restante da célula falhar.
 
-`mcp` e `codemode` são barreiras seriais no bucket mutating. As chamadas internas
-MCP executam em ordem e consomem, individualmente, os limites por turno e por
-run, além do slot da célula. Reutilizam a proteção de credenciais e o transporte
-cancelável. O journal registra cada chamada com identidade ligada à célula,
-início, resultado e duração; a atividade aparece como progresso da ferramenta.
+`mcp` e `codemode` são barreiras seriais no bucket mutating. Toda chamada
+interna (nativa ou MCP) consome, ao começar, os limites por turno e por run,
+além do slot da célula; a que não cabe falha sem ser enviada. O journal
+(`codemode.call.v1`) registra cada chamada com identidade ligada à célula:
+`started` com os argumentos, depois `completed`/`failed`/`not_sent`/`uncertain`
+com duração e resultado (para nativas, só `output_bytes` no sucesso, e na falha
+`error_bytes` com no máximo 1 KiB do erro); cada etapa aparece como progresso
+da ferramenta. O `started` só é gravado depois que a chamada foi disparada; se
+o journal falhar, as chamadas já disparadas ainda terminam e são coletadas, e a
+célula devolve o primeiro erro de journal.
 
-Limites da célula: código de 64 KiB, memória de 32 MiB, prazo de 120 s, 1.024
-operações com o host, valores persistidos de 64 KiB no total e JSON de até 1 MiB
-por requisição/resposta. Exceder um limite produz erro explícito. Resultados
-maiores devem ser reduzidos pelo servidor; o código deve retornar um resumo.
-Cancelar interrompe o interpretador e a chamada pendente; efeitos externos já
-enviados não são desfeitos. Células interrompidas não são repetidas automaticamente.
+Limites da célula: código de 64 KiB, memória de 32 MiB, 120 s de CPU do
+JavaScript (as esperas por chamadas do host não contam), prazo de relógio de
+120 s em Auto e 3.600 s em Code, 1.024 operações com o host, valores persistidos de 64 KiB no total e JSON de até 1 MiB
+por requisição/resposta (inclusive a saída de uma chamada nativa). Exceder um
+limite produz erro explícito. Resultados maiores devem ser reduzidos na
+chamada; o código deve retornar um resumo. Cancelar ou estourar o prazo
+cancela o interpretador e as chamadas em voo (nativas pelo token da célula,
+MCP pelo cancelamento do transporte); efeitos externos já enviados não são
+desfeitos, e um resultado MCP incerto interrompe a célula. Células
+interrompidas não são repetidas automaticamente.
 
 ### Cancelamento e efeitos externos
 
@@ -1208,7 +1306,7 @@ barreiras são estas):
   fragmento (a URL configurada continua completa no transporte).
 - **Sem reexecução** de chamada com resultado incerto (cancelamento, timeout,
   conexão perdida, sessão expirada), inclusive após retomar a sessão.
-- **Auto-only**: nenhuma ação MCP roda em Plan ou Read-only.
+- **Auto e Code**: nenhuma ação MCP roda em Plan ou Read-only.
 
 | Limite | Valor |
 |---|---|

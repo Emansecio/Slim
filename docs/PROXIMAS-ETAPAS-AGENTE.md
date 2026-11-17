@@ -368,9 +368,10 @@ Siga AGENTS.md e RULES.md no escopo da fatia autorizada:
 1. Confirme o fluxo afetado e reutilize testes existentes; acrescente uma
    regressão apenas quando houver lacuna relevante.
 2. Complete o caller existente com a menor correção necessária.
-3. Execute os checks pertinentes. Se a suíte completa e o deploy forem
-   necessários e autorizados, refresh-slim.ps1 -Test cobre ambos. Não rode
-   cargo test --workspace imediatamente antes sem mudança intermediária.
+3. Execute o check pertinente — um comando por mudança. A suíte completa só
+   roda a pedido explícito; com ela e o deploy autorizados,
+   refresh-slim.ps1 -Test cobre ambos. Não rode cargo test --workspace
+   imediatamente antes sem mudança intermediária.
    Se os checks já passaram, o deploy autorizado usa o script sem -Test.
 4. Atualize somente os estados ou contratos documentais afetados, preservando
    registros históricos e evitando copiar contagens entre READMEs.

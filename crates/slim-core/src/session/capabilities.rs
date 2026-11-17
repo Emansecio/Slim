@@ -168,9 +168,10 @@ impl CapabilityCatalog {
                     OperatingMode::Auto,
                     OperatingMode::ReadOnly,
                     OperatingMode::Plan,
+                    OperatingMode::Code,
                 ]
             } else {
-                vec![OperatingMode::Auto]
+                vec![OperatingMode::Auto, OperatingMode::Code]
             };
             // Native tool names are supplied by the static registry and are
             // therefore already bounded and trusted.
@@ -202,7 +203,7 @@ impl CapabilityCatalog {
         self.add(CapabilityDescriptor {
             id: format!("skill.{name}"),
             kind: CapabilityKind::Skill,
-            allowed_modes: vec![OperatingMode::Auto],
+            allowed_modes: vec![OperatingMode::Auto, OperatingMode::Code],
             authorization: if trusted {
                 AuthorizationRequirement::Trusted
             } else {
@@ -246,7 +247,7 @@ impl CapabilityCatalog {
             next.add(CapabilityDescriptor {
                 id: canonical_name(catalog.server_name(), tool),
                 kind: CapabilityKind::McpTool,
-                allowed_modes: vec![OperatingMode::Auto],
+                allowed_modes: vec![OperatingMode::Auto, OperatingMode::Code],
                 authorization: AuthorizationRequirement::Explicit,
                 replay_policy: ReplayPolicy::Never,
                 mutates_workspace: true,
@@ -310,7 +311,11 @@ impl CapabilityCatalog {
             next.add(CapabilityDescriptor {
                 id: id.into(),
                 kind,
-                allowed_modes: vec![OperatingMode::Auto, OperatingMode::Plan],
+                allowed_modes: vec![
+                    OperatingMode::Auto,
+                    OperatingMode::Plan,
+                    OperatingMode::Code,
+                ],
                 authorization: AuthorizationRequirement::Explicit,
                 replay_policy: ReplayPolicy::Never,
                 mutates_workspace: false,

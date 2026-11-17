@@ -7,18 +7,22 @@ pub enum OperatingMode {
     Auto,
     ReadOnly,
     Plan,
+    /// Full access like Auto, but the model acts by writing one JavaScript
+    /// program per step (`codemode`) instead of calling tools one by one.
+    Code,
 }
 
 impl OperatingMode {
     pub fn allows_mutation(self) -> bool {
-        matches!(self, Self::Auto)
+        matches!(self, Self::Auto | Self::Code)
     }
 
     pub fn next(self) -> Self {
         match self {
             Self::Auto => Self::ReadOnly,
             Self::ReadOnly => Self::Plan,
-            Self::Plan => Self::Auto,
+            Self::Plan => Self::Code,
+            Self::Code => Self::Auto,
         }
     }
 }

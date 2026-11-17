@@ -1274,6 +1274,10 @@ fn alt_tab_cycles_mode_like_shift_tab() {
         ),
         (
             slim_core::OperatingMode::Plan,
+            slim_core::OperatingMode::Code,
+        ),
+        (
+            slim_core::OperatingMode::Code,
             slim_core::OperatingMode::Auto,
         ),
     ] {
@@ -1312,6 +1316,13 @@ fn mode_slash_command_accepts_explicit_modes() {
     let effects = reduce(&mut state, Action::Key(enter()));
     assert!(effects.contains(&Effect::Send(UiCommand::SetMode(
         slim_core::OperatingMode::Plan
+    ))));
+
+    let mut state = AppState::new();
+    state.composer.insert_text("/mode code");
+    let effects = reduce(&mut state, Action::Key(enter()));
+    assert!(effects.contains(&Effect::Send(UiCommand::SetMode(
+        slim_core::OperatingMode::Code
     ))));
 
     let mut state = AppState::new();

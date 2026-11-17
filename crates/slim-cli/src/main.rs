@@ -61,6 +61,7 @@ fn has_positional_prompt(args: &[String]) -> bool {
                 | "--recover"
                 | "--image"
                 | "--effort"
+                | "--thinking-display"
                 | "--experiment-id"
                 | "--task-id"
         ) {
@@ -81,10 +82,11 @@ fn known_options_without_prompt(args: &[String]) -> bool {
         match args[index].as_str() {
             // Recovery has no prompt and must not wait for a piped stdin EOF.
             "--recover" => return false,
-            "--plan" | "--read-only" | "--verbose" | "--jsonl" | "--headless" | "--tui"
-            | "--fake" | "--abandon-pending" | "--fast" | "--normal" | "--trust-project" => {}
+            "--plan" | "--read-only" | "--code" | "--verbose" | "--jsonl" | "--headless"
+            | "--tui" | "--fake" | "--abandon-pending" | "--fast" | "--normal"
+            | "--trust-project" => {}
             "--prompt" | "--provider" | "--model" | "--endpoint" | "--session" | "--resume"
-            | "--image" | "--effort" | "--experiment-id" | "--task-id" => {
+            | "--image" | "--effort" | "--thinking-display" | "--experiment-id" | "--task-id" => {
                 if args.get(index + 1).is_none() {
                     return false;
                 }

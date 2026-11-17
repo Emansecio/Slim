@@ -60,22 +60,22 @@ configuração, providers, MCP, autenticação e contratos operacionais.
 ```powershell
 cargo build --workspace
 .\refresh-slim.ps1          # release + cópia para o PATH + smoke
-.\refresh-slim.ps1 -Test    # inclui cargo test --workspace; só se a mudança cruza crates
+.\refresh-slim.ps1 -Test    # inclui cargo test --workspace; só a pedido explícito
 .\refresh-slim.ps1 -FastBuild # ciclo local com menos otimização; veja release/README.md
 ```
 
-Rode o mínimo de testes que cobre o que foi alterado, somente onde foi mexido,
-e suba de nível apenas se a mudança exigir:
+Rode o mínimo que cobre o que foi alterado: um comando por mudança, nenhum
+quando a mudança é só documental.
 
 ```sh
-cargo test -p slim-core --lib run_guards           # 1. o módulo alterado
-cargo test -p slim-core --test agent_loop <filtro> # 2. o arquivo de integração tocado
-cargo test -p slim-core                            # 3. o crate, se a mudança atravessa módulos
-cargo test --workspace                             # 4. tudo, só se cruza crates ou a pedido
+cargo test -p slim-core --lib run_guards   # o teste que nomeia o comportamento
+cargo check -p slim-core                   # alternativa, quando a dúvida é só compilação
 ```
 
-Crate não alterado e sem dependência do que mudou não precisa ser testado. A
-publicação normal é o refresh sem suíte (`./refresh-slim.sh`, `.\refresh-slim.ps1`).
+Suíte do crate, integração completa, `cargo test --workspace` e o refresh com
+`-Test`/`--test` só a pedido explícito. Crate não alterado e sem dependência do
+que mudou não precisa ser testado. A publicação normal é o refresh sem suíte
+(`./refresh-slim.sh`, `.\refresh-slim.ps1`).
 
 O comando `slim` instalado é uma cópia estática em
 `%USERPROFILE%\bin\Slim.exe`; ele não acompanha o checkout automaticamente.
@@ -109,8 +109,15 @@ keep_recent_tokens = 20000
 Arquivos presentes e inválidos causam erro explícito. Credenciais não devem ser
 armazenadas em `slim.toml`.
 
-No modo Auto da TUI, `!& COMANDO` roda em segundo plano e `/jobs` acompanha
-saída, interrupção e cancelamento. Jobs sobrevivem entre prompts da sessão;
+Há quatro modos de operação: Auto (padrão), Read-only, Plan e Code. Na TUI,
+`Shift+Tab` ou `/mode` alterna entre eles; na CLI, `--read-only`, `--plan` e
+`--code` escolhem o modo do run. Em Code o modelo age escrevendo um programa
+JavaScript curto por passo (`codemode`) contra funções tipadas, e só o `return`
+volta ao contexto. Detalhes em
+[modos de operação](docs/reference/CLI-AND-RUNTIME.md#modos-de-operacao).
+
+Nos modos Auto e Code da TUI, `!& COMANDO` roda em segundo plano e `/jobs`
+acompanha saída, interrupção e cancelamento. Jobs sobrevivem entre prompts da sessão;
 terminar a resposta libera o composer. Limites `[shell_jobs]` e ações do modelo
 estão na [referência de CLI/runtime](docs/reference/CLI-AND-RUNTIME.md).
 

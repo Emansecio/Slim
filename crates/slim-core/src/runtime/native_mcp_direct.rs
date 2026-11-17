@@ -117,7 +117,8 @@ impl Runtime {
         code_intel_enabled: bool,
     ) -> Arc<[Value]> {
         let base = self.base_tool_definition_set(mode, code_intel_enabled);
-        if !mode.allows_mutation() {
+        // Code mode reaches MCP tools only through codemode discovery.
+        if !mode.allows_mutation() || mode == crate::OperatingMode::Code {
             return base;
         }
         let Some(manager) = self.mcp.as_ref() else {
@@ -236,6 +237,31 @@ mod tests {
         assert_eq!(
             auto,
             runtime.advertised_tool_definitions(crate::OperatingMode::Auto)
+        );
+    }
+
+    #[test]
+    fn code_mode_advertises_codemode_alone_without_natives_mcp_or_direct_tools() {
+        let names = |runtime: &Runtime| {
+            runtime
+                .advertised_tool_definitions(crate::OperatingMode::Code)
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let mut runtime = Runtime::new();
+        assert_eq!(
+            names(&runtime),
+            ["codemode", "todo", "skill"],
+            "natives without MCP too"
+        );
+        runtime.set_mcp_manager(Some(manager_with_direct_tool()));
+        assert_eq!(names(&runtime), ["codemode", "todo", "skill"]);
+        let (route, _responder) = crate::interaction_route();
+        runtime.set_interaction_route(route);
+        assert_eq!(
+            names(&runtime),
+            ["codemode", "ask_question", "todo", "skill"]
         );
     }
 

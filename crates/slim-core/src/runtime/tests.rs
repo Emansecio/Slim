@@ -4256,6 +4256,72 @@ fn provider_call(id: &str, name: &str, arguments: serde_json::Value) -> Provider
 }
 
 #[tokio::test]
+async fn code_mode_refuses_direct_tool_calls_on_every_scheduling_path() {
+    let root = TempRoot::new("code-refusal");
+    std::fs::write(root.join("a.txt"), "old-a\n").unwrap();
+    // Snapshot read wave, independent mutation cluster, managed shell and the
+    // runtime-routed tools each take their own path through the batch.
+    let calls = [
+        provider_call("r", "read", json!({"path":"a.txt"})),
+        provider_call(
+            "wa",
+            "write",
+            json!({"path":"a.txt","content":"new-a\n","expected":"old-a\n"}),
+        ),
+        provider_call("wb", "write", json!({"path":"b.txt","content":"new-b\n"})),
+        provider_call("s", "shell", json!({"command":"echo hi > c.txt"})),
+        provider_call("m", "mcp", json!({"action":"servers"})),
+        provider_call("d", "mcp__fs__read", json!({})),
+    ];
+    let mut runtime = Runtime::new();
+    let (results, next_seq) = runtime
+        .execute_provider_tool_batch(
+            crate::OperatingMode::Code,
+            &root,
+            "batch",
+            &calls,
+            1,
+            &mut CausalGovernor::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), calls.len());
+    for (call, result) in calls.iter().zip(&results) {
+        assert!(!result.success, "{}: {}", call.name, result.output);
+        assert!(
+            result
+                .output
+                .contains("is not callable directly in Code mode")
+                && result.output.contains("codemode"),
+            "{}: {}",
+            call.name,
+            result.output
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "old-a\n"
+    );
+    assert!(!root.join("b.txt").exists());
+    assert!(!root.join("c.txt").exists());
+
+    // The same native call still runs in Auto.
+    let (results, _) = runtime
+        .execute_provider_tool_batch(
+            crate::OperatingMode::Auto,
+            &root,
+            "batch-auto",
+            &calls[..1],
+            next_seq,
+            &mut CausalGovernor::default(),
+        )
+        .await
+        .unwrap();
+    assert!(results[0].success, "{}", results[0].output);
+    assert!(results[0].output.contains("old-a"));
+}
+
+#[tokio::test]
 async fn independent_writes_apply_and_same_file_stays_ordered() {
     let root = TempRoot::new("mut-batch");
     std::fs::write(root.join("a.txt"), "old-a\n").unwrap();

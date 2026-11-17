@@ -51,6 +51,16 @@ fn bang_command_runs_in_auto_mode_and_clears_the_draft() {
 }
 
 #[test]
+fn code_mode_runs_user_commands_like_auto() {
+    let mut state = ready(OperatingMode::Code);
+    let effects = submit(&mut state, "!echo code");
+    assert_eq!(shell_commands(&effects), [(1, "echo code")]);
+    let mut state = ready(OperatingMode::Code);
+    let effects = submit(&mut state, "!& echo background");
+    assert!(effects.iter().any(|e| matches!(e, Effect::Send(UiCommand::RunBackgroundShell { command }) if command == "echo background")));
+}
+
+#[test]
 fn bang_command_does_not_need_a_connected_provider() {
     let mut state = ready(OperatingMode::Auto);
     state.authenticated = false;

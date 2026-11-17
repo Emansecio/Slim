@@ -1226,7 +1226,7 @@ fn nearest_native_field(key: &str, allowed: &[&'static str]) -> Option<&'static 
     let key_words = words(&key);
     let mut matches = allowed.iter().copied().filter(|field| {
         let field_words = words(field);
-        let same_lead = key_words.first().is_some() && key_words.first() == field_words.first();
+        let same_lead = !key_words.is_empty() && key_words.first() == field_words.first();
         let nested = key_words.iter().all(|word| field_words.contains(word))
             || field_words.iter().all(|word| key_words.contains(word));
         (same_lead && nested) || (key.len() >= 4 && edit_distance(&key, field) <= 2)

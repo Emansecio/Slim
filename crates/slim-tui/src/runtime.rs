@@ -358,10 +358,7 @@ fn run_loop(
                 // which would otherwise strand input until the next OS signal.
                 let mut handled = 0usize;
                 let mut input_pending = false;
-                loop {
-                    let Some(event) = input.next()? else {
-                        break;
-                    };
+                while let Some(event) = input.next()? {
                     input_pending = input.pending()?;
                     if let Event::Resize(width, height) = event {
                         size = ratatui::layout::Size { width, height };
@@ -1813,8 +1810,10 @@ fn motion_needed(state: &AppState, capabilities: Capabilities, cache: &mut WrapC
 
 /// Silence after which the run is shown waiting rather than busy: the
 /// footer names it (`sem novo conteúdo há …`), the spinner slows to the
-/// one-second status tick and the motion clock stops.
-const ACTIVITY_STALL_MS: u64 = 5_000;
+/// one-second status tick and the motion clock stops. Twelve seconds, not
+/// five: a provider commonly takes several seconds to the first token, and at
+/// five the spinner dropped to 1 Hz while the model was still starting.
+const ACTIVITY_STALL_MS: u64 = 12_000;
 
 /// The provider has produced nothing for [`ACTIVITY_STALL_MS`] while the run
 /// is still working. A tool that is executing is busy, not stalled: a build
@@ -4508,9 +4507,9 @@ fn user_message_lines(
             }
         })
         .collect();
-    // One row of air inside the band closes the prompt, so the next turn never
-    // starts against the text.
-    lines.push(band(Vec::new()));
+    // One row of air closes the prompt outside the band: the gray ends where
+    // the words end, and the blank row keeps the next turn off the text.
+    lines.push(Line::default());
     if awaiting_agent {
         // The agent has not produced anything yet. Its header is already
         // here, in the row the first block will take over.
@@ -6191,13 +6190,14 @@ fn footer_segment_style(
 ) -> Style {
     let lower = segment.to_ascii_lowercase();
     // The operating mode names itself by hue: Auto stays neutral, Read-only
-    // takes the navigation blue and Plan the reasoning violet. A fresh change
-    // still gets the short weight emphasis.
+    // takes the navigation blue, Plan the reasoning violet and Code the amber
+    // of full access exercised through programs. A fresh change still gets the short weight emphasis.
     if segment == mode_name(state.mode) {
         let hue = match state.mode {
             slim_core::OperatingMode::Auto => None,
             slim_core::OperatingMode::ReadOnly => Some(palette.accent),
             slim_core::OperatingMode::Plan => Some(palette.reasoning),
+            slim_core::OperatingMode::Code => Some(palette.warning),
         };
         if let Some(hue) = hue {
             return if active {
@@ -8650,9 +8650,10 @@ fn palette_header(
 }
 
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-/// Motion frames each spinner glyph stays for: about six steps a second, a
-/// turn the eye can follow instead of a flicker at the edge of the view.
-const SPINNER_FRAME_HOLD: usize = 2;
+/// Motion frames each spinner glyph stays for: one, so the glyph turns at the
+/// clock's own pace (twelve steps a second, a turn in 0.83 s) instead of one
+/// step every other frame. Two frames per glyph read as a stuck spinner.
+const SPINNER_FRAME_HOLD: usize = 1;
 /// What the footer calls a run whose phase the transcript is already showing.
 const RUN_LABEL: &str = "Trabalhando";
 /// Same spinner for terminals told not to use color (`NO_COLOR`): ASCII, so it

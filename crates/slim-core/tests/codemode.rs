@@ -359,6 +359,116 @@ fn nested_calls_consume_both_turn_and_run_budgets() {
 }
 
 #[test]
+fn code_mode_program_reads_searches_and_writes_returning_only_its_result() {
+    let root = TempRoot::new("codemode-code");
+    std::fs::write(
+        root.path().join("notes.txt"),
+        "INTERMEDIATE_MARKER first\nTODO: ship\n",
+    )
+    .unwrap();
+    let (client, provider) = provider(
+        vec![(
+            "codemode",
+            json!({"code": r#"
+            const [notes, hits] = await Promise.all([
+                slim.read({path: 'notes.txt'}),
+                slim.search({query: 'TODO'}),
+            ]);
+            await slim.write({path: 'summary.txt', content: notes.includes('first') ? 'seen\n' : 'missing\n'});
+            console.log('wrote summary');
+            const summary = await slim.read({path: 'summary.txt'});
+            return {todo: hits.includes('TODO: ship'), summary: summary.includes('seen')};
+        "#}),
+        )],
+        true,
+    );
+    let repo = JsonlRepo::create(
+        root.path().join("session.jsonl"),
+        DurableSessionHeader::new("code", "now", root.path().to_string_lossy(), None, None),
+    )
+    .unwrap();
+    let journal = Arc::new(Mutex::new(
+        ManualRunJournal::start(
+            repo,
+            ManualRunSpec::new("one", "attempt", "input", "final", "summarize notes", 0),
+        )
+        .unwrap(),
+    ));
+    let mut runtime = Runtime::new();
+    runtime.app.set_run_journal(journal.clone());
+    let executor = tokio::runtime::Runtime::new().unwrap();
+    let result = executor
+        .block_on(runtime.run_agent_loop(
+            &client,
+            "summarize notes",
+            OperatingMode::Code,
+            root.path(),
+            0,
+            AgentLoopConfig::default(),
+        ))
+        .unwrap();
+    assert_eq!(result.stop, AgentLoopStop::ProviderCompleted);
+    let output = &result.tool_results[0];
+    assert!(output.success, "{}", output.output);
+    let (value, console) = output.output.split_once("\nconsole:\n").unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(value).unwrap(),
+        json!({"todo": true, "summary": true})
+    );
+    assert_eq!(console, "wrote summary");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("summary.txt")).unwrap(),
+        "seen\n"
+    );
+    let requests = provider.join().unwrap();
+    let names: Vec<_> = requests[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect();
+    // Workspace tools reach the program only through `codemode`.
+    assert!(names.contains(&"codemode"), "{names:?}");
+    for workspace_tool in ["read", "list", "search", "write", "patch", "shell", "mcp"] {
+        assert!(!names.contains(&workspace_tool), "{names:?}");
+    }
+    // What the program read stayed in the program.
+    assert!(!requests[1].to_string().contains("INTERMEDIATE_MARKER"));
+    let facts: Vec<_> = journal
+        .lock()
+        .unwrap()
+        .repo()
+        .records()
+        .iter()
+        .filter_map(|record| match record {
+            DurableRecord::Fact { fact, .. } if fact.namespace == "codemode.call.v1" => {
+                Some(fact.value.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let finished: Vec<_> = facts
+        .iter()
+        .filter(|fact| fact["status"] != "started")
+        .map(|fact| {
+            (
+                fact["name"].as_str().unwrap(),
+                fact["status"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(facts.len(), 8, "{facts:?}");
+    assert_eq!(finished.len(), 4);
+    assert!(finished.iter().all(|(_, status)| *status == "completed"));
+    assert_eq!(finished[2], ("slim.write", "completed"));
+    journal
+        .lock()
+        .unwrap()
+        .finish(ProviderResponse::new("done", None))
+        .unwrap();
+}
+
+#[test]
 fn global_discovery_does_not_connect_disconnected_servers() {
     let root = TempRoot::new("codemode-lazy-search");
     let manager = manager(

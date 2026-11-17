@@ -343,6 +343,7 @@ fn the_operating_mode_is_named_by_hue() {
                     OperatingMode::Auto => "Auto ·",
                     OperatingMode::ReadOnly => "Read-only ·",
                     OperatingMode::Plan => "Plan ·",
+                    OperatingMode::Code => "Code ·",
                 })
             })
             .unwrap_or_else(|| panic!("mode row missing\n{}", rendered.rows.join("\n")));
@@ -350,6 +351,7 @@ fn the_operating_mode_is_named_by_hue() {
             OperatingMode::Auto => "Auto",
             OperatingMode::ReadOnly => "Read-only",
             OperatingMode::Plan => "Plan",
+            OperatingMode::Code => "Code",
         };
         rendered.style_at(row, word)
     };
@@ -361,6 +363,10 @@ fn the_operating_mode_is_named_by_hue() {
         BLUE
     );
     assert_eq!(footer(OperatingMode::Plan, ColorDepth::TrueColor).0, VIOLET);
+    // Code has its own hue: full access, but not the neutral Auto.
+    let code = footer(OperatingMode::Code, ColorDepth::TrueColor);
+    assert!(code.1.contains(Modifier::BOLD));
+    assert_eq!(code.0, AMBER);
     // The two safe modes differ from each other and from Auto at every depth
     // that has color, and the name stays bold so it never depends on hue.
     for depth in [ColorDepth::Ansi256, ColorDepth::Ansi16] {

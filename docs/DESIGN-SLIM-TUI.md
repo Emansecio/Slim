@@ -407,7 +407,7 @@ milestone correspondente passou seu gate.
   bounded 4 para artefatos independentes; a TUI toma posse do conteúdo bounded
   sem clonar o `String` integral;
 - lifecycle básico de run/tool, resposta final e usage projetados para a TUI;
-- troca `Auto → Read-only → Plan → Auto` no boundary de modo; o esforço salvo
+- troca `Auto → Read-only → Plan → Code → Auto` no boundary de modo; o esforço salvo
   continua visível no rodapé;
   Plan na TUI executa o loop com read/list/search (sem write/shell/`ask_question`);
   headless `--plan` continua `approval_required` / exit 10;
@@ -820,13 +820,14 @@ revisões abaixo é o que esta não substitui.
   pensamento ou uma única chamada em execução visível), o spinner fica nessa
   row e o rodapé mostra o total parado: `○ Trabalhando · 8s · Esc parar`. Com
   várias chamadas vivas, ou a row fora da viewport, o spinner volta ao rodapé.
-  Execução parada há 5 s troca o spinner da row pelo quadro lento de 1 Hz;
+  Execução parada há 12 s troca o spinner da row pelo quadro lento de 1 Hz;
   reduced motion mantém `○`.
 - **Movimento contido.** Saem a varredura do rótulo `Pensando`, a varredura do
   nome `Slim` no cabeçalho pendente e o brilho de chegada (na resposta e na
   cauda do pensamento). Ficam o spinner, o caret, o assentamento de 249 ms e a
-  luz única do `SLIM` na welcome. O spinner avança a cada dois ticks (cerca de
-  6 passos por segundo) em vez de um. Substitui a varredura de 28/09 e 20/10 e
+  luz única do `SLIM` na welcome. O spinner avança a cada tick (cerca de
+  12 passos por segundo, uma volta em 0,83 s), como §15.4 já prescrevia: um
+  passo a cada 166 ms lia como spinner travado. Substitui a varredura de 28/09 e 20/10 e
   o brilho de 05/10/2026.
 - **Vocabulário do rodapé.** `Trabalhando` é o nome único da execução sem fase
   própria: substitui `Em atividade` e o rótulo `execução Ns`.
@@ -907,7 +908,7 @@ a TUI deixa de refazer a cada quadro muda muito.
   crossterm, o `SIGWINCH` chega a uma UI ociosa na hora. No Windows o loop
   continua lendo o console diretamente.
 - **Movimento que para quando não há o que mostrar.** O clock de 83 ms não
-  roda depois de 5 s sem conteúdo útil do provider: o spinner do rodapé e do
+  roda depois de 12 s sem conteúdo útil do provider: o spinner do rodapé e do
   cabeçalho `Pensando` passam ao quadro lento de 1 Hz até o conteúdo voltar.
   O progresso de uma chamada de ferramenta sendo escrita pelo modelo
   (`Preparing tool · … KB`) conta como conteúdo, e uma ferramenta em execução
@@ -966,7 +967,8 @@ continua sendo o que já existia (spinner, sweep, brilho de chegada, settle).
   Substitui, em §15.2.1 e §21.4, o cabeçalho de uma row só.
 - **Ar na banda do prompt.** A banda do prompt fecha com uma row de ar própria,
   em vez de uma row em branco fora dela, para o turno seguinte nunca encostar no
-  texto. Nenhuma row nova: a que existia mudou de fundo.
+  texto. Nenhuma row nova: a que existia mudou de fundo. (Substituído em
+  15/11/2026: o ar volta a ficar fora da banda — ver §15.2.1.)
 - **Seletores de largura total.** `/model`, `/effort`, `/resume`, `/rewind` e a
   paleta de comandos (`/` ou Ctrl+P) deixam de ser caixas arredondadas centradas
   e passam a ser um painel que ocupa o terminal, com réguas em vez de borda:
@@ -1330,7 +1332,7 @@ streaming, ou o tick de status de 1 Hz. Parado, continuam zero ticks.
   continuam dizendo qual espera é. Movimento reduzido mantém o marcador antigo.
 
 Correções de texto neste documento, que descrevia o que o código não faz: o
-spinner é o braille de dez quadros a 12 fps, não `◒◓◑◐` nem um pulso `○/●`; o
+spinner é o braille de dez quadros, um por tick de 83 ms, não `◒◓◑◐` nem um pulso `○/●`; o
 composer não pulsa; e a célula do cabeçalho Thinking anima no transcript, uma
 só por vez, no lugar do spinner da rail. Esta revisão substitui as prescrições
 conflitantes de §15.4 e §21.4.
@@ -1363,7 +1365,7 @@ magenta claro em ANSI16 e para um índice distinto do azul em 256 cores.
   Falha, cancelamento, execução e histórico não mudam. Sem cor, os glifos ASCII
   continuam iguais e o tipo da chamada segue no verbo.
 - **Modo de operação:** no rodapé, `Auto` permanece neutro, `Read-only` usa
-  `accent` e `Plan` usa `reasoning_accent`. O nome continua em negrito nos casos
+  `accent`, `Plan` usa `reasoning_accent` e `Code` usa `warning` (âmbar; `tool_accent` coincide com o texto secundário de Auto). O nome continua em negrito nos casos
   destacados, então a leitura não depende do matiz. A ênfase de 249 ms de uma
   troca recente continua valendo.
 
@@ -2224,8 +2226,8 @@ visível (`interaction route unavailable`); a TUI nunca simula sucesso local.
 - `InputRequestView` carrega id, pergunta, opções e estado de persistência.
 
 - A sessão começa em `Auto`.
-- `Shift+Tab` percorre `Auto → Read-only → Plan → Auto`; `/mode` é o caminho
-  textual equivalente.
+- `Shift+Tab` percorre `Auto → Read-only → Plan → Code → Auto`; `/mode` é o
+  caminho textual equivalente (`/mode auto|read-only|plan|code`).
 - `Plan` e `Read-only` exibem o catálogo de capabilities recebido em
   `CapabilitySurfaceChanged`; a TUI não calcula permissões.
 - Aprovar/rejeitar emite `Approve`/`Reject`; somente o acknowledgement do
@@ -3254,13 +3256,14 @@ o `row_offset` dentro da nova altura.
 - user e assistant compartilham a surface principal; metadata (thinking/tools)
   usa `muted`, resposta usa `text` com headings cromáticos; sem card por mensagem;
 - prompt do usuário começa ao lado do marcador, `  ● texto`, sem row de rótulo
-  (§1.2, 13/11/2026), sobre a banda `user_prompt_bg`; a primeira row e as
-  continuações têm o texto na coluna 4;
+  (§1.2, 13/11/2026), sobre a banda `user_prompt_bg`, que cobre só as rows de
+  texto — a row de ar fica fora dela; a primeira row e as continuações têm o
+  texto na coluna 4;
 - somente o marcador recebe realce bold por 249 ms após envio, usando a
   transição existente; depois fica estático em accent/dim. Reduced motion
   usa o estado estático desde o início; NO_COLOR usa `*` sem cor;
-- após o corpo do user há exatamente uma row vazia antes de thinking, tools
-  ou assistant; `HeightIndex` conta corpo e separador;
+- após o corpo do user há exatamente uma row vazia, na surface e não na banda,
+  antes de thinking, tools ou assistant; `HeightIndex` conta corpo e separador;
 - o primeiro que o agente emite depois do prompt (pensamento, tool ou prosa)
   é precedido por `● Slim ─────` (rótulo em `assistant_accent`/bold e régua em
   `border` na mesma row), no canal do marcador do prompt;

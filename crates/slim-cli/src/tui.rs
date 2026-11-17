@@ -979,6 +979,9 @@ fn prepare_tui_in(
     if configured_effort.is_some() {
         options = options.with_reasoning_effort(effort.id());
     }
+    if let Some(display) = parsed.thinking_display {
+        options = options.with_thinking_display(display);
+    }
     Ok(TuiStartup {
         request,
         oauth_session,
@@ -2030,8 +2033,8 @@ impl JobCommandContext {
                 return None;
             }
             UiCommand::JobControl { id, interrupt } => {
-                if self.mode != slim_core::OperatingMode::Auto {
-                    Err("Controle de processos exige Auto (/mode auto)".into())
+                if !self.mode.allows_mutation() {
+                    Err("Controle de processos exige Auto ou Code (/mode auto)".into())
                 } else if interrupt {
                     self.jobs.interrupt(&id)
                 } else {
@@ -2039,8 +2042,8 @@ impl JobCommandContext {
                 }
             }
             UiCommand::RunBackgroundShell { command } => {
-                if self.mode != slim_core::OperatingMode::Auto {
-                    Err("Comandos com !& exigem Auto (/mode auto)".into())
+                if !self.mode.allows_mutation() {
+                    Err("Comandos com !& exigem Auto ou Code (/mode auto)".into())
                 } else {
                     self.jobs
                         .start_user(
@@ -5614,7 +5617,7 @@ fn reject_user_shell(sink: &EventSink, request_id: u64, message: &str) {
 /// Runs `command` for the user through the same `shell` tool the agent uses,
 /// so mode gating, confinement to the workspace, the shared registry's
 /// workspace revision and process cancellation all apply unchanged. Only Auto
-/// mode may run it. The transcript shows it as a `shell` block marked `!`; a
+/// and Code modes may run it. The transcript shows it as a `shell` block marked `!`; a
 /// bounded copy of its output is held for the model's next prompt.
 fn start_user_shell(
     request_id: u64,
@@ -5623,8 +5626,8 @@ fn start_user_shell(
     sink: &EventSink,
     context: &UserShellContext,
 ) -> Result<UserShellRun, String> {
-    if startup.mode != slim_core::OperatingMode::Auto {
-        return Err("Comandos com ! exigem o modo Auto (/mode auto)".into());
+    if !startup.mode.allows_mutation() {
+        return Err("Comandos com ! exigem o modo Auto ou Code (/mode auto)".into());
     }
     let command = command.trim().to_owned();
     if command.is_empty() {

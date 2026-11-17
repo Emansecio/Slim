@@ -132,6 +132,38 @@ pub fn claude_reasoning_levels(model: &str) -> &'static [&'static str] {
     }
 }
 
+/// The effort a Claude model uses when the request omits
+/// `output_config.effort`. Documented per generation: Claude Opus 5.5 and
+/// Claude Haiku 5.5 default to medium, most other models to high. `None` when
+/// the model exposes no effort knob.
+pub fn claude_default_effort(model: &str) -> Option<&'static str> {
+    let (family, major, minor) = claude_generation(model)?;
+    if claude_reasoning_levels(model).is_empty() {
+        return None;
+    }
+    match (family, major, minor) {
+        ("opus" | "haiku", 5, 5) => Some("medium"),
+        _ => Some("high"),
+    }
+}
+
+fn claude_summarized_adaptive_thinking(model: &str) -> bool {
+    matches!(
+        claude_generation(model),
+        Some((family, major, minor)) if family != "haiku" && (major >= 5 || (major == 4 && minor >= 7))
+    )
+}
+
+/// Whether the model thinks even when the request says nothing about it:
+/// Claude 5 and later keep adaptive thinking on by default. Earlier
+/// generations need `thinking` in the request to turn it on.
+fn claude_thinking_on_by_default(model: &str) -> bool {
+    matches!(
+        claude_generation(model),
+        Some((family, major, _)) if family != "haiku" && major >= 5
+    )
+}
+
 /// Documented effort controls for catalog gateways without capability metadata.
 /// Empty means no confirmed effort knob, not that the model cannot reason.
 /// Sources: DeepSeek thinking_mode; Claude effort; xAI text/reasoning.
@@ -963,11 +995,38 @@ impl ProviderAuth {
     }
 }
 
+/// How the provider returns the text of a thinking block. `None` in the
+/// config keeps the adapter's default (summarized only when an effort is
+/// set); an explicit value decouples the display from the effort knob.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThinkingDisplay {
+    Summarized,
+    Omitted,
+}
+
+impl ThinkingDisplay {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "summarized" => Some(Self::Summarized),
+            "omitted" => Some(Self::Omitted),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Summarized => "summarized",
+            Self::Omitted => "omitted",
+        }
+    }
+}
+
 pub struct ProviderConfig {
     pub kind: ProviderKind,
     pub endpoint: String,
     pub model: String,
     reasoning_effort: Option<String>,
+    thinking_display: Option<ThinkingDisplay>,
     auth: ProviderAuth,
     max_output_tokens: u32,
     response_cache_scope_id: u64,
@@ -1044,6 +1103,7 @@ impl ProviderConfig {
             endpoint: endpoint.into(),
             model: model.into(),
             reasoning_effort: None,
+            thinking_display: None,
             auth,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             response_cache_scope_id: next_response_cache_scope_id(),
@@ -1116,6 +1176,17 @@ impl ProviderConfig {
 
     pub fn reasoning_effort(&self) -> Option<&str> {
         self.reasoning_effort.as_deref()
+    }
+
+    /// Decouples how the thinking text is returned from the effort knob.
+    /// `None` keeps the adapter's default (summarized when an effort is set).
+    pub fn with_thinking_display(mut self, display: ThinkingDisplay) -> Self {
+        self.thinking_display = Some(display);
+        self
+    }
+
+    pub fn thinking_display(&self) -> Option<ThinkingDisplay> {
+        self.thinking_display
     }
 
     /// Sets the finite output cap sent to the provider.
@@ -1827,14 +1898,19 @@ fn harden_compaction_body(body: &mut Value, anthropic_wire: bool) -> Result<(), 
     // Anthropic would still bill the cache write: strip the markers entirely.
     object.remove("cache_control");
     if let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) {
-        for block in messages
+        for content in messages
             .iter_mut()
             .filter_map(|message| message.get_mut("content"))
             .filter_map(Value::as_array_mut)
-            .flatten()
-            .filter_map(Value::as_object_mut)
         {
-            block.remove("cache_control");
+            // The compaction system prompt differs from the session one, so a
+            // thinking block bound to the session prefix is invalid here.
+            if anthropic_wire {
+                content.retain(|block| !is_thinking_block(block));
+            }
+            for block in content.iter_mut().filter_map(Value::as_object_mut) {
+                block.remove("cache_control");
+            }
         }
     }
     // Preserve the adapter's effort. Compatible gateways may expose high-only
@@ -5667,7 +5743,7 @@ fn anthropic_headers(config: &ProviderConfig) -> Vec<(String, String)> {
                 "anthropic-beta".into(),
                 "claude-code-20250219,oauth-2025-04-20".into(),
             ),
-            ("user-agent".into(), "claude-cli/2.1.75".into()),
+            ("user-agent".into(), "claude-cli/2.1.325".into()),
             ("x-app".into(), "cli".into()),
         ]);
     }
@@ -6375,15 +6451,32 @@ impl AnthropicAdapter {
         if let Some(system) = self.config.effective_system_prompt() {
             body["system"] = Value::String(system.into());
         }
-        if let Some(effort) = self.config.reasoning_effort() {
+        let effort = self.config.reasoning_effort();
+        if let Some(effort) = effort {
             body["output_config"] = json!({"effort": effort});
+        }
+        // The display is its own preference: an explicit value keeps the
+        // thinking text independent of the effort knob. Without one, the
+        // previous behavior stands (summarized only when an effort is set).
+        let display = self
+            .config
+            .thinking_display()
+            .or_else(|| effort.is_some().then_some(ThinkingDisplay::Summarized));
+        if let Some(display) = display {
+            if claude_summarized_adaptive_thinking(&self.config.model)
+                && (effort.is_some() || claude_thinking_on_by_default(&self.config.model))
+            {
+                body["thinking"] = json!({"type": "adaptive", "display": display.as_str()});
+            }
         }
         if !tools.is_empty() {
             body["tools"] = Value::Array(anthropic_tool_definitions(tools));
         }
-        settle_thinking_blocks(&mut body, &bindings);
+        // The binding covers the final wire prefix, identity block included;
+        // settling before it would drop every block on the OAuth route.
         self.materialize_prompt_cache_intent(&mut body);
         self.prepend_oauth_identity(&mut body);
+        settle_thinking_blocks(&mut body, &bindings);
         body
     }
 
@@ -7337,7 +7430,14 @@ mod finalization_tests {
             for level in claude_reasoning_levels(model) {
                 let config = ProviderConfig::anthropic("https://api.anthropic.com/v1/messages", model, "k")
                     .with_reasoning_effort(*level);
-                assert!(AnthropicAdapter::new(config).is_ok(), "{model} {level} must pass the adapter");
+                let adapter = AnthropicAdapter::new(config).expect("adapter");
+                let body = adapter.messages_body(&[ProviderMessage::user("hi")], &[]);
+                assert_eq!(body["output_config"]["effort"], json!(level));
+                if model == "claude-opus-5-5" {
+                    assert_eq!(body["thinking"], json!({"type": "adaptive", "display": "summarized"}), "{model} {level}");
+                } else {
+                    assert!(body.get("thinking").is_none(), "{model} {level}");
+                }
             }
         }
     }
@@ -8143,6 +8243,126 @@ mod finalization_tests {
                 .unwrap(),
         );
         assert!(!body.to_string().contains("\"signature\""), "{body}");
+    }
+
+    #[test]
+    fn oauth_identity_keeps_the_thinking_binding() {
+        let adapter = AnthropicAdapter::new(ProviderConfig::anthropic_oauth(
+            "https://api.anthropic.com/v1/messages",
+            "claude-sonnet-5",
+            "fixture-token",
+        ))
+        .expect("adapter");
+        let client = HttpProviderClient::new(adapter, Duration::from_secs(1)).expect("client");
+        let tools = [read_tool()];
+        let mut messages = vec![ProviderMessage::user("task")];
+        let first = client
+            .prepare_messages_with_tools(&messages, &tools)
+            .unwrap();
+        messages.push(thinking_answer(&client, &first, "call-1", "first"));
+        messages.push(ProviderMessage::tool("read", "call-1", "contents"));
+        let body = wire_body(
+            client
+                .prepare_messages_with_tools(&messages, &tools)
+                .unwrap(),
+        );
+        let wire = body["messages"].as_array().unwrap();
+        assert_eq!(
+            wire[1]["content"][0]["thinking"], "first",
+            "the OAuth identity block must not break the thinking binding"
+        );
+    }
+
+    #[test]
+    fn compaction_drops_thinking_bound_to_the_session_prefix() {
+        let adapter = AnthropicAdapter::new(ProviderConfig::anthropic_oauth(
+            "https://api.anthropic.com/v1/messages",
+            "claude-sonnet-5",
+            "fixture-token",
+        ))
+        .expect("adapter");
+        let client = HttpProviderClient::new(adapter, Duration::from_secs(1)).expect("client");
+        let tools = [read_tool()];
+        let mut messages = vec![ProviderMessage::user("task")];
+        let first = client
+            .prepare_messages_with_tools(&messages, &tools)
+            .unwrap();
+        messages.push(thinking_answer(&client, &first, "call-1", "first"));
+        messages.push(ProviderMessage::tool("read", "call-1", "contents"));
+        let body = wire_body(
+            client
+                .prepare_compaction_messages(&messages, 1_024)
+                .unwrap(),
+        );
+        assert!(
+            !body.to_string().contains("\"thinking\""),
+            "compaction changes the system prefix: {body}"
+        );
+    }
+
+    #[test]
+    fn thinking_display_is_independent_of_effort_for_claude_5() {
+        let adapter = AnthropicAdapter::new(
+            ProviderConfig::anthropic(
+                "https://api.anthropic.com/v1/messages",
+                "claude-opus-5-5",
+                "k",
+            )
+            .with_thinking_display(ThinkingDisplay::Omitted),
+        )
+        .expect("adapter");
+        let body = adapter.messages_body(&[ProviderMessage::user("hi")], &[]);
+        assert!(body.get("output_config").is_none(), "{body}");
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "adaptive", "display": "omitted"})
+        );
+
+        let adapter = AnthropicAdapter::new(
+            ProviderConfig::anthropic(
+                "https://api.anthropic.com/v1/messages",
+                "claude-opus-5-5",
+                "k",
+            )
+            .with_thinking_display(ThinkingDisplay::Summarized),
+        )
+        .expect("adapter");
+        let body = adapter.messages_body(&[ProviderMessage::user("hi")], &[]);
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
+    }
+
+    #[test]
+    fn thinking_display_does_not_turn_on_thinking_for_claude_46() {
+        let adapter = AnthropicAdapter::new(
+            ProviderConfig::anthropic(
+                "https://api.anthropic.com/v1/messages",
+                "claude-sonnet-4-6",
+                "k",
+            )
+            .with_thinking_display(ThinkingDisplay::Summarized),
+        )
+        .expect("adapter");
+        let body = adapter.messages_body(&[ProviderMessage::user("hi")], &[]);
+        assert!(body.get("thinking").is_none(), "{body}");
+    }
+
+    #[test]
+    fn claude_default_effort_follows_the_generation() {
+        assert_eq!(claude_default_effort("claude-opus-5-5"), Some("medium"));
+        assert_eq!(
+            claude_default_effort("anthropic/claude-opus-5-5"),
+            Some("medium")
+        );
+        assert_eq!(claude_default_effort("claude-sonnet-4-6"), Some("high"));
+        assert_eq!(
+            claude_default_effort("claude-opus-4-5-20251101"),
+            Some("high")
+        );
+        assert_eq!(claude_default_effort("claude-haiku-5-5"), None);
+        assert_eq!(claude_default_effort("gpt-5.6-sol"), None);
     }
 
     #[test]

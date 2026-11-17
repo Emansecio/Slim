@@ -2126,8 +2126,8 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
             if body.is_empty() {
                 state.push_notification("Uso: !& COMANDO".into());
                 keep_draft = true;
-            } else if state.mode != slim_core::OperatingMode::Auto {
-                state.push_notification("Comandos com !& exigem Auto (/mode auto)".into());
+            } else if !state.mode.allows_mutation() {
+                state.push_notification("Comandos com !& exigem Auto ou Code (/mode auto)".into());
                 keep_draft = true;
             } else {
                 effects.push(Effect::Send(UiCommand::RunBackgroundShell {
@@ -2260,6 +2260,7 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                 "auto" => Some(slim_core::OperatingMode::Auto),
                 "read-only" | "readonly" => Some(slim_core::OperatingMode::ReadOnly),
                 "plan" => Some(slim_core::OperatingMode::Plan),
+                "code" => Some(slim_core::OperatingMode::Code),
                 _ => None,
             };
             if state.working {
@@ -2270,7 +2271,7 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
             } else if let Some(mode) = mode {
                 effects.push(Effect::Send(UiCommand::SetMode(mode)));
             } else {
-                state.push_notification("Uso: /mode auto|read-only|plan".into());
+                state.push_notification("Uso: /mode auto|read-only|plan|code".into());
                 keep_draft = true;
             }
             state.revisions.status += 1;
@@ -2501,8 +2502,10 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                         .into(),
                 );
                 keep_draft = true;
-            } else if state.mode != slim_core::OperatingMode::Auto {
-                state.push_notification("Comandos com ! exigem o modo Auto (/mode auto)".into());
+            } else if !state.mode.allows_mutation() {
+                state.push_notification(
+                    "Comandos com ! exigem o modo Auto ou Code (/mode auto)".into(),
+                );
                 keep_draft = true;
             } else if let Some(request_id) = state.begin_user_shell() {
                 effects.push(Effect::Send(UiCommand::RunUserShell {

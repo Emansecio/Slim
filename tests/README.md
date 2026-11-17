@@ -143,7 +143,7 @@ Prioridade reduzida favorece outros aplicativos, mas nao limita CPU/memoria nem
 garante execucao mais rapida. Execute uma operacao Cargo por vez neste checkout.
 
 Apos aprovar os checks necessarios, execute `refresh-slim.ps1` uma vez. Use
-`refresh-slim.ps1 -Test` quando ainda precisar da suite completa; nao repita
+`refresh-slim.ps1 -Test` somente a pedido explicito da suite completa; nao repita
 essa suite imediatamente antes. Nao acrescente `--no-run` antes de executar
 os mesmos testes sem uma necessidade intermediaria. Preserve o cache `target`.
 

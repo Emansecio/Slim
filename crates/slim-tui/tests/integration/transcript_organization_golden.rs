@@ -1076,18 +1076,24 @@ fn the_prompt_is_found_by_its_band_or_by_a_marker_of_its_own() {
             assert_ne!(user.chars().next(), agent.chars().next(), "{depth:?}");
         }
     }
-    // Where shades show, the prompt and the row of air that closes it sit on
-    // the band, edge to edge, and nothing else in the turn does.
+    // Where shades show, only the row with the prompt's words sits on the band;
+    // the row of air that closes it belongs to the surface, so the gray ends
+    // with the text and the next turn does not start against it.
     let rendered = render(&state, 80, 40);
     let band = Color::Rgb(0x14, 0x14, 0x14);
     let prompt = rendered.row("● O parser quebra");
-    for row in [prompt, prompt + 1] {
-        assert!(
-            rendered.background[row][..78].iter().all(|bg| *bg == band),
-            "row {row} is not on the band\n{}",
-            rendered.text()
-        );
-    }
+    assert!(
+        rendered.background[prompt][..78].iter().all(|bg| *bg == band),
+        "row {prompt} is not on the band\n{}",
+        rendered.text()
+    );
+    assert!(
+        rendered.background[prompt + 1][..78]
+            .iter()
+            .all(|bg| *bg != band),
+        "the air row after the prompt must leave the band\n{}",
+        rendered.text()
+    );
     for needle in ["● Slim", "Trabalhou", "Resultado"] {
         assert_ne!(rendered.bg(needle), band, "{needle}");
     }

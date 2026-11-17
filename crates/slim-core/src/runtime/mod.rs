@@ -518,6 +518,26 @@ impl Runtime {
         if let Some(definitions) = sets.get(&key) {
             return Arc::clone(definitions);
         }
+        if mode == crate::OperatingMode::Code {
+            // Code mode: one orchestration tool; workspace and MCP tools are
+            // reached from the program, never advertised one by one.
+            let mut tools = vec![codemode::definition(mode, code_intel_enabled)];
+            if key.artifact_enabled {
+                tools.push(artifact_read_definition());
+            }
+            if key.interaction_enabled {
+                tools.push(ask_question_definition());
+            }
+            // Meta tools whose result belongs to the conversation, not to a
+            // program: the visible plan and skill instructions.
+            tools.push(todo_tool_definition());
+            if key.skills_enabled {
+                tools.push(skill_tool_definition());
+            }
+            let definitions: Arc<[Value]> = tools.into();
+            sets.insert(key, Arc::clone(&definitions));
+            return definitions;
+        }
         let mut tools = self
             .tools
             .definitions_for_mode_shared(mode)
@@ -546,7 +566,7 @@ impl Runtime {
             }
             if key.mcp_enabled {
                 tools.push(mcp_tool_definition());
-                tools.push(codemode::definition());
+                tools.push(codemode::definition(mode, code_intel_enabled));
             }
         }
         let definitions: Arc<[Value]> = tools.into();

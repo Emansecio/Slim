@@ -1,4 +1,4 @@
-use slim_core::provider::ProviderKind;
+use slim_core::provider::{ProviderKind, ThinkingDisplay};
 use slim_core::OperatingMode;
 use slim_tui::api::ModelAlias;
 
@@ -29,11 +29,13 @@ Modes:
   --fake             Use the deterministic offline provider
   --plan             Allow inspection without workspace mutations
   --read-only        Disable workspace mutations
+  --code             Full access through codemode programs (JavaScript per step)
 
 Provider:
   --provider NAME    Provider route
   --model MODEL      Model identifier (Codex: astra, sol, terra, luna)
   --effort LEVEL     Reasoning effort
+  --thinking-display MODE  Thinking text: summarized or omitted
   --fast             Enable Codex Fast (higher usage)
   --normal           Use normal Codex speed
   --endpoint URL     Override the provider endpoint
@@ -79,6 +81,7 @@ pub(crate) struct ParsedArgs {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub thinking_display: Option<ThinkingDisplay>,
     pub codex_fast: Option<bool>,
     pub endpoint: Option<String>,
     pub session_path: Option<String>,
@@ -106,6 +109,7 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
         provider: None,
         model: None,
         effort: None,
+        thinking_display: None,
         codex_fast: None,
         endpoint: None,
         session_path: None,
@@ -124,6 +128,10 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
         mcp_config: None,
     };
     let mut index = 0;
+    // `--code` grants full access, so it cannot share a run with the
+    // inspection-only modes; `--plan` and `--read-only` keep last-wins.
+    let mut code_flag = false;
+    let mut inspection_flag = false;
     // Parsed flags are the only evidence of a selected mode: values such as
     // `--prompt "--plan"` are prompt text, not a mode selection.
     while index < args.len() {
@@ -138,14 +146,20 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
             "--trust-project" => parsed.trust_project = true,
             "--plan" => {
                 parsed.mode = OperatingMode::Plan;
+                inspection_flag = true;
             }
             "--read-only" => {
                 parsed.mode = OperatingMode::ReadOnly;
+                inspection_flag = true;
+            }
+            "--code" => {
+                parsed.mode = OperatingMode::Code;
+                code_flag = true;
             }
             "--jsonl" => parsed.format = OutputFormat::Jsonl,
             "--prompt" | "--provider" | "--model" | "--endpoint" | "--session" | "--resume"
-            | "--recover" | "--image" | "--effort" | "--experiment-id" | "--task-id"
-            | "--mcp-config" => {
+            | "--recover" | "--image" | "--effort" | "--thinking-display" | "--experiment-id"
+            | "--task-id" | "--mcp-config" => {
                 let option = args[index].clone();
                 index += 1;
                 let value = args.get(index).cloned().ok_or_else(|| {
@@ -156,6 +170,15 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
                     "--provider" => parsed.provider = Some(value),
                     "--model" => parsed.model = Some(value),
                     "--effort" => parsed.effort = Some(value),
+                    "--thinking-display" => {
+                        parsed.thinking_display =
+                            Some(ThinkingDisplay::parse(&value).ok_or_else(|| {
+                                failure(
+                                    ExitCode::InputRequired,
+                                    "unsupported thinking display; use summarized or omitted\n",
+                                )
+                            })?)
+                    }
                     "--endpoint" => parsed.endpoint = Some(value),
                     "--session" => parsed.session_path = Some(value),
                     "--resume" => parsed.resume_path = Some(value),
@@ -185,6 +208,12 @@ pub(crate) fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, CliOutput> {
     .into_iter()
     .filter(|present| *present)
     .count();
+    if code_flag && inspection_flag {
+        return Err(failure(
+            ExitCode::InputRequired,
+            "--code cannot be combined with --plan or --read-only\n",
+        ));
+    }
     if session_modes > 1 {
         return Err(failure(
             ExitCode::InputRequired,
@@ -220,6 +249,7 @@ where
         provider,
         model,
         effort,
+        thinking_display,
         codex_fast,
         endpoint,
         session_path,
@@ -461,9 +491,12 @@ where
         if let Some(effort) = effort {
             options = options.with_reasoning_effort(effort);
         }
+        if let Some(display) = thinking_display {
+            options = options.with_thinking_display(display);
+        }
         options.codex_fast = codex_fast;
         options.trust_project = trust_project;
-        options.host_mcp_config = mcp_config.clone().map(std::path::PathBuf::from);
+        options.host_mcp_config = mcp_config.map(std::path::PathBuf::from);
         let provider_result = match resume_preflight {
             Some(preflight) => {
                 crate::headless::run_provider_headless_with_resume_preflight_and_options(
@@ -966,6 +999,32 @@ mod tests {
         assert_eq!(parsed.prompt.as_deref(), Some("--mcp-config"), "a prompt value is never a flag");
         assert!(parse_cli_args(&["--mcp-config".to_owned()]).is_err(), "the path is required");
         assert_eq!(parse_cli_args(&[]).expect("empty").mcp_config, None);
+    }
+
+    #[test]
+    fn code_flag_selects_code_mode_and_refuses_inspection_modes() {
+        use slim_core::OperatingMode;
+        let parse = |args: &[&str]| {
+            parse_cli_args(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+        };
+        let parsed = parse(&["--headless", "--code", "--prompt", "fix"]).expect("parse");
+        assert_eq!(parsed.mode, OperatingMode::Code);
+        for conflicting in [["--code", "--plan"], ["--read-only", "--code"]] {
+            let refused = parse(&conflicting).err().expect("conflict");
+            assert_eq!(refused.code, crate::ExitCode::InputRequired);
+            assert!(
+                refused.stderr.contains("--code cannot be combined"),
+                "{}",
+                refused.stderr
+            );
+        }
+        // A prompt value is never a mode selection.
+        let parsed = parse(&["--plan", "--prompt", "--code"]).expect("parse");
+        assert_eq!(parsed.mode, OperatingMode::Plan);
+        assert_eq!(parsed.prompt.as_deref(), Some("--code"));
+        // The inspection modes keep their last-wins combination.
+        let parsed = parse(&["--plan", "--read-only"]).expect("parse");
+        assert_eq!(parsed.mode, OperatingMode::ReadOnly);
     }
 
     #[test]

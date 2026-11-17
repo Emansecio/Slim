@@ -25,6 +25,13 @@ fn effort_without_value_disables_stdin() {
 }
 
 #[test]
+fn thinking_display_value_is_not_a_positional_prompt() {
+    let args = args(&["--headless", "--thinking-display", "omitted"]);
+    assert!(!has_positional_prompt(&args));
+    assert!(known_options_without_prompt(&args));
+}
+
+#[test]
 fn codex_speed_flags_keep_stdin_prompt_mode() {
     for flag in ["--fast", "--normal"] {
         let args = args(&["--headless", "--provider", "openai-codex", flag]);

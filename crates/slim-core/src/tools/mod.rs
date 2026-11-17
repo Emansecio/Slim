@@ -803,7 +803,8 @@ impl ToolRegistry {
 
     pub(crate) fn definitions_for_mode_shared(&self, mode: OperatingMode) -> Arc<[Value]> {
         match mode {
-            OperatingMode::Auto => Arc::clone(&MODE_DEFINITIONS_AUTO),
+            // Code mode reaches the same native tools, from inside `codemode`.
+            OperatingMode::Auto | OperatingMode::Code => Arc::clone(&MODE_DEFINITIONS_AUTO),
             OperatingMode::ReadOnly => Arc::clone(&MODE_DEFINITIONS_READ_ONLY),
             OperatingMode::Plan => Arc::clone(&MODE_DEFINITIONS_PLAN),
         }

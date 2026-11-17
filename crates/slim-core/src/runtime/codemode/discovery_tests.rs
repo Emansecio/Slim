@@ -81,6 +81,8 @@ async fn eval(runtime: &mut Runtime, code: &str) -> Result<String, String> {
     let mut seq = runtime.app.events().last().map_or(0, |event| event.seq + 1);
     runtime
         .run_codemode(
+            crate::OperatingMode::Auto,
+            Path::new("."),
             ToolInvocation {
                 batch_id: "cell",
                 call_id: "test",

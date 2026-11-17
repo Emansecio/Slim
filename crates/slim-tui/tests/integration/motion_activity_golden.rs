@@ -619,10 +619,10 @@ fn stale_activity_reports_age_since_last_semantic_update() {
         text: "plan".into(),
     });
     assert_eq!(state.last_provider_content_ms, Some(1_000));
-    state.clock.elapsed_ms = 7_000;
+    state.clock.elapsed_ms = 14_000;
     let frame = render_state(&state, caps(false)).join("\n");
     assert!(
-        frame.contains("sem novo conteúdo há 6.0s"),
+        frame.contains("sem novo conteúdo há 13.0s"),
         "clock-only redraw must expose semantic staleness\n{frame}"
     );
 }

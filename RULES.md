@@ -120,8 +120,8 @@ amplia escopo.
 
 - Evidência das alterações ou conclusões e referências lidas (R1, R3).
 - Comandos realmente executados, resultados e falhas; testes de código são
-  não aplicáveis a análise e documentação. A suíte completa só é necessária
-  quando o risco ou o escopo a justificar ([AGENTS.md](AGENTS.md)).
+  não aplicáveis a análise e documentação. Um único comando por mudança basta;
+  suíte completa e `--workspace` só a pedido explícito ([AGENTS.md](AGENTS.md)).
 - Medições atuais verificadas ou resultados históricos identificados (R2).
 - Deploy: resultado do script e identidade do binário; não aplicável a mudança
   somente documental (R6, R7).

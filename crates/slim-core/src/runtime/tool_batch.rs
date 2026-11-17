@@ -436,6 +436,11 @@ impl Runtime {
             .into_iter()
             .map(|index| {
                 let mut prepared = prepared[index].clone();
+                // Parallel read and mutation waves execute `prepared` without
+                // the per-call dispatch below, so the refusal travels with it.
+                if let Some(refusal) = super::mode::code_mode_direct_refusal(mode, &prepared.name) {
+                    prepared.reject(&refusal);
+                }
                 if self.tuning_closed && prepared.error.is_none() && prepared.is_tuning_patch() {
                     prepared.reject(TUNING_CLOSED_ERROR);
                 }
@@ -1035,6 +1040,24 @@ impl Runtime {
     ) -> Result<(ToolExecutionOutcome, u64), ProviderError> {
         let started_at = Instant::now();
         let revision_before = self.tools.workspace_revision();
+        if let Some(refusal) = super::mode::code_mode_direct_refusal(mode, invocation.name) {
+            self.ensure_not_cancelled()?;
+            let mut following = next_seq;
+            let begun = self.begin_tool(invocation, &mut following)?;
+            let mut result = ToolResult::fail(invocation.name, refusal);
+            self.finish_tool(invocation, &mut result, begun, &mut following, None)?;
+            return Ok((
+                ToolExecutionOutcome {
+                    result,
+                    receipt: ToolExecutionReceipt::unobserved(
+                        revision_before,
+                        self.tools.workspace_revision(),
+                        elapsed_micros(started_at),
+                    ),
+                },
+                following,
+            ));
+        }
         if invocation.name == "shell_job" || (invocation.name == "shell" && mode.allows_mutation())
         {
             return self
@@ -1057,7 +1080,8 @@ impl Runtime {
         {
             self.execute_mcp(mode, invocation, next_seq).await?
         } else if invocation.name == "codemode" {
-            self.execute_codemode(mode, invocation, next_seq).await?
+            self.execute_codemode(mode, cwd, invocation, next_seq)
+                .await?
         } else {
             let (outcome, following) = self
                 .execute_tool_call_async(invocation, prepared, next_seq)

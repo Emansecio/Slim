@@ -238,6 +238,28 @@ fn runtime_catalog_preserves_native_modes_and_mcp_selection_boundary() {
 }
 
 #[test]
+fn code_mode_holds_the_same_capabilities_as_auto() {
+    let mut mcp = McpCatalog::new("fixture");
+    mcp.add_tool("fake");
+    mcp.add_resource("resource");
+    let mut catalog = CapabilityCatalog::with_native_tools();
+    catalog.add_skill("review").expect("skill");
+    catalog.add_mcp_catalog(&mcp).expect("catalog");
+    for descriptor in catalog.list() {
+        assert_eq!(
+            descriptor.allows_mode(OperatingMode::Code),
+            descriptor.allows_mode(OperatingMode::Auto),
+            "{}",
+            descriptor.id
+        );
+    }
+    assert!(catalog
+        .descriptor("tool.write")
+        .expect("write")
+        .allows_mode(OperatingMode::Code));
+}
+
+#[test]
 fn cancellation_token_broadcasts_to_all_waiters() {
     let token = slim_core::runtime::CancellationToken::new();
     let runtime = tokio::runtime::Runtime::new().expect("tokio");

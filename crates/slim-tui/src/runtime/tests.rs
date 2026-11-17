@@ -2363,10 +2363,10 @@ fn data_barrier_drains_prefetched_event_and_full_bounded_stream_lane() {
 #[test]
 fn spinner_glyph_cycles_braille_and_honors_fallbacks() {
     let full = caps();
-    // Each glyph holds for two motion frames: about six steps a second.
+    // One glyph per motion frame: about twelve steps a second.
     assert_eq!(super::spinner_glyph(0, full), '⠋');
-    assert_eq!(super::spinner_glyph(1, full), '⠋');
-    assert_eq!(super::spinner_glyph(2, full), '⠙');
+    assert_eq!(super::spinner_glyph(1, full), '⠙');
+    assert_eq!(super::spinner_glyph(2, full), '⠹');
     assert_eq!(super::spinner_glyph(19, full), '⠏');
     assert_eq!(super::spinner_glyph(20, full), '⠋');
 
@@ -2378,15 +2378,16 @@ fn spinner_glyph_cycles_braille_and_honors_fallbacks() {
     assert_eq!(super::spinner_glyph(1, reduced), '\u{25cb}');
 
     // NO_COLOR removes hue, not movement: an ASCII spinner, half the speed of
-    // the braille one because it has four frames instead of ten.
+    // the braille one because it has four frames instead of ten (two motion
+    // frames per glyph).
     let no_color = Capabilities {
         color_depth: ColorDepth::None,
         ..full
     };
-    let ascii: Vec<char> = (0..10)
-        .map(|frame| super::spinner_glyph(frame * 2, no_color))
+    let ascii: Vec<char> = (0..8)
+        .map(|frame| super::spinner_glyph(frame, no_color))
         .collect();
-    assert_eq!(ascii, ['|', '|', '/', '/', '-', '-', '\\', '\\', '|', '|']);
+    assert_eq!(ascii, ['|', '|', '/', '/', '-', '-', '\\', '\\']);
     // Only the reduced-motion preference stops it, and then it is the static
     // ASCII marker.
     let plain_and_reduced = Capabilities {

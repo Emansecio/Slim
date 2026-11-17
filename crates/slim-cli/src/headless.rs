@@ -240,6 +240,9 @@ pub struct ProviderRunOptions {
     pub context_window_tokens: Option<u64>,
     pub max_output_tokens: Option<u32>,
     pub reasoning_effort: Option<String>,
+    /// How Anthropic returns the thinking text; `None` keeps the adapter's
+    /// default (summarized only when an effort is set).
+    pub thinking_display: Option<slim_core::provider::ThinkingDisplay>,
     pub codex_fast: bool,
     pub max_turns: Option<usize>,
     /// Wall-clock budget of one run, in seconds.
@@ -329,6 +332,11 @@ impl ProviderRunOptions {
 
     pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
         self.reasoning_effort = Some(effort.into());
+        self
+    }
+
+    pub fn with_thinking_display(mut self, display: slim_core::provider::ThinkingDisplay) -> Self {
+        self.thinking_display = Some(display);
         self
     }
 
@@ -2198,6 +2206,9 @@ pub(crate) async fn execute_provider_turn_async(
             };
             if let Some(effort) = reasoning_effort.as_deref() {
                 config = config.with_reasoning_effort(effort);
+            }
+            if let Some(display) = options.thinking_display {
+                config = config.with_thinking_display(display);
             }
             let adapter = AnthropicAdapter::new(config.with_max_output_tokens(max_output_tokens))?;
             run_loop!(adapter, AnthropicAdapter)

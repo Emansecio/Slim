@@ -1,8 +1,9 @@
 //! Discovery helpers of codemode (`searchTools`, `describeTool`,
 //! `listServers`). They read the same catalogs, ranking and hidden-tool
-//! filter as the `mcp` gateway and never consume the tool budget. Like every
-//! host call they run one at a time: the interpreter bridge is synchronous,
-//! so parallel host calls are not supported.
+//! filter as the `mcp` gateway and never consume the tool budget. They are
+//! synchronous for the program: the worker blocks until the host replies,
+//! while calls already in flight keep running. In Code mode `describeTool`
+//! also describes `slim.<tool>` and adds a TypeScript `signature`.
 
 use super::*;
 use crate::mcp::{McpCleanupStatus, McpInterruption};
@@ -15,46 +16,45 @@ impl Runtime {
     pub(super) async fn codemode_discovery(
         &mut self,
         command: Command,
+        scope: &CellScope<'_>,
         cell: &engine::Cell,
-        run: &CancellationToken,
     ) -> Result<Value, String> {
-        if run.is_cancelled() || cell.cancellation.is_cancelled() || Instant::now() >= cell.deadline
-        {
+        if cell.cancellation.is_cancelled() {
             return Err("cell cancelled or deadline exceeded".into());
+        }
+        if let Command::DescribeTool { name } = &command {
+            if let Some(native) = name
+                .strip_prefix("slim.")
+                .filter(|_| !scope.natives.is_empty())
+            {
+                return Ok(scope.native(native).map_or(Value::Null, |definition| {
+                    describe_native(name, native, definition)
+                }));
+            }
         }
         let Some(manager) = self.mcp.clone() else {
             return Err("no MCP servers configured".into());
         };
-        let cancellation = cell.cancellation.clone();
-        let pending = async {
-            match command {
-                Command::SearchTools(SearchArgs {
-                    query,
-                    limit,
-                    server,
-                }) => {
-                    let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
-                    if limit == 0 {
-                        return McpRequestOutcome::Completed(Err(crate::mcp::McpError::Protocol(
-                            "searchTools() limit must be a positive integer".into(),
-                        )));
-                    }
-                    manager
-                        .search_tools_value(server.as_deref(), &query, limit, cancellation)
-                        .await
+        // The cell's token is cancelled by the run and by the deadline.
+        let cancellation = cell.cancellation.mcp_cancellation();
+        let outcome = match command {
+            Command::SearchTools(SearchArgs {
+                query,
+                limit,
+                server,
+            }) => {
+                let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+                if limit == 0 {
+                    return Err("searchTools() limit must be a positive integer".into());
                 }
-                Command::DescribeTool { name } => {
-                    manager.describe_tool_value(&name, cancellation).await
-                }
-                _ => McpRequestOutcome::Completed(Ok(manager.list_servers_value())),
+                manager
+                    .search_tools_value(server.as_deref(), &query, limit, cancellation)
+                    .await
             }
-        };
-        tokio::pin!(pending);
-        let outcome = tokio::select! {
-            biased;
-            _ = run.cancelled() => { cell.cancellation.cancel(); pending.await },
-            _ = tokio::time::sleep_until(cell.deadline.into()) => { cell.cancellation.cancel(); pending.await },
-            outcome = &mut pending => outcome,
+            Command::DescribeTool { name } => {
+                manager.describe_tool_value(&name, cancellation).await
+            }
+            _ => McpRequestOutcome::Completed(Ok(manager.list_servers_value())),
         };
         let mut value = match outcome {
             McpRequestOutcome::Completed(Ok(value)) => value,
@@ -68,12 +68,46 @@ impl Runtime {
                 cleanup,
             } => return Err(interrupted(interruption, cleanup)),
         };
+        if !scope.natives.is_empty() {
+            add_signature(&mut value);
+        }
         redact_value(&mut value, &self.sensitive_values.0);
         if value.to_string().len() > MAX_JSON_BYTES {
             return Err("discovery result exceeds the 1 MiB bridge limit; narrow the query".into());
         }
         Ok(value)
     }
+}
+
+/// `describeTool('slim.<tool>')`: the native definition in the shape of an
+/// MCP description, with the signature of `slim.<tool>` as declared. Natives
+/// resolve to their text output.
+fn describe_native(name: &str, native: &str, definition: &Value) -> Value {
+    let description = definition["description"].as_str();
+    let schema = &definition["input_schema"];
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": schema,
+        "signature": typescript::signature(native, description, schema, "string"),
+    })
+}
+
+/// Adds the TypeScript signature to a described MCP tool. The call resolves
+/// to `structuredContent`, typed by `outputSchema`, when the tool has one.
+fn add_signature(described: &mut Value) {
+    let Some(name) = described["name"].as_str() else {
+        return;
+    };
+    let returns = described
+        .get("outputSchema")
+        .map_or_else(|| "unknown".to_owned(), typescript::ts_type);
+    described["signature"] = Value::String(typescript::signature(
+        name,
+        described["description"].as_str(),
+        &described["inputSchema"],
+        &returns,
+    ));
 }
 
 fn interrupted(interruption: McpInterruption, cleanup: McpCleanupStatus) -> String {
