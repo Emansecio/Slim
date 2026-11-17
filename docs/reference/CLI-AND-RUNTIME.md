@@ -1234,8 +1234,10 @@ célula sem as rows de cada chamada (o journal `codemode.call.v1` continua a
 fonte durável).
 
 **Console.** `console.log/info/warn/error` são capturados (`warn:`/`error:`
-como prefixo; objetos em JSON) até 16 KiB por célula; o excedente é contado
-numa linha final de truncamento. A captura vem depois do resultado ou do erro,
+como prefixo; objetos em JSON) até 1 MiB por célula, o mesmo teto do `return`;
+o excedente é contado numa linha final de truncamento. Uma saída acima do
+limite de resultado vira artefato como qualquer saída longa de tool: o modelo
+recebe a prévia com `[artifact id=…]` e lê o resto com `artifact_read`. A captura vem depois do resultado ou do erro,
 após uma linha `console:`.
 
 `store(chave, valorJSON)` e `load(chave)` mantêm valores na sessão;

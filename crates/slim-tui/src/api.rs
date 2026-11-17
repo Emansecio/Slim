@@ -1372,6 +1372,11 @@ pub fn tool_output_preview(name: &str, output: &str) -> String {
             return bounded_first_line(reason, 512);
         }
     }
+    if name == "codemode" {
+        if let Some(reason) = codemode_preview(output) {
+            return bounded_first_line(reason, 512);
+        }
+    }
     if name == "shell" {
         let status = output.lines().next().unwrap_or_default();
         if status.starts_with("exit ") && status != "exit 0" {
@@ -1390,6 +1395,25 @@ pub fn tool_output_preview(name: &str, output: &str) -> String {
         }
     }
     bounded_first_line(output, 512)
+}
+
+/// The line of a codemode cell that says what happened. A failure opens with
+/// a note for the model (`codemode failed after N tool call(s); …`) and the
+/// error follows it; a program that returned nothing and wrote to the console
+/// speaks through its first console line.
+fn codemode_preview(output: &str) -> Option<&str> {
+    if output.starts_with("codemode failed after ") {
+        let error = output
+            .lines()
+            .skip(1)
+            .find(|line| !line.trim().is_empty())?;
+        return Some(error.strip_prefix("Error: ").unwrap_or(error));
+    }
+    let (result, console) = output.split_once("\nconsole:\n")?;
+    if !matches!(result.trim(), "" | "null" | "undefined") {
+        return None;
+    }
+    console.lines().find(|line| !line.trim().is_empty())
 }
 
 fn bounded_first_line(output: &str, limit: usize) -> String {
@@ -2036,6 +2060,23 @@ mod tests {
         };
         assert_eq!(call_id, ToolCallId("code:1".into()));
         assert_eq!((name.as_str(), success), ("read", false));
+    }
+
+    #[test]
+    fn codemode_previews_say_what_the_program_did() {
+        let preview = |output: &str| super::tool_output_preview("codemode", output);
+        assert_eq!(
+            preview(
+                "codemode failed after 0 tool call(s); stored values and prior tool effects remain, do not replay the cell automatically.\nError: Unexpected identifier 'pathsFound'\n    at eval_script:44:22"
+            ),
+            "Unexpected identifier 'pathsFound'"
+        );
+        assert_eq!(
+            preview("null\nconsole:\n\npatched a.swift; 2 edits applied"),
+            "patched a.swift; 2 edits applied"
+        );
+        assert_eq!(preview("{\"ok\":true}\nconsole:\nlog"), "{\"ok\":true}");
+        assert_eq!(preview("null"), "null");
     }
 
     #[test]

@@ -163,7 +163,7 @@ async fn console_is_captured_with_the_result_and_the_failure_and_truncated() {
         "{error}"
     );
     let output = serve(
-        "for (let i = 0; i < 100; i++) console.log('é'.repeat(200)); return null;",
+        "for (let i = 0; i < 3000; i++) console.log('é'.repeat(200)); return null;",
         &[],
         SECOND,
         CancellationToken::new(),
@@ -175,8 +175,8 @@ async fn console_is_captured_with_the_result_and_the_failure_and_truncated() {
     let kept = kept.strip_prefix("null\nconsole:\n").unwrap();
     assert!(kept.len() <= engine::MAX_CONSOLE_BYTES);
     assert!(kept.len() > engine::MAX_CONSOLE_BYTES - 2, "{}", kept.len());
-    // 100 lines of 400 bytes, less the line bytes kept.
-    let dropped = 100 * 400 - (kept.len() - kept.matches('\n').count());
+    // 3000 lines of 400 bytes, less the line bytes kept.
+    let dropped = 3000 * 400 - (kept.len() - kept.matches('\n').count());
     assert_eq!(note, format!("… console truncated: {dropped} more bytes"));
 }
 

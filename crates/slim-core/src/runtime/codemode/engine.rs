@@ -23,8 +23,10 @@ use crate::runtime::CancellationToken;
 
 pub(super) const MAX_JSON_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_CODE_BYTES: usize = 64 * 1024;
-/// Console output kept per cell; the rest is counted, not stored.
-pub(super) const MAX_CONSOLE_BYTES: usize = 16 * 1024;
+/// Console output kept per cell, the bound of a returned value; the rest is
+/// counted, not stored. What exceeds the result budget is not lost: the cell
+/// output becomes an artifact like any long tool output.
+pub(super) const MAX_CONSOLE_BYTES: usize = MAX_JSON_BYTES;
 /// How often a waiting worker rechecks cancellation and the deadline.
 const POLL: Duration = Duration::from_millis(25);
 const INTERRUPTED: &str = "cell cancelled or deadline exceeded";
