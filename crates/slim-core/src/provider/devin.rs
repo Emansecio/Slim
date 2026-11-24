@@ -618,6 +618,61 @@ fn invalidate_cached_jwt(endpoint: &str, api_key: &str) {
     }
 }
 
+fn valid_cached_jwt(endpoint: &str, api_key: &str) -> Option<(String, String)> {
+    let cache = JWT_CACHE.get()?;
+    let guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+    let entry = guard.get(&jwt_cache_key(endpoint, api_key))?;
+    (Instant::now() < entry.expires_at)
+        .then(|| (entry.user_jwt.clone(), entry.base_url.clone()))
+}
+
+/// Warms Devin's short-lived user JWT while the user types or while catalog,
+/// MCP and workspace setup run. Errors only retry on the authoritative request.
+pub fn prewarm_devin_auth(endpoint: &str, api_key: &str, connect: Duration) {
+    const PREWARM_COOLDOWN: Duration = Duration::from_secs(60);
+    static WARMING: OnceLock<Mutex<HashMap<[u8; 32], Instant>>> = OnceLock::new();
+    if api_key.trim().is_empty() || valid_cached_jwt(endpoint, api_key).is_some() {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let key = jwt_cache_key(endpoint, api_key);
+    let now = Instant::now();
+    {
+        let mut warming = WARMING
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if warming
+            .get(&key)
+            .is_some_and(|last| now.saturating_duration_since(*last) < PREWARM_COOLDOWN)
+        {
+            return;
+        }
+        warming.insert(key, now);
+    }
+    let Ok(client) = super::shared_http_client(connect) else {
+        return;
+    };
+    let endpoint = endpoint.trim_end_matches('/').to_owned();
+    let api_key = api_key.to_owned();
+    handle.spawn(async move {
+        let result = match DevinAdapter::new(&endpoint, DEVIN_DEFAULT_MODEL, &api_key, None) {
+            Ok(adapter) => adapter.resolve_user_jwt(&client, false).await.map(|_| ()),
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            if let Some(warming) = WARMING.get() {
+                warming
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&key);
+            }
+        }
+    });
+}
+
 /// Text and images of a user/tool turn: blocks replace `content` when present.
 fn message_text_and_images(message: &ProviderMessage) -> (String, Vec<Vec<u8>>) {
     let mut prompt = String::new();
@@ -1507,8 +1562,10 @@ struct DevinStreamState {
     last_tool_id: Option<String>,
     stop_reason: u64,
     saw_trailer: bool,
-    /// True once a usage block was forwarded upstream (server re-sends usage).
-    usage_reported: bool,
+    /// Cumulative usage totals already emitted as additive partials.
+    input_tokens_reported: u64,
+    output_tokens_reported: u64,
+    input_complete_reported: bool,
     usage: UsageBreakdown,
     has_usage: bool,
     /// Latest `delta_signature`; replayed with the thinking on the next turn.
@@ -1585,13 +1642,25 @@ impl DevinAdapter {
 
     /// Applies what discovery knows about this model: its wire uid at the
     /// session's effort, router status and parallel-tool support.
-    pub fn with_catalog_entry(mut self, entry: &DevinCatalogEntry) -> Self {
+    pub fn with_catalog_entry(mut self, entry: &DevinCatalogEntry) -> Result<Self, ProviderError> {
+        if let Some(effort) = self.reasoning_effort.as_deref() {
+            if !entry.effort_routes.is_empty()
+                && !entry.effort_routes.iter().any(|(route, _)| route == effort)
+            {
+                return Err(ProviderError::InvalidResponse {
+                    message: format!(
+                        "unsupported reasoning effort for Devin model {}: {effort}",
+                        entry.id
+                    ),
+                });
+            }
+        }
         self.chat_model_uid = entry
             .chat_model_uid(self.reasoning_effort.as_deref())
             .to_owned();
         self.model_router = entry.model_router;
         self.parallel_tool_calls = entry.parallel_tool_calls;
-        self
+        Ok(self)
     }
 
     pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
@@ -1793,6 +1862,7 @@ impl DevinAdapter {
             .header("content-type", "application/proto")
             .header("connect-protocol-version", "1")
             .header("accept", "*/*")
+            .timeout(Duration::from_secs(10))
             .body(body)
             .send()
             .await
@@ -2217,18 +2287,27 @@ fn parse_connect_frame_with_state(
     }
     if delta.has_usage {
         state.has_usage = true;
-        // `input_tokens` excludes cache reads and writes on this wire.
+        // `input_tokens` excludes cache reads and writes on this wire; the server
+        // re-sends cumulative totals, while `UsagePartial` is additive.
         state.usage.uncached_input_tokens = delta.input_tokens;
         state.usage.cache_write_tokens = delta.cache_write_tokens;
         state.usage.cache_read_tokens = delta.cache_read_tokens;
         state.usage.output_tokens = delta.output_tokens;
+        let total_input = state.usage.total_input_tokens();
+        let input_delta = total_input.saturating_sub(state.input_tokens_reported);
+        let output_delta = delta
+            .output_tokens
+            .saturating_sub(state.output_tokens_reported);
+        state.input_tokens_reported = state.input_tokens_reported.max(total_input);
+        state.output_tokens_reported = state.output_tokens_reported.max(delta.output_tokens);
+        let input_complete = !state.input_complete_reported && total_input > 0;
+        state.input_complete_reported |= input_complete;
         events.push(ProviderEvent::UsagePartial {
-            input_tokens: state.usage.total_input_tokens(),
-            output_tokens: delta.output_tokens,
-            input_complete: !state.usage_reported,
+            input_tokens: input_delta,
+            output_tokens: output_delta,
+            input_complete,
             output_complete: false,
         });
-        state.usage_reported = true;
     }
     Ok(events)
 }
@@ -2328,10 +2407,23 @@ fn parse_trailer_with_state(
         });
     }
     if state.has_usage {
+        let total_input = state.usage.total_input_tokens();
+        let input_delta = total_input.saturating_sub(state.input_tokens_reported);
+        let output_delta = state
+            .usage
+            .output_tokens
+            .saturating_sub(state.output_tokens_reported);
+        let input_complete = !state.input_complete_reported;
+        events.push(ProviderEvent::UsagePartial {
+            input_tokens: input_delta,
+            output_tokens: output_delta,
+            input_complete,
+            output_complete: true,
+        });
         events.push(ProviderEvent::UsageBreakdown { usage: state.usage });
         events.push(ProviderEvent::Usage {
-            input_tokens: state.usage.total_input_tokens(),
-            output_tokens: state.usage.output_tokens,
+            input_tokens: 0,
+            output_tokens: 0,
         });
     }
     let reason = if !state.tool_names.is_empty() {
@@ -2355,12 +2447,8 @@ impl DevinAdapter {
     ) -> Result<(String, String), ProviderError> {
         let key = jwt_cache_key(&self.endpoint, &self.api_key);
         if !force_refresh {
-            let cache = JWT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-            let guard = cache.lock().unwrap_or_else(|error| error.into_inner());
-            if let Some(entry) = guard.get(&key) {
-                if Instant::now() < entry.expires_at {
-                    return Ok((entry.user_jwt.clone(), entry.base_url.clone()));
-                }
+            if let Some(cached) = valid_cached_jwt(&self.endpoint, &self.api_key) {
+                return Ok(cached);
             }
         }
         let jwt_payload = Self::unary_rpc(
@@ -2545,7 +2633,58 @@ mod tests {
         assert_eq!(family.chat_model_uid(None), "gpt-5-6-sol-high");
         assert_eq!(family.chat_model_uid(Some("low")), "gpt-5-6-sol-low");
         assert_eq!(family.chat_model_uid(Some("xhigh")), "gpt-5-6-sol-xhigh");
-        assert_eq!(family.chat_model_uid(Some("ultra")), "gpt-5-6-sol-high");
+        let invalid = DevinAdapter::new(
+            DEVIN_DEFAULT_BASE_URL,
+            "gpt-5-6-sol",
+            "key",
+            Some("ultra"),
+        )
+        .unwrap()
+        .with_catalog_entry(family);
+        assert!(invalid.is_err(), "invalid effort must not fall back to the default lane");
+        let valid = DevinAdapter::new(
+            DEVIN_DEFAULT_BASE_URL,
+            "gpt-5-6-sol",
+            "key",
+            Some("xhigh"),
+        )
+        .unwrap()
+        .with_catalog_entry(family)
+        .unwrap();
+        assert_eq!(valid.chat_model_uid, "gpt-5-6-sol-xhigh");
+    }
+
+    #[test]
+    fn explicit_off_effort_uses_its_declared_route() {
+        let entry = DevinCatalogEntry {
+            id: "claude-opus-4-6".into(),
+            request_model: Some("claude-opus-4-6-high".into()),
+            effort_routes: vec![
+                ("off".into(), "claude-opus-4-6-off".into()),
+                ("high".into(), "claude-opus-4-6-high".into()),
+            ],
+            ..DevinCatalogEntry::default()
+        };
+        let adapter = DevinAdapter::new(
+            DEVIN_DEFAULT_BASE_URL,
+            "claude-opus-4-6",
+            "key",
+            Some("off"),
+        )
+        .unwrap()
+        .with_catalog_entry(&entry)
+        .unwrap();
+        assert_eq!(adapter.chat_model_uid, "claude-opus-4-6-off");
+        let default = DevinAdapter::new(
+            DEVIN_DEFAULT_BASE_URL,
+            "claude-opus-4-6",
+            "key",
+            None,
+        )
+        .unwrap()
+        .with_catalog_entry(&entry)
+        .unwrap();
+        assert_eq!(default.chat_model_uid, "claude-opus-4-6-high");
     }
 
     #[test]
@@ -2655,11 +2794,78 @@ mod tests {
         proto_varint_field(&mut usage, 5, 30);
         let mut frame = Vec::new();
         proto_message_field(&mut frame, 7, usage);
-        adapter.parse_connect_frame(&frame, false).unwrap();
+        let partials = adapter.parse_connect_frame(&frame, false).unwrap();
+        assert!(partials.iter().any(|event| matches!(
+            event,
+            ProviderEvent::UsagePartial {
+                input_tokens: 42,
+                output_tokens: 4,
+                input_complete: true,
+                output_complete: false,
+            }
+        )));
         let events = adapter.parse_connect_frame(b"", true).unwrap();
         assert!(events.iter().any(|event| matches!(
             event,
-            ProviderEvent::Usage { input_tokens: 42, output_tokens: 4 }
+            ProviderEvent::UsageBreakdown { usage }
+                if usage.total_input_tokens() == 42 && usage.output_tokens == 4
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::Usage { input_tokens: 0, output_tokens: 0 }
+        )));
+    }
+
+    #[test]
+    fn cumulative_usage_wire_frames_become_additive_deltas() {
+        let adapter = adapter();
+        let usage_frame = |input: u64, output: u64, cache_write: u64, cache_read: u64| {
+            let mut usage = Vec::new();
+            proto_varint_field(&mut usage, 2, input);
+            proto_varint_field(&mut usage, 3, output);
+            proto_varint_field(&mut usage, 4, cache_write);
+            proto_varint_field(&mut usage, 5, cache_read);
+            let mut frame = Vec::new();
+            proto_message_field(&mut frame, 7, usage);
+            frame
+        };
+        let first = adapter
+            .parse_connect_frame(&usage_frame(10, 4, 2, 30), false)
+            .unwrap();
+        assert!(first.iter().any(|event| matches!(
+            event,
+            ProviderEvent::UsagePartial {
+                input_tokens: 42,
+                output_tokens: 4,
+                input_complete: true,
+                output_complete: false,
+            }
+        )));
+        let second = adapter
+            .parse_connect_frame(&usage_frame(20, 9, 4, 60), false)
+            .unwrap();
+        assert!(second.iter().any(|event| matches!(
+            event,
+            ProviderEvent::UsagePartial {
+                input_tokens: 42,
+                output_tokens: 5,
+                input_complete: false,
+                output_complete: false,
+            }
+        )));
+        let final_events = adapter.parse_connect_frame(b"", true).unwrap();
+        assert!(final_events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::UsagePartial {
+                input_tokens: 0,
+                output_tokens: 0,
+                input_complete: false,
+                output_complete: true,
+            }
+        )));
+        assert!(final_events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::Usage { input_tokens: 0, output_tokens: 0 }
         )));
     }
 
@@ -2733,7 +2939,7 @@ mod tests {
             parallel_tool_calls: true,
             ..DevinCatalogEntry::default()
         };
-        assert!(!disabled(&adapter.with_catalog_entry(&entry)));
+        assert!(!disabled(&adapter.with_catalog_entry(&entry).unwrap()));
     }
 
     #[test]

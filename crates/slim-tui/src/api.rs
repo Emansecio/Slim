@@ -86,6 +86,7 @@ impl ModelAlias {
 /// Codex model catalog (`supported_reasoning_levels`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReasoningEffort {
+    Off,
     Low,
     Medium,
     High,
@@ -95,7 +96,8 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
+        Self::Off,
         Self::Low,
         Self::Medium,
         Self::High,
@@ -106,6 +108,7 @@ impl ReasoningEffort {
 
     pub fn id(self) -> &'static str {
         match self {
+            Self::Off => "off",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -117,6 +120,7 @@ impl ReasoningEffort {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Off => "Off",
             Self::Low => "Low",
             Self::Medium => "Medium",
             Self::High => "High",
@@ -128,6 +132,7 @@ impl ReasoningEffort {
 
     pub fn description(self) -> &'static str {
         match self {
+            Self::Off => "Raciocínio desligado quando o modelo permite",
             Self::Low => "Respostas rápidas, raciocínio leve",
             Self::Medium => "Equilíbrio entre velocidade e profundidade",
             Self::High => "Raciocínio estendido para problemas complexos",
@@ -139,6 +144,7 @@ impl ReasoningEffort {
 
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
@@ -163,9 +169,24 @@ impl ReasoningEffort {
     /// Request-level efforts supported by each built-in Codex model, matching
     /// the catalog's `supported_reasoning_levels`.
     pub fn supported(model: ModelAlias) -> &'static [Self] {
+        const CODEX_DEFAULT: &[ReasoningEffort] = &[
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+            ReasoningEffort::Ultra,
+        ];
+        const CODEX_LUNA: &[ReasoningEffort] = &[
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+        ];
         match model {
-            ModelAlias::Sol | ModelAlias::Terra => &Self::ALL,
-            ModelAlias::Luna => &Self::ALL[..Self::ALL.len() - 1],
+            ModelAlias::Sol | ModelAlias::Terra => CODEX_DEFAULT,
+            ModelAlias::Luna => CODEX_LUNA,
         }
     }
 
@@ -1657,7 +1678,7 @@ pub enum UiCommand {
     },
     SetDevinModel {
         model: String,
-        effort: ReasoningEffort,
+        effort: Option<ReasoningEffort>,
     },
     /// Applies an Anthropic model id and effort on the live worker (activating
     /// the saved Anthropic OAuth or API-key login when switching providers).
@@ -3082,19 +3103,13 @@ mod tests {
 
     #[test]
     fn gpt_56_efforts_match_codex_model_catalog() {
-        assert_eq!(
-            ReasoningEffort::supported(ModelAlias::Sol),
-            &ReasoningEffort::ALL
-        );
-        assert_eq!(
-            ReasoningEffort::supported(ModelAlias::Terra),
-            &ReasoningEffort::ALL
-        );
-        assert_eq!(
-            ReasoningEffort::supported(ModelAlias::Luna),
-            &ReasoningEffort::ALL[..5]
-        );
+        assert_eq!(ReasoningEffort::supported(ModelAlias::Sol).len(), 6);
+        assert_eq!(ReasoningEffort::supported(ModelAlias::Terra).len(), 6);
+        assert_eq!(ReasoningEffort::supported(ModelAlias::Luna).len(), 5);
+        assert!(!ReasoningEffort::supported(ModelAlias::Sol).contains(&ReasoningEffort::Off));
         assert!(!ReasoningEffort::supported(ModelAlias::Luna).contains(&ReasoningEffort::Ultra));
+        assert!(ReasoningEffort::ALL.contains(&ReasoningEffort::Off));
+        assert_eq!(ReasoningEffort::parse("off"), Some(ReasoningEffort::Off));
     }
 }
 

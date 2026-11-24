@@ -177,7 +177,7 @@ fn restored_codemode_reconstructs_child_steps_from_journal_facts() {
             },
         ],
     };
-    let messages = session_transcript(&preflight).unwrap();
+    let messages = session_transcript(&preflight, false).unwrap();
     assert_eq!(messages.len(), 3);
     let TranscriptRole::Tool {
         batch_id: cm_batch,

@@ -13,6 +13,7 @@ pub use crate::command_code_catalog::CatalogSource;
 
 const MAX_CATALOG_BYTES: usize = 4 * 1024 * 1024;
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
+static REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DevinCatalogSnapshot {
@@ -112,7 +113,39 @@ impl DevinCatalog {
             })
     }
 
+    pub fn cache_is_fresh(&self, ttl: Duration) -> bool {
+        fs::symlink_metadata(&self.cache_path)
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age <= ttl)
+    }
+
     pub async fn refresh(
+        &self,
+        api_key: &str,
+    ) -> Result<DevinCatalogSnapshot, slim_core::ProviderError> {
+        let _guard = REFRESH_LOCK.lock().await;
+        self.refresh_unlocked(api_key).await
+    }
+
+    pub async fn refresh_if_stale(
+        &self,
+        api_key: &str,
+        ttl: Duration,
+    ) -> Result<Option<DevinCatalogSnapshot>, slim_core::ProviderError> {
+        if self.cache_is_fresh(ttl) {
+            return Ok(None);
+        }
+        let _guard = REFRESH_LOCK.lock().await;
+        if self.cache_is_fresh(ttl) {
+            return Ok(None);
+        }
+        self.refresh_unlocked(api_key).await.map(Some)
+    }
+
+    async fn refresh_unlocked(
         &self,
         api_key: &str,
     ) -> Result<DevinCatalogSnapshot, slim_core::ProviderError> {
@@ -221,6 +254,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let path = dir.join("devin-models.json");
         let catalog = DevinCatalog::at("http://127.0.0.1:9", &path).unwrap();
+        assert!(!catalog.cache_is_fresh(Duration::from_secs(60)));
         let fallback = catalog.load_or_fallback();
         assert_eq!(fallback.source, CatalogSource::Fallback);
         assert!(fallback
@@ -240,6 +274,8 @@ mod tests {
             parallel_tool_calls: true,
         }];
         catalog.write_cache(&models).unwrap();
+        assert!(catalog.cache_is_fresh(Duration::from_secs(60)));
+        assert!(!catalog.cache_is_fresh(Duration::ZERO));
         let cached = catalog.load_or_fallback();
         assert_eq!(cached.source, CatalogSource::Cache);
         assert_eq!(cached.models, models);

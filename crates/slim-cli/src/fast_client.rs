@@ -232,7 +232,7 @@ pub fn run_fast_micro_completion(
                     .with_max_output_tokens(max_output_tokens)
                     .with_system_prompt(system_prompt);
                 if let Some(entry) = devin_entry(&model) {
-                    adapter = adapter.with_catalog_entry(&entry);
+                    adapter = adapter.with_catalog_entry(&entry)?;
                 }
                 execute_adapter(adapter, &prompt, timeout, cancel).await
             }

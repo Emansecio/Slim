@@ -54,6 +54,33 @@ fn command_code_catalog_refresh_preserves_effort_capabilities() {
 }
 
 #[test]
+fn devin_catalog_preserves_off_effort_route() {
+    let entry = slim_core::provider::DevinCatalogEntry {
+        id: "claude-opus-4-6".into(),
+        name: "Claude Opus 4.6".into(),
+        context_window: 200_000,
+        max_output_tokens: 64_000,
+        effort_routes: vec![
+            ("off".into(), "claude-opus-4-6-off".into()),
+            ("high".into(), "claude-opus-4-6-high".into()),
+        ],
+        ..Default::default()
+    };
+    let super::UiEvent::DevinCatalogLoaded { models, .. } =
+        super::devin_catalog_event(crate::devin_catalog::DevinCatalogSnapshot {
+            models: vec![entry],
+            source: crate::command_code_catalog::CatalogSource::Cache,
+        })
+    else {
+        panic!("catalog event")
+    };
+    assert_eq!(
+        models[0].reasoning_levels,
+        vec![super::ReasoningEffort::Off, super::ReasoningEffort::High]
+    );
+}
+
+#[test]
 fn worker_join_reports_panic_and_normal_shutdown_is_success() {
     let failed = super::TuiRuntimeHandle {
         shutdown: None,

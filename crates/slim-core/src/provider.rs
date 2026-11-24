@@ -47,8 +47,8 @@ pub use codex::{
 pub use devin::{
     devin_model, devin_models, encode_devin_models_json, fetch_devin_model_configs,
     is_devin_model_id,
-    parse_devin_models_json, DevinAdapter, DevinCatalogEntry, DevinModel, DEVIN_CHAT_MESSAGE_PATH,
-    DEVIN_DEFAULT_BASE_URL, DEVIN_DEFAULT_MODEL,
+    parse_devin_models_json, prewarm_devin_auth, DevinAdapter, DevinCatalogEntry, DevinModel,
+    DEVIN_CHAT_MESSAGE_PATH, DEVIN_DEFAULT_BASE_URL, DEVIN_DEFAULT_MODEL,
 };
 pub use open_design::{
     fetch_open_design_catalog, is_open_design_model_id, open_design_model, open_design_models,
@@ -4830,6 +4830,12 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         S: FnMut(&ProviderEvent),
     {
         let mut request = request;
+        let started = Instant::now();
+        on_started();
+        on_event(ProviderEvent::Phase {
+            phase: ProviderPhase::Connecting,
+            elapsed_ms: 0,
+        });
         if self.adapter.stream_wire() == StreamWire::Connect {
             // Connect adapters need a unary pre-request (Devin's GetUserJwt /
             // AssignModel) that splices fresh auth into the prepared body.
@@ -4871,12 +4877,6 @@ impl<A: ProviderAdapter> HttpProviderClient<A> {
         let request_headers = request.headers;
         let mut full_body = request.body;
         let mut pending_delta_body = delta_body;
-        let started = Instant::now();
-        on_started();
-        on_event(ProviderEvent::Phase {
-            phase: ProviderPhase::Connecting,
-            elapsed_ms: 0,
-        });
         let response = loop {
             let sending_delta = pending_delta_body.is_some();
             if sending_delta {

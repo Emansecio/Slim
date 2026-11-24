@@ -206,7 +206,7 @@ fn resume_after_cancel_restores_final_and_partial_answers_without_mutation() {
     let selected = select_previous_tui_session(&root, None)
         .expect("resume cancelled session")
         .unwrap();
-    let messages = super::session_transcript(&selected.preflight).unwrap();
+    let messages = super::session_transcript(&selected.preflight, false).unwrap();
     let mut app = slim_tui::app::AppState::new();
     let effects = slim_tui::reducer::reduce(
         &mut app,

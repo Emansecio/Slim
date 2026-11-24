@@ -2556,7 +2556,7 @@ fn submit_composer(state: &mut AppState) -> Vec<Effect> {
                         found,
                         "Modelo Devin desconhecido. Use /models.",
                         EffortTarget::Devin,
-                        |model, effort| UiCommand::SetDevinModel { model, effort },
+                        |model, effort| UiCommand::SetDevinModel { model, effort: Some(effort) },
                     );
                 }
                 Some(LoginProvider::Xai) => {
@@ -2992,7 +2992,7 @@ fn reduce_model_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 }
                 EffortTarget::Xai(model) => UiCommand::SetXaiModel { model, effort },
                 EffortTarget::OpenDesign(model) => UiCommand::SetOpenDesignModel { model, effort },
-                EffortTarget::Devin(model) => UiCommand::SetDevinModel { model, effort },
+                EffortTarget::Devin(model) => UiCommand::SetDevinModel { model, effort: Some(effort) },
                 EffortTarget::Anthropic(model) => UiCommand::SetAnthropicModel { model, effort },
             };
             state.model_overlay = None;
@@ -3382,7 +3382,7 @@ fn reduce_effort_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 }
                 EffortTarget::Xai(model) => UiCommand::SetXaiModel { model, effort },
                 EffortTarget::OpenDesign(model) => UiCommand::SetOpenDesignModel { model, effort },
-                EffortTarget::Devin(model) => UiCommand::SetDevinModel { model, effort },
+                EffortTarget::Devin(model) => UiCommand::SetDevinModel { model, effort: Some(effort) },
                 EffortTarget::Anthropic(model) => UiCommand::SetAnthropicModel { model, effort },
             };
             return vec![Effect::Send(command), Effect::RequestRender];

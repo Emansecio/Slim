@@ -2379,6 +2379,25 @@ fn attach_local_mcp(
     (manager, warnings)
 }
 
+const DEVIN_CATALOG_BACKGROUND_REFRESH_TTL: Duration = Duration::from_secs(300);
+
+fn validate_reasoning_effort_boundary(
+    kind: ProviderKind,
+    reasoning_effort: Option<&str>,
+) -> Result<(), ProviderError> {
+    if kind != ProviderKind::Devin
+        && reasoning_effort.is_some_and(|effort| effort.trim().eq_ignore_ascii_case("off"))
+    {
+        return Err(ProviderError::InvalidResponse {
+            message: format!(
+                "reasoning effort off is only supported by Devin models, not {}",
+                provider_kind_name(kind)
+            ),
+        });
+    }
+    Ok(())
+}
+
 pub(crate) async fn execute_provider_turn_async(
     request: ProviderRequest,
     capture_transcript: impl Into<TranscriptCapture>,
@@ -2390,6 +2409,7 @@ pub(crate) async fn execute_provider_turn_async(
     if request.prompt.trim().is_empty() && !options.compact_only {
         return Ok(empty_provider_execution(input_required_result(&request)));
     }
+    validate_reasoning_effort_boundary(request.kind, options.reasoning_effort.as_deref())?;
     let skill_user_prefix = skill_instructions
         .as_ref()
         .map(validated_skill_user_prefix)
@@ -2418,10 +2438,11 @@ pub(crate) async fn execute_provider_turn_async(
     }
 
     // TCP and TLS overlap catalog, MCP and workspace setup below.
-    slim_core::provider::prewarm_connection(
-        &request.endpoint,
-        ProviderTimeouts::production(request.timeout).connect,
-    );
+    let connect_timeout = ProviderTimeouts::production(request.timeout).connect;
+    slim_core::provider::prewarm_connection(&request.endpoint, connect_timeout);
+    if request.kind == ProviderKind::Devin {
+        slim_core::provider::prewarm_devin_auth(&request.endpoint, &request.api_key, connect_timeout);
+    }
     let open_code_spec = match request.kind {
         ProviderKind::OpenCodeGo => Some(
             crate::opencode_go_catalog::resolve_model(&request.model).ok_or_else(|| {
@@ -2490,13 +2511,19 @@ pub(crate) async fn execute_provider_turn_async(
         && request.endpoint == slim_core::provider::DEVIN_DEFAULT_BASE_URL
     {
         if let Ok(catalog) = DevinCatalog::production() {
-            if catalog.load_or_fallback().find(&request.model).is_some() {
-                let api_key = request.api_key.clone();
-                tokio::spawn(async move {
-                    let _ = catalog.refresh(&api_key).await;
-                });
-            } else {
-                let _ = catalog.refresh(&request.api_key).await;
+            if !catalog.cache_is_fresh(DEVIN_CATALOG_BACKGROUND_REFRESH_TTL) {
+                if catalog.load_or_fallback().find(&request.model).is_some() {
+                    let api_key = request.api_key.clone();
+                    tokio::spawn(async move {
+                        let _ = catalog
+                            .refresh_if_stale(&api_key, DEVIN_CATALOG_BACKGROUND_REFRESH_TTL)
+                            .await;
+                    });
+                } else {
+                    let _ = catalog
+                        .refresh_if_stale(&request.api_key, DEVIN_CATALOG_BACKGROUND_REFRESH_TTL)
+                        .await;
+                }
             }
         }
     }
@@ -2863,6 +2890,7 @@ async fn dispatch_bound_adapter(
     exec_mode: BoundExecMode,
     speculative_out: &mut Option<slim_core::context::SpeculativeCompaction>,
 ) -> Result<AgentLoopResult, ProviderError> {
+    validate_reasoning_effort_boundary(provider, reasoning_effort)?;
     macro_rules! run_loop {
         ($adapter:expr, $adapter_type:ident) => {
             run_bound_agent_loop(
@@ -2976,7 +3004,7 @@ async fn dispatch_bound_adapter(
             let adapter = DevinAdapter::new(&endpoint, &model, &api_key, reasoning_effort)?
                 .with_max_output_tokens(max_output_tokens);
             let adapter = match devin_entry(&model) {
-                Some(entry) => adapter.with_catalog_entry(&entry),
+                Some(entry) => adapter.with_catalog_entry(&entry)?,
                 None => adapter,
             };
             let adapter = match provider_session_id {

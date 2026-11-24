@@ -1608,6 +1608,30 @@ fn model_switch_rejection(
     }
 }
 
+/// Devin effort validation uses the account catalog, whose lanes are dynamic.
+fn devin_model_switch_rejection(
+    spec: &ApiKeyProviderSpec,
+    model: &str,
+    effort: Option<ReasoningEffort>,
+) -> Option<String> {
+    if !(spec.is_model)(model) {
+        return Some(format!("Unsupported {} model", spec.label));
+    }
+    let Some(effort) = effort else {
+        return None;
+    };
+    let snapshot = crate::devin_catalog::DevinCatalog::production()
+        .ok()
+        .map(|catalog| catalog.load_or_fallback())?;
+    let entry = snapshot.find(model)?;
+    (!entry.effort_routes.is_empty()
+        && !entry
+            .effort_routes
+            .iter()
+            .any(|(route, _)| route == effort.id()))
+    .then(|| "Unsupported reasoning effort for this model".to_owned())
+}
+
 /// Reasoning effort a switched session sends; `None` for OpenCode models that
 /// expose no effort knob.
 fn switched_reasoning_effort(
@@ -1631,7 +1655,7 @@ fn switch_api_key_model(
     oauth: &OAuthService,
     sink: &EventSink,
     model: String,
-    effort: ReasoningEffort,
+    effort: Option<ReasoningEffort>,
 ) {
     let Some(spec) = api_key_spec(login) else {
         let _ = sink.send(UiEvent::Notification {
@@ -1639,7 +1663,12 @@ fn switch_api_key_model(
         });
         return;
     };
-    if let Some(message) = model_switch_rejection(spec, &model, effort) {
+    let rejection = if spec.kind == ProviderKind::Devin {
+        devin_model_switch_rejection(spec, &model, effort)
+    } else {
+        effort.and_then(|effort| model_switch_rejection(spec, &model, effort))
+    };
+    if let Some(message) = rejection {
         let _ = sink.send(UiEvent::Notification { message });
         return;
     }
@@ -1664,14 +1693,20 @@ fn switch_api_key_model(
         });
     }
     startup.model_override = Some(model.clone());
-    startup.effort = effort;
-    startup.options.reasoning_effort = switched_reasoning_effort(spec, &model, effort);
+    if let Some(effort) = effort {
+        startup.effort = effort;
+    }
+    startup.options.reasoning_effort = effort.and_then(|effort| {
+        switched_reasoning_effort(spec, &model, effort)
+    });
     startup.options.context_window_tokens = None;
     let _ = sink.send(UiEvent::Notification {
         message: "Modelo aplicado nesta sessão · /model --default para salvar o padrão".into(),
     });
     let _ = sink.send(UiEvent::ModelChanged { model });
-    let _ = sink.send(UiEvent::EffortChanged { effort });
+    if let Some(effort) = effort {
+        let _ = sink.send(UiEvent::EffortChanged { effort });
+    }
 }
 
 /// Makes `spec` the active provider from its saved key (or its public key).
@@ -3269,10 +3304,11 @@ fn run_worker(
         });
         // The first message reuses a connection opened while the user types.
         if let Some(request) = &startup.request {
-            slim_core::provider::prewarm_connection(
-                &request.endpoint,
-                slim_core::provider::ProviderTimeouts::production(startup.timeout).connect,
-            );
+            let connect = slim_core::provider::ProviderTimeouts::production(startup.timeout).connect;
+            slim_core::provider::prewarm_connection(&request.endpoint, connect);
+            if request.kind == ProviderKind::Devin {
+                slim_core::provider::prewarm_devin_auth(&request.endpoint, &request.api_key, connect);
+            }
         }
         let jobs = match slim_core::runtime::ShellJobs::new(startup.options.shell_job_limits.clone()) {
             Ok(jobs) => jobs,
@@ -4861,25 +4897,25 @@ fn run_worker(
                     );
                 }
                 UiCommand::SetOpenCodeModel { model, effort } => {
-                    switch_api_key_model(LoginProvider::OpenCodeGo, &mut startup, &oauth, &sink, model, effort);
+                    switch_api_key_model(LoginProvider::OpenCodeGo, &mut startup, &oauth, &sink, model, Some(effort));
                 }
                 UiCommand::SetZenModel { model, effort } => {
-                    switch_api_key_model(LoginProvider::OpenCodeZen, &mut startup, &oauth, &sink, model, effort);
+                    switch_api_key_model(LoginProvider::OpenCodeZen, &mut startup, &oauth, &sink, model, Some(effort));
                 }
                 UiCommand::SetClinePassModel { model, effort } => {
-                    switch_api_key_model(LoginProvider::ClinePass, &mut startup, &oauth, &sink, model, effort);
+                    switch_api_key_model(LoginProvider::ClinePass, &mut startup, &oauth, &sink, model, Some(effort));
                 }
                 UiCommand::SetCommandCodeModel { model, effort } => {
-                    switch_api_key_model(LoginProvider::CommandCode, &mut startup, &oauth, &sink, model, effort);
+                    switch_api_key_model(LoginProvider::CommandCode, &mut startup, &oauth, &sink, model, Some(effort));
                 }
                 UiCommand::SetOpenDesignModel { model, effort } => {
-                    switch_api_key_model(LoginProvider::OpenDesign, &mut startup, &oauth, &sink, model, effort);
+                    switch_api_key_model(LoginProvider::OpenDesign, &mut startup, &oauth, &sink, model, Some(effort));
                 }
                 UiCommand::SetDevinModel { model, effort } => {
                     switch_api_key_model(LoginProvider::Devin, &mut startup, &oauth, &sink, model, effort);
                 }
                 UiCommand::SetXaiModel { model, effort } => {
-                    switch_api_key_model(LoginProvider::Xai, &mut startup, &oauth, &sink, model, effort);
+                    switch_api_key_model(LoginProvider::Xai, &mut startup, &oauth, &sink, model, Some(effort));
                 }
                 UiCommand::SetAnthropicModel { model, effort } => {
                     let resolved_model = if model.trim().is_empty() {
