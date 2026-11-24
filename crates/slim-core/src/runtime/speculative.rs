@@ -40,6 +40,7 @@ pub(crate) enum SpeculativeOutcome {
         fingerprint: String,
         outcome: ToolExecutionOutcome,
     },
+    CodeMode(super::codemode::SpeculativeCodeModeOutcome),
 }
 
 pub(crate) struct SpeculativeReadEntry {
@@ -110,6 +111,8 @@ struct StreamingCallBuffer {
     name: String,
     args: String,
     scanned_offset: usize,
+    in_codemode_list: bool,
+    wants_index: bool,
     dispatched: bool,
     tracker: JsonObjectTracker,
 }
@@ -121,6 +124,8 @@ impl StreamingCallBuffer {
             name,
             args: String::new(),
             scanned_offset: 0,
+            in_codemode_list: false,
+            wants_index: false,
             dispatched: false,
             tracker: JsonObjectTracker::default(),
         }
@@ -221,6 +226,7 @@ pub(crate) struct StreamSpeculator {
     prewarm_sem: Arc<Semaphore>,
     warmed_paths: HashSet<String>,
     prewarmed_codemode: bool,
+    prewarmed_index: bool,
     anthropic_blocks: HashMap<u32, StreamingCallBuffer>,
     chat_slots: HashMap<u32, StreamingCallBuffer>,
     active_chat_index: Option<u32>,
@@ -237,6 +243,7 @@ impl StreamSpeculator {
             prewarm_sem: Arc::new(Semaphore::new(MAX_PREWARM_CONCURRENCY)),
             warmed_paths: HashSet::new(),
             prewarmed_codemode: false,
+            prewarmed_index: false,
             anthropic_blocks: HashMap::new(),
             chat_slots: HashMap::new(),
             active_chat_index: None,
@@ -406,22 +413,30 @@ impl StreamSpeculator {
     }
 
     fn scan_buffer_for_prewarm_anthropic(&mut self, index: u32) {
-        let (allow_lsp, paths) = {
+        let (allow_lsp, wants_index, paths) = {
             let Some(buf) = self.anthropic_blocks.get_mut(&index) else {
                 return;
             };
-            extract_paths_from_buffer(buf)
+            let (allow_lsp, paths) = extract_paths_from_buffer(buf);
+            (allow_lsp, buf.wants_index, paths)
         };
+        if wants_index {
+            self.trigger_index_prewarm();
+        }
         self.enqueue_path_prewarms(allow_lsp, &paths);
     }
 
     fn scan_buffer_for_prewarm_chat(&mut self, index: u32) {
-        let (allow_lsp, paths) = {
+        let (allow_lsp, wants_index, paths) = {
             let Some(buf) = self.chat_slots.get_mut(&index) else {
                 return;
             };
-            extract_paths_from_buffer(buf)
+            let (allow_lsp, paths) = extract_paths_from_buffer(buf);
+            (allow_lsp, buf.wants_index, paths)
         };
+        if wants_index {
+            self.trigger_index_prewarm();
+        }
         self.enqueue_path_prewarms(allow_lsp, &paths);
     }
 
@@ -429,6 +444,21 @@ impl StreamSpeculator {
         if !self.prewarmed_codemode {
             self.prewarmed_codemode = true;
             super::codemode::prewarm_worker_cell();
+        }
+    }
+
+    fn trigger_index_prewarm(&mut self) {
+        if !self.prewarmed_index {
+            self.prewarmed_index = true;
+            if let Some(root) = self.cfg.canonical_workspace.clone() {
+                let handle = tokio::spawn(async move {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = crate::project_index::for_workspace(&root);
+                    })
+                    .await;
+                });
+                self.prewarm_handles.push(handle);
+            }
         }
     }
 
@@ -508,6 +538,69 @@ impl StreamSpeculator {
             let wants_lsp = collect_codemode_read_literals(arguments, &mut cm_paths);
             if !cm_paths.is_empty() {
                 self.enqueue_path_prewarms(wants_lsp, &cm_paths);
+            }
+            if arguments.contains("slim.grepIndex(") || arguments.contains("slim.graph(") {
+                self.trigger_index_prewarm();
+            }
+            let can_speculate_ro = !self.hazards.hard_barrier
+                && self.hazards.open_non_readonly.is_empty()
+                && self.hazards.mutated_paths.is_empty()
+                && self.dispatched.len() < self.cfg.max_read_calls
+                && (name == "batch_code" || self.cfg.mode == crate::OperatingMode::Code);
+            if can_speculate_ro {
+                if let Ok(val) = serde_json::from_str::<Value>(arguments) {
+                    if let Some(code) = val.get("code").and_then(Value::as_str) {
+                        if super::codemode::is_strictly_readonly_program(code) {
+                            let revision_before = self.cfg.tools.workspace_revision();
+                            let (fs_epoch_before, git_dirty_epoch_before) = self
+                                .cfg
+                                .canonical_workspace
+                                .as_ref()
+                                .and_then(|root| crate::project_index::existing_for_workspace(root))
+                                .map_or((0, 0), |d| (d.fs_epoch(), d.git_dirty_epoch()));
+                            let fingerprint = crate::tools::hash_fields(&[
+                                b"slim-spec-codemode-v1",
+                                name.as_bytes(),
+                                arguments.as_bytes(),
+                            ]);
+                            let mode = self.cfg.mode;
+                            let cwd = self.cfg.cwd.clone();
+                            let call_name = name.to_owned();
+                            let args_owned = arguments.to_owned();
+                            let max_read_calls = self.cfg.max_read_calls;
+                            let tools = self.cfg.tools.clone();
+                            let code_intel = self.cfg.code_intel.clone();
+                            let spec_cancel = self.cfg.spec_cancel.clone();
+                            let secrets = self.cfg.sensitive_values.clone();
+                            let handle = tokio::spawn(async move {
+                                super::codemode::run_readonly_speculative_cell(
+                                    mode,
+                                    cwd,
+                                    call_name,
+                                    args_owned,
+                                    max_read_calls,
+                                    tools,
+                                    code_intel,
+                                    spec_cancel,
+                                    secrets,
+                                )
+                                .await
+                                .map(SpeculativeOutcome::CodeMode)
+                            });
+                            self.dispatched.push((
+                                id.to_owned(),
+                                SpeculativeReadEntry {
+                                    fingerprint,
+                                    revision_before,
+                                    fs_epoch_before,
+                                    git_dirty_epoch_before,
+                                    handle,
+                                },
+                            ));
+                            return;
+                        }
+                    }
+                }
             }
             self.hazards.force_barrier();
             return;
@@ -655,8 +748,21 @@ fn extract_paths_from_buffer(buf: &mut StreamingCallBuffer) -> (bool, Vec<String
     let mut cursor = buf.scanned_offset.min(bytes.len());
 
     if is_codemode {
-        collect_codemode_read_literals(&buf.args[cursor..], &mut paths);
+        let slice = &buf.args[cursor..];
+        if slice.contains("slim.readMany(") || slice.contains("slim.outlineMany(") {
+            buf.in_codemode_list = true;
+        }
+        collect_codemode_read_literals(slice, &mut paths);
+        if buf.in_codemode_list {
+            collect_quoted_path_literals(slice, &mut paths);
+            if slice.contains(']') || slice.contains(')') {
+                buf.in_codemode_list = false;
+            }
+        }
         let wants_lsp = buf.args.contains("slim.code_intel(");
+        if slice.contains("slim.grepIndex(") || slice.contains("slim.graph(") {
+            buf.wants_index = true;
+        }
         buf.scanned_offset = buf
             .args
             .floor_char_boundary(buf.args.len().saturating_sub(64));
@@ -718,6 +824,44 @@ fn extract_paths_from_buffer(buf: &mut StreamingCallBuffer) -> (bool, Vec<String
     (buf.name == "code_intel", paths)
 }
 
+fn collect_quoted_path_literals(window: &str, out: &mut Vec<String>) {
+    let mut quote_scan = 0;
+    let wb = window.as_bytes();
+    while quote_scan < wb.len() && out.len() < MAX_PREWARM_PATHS_PER_TURN {
+        if wb[quote_scan] == b'\\' && wb.get(quote_scan + 1) == Some(&b'"') {
+            let start = quote_scan + 2;
+            let mut end = start;
+            while end < wb.len() && wb[end] != b'\\' && wb[end] != b'"' && wb[end] != b'\n' {
+                end += 1;
+            }
+            if wb.get(end) == Some(&b'\\') && wb.get(end + 1) == Some(&b'"') {
+                let cand = &window[start..end];
+                if (cand.contains('/') || cand.contains('.')) && !cand.contains(' ') {
+                    out.push(cand.to_owned());
+                }
+                quote_scan = end + 2;
+                continue;
+            }
+        } else if wb[quote_scan] == b'\'' || wb[quote_scan] == b'"' {
+            let q = wb[quote_scan];
+            let start = quote_scan + 1;
+            let mut end = start;
+            while end < wb.len() && wb[end] != q && wb[end] != b'\\' && wb[end] != b'\n' {
+                end += 1;
+            }
+            if end < wb.len() && wb[end] == q {
+                let cand = &window[start..end];
+                if (cand.contains('/') || cand.contains('.')) && !cand.contains(' ') {
+                    out.push(cand.to_owned());
+                }
+                quote_scan = end + 1;
+                continue;
+            }
+        }
+        quote_scan += 1;
+    }
+}
+
 fn collect_codemode_read_literals(snippet: &str, out: &mut Vec<String>) -> bool {
     let wants_lsp = snippet.contains("slim.code_intel(");
     for needle in [
@@ -731,42 +875,13 @@ fn collect_codemode_read_literals(snippet: &str, out: &mut Vec<String>) -> bool 
         let mut idx = 0;
         while let Some(pos) = snippet[idx..].find(needle) {
             let after = &snippet[idx + pos + needle.len()..];
-            let window = &after[..after.floor_char_boundary(256)];
-            let mut quote_scan = 0;
-            let wb = window.as_bytes();
-            while quote_scan < wb.len() && out.len() < MAX_PREWARM_PATHS_PER_TURN {
-                if wb[quote_scan] == b'\\' && wb.get(quote_scan + 1) == Some(&b'"') {
-                    let start = quote_scan + 2;
-                    let mut end = start;
-                    while end < wb.len() && wb[end] != b'\\' && wb[end] != b'"' && wb[end] != b'\n' {
-                        end += 1;
-                    }
-                    if wb.get(end) == Some(&b'\\') && wb.get(end + 1) == Some(&b'"') {
-                        let cand = &window[start..end];
-                        if (cand.contains('/') || cand.contains('.')) && !cand.contains(' ') {
-                            out.push(cand.to_owned());
-                        }
-                        quote_scan = end + 2;
-                        continue;
-                    }
-                } else if wb[quote_scan] == b'\'' || wb[quote_scan] == b'"' {
-                    let q = wb[quote_scan];
-                    let start = quote_scan + 1;
-                    let mut end = start;
-                    while end < wb.len() && wb[end] != q && wb[end] != b'\\' && wb[end] != b'\n' {
-                        end += 1;
-                    }
-                    if end < wb.len() && wb[end] == q {
-                        let cand = &window[start..end];
-                        if (cand.contains('/') || cand.contains('.')) && !cand.contains(' ') {
-                            out.push(cand.to_owned());
-                        }
-                        quote_scan = end + 1;
-                        continue;
-                    }
-                }
-                quote_scan += 1;
-            }
+            let cap = if matches!(needle, "slim.readMany(" | "slim.outlineMany(") {
+                after.find(')').map_or(after.len().min(2048), |p| p.min(2048))
+            } else {
+                256
+            };
+            let window = &after[..after.floor_char_boundary(cap)];
+            collect_quoted_path_literals(window, out);
             idx += pos + needle.len();
         }
     }
@@ -777,6 +892,16 @@ pub(super) fn is_allowlisted_readonly_git(args_json: &str) -> bool {
     let Ok(val) = serde_json::from_str::<serde_json::Value>(args_json) else {
         return false;
     };
+    is_allowlisted_readonly_shell_inner(&val, true)
+}
+
+/// Strictly fail-closed classifier for read-only shell commands (git inspection
+/// + simple non-mutating inspection tools with zero shell metacharacters).
+pub(super) fn is_allowlisted_readonly_shell_value(val: &Value) -> bool {
+    is_allowlisted_readonly_shell_inner(val, false)
+}
+
+fn is_allowlisted_readonly_shell_inner(val: &Value, git_only: bool) -> bool {
     let Some(obj) = val.as_object() else {
         return false;
     };
@@ -790,23 +915,8 @@ pub(super) fn is_allowlisted_readonly_git(args_json: &str) -> bool {
         return false;
     };
     let trimmed = command.trim();
-    let tokens: Vec<&str> = if trimmed == "git" {
-        let Some(args) = obj.get("args").and_then(Value::as_array) else {
-            return false;
-        };
-        let mut collected = Vec::with_capacity(args.len());
-        for a in args {
-            let Some(s) = a.as_str() else {
-                return false;
-            };
-            collected.push(s);
-        }
-        collected
-    } else if let Some(rest) = trimmed.strip_prefix("git ") {
-        if obj.get("args").is_some_and(|a| !a.is_null()) {
-            return false;
-        }
-        if trimmed.chars().any(|c| {
+    let has_shell_meta = |s: &str| {
+        s.chars().any(|c| {
             matches!(
                 c,
                 '&' | '|'
@@ -827,47 +937,85 @@ pub(super) fn is_allowlisted_readonly_git(args_json: &str) -> bool {
                     | '*'
                     | '?'
             )
-        }) {
+        })
+    };
+    let (program, tokens): (&str, Vec<&str>) = if let Some(args) =
+        obj.get("args").and_then(Value::as_array)
+    {
+        if trimmed.contains(char::is_whitespace) {
             return false;
         }
-        rest.split_whitespace().collect()
-    } else {
+        let mut collected = Vec::with_capacity(args.len());
+        for a in args {
+            let Some(s) = a.as_str() else {
+                return false;
+            };
+            collected.push(s);
+        }
+        (trimmed, collected)
+    } else if obj.get("args").is_some_and(|a| !a.is_null()) || has_shell_meta(trimmed) {
         return false;
+    } else {
+        let mut parts = trimmed.split_whitespace();
+        let Some(prog) = parts.next() else {
+            return false;
+        };
+        (prog, parts.collect())
     };
 
-    let Some(&subcmd) = tokens.first() else {
-        return false;
-    };
-    if !matches!(
-        subcmd,
-        "status" | "diff" | "log" | "show" | "branch" | "rev-parse"
-    ) {
-        return false;
-    }
-    for &arg in &tokens[1..] {
-        if arg == "-c"
-            || arg == "-C"
-            || arg == "-o"
-            || arg.starts_with("--git-dir")
-            || arg.starts_with("--work-tree")
-            || arg.starts_with("--exec-path")
-            || arg.starts_with("--output")
-            || arg.starts_with("-c=")
-        {
+    if program == "git" {
+        let Some(&subcmd) = tokens.first() else {
+            return false;
+        };
+        if !matches!(
+            subcmd,
+            "status" | "diff" | "log" | "show" | "branch" | "rev-parse"
+        ) {
             return false;
         }
-    }
-    if subcmd == "branch" {
         for &arg in &tokens[1..] {
-            if !matches!(
-                arg,
-                "--list" | "--show-current" | "-a" | "--all" | "-r" | "--remotes" | "-v" | "-vv"
-            ) {
+            if arg == "-c"
+                || arg == "-C"
+                || arg == "-o"
+                || arg.starts_with("--git-dir")
+                || arg.starts_with("--work-tree")
+                || arg.starts_with("--exec-path")
+                || arg.starts_with("--output")
+                || arg.starts_with("-c=")
+            {
                 return false;
             }
         }
+        if subcmd == "branch" {
+            for &arg in &tokens[1..] {
+                if !matches!(
+                    arg,
+                    "--list"
+                        | "--show-current"
+                        | "-a"
+                        | "--all"
+                        | "-r"
+                        | "--remotes"
+                        | "-v"
+                        | "-vv"
+                ) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
-    true
+
+    if git_only {
+        return false;
+    }
+    match program {
+        "pwd" | "which" | "wc" | "ls" | "head" | "tail" | "stat" | "cat" => true,
+        "rg" => !tokens
+            .iter()
+            .any(|a| *a == "--pre" || a.starts_with("--pre=")),
+        _ => false,
+    }
 }
 
 #[cfg(test)]

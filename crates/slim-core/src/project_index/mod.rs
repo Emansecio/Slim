@@ -108,6 +108,7 @@ impl Drop for WakeHookGuard {
 pub struct ProjectIndexDaemon {
     canonical_root: PathBuf,
     fs_epoch: AtomicU64,
+    external_fs_epoch: AtomicU64,
     git_dirty_epoch: AtomicU64,
     tree_dirty: AtomicBool,
     watcher_active: AtomicBool,
@@ -238,6 +239,7 @@ impl ProjectIndexDaemon {
         let daemon = Arc::new(Self {
             canonical_root: canonical_root.clone(),
             fs_epoch: AtomicU64::new(1),
+            external_fs_epoch: AtomicU64::new(1),
             git_dirty_epoch: AtomicU64::new(1),
             tree_dirty: AtomicBool::new(true),
             watcher_active: AtomicBool::new(false),
@@ -586,6 +588,7 @@ impl ProjectIndexDaemon {
 
     pub fn notify_local_delete(&self, abs_path: &Path) {
         self.fs_epoch.fetch_add(1, Ordering::AcqRel);
+        self.external_fs_epoch.fetch_add(1, Ordering::AcqRel);
         self.git_dirty_epoch.fetch_add(1, Ordering::AcqRel);
         self.tree_dirty.store(true, Ordering::Release);
         *lock_or_recover(&self.tree_digest_cache) = None;
@@ -598,9 +601,16 @@ impl ProjectIndexDaemon {
         self.fire_wake_hooks();
     }
 
+    /// Epoch bumped only on external FSEvents, deletes, or opaque workspace
+    /// invalidations (not local path-tracked `notify_local_write` updates).
+    pub fn external_fs_epoch(&self) -> u64 {
+        self.external_fs_epoch.load(Ordering::Acquire)
+    }
+
     /// Marks the whole workspace index dirty (e.g. after an opaque shell mutation).
     pub fn invalidate_workspace(&self) {
         self.fs_epoch.fetch_add(1, Ordering::AcqRel);
+        self.external_fs_epoch.fetch_add(1, Ordering::AcqRel);
         self.git_dirty_epoch.fetch_add(1, Ordering::AcqRel);
         self.tree_dirty.store(true, Ordering::Release);
         *lock_or_recover(&self.tree_digest_cache) = None;
@@ -709,17 +719,35 @@ impl ProjectIndexDaemon {
             return;
         }
         if !relevant_paths.is_empty() {
-            self.fs_epoch.fetch_add(1, Ordering::AcqRel);
-            self.git_dirty_epoch.fetch_add(1, Ordering::AcqRel);
-            self.tree_dirty.store(true, Ordering::Release);
-            *lock_or_recover(&self.tree_digest_cache) = None;
-
+            // Skip FSEvents echoes of our own `notify_local_write` whose on-disk
+            // metadata already matches the updated slab entry.
+            let mut external_paths = Vec::with_capacity(relevant_paths.len());
             {
                 let mut slab = lock_or_recover(&self.slab);
                 for path in &relevant_paths {
-                    slab.remove(path);
+                    let echoed_local = fs::metadata(path)
+                        .ok()
+                        .is_some_and(|meta| slab.get_matching_meta(path, &meta).is_some());
+                    if !echoed_local {
+                        slab.remove(path);
+                        external_paths.push(path.clone());
+                    }
                 }
             }
+            if external_paths.is_empty() {
+                if git_touched {
+                    self.git_dirty_epoch.fetch_add(1, Ordering::AcqRel);
+                    *lock_or_recover(&self.tree_digest_cache) = None;
+                    self.fire_wake_hooks();
+                }
+                return;
+            }
+            let relevant_paths = external_paths;
+            self.fs_epoch.fetch_add(1, Ordering::AcqRel);
+            self.external_fs_epoch.fetch_add(1, Ordering::AcqRel);
+            self.git_dirty_epoch.fetch_add(1, Ordering::AcqRel);
+            self.tree_dirty.store(true, Ordering::Release);
+            *lock_or_recover(&self.tree_digest_cache) = None;
             let mut fs_payloads: Vec<(String, PathBuf, Option<(Vec<u8>, u64, u64, u32)>)> =
                 Vec::with_capacity(relevant_paths.len());
             for path in &relevant_paths {

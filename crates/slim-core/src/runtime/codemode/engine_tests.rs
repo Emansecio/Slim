@@ -490,9 +490,9 @@ async fn prelude_bytecode_prewarm_and_json_value_isolation_work() {
         |cell, ticket, _, _| {
             cell.settle(
                 ticket,
-                Ok(engine::Payload::JsonValue(json!({
+                Ok(engine::Payload::JsonValue(Arc::new(json!({
                     "nested": { "arr": [1, true, "ok"] },
-                }))),
+                })))),
             );
         },
     )
@@ -513,6 +513,32 @@ async fn prelude_bytecode_prewarm_and_json_value_isolation_work() {
     .await
     .unwrap();
     assert_eq!(clean, r#""undefined""#);
+}
+
+#[test]
+fn readonly_program_classifier_is_fail_closed() {
+    assert!(engine::is_strictly_readonly_program(
+        "const f = await slim.readMany(['a.rs', 'b.rs']); return Object.keys(f);"
+    ));
+    assert!(engine::is_strictly_readonly_program(
+        "// write patch shell inside comment is ignored\nconst g = await slim.grepIndex('write'); return g;"
+    ));
+    for unsafe_prog in [
+        "await slim.write({ path: 'a', content: 'x' });",
+        "await slim.patch({ path: 'a', edits: [] });",
+        "await slim.patchMany([]);",
+        "await slim.shell({ command: 'ls' });",
+        "await tools.call('mcp.s.t', {});",
+        "store('k', 1); return await slim.read({ path: 'a' });",
+        "const m = 'write'; await slim[m]({});",
+        "finish('done'); return await slim.read({ path: 'a' });",
+        "return 1 + 2;",
+    ] {
+        assert!(
+            !engine::is_strictly_readonly_program(unsafe_prog),
+            "must reject: {unsafe_prog}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

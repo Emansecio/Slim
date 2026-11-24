@@ -220,6 +220,7 @@ pub(super) enum Command {
     DescribeTool { name: String },
     ListServers,
     Finish { answer: String },
+    ReadArtifact { args: Value },
     BeginAtomic,
     CommitAtomic,
     RollbackAtomic,
@@ -313,7 +314,7 @@ pub(super) enum Payload {
     #[allow(dead_code)]
     Json(String),
     /// Pre-parsed JSON value converted directly into native JS values without stringify/parse.
-    JsonValue(Value),
+    JsonValue(Arc<Value>),
 }
 
 impl From<Value> for Payload {
@@ -328,7 +329,7 @@ enum WorkerWake {
         ticket: u32,
         result: Result<Payload, String>,
     },
-    HelperReply(Result<String, String>),
+    HelperReply(Result<Value, String>),
     Interrupt,
 }
 
@@ -362,9 +363,7 @@ impl Cell {
 
     /// Delivers the reply to a synchronous `Request::Helper`.
     pub fn reply_helper(&self, result: Result<Value, String>) {
-        let _ = self
-            .wake
-            .send(WorkerWake::HelperReply(result.map(|value| value.to_string())));
+        let _ = self.wake.send(WorkerWake::HelperReply(result));
     }
 }
 
@@ -380,7 +379,7 @@ impl Drop for Cell {
 const PRELUDE: &str = r#"
 ((callHost, helper, log, natives, nativeGrep, nativeDiff) => {
     const { stringify, parse } = JSON;
-    const runHelper = value => parse(helper(stringify(value)));
+    const runHelper = value => helper(stringify(value));
     const pending = new Map();
     const call = (name, arguments_) => new Promise((resolve, reject) => {
         const json = stringify(arguments_ ?? {});
@@ -459,6 +458,9 @@ const PRELUDE: &str = r#"
             }});
             Object.defineProperty(slimObj, 'graph', {value: async req => {
                 return call('slim.graph', req ?? {});
+            }});
+            Object.defineProperty(slimObj, 'readArtifact', {value: async args => {
+                return runHelper({op: 'read_artifact', args: args ?? {}});
             }});
         }
         Object.defineProperty(slimObj, 'patchMany', {value: async specs => {
@@ -1269,8 +1271,10 @@ fn helper_function<'js>(
     wake_rx: Rc<mpsc::Receiver<WorkerWake>>,
     interrupted: impl Fn() -> bool + 'static,
 ) -> rquickjs::Result<Function<'js>> {
-    Function::new(ctx.clone(), move |ctx: Ctx<'_>, input: String| {
-        let dispatch = || -> Result<String, String> {
+    Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, input: String| -> rquickjs::Result<rquickjs::Value<'js>> {
+        let dispatch = || -> Result<Value, String> {
             if input.len() > MAX_JSON_BYTES {
                 return Err("host request exceeds 1 MiB".into());
             }
@@ -1302,7 +1306,10 @@ fn helper_function<'js>(
                 }
             })
         };
-        dispatch().map_err(|error| Exception::throw_message(&ctx, &error))
+        match dispatch() {
+            Ok(val) => json_value_to_js(&ctx, &val, 0),
+            Err(error) => Err(Exception::throw_message(&ctx, &error)),
+        }
     })
 }
 
@@ -1895,9 +1902,84 @@ pub(super) fn strip_typescript_annotations(code: &str) -> String {
             i = end;
             continue;
         }
-        let ch = code[i..].chars().next().unwrap();
+    let ch = code[i..].chars().next().unwrap();
         out.push(ch);
         i += ch.len_utf8();
     }
     out
+}
+
+/// Fail-closed lexical check confirming a CodeMode program can only perform
+/// read-only workspace inspection with zero mutations, MCP calls, store writes,
+/// subagents, `finish()`, or dynamic property dispatch (`slim[...]`).
+pub(crate) fn is_strictly_readonly_program(code: &str) -> bool {
+    let trimmed = code.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_CODE_BYTES {
+        return false;
+    }
+    let b = code.as_bytes();
+    let mut i = 0usize;
+    let mut saw_readonly_call = false;
+    while i < b.len() {
+        if let Some(next) = scan_string_or_comment(b, i) {
+            i = next;
+            continue;
+        }
+        if let Some((word, end)) = read_ident(b, i) {
+            if matches!(
+                word,
+                "write"
+                    | "patch"
+                    | "patchMany"
+                    | "atomic"
+                    | "shell"
+                    | "tools"
+                    | "store"
+                    | "load"
+                    | "readArtifact"
+                    | "subagent"
+                    | "subagent_control"
+                    | "finish"
+                    | "eval"
+                    | "Function"
+                    | "globalThis"
+            ) {
+                return false;
+            }
+            if word == "slim" {
+                let next = skip_ws_and_comments(b, end);
+                if b.get(next) == Some(&b'[') {
+                    return false;
+                }
+                if b.get(next) == Some(&b'.') {
+                    let prop_start = skip_ws_and_comments(b, next + 1);
+                    if let Some((prop, _)) = read_ident(b, prop_start) {
+                        if matches!(
+                            prop,
+                            "read"
+                                | "readMany"
+                                | "list"
+                                | "search"
+                                | "glob"
+                                | "git"
+                                | "outlineMany"
+                                | "grepIndex"
+                                | "graph"
+                                | "code_intel"
+                        ) {
+                            saw_readonly_call = true;
+                        } else {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+            }
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    saw_readonly_call
 }

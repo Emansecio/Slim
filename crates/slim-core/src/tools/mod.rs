@@ -1738,7 +1738,7 @@ impl ToolRegistry {
                 });
             }
         }
-        let effective_max_lines = if *raw && max_lines.is_none() && *offset <= 1 {
+        let effective_max_lines = if (in_code_mode || *raw) && max_lines.is_none() && *offset <= 1 {
             Some(MAX_READ_LINES_CAP)
         } else {
             *max_lines
@@ -2183,6 +2183,8 @@ impl ToolRegistry {
                 observer.capture_bytes
             } else if self.artifact_store.is_some() {
                 SHELL_LOG_CAPTURE_CAP_BYTES
+            } else if prepared.mode == OperatingMode::Code {
+                CODE_SHELL_STREAM_CAP_BYTES
             } else {
                 SHELL_STREAM_CAP_BYTES
             }),
@@ -2220,9 +2222,14 @@ impl ToolRegistry {
             Some(a) if !a.is_empty() => format!("{command} {}", a.join(" ")),
             _ => command.clone(),
         };
+        let stream_cap = if prepared.mode == OperatingMode::Code {
+            CODE_SHELL_STREAM_CAP_BYTES
+        } else {
+            SHELL_STREAM_CAP_BYTES
+        };
         let mut output = if safe_output.is_none()
-            && (result.output.stdout.len() > SHELL_STREAM_CAP_BYTES
-                || result.output.stderr.len() > SHELL_STREAM_CAP_BYTES)
+            && (result.output.stdout.len() > stream_cap
+                || result.output.stderr.len() > stream_cap)
         {
             let full_out = normalize_shell_text(&String::from_utf8_lossy(&result.output.stdout));
             let full_err = normalize_shell_text(&String::from_utf8_lossy(&result.output.stderr));
@@ -2238,33 +2245,51 @@ impl ToolRegistry {
             if let Some(folded) =
                 crate::runtime::shell_fold::fold_shell_output(&effective_command, &combined, success)
             {
-                if folded.len() <= SHELL_STREAM_CAP_BYTES * 2 {
+                if folded.len() <= stream_cap * 2 {
                     folded
                 } else {
-                    let mut stdout =
-                        clean_shell_stream(&result.output.stdout, result.stdout_discarded_bytes);
+                    let mut stdout = clean_shell_stream_with_cap(
+                        &result.output.stdout,
+                        result.stdout_discarded_bytes,
+                        stream_cap,
+                    );
                     if !stdout.is_empty() && !stdout.ends_with('\n') {
                         stdout.push('\n');
                     }
                     format!(
                         "{status_header}\nstdout:\n{stdout}stderr:\n{}",
-                        clean_shell_stream(&result.output.stderr, result.stderr_discarded_bytes),
+                        clean_shell_stream_with_cap(
+                            &result.output.stderr,
+                            result.stderr_discarded_bytes,
+                            stream_cap,
+                        ),
                     )
                 }
             } else {
-                let mut stdout =
-                    clean_shell_stream(&result.output.stdout, result.stdout_discarded_bytes);
+                let mut stdout = clean_shell_stream_with_cap(
+                    &result.output.stdout,
+                    result.stdout_discarded_bytes,
+                    stream_cap,
+                );
                 if !stdout.is_empty() && !stdout.ends_with('\n') {
                     stdout.push('\n');
                 }
                 format!(
                     "{status_header}\nstdout:\n{stdout}stderr:\n{}",
-                    clean_shell_stream(&result.output.stderr, result.stderr_discarded_bytes),
+                    clean_shell_stream_with_cap(
+                        &result.output.stderr,
+                        result.stderr_discarded_bytes,
+                        stream_cap,
+                    ),
                 )
             }
         } else {
             let mut stdout = safe_output.clone().unwrap_or_else(|| {
-                clean_shell_stream(&result.output.stdout, result.stdout_discarded_bytes)
+                clean_shell_stream_with_cap(
+                    &result.output.stdout,
+                    result.stdout_discarded_bytes,
+                    stream_cap,
+                )
             });
             // The stderr label must start its own line even when stdout does not
             // end with a newline.
@@ -2276,7 +2301,11 @@ impl ToolRegistry {
                 if safe_output.is_some() {
                     String::new()
                 } else {
-                    clean_shell_stream(&result.output.stderr, result.stderr_discarded_bytes)
+                    clean_shell_stream_with_cap(
+                        &result.output.stderr,
+                        result.stderr_discarded_bytes,
+                        stream_cap,
+                    )
                 },
             )
         };
@@ -2326,8 +2355,8 @@ impl ToolRegistry {
             );
         }
         let artifact = if let Some(store) = &self.artifact_store {
-            if result.output.stdout.len() > SHELL_STREAM_CAP_BYTES
-                || result.output.stderr.len() > SHELL_STREAM_CAP_BYTES
+            if result.output.stdout.len() > stream_cap
+                || result.output.stderr.len() > stream_cap
                 || result.stdout_discarded_bytes > 0
                 || result.stderr_discarded_bytes > 0
             {
@@ -2494,6 +2523,8 @@ fn format_shell_status_header(code: Option<i32>, timed_out: bool, cancelled: boo
 /// header, markers, an admission note and an artifact reference stay under the
 /// default 16 KiB per-result allowance, so presentation never cuts them again.
 const SHELL_STREAM_CAP_BYTES: usize = 7 * 1024;
+/// Larger per-stream cap in Code mode where output goes into JS RAM (not LLM context).
+const CODE_SHELL_STREAM_CAP_BYTES: usize = 256 * 1024;
 const SHELL_LOG_CAPTURE_CAP_BYTES: usize = 8 * 1024 * 1024;
 
 fn captured_shell_stream_text(raw: &[u8], discarded_bytes: usize) -> String {
@@ -2539,42 +2570,52 @@ const CLEANED_BASIS: &str = " after terminal cleanup";
 /// capture tail, with the real gap at the midpoint: the halves are cleaned
 /// separately so nothing (an unterminated escape, a repeat run, a partial
 /// character) crosses the gap, and the marker stays where the gap is.
+#[cfg(test)]
 fn clean_shell_stream(raw: &[u8], previously_discarded_bytes: usize) -> String {
+    clean_shell_stream_with_cap(raw, previously_discarded_bytes, SHELL_STREAM_CAP_BYTES)
+}
+
+fn clean_shell_stream_with_cap(
+    raw: &[u8],
+    previously_discarded_bytes: usize,
+    cap_bytes: usize,
+) -> String {
     if previously_discarded_bytes == 0 {
         let text = String::from_utf8_lossy(raw);
         let cleaned = normalize_shell_text(&text);
         if cleaned == text {
-            return cap_shell_stream(raw, 0);
+            return cap_shell_bytes(raw, 0, "", cap_bytes);
         }
-        return cap_shell_bytes(cleaned.as_bytes(), 0, CLEANED_BASIS);
+        return cap_shell_bytes(cleaned.as_bytes(), 0, CLEANED_BASIS, cap_bytes);
     }
     let (head, tail) = raw.split_at(raw.len().div_ceil(2));
     let (head, tail, boundary_bytes) = utf8_edges(head, tail);
     let (head, tail) = (String::from_utf8_lossy(head), String::from_utf8_lossy(tail));
     let (cleaned_head, cleaned_tail) = (normalize_shell_text(&head), normalize_shell_text(&tail));
     if cleaned_head == head && cleaned_tail == tail {
-        return cap_shell_stream(raw, previously_discarded_bytes);
+        return cap_shell_bytes(raw, previously_discarded_bytes, "", cap_bytes);
     }
     cap_shell_gap(
         &cleaned_head,
         &cleaned_tail,
         previously_discarded_bytes.saturating_add(boundary_bytes),
+        cap_bytes,
     )
 }
 
-/// Caps a cleaned capture head and tail to `SHELL_STREAM_CAP_BYTES` in total,
+/// Caps a cleaned capture head and tail to `cap_bytes` in total,
 /// trimming at the gap (end of head, start of tail) and reporting the gap's
 /// `omitted_bytes` plus what the trim removed.
-fn cap_shell_gap(head: &str, tail: &str, omitted_bytes: usize) -> String {
-    let head_share = SHELL_STREAM_CAP_BYTES.div_ceil(2);
-    let tail_share = SHELL_STREAM_CAP_BYTES - head_share;
+fn cap_shell_gap(head: &str, tail: &str, omitted_bytes: usize, cap_bytes: usize) -> String {
+    let head_share = cap_bytes.div_ceil(2);
+    let tail_share = cap_bytes - head_share;
     let head_limit = if tail.len() < tail_share {
-        SHELL_STREAM_CAP_BYTES - tail.len()
+        cap_bytes - tail.len()
     } else {
         head_share
     };
     let tail_limit = if head.len() < head_share {
-        SHELL_STREAM_CAP_BYTES - head.len()
+        cap_bytes - head.len()
     } else {
         tail_share
     };
@@ -2597,15 +2638,21 @@ fn cap_shell_gap(head: &str, tail: &str, omitted_bytes: usize) -> String {
     )
 }
 
+#[cfg(test)]
 fn cap_shell_stream(raw: &[u8], previously_discarded_bytes: usize) -> String {
-    cap_shell_bytes(raw, previously_discarded_bytes, "")
+    cap_shell_bytes(raw, previously_discarded_bytes, "", SHELL_STREAM_CAP_BYTES)
 }
 
-fn cap_shell_bytes(raw: &[u8], previously_discarded_bytes: usize, basis: &str) -> String {
-    if raw.len() <= SHELL_STREAM_CAP_BYTES && previously_discarded_bytes == 0 {
+fn cap_shell_bytes(
+    raw: &[u8],
+    previously_discarded_bytes: usize,
+    basis: &str,
+    cap_bytes: usize,
+) -> String {
+    if raw.len() <= cap_bytes && previously_discarded_bytes == 0 {
         return String::from_utf8_lossy(raw).into_owned();
     }
-    let retained_bytes = raw.len().min(SHELL_STREAM_CAP_BYTES);
+    let retained_bytes = raw.len().min(cap_bytes);
     let head_bytes = retained_bytes / 2 + retained_bytes % 2;
     let tail_bytes = retained_bytes - head_bytes;
     let tail_start = raw.len() - tail_bytes;

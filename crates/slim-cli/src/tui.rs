@@ -736,7 +736,7 @@ fn transcript_messages_with_steps(
                         },
                         text: String::new(),
                     });
-                    if call.name == "codemode" {
+                    if matches!(call.name.as_str(), "codemode" | "batch_code") {
                         if let Some(steps) = steps_by_parent
                             .get_mut(&call.id)
                             .and_then(std::collections::VecDeque::pop_front)
@@ -7146,7 +7146,10 @@ fn project_codemode_source(event: &SessionEvent) -> Option<UiEvent> {
     else {
         return None;
     };
-    if name != "codemode" || batch_id.is_empty() || call_id.is_empty() {
+    if !matches!(name.as_str(), "codemode" | "batch_code")
+        || batch_id.is_empty()
+        || call_id.is_empty()
+    {
         return None;
     }
     let code = serde_json::from_str::<serde_json::Value>(arguments)

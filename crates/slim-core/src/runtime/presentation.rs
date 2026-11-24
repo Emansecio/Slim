@@ -133,10 +133,20 @@ impl Runtime {
                         Some((body, tail)) => (body, Some(tail)),
                         None => (result.output.as_str(), None),
                     };
-                    super::distill::distill_json_for_model(body).map(|d| match console_tail {
-                        Some(tail) => format!("{}\nconsole:\n{tail}", d.text),
-                        None => d.text,
-                    })
+                    let body_distilled = super::distill::distill_json_for_model(body);
+                    let console_distilled =
+                        console_tail.and_then(super::distill::distill_generic_log);
+                    if body_distilled.is_some() || console_distilled.is_some() {
+                        let out_body = body_distilled.as_ref().map_or(body, |d| d.text.as_str());
+                        match (console_distilled.as_deref(), console_tail) {
+                            (Some(tail), _) | (None, Some(tail)) => {
+                                Some(format!("{out_body}\nconsole:\n{tail}"))
+                            }
+                            (None, None) => Some(out_body.to_owned()),
+                        }
+                    } else {
+                        None
+                    }
                 } else if result.name == "read"
                     && result.success
                     && result.media.is_empty()

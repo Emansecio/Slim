@@ -50,6 +50,85 @@ pub(crate) fn prewarm_worker_cell() {
     engine::prewarm_worker_cell();
 }
 
+pub(crate) fn is_strictly_readonly_program(code: &str) -> bool {
+    engine::is_strictly_readonly_program(code)
+}
+
+/// Captured outcome of a Stage 2 read-only speculative CodeMode cell.
+pub(crate) struct SpeculativeCodeModeOutcome {
+    pub(crate) output: Result<String, String>,
+    pub(crate) used_calls: usize,
+    pub(crate) steps: Vec<crate::EventKind>,
+}
+
+/// Runs a strictly read-only CodeMode program speculatively during SSE tail
+/// without touching the parent session's journal or `AppHandle`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_readonly_speculative_cell(
+    mode: crate::OperatingMode,
+    cwd: PathBuf,
+    call_name: String,
+    arguments: String,
+    max_read_calls: usize,
+    tools: ToolRegistry,
+    code_intel: Option<Arc<dyn CodeIntelligence>>,
+    spec_cancel: CancellationToken,
+    sensitive_values: Vec<String>,
+) -> Option<SpeculativeCodeModeOutcome> {
+    if spec_cancel.is_cancelled() {
+        return None;
+    }
+    let mut rt = Runtime::new();
+    rt.tools = tools;
+    rt.code_intel = code_intel;
+    rt.cancellation = Some(spec_cancel.clone());
+    for secret in sensitive_values {
+        rt.register_sensitive_value(secret);
+    }
+    rt.codemode.remaining_calls = max_read_calls.max(16);
+    rt.codemode.remaining_mutating_calls = Some(0);
+    rt.codemode.restored = true;
+    let mut seq = 1u64;
+    let invocation = ToolInvocation {
+        batch_id: "__spec__",
+        call_id: "__spec__",
+        name: &call_name,
+        arguments: &arguments,
+    };
+    let output = rt
+        .run_codemode_with_governor(
+            mode,
+            CellProfile::HybridBatch {
+                allow_mutation: false,
+            },
+            &cwd,
+            invocation,
+            &mut seq,
+            CELL_TIMEOUT,
+            None,
+        )
+        .await
+        .ok()?;
+    if spec_cancel.is_cancelled() {
+        return None;
+    }
+    let steps = rt
+        .app
+        .events()
+        .iter()
+        .filter_map(|ev| match &ev.kind {
+            crate::EventKind::ToolStepStarted { .. }
+            | crate::EventKind::ToolStepFinished { .. } => Some(ev.kind.clone()),
+            _ => None,
+        })
+        .collect();
+    Some(SpeculativeCodeModeOutcome {
+        output,
+        used_calls: rt.codemode.used_calls,
+        steps,
+    })
+}
+
 pub(super) fn batch_code_enabled() -> bool {
     !std::env::var_os("SLIM_HYBRID_BATCH_CODE")
         .is_some_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
@@ -120,6 +199,7 @@ const MAX_SESSION_READ_CACHE: usize = 256;
 
 struct CachedSessionRead {
     rev: (u64, u64),
+    path_scoped: bool,
     last_used: u64,
     deps: Vec<PathBuf>,
     finished: dispatch::Finished,
@@ -132,8 +212,16 @@ struct SessionReadCache {
 }
 
 impl SessionReadCache {
-    fn get(&mut self, key: &str, rev: (u64, u64)) -> Option<dispatch::Finished> {
-        let matches = self.entries.get(key).is_some_and(|e| e.rev == rev);
+    fn get(
+        &mut self,
+        key: &str,
+        global_rev: (u64, u64),
+        path_rev: (u64, u64),
+    ) -> Option<dispatch::Finished> {
+        let matches = self.entries.get(key).is_some_and(|e| {
+            let expected = if e.path_scoped { path_rev } else { global_rev };
+            e.rev == expected
+        });
         if !matches {
             return None;
         }
@@ -148,6 +236,7 @@ impl SessionReadCache {
         &mut self,
         key: String,
         rev: (u64, u64),
+        path_scoped: bool,
         deps: Vec<PathBuf>,
         finished: dispatch::Finished,
     ) {
@@ -169,6 +258,7 @@ impl SessionReadCache {
             key,
             CachedSessionRead {
                 rev,
+                path_scoped,
                 last_used: self.clock,
                 deps,
                 finished,
@@ -182,7 +272,7 @@ impl SessionReadCache {
             return;
         }
         self.entries.retain(|_, entry| {
-            !entry.deps.is_empty() && !entry.deps.iter().any(|d| paths.contains(d))
+            entry.path_scoped && !entry.deps.iter().any(|d| paths.contains(d))
         });
     }
 
@@ -212,6 +302,8 @@ pub(super) struct CodeMode {
     pub(super) cell_validation_green: bool,
     pub(super) cell_effects: HashMap<String, CellEffectSummary>,
     session_read_cache: SessionReadCache,
+    /// Bumped only on non-path-scoped mutations (shell, non-readonly MCP, rollback).
+    pub(super) global_rev: u64,
     pub(super) last_applied_effects: Vec<Value>,
 }
 
@@ -268,7 +360,7 @@ pub(super) fn definition_for_with_subagents(
             native_definitions_for(code_intel_enabled, subagents_enabled),
         );
         let helpers_block =
-            "readMany(paths: (string | { path: string; offset?: number; max_lines?: number; outline?: boolean; symbols?: string[]; ranges?: number[][]; raw?: boolean })[], opts?: { offset?: number; max_lines?: number; outline?: boolean; raw?: boolean; structured?: boolean }): Promise<Record<string, unknown>>; // at most 64 paths\noutlineMany(pathsOrReq: string[] | { paths?: string[]; glob?: string; path?: string; limit?: number; max_symbols?: number }, opts?: object): Promise<Record<string, unknown[]>>;\ngrepIndex(queries: string | string[] | { queries: string[]; case_insensitive?: boolean; path?: string; max_hits?: number }, opts?: object): Promise<{ matches: unknown[]; truncated: boolean }>;\ngraph(req: { op: \"definitions\" | \"callers\" | \"callees\" | \"imports\" | \"tests\" | \"impact\" | \"symbols\"; symbol?: string; path?: string; depth?: number; limit?: number }): Promise<Record<string, unknown>>;\npatchMany(specs: object[]): Promise<string[]>;\natomic<T>(fn: () => Promise<T>): Promise<T>;";
+            "readMany(paths: (string | { path: string; offset?: number; max_lines?: number; outline?: boolean; symbols?: string[]; ranges?: number[][]; raw?: boolean })[], opts?: { offset?: number; max_lines?: number; outline?: boolean; raw?: boolean; structured?: boolean }): Promise<Record<string, unknown>>; // at most 64 paths\noutlineMany(pathsOrReq: string[] | { paths?: string[]; glob?: string; path?: string; limit?: number; max_symbols?: number }, opts?: object): Promise<Record<string, unknown[]>>;\ngrepIndex(queries: string | string[] | { queries: string[]; case_insensitive?: boolean; path?: string; max_hits?: number }, opts?: object): Promise<{ matches: unknown[]; truncated: boolean }>;\ngraph(req: { op: \"definitions\" | \"callers\" | \"callees\" | \"imports\" | \"tests\" | \"impact\" | \"symbols\"; symbol?: string; path?: string; depth?: number; limit?: number }): Promise<Record<string, unknown>>;\nreadArtifact(req: { id: string; offset?: number; max_bytes?: number; pattern?: string; case_insensitive?: boolean; context_lines?: number; max_matches?: number }): Promise<Record<string, unknown>>;\npatchMany(specs: object[]): Promise<string[]>;\natomic<T>(fn: () => Promise<T>): Promise<T>;";
         if mcp_enabled {
             format!(
                 "{prose}\n```ts\n{decls}\n// Also on slim: {helpers_block}\n{CODE_HELPERS_MCP}\n{CODE_HELPERS_BASE}\n```"
@@ -378,13 +470,21 @@ fn build_native_definitions(
                 );
             }
             "write" | "patch" => {
-                if let Some(properties) = definition["input_schema"]["properties"]["then_run"]
-                    ["properties"]
-                    .as_object_mut()
+                // In Code mode, programs chain `await slim.shell(...)` directly;
+                // omit `then_run` from advertised TS signatures to save per-turn
+                // prompt tokens while keeping runtime support + `then_run.final` refusal.
+                if let Some(properties) =
+                    definition["input_schema"]["properties"].as_object_mut()
                 {
-                    for argument in UNSUPPORTED_THEN_RUN_ARGUMENTS {
-                        properties.remove(argument);
-                    }
+                    properties.remove("then_run");
+                }
+                if let Some(desc) = definition["description"].as_str() {
+                    let cleaned = desc
+                        .replace(
+                            " Attach any check/test as then_run on the last edit instead of a separate shell call; it runs after success and reports both results (a failed check keeps the edit).",
+                            "",
+                        );
+                    definition["description"] = Value::String(cleaned);
                 }
             }
             "search" => {
@@ -495,10 +595,15 @@ struct CellState {
     unawaited_failures: Vec<String>,
     /// Advisories from `RunGuards` (e.g. rewrite warning) surfaced at cell end.
     guard_notes: Vec<String>,
-    /// Intra-cell cache for snapshot reads; cleared on any non-readonly call.
-    read_cache: HashMap<String, dispatch::Finished>,
+    /// Intra-cell cache for snapshot reads: `(deps, finished)`. Path-scoped
+    /// mutations invalidate only overlapping entries; opaque mutations clear all.
+    read_cache: HashMap<String, (Vec<PathBuf>, dispatch::Finished)>,
     /// Incremented whenever a non-readonly call starts or an MCP call settles.
     mutation_epoch: u64,
+    /// Incremented on opaque (non-path-scoped) mutations inside the cell.
+    global_mutation_epoch: u64,
+    /// Path-scoped mutations recorded during this cell as `(mutation_epoch, paths)`.
+    cell_mutated_paths: Vec<(u64, Vec<PathBuf>)>,
     /// Number of MCP calls currently in flight; while > 0, reads must not
     /// populate `read_cache` because an overlapping MCP call may mutate disk.
     in_flight_mcp: usize,
@@ -506,6 +611,10 @@ struct CellState {
     applied_effects: Vec<Value>,
     /// Active `slim.atomic(...)` transaction backups.
     atomic_tx: Option<AtomicTx>,
+    /// In-flight async LSP `didChange`/`didSave` notifications fired after
+    /// `write`/`patch` so `drive_cell` settles JS promises immediately and only
+    /// drains as a barrier before `slim.code_intel` or cell exit.
+    pending_lsp_syncs: tokio::task::JoinSet<()>,
 }
 
 impl Runtime {
@@ -566,6 +675,19 @@ impl Runtime {
 }
 
 impl CellState {
+    async fn drain_lsp_syncs(&mut self) {
+        while self.pending_lsp_syncs.join_next().await.is_some() {}
+    }
+
+    fn invalidate_read_cache_paths(&mut self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            self.read_cache.clear();
+            return;
+        }
+        self.read_cache
+            .retain(|_, (deps, _)| !deps.is_empty() && !deps.iter().any(|d| paths.contains(d)));
+    }
+
     /// Notes attached to the cell result (guard advisories + unawaited failures).
     fn cell_notes(&self) -> Option<String> {
         let mut notes = self.guard_notes.clone();
@@ -644,7 +766,93 @@ impl Runtime {
         } else {
             None
         };
-        let outcome = if let Some(profile) = profile {
+        let mut speculative_outcome: Option<Result<String, String>> = None;
+        if let Some(spec) = self.speculative_reads.remove(invocation.call_id) {
+            let expected_fp = crate::tools::hash_fields(&[
+                b"slim-spec-codemode-v1",
+                invocation.name.as_bytes(),
+                invocation.arguments.as_bytes(),
+            ]);
+            let rev_now = self.tools.workspace_revision();
+            let (fs_now, git_now) = crate::tools::canonical_workspace(cwd)
+                .ok()
+                .and_then(|root| crate::project_index::existing_for_workspace(&root))
+                .map_or((0, 0), |d| (d.fs_epoch(), d.git_dirty_epoch()));
+            if spec.fingerprint == expected_fp
+                && spec.revision_before == rev_now
+                && spec.fs_epoch_before == fs_now
+                && spec.git_dirty_epoch_before == git_now
+                && profile.is_some()
+            {
+                if let Ok(Some(super::speculative::SpeculativeOutcome::CodeMode(cm))) =
+                    spec.handle.await
+                {
+                    let rev_after = self.tools.workspace_revision();
+                    let (fs_after, git_after) = crate::tools::canonical_workspace(cwd)
+                        .ok()
+                        .and_then(|root| crate::project_index::existing_for_workspace(&root))
+                        .map_or((0, 0), |d| (d.fs_epoch(), d.git_dirty_epoch()));
+                    if rev_after == rev_now
+                        && fs_after == fs_now
+                        && git_after == git_now
+                        && self.codemode.remaining_calls >= cm.used_calls
+                    {
+                        self.codemode.remaining_calls -= cm.used_calls;
+                        self.codemode.used_calls += cm.used_calls;
+                        for step in cm.steps {
+                            let remapped = match step {
+                                crate::EventKind::ToolStepStarted {
+                                    step_id,
+                                    name,
+                                    arguments,
+                                    ..
+                                } => crate::EventKind::ToolStepStarted {
+                                    batch_id: invocation.batch_id.into(),
+                                    call_id: invocation.call_id.into(),
+                                    step_id: step_id.replacen(
+                                        "__spec__:__spec__:",
+                                        &format!("{}:{}:", invocation.batch_id, invocation.call_id),
+                                        1,
+                                    ),
+                                    name,
+                                    arguments,
+                                },
+                                crate::EventKind::ToolStepFinished {
+                                    step_id,
+                                    name,
+                                    success,
+                                    duration_ms,
+                                    output,
+                                    diff,
+                                    ..
+                                } => crate::EventKind::ToolStepFinished {
+                                    batch_id: invocation.batch_id.into(),
+                                    call_id: invocation.call_id.into(),
+                                    step_id: step_id.replacen(
+                                        "__spec__:__spec__:",
+                                        &format!("{}:{}:", invocation.batch_id, invocation.call_id),
+                                        1,
+                                    ),
+                                    name,
+                                    success,
+                                    duration_ms,
+                                    output,
+                                    diff,
+                                },
+                                other => other,
+                            };
+                            push_runtime_event(&mut self.app, &mut seq, remapped)?;
+                        }
+                        speculative_outcome = Some(cm.output);
+                    }
+                }
+            } else {
+                spec.handle.abort();
+            }
+        }
+        let outcome = if let Some(hit) = speculative_outcome {
+            hit
+        } else if let Some(profile) = profile {
             self.run_codemode_with_governor(mode, profile, cwd, invocation, &mut seq, wall, governor)
                 .await?
         } else if is_batch_code {
@@ -814,9 +1022,12 @@ impl Runtime {
             guard_notes: Vec::new(),
             read_cache: HashMap::new(),
             mutation_epoch: 0,
+            global_mutation_epoch: 0,
+            cell_mutated_paths: Vec::new(),
             in_flight_mcp: 0,
             applied_effects: Vec::new(),
             atomic_tx: None,
+            pending_lsp_syncs: tokio::task::JoinSet::new(),
         };
         let ended = self
             .drive_cell(&scope, &run, &mut cell, &mut state, seq, governor)
@@ -834,12 +1045,14 @@ impl Runtime {
                 journal_error.get_or_insert(error);
             }
         }
+        state.drain_lsp_syncs().await;
         let ended = ended?;
         if let Some(error) = journal_error {
             if let Some(tx) = state.atomic_tx.take() {
                 self.rollback_atomic(tx.backups, scope.cwd).await;
                 state.read_cache.clear();
                 self.codemode.session_read_cache.clear();
+                self.codemode.global_rev = self.codemode.global_rev.saturating_add(1);
             }
             self.codemode.last_applied_effects = state.applied_effects;
             return Err(error);
@@ -859,6 +1072,7 @@ impl Runtime {
                 self.codemode.cell_validation_green = false;
                 state.read_cache.clear();
                 self.codemode.session_read_cache.clear();
+                self.codemode.global_rev = self.codemode.global_rev.saturating_add(1);
             }
         }
         self.codemode.last_applied_effects = state.applied_effects.clone();
@@ -907,7 +1121,8 @@ impl Runtime {
         loop {
             // On an error the calls already sent are left to finish: the
             // caller drains them before the cell is dropped and stopped.
-            self.start_ready_calls(scope, cell, state, seq, governor)?;
+            self.start_ready_calls(scope, cell, state, seq, governor)
+                .await?;
             let cancellation = cell.cancellation.clone();
             let event = tokio::select! {
                 biased;
@@ -1026,6 +1241,23 @@ impl Runtime {
                 self.codemode.pending_final_answer = Some(answer);
                 Ok(Value::Null)
             }
+            Command::ReadArtifact { args } => {
+                if scope.natives.is_empty() {
+                    return Ok(Err(
+                        "slim.readArtifact() is only available in workspace cells".into(),
+                    ));
+                }
+                let raw_args = args.to_string();
+                match self.read_artifact_page_with_cap(&raw_args, 256 * 1024) {
+                    Ok(json_text) => {
+                        let mut val: Value = serde_json::from_str(&json_text)
+                            .unwrap_or_else(|_| Value::String(json_text));
+                        redact_value(&mut val, &self.sensitive_values.0);
+                        Ok(val)
+                    }
+                    Err(error) => Err(self.redact_sensitive(&error)),
+                }
+            }
             Command::BeginAtomic => {
                 if !scope.allow_mutation || scope.natives.is_empty() {
                     return Ok(Err("slim.atomic() requires a writable workspace cell".into()));
@@ -1056,7 +1288,9 @@ impl Runtime {
                     self.codemode.cell_validation_green = false;
                     state.read_cache.clear();
                     self.codemode.session_read_cache.clear();
+                    self.codemode.global_rev = self.codemode.global_rev.saturating_add(1);
                     state.mutation_epoch = state.mutation_epoch.saturating_add(1);
+                    state.global_mutation_epoch = state.global_mutation_epoch.saturating_add(1);
                     Ok(json!({ "rolled_back": rolled_back }))
                 } else {
                     Ok(json!({ "rolled_back": [] }))

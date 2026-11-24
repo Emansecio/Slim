@@ -213,7 +213,8 @@ pub(super) struct Running {
     pub from_cache: bool,
     pub effect_target: Option<String>,
     pub mutation_epoch: u64,
-    pub daemon_epoch: (u64, u64),
+    pub global_mutation_epoch: u64,
+    pub daemon_epoch: (u64, u64, u64),
     pub governor_pending: Option<super::governor::PendingCall>,
     pub cache_key: Option<String>,
     concurrency: Concurrency,
@@ -400,7 +401,8 @@ impl Scheduler {
         is_read_only: bool,
         effect_target: Option<String>,
         mutation_epoch: u64,
-        daemon_epoch: (u64, u64),
+        global_mutation_epoch: u64,
+        daemon_epoch: (u64, u64, u64),
         governor_pending: Option<super::governor::PendingCall>,
     ) {
         let concurrency = job.concurrency();
@@ -430,6 +432,7 @@ impl Scheduler {
                     from_cache: true,
                     effect_target,
                     mutation_epoch,
+                    global_mutation_epoch,
                     daemon_epoch,
                     governor_pending,
                     cache_key,
@@ -724,6 +727,7 @@ impl Scheduler {
                 from_cache: false,
                 effect_target,
                 mutation_epoch,
+                global_mutation_epoch,
                 daemon_epoch,
                 governor_pending,
                 cache_key,
@@ -743,7 +747,8 @@ impl Scheduler {
         effect_target: Option<String>,
         prepared: Option<Arc<PreparedToolInvocation>>,
         mutation_epoch: u64,
-        daemon_epoch: (u64, u64),
+        global_mutation_epoch: u64,
+        daemon_epoch: (u64, u64, u64),
         governor_pending: Option<super::governor::PendingCall>,
         finished: Finished,
     ) {
@@ -765,6 +770,7 @@ impl Scheduler {
                 from_cache: true,
                 effect_target,
                 mutation_epoch,
+                global_mutation_epoch,
                 daemon_epoch,
                 governor_pending,
                 cache_key,
@@ -1165,6 +1171,61 @@ fn read_one_spec(
     Ok((spec.raw_path.clone(), val, prepared.target_paths))
 }
 
+fn try_read_one_spec_from_slab(
+    daemon: &crate::project_index::ProjectIndexDaemon,
+    workspace: &Path,
+    spec: &ReadManySpec,
+    default_structured: bool,
+) -> Option<(String, Value, Vec<PathBuf>)> {
+    if spec.outline || !spec.symbols.is_empty() || !spec.ranges.is_empty() {
+        return None;
+    }
+    let abs = crate::tools::resolve_workspace_path_from_root(workspace, &spec.raw_path).ok()?;
+    let cached = daemon.read_file_cached(&abs).ok()??;
+    let total_lines = cached.line_count();
+    let first = spec.offset.max(1);
+    let max_lines = spec.max_lines.unwrap_or(crate::tools::MAX_READ_LINES_CAP);
+    if first > total_lines {
+        let val = if default_structured {
+            serde_json::json!({
+                "path": spec.raw_path,
+                "content": "",
+                "first_line": first,
+                "total_lines": 0,
+                "next_offset": Value::Null,
+                "complete": true,
+            })
+        } else {
+            Value::String(String::new())
+        };
+        return Some((spec.raw_path.clone(), val, vec![abs]));
+    }
+    let end = first.saturating_add(max_lines).saturating_sub(1).min(total_lines);
+    let slice = cached.line_slice(first, end);
+    if slice.len() > 1024 * 1024 {
+        return None;
+    }
+    let next_offset = (end < total_lines).then_some(end + 1);
+    let returned_lines = end.saturating_sub(first) + 1;
+    let val = if default_structured {
+        serde_json::json!({
+            "path": spec.raw_path,
+            "content": slice,
+            "first_line": first,
+            "total_lines": returned_lines,
+            "next_offset": next_offset,
+            "complete": next_offset.is_none(),
+        })
+    } else if let Some(next) = next_offset {
+        Value::String(format!(
+            "{slice}\n[showing lines {first}-{end}; more content available; pass \"offset\": {next} for the next page]"
+        ))
+    } else {
+        Value::String(slice.to_owned())
+    };
+    Some((spec.raw_path.clone(), val, vec![abs]))
+}
+
 fn run_read_many_batch(
     tools: &ToolRegistry,
     workspace: &Path,
@@ -1174,56 +1235,73 @@ fn run_read_many_batch(
 ) -> (Result<Value, String>, Vec<PathBuf>) {
     let mut map = serde_json::Map::with_capacity(specs.len());
     let mut deps = Vec::with_capacity(specs.len());
-    if specs.len() < 4 {
-        for spec in specs {
+    let daemon = crate::project_index::existing_for_workspace(workspace);
+    let mut misses: Vec<(usize, &ReadManySpec)> = Vec::new();
+    let mut ordered: Vec<Option<(String, Value, Vec<PathBuf>)>> =
+        (0..specs.len()).map(|_| None).collect();
+
+    if let Some(d) = daemon.as_deref() {
+        for (idx, spec) in specs.iter().enumerate() {
+            if cell.is_some_and(CancellationToken::is_cancelled) {
+                return (Err("readMany cancelled".into()), deps);
+            }
+            if let Some(hit) = try_read_one_spec_from_slab(d, workspace, spec, default_structured) {
+                ordered[idx] = Some(hit);
+            } else {
+                misses.push((idx, spec));
+            }
+        }
+    } else {
+        misses.extend(specs.iter().enumerate());
+    }
+
+    if misses.len() < 4 {
+        for (idx, spec) in misses {
             match read_one_spec(tools, workspace, spec, default_structured, cell) {
-                Ok((key, val, target_paths)) => {
-                    for p in target_paths {
-                        if !deps.contains(&p) {
-                            deps.push(p);
-                        }
-                    }
-                    map.insert(key, val);
-                }
+                Ok(row) => ordered[idx] = Some(row),
                 Err(err) => return (Err(err), deps),
             }
         }
-        return (Ok(Value::Object(map)), deps);
+    } else {
+        let next = AtomicUsize::new(0);
+        let aborted = std::sync::atomic::AtomicBool::new(false);
+        let collected = std::sync::Mutex::new(Vec::with_capacity(misses.len()));
+        let workers = misses.len().min(4);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    while !aborted.load(Ordering::Acquire) {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(orig_idx, spec)) = misses.get(i) else { break };
+                        let res = read_one_spec(tools, workspace, spec, default_structured, cell);
+                        if res.is_err() {
+                            aborted.store(true, Ordering::Release);
+                        }
+                        collected
+                            .lock()
+                            .expect("read_many mutex")
+                            .push((orig_idx, res));
+                    }
+                });
+            }
+        });
+        let rows = collected.into_inner().expect("read_many mutex");
+        for (orig_idx, res) in rows {
+            match res {
+                Ok(row) => ordered[orig_idx] = Some(row),
+                Err(err) => return (Err(err), deps),
+            }
+        }
     }
 
-    let next = AtomicUsize::new(0);
-    let aborted = std::sync::atomic::AtomicBool::new(false);
-    let collected = std::sync::Mutex::new(Vec::with_capacity(specs.len()));
-    let workers = specs.len().min(4);
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| {
-                while !aborted.load(Ordering::Acquire) {
-                    let idx = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(spec) = specs.get(idx) else { break };
-                    let res = read_one_spec(tools, workspace, spec, default_structured, cell);
-                    if res.is_err() {
-                        aborted.store(true, Ordering::Release);
-                    }
-                    collected.lock().expect("read_many mutex").push((idx, res));
-                }
-            });
-        }
-    });
-    let mut rows = collected.into_inner().expect("read_many mutex");
-    rows.sort_by_key(|(idx, _)| *idx);
-    for (_, res) in rows {
-        match res {
-            Ok((key, val, target_paths)) => {
-                for p in target_paths {
-                    if !deps.contains(&p) {
-                        deps.push(p);
-                    }
-                }
-                map.insert(key, val);
+    for row in ordered.into_iter().flatten() {
+        let (key, val, target_paths) = row;
+        for p in target_paths {
+            if !deps.contains(&p) {
+                deps.push(p);
             }
-            Err(err) => return (Err(err), deps),
         }
+        map.insert(key, val);
     }
     (Ok(Value::Object(map)), deps)
 }
@@ -1430,38 +1508,43 @@ fn run_grep_index_batch(
         .collect();
     let mut disk_cache: HashMap<PathBuf, Option<Arc<str>>> = HashMap::new();
     let mut fallback_queries: Vec<&(String, Option<Vec<u8>>)> = Vec::new();
+    let mut candidate_masks: std::collections::BTreeMap<PathBuf, u16> =
+        std::collections::BTreeMap::new();
 
-    for pq in &prepared_queries {
+    for (q_idx, pq) in prepared_queries.iter().enumerate() {
         if cell.is_some_and(CancellationToken::is_cancelled) {
             return Err("grepIndex cancelled".into());
-        }
-        if matches.len() >= max_hits {
-            truncated = true;
-            break;
         }
         let Some(paths) = daemon.as_ref().and_then(|d| d.search_candidates(&pq.0)) else {
             fallback_queries.push(pq);
             continue;
         };
-        let single = [pq];
+        let bit = 1u16 << q_idx;
         for abs in paths {
-            if cell.is_some_and(CancellationToken::is_cancelled) {
-                return Err("grepIndex cancelled".into());
-            }
-            let rel = crate::tools::display_path(workspace, &abs)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if !in_scope(&rel) {
-                continue;
-            }
-            let Some(text) = load_searchable_text(&abs, daemon.as_deref(), &mut disk_cache) else {
-                continue;
-            };
-            scan_text_for_queries(&text, &rel, &single, max_hits, &mut matches, &mut truncated);
-            if truncated {
-                break;
-            }
+            *candidate_masks.entry(abs).or_insert(0) |= bit;
         }
+    }
+
+    for (abs, mask) in candidate_masks {
+        if cell.is_some_and(CancellationToken::is_cancelled) {
+            return Err("grepIndex cancelled".into());
+        }
+        let rel = crate::tools::display_path(workspace, &abs)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !in_scope(&rel) {
+            continue;
+        }
+        let Some(text) = load_searchable_text(&abs, daemon.as_deref(), &mut disk_cache) else {
+            continue;
+        };
+        let active: Vec<&(String, Option<Vec<u8>>)> = prepared_queries
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| (mask & (1u16 << idx)) != 0)
+            .map(|(_, pq)| pq)
+            .collect();
+        scan_text_for_queries(&text, &rel, &active, max_hits, &mut matches, &mut truncated);
         if truncated {
             break;
         }
@@ -1469,29 +1552,92 @@ fn run_grep_index_batch(
 
     if !truncated && !fallback_queries.is_empty() {
         let listing = glob_workspace_files(workspace, path, None, 1000, cell)?;
-        for rel in listing.files {
+        let scoped: Vec<(String, PathBuf)> = listing
+            .files
+            .into_iter()
+            .filter(|rel| in_scope(rel))
+            .filter_map(|rel| {
+                crate::tools::resolve_workspace_path_from_root(workspace, &rel)
+                    .ok()
+                    .map(|abs| (rel, abs))
+            })
+            .collect();
+        if scoped.len() > 32 && daemon.is_none() {
+            let next = AtomicUsize::new(0);
+            let done = std::sync::atomic::AtomicBool::new(false);
+            let chunks = std::sync::Mutex::new(Vec::<(usize, Vec<Value>)>::new());
+            let workers = scoped.len().min(4);
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    scope.spawn(|| {
+                        while !done.load(Ordering::Acquire) {
+                            if cell.is_some_and(CancellationToken::is_cancelled) {
+                                done.store(true, Ordering::Release);
+                                break;
+                            }
+                            let idx = next.fetch_add(1, Ordering::Relaxed);
+                            let Some((rel, abs)) = scoped.get(idx) else { break };
+                            let Some(text) = std::fs::metadata(abs)
+                                .ok()
+                                .filter(|m| m.is_file() && m.len() <= MAX_GREP_FILE_BYTES)
+                                .and_then(|_| std::fs::read_to_string(abs).ok())
+                            else {
+                                continue;
+                            };
+                            let mut local = Vec::new();
+                            let mut local_trunc = false;
+                            scan_text_for_queries(
+                                &text,
+                                rel,
+                                &fallback_queries,
+                                max_hits,
+                                &mut local,
+                                &mut local_trunc,
+                            );
+                            if !local.is_empty() {
+                                chunks.lock().expect("grep_index mutex").push((idx, local));
+                            }
+                        }
+                    });
+                }
+            });
             if cell.is_some_and(CancellationToken::is_cancelled) {
                 return Err("grepIndex cancelled".into());
             }
-            if !in_scope(&rel) {
-                continue;
+            let mut rows = chunks.into_inner().expect("grep_index mutex");
+            rows.sort_by_key(|(idx, _)| *idx);
+            for (_, local) in rows {
+                for hit in local {
+                    matches.push(hit);
+                    if matches.len() >= max_hits {
+                        truncated = true;
+                        break;
+                    }
+                }
+                if truncated {
+                    break;
+                }
             }
-            let Ok(abs) = crate::tools::resolve_workspace_path_from_root(workspace, &rel) else {
-                continue;
-            };
-            let Some(text) = load_searchable_text(&abs, daemon.as_deref(), &mut disk_cache) else {
-                continue;
-            };
-            scan_text_for_queries(
-                &text,
-                &rel,
-                &fallback_queries,
-                max_hits,
-                &mut matches,
-                &mut truncated,
-            );
-            if truncated {
-                break;
+        } else {
+            for (rel, abs) in scoped {
+                if cell.is_some_and(CancellationToken::is_cancelled) {
+                    return Err("grepIndex cancelled".into());
+                }
+                let Some(text) = load_searchable_text(&abs, daemon.as_deref(), &mut disk_cache)
+                else {
+                    continue;
+                };
+                scan_text_for_queries(
+                    &text,
+                    &rel,
+                    &fallback_queries,
+                    max_hits,
+                    &mut matches,
+                    &mut truncated,
+                );
+                if truncated {
+                    break;
+                }
             }
         }
     }

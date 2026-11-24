@@ -44,7 +44,10 @@ impl Runtime {
         let (target, slots) = if let Some(native) = name.strip_prefix("slim.") {
             if native == "shell" {
                 allow_non_zero = take_optional_bool(&mut arguments, "allow_non_zero")?;
-                read_only_override = take_optional_bool(&mut arguments, "readonly")?;
+                read_only_override = match take_optional_bool_opt(&mut arguments, "readonly")? {
+                    Some(flag) => flag,
+                    None => super::speculative::is_allowlisted_readonly_shell_value(&arguments),
+                };
             } else if matches!(native, "read" | "readMany" | "search" | "list") {
                 structured = take_optional_bool(&mut arguments, "structured")?;
             }
@@ -226,7 +229,7 @@ impl Runtime {
     /// Starts every queued call the scheduler admits: budget and run guards,
     /// causal governor preflight, task (or intra-cell/session cache hit), then the
     /// unsynced `started` fact and step event.
-    pub(super) fn start_ready_calls(
+    pub(super) async fn start_ready_calls(
         &mut self,
         scope: &CellScope<'_>,
         cell: &engine::Cell,
@@ -237,8 +240,11 @@ impl Runtime {
         let display_root = scope.workspace.as_ref().map_or(scope.cwd, PathBuf::as_path);
         let daemon_epochs = crate::project_index::existing_for_workspace(display_root)
             .or_else(|| crate::project_index::for_workspace(display_root).ok())
-            .map_or((0, 0), |d| (d.fs_epoch(), d.git_dirty_epoch()));
+            .map_or((0, 0, 0), |d| {
+                (d.fs_epoch(), d.git_dirty_epoch(), d.external_fs_epoch())
+            });
         let ws_base_rev = self.tools.workspace_revision();
+        let path_rev = (self.codemode.global_rev, daemon_epochs.2);
 
         while let Some(mut job) = state.calls.next_startable() {
             if cell.cancellation.is_cancelled() {
@@ -266,19 +272,27 @@ impl Runtime {
                     *remaining -= job.slots;
                 }
                 self.codemode.cell_had_non_readonly_effect = true;
-                state.read_cache.clear();
+                state.mutation_epoch = state.mutation_epoch.saturating_add(1);
                 match &job.target {
                     Target::Native { prepared, .. }
                         if matches!(prepared.name.as_str(), "write" | "patch")
                             && !prepared.target_paths.is_empty() =>
                     {
+                        state.invalidate_read_cache_paths(&prepared.target_paths);
+                        state
+                            .cell_mutated_paths
+                            .push((state.mutation_epoch, prepared.target_paths.clone()));
                         self.codemode
                             .session_read_cache
                             .invalidate_paths(&prepared.target_paths);
                     }
-                    _ => self.codemode.session_read_cache.clear(),
+                    _ => {
+                        state.read_cache.clear();
+                        state.global_mutation_epoch = state.global_mutation_epoch.saturating_add(1);
+                        self.codemode.session_read_cache.clear();
+                        self.codemode.global_rev = self.codemode.global_rev.saturating_add(1);
+                    }
                 }
-                state.mutation_epoch = state.mutation_epoch.saturating_add(1);
             }
             self.codemode.used_calls += job.slots;
             let id = format!(
@@ -320,8 +334,8 @@ impl Runtime {
                     if let Some(cached) = state
                         .read_cache
                         .get(fingerprint)
-                        .and_then(Finished::clone_for_cache)
-                        .or_else(|| self.codemode.session_read_cache.get(fingerprint, rev))
+                        .and_then(|(_, v)| v.clone_for_cache())
+                        .or_else(|| self.codemode.session_read_cache.get(fingerprint, rev, path_rev))
                     {
                         cache_hit = Some(cached);
                     }
@@ -337,8 +351,8 @@ impl Runtime {
                     if let Some(cached) = state
                         .read_cache
                         .get(fingerprint)
-                        .and_then(Finished::clone_for_cache)
-                        .or_else(|| self.codemode.session_read_cache.get(fingerprint, rev))
+                        .and_then(|(_, v)| v.clone_for_cache())
+                        .or_else(|| self.codemode.session_read_cache.get(fingerprint, rev, path_rev))
                     {
                         cache_hit = Some(cached);
                     }
@@ -369,8 +383,8 @@ impl Runtime {
                     if let Some(cached) = state
                         .read_cache
                         .get(fingerprint)
-                        .and_then(Finished::clone_for_cache)
-                        .or_else(|| self.codemode.session_read_cache.get(fingerprint, rev))
+                        .and_then(|(_, v)| v.clone_for_cache())
+                        .or_else(|| self.codemode.session_read_cache.get(fingerprint, rev, path_rev))
                     {
                         cache_hit = Some(cached);
                     }
@@ -421,8 +435,10 @@ impl Runtime {
                             if let Some(cached) = state
                                 .read_cache
                                 .get(key)
-                                .and_then(Finished::clone_for_cache)
-                                .or_else(|| self.codemode.session_read_cache.get(key, rev))
+                                .and_then(|(_, v)| v.clone_for_cache())
+                                .or_else(|| {
+                                    self.codemode.session_read_cache.get(key, rev, path_rev)
+                                })
                             {
                                 cache_hit = Some(cached);
                             }
@@ -442,13 +458,23 @@ impl Runtime {
                 "status": "started",
                 "arguments": compact_arguments,
             });
+            let step_arguments = if serialized_arguments.len() > MAX_JOURNALED_ARGUMENT_BYTES {
+                self.redact_sensitive(&compact_arguments.to_string())
+            } else {
+                self.redact_sensitive(&serialized_arguments)
+            };
             let step = crate::EventKind::ToolStepStarted {
                 batch_id: scope.parent.batch_id.into(),
                 call_id: scope.parent.call_id.into(),
                 step_id: id.clone(),
                 name: job.name.clone(),
-                arguments: self.redact_sensitive(&serialized_arguments),
+                arguments: step_arguments,
             };
+            if let Target::Native { prepared, .. } = &job.target {
+                if prepared.name == "code_intel" && !state.pending_lsp_syncs.is_empty() {
+                    state.drain_lsp_syncs().await;
+                }
+            }
             if let Some(finished) = cache_hit {
                 let prepared = match &job.target {
                     Target::Native { prepared, .. } => Some(Arc::from(prepared.clone())),
@@ -461,6 +487,7 @@ impl Runtime {
                     effect_target,
                     prepared,
                     state.mutation_epoch,
+                    state.global_mutation_epoch,
                     daemon_epochs,
                     governor_pending,
                     finished,
@@ -472,6 +499,7 @@ impl Runtime {
                     is_read_only,
                     effect_target,
                     state.mutation_epoch,
+                    state.global_mutation_epoch,
                     daemon_epochs,
                     governor_pending,
                 );
@@ -593,9 +621,14 @@ impl Runtime {
                             };
                             self.cache_read_result(state, &running, &fingerprint, &cached);
                         }
-                        let mut redacted = v.clone();
-                        redact_value(&mut redacted, &self.sensitive_values.0);
-                        match probe_json_size_and_preview(&redacted) {
+                        let payload_val = if self.sensitive_values.0.is_empty() {
+                            Arc::new(v.clone())
+                        } else {
+                            let mut redacted = v.clone();
+                            redact_value(&mut redacted, &self.sensitive_values.0);
+                            Arc::new(redacted)
+                        };
+                        match json_serialized_len_bounded(&payload_val, MAX_JSON_BYTES) {
                             None => {
                                 let msg = format!(
                                     "{} output exceeds the 1 MiB bridge limit; narrow the request",
@@ -604,9 +637,9 @@ impl Runtime {
                                 let preview = prefix(&msg, MAX_STEP_OUTPUT_BYTES).to_owned();
                                 ("failed", Err(msg.clone()), msg.len(), preview)
                             }
-                            Some((raw_len, _)) => {
+                            Some(raw_len) => {
                                 let preview = format!("<{} bytes JSON>", raw_len);
-                                ("completed", Ok(Payload::JsonValue(redacted)), raw_len, preview)
+                                ("completed", Ok(Payload::JsonValue(payload_val)), raw_len, preview)
                             }
                         }
                     }
@@ -703,37 +736,53 @@ impl Runtime {
     ) {
         if !running.is_read_only
             || state.in_flight_mcp != 0
-            || running.mutation_epoch != state.mutation_epoch
+            || running.global_mutation_epoch != state.global_mutation_epoch
         {
             return;
         }
+        let deps: Vec<PathBuf> = match value {
+            Finished::Native(outcome) => outcome
+                .receipt
+                .dependencies
+                .iter()
+                .map(|dep| dep.path.clone())
+                .collect(),
+            Finished::JsonValue { deps, .. } => deps.clone(),
+            _ => Vec::new(),
+        };
+        let path_scoped = !deps.is_empty();
+        if running.mutation_epoch != state.mutation_epoch {
+            if !path_scoped {
+                return;
+            }
+            let overlapped = state
+                .cell_mutated_paths
+                .iter()
+                .filter(|(epoch, _)| *epoch > running.mutation_epoch)
+                .any(|(_, mutated)| deps.iter().any(|d| mutated.contains(d)));
+            if overlapped {
+                return;
+            }
+        }
         if state.read_cache.len() < MAX_CELL_READ_CACHE && !state.read_cache.contains_key(key) {
             if let Some(cloned) = value.clone_for_cache() {
-                state.read_cache.insert(key.to_owned(), cloned);
+                state.read_cache.insert(key.to_owned(), (deps.clone(), cloned));
             }
         }
         if let Some(cloned) = value.clone_for_cache() {
-            let deps = match value {
-                Finished::Native(outcome) => outcome
-                    .receipt
-                    .dependencies
-                    .iter()
-                    .map(|dep| dep.path.clone())
-                    .collect(),
-                Finished::JsonValue { deps, .. } => deps.clone(),
-                _ => Vec::new(),
-            };
-            let daemon_epoch = if matches!(value, Finished::Git { .. }) {
-                running.daemon_epoch.1
+            let rev = if path_scoped {
+                (self.codemode.global_rev, running.daemon_epoch.2)
             } else {
-                running.daemon_epoch.0
+                let daemon_epoch = if matches!(value, Finished::Git { .. }) {
+                    running.daemon_epoch.1
+                } else {
+                    running.daemon_epoch.0
+                };
+                (self.tools.workspace_revision(), daemon_epoch)
             };
-            self.codemode.session_read_cache.insert(
-                key.to_owned(),
-                (self.tools.workspace_revision(), daemon_epoch),
-                deps,
-                cloned,
-            );
+            self.codemode
+                .session_read_cache
+                .insert(key.to_owned(), rev, path_scoped, deps, cloned);
         }
     }
 
@@ -750,7 +799,9 @@ impl Runtime {
             state.in_flight_mcp = state.in_flight_mcp.saturating_sub(1);
             state.read_cache.clear();
             self.codemode.session_read_cache.clear();
+            self.codemode.global_rev = self.codemode.global_rev.saturating_add(1);
             state.mutation_epoch = state.mutation_epoch.saturating_add(1);
+            state.global_mutation_epoch = state.global_mutation_epoch.saturating_add(1);
         }
         self.refresh_mcp_secrets();
         match outcome {
@@ -827,11 +878,10 @@ impl Runtime {
                 });
                 redact_value(&mut value, &self.sensitive_values.0);
                 if let Some((output_bytes, preview)) = probe_json_size_and_preview(&value) {
-                    let raw = value.to_string();
-                    let tool_result = ToolResult::ok("glob", raw);
+                    let tool_result = ToolResult::ok("glob", preview.clone());
                     (
                         "completed",
-                        Ok(Payload::JsonValue(value)),
+                        Ok(Payload::JsonValue(Arc::new(value))),
                         output_bytes,
                         preview,
                         tool_result,
@@ -881,7 +931,12 @@ impl Runtime {
                 let mut redacted = value.clone();
                 redact_value(&mut redacted, &self.sensitive_values.0);
                 if let Some((output_bytes, preview)) = probe_json_size_and_preview(&redacted) {
-                    ("completed", Ok(Payload::JsonValue(redacted)), output_bytes, preview)
+                    (
+                        "completed",
+                        Ok(Payload::JsonValue(Arc::new(redacted))),
+                        output_bytes,
+                        preview,
+                    )
                 } else {
                     let msg = "slim.git output exceeds the 1 MiB bridge limit; narrow the path or limit".to_owned();
                     let preview = prefix(&msg, MAX_STEP_OUTPUT_BYTES).to_owned();
@@ -979,14 +1034,14 @@ impl Runtime {
         }
         let display_root = scope.workspace.as_ref().map_or(scope.cwd, PathBuf::as_path);
         if let Some(prepared) = &running.prepared {
-            let native = ToolInvocation {
-                batch_id: scope.parent.batch_id,
-                call_id: &running.id,
-                name: &prepared.name,
-                arguments: "",
-            };
-            self.notify_code_intel_after_mutation(scope.cwd, native, prepared, &outcome)
-                .await;
+            if let Some(sync_fut) = self.prepare_code_intel_sync_task(
+                scope.cwd,
+                &prepared.name,
+                prepared,
+                &outcome,
+            ) {
+                state.pending_lsp_syncs.spawn(sync_fut);
+            }
             if matches!(prepared.name.as_str(), "write" | "patch")
                 && (outcome.result.success
                     || outcome
@@ -1047,7 +1102,7 @@ impl Runtime {
             if let Some(val) =
                 self.structured_native_value(&outcome.receipt.presentation, path_hint, display_root)
             {
-                if probe_json_size_and_preview(&val).is_none() {
+                if json_serialized_len_bounded(&val, MAX_JSON_BYTES).is_none() {
                     let message = format!(
                         "{} finished ({status}), but its structured output exceeds the 1 MiB bridge limit; narrow the call",
                         running.name
@@ -1057,7 +1112,7 @@ impl Runtime {
                     (Err(message), bytes, preview)
                 } else {
                     let preview = prefix(&output, MAX_STEP_OUTPUT_BYTES).to_owned();
-                    (Ok(Payload::JsonValue(val)), output_bytes, preview)
+                    (Ok(Payload::JsonValue(Arc::new(val))), output_bytes, preview)
                 }
             } else if output_bytes > MAX_JSON_BYTES {
                 let mut message = format!(
@@ -1216,12 +1271,16 @@ fn job_effect_target(target: &Target, cwd: &Path) -> Option<String> {
 }
 
 fn take_optional_bool(arguments: &mut Value, key: &str) -> Result<bool, String> {
+    Ok(take_optional_bool_opt(arguments, key)?.unwrap_or(false))
+}
+
+fn take_optional_bool_opt(arguments: &mut Value, key: &str) -> Result<Option<bool>, String> {
     let Some(object) = arguments.as_object_mut() else {
-        return Ok(false);
+        return Ok(None);
     };
     match object.remove(key) {
-        None | Some(Value::Null) => Ok(false),
-        Some(Value::Bool(flag)) => Ok(flag),
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(flag)) => Ok(Some(flag)),
         Some(_) => Err(format!("`{key}` must be a boolean")),
     }
 }
@@ -1498,6 +1557,72 @@ impl std::io::Write for BoundedJsonProbe {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+/// Exact zero-allocation serialized JSON byte length, short-circuiting above `limit`.
+pub(super) fn json_serialized_len_bounded(value: &Value, limit: usize) -> Option<usize> {
+    fn str_len(s: &str, rem: usize) -> Option<usize> {
+        let mut n = 2usize; // surrounding quotes
+        for b in s.bytes() {
+            n += match b {
+                b'"' | b'\\' | b'\x08' | b'\x0c' | b'\n' | b'\r' | b'\t' => 2,
+                0x00..=0x1f => 6,
+                _ => 1,
+            };
+            if n > rem {
+                return None;
+            }
+        }
+        Some(n)
+    }
+    fn walk(value: &Value, rem: usize) -> Option<usize> {
+        let n = match value {
+            Value::Null => 4,
+            Value::Bool(true) => 4,
+            Value::Bool(false) => 5,
+            Value::Number(num) => num.to_string().len(),
+            Value::String(s) => return str_len(s, rem),
+            Value::Array(items) => {
+                let mut total = 2usize;
+                if total > rem {
+                    return None;
+                }
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        total += 1;
+                        if total > rem {
+                            return None;
+                        }
+                    }
+                    total += walk(item, rem - total)?;
+                }
+                return Some(total);
+            }
+            Value::Object(map) => {
+                let mut total = 2usize;
+                if total > rem {
+                    return None;
+                }
+                for (i, (k, v)) in map.iter().enumerate() {
+                    if i > 0 {
+                        total += 1;
+                        if total > rem {
+                            return None;
+                        }
+                    }
+                    total += str_len(k, rem - total)?;
+                    total += 1; // ':'
+                    if total > rem {
+                        return None;
+                    }
+                    total += walk(v, rem - total)?;
+                }
+                return Some(total);
+            }
+        };
+        (n <= rem).then_some(n)
+    }
+    walk(value, limit)
 }
 
 fn probe_json_size_and_preview(value: &Value) -> Option<(usize, String)> {

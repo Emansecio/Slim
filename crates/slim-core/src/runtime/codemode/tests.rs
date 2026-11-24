@@ -615,8 +615,8 @@ fn definition_keeps_auto_and_declares_the_slim_api_in_code_mode() {
     assert!(description.contains("declare function describeTool("));
     assert!(!description.contains("code_intel("));
     assert!(!description.contains("background"));
-    // The program returns the answer: no `then_run.final` on edits.
-    assert!(description.contains("then_run?:"), "{description}");
+    // The program chains `await slim.shell(...)` directly: `then_run` is omitted from TS decls.
+    assert!(!description.contains("then_run?:"), "{description}");
     assert!(!description.contains("final?:"), "{description}");
     // Compact provider definitions: no legacy read alias.
     assert!(!description.contains(" lines?:"), "{description}");
@@ -2178,4 +2178,75 @@ fn code_mode_deduplicates_top_level_subagent_schemas_and_frame_prose() {
     let auto_names: Vec<_> = auto_tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(auto_names.contains(&"subagent"));
     assert!(auto_names.contains(&"subagent_control"));
+}
+
+#[tokio::test]
+async fn code_mode_enhancements_cache_survival_full_read_artifact_and_json_len() {
+    // 1. Exact zero-alloc JSON length matches serde_json::to_vec including escapes & UTF-8.
+    let sample = json!({
+        "a": "hello \"world\"\n\t\\\x01ação",
+        "b": [1, -42, true, false, null, { "k": "v" }],
+        "empty": []
+    });
+    let expected_len = serde_json::to_vec(&sample).unwrap().len();
+    assert_eq!(
+        calls::json_serialized_len_bounded(&sample, expected_len),
+        Some(expected_len)
+    );
+    assert_eq!(
+        calls::json_serialized_len_bounded(&sample, expected_len - 1),
+        None
+    );
+
+    // 2. Code mode reads >32 KiB (>200 lines) in full without raw:true, SessionReadCache
+    // survives a disjoint patch on another file, and slim.readArtifact reads session artifacts.
+    let dir = crate::runtime::temp_root::TempRoot::new("codemode-enhancements");
+    let big_content: String = (1..=350)
+        .map(|i| format!("line-{i:04}: {}\n", "x".repeat(110)))
+        .collect();
+    assert!(big_content.len() > 32 * 1024);
+    std::fs::write(dir.join("big.txt"), &big_content).unwrap();
+    std::fs::write(dir.join("other.txt"), "before\n").unwrap();
+
+    let mut runtime = Runtime::new();
+    let store = crate::context::ArtifactStore::new(dir.join("artifacts")).unwrap();
+    let handle = store.put("test-art", b"alpha\nneedle-line\nomega\n").unwrap();
+    runtime.artifact_store = Some(store);
+    runtime.restored_artifact_ids.insert(handle.id.clone());
+
+    let code = format!(
+        r#"
+        const full = await slim.read({{ path: "big.txt" }});
+        await slim.patch({{ path: "other.txt", edits: [{{ expected: "before", replacement: "after" }}] }});
+        const cached = await slim.read({{ path: "big.txt" }});
+        const art = await slim.readArtifact({{ id: "{id}", pattern: "needle" }});
+        return {{ has350: full.includes("line-0350"), same: full === cached, art }};
+    "#,
+        id = handle.id
+    );
+    let arguments = json!({ "code": code }).to_string();
+    runtime.codemode.remaining_calls = 16;
+    let mut seq = 1u64;
+    let out = runtime
+        .run_codemode(
+            crate::OperatingMode::Code,
+            &dir,
+            ToolInvocation {
+                batch_id: "b1",
+                call_id: "c1",
+                name: "codemode",
+                arguments: &arguments,
+            },
+            &mut seq,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(parsed["has350"], true);
+    assert_eq!(parsed["same"], true);
+    assert!(parsed["art"]["matches"].to_string().contains("needle-line"));
+    // SessionReadCache must still hold big.txt after patching other.txt.
+    assert!(!runtime.codemode.session_read_cache.is_empty());
 }

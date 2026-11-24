@@ -209,6 +209,10 @@ pub(super) const POST_EDIT_DIAGNOSTICS_DEADLINE: std::time::Duration =
 const POST_EDIT_DIAGNOSTICS_SHORT_DEADLINE: std::time::Duration =
     std::time::Duration::from_millis(250);
 
+/// Short opportunistic deadline when the cell already validated green and called `finish()`.
+const POST_EDIT_DIAGNOSTICS_CONCLUDED_DEADLINE: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
 impl Runtime {
     /// Runs one code_intel tool call against the installed CodeIntelligence
     /// facade. Only this async path can serve it: LSP queries await
@@ -243,28 +247,27 @@ impl Runtime {
         Ok((outcome, seq))
     }
 
-    /// Best-effort didChange/didSave push after the agent wrote a file. The
-    /// warm-only implementation may no-op, but when it does synchronize, the
-    /// await establishes protocol order before the next tool call.
-    pub(super) async fn notify_code_intel_after_mutation(
+    /// Prepares the async LSP `didChange`/`didSave` sync future for a mutation,
+    /// recording edited paths immediately. Returns `None` when no LSP sync is needed.
+    /// Does not duplicate `ProjectIndexDaemon::notify_local_write`, which `ToolRegistry`
+    /// already invokes on write/patch.
+    pub(super) fn prepare_code_intel_sync_task(
         &mut self,
         cwd: &Path,
-        invocation: ToolInvocation<'_>,
+        invocation_name: &str,
         prepared: &PreparedToolInvocation,
         outcome: &ToolExecutionOutcome,
-    ) {
+    ) -> Option<futures_util::future::BoxFuture<'static, ()>> {
         if (!outcome.result.success
             && outcome.receipt.mutations.is_empty()
             && !outcome.receipt.effects_uncertain)
-            || !matches!(invocation.name, "write" | "patch")
+            || !matches!(invocation_name, "write" | "patch")
         {
-            return;
+            return None;
         }
-        let Some(code_intel) = self.code_intel.as_ref() else {
-            return;
-        };
+        let code_intel = self.code_intel.clone()?;
         if prepared.target_paths.is_empty() {
-            return;
+            return None;
         }
         self.edited.record(&prepared.target_paths);
         let text = if outcome.receipt.effects_uncertain || outcome.receipt.fused_shell.is_some() {
@@ -281,43 +284,59 @@ impl Runtime {
                 _ => None,
             }
         };
-        let target_paths = &prepared.target_paths;
-        if let Ok(daemon) = crate::project_index::for_workspace(cwd) {
-            for (idx, absolute) in target_paths.iter().enumerate() {
-                let bytes = if idx == 0 {
-                    text.as_ref().map(|u| u.text.as_bytes())
-                } else {
-                    None
-                };
-                daemon.notify_local_write(absolute, bytes);
-            }
-        }
-        let synchronize = async {
-            for (idx, absolute) in target_paths.iter().enumerate() {
-                if idx == 0 {
-                    if let Some(update) = text.clone() {
-                        code_intel.notify_file_updated(cwd, absolute, update).await;
-                        continue;
+        let cwd = cwd.to_path_buf();
+        let target_paths = prepared.target_paths.clone();
+        let cancellation = self.cancellation.clone();
+        Some(Box::pin(async move {
+            let synchronize = async {
+                for (idx, absolute) in target_paths.iter().enumerate() {
+                    if idx == 0 {
+                        if let Some(update) = text.clone() {
+                            code_intel.notify_file_updated(&cwd, absolute, update).await;
+                            continue;
+                        }
                     }
+                    code_intel.notify_file_changed(&cwd, absolute, None).await;
                 }
-                code_intel.notify_file_changed(cwd, absolute, None).await;
+            };
+            if let Some(cancellation) = cancellation {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {},
+                    _ = synchronize => {},
+                }
+            } else {
+                synchronize.await;
             }
-        };
-        if let Some(cancellation) = &self.cancellation {
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => {},
-                _ = synchronize => {},
-            }
-        } else {
-            synchronize.await;
+        }))
+    }
+
+    /// Best-effort didChange/didSave push after the agent wrote a file. The
+    /// warm-only implementation may no-op, but when it does synchronize, the
+    /// await establishes protocol order before the next tool call.
+    pub(super) async fn notify_code_intel_after_mutation(
+        &mut self,
+        cwd: &Path,
+        invocation: ToolInvocation<'_>,
+        prepared: &PreparedToolInvocation,
+        outcome: &ToolExecutionOutcome,
+    ) {
+        if let Some(task) =
+            self.prepare_code_intel_sync_task(cwd, invocation.name, prepared, outcome)
+        {
+            task.await;
         }
     }
 
     /// Errors the language server sees in the files this batch wrote or
-    /// patched, with explicit coverage in the next request. Silent when no
-    /// integration is installed, nothing was edited or the run was cancelled.
-    pub(super) async fn post_edit_diagnostics_note(&mut self, cwd: &Path) -> Option<String> {
+    /// patched, with explicit coverage in the next request. When `concluded_green`
+    /// is true (`finish()` after a passing build/test), uses a short opportunistic
+    /// deadline and only surfaces real errors (never coverage-only notes).
+    pub(super) async fn post_edit_diagnostics_note_for(
+        &mut self,
+        cwd: &Path,
+        concluded_green: bool,
+    ) -> Option<String> {
         let paths = std::mem::take(&mut self.edited.paths);
         if paths.is_empty() {
             return None;
@@ -327,7 +346,9 @@ impl Runtime {
         // fourth check tries the full one again, so a server that warmed up
         // is trusted again.
         let slow = self.edited.slow_checks;
-        let deadline = if slow >= 2 && slow % 4 != 0 {
+        let deadline = if concluded_green {
+            POST_EDIT_DIAGNOSTICS_CONCLUDED_DEADLINE
+        } else if slow >= 2 && slow % 4 != 0 {
             POST_EDIT_DIAGNOSTICS_SHORT_DEADLINE
         } else {
             POST_EDIT_DIAGNOSTICS_DEADLINE
@@ -336,13 +357,15 @@ impl Runtime {
         let report = code_intel
             .diagnostics_after_edits(cwd, &paths, deadline, self.cancellation.clone())
             .await;
-        self.edited.slow_checks = if started.elapsed() >= deadline {
-            slow.wrapping_add(1)
-        } else {
-            0
-        };
+        if !concluded_green {
+            self.edited.slow_checks = if started.elapsed() >= deadline {
+                slow.wrapping_add(1)
+            } else {
+                0
+            };
+        }
         let report = report?;
-        crate::codeintel::render_edit_diagnostics(&report, true)
+        crate::codeintel::render_edit_diagnostics(&report, !concluded_green)
             .map(|note| self.redact_sensitive(&note))
     }
 }

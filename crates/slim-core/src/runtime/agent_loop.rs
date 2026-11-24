@@ -2135,7 +2135,11 @@ impl Runtime {
             self.append_conversation_message(st.messages, ProviderMessage::user(steer))?;
         }
         if active.more_turns && !self.is_cancelled() {
-            if let Some(note) = self.post_edit_diagnostics_note(ctx.cwd).await {
+            let concluded_green = report.concluded.is_some() && st.clean_check_passed;
+            if let Some(note) = self
+                .post_edit_diagnostics_note_for(ctx.cwd, concluded_green)
+                .await
+            {
                 self.append_conversation_message(st.messages, ProviderMessage::user(note))?;
             }
         }

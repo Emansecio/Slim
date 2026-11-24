@@ -1433,7 +1433,7 @@ pub fn tool_output_preview(name: &str, output: &str) -> String {
             return bounded_first_line(reason, 512);
         }
     }
-    if name == "codemode" {
+    if matches!(name, "codemode" | "batch_code") {
         if let Some(reason) = codemode_preview(output) {
             return bounded_first_line(&reason, 512);
         }
@@ -1463,7 +1463,9 @@ pub fn tool_output_preview(name: &str, output: &str) -> String {
 /// error follows it; a string return unwraps its JSON quotes, and an empty
 /// return speaks through its first console line.
 fn codemode_preview(output: &str) -> Option<String> {
-    if output.starts_with("codemode failed after ") {
+    if output.starts_with("codemode failed after ")
+        || output.starts_with("batch_code failed after ")
+    {
         let error = output
             .lines()
             .skip(1)

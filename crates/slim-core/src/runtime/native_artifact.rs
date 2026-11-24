@@ -43,6 +43,14 @@ impl Runtime {
     /// One verified UTF-8 page (or pattern search) of a session artifact, as
     /// the JSON the model reads; the error text is the tool failure message.
     fn read_artifact_page(&self, arguments: &str) -> Result<String, String> {
+        self.read_artifact_page_with_cap(arguments, 16 * 1024)
+    }
+
+    pub(super) fn read_artifact_page_with_cap(
+        &self,
+        arguments: &str,
+        max_bytes_cap: usize,
+    ) -> Result<String, String> {
         fn default_true() -> bool {
             true
         }
@@ -72,8 +80,8 @@ impl Runtime {
 
         let args: Arguments = serde_json::from_str(arguments)
             .map_err(|_| "artifact_read requires id, offset and max_bytes".to_owned())?;
-        if !(4..=16 * 1024).contains(&args.max_bytes) {
-            return Err("artifact_read max_bytes must be 4..=16384".into());
+        if !(4..=max_bytes_cap).contains(&args.max_bytes) {
+            return Err(format!("artifact_read max_bytes must be 4..={max_bytes_cap}"));
         }
         if args.context_lines > 10 {
             return Err("artifact_read context_lines must be 0..=10".into());
