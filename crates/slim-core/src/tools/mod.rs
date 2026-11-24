@@ -945,6 +945,10 @@ impl ToolRegistry {
         )
     }
 
+    pub(crate) fn remember_complete_read_digest(&self, path: &Path, sha256: [u8; 32]) {
+        self.services.read.remember_complete_digest(path, sha256);
+    }
+
     pub(crate) fn prepare_invocation_value(
         &self,
         mode: OperatingMode,

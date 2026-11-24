@@ -59,6 +59,7 @@ pub(crate) struct SpeculativeCodeModeOutcome {
     pub(crate) output: Result<String, String>,
     pub(crate) used_calls: usize,
     pub(crate) steps: Vec<crate::EventKind>,
+    cache: SessionReadCache,
 }
 
 /// Runs a strictly read-only CodeMode program speculatively during SSE tail
@@ -126,6 +127,7 @@ pub(crate) async fn run_readonly_speculative_cell(
         output,
         used_calls: rt.codemode.used_calls,
         steps,
+        cache: rt.codemode.session_read_cache,
     })
 }
 
@@ -264,6 +266,15 @@ impl SessionReadCache {
                 finished,
             },
         );
+    }
+
+    fn merge_from(&mut self, other: Self, global_rev: u64) {
+        for (key, mut entry) in other.entries {
+            if !entry.path_scoped {
+                entry.rev.0 = global_rev;
+            }
+            self.insert(key, entry.rev, entry.path_scoped, entry.deps, entry.finished);
+        }
     }
 
     fn invalidate_paths(&mut self, paths: &[PathBuf]) {
@@ -784,21 +795,36 @@ impl Runtime {
                 && spec.git_dirty_epoch_before == git_now
                 && profile.is_some()
             {
-                if let Ok(Some(super::speculative::SpeculativeOutcome::CodeMode(cm))) =
-                    spec.handle.await
-                {
+                let mut handle = spec.handle;
+                let awaited = if let Some(cancel) = self.cancellation.clone() {
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => {
+                            handle.abort();
+                            None
+                        }
+                        res = &mut handle => res.ok().flatten(),
+                    }
+                } else {
+                    handle.await.ok().flatten()
+                };
+                if let Some(super::speculative::SpeculativeOutcome::CodeMode(cm)) = awaited {
                     let rev_after = self.tools.workspace_revision();
                     let (fs_after, git_after) = crate::tools::canonical_workspace(cwd)
                         .ok()
                         .and_then(|root| crate::project_index::existing_for_workspace(&root))
                         .map_or((0, 0), |d| (d.fs_epoch(), d.git_dirty_epoch()));
-                    if rev_after == rev_now
+                    if cm.output.is_ok()
+                        && rev_after == rev_now
                         && fs_after == fs_now
                         && git_after == git_now
                         && self.codemode.remaining_calls >= cm.used_calls
                     {
                         self.codemode.remaining_calls -= cm.used_calls;
                         self.codemode.used_calls += cm.used_calls;
+                        self.codemode
+                            .session_read_cache
+                            .merge_from(cm.cache, self.codemode.global_rev);
                         for step in cm.steps {
                             let remapped = match step {
                                 crate::EventKind::ToolStepStarted {
@@ -806,17 +832,30 @@ impl Runtime {
                                     name,
                                     arguments,
                                     ..
-                                } => crate::EventKind::ToolStepStarted {
-                                    batch_id: invocation.batch_id.into(),
-                                    call_id: invocation.call_id.into(),
-                                    step_id: step_id.replacen(
+                                } => {
+                                    let new_id = step_id.replacen(
                                         "__spec__:__spec__:",
                                         &format!("{}:{}:", invocation.batch_id, invocation.call_id),
                                         1,
-                                    ),
-                                    name,
-                                    arguments,
-                                },
+                                    );
+                                    let _ = self.persist_codemode_fact_unsynced(
+                                        CALL_NAMESPACE,
+                                        &new_id,
+                                        json!({
+                                            "parent_call_id": invocation.call_id,
+                                            "name": name,
+                                            "status": "started",
+                                            "arguments": arguments,
+                                        }),
+                                    );
+                                    crate::EventKind::ToolStepStarted {
+                                        batch_id: invocation.batch_id.into(),
+                                        call_id: invocation.call_id.into(),
+                                        step_id: new_id,
+                                        name,
+                                        arguments,
+                                    }
+                                }
                                 crate::EventKind::ToolStepFinished {
                                     step_id,
                                     name,
@@ -825,20 +864,33 @@ impl Runtime {
                                     output,
                                     diff,
                                     ..
-                                } => crate::EventKind::ToolStepFinished {
-                                    batch_id: invocation.batch_id.into(),
-                                    call_id: invocation.call_id.into(),
-                                    step_id: step_id.replacen(
+                                } => {
+                                    let new_id = step_id.replacen(
                                         "__spec__:__spec__:",
                                         &format!("{}:{}:", invocation.batch_id, invocation.call_id),
                                         1,
-                                    ),
-                                    name,
-                                    success,
-                                    duration_ms,
-                                    output,
-                                    diff,
-                                },
+                                    );
+                                    let _ = self.persist_codemode_fact_unsynced(
+                                        CALL_NAMESPACE,
+                                        &new_id,
+                                        json!({
+                                            "parent_call_id": invocation.call_id,
+                                            "name": name,
+                                            "status": if success { "completed" } else { "failed" },
+                                            "duration_ms": duration_ms,
+                                        }),
+                                    );
+                                    crate::EventKind::ToolStepFinished {
+                                        batch_id: invocation.batch_id.into(),
+                                        call_id: invocation.call_id.into(),
+                                        step_id: new_id,
+                                        name,
+                                        success,
+                                        duration_ms,
+                                        output,
+                                        diff,
+                                    }
+                                }
                                 other => other,
                             };
                             push_runtime_event(&mut self.app, &mut seq, remapped)?;
@@ -1149,7 +1201,8 @@ impl Runtime {
                     return Ok(CellEnd::Finished(joined((&mut cell.worker).await)))
                 }
                 Event::Request(Some(request)) => {
-                    self.answer_request(scope, cell, state, request).await
+                    self.answer_request(scope, cell, state, seq, governor, request)
+                        .await
                 }
                 Event::Finished(done) => {
                     self.finish_call(scope, cell, state, seq, governor, done)
@@ -1165,6 +1218,8 @@ impl Runtime {
         scope: &CellScope<'_>,
         cell: &engine::Cell,
         state: &mut CellState,
+        seq: &mut u64,
+        governor: &mut CausalGovernor,
         request: Request,
     ) -> Result<(), ProviderError> {
         const OVER_LIMIT: &str = "cell host-request limit exceeded";
@@ -1189,10 +1244,37 @@ impl Runtime {
                 let response = if count_request(cell, state) {
                     Err(OVER_LIMIT.into())
                 } else {
-                    self.answer_helper(scope, cell, state, command).await?
+                    self.answer_helper(scope, cell, state, seq, governor, command)
+                        .await?
                 };
                 cell.reply_helper(response);
             }
+        }
+        Ok(())
+    }
+
+    async fn drain_atomic_calls(
+        &mut self,
+        scope: &CellScope<'_>,
+        cell: &engine::Cell,
+        state: &mut CellState,
+        seq: &mut u64,
+        governor: &mut CausalGovernor,
+        start_queued: bool,
+    ) -> Result<(), ProviderError> {
+        if !start_queued {
+            state.calls.discard_queued();
+        }
+        loop {
+            if start_queued {
+                self.start_ready_calls(scope, cell, state, seq, governor)
+                    .await?;
+            }
+            let Some(done) = state.calls.next_finished().await else {
+                break;
+            };
+            self.finish_call(scope, cell, state, seq, governor, done)
+                .await?;
         }
         Ok(())
     }
@@ -1202,6 +1284,8 @@ impl Runtime {
         scope: &CellScope<'_>,
         cell: &engine::Cell,
         state: &mut CellState,
+        seq: &mut u64,
+        governor: &mut CausalGovernor,
         command: Command,
     ) -> Result<Result<Value, String>, ProviderError> {
         Ok(match command {
@@ -1272,10 +1356,14 @@ impl Runtime {
                 Ok(Value::Null)
             }
             Command::CommitAtomic => {
+                self.drain_atomic_calls(scope, cell, state, seq, governor, true)
+                    .await?;
                 state.atomic_tx = None;
                 Ok(Value::Null)
             }
             Command::RollbackAtomic => {
+                self.drain_atomic_calls(scope, cell, state, seq, governor, false)
+                    .await?;
                 if let Some(tx) = state.atomic_tx.take() {
                     let rolled_back = self.rollback_atomic(tx.backups, scope.cwd).await;
                     state.applied_effects.truncate(tx.effect_start);

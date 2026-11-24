@@ -532,6 +532,7 @@ fn readonly_program_classifier_is_fail_closed() {
         "store('k', 1); return await slim.read({ path: 'a' });",
         "const m = 'write'; await slim[m]({});",
         "finish('done'); return await slim.read({ path: 'a' });",
+        "return `${await slim.write({ path: 'a', content: 'x' })}`;",
         "return 1 + 2;",
     ] {
         assert!(
@@ -539,6 +540,10 @@ fn readonly_program_classifier_is_fail_closed() {
             "must reject: {unsafe_prog}"
         );
     }
+    let ts_out = engine::strip_typescript_annotations(
+        "function id<T>(x: T): T { return x; }\nconst { a }: { a: number } = { a: 1 } satisfies Record<string, number>;\nreturn id(a)!.toString();",
+    );
+    assert!(!ts_out.contains("<T>") && !ts_out.contains("satisfies") && !ts_out.contains("!.toString"), "{ts_out}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

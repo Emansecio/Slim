@@ -22,6 +22,7 @@ pub struct LoopGuard {
 fn codemode_error_signature(error: &str) -> String {
     let body = error
         .strip_prefix("codemode failed after ")
+        .or_else(|| error.strip_prefix("batch_code failed after "))
         .and_then(|rest| rest.split_once('\n'))
         .map_or(error, |(_, rest)| rest);
     body.lines().next().unwrap_or(body).trim().to_owned()
@@ -143,5 +144,11 @@ mod tests {
         assert!(!guard.accept("codemode", r#"{"code":"c"}"#, err));
         guard.record_success("codemode");
         assert!(guard.accept("codemode", r#"{"code":"d"}"#, err));
+        let b1 = "batch_code failed after 1 tool call(s); ...\nTypeError: boom";
+        let b2 = "batch_code failed after 2 tool call(s); ...\nTypeError: boom";
+        let b3 = "batch_code failed after 3 tool call(s); ...\nTypeError: boom";
+        assert!(guard.accept("batch_code", r#"{"code":"x"}"#, b1));
+        assert!(guard.accept("batch_code", r#"{"code":"y"}"#, b2));
+        assert!(!guard.accept("batch_code", r#"{"code":"z"}"#, b3));
     }
 }

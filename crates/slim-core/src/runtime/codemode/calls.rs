@@ -403,10 +403,29 @@ impl Runtime {
                 } => {
                     if let Some(tx) = state.atomic_tx.as_mut() {
                         if matches!(prepared.name.as_str(), "write" | "patch") {
-                            for path in &prepared.target_paths {
-                                if !tx.backups.iter().any(|(existing, _)| existing == path) {
-                                    tx.backups.push((path.clone(), std::fs::read(path).ok()));
-                                }
+                            const MAX_ATOMIC_BACKUP_BYTES: u64 = 8 * 1024 * 1024;
+                            let to_backup: Vec<PathBuf> = prepared
+                                .target_paths
+                                .iter()
+                                .filter(|p| !tx.backups.iter().any(|(existing, _)| existing == *p))
+                                .cloned()
+                                .collect();
+                            if !to_backup.is_empty() {
+                                let loaded = tokio::task::spawn_blocking(move || {
+                                    to_backup
+                                        .into_iter()
+                                        .map(|path| {
+                                            let data = std::fs::metadata(&path)
+                                                .ok()
+                                                .filter(|m| m.len() <= MAX_ATOMIC_BACKUP_BYTES)
+                                                .and_then(|_| std::fs::read(&path).ok());
+                                            (path, data)
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .await
+                                .unwrap_or_default();
+                                tx.backups.extend(loaded);
                             }
                         }
                     }
@@ -610,21 +629,21 @@ impl Runtime {
                 deps,
                 cacheable,
             }) => {
-                let (status, response, output_bytes, step_preview) = match value.as_ref() {
+                let (status, response, output_bytes, step_preview) = match value {
                     Ok(v) => {
                         if !running.from_cache && cacheable {
                             let cached = Finished::JsonValue {
                                 fingerprint: fingerprint.clone(),
-                                value: Arc::clone(&value),
+                                value: Ok(Arc::clone(&v)),
                                 deps,
                                 cacheable: true,
                             };
                             self.cache_read_result(state, &running, &fingerprint, &cached);
                         }
                         let payload_val = if self.sensitive_values.0.is_empty() {
-                            Arc::new(v.clone())
+                            v
                         } else {
-                            let mut redacted = v.clone();
+                            let mut redacted = (*v).clone();
                             redact_value(&mut redacted, &self.sensitive_values.0);
                             Arc::new(redacted)
                         };
@@ -644,7 +663,7 @@ impl Runtime {
                         }
                     }
                     Err(error) => {
-                        let error = self.redact_sensitive(error);
+                        let error = self.redact_sensitive(&error);
                         let bytes = error.len();
                         let preview = prefix(&error, MAX_STEP_OUTPUT_BYTES).to_owned();
                         ("failed", Err(error), bytes, preview)
@@ -877,8 +896,28 @@ impl Runtime {
                     "timed_out": listing.timed_out,
                 });
                 redact_value(&mut value, &self.sensitive_values.0);
-                if let Some((output_bytes, preview)) = probe_json_size_and_preview(&value) {
-                    let tool_result = ToolResult::ok("glob", preview.clone());
+                if let Some(output_bytes) = json_serialized_len_bounded(&value, MAX_JSON_BYTES) {
+                    let preview = if output_bytes <= MAX_STEP_OUTPUT_BYTES {
+                        value.to_string()
+                    } else {
+                        format!("<{} files, {} bytes JSON>", listing.files.len(), output_bytes)
+                    };
+                    let gov_evidence = if output_bytes <= MAX_STEP_OUTPUT_BYTES {
+                        preview.clone()
+                    } else {
+                        let mut parts: Vec<&[u8]> = Vec::with_capacity(listing.files.len() + 2);
+                        parts.push(b"slim-glob-evidence-v1");
+                        for f in &listing.files {
+                            parts.push(f.as_bytes());
+                        }
+                        format!(
+                            "files={} truncated={} hash={}",
+                            listing.files.len(),
+                            listing.truncated,
+                            crate::tools::hash_fields(&parts)
+                        )
+                    };
+                    let tool_result = ToolResult::ok("glob", gov_evidence);
                     (
                         "completed",
                         Ok(Payload::JsonValue(Arc::new(value))),
@@ -917,23 +956,35 @@ impl Runtime {
         running: &Running,
         state: &mut CellState,
         fingerprint: &str,
-        result: Arc<Result<Value, String>>,
+        result: Result<Arc<Value>, String>,
     ) -> (&'static str, Result<Payload, String>, usize, String) {
-        match result.as_ref() {
+        match result {
             Ok(value) => {
                 if !running.from_cache {
                     let cached = Finished::Git {
                         fingerprint: fingerprint.to_owned(),
-                        result: Arc::clone(&result),
+                        result: Ok(Arc::clone(&value)),
                     };
                     self.cache_read_result(state, running, fingerprint, &cached);
                 }
-                let mut redacted = value.clone();
-                redact_value(&mut redacted, &self.sensitive_values.0);
-                if let Some((output_bytes, preview)) = probe_json_size_and_preview(&redacted) {
+                let payload_val = if self.sensitive_values.0.is_empty() {
+                    value
+                } else {
+                    let mut redacted = (*value).clone();
+                    redact_value(&mut redacted, &self.sensitive_values.0);
+                    Arc::new(redacted)
+                };
+                if let Some(output_bytes) =
+                    json_serialized_len_bounded(&payload_val, MAX_JSON_BYTES)
+                {
+                    let preview = if output_bytes <= MAX_STEP_OUTPUT_BYTES {
+                        payload_val.to_string()
+                    } else {
+                        format!("<{} bytes JSON>", output_bytes)
+                    };
                     (
                         "completed",
-                        Ok(Payload::JsonValue(Arc::new(redacted))),
+                        Ok(Payload::JsonValue(payload_val)),
                         output_bytes,
                         preview,
                     )
@@ -944,7 +995,7 @@ impl Runtime {
                 }
             }
             Err(error) => {
-                let error = self.redact_sensitive(error);
+                let error = self.redact_sensitive(&error);
                 let output_bytes = error.len();
                 let preview = prefix(&error, MAX_STEP_OUTPUT_BYTES).to_owned();
                 ("failed", Err(error), output_bytes, preview)
@@ -1005,9 +1056,15 @@ impl Runtime {
         ),
         ProviderError,
     > {
-        let mut outcome = Arc::unwrap_or_clone(outcome);
-        let mut output = self.redact_sensitive(&outcome.result.output);
-        outcome.result.output = output.clone();
+        let outcome_arc = if self.sensitive_values.0.is_empty() {
+            outcome
+        } else {
+            let mut owned = Arc::unwrap_or_clone(outcome);
+            owned.result.output = self.redact_sensitive(&owned.result.output);
+            Arc::new(owned)
+        };
+        let outcome = outcome_arc.as_ref();
+        let mut output = outcome.result.output.clone();
         let allow_non_zero_exit = running.allow_non_zero
             && !outcome.result.success
             && outcome
@@ -1083,7 +1140,7 @@ impl Runtime {
         }
         if outcome.result.success && !running.from_cache {
             if let Some(cache_key) = running.cache_key.clone() {
-                let cached = Finished::Native(Arc::new(outcome.clone()));
+                let cached = Finished::Native(Arc::clone(&outcome_arc));
                 self.cache_read_result(state, running, &cache_key, &cached);
             }
         }
@@ -1154,7 +1211,8 @@ impl Runtime {
             .success
             .then(|| self.redacted_edit_diff(outcome.receipt.edit_diff.as_ref()))
             .flatten();
-        Ok((status, response, reported_bytes, step_preview, outcome.result, diff))
+        let result = Arc::try_unwrap(outcome_arc).map_or_else(|a| a.result.clone(), |o| o.result);
+        Ok((status, response, reported_bytes, step_preview, result, diff))
     }
 
     fn structured_native_value(
@@ -1530,35 +1588,6 @@ pub(super) fn prefix(text: &str, limit: usize) -> &str {
     &text[..end]
 }
 
-struct BoundedJsonProbe {
-    total: usize,
-    limit: usize,
-    preview: Vec<u8>,
-    preview_limit: usize,
-}
-
-impl std::io::Write for BoundedJsonProbe {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let next = self.total.saturating_add(buf.len());
-        if next > self.limit {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "json bridge limit exceeded",
-            ));
-        }
-        self.total = next;
-        let room = self.preview_limit.saturating_sub(self.preview.len());
-        if room > 0 {
-            self.preview.extend_from_slice(&buf[..buf.len().min(room)]);
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 /// Exact zero-allocation serialized JSON byte length, short-circuiting above `limit`.
 pub(super) fn json_serialized_len_bounded(value: &Value, limit: usize) -> Option<usize> {
     fn str_len(s: &str, rem: usize) -> Option<usize> {
@@ -1623,22 +1652,6 @@ pub(super) fn json_serialized_len_bounded(value: &Value, limit: usize) -> Option
         (n <= rem).then_some(n)
     }
     walk(value, limit)
-}
-
-fn probe_json_size_and_preview(value: &Value) -> Option<(usize, String)> {
-    let mut probe = BoundedJsonProbe {
-        total: 0,
-        limit: MAX_JSON_BYTES,
-        preview: Vec::with_capacity(256),
-        preview_limit: MAX_STEP_OUTPUT_BYTES,
-    };
-    serde_json::to_writer(&mut probe, value).ok()?;
-    let mut preview_end = probe.preview.len();
-    while preview_end > 0 && std::str::from_utf8(&probe.preview[..preview_end]).is_err() {
-        preview_end -= 1;
-    }
-    let preview = String::from_utf8_lossy(&probe.preview[..preview_end]).into_owned();
-    Some((probe.total, preview))
 }
 
 fn canonical_json_hash(tag: &[u8], extra: &[u8], value: &Value) -> String {

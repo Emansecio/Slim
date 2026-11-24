@@ -377,6 +377,7 @@ impl Runtime {
                 mutation_succeeded |= is_mutation || codemode_mutated;
                 if codemode_effects.had_non_readonly_effect {
                     guard.record_success("write");
+                    repeated_failure_in_batch = false;
                 }
                 if matches!(
                     call.name.as_str(),

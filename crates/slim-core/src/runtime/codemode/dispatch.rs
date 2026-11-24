@@ -170,6 +170,7 @@ impl Job {
                 coalesce_key: Some(fingerprint.clone()),
                 read_paths: read_paths.clone(),
             },
+            Target::Subagent { req, .. } if !req.readonly => Concurrency::Exclusive,
             Target::Subagent { .. } | Target::SubagentControl { .. } => Concurrency::Shared {
                 coalesce_key: None,
                 read_paths: Vec::new(),
@@ -229,11 +230,11 @@ pub(super) enum Finished {
     },
     Git {
         fingerprint: String,
-        result: Arc<Result<Value, String>>,
+        result: Result<Arc<Value>, String>,
     },
     JsonValue {
         fingerprint: String,
-        value: Arc<Result<Value, String>>,
+        value: Result<Arc<Value>, String>,
         deps: Vec<PathBuf>,
         cacheable: bool,
     },
@@ -256,7 +257,7 @@ impl Finished {
                 result,
             } => Some(Self::Git {
                 fingerprint: fingerprint.clone(),
-                result: Arc::clone(result),
+                result: result.clone(),
             }),
             Self::JsonValue {
                 fingerprint,
@@ -265,7 +266,7 @@ impl Finished {
                 cacheable,
             } if *cacheable => Some(Self::JsonValue {
                 fingerprint: fingerprint.clone(),
-                value: Arc::clone(value),
+                value: value.clone(),
                 deps: deps.clone(),
                 cacheable: true,
             }),
@@ -522,7 +523,7 @@ impl Scheduler {
                     .await;
                     Finished::Git {
                         fingerprint,
-                        result: Arc::new(result),
+                        result: result.map(Arc::new),
                     }
                 });
                 (None, call)
@@ -547,7 +548,7 @@ impl Scheduler {
                     Finished::JsonValue {
                         fingerprint,
                         cacheable: value.is_ok(),
-                        value: Arc::new(value),
+                        value: value.map(Arc::new),
                         deps,
                     }
                 });
@@ -572,7 +573,7 @@ impl Scheduler {
                     Finished::JsonValue {
                         fingerprint,
                         cacheable: value.is_ok(),
-                        value: Arc::new(value),
+                        value: value.map(Arc::new),
                         deps,
                     }
                 });
@@ -606,7 +607,7 @@ impl Scheduler {
                     Finished::JsonValue {
                         fingerprint,
                         cacheable: value.is_ok(),
-                        value: Arc::new(value),
+                        value: value.map(Arc::new),
                         deps: Vec::new(),
                     }
                 });
@@ -640,7 +641,7 @@ impl Scheduler {
                     Finished::JsonValue {
                         fingerprint,
                         cacheable: ready && value.is_ok(),
-                        value: Arc::new(value),
+                        value: value.map(Arc::new),
                         deps: Vec::new(),
                     }
                 });
@@ -848,13 +849,31 @@ fn clone_coalesced_finished(
             if let Some(cloned) = finished.clone_for_cache() {
                 return cloned;
             }
-            let msg = match finished {
-                Finished::Mcp(McpRequestOutcome::Completed(Err(err))) => err.to_string(),
-                _ => "coalesced call failed".to_owned(),
-            };
-            Finished::Glob {
-                fingerprint: String::new(),
-                result: Arc::new(Err(msg)),
+            match finished {
+                Finished::JsonValue {
+                    fingerprint,
+                    value,
+                    deps,
+                    cacheable,
+                } => Finished::JsonValue {
+                    fingerprint: fingerprint.clone(),
+                    value: value.clone(),
+                    deps: deps.clone(),
+                    cacheable: *cacheable,
+                },
+                Finished::Subagent(res) => Finished::Subagent(res.clone()),
+                Finished::Mcp(McpRequestOutcome::Completed(Err(err))) => Finished::JsonValue {
+                    fingerprint: String::new(),
+                    value: Err(err.to_string()),
+                    deps: Vec::new(),
+                    cacheable: false,
+                },
+                _ => Finished::JsonValue {
+                    fingerprint: String::new(),
+                    value: Err("coalesced call failed".to_owned()),
+                    deps: Vec::new(),
+                    cacheable: false,
+                },
             }
         }
         Err(error) => Finished::Native(Arc::new(ToolExecutionOutcome {
@@ -1172,6 +1191,7 @@ fn read_one_spec(
 }
 
 fn try_read_one_spec_from_slab(
+    tools: &ToolRegistry,
     daemon: &crate::project_index::ProjectIndexDaemon,
     workspace: &Path,
     spec: &ReadManySpec,
@@ -1186,6 +1206,9 @@ fn try_read_one_spec_from_slab(
     let first = spec.offset.max(1);
     let max_lines = spec.max_lines.unwrap_or(crate::tools::MAX_READ_LINES_CAP);
     if first > total_lines {
+        if first == 1 {
+            tools.remember_complete_read_digest(&abs, cached.sha256);
+        }
         let val = if default_structured {
             serde_json::json!({
                 "path": spec.raw_path,
@@ -1206,6 +1229,9 @@ fn try_read_one_spec_from_slab(
         return None;
     }
     let next_offset = (end < total_lines).then_some(end + 1);
+    if first == 1 && next_offset.is_none() {
+        tools.remember_complete_read_digest(&abs, cached.sha256);
+    }
     let returned_lines = end.saturating_sub(first) + 1;
     let val = if default_structured {
         serde_json::json!({
@@ -1245,7 +1271,9 @@ fn run_read_many_batch(
             if cell.is_some_and(CancellationToken::is_cancelled) {
                 return (Err("readMany cancelled".into()), deps);
             }
-            if let Some(hit) = try_read_one_spec_from_slab(d, workspace, spec, default_structured) {
+            if let Some(hit) =
+                try_read_one_spec_from_slab(tools, d, workspace, spec, default_structured)
+            {
                 ordered[idx] = Some(hit);
             } else {
                 misses.push((idx, spec));
@@ -1501,6 +1529,7 @@ fn run_grep_index_batch(
 
     let prepared_queries: Vec<(String, Option<Vec<u8>>)> = queries
         .iter()
+        .take(16)
         .map(|q| {
             let lower = case_insensitive.then(|| q.to_ascii_lowercase().into_bytes());
             (q.clone(), lower)
@@ -1562,11 +1591,12 @@ fn run_grep_index_batch(
                     .map(|abs| (rel, abs))
             })
             .collect();
-        if scoped.len() > 32 && daemon.is_none() {
+        if scoped.len() > 32 {
             let next = AtomicUsize::new(0);
             let done = std::sync::atomic::AtomicBool::new(false);
             let chunks = std::sync::Mutex::new(Vec::<(usize, Vec<Value>)>::new());
             let workers = scoped.len().min(4);
+            let daemon_ref = daemon.as_deref();
             std::thread::scope(|scope| {
                 for _ in 0..workers {
                     scope.spawn(|| {
@@ -1577,17 +1607,29 @@ fn run_grep_index_batch(
                             }
                             let idx = next.fetch_add(1, Ordering::Relaxed);
                             let Some((rel, abs)) = scoped.get(idx) else { break };
-                            let Some(text) = std::fs::metadata(abs)
-                                .ok()
-                                .filter(|m| m.is_file() && m.len() <= MAX_GREP_FILE_BYTES)
-                                .and_then(|_| std::fs::read_to_string(abs).ok())
-                            else {
-                                continue;
+                            let slab_text = daemon_ref
+                                .and_then(|d| d.read_file_cached(abs).ok().flatten());
+                            let disk_text;
+                            let text: &str = if let Some(cached) = slab_text.as_ref() {
+                                if cached.text.len() as u64 > MAX_GREP_FILE_BYTES {
+                                    continue;
+                                }
+                                &cached.text
+                            } else {
+                                let Some(s) = std::fs::metadata(abs)
+                                    .ok()
+                                    .filter(|m| m.is_file() && m.len() <= MAX_GREP_FILE_BYTES)
+                                    .and_then(|_| std::fs::read_to_string(abs).ok())
+                                else {
+                                    continue;
+                                };
+                                disk_text = s;
+                                disk_text.as_str()
                             };
                             let mut local = Vec::new();
                             let mut local_trunc = false;
                             scan_text_for_queries(
-                                &text,
+                                text,
                                 rel,
                                 &fallback_queries,
                                 max_hits,

@@ -984,6 +984,7 @@ fn interpret_with_slot(
     } else {
         result
     };
+    let is_pool_worker = reply.is_some();
     let reply_out = send_or_return(
         reply,
         Output {
@@ -995,6 +996,9 @@ fn interpret_with_slot(
     drop(context);
     if !was_interrupted && !cpu_exceeded && !runtime.is_job_pending() {
         runtime.run_gc();
+        if is_pool_worker {
+            *warm_ctx = Context::full(&runtime).ok();
+        }
         *warm_rt = Some(runtime);
     }
     reply_out
@@ -1817,6 +1821,36 @@ pub(super) fn strip_typescript_annotations(code: &str) -> String {
                 }
             }
         }
+        if b[i] == b'<' {
+            let without_name = out.trim_end();
+            let name_start = without_name
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+                .map_or(0, |p| p + 1);
+            let is_fn_generic = prev_word(&out) == "function"
+                || (name_start < without_name.len()
+                    && prev_word(&without_name[..name_start]) == "function");
+            if is_fn_generic {
+                let close = scan_balanced(b, i, b'<', b'>');
+                let after = skip_ws_and_comments(b, close);
+                if after < b.len() && b[after] == b'(' {
+                    i = close;
+                    continue;
+                }
+            }
+        }
+        if b[i] == b'!'
+            && b.get(i + 1) != Some(&b'=')
+            && prev_non_ws_byte(&out)
+                .is_some_and(|pb| is_ident_cont(pb) || matches!(pb, b')' | b']'))
+            && matches!(
+                b.get(i + 1),
+                Some(b'.' | b'[' | b'(' | b',' | b';' | b')' | b']' | b'}' | b' ' | b'\t' | b'\r' | b'\n')
+                    | None
+            )
+        {
+            i += 1;
+            continue;
+        }
         if b[i] == b'(' {
             let close = scan_balanced(b, i, b'(', b')');
             let after_close = skip_ws_and_comments(b, close);
@@ -1866,24 +1900,31 @@ pub(super) fn strip_typescript_annotations(code: &str) -> String {
                 && end < b.len()
                 && b[end].is_ascii_whitespace()
             {
-                let mut scan = skip_ws_and_comments(b, end);
-                if let Some((_, after_name)) = read_ident(b, scan) {
-                    scan = skip_ws_inline(b, after_name);
-                    let mut colon_pos = scan;
+                let scan = skip_ws_and_comments(b, end);
+                let after_binding = if let Some((_, after_name)) = read_ident(b, scan) {
+                    Some(after_name)
+                } else if scan < b.len() && matches!(b[scan], b'{' | b'[') {
+                    let close = if b[scan] == b'{' { b'}' } else { b']' };
+                    Some(scan_balanced(b, scan, b[scan], close))
+                } else {
+                    None
+                };
+                if let Some(after_binding) = after_binding {
+                    let mut colon_pos = skip_ws_inline(b, after_binding);
                     if colon_pos < b.len() && b[colon_pos] == b'!' {
                         colon_pos = skip_ws_inline(b, colon_pos + 1);
                     }
                     if colon_pos < b.len() && b[colon_pos] == b':' {
-                        out.push_str(&code[i..after_name]);
+                        out.push_str(&code[i..after_binding]);
                         i = skip_ts_type(b, colon_pos + 1);
                         continue;
                     }
                 }
-            } else if word == "as"
+            } else if matches!(word, "as" | "satisfies")
                 && end < b.len()
                 && matches!(b[end], b' ' | b'\t')
                 && prev_non_ws_byte(&out).is_some_and(|pb| {
-                    is_ident_cont(pb) || matches!(pb, b')' | b']' | b'\'' | b'"' | b'`')
+                    is_ident_cont(pb) || matches!(pb, b')' | b']' | b'}' | b'\'' | b'"' | b'`')
                 })
                 && !out.trim_end().ends_with('.')
             {
@@ -1921,6 +1962,25 @@ pub(crate) fn is_strictly_readonly_program(code: &str) -> bool {
     let mut i = 0usize;
     let mut saw_readonly_call = false;
     while i < b.len() {
+        if b[i] == b'`' {
+            let mut j = i + 1;
+            while j < b.len() {
+                if b[j] == b'\\' {
+                    j = (j + 2).min(b.len());
+                    continue;
+                }
+                if j + 1 < b.len() && b[j] == b'$' && b[j + 1] == b'{' {
+                    return false;
+                }
+                if b[j] == b'`' {
+                    j += 1;
+                    break;
+                }
+                j += 1;
+            }
+            i = j;
+            continue;
+        }
         if let Some(next) = scan_string_or_comment(b, i) {
             i = next;
             continue;
